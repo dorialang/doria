@@ -110,21 +110,18 @@ pub struct ConformanceFacts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingContractOperation {
-    CoreValueOperation,
     TraitComposition,
 }
 
 impl PendingContractOperation {
     pub fn slice(self) -> u8 {
         match self {
-            Self::CoreValueOperation => 3,
             Self::TraitComposition => 4,
         }
     }
 
     pub fn diagnostic(self, span: Span) -> Diagnostic {
         let (code, description) = match self {
-            Self::CoreValueOperation => ("E0759", "core value-contract execution"),
             Self::TraitComposition => ("E0493", "trait composition"),
         };
         Diagnostic::unsupported_stage(
@@ -136,7 +133,6 @@ impl PendingContractOperation {
             span,
         )
         .with_title(match self {
-            Self::CoreValueOperation => "Core Contract Execution Is Not Yet Supported",
             Self::TraitComposition => "Trait Composition Is Not Yet Supported",
         })
     }
@@ -490,17 +486,6 @@ impl Checker<'_> {
                     requirement: required.method.declaration,
                 });
         }
-        if self.contract_type_depth == 0
-            && required.origins.iter().any(|(interface, span)| {
-                span.source == crate::compiler_known_contracts::SOURCE_ID
-                    && crate::compiler_known_contracts::requires_core_execution(&interface.name)
-            })
-        {
-            self.report_contract_boundary(
-                PendingContractOperation::CoreValueOperation,
-                member_span,
-            );
-        }
         self.record_contract_member_reference(
             member_span,
             required.origins.iter().map(|(_, span)| *span).collect(),
@@ -579,6 +564,7 @@ impl Checker<'_> {
         let CallableTarget::ConstrainedMethod {
             receiver,
             method_name,
+            requirement,
             ..
         } = self.call_targets.get(&span)?.clone()
         else {
@@ -586,6 +572,14 @@ impl Checker<'_> {
         };
         let receiver = self.types.intern_resolved(&receiver);
         let receiver = self.substitute_type_id(receiver, substitutions);
+        if requirement.source == crate::compiler_known_contracts::SOURCE_ID
+            && matches!(
+                self.types.kind(receiver),
+                TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
+            )
+        {
+            return None;
+        }
         let TypeKind::Class(class_type) = self.types.kind(receiver).clone() else {
             return None;
         };
@@ -686,10 +680,6 @@ impl Checker<'_> {
         if !self.is_core_interface(name) {
             return false;
         }
-        let ty = match self.types.kind(ty) {
-            TypeKind::Nullable(inner) => *inner,
-            _ => ty,
-        };
         let arguments = if matches!(name, "Comparable" | "Equatable") {
             vec![ty]
         } else {
@@ -703,7 +693,15 @@ impl Checker<'_> {
     }
 
     pub(super) fn public_iterable_element(&mut self, ty: TypeId) -> Option<TypeId> {
-        if !self.is_core_interface("Iterable") {
+        self.core_iteration_element(ty, "Iterable")
+    }
+
+    pub(super) fn public_iterator_element(&mut self, ty: TypeId) -> Option<TypeId> {
+        self.core_iteration_element(ty, "Iterator")
+    }
+
+    fn core_iteration_element(&mut self, ty: TypeId, contract: &str) -> Option<TypeId> {
+        if !self.is_core_interface(contract) {
             return None;
         }
         let interfaces = match self.types.kind(ty).clone() {
@@ -738,7 +736,7 @@ impl Checker<'_> {
             contracts.push(interface);
             if let Some(iterable) = contracts
                 .iter()
-                .find(|interface| interface.name == "Iterable")
+                .find(|interface| interface.name == contract)
             {
                 return iterable.arguments.first().copied();
             }
@@ -746,24 +744,129 @@ impl Checker<'_> {
         None
     }
 
-    pub(super) fn gate_core_operation(
+    pub(super) fn select_core_operation(
         &mut self,
         ty: TypeId,
-        contract: &'static str,
+        operation: crate::compiler_known_contracts::CoreValueOperation,
         span: Span,
     ) -> bool {
-        if self.type_is_symbolic(ty) {
-            let template = (span, ty, contract);
-            if !self.pending_core_operations.contains(&template) {
-                self.pending_core_operations.push(template);
+        use crate::compiler_known_contracts::CoreValueOperation;
+
+        // Only equality and duplication define absence handling for nullable values.
+        let ty = match self.types.kind(ty) {
+            TypeKind::Nullable(inner)
+                if matches!(
+                    operation,
+                    CoreValueOperation::Equal | CoreValueOperation::Clone
+                ) =>
+            {
+                *inner
             }
+            _ => ty,
+        };
+        if !self.has_core_contract(ty, operation.contract()) {
             return false;
         }
-        if self.has_core_contract(ty, contract) {
-            self.report_contract_boundary(PendingContractOperation::CoreValueOperation, span);
-            true
+        let Some((target, method)) = self.select_contract_method(ty, operation.method(), span)
+        else {
+            return false;
+        };
+        self.record_selected_contract_effects(&target, &method, span);
+        let call = CoreValueCallInfo {
+            operation,
+            receiver_type: self.types.resolved(ty),
+            target,
+        };
+        let calls = self.core_operation_calls.entry(span).or_default();
+        if !calls.contains(&call) {
+            calls.push(call);
+        }
+        true
+    }
+
+    fn select_contract_method(
+        &mut self,
+        ty: TypeId,
+        method_name: &str,
+        span: Span,
+    ) -> Option<(CallableTarget, MethodInfo)> {
+        let method_name = method_name.to_string();
+        Some(match self.types.kind(ty).clone() {
+            TypeKind::Class(class) => {
+                let (declaring, method) = self.lookup_instance_method(&class, &method_name)?;
+                let declaring = self.types.intern(TypeKind::Class(declaring));
+                let ResolvedType::Class(class_type) = self.types.resolved(declaring) else {
+                    unreachable!("resolved core implementation class")
+                };
+                let target = CallableTarget::Method {
+                    class_type,
+                    method_name,
+                    direct_parent: false,
+                };
+                self.record_callable_dependency(method.declaration);
+                (target, method)
+            }
+            TypeKind::TypeParameter(parameter) => {
+                let Ok(Some(required)) =
+                    self.constrained_requirement(&parameter, &method_name, span)
+                else {
+                    return None;
+                };
+                let target = CallableTarget::ConstrainedMethod {
+                    receiver: self.types.resolved(ty),
+                    method_name,
+                    requirement: required.method.declaration,
+                    implementations: Vec::new(),
+                };
+                (target, required.method)
+            }
+            TypeKind::Interface(interface) => {
+                let required = self
+                    .canonical_interface_requirements(&interface, &mut Vec::new())
+                    .requirements
+                    .into_iter()
+                    .find(|required| required.name == method_name)?;
+                let interface = self.resolved_interface(&interface);
+                let target = CallableTarget::InterfaceMethod {
+                    interface,
+                    method_name,
+                    requirement: required.method.declaration,
+                };
+                (target, required.method)
+            }
+            _ => return None,
+        })
+    }
+
+    fn record_selected_contract_effects(
+        &mut self,
+        target: &CallableTarget,
+        method: &MethodInfo,
+        span: Span,
+    ) {
+        let effects = if matches!(
+            target,
+            CallableTarget::InterfaceMethod { .. } | CallableTarget::ConstrainedMethod { .. }
+        ) {
+            self.complete_function_value_effects(&method.checked_effects, span)
         } else {
-            false
+            method.checked_effects.clone()
+        };
+        self.record_checked_effects(effects, span);
+    }
+
+    pub(super) fn select_public_iteration(&mut self, ty: TypeId, span: Span) {
+        let Some((target, method)) = self.select_contract_method(ty, "iterator", span) else {
+            return;
+        };
+        self.record_selected_contract_effects(&target, &method, span);
+        self.call_targets.entry(span).or_insert(target);
+        for name in ["hasCurrent", "getCurrent", "advance"] {
+            if let Some((target, operation)) =
+                self.select_contract_method(method.return_ty, name, span)
+            {
+                self.record_selected_contract_effects(&target, &operation, span);
+            }
         }
     }
 
@@ -772,14 +875,43 @@ impl Checker<'_> {
         declaration: Span,
         substitutions: &HashMap<String, TypeId>,
     ) {
-        for (span, ty, contract) in self.pending_core_operations.clone() {
+        for (span, foreach) in self.foreach_loops.clone() {
+            if foreach.iterable_family == ForeachIterableFamily::PublicIterable
+                && span.source == declaration.source
+                && span.start >= declaration.start
+                && span.end <= declaration.end
+            {
+                self.specialize_constrained_method(span, substitutions);
+                let ty = self.types.intern_resolved(&foreach.iterable_type);
+                let ty = self.substitute_type_id(ty, substitutions);
+                if !self.type_is_symbolic(ty) {
+                    self.select_public_iteration(ty, span);
+                }
+            }
+        }
+        for (span, calls) in self.core_operation_calls.clone() {
             if span.source == declaration.source
                 && span.start >= declaration.start
                 && span.end <= declaration.end
             {
-                let ty = self.substitute_type_id(ty, substitutions);
-                if !self.type_is_symbolic(ty) {
-                    self.gate_core_operation(ty, contract, span);
+                for call in calls {
+                    let template = self.types.intern_resolved(&call.receiver_type);
+                    let ty = self.substitute_type_id(template, substitutions);
+                    if ty != template && !self.type_is_symbolic(ty) {
+                        self.select_core_operation(ty, call.operation, span);
+                    }
+                }
+            }
+        }
+        for (span, left, right) in self.pending_relational_comparisons.clone() {
+            if span.source == declaration.source
+                && span.start >= declaration.start
+                && span.end <= declaration.end
+            {
+                let left = self.substitute_type_id(left, substitutions);
+                let right = self.substitute_type_id(right, substitutions);
+                if !self.type_is_symbolic(left) && !self.type_is_symbolic(right) {
+                    self.check_relational_operand_types(left, right, span);
                 }
             }
         }
@@ -1111,15 +1243,18 @@ impl Checker<'_> {
                 | TypeKind::List(element)
                 | TypeKind::Set(element)
                 | TypeKind::SortedSet(element)
-                | TypeKind::Deque(element)
-                | TypeKind::PriorityQueue(element) => Some(*element),
+                | TypeKind::Deque(element) => Some(*element),
                 TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value) => {
                     Some(*value)
                 }
                 _ => None,
             };
             if let Some(element) = element {
-                return target.arguments.as_slice() == [element];
+                let conforms = target.arguments.as_slice() == [element];
+                if conforms {
+                    self.types.intern(TypeKind::Interface(target.clone()));
+                }
+                return conforms;
             }
         }
         let (name, arguments, parameters, edges) = match self.types.kind(ty).clone() {
@@ -1413,7 +1548,7 @@ impl Checker<'_> {
             && crate::compiler_known_contracts::interfaces().any(|interface| {
                 interface.name == "Iterator"
                     && interface.requirements.iter().any(|requirement| {
-                        requirement.name == "current" && requirement.span == method.declaration
+                        requirement.name == "getCurrent" && requirement.span == method.declaration
                     })
             })
         {
@@ -2252,6 +2387,7 @@ impl Checker<'_> {
         Some(PropertyInfo {
             access: property.access,
             writable: property.writable,
+            borrowed_source: false,
             ty,
             init_state: if property.initializer.is_some() {
                 PropertyInitState::HasInitializer

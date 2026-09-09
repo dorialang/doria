@@ -73,8 +73,9 @@ redundant `open override` may offer exact modifier edits; signature, receiver,
 return, default, generic, and checked-effect incompatibilities require review
 unless the only safe edit is mechanically certain. Do not expose descriptor,
 carrier, thunk, slot, or vtable vocabulary as the user's mistake. Decision 0134's
-accepted interface and trait syntax remains a staged implementation
-boundary rather than being described as invalid Doria. Diagnostics name the
+accepted trait composition remains a Slice 4 implementation
+boundary rather than invalid Doria. Interface runtime, core value operations,
+and public iteration are implemented; E0758/E0759 remain reserved. Diagnostics name the
 precise remaining Stage 35 slice and never reinterpret accepted syntax as a
 permanent language rejection.
 

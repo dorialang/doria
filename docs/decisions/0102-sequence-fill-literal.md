@@ -4,8 +4,8 @@
 > `Cloneable`; the source is evaluated once and cloned once per destination slot
 > in ascending order. Copy values retain the existing direct path.
 
-**Status:** Accepted (design direction; Copy-scalar and `string` elements in v1.0,
-move-type fills deferred to `Cloneable`). Amends decision 0100's fill deferral and
+**Status:** Accepted And Implemented (Copy scalars, immutable strings, and
+Decision 0134 Cloneable Move elements). Amends decision 0100's fill deferral and
 plan §4.9's bracket-literal forms. Un-parks the *fill* half of 0100's deferred
 constructors; the *capacity hint* (`withCapacity`) stays parked.
 
@@ -58,21 +58,23 @@ let $flags = [false; n];          // no expected type -> List<bool>
 
 ### Which element types can be filled (v1.0)
 
-Replicating a value `count` times requires copying it, so the element type must be
-replicable without invoking the Decision 0134 `Cloneable` contract, whose
-execution lands in Stage 35 Slice 3:
+Replicating a value `count` times requires its checked duplication plan.
+Stage 35 Slice 3 implements Decision 0134's widening:
 
 - **Copy scalars** (`bool`, `int` and the fixed-width integers, `float`/`float32`/
   `float64`) — a bit copy. This covers the motivating buffer workloads.
 - **`string`** — immutable and reference-counted, so `count` copies are `count`
   retained handles to the same `DrStringV1`; sound and cheap.
 
-Move-type elements — concrete classes, collections, `Bytes`, `mixed`, nullable
-payloads — are **deferred**: a single-owner value cannot be replicated, and the
-`[value; count]` form over such a type is rejected with a stage/record-named
-diagnostic. When `Cloneable` lands (Stage 35), the fill form extends to
-`Cloneable` element types by cloning `value` per slot; nothing here forecloses
-that.
+- **Cloneable Move elements** — invoke the author-provided nominal `clone`
+  once per slot, retaining exact dynamic type and independent result ownership.
+- **Nullable elements** — copy absence, or use the present payload's plan.
+
+Other Move types, including collections, `Bytes`, and `mixed`, do not acquire
+implicit cloning. Missing duplicability receives a capability diagnostic.
+Zero slots still evaluate the source and count, but call no clone. Temporary
+source ownership ends after construction; checked clone failure cleans partial
+output under the ordinary automatic-effect rules.
 
 ### Not in scope
 
@@ -105,8 +107,8 @@ that.
 - The bracket literal now has two forms — an element list `[a, b, c]` and a repeat
   `[value; count]` — disambiguated by the `;` separator; both are contextually
   typed identically.
-- The Copy+`string` restriction is an honest, self-describing boundary that lifts
-  cleanly when `Cloneable` arrives, not a special case.
+- Copy, immutable-string retention, and nominal Cloneable selection share one
+  duplication plan; ordinary assignments and consuming calls never clone.
 
 ## Sequencing
 

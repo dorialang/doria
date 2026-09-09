@@ -6,6 +6,285 @@ fn analyze(source: &str) -> doriac::semantics::SemanticAnalysis {
         .1
 }
 
+const BORROWING_CURSOR: &str = r#"
+class Cursor implements Iterator<int> {
+    writable int $position = 0;
+    function __construct(borrow List<int> $source) {}
+    function hasCurrent(): bool { return $this->position < $this->source->count; }
+    function getCurrent(): int { return $this->source[$this->position]; }
+    writable function advance(): void { $this->position++; }
+}
+"#;
+
+#[test]
+fn nullable_collection_constraints_do_not_inherit_payload_conformance() {
+    let declarations = r#"
+class Key implements Hashable, Comparable<Key>, Cloneable {
+    function hash(): uint64 { return 0; }
+    function compare(Key $other): Ordering { return Ordering::Equal; }
+    function clone(): self { return new Key(); }
+}
+class GenericKey<T> implements Hashable, Comparable<GenericKey<T>> {
+    function hash(): uint64 { return 0; }
+    function compare(GenericKey<T> $other): Ordering { return Ordering::Equal; }
+}
+interface KeyView extends Hashable, Comparable<KeyView>, Cloneable {}
+"#;
+    for (container, contract) in [
+        ("Set<E>", "Hashable"),
+        ("Dictionary<E, int>", "Hashable"),
+        ("SortedSet<E>", "Comparable"),
+        ("SortedDictionary<E, int>", "Comparable"),
+        ("PriorityQueue<E>", "Comparable"),
+    ] {
+        for element in [
+            "int",
+            "string",
+            "bool",
+            "Key",
+            "GenericKey<int>",
+            "KeyView",
+            "T",
+        ] {
+            let generic = if element == "T" {
+                format!("<T implements {contract}>")
+            } else {
+                String::new()
+            };
+            for nullable in [false, true] {
+                let element = if nullable {
+                    format!("?{element}")
+                } else {
+                    element.to_owned()
+                };
+                let ty = container.replace('E', &element);
+                let source =
+                    format!("{declarations} function inspect{generic}({ty} $items): void {{}}");
+                let analysis = analyze(&source);
+                if nullable {
+                    assert!(
+                        analysis.diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == "E0523"
+                                && diagnostic.message.contains(&element)
+                                && diagnostic.message.contains(contract)
+                        }),
+                        "{ty}: {:?}",
+                        analysis.diagnostics
+                    );
+                } else {
+                    assert!(
+                        analysis.diagnostics.is_empty(),
+                        "{ty}: {:?}",
+                        analysis.diagnostics
+                    );
+                }
+            }
+        }
+    }
+    for body in [
+        "Set<?Key> $items = Set::from($source);",
+        "let $items = Set::from($source);",
+        "SortedSet<?Key> $items = SortedSet::from($source);",
+        "let $items = SortedSet::from($source);",
+        "PriorityQueue<?Key> $items = PriorityQueue::from($source);",
+        "let $items = PriorityQueue::from($source);",
+    ] {
+        let source = format!(
+            "{declarations} function main(): void {{ List<?Key> $source = [new Key()]; {body} }}"
+        );
+        let diagnostics = doriac::lower_source_to_mir("nullable-collection.doria", source)
+            .expect_err("nullable hash/order operands must be rejected before MIR");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0523"),
+            "{body}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn retained_iterator_sources_follow_returns_aliases_and_forward_calls() {
+    let source = format!(
+        r#"{BORROWING_CURSOR}
+function forward(List<int> $source): Cursor {{ return make($source); }}
+function make(List<int> $source): Cursor {{ let $cursor = new Cursor($source); return $cursor; }}
+function relay(take Cursor $cursor): Cursor {{ return $cursor; }}
+function main(): void {{
+    let $source = [1, 2];
+    let writable $first = relay(forward($source));
+    $first->advance();
+    echo $source->count;
+}}
+"#
+    );
+    let analysis = analyze(&source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for (name, inherited) in [("forward", false), ("make", false), ("relay", true)] {
+        let info = analysis
+            .info
+            .retained_callables
+            .iter()
+            .filter(|(span, _)| span.source == doriac::source::SourceId::default())
+            .find_map(|(span, info)| {
+                source[span.start..span.end]
+                    .starts_with(&format!("function {name}("))
+                    .then_some(info)
+            })
+            .expect(name);
+        assert_eq!(
+            info.returns,
+            vec![doriac::ownership::RetainedSource {
+                source: doriac::symbols::BorrowSource::Parameter(0),
+                inherited,
+            }],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn retained_iterator_source_loans_reject_mutation_escape_and_reassignment_leaks() {
+    for (body, expected) in [
+        ("let writable $source = [1]; let $cursor = new Cursor($source); $source->add(2); echo $cursor->getCurrent();", "E0763"),
+        ("let $source = [1]; let $cursor = new Cursor($source); let $moved = $cursor; let $stolen = $source; echo $moved->getCurrent();", "E0763"),
+        ("let writable $cursor = new Cursor([1]); echo $cursor->getCurrent();", "E0762"),
+        ("let $outer = [1]; let writable $cursor = new Cursor($outer); { let $inner = [2]; $cursor = new Cursor($inner); } echo $cursor->getCurrent();", "E0762"),
+    ] {
+        let source = format!("{BORROWING_CURSOR} function main(): void {{ {body} }}");
+        let analysis = analyze(&source);
+        assert!(analysis.diagnostics.iter().any(|diagnostic| diagnostic.code == expected), "{body}: {:?}", analysis.diagnostics);
+    }
+    let source = format!("{BORROWING_CURSOR} function escape(): Cursor {{ let $source = [1]; let $cursor = new Cursor($source); return $cursor; }}");
+    let analysis = analyze(&source);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0762"),
+        "{:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn borrow_parameters_are_scoped_to_readonly_iterator_promotion() {
+    for declaration in [
+        "function invalid(borrow List<int> $source): void {}",
+        "class Invalid { function __construct(borrow List<int> $source) {} }",
+        "class Invalid implements Iterator<int> { function __construct(borrow writable List<int> $source) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }",
+        "class Invalid implements Iterator<int> { function __construct(borrow take List<int> $source) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }",
+    ] {
+        let analysis = analyze(declaration);
+        assert!(analysis.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0761"), "{declaration}: {:?}", analysis.diagnostics);
+    }
+}
+
+#[test]
+fn iterator_loans_follow_match_and_when_results() {
+    for expression in [
+        "match (true) { true => new Cursor($source), default => new Cursor($source) }",
+        "when (true): Cursor { let $cursor = new Cursor($source); return $cursor; } else { return new Cursor($source); }",
+    ] {
+        let source = format!("{BORROWING_CURSOR} function forward(List<int> $source): Cursor {{ return {expression}; }} function main(): void {{ let $source = [1]; let $cursor = forward($source); echo $cursor->getCurrent(); }}");
+        let valid = analyze(&source);
+        assert!(valid.diagnostics.is_empty(), "{expression}: {:?}", valid.diagnostics);
+        for body in [
+            format!("let writable $source = [1]; let $cursor = {expression}; $source->add(2); echo $cursor->getCurrent();"),
+            "let writable $source = [1]; let $cursor = forward($source); $source->add(2); echo $cursor->getCurrent();".to_owned(),
+        ] {
+            let invalid = analyze(&format!("{BORROWING_CURSOR} function forward(List<int> $source): Cursor {{ return {expression}; }} function main(): void {{ {body} }}"));
+            assert!(invalid.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0763"), "{body}: {:?}", invalid.diagnostics);
+        }
+        for body in [
+            format!("let $source = [1]; return {expression};"),
+            format!("let $outer = [1]; let writable $cursor = new Cursor($outer); {{ let $source = [2]; $cursor = {expression}; }} return $cursor;"),
+        ] {
+            let invalid = analyze(&format!("{BORROWING_CURSOR} function escape(): Cursor {{ {body} }}"));
+            assert!(invalid.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0762"), "{body}: {:?}", invalid.diagnostics);
+        }
+        let invalid = analyze(&format!("{BORROWING_CURSOR} function main(): void {{ let $source = [1]; List<Cursor> $stored = [{expression}]; }}"));
+        assert!(invalid.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0762"), "{expression}: {:?}", invalid.diagnostics);
+    }
+}
+
+#[test]
+fn iterator_loans_survive_erasure_and_forbid_owned_storage_or_later_argument_mutation() {
+    for (tail, expected) in [
+        ("class Holder { function __construct(take Cursor $cursor) {} } function main(): void { let $source = [1]; let $cursor = new Cursor($source); let $holder = new Holder($cursor); }", "E0762"),
+        ("function main(): void { let $source = [1]; let $shared = shared new Cursor($source); }", "E0762"),
+        ("function main(): void { let writable $source = [1]; Iterator<int> $cursor = new Cursor($source); $source->add(2); echo $cursor->getCurrent(); }", "E0763"),
+        ("function mutate(writable List<int> $source): int { $source->add(2); return 0; } function inspect(Cursor $cursor, int $later): void {} function main(): void { let writable $source = [1]; inspect(new Cursor($source), mutate($source)); }", "E0477"),
+    ] {
+        let source = format!("{BORROWING_CURSOR} {tail}");
+        let analysis = analyze(&source);
+        assert!(analysis.diagnostics.iter().any(|diagnostic| diagnostic.code == expected), "{tail}: {:?}", analysis.diagnostics);
+    }
+}
+
+#[test]
+fn inherited_iterator_constructors_keep_the_parent_source_loan() {
+    let parent = BORROWING_CURSOR.replace("class Cursor", "open class Cursor");
+    let constructor =
+        "function __construct(parameter List<int> $input) { parent::__construct($input); }";
+    let source = format!("{parent} class Child extends Cursor {{ {constructor} }} function main(): void {{ let writable $source = [1]; let $cursor = new Child($source); $source->add(2); echo $cursor->getCurrent(); }}");
+    let analysis = analyze(&source);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0763"),
+        "{constructor}: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn iterator_current_borrows_survive_erasure_and_constrained_calls() {
+    let declarations = r#"
+class Book { function __construct(string $title) {} }
+class Cursor implements Iterator<Book> {
+    function __construct(borrow List<Book> $source) {}
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): Book { return $this->source[0]; }
+    writable function advance(): void {}
+}
+"#;
+    for cursor_type in ["Cursor", "Iterator<Book>"] {
+        let source = format!("{declarations} function inspect(writable {cursor_type} $cursor): void {{ let $book = $cursor->getCurrent(); echo $book->title; }}");
+        assert!(
+            analyze(&source).diagnostics.is_empty(),
+            "{cursor_type}: {:?}",
+            analyze(&source).diagnostics
+        );
+        let source = source.replace(
+            "echo $book->title;",
+            "$cursor->advance(); echo $book->title;",
+        );
+        assert!(
+            analyze(&source)
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0477"),
+            "{cursor_type}: {:?}",
+            analyze(&source).diagnostics
+        );
+    }
+    let source = format!("{declarations} function relay<T implements Iterator<Book>>(take T $cursor): T {{ return $cursor; }} function main(): void {{ let writable $source = [new Book(\"one\")]; let $cursor = relay(new Cursor($source)); $source->clear(); echo $cursor->getCurrent()->title; }}");
+    assert!(
+        analyze(&source)
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0763"),
+        "{:?}",
+        analyze(&source).diagnostics
+    );
+}
+
 #[test]
 fn interface_self_requires_exact_dynamic_owned_results() {
     let prefix = "interface Duplicate { function duplicate(): self; }";
@@ -45,7 +324,7 @@ fn concrete_generic_instances_publish_substituted_conformance_facts() {
 }
 
 #[test]
-fn compiler_known_contract_vocabulary_does_not_create_runtime_enums() {
+fn compiler_known_enums_share_the_executable_enum_model() {
     let source = "function main(): void { echo 42; }";
     let analysis = analyze(source);
     assert!(analysis
@@ -55,25 +334,45 @@ fn compiler_known_contract_vocabulary_does_not_create_runtime_enums() {
         .iter()
         .any(|interface| interface.name == "Iterator"));
     let mir = doriac::lower_source_to_mir("plain.doria", source).unwrap();
+    assert!(mir
+        .sources
+        .iter()
+        .all(|source| source.id != doriac::compiler_known_contracts::SOURCE_ID));
+    assert!(mir
+        .packages
+        .iter()
+        .all(|package| package.identity != doriac::names::PackageIdentity::CompilerKnown));
+    assert!(analysis
+        .info
+        .enums
+        .iter()
+        .any(|value| value.name == "Ordering"));
     doriac::mir_interpreter::interpret(&mir).unwrap();
+    let mut malformed = mir.clone();
+    malformed
+        .enums
+        .iter_mut()
+        .find(|definition| definition.name == "Ordering")
+        .unwrap()
+        .source_span
+        .end = doriac::compiler_known_contracts::SOURCE_TEXT.len() + 1;
+    assert!(doriac::mir_validation::validate_program(&malformed).is_err());
     for expression in ["Ordering::Less", "Ordering::Equal", "Ordering::Greater"] {
         let source = format!("function main(): void {{ let $order = {expression}; }}");
         let analysis = analyze(&source);
         assert!(
-            analysis
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "E0759"),
+            analysis.diagnostics.is_empty(),
             "{:?}",
             analysis.diagnostics
         );
-        assert!(doriac::lower_source("pending.doria", &source).is_err());
+        let mir = doriac::lower_source_to_mir("ordering.doria", &source).unwrap();
+        doriac::mir_interpreter::interpret(&mir).unwrap();
     }
 }
 
 #[test]
-fn iterator_current_requires_receiver_borrow_for_move_elements() {
-    let valid = "class Value {} class Cursor implements Iterator<Value> { Value $value = new Value(); function hasCurrent(): bool { return true; } function current(): Value { return $this->value; } writable function advance(): void {} }";
+fn iterator_get_current_requires_receiver_borrow_for_move_elements() {
+    let valid = "class Value {} class Cursor implements Iterator<Value> { Value $value = new Value(); function hasCurrent(): bool { return true; } function getCurrent(): Value { return $this->value; } writable function advance(): void {} }";
     let analysis = analyze(valid);
     assert!(
         analysis.diagnostics.is_empty(),
@@ -97,6 +396,81 @@ fn iterator_current_requires_receiver_borrow_for_move_elements() {
         "{:?}",
         analysis.info.contracts.conformances
     );
+}
+
+#[test]
+fn core_constraints_do_not_make_borrowed_generic_values_copy() {
+    let declarations = r#"
+class Key implements Equatable<Key>, Hashable, Comparable<Key> {
+    function equals(Key $other): bool { return true; }
+    function hash(): uint64 { return 1; }
+    function compare(Key $other): Ordering { return Ordering::Equal; }
+}
+
+function consume<T>(take T $value): void {}
+"#;
+    for constraint in ["Equatable", "Hashable", "Comparable"] {
+        let source = format!("{declarations} function forward<T implements {constraint}>(T $value): void {{ consume($value); }} function main(): void {{ forward(new Key()); }}");
+        let analysis = analyze(&source);
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0474"),
+            "{constraint}: {:?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
+fn comparable_never_grants_class_relational_operators_through_specialization() {
+    let key = "class Key implements Comparable<Key> { function compare(Key $other): Ordering { return Ordering::Equal; } }";
+    for operator in ["<", "<=", ">", ">="] {
+        let body = format!("return $left {operator} $right;");
+        for (declaration, call) in [
+            (
+                format!("function compareKeys(Key $left, Key $right): bool {{ {body} }}"),
+                "compareKeys(new Key(), new Key());",
+            ),
+            (
+                format!("function compareKeys<T implements Comparable<T>>(T $left, T $right): bool {{ {body} }}"),
+                "compareKeys(new Key(), new Key());",
+            ),
+            (
+                format!("class Comparer<T implements Comparable<T>> {{ function compareKeys(T $left, T $right): bool {{ {body} }} }}"),
+                "let $comparer = new Comparer<Key>(); $comparer->compareKeys(new Key(), new Key());",
+            ),
+        ] {
+            let source = format!("{key} {declaration} function main(): void {{ {call} }}");
+            for errors in [
+                doriac::check_source("class-comparison.doria", &source).unwrap_err(),
+                doriac::lower_source_to_mir("class-comparison.doria", &source).unwrap_err(),
+            ] {
+                assert!(
+                    errors.iter().any(|error| error.code == "E0441"
+                        && error.message.contains("class values")),
+                    "{source}: {errors:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn primitive_constrained_methods_keep_check_and_lowering_in_agreement() {
+    for (constraint, body, result, argument) in [
+        ("Equatable<T>", "$value->equals($value)", "bool", "1"),
+        ("Equatable<T>", "$value->equals($value)", "bool", "1.5"),
+        ("Comparable<T>", "$value->compare($value)", "Ordering", "1"),
+        ("Hashable", "$value->hash()", "uint64", "true"),
+        ("Hashable", "$value->hash()", "uint64", "\"text\""),
+    ] {
+        let source = format!("function inspect<T implements {constraint}>(T $value): {result} {{ return {body}; }} function main(): void {{ inspect({argument}); }}");
+        doriac::check_source("primitive-contract.doria", &source).unwrap();
+        let mir = doriac::lower_source_to_mir("primitive-contract.doria", &source).unwrap();
+        doriac::mir_interpreter::interpret(&mir).unwrap();
+    }
 }
 
 #[test]
@@ -206,7 +580,7 @@ fn every_shared_family_and_nested_contract_position_is_accepted() {
 }
 
 #[test]
-fn new_core_operations_are_pending_without_changing_concrete_methods() {
+fn core_collection_operations_preserve_concrete_methods() {
     let declarations = r#"
 class Value implements Equatable<Value>, Hashable, Cloneable {
     function equals(Value $other): bool { return true; }
@@ -223,24 +597,18 @@ class Value implements Equatable<Value>, Hashable, Cloneable {
         analyze(&concrete).diagnostics
     );
     for body in [
-        "let $left = new Value(); let $right = new Value(); echo $left == $right;",
-        "Set<Value> $values = Set::from([]);",
         "List<Value> $values = [new Value(); 2];",
         "List<Value> $values = [new Value()]; let $other = new Value(); echo $values->contains($other);",
         "List<Value> $values = [new Value()]; let $copy = Deque::from($values);",
     ] {
         let source = format!("{declarations} function main(): void {{ {body} }}");
         let analysis = analyze(&source);
-        assert!(!analysis.diagnostics.is_empty(), "{body}");
-        assert!(analysis.diagnostics.iter().all(|diagnostic| diagnostic.code == "E0759"), "{body}: {:?}", analysis.diagnostics);
-        assert!(doriac::lower_source("core.doria", &source).is_err());
+        assert!(analysis.diagnostics.is_empty(), "{body}: {:?}", analysis.diagnostics);
+        doriac::lower_source_to_mir("core.doria", &source).unwrap();
     }
     let generic = format!("{declarations} function equal<T implements Equatable>(T $left, T $right): bool {{ return $left == $right; }} function main(): void {{ let $left = new Value(); let $right = new Value(); echo equal($left, $right); }}");
     assert!(
-        analyze(&generic)
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0759"),
+        analyze(&generic).diagnostics.is_empty(),
         "{:?}",
         analyze(&generic).diagnostics
     );
@@ -256,11 +624,11 @@ class Value implements Equatable<Value>, Hashable, Cloneable {
 }
 
 #[test]
-fn public_iteration_is_resolved_but_waits_for_slice_three() {
+fn public_iteration_executes_checked_requirements() {
     let source = r#"
 class Cursor implements Iterator<int> {
     function hasCurrent(): bool { return false; }
-    function current(): int { return 0; }
+    function getCurrent(): int { return 0; }
     writable function advance(): void {}
 }
 class Values implements Iterable<int> {
@@ -270,21 +638,15 @@ function main(): void { let $values = new Values(); foreach ($values as int $val
 "#;
     let analysis = analyze(source);
     assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0759"),
+        analysis.diagnostics.is_empty(),
         "{:?}",
         analysis.diagnostics
     );
-    assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.code == "E0759"),
-        "{:?}",
-        analysis.diagnostics
-    );
+    let program = doriac::lower_source_to_mir("empty-iteration.doria", source).unwrap();
+    assert!(doriac::mir_interpreter::interpret(&program)
+        .unwrap()
+        .stdout
+        .is_empty());
     let builtin = analyze("function count<T implements Iterable<int>>(T $values): void {} function main(): void { List<int> $values = [1]; count($values); }");
     assert!(builtin.diagnostics.is_empty(), "{:?}", builtin.diagnostics);
 }

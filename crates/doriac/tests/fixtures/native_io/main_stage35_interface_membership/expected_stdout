@@ -1,0 +1,26 @@
+compare 1:2
+compare 2:2
+1
+compare 1:2
+compare 2:2
+true
+left 1
+left 2
+compare 1:3
+compare 2:3
+false
+compare 1:1
+remaining 2
+0
+compare 7:7
+true
+compare 7:7
+true
+true
+false
+compare 4:4
+true
+compare 1:1
+true
+compare 8:8
+true

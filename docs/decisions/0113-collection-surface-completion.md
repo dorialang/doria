@@ -3,6 +3,8 @@
 > **Stage 35 amendment:** Decision 0134 fixes Copy-or-Cloneable preserving
 > construction and set algebra plus public value-only iteration, without
 > replacing optimized built-in iteration or inventing generalized first bindings.
+> Slice 3 implements that widening. It does not authorize bulk move APIs,
+> generalized map pair values, or higher-order algorithms on other families.
 
 - **Status:** Complete
 - **Accepted:** 2026-08-06 by Andrew Masiye
@@ -150,7 +152,7 @@ future pass does not re-propose them as oversights.
 |-------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `getOrDefault`, `tryGetValue`, entry APIs             | `$d->get($k) ?? $default` already expresses this exactly. A method would be a second spelling for one idea                                                                                       |
 | `isSubsetOf`, `isSupersetOf`, `overlaps`, `setEquals` | `$a->difference($b)->isEmpty` is correct and readable. It costs one allocation, which is a performance argument, not an ergonomics one — reopen it with profiling evidence, not by analogy to C# |
-| `addAll`, `extend`, `merge`                           | `foreach ($src as T $v) { $dst->add($v); }` is three clear lines, and bulk-move ownership is genuinely unsettled until `Cloneable` at Stage 35                                                   |
+| `addAll`, `extend`, `merge`                           | Bulk consuming operations remain separate work; Stage 35 Cloneable support only widens the explicitly preserving operations                                                                      |
 | `sort`, `sortBy`, `reverse`                           | Ordering is what `SortedSet`/`SortedDictionary` are for; comparator-driven sorting belongs with closures at Stage 30                                                                             |
 | `Deque::remove`, `removeAt`, `insertAt`               | Middle mutation is not what a deque is for, and the runtime's shift path is not ring-aware (see §7)                                                                                              |
 | Range and slice queries over sorted types             | 0100 deferred these; they remain deferred, and they need a range/slice value type that v1.0 does not have                                                                                        |

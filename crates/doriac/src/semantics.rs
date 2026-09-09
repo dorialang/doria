@@ -206,6 +206,8 @@ pub struct SemanticInfo {
     /// Checked contextual views established when constructing a new shared owner.
     /// This is construction, not covariance between existing handle values.
     pub shared_construction_types: HashMap<Span, ResolvedType>,
+    /// Contextual storage identities for literals and preserving constructors.
+    pub collection_construction_types: HashMap<Span, ResolvedType>,
     /// Concrete transport plan at each value-to-`mixed` boundary.
     ///
     /// Compatibility backends use this semantic fact to preserve Doria's exact
@@ -226,6 +228,7 @@ pub struct SemanticInfo {
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
+    pub retained_callables: HashMap<Span, crate::ownership::RetainedCallableInfo>,
     /// Compiler-owned hierarchy identity for every checked method declaration.
     ///
     /// Tooling uses this table to relate override families without rebuilding
@@ -260,6 +263,10 @@ pub struct SemanticInfo {
     pub(crate) constrained_display_calls: HashSet<Span>,
     /// Explicit display contexts that invoke the canonical Displayable contract.
     pub display_conversion_sites: HashSet<Span>,
+    /// Checked contextual interface destinations, before backend representation conversion.
+    pub interface_conversion_types: HashMap<Span, ResolvedType>,
+    /// Implicit core calls selected by nominal contracts, sharing ordinary call targets/effects.
+    pub core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
     /// Declaration-level hierarchy facts for every class, including generic
@@ -508,6 +515,13 @@ pub enum CallableTarget {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreValueCallInfo {
+    pub operation: crate::compiler_known_contracts::CoreValueOperation,
+    pub receiver_type: ResolvedType,
+    pub target: CallableTarget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstrainedMethodImplementation {
     pub receiver: ResolvedType,
@@ -542,6 +556,44 @@ impl CallableTarget {
                 implementations,
             } => {
                 let receiver = substitute(receiver);
+                if matches!(
+                    receiver,
+                    ResolvedType::TypedArray(_)
+                        | ResolvedType::List(_)
+                        | ResolvedType::Set(_)
+                        | ResolvedType::SortedSet(_)
+                        | ResolvedType::Deque(_)
+                        | ResolvedType::Dictionary(_, _)
+                        | ResolvedType::SortedDictionary(_, _)
+                ) && crate::compiler_known_contracts::IterationOperation::from_requirement(
+                    *requirement,
+                ) == Some(crate::compiler_known_contracts::IterationOperation::Acquire)
+                {
+                    return Some(Self::ConstrainedMethod {
+                        receiver,
+                        method_name: method_name.clone(),
+                        requirement: *requirement,
+                        implementations: Vec::new(),
+                    });
+                }
+                if matches!(
+                    receiver,
+                    ResolvedType::Integer(_)
+                        | ResolvedType::Float(_)
+                        | ResolvedType::Bool
+                        | ResolvedType::String
+                ) && crate::compiler_known_contracts::CoreValueOperation::from_requirement(
+                    *requirement,
+                )
+                .is_some()
+                {
+                    return Some(Self::ConstrainedMethod {
+                        receiver,
+                        method_name: method_name.clone(),
+                        requirement: *requirement,
+                        implementations: Vec::new(),
+                    });
+                }
                 if let ResolvedType::Interface(interface) = &receiver {
                     return Some(Self::InterfaceMethod {
                         interface: interface.clone(),
@@ -646,6 +698,7 @@ pub struct PropertySemanticInfo {
     pub ty: ResolvedType,
     pub writable: bool,
     pub promoted: bool,
+    pub borrowed_source: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1052,6 +1105,22 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
         .filter(|definition| !definition.capabilities.copy)
         .map(|definition| definition.name.clone())
         .collect();
+    let classes = collect_ordered_class_semantics(program, &mut checker);
+    checker.specialize_conformance_facts(&classes);
+    checker.publish_interface_specializations();
+    let interface_conversion_types = checker
+        .contextual_expression_types
+        .iter()
+        .filter_map(|(span, ty)| {
+            let resolved = checker.types.resolved(*ty);
+            let inner = if let ResolvedType::Nullable(inner) = &resolved {
+                inner.as_ref()
+            } else {
+                &resolved
+            };
+            matches!(inner, ResolvedType::Interface(_)).then_some((*span, resolved))
+        })
+        .collect();
     let ownership_analysis = crate::ownership::check_program_with_inferred_move_returns(
         program,
         &crate::ownership::OwnershipAnalysisContext {
@@ -1069,16 +1138,17 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             callable_value_calls: &checker.callable_value_calls,
             assertion_callable_invocations: &checker.assertion_callable_invocations,
             list_algorithm_calls: &checker.list_algorithm_calls,
+            call_targets: &checker.call_targets,
+            contracts: &checker.contracts,
+            classes: &classes,
         },
     );
     let closure_ownership = ownership_analysis.closures;
+    let retained_callables = ownership_analysis.retained_callables;
     let return_borrows = ownership_analysis.return_borrows;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
     let class_hierarchy = collect_class_hierarchy_semantics(&checker);
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
-    let classes = collect_ordered_class_semantics(program, &mut checker);
-    checker.specialize_conformance_facts(&classes);
-    checker.publish_interface_specializations();
     let enums = collect_ordered_enum_semantics(&checker);
     let property_families = collect_property_family_semantics(&checker);
     let callable_signatures = checker
@@ -1127,6 +1197,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
             shared_construction_types: checker.shared_construction_types,
+            collection_construction_types: checker.collection_construction_types,
             mixed_box_plans: checker.mixed_box_plans,
             enum_case_values: checker.enum_case_values,
             enum_case_constructions: checker.enum_case_constructions,
@@ -1135,6 +1206,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             whens: checker.whens,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
+            retained_callables,
             method_hierarchy,
             constructor_parameters: checker.constructor_parameters,
             foreach_loops: checker.foreach_loops,
@@ -1144,6 +1216,8 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
             display_conversion_sites: checker.display_conversion_sites,
+            interface_conversion_types,
+            core_operation_calls: checker.core_operation_calls,
             classes,
             class_hierarchy,
             enums,
@@ -1184,13 +1258,7 @@ fn ambient_effect_maps_equal(
 }
 
 fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
-    // Signature-only contract vocabulary is not an executable enum declaration.
-    let mut enums = checker
-        .enums
-        .values()
-        .filter(|definition| definition.span.source != crate::compiler_known_contracts::SOURCE_ID)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut enums = checker.enums.values().cloned().collect::<Vec<_>>();
     enums.sort_by_key(|definition| definition.id);
     enums
         .into_iter()
@@ -1383,7 +1451,9 @@ fn collect_ordered_class_semantics(
                 .collect::<Vec<_>>(),
         )
     });
-    if !checker.pending_core_operations.is_empty() {
+    if !checker.pending_relational_comparisons.is_empty()
+        || !checker.core_operation_calls.is_empty()
+    {
         for instance in &instances {
             if let Some(declaration) = checker
                 .classes
@@ -1499,6 +1569,7 @@ fn collect_ordered_class_semantics(
                         checker.types.resolved(ty),
                         writable,
                         promoted,
+                        property.borrowed_source,
                     ));
                 }
             }
@@ -1547,16 +1618,22 @@ fn collect_ordered_class_semantics(
                 properties: properties
                     .into_iter()
                     .enumerate()
-                    .map(|(index, (declaring_class, name, ty, writable, promoted))| {
-                        PropertySemanticInfo {
-                            id: PropertyId { class: id, index },
-                            declaring_class,
-                            name,
-                            ty,
-                            writable,
-                            promoted,
-                        }
-                    })
+                    .map(
+                        |(
+                            index,
+                            (declaring_class, name, ty, writable, promoted, borrowed_source),
+                        )| {
+                            PropertySemanticInfo {
+                                id: PropertyId { class: id, index },
+                                declaring_class,
+                                name,
+                                ty,
+                                writable,
+                                promoted,
+                                borrowed_source,
+                            }
+                        },
+                    )
                     .collect(),
             });
         }
@@ -2062,6 +2139,7 @@ struct Checker<'program> {
     float_expression_types: HashMap<Span, FloatType>,
     expression_types: HashMap<Span, ResolvedType>,
     shared_construction_types: HashMap<Span, ResolvedType>,
+    collection_construction_types: HashMap<Span, ResolvedType>,
     mixed_box_plans: HashMap<Span, MixedBoxPlan>,
     enum_case_values: HashMap<Span, EnumValue>,
     enum_case_constructions: HashMap<Span, EnumCaseId>,
@@ -2075,8 +2153,9 @@ struct Checker<'program> {
     generic_call_specializations: HashMap<Span, GenericSpecialization>,
     constrained_display_calls: HashSet<Span>,
     display_conversion_sites: HashSet<Span>,
+    core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
-    pending_core_operations: Vec<(Span, TypeId, &'static str)>,
+    pending_relational_comparisons: Vec<(Span, TypeId, TypeId)>,
     class_conformance_cache: HashMap<ClassType<TypeId>, contracts::ClassConformances>,
     type_parameter_scopes: Vec<HashMap<String, Vec<TypeRef>>>,
     contract_type_depth: usize,
@@ -2797,6 +2876,7 @@ impl<'program> Checker<'program> {
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
             shared_construction_types: HashMap::new(),
+            collection_construction_types: HashMap::new(),
             mixed_box_plans: HashMap::new(),
             enum_case_values: HashMap::new(),
             enum_case_constructions: HashMap::new(),
@@ -2810,8 +2890,9 @@ impl<'program> Checker<'program> {
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
             display_conversion_sites: HashSet::new(),
+            core_operation_calls: HashMap::new(),
             pending_generic_calls: HashMap::new(),
-            pending_core_operations: Vec::new(),
+            pending_relational_comparisons: Vec::new(),
             class_conformance_cache: HashMap::new(),
             type_parameter_scopes: Vec::new(),
             contract_type_depth: 0,
@@ -2910,9 +2991,7 @@ impl<'program> Checker<'program> {
                     }
                 }
                 Item::Function(function) => self.check_function(function, None),
-                Item::Constant(constant) => {
-                    self.check_constant_initializer(&constant.initializer, None)
-                }
+                Item::Constant(constant) => self.check_constant_initializer(constant, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
                 Item::Enum(enum_decl) => self.check_enum(enum_decl),
                 Item::Interface(_) => {}
@@ -6174,6 +6253,15 @@ impl<'program> Checker<'program> {
             let ty = self.resolve_type_ref_with_class(&param.ty, param.span, declaring_class);
             let has_default = param.default.is_some();
 
+            if let Some(span) = param.borrow_span {
+                if !param.constructor_role.is_promoted() || param.take || param.writable {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0761", "`borrow` requires a readonly promoted iterator source parameter", span,
+                    ).with_title("Invalid Retained Source Parameter")
+                        .with_explanation("A retained source stays owned by its caller; it cannot also be taken, made writable, or declared constructor-only."));
+                }
+            }
+
             if param.take && param.writable {
                 let span = param
                     .take_span
@@ -6192,7 +6280,11 @@ impl<'program> Checker<'program> {
                 );
             }
 
-            if param.constructor_role.is_promoted() && self.type_is_move_type(ty) && !param.take {
+            if param.constructor_role.is_promoted()
+                && self.type_is_move_type(ty)
+                && !param.take
+                && param.borrow_span.is_none()
+            {
                 let diagnostic = Diagnostic::new(
                     "E0468",
                     format!(
@@ -7003,6 +7095,7 @@ impl<'program> Checker<'program> {
                         if let Some(initializer) = &property.initializer {
                             self.check_nonthrowing_initializer(
                                 initializer,
+                                Some(&property.ty),
                                 Some(&class_decl.name),
                                 "E0634",
                                 "Static Initializer Cannot Throw",
@@ -7011,12 +7104,7 @@ impl<'program> Checker<'program> {
                     }
                 }
                 ClassMember::Constant(constant) => {
-                    self.check_nonthrowing_initializer(
-                        &constant.initializer,
-                        Some(&class_decl.name),
-                        "E0633",
-                        "Constant Initializer Cannot Throw",
-                    );
+                    self.check_constant_initializer(constant, Some(&class_decl.name));
                 }
                 ClassMember::Method(_) | ClassMember::Uses(_) => {}
             }
@@ -7069,9 +7157,14 @@ impl<'program> Checker<'program> {
         self.type_parameter_scopes.pop();
     }
 
-    fn check_constant_initializer(&mut self, initializer: &Expr, class_name: Option<&str>) {
+    fn check_constant_initializer(
+        &mut self,
+        constant: &crate::ast::ConstDecl,
+        class_name: Option<&str>,
+    ) {
         self.check_nonthrowing_initializer(
-            initializer,
+            &constant.initializer,
+            constant.ty.as_ref(),
             class_name,
             "E0633",
             "Constant Initializer Cannot Throw",
@@ -7081,6 +7174,7 @@ impl<'program> Checker<'program> {
     fn check_nonthrowing_initializer(
         &mut self,
         initializer: &Expr,
+        expected: Option<&TypeRef>,
         class_name: Option<&str>,
         code: &'static str,
         title: &'static str,
@@ -7090,6 +7184,11 @@ impl<'program> Checker<'program> {
             class_name: class_name.to_string(),
             receiver_access: ReceiverAccess::Unavailable,
         });
+        if let Some(expected) = expected {
+            let ty = self.resolve_type_ref_with_class(expected, initializer.span(), class_name);
+            self.record_expected_expression_type(initializer, ty);
+            self.contextualize_scalar_literals(ty, initializer);
+        }
         self.effect_scopes.push(CheckedEffectSet::default());
         self.check_expr(initializer, &scopes, context.as_ref());
         let effects = self.effect_scopes.pop().expect("initializer effect scope");
@@ -7195,6 +7294,7 @@ impl<'program> Checker<'program> {
             PropertyInfo {
                 access: property.access,
                 writable: property.writable,
+                borrowed_source: false,
                 ty,
                 init_state: if property.initializer.is_some() {
                     PropertyInitState::HasInitializer
@@ -7302,6 +7402,7 @@ impl<'program> Checker<'program> {
                     .promoted_access()
                     .expect("only promoted parameters declare properties"),
                 writable: param.writable,
+                borrowed_source: param.borrow_span.is_some(),
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
                 declaration_span: param.span,
@@ -7473,6 +7574,20 @@ impl<'program> Checker<'program> {
             .push(type_parameter_scope(&function.type_params));
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
+        for param in &function.params {
+            if let Some(span) = param.borrow_span {
+                let iterator = method_context.as_ref().is_some_and(|context| {
+                    let ty = self.symbolic_class_type(&context.class_name);
+                    self.public_iterator_element(ty).is_some()
+                });
+                if function.name != "__construct" || !iterator {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0761", "retained source parameters are valid only in Iterator constructors", span,
+                    ).with_title("Invalid Retained Source Parameter")
+                        .with_explanation("Decision 0134 scopes retained readonly source access to iterator carriers, not general borrowed fields."));
+                }
+            }
+        }
         if let Some(context) = method_context.as_ref().filter(|_| !function.is_static) {
             let receiver_ty = self.symbolic_class_type(&context.class_name);
             self.declare_binding(
@@ -8185,7 +8300,12 @@ impl<'program> Checker<'program> {
                         }
                         self.check_panic_call(args, *span, scopes, method_context);
                     }
-                    _ => self.check_expr(expr, scopes, method_context),
+                    _ => {
+                        self.check_expr(expr, scopes, method_context);
+                        if !self.expression_types.contains_key(&expr.span()) {
+                            self.infer_expr_type(expr, scopes, method_context);
+                        }
+                    }
                 }
                 self.allow_terminal_assertion = previous;
             }
@@ -8451,10 +8571,7 @@ impl<'program> Checker<'program> {
                     );
                 }
                 if plan.family == ForeachIterableFamily::PublicIterable {
-                    self.report_contract_boundary(
-                        contracts::PendingContractOperation::CoreValueOperation,
-                        foreach.iterable.span(),
-                    );
+                    self.select_public_iteration(plan.iterable_type, foreach.span);
                     if foreach.value_binding.writable {
                         self.diagnostics.push(
                             Diagnostic::new(
@@ -9856,10 +9973,41 @@ impl<'program> Checker<'program> {
     }
 
     fn record_expected_expression_type(&mut self, expr: &Expr, expected: TypeId) {
+        self.record_collection_construction_type(expr, expected);
         let span = expr.span();
         self.contextual_expression_types.insert(span, expected);
         if let Expr::Grouped { expr, .. } = expr {
             self.record_expected_expression_type(expr, expected);
+        }
+    }
+
+    fn record_collection_construction_type(&mut self, expr: &Expr, expected: TypeId) {
+        if let Expr::Grouped { expr, .. } = expr {
+            self.record_collection_construction_type(expr, expected);
+            return;
+        }
+        if !matches!(expr, Expr::Array { .. } | Expr::ArrayRepeat { .. })
+            && !matches!(expr, Expr::StaticCall { method, .. } if method == "from")
+        {
+            return;
+        }
+        let expected = match self.types.kind(expected) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => expected,
+        };
+        if matches!(
+            self.types.kind(expected),
+            TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_)
+        ) {
+            self.collection_construction_types
+                .insert(expr.span(), self.types.resolved(expected));
         }
     }
 
@@ -10478,6 +10626,15 @@ impl<'program> Checker<'program> {
                     _ => unreachable!("matcher overload was selected from the actual type"),
                 };
                 self.check_stage23_equatable_type(element, *span, "toContain");
+                match self.types.kind(actual_ty) {
+                    TypeKind::Set(_) => {
+                        self.check_stage23_hashable_type(element, *span, "Set element")
+                    }
+                    TypeKind::SortedSet(_) => {
+                        self.check_stage26_comparable_type(element, *span, "SortedSet element")
+                    }
+                    _ => {}
+                }
                 self.check_expr_assignable(
                     element,
                     expected,
@@ -10501,6 +10658,17 @@ impl<'program> Checker<'program> {
                     value
                 };
                 self.check_stage23_equatable_type(compared, *span, matcher.source_name());
+                if matcher == crate::assertions::AssertionMatcher::DictionaryHasKey {
+                    match self.types.kind(actual_ty) {
+                        TypeKind::Dictionary(_, _) => {
+                            self.check_stage23_hashable_type(key, *span, "Dictionary key")
+                        }
+                        TypeKind::SortedDictionary(_, _) => {
+                            self.check_stage26_comparable_type(key, *span, "SortedDictionary key")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 self.check_expr_assignable(
                     compared,
                     expected,
@@ -11157,6 +11325,17 @@ impl<'program> Checker<'program> {
                 for element in elements {
                     if let Some(key) = &element.key {
                         self.check_expr(key, scopes, method_context);
+                        let key_type = self.infer_expr_type(key, scopes, method_context);
+                        self.select_core_operation(
+                            key_type,
+                            crate::compiler_known_contracts::CoreValueOperation::Hash,
+                            key.span(),
+                        );
+                        self.select_core_operation(
+                            key_type,
+                            crate::compiler_known_contracts::CoreValueOperation::Equal,
+                            key.span(),
+                        );
                     }
                     self.check_expr(&element.value, scopes, method_context);
                 }
@@ -11194,29 +11373,20 @@ impl<'program> Checker<'program> {
                     method_context,
                 );
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
-                if let Some((kind, _)) = self.shared_handle_type(object_ty, *null_safe) {
-                    if kind == SharedHandleKind::SharedReference && property == "referencedValue" {
-                        // The compiler-known readonly projection; nothing to look up.
-                    } else if self.is_error_interface_receiver(object_ty) {
-                        self.check_compiler_known_property(
-                            object,
-                            property,
-                            *member_span,
-                            *span,
-                            scopes,
-                            method_context,
-                        );
-                    } else if self.reject_nonforwarding_shared_handle_member_access(
-                        object,
-                        property,
-                        *null_safe,
-                        *span,
-                        scopes,
-                        method_context,
-                    ) {
-                    } else {
-                        self.lookup_property(object, property, *span, scopes, method_context);
-                    }
+                if property == "referencedValue"
+                    && self
+                        .shared_handle_type(object_ty, *null_safe)
+                        .is_some_and(|(kind, _)| kind == SharedHandleKind::SharedReference)
+                {
+                    // The compiler-known readonly projection; nothing to look up.
+                } else if self.reject_nonforwarding_shared_handle_member_access(
+                    object,
+                    property,
+                    *null_safe,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
                 } else {
                     let receiver_ty = self.forwarded_access_payload_type(object_ty);
                     let enum_receiver = match self.types.kind(receiver_ty) {
@@ -12366,6 +12536,7 @@ impl<'program> Checker<'program> {
             .parameters
             .iter()
             .map(|parameter| Param {
+                borrow_span: None,
                 constructor_role: ConstructorParameterRole::Ordinary,
                 role_and_mode_prefix_span: parameter.type_span,
                 take: parameter.take,
@@ -14391,7 +14562,11 @@ impl<'program> Checker<'program> {
                 let left_ty = self.infer_expr_type(left, scopes, method_context);
                 let right_ty = self.infer_expr_type(right, scopes, method_context);
                 if !matches!(self.types.kind(right_ty), TypeKind::Null) {
-                    self.gate_core_operation(left_ty, "Equatable", span);
+                    self.select_core_operation(
+                        left_ty,
+                        crate::compiler_known_contracts::CoreValueOperation::Equal,
+                        span,
+                    );
                 }
             }
             BinaryOp::Concat => {
@@ -14411,27 +14586,14 @@ impl<'program> Checker<'program> {
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
                 let (left_ty, right_ty) =
                     self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
-                if matches!(
-                    (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right
-                ) || matches!(
-                    (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::Float(left), TypeKind::Float(right)) if left == right
-                ) || matches!(
-                    (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::String, TypeKind::String)
-                ) || matches!(
-                    (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::Bool, TypeKind::Bool)
-                ) || self.constrained_relational_operands(left_ty, right_ty)
-                    || matches!(
-                        (self.types.kind(left_ty), self.types.kind(right_ty)),
-                        (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
-                    )
-                {
+                if self.constrained_relational_operands(left_ty, right_ty) {
+                    let comparison = (span, left_ty, right_ty);
+                    if !self.pending_relational_comparisons.contains(&comparison) {
+                        self.pending_relational_comparisons.push(comparison);
+                    }
                     return;
                 }
-                self.report_integer_operand_mismatch(left_ty, right_ty, span, "comparison");
+                self.check_relational_operand_types(left_ty, right_ty, span);
             }
             BinaryOp::Coalesce => {
                 let result = self.infer_binary_type(left, op, right, scopes, method_context);
@@ -14484,6 +14646,37 @@ impl<'program> Checker<'program> {
         }
 
         self.report_integer_operand_mismatch(left_ty, right_ty, span, "integer operator");
+    }
+
+    fn check_relational_operand_types(&mut self, left: TypeId, right: TypeId, span: Span) {
+        let kinds = (self.types.kind(left), self.types.kind(right));
+        if matches!(kinds, (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right)
+            || matches!(kinds, (TypeKind::Float(left), TypeKind::Float(right)) if left == right)
+            || matches!(
+                kinds,
+                (TypeKind::String, TypeKind::String)
+                    | (TypeKind::Bool, TypeKind::Bool)
+                    | (TypeKind::Unknown, _)
+                    | (_, TypeKind::Unknown)
+            )
+        {
+            return;
+        }
+        if matches!(kinds, (TypeKind::Class(_), _) | (_, TypeKind::Class(_))) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0441",
+                    "class values do not support relational operators",
+                    span,
+                )
+                .with_title("Class Relational Operators Are Not Supported")
+                .with_help(
+                    "compare scalar properties, or call a declared `compare()` method explicitly",
+                ),
+            );
+        } else {
+            self.report_integer_operand_mismatch(left, right, span, "comparison");
+        }
     }
 
     fn report_integer_operand_mismatch(
@@ -14889,6 +15082,16 @@ impl<'program> Checker<'program> {
             };
             return self.expr_declares_nullable(other, scopes, method_context)
                 || matches!(self.types.kind(other_ty), TypeKind::Nullable(_));
+        }
+
+        let inner = |ty| match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => ty,
+        };
+        if inner(left_ty) == inner(right_ty)
+            && matches!(self.types.kind(inner(left_ty)), TypeKind::Class(_))
+        {
+            return true;
         }
 
         matches!(
@@ -15734,8 +15937,10 @@ impl<'program> Checker<'program> {
                     }
                     Some(AssignmentTarget {
                         ty: if matches!(op, AssignOp::Assign)
-                            && matches!(self.types.kind(binding.declared_ty), TypeKind::Nullable(_))
-                        {
+                            && matches!(
+                                self.types.kind(binding.declared_ty),
+                                TypeKind::Nullable(_) | TypeKind::Mixed
+                            ) {
                             binding.declared_ty
                         } else {
                             self.infer_expr_type(target, scopes, method_context)
@@ -17389,12 +17594,6 @@ impl<'program> Checker<'program> {
                 )),
             );
             return;
-        }
-        if definition.span.source == crate::compiler_known_contracts::SOURCE_ID {
-            self.report_contract_boundary(
-                contracts::PendingContractOperation::CoreValueOperation,
-                access.span,
-            );
         }
         self.enum_case_values.insert(
             access.span,
@@ -19462,9 +19661,6 @@ impl<'program> Checker<'program> {
                     }
                     return self.types.unknown();
                 }
-                if name == "Ordering" && span.source != crate::compiler_known_contracts::SOURCE_ID && self.contract_type_depth == 0 {
-                    self.report_contract_boundary(contracts::PendingContractOperation::CoreValueOperation, span);
-                }
                 let definition = self.enums.get(name).expect("enum existence checked");
                 self.types.intern(TypeKind::Enum(EnumType::new(
                     definition.id,
@@ -19727,7 +19923,16 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage23_hashable_type(&mut self, ty: TypeId, span: Span, role: &str) {
-        if self.gate_core_operation(ty, "Hashable", span) {
+        if self.select_core_operation(
+            ty,
+            crate::compiler_known_contracts::CoreValueOperation::Hash,
+            span,
+        ) {
+            self.select_core_operation(
+                ty,
+                crate::compiler_known_contracts::CoreValueOperation::Equal,
+                span,
+            );
             return;
         }
         let diagnostic = match self.types.kind(ty) {
@@ -19750,14 +19955,6 @@ impl<'program> Checker<'program> {
             .with_help(format!(
                 "declare `{parameter} implements Hashable` before using it as a hash key or set element"
             )),
-            TypeKind::Class(_) => Diagnostic::unsupported_stage(
-                "E0523",
-                format!(
-                    "{role} type `{}` requires Stage 35 user-defined `Hashable` conformance",
-                    self.types.display(ty)
-                ),
-                span,
-            ),
             _ => Diagnostic::new(
                 "E0523",
                 format!(
@@ -19882,25 +20079,11 @@ impl<'program> Checker<'program> {
         second: Option<TypeId>,
         span: Span,
     ) {
-        let elements = [Some(first), second];
-        if elements
-            .iter()
-            .flatten()
-            .any(|ty| self.type_is_move_type(*ty))
-            && elements
-                .iter()
-                .flatten()
-                .all(|ty| !self.type_is_move_type(*ty) || self.has_core_contract(*ty, "Cloneable"))
-        {
-            self.report_contract_boundary(
-                contracts::PendingContractOperation::CoreValueOperation,
-                span,
-            );
-            return;
+        let mut supported = true;
+        for element in [Some(first), second].into_iter().flatten() {
+            supported &= self.select_element_duplication(element, span);
         }
-        if self.type_is_move_type(first)
-            || second.is_some_and(|value| self.type_is_move_type(value))
-        {
+        if !supported {
             let element = second
                 .map(|value| {
                     format!(
@@ -19911,16 +20094,16 @@ impl<'program> Checker<'program> {
                 })
                 .unwrap_or_else(|| self.types.display(first));
             self.diagnostics.push(
-                Diagnostic::unsupported_stage(
+                Diagnostic::new(
                     "E0528",
                     format!(
-                        "`{operation}` preserves its source, so owned move value `{element}` cannot be duplicated before Stage 35 `Cloneable`"
+                        "`{operation}` preserves its source and requires Cloneable for Move element types `{element}`"
                     ),
                     span,
                 )
                 .with_title("Collection Elements Cannot Be Duplicated")
                 .with_explanation(format!(
-                    "`{operation}` leaves every input collection unchanged, so every stored value must be copied."
+                    "`{operation}` leaves every input collection unchanged, so every selected value must support Copy, immutable-string retention, or Cloneable."
                 ))
                 .with_help(match collection {
                     "Deque" => format!(
@@ -19939,7 +20122,7 @@ impl<'program> Checker<'program> {
                             .to_string()
                     }
                     _ => format!(
-                        "build the destination incrementally; Stage 35 widens `{collection}` duplication through `Cloneable`"
+                        "use Copy, immutable-string, or Cloneable elements in `{collection}`"
                     ),
                 }),
             );
@@ -19947,7 +20130,11 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage26_comparable_type(&mut self, ty: TypeId, span: Span, role: &str) {
-        if self.gate_core_operation(ty, "Comparable", span) {
+        if self.select_core_operation(
+            ty,
+            crate::compiler_known_contracts::CoreValueOperation::Compare,
+            span,
+        ) {
             return;
         }
         let diagnostic = match self.types.kind(ty) {
@@ -19983,15 +20170,7 @@ impl<'program> Checker<'program> {
             .with_explanation(
                 "NaN and signed zero prevent Doria floats from defining the total order required by sorted collections and PriorityQueue.",
             )
-            .with_help("use an integer, bool, or string element, or wrap the value in a later user-defined Comparable type"),
-            TypeKind::Class(_) => Diagnostic::unsupported_stage(
-                "E0523",
-                format!(
-                    "{role} type `{}` requires Stage 35 user-defined `Comparable` conformance",
-                    self.types.display(ty)
-                ),
-                span,
-            ),
+            .with_help("use an integer, bool, string, or a type implementing Comparable"),
             _ => Diagnostic::new(
                 "E0523",
                 format!(
@@ -20306,6 +20485,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         destination: AssignmentDestination,
     ) -> bool {
+        self.record_collection_construction_type(value_expr, target);
         self.complete_generic_call_from_expected(value_expr, target);
 
         if matches!(value_expr, Expr::Array { .. }) {
@@ -20436,6 +20616,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         record_boundary: bool,
     ) -> bool {
+        self.record_collection_construction_type(value_expr, target);
         self.complete_generic_call_from_expected(value_expr, target);
         let target_is_mixed_boundary = matches!(self.types.kind(target), TypeKind::Mixed)
             || matches!(
@@ -20691,9 +20872,35 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn select_element_duplication(&mut self, element: TypeId, span: Span) -> bool {
+        !self.type_is_move_type(element)
+            || self.select_core_operation(
+                element,
+                crate::compiler_known_contracts::CoreValueOperation::Clone,
+                span,
+            )
+    }
+
     fn check_repeat_element_eligibility(&mut self, element: TypeId, span: Span) -> bool {
-        if self.gate_core_operation(element, "Cloneable", span) {
+        if !self.type_is_move_type(element)
+            && !matches!(
+                self.types.kind(element),
+                TypeKind::Bool
+                    | TypeKind::Integer(_)
+                    | TypeKind::Float(_)
+                    | TypeKind::String
+                    | TypeKind::Unknown
+            )
+        {
+            self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0528",
+                format!("sequence fill for `{}` is not yet supported by the Decision 0102 fill representation", self.types.display(element)),
+                span,
+            ));
             return false;
+        }
+        if self.select_element_duplication(element, span) {
+            return true;
         }
         match self.types.kind(element) {
             TypeKind::Bool
@@ -20708,16 +20915,16 @@ impl<'program> Checker<'program> {
                     .any(|diagnostic| diagnostic.code == "E0528" && diagnostic.span == span)
                 {
                     self.diagnostics.push(
-                        Diagnostic::unsupported_stage(
+                        Diagnostic::new(
                             "E0528",
                             format!(
-                                "sequence fill cannot replicate move-type element `{}` in Stage 23c (decision 0102); this requires `Cloneable` in Stage 35",
+                                "sequence fill requires Cloneable for Move element type `{}`",
                                 self.types.display(element)
                             ),
                             span,
                         )
                         .with_help(
-                            "use a Copy scalar or string element until the `Cloneable` contract is available",
+                            "Use Copy, immutable-string, or Cloneable elements for preserving duplication.",
                         ),
                     );
                 }
@@ -21452,6 +21659,12 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let collection_ty = self.infer_expr_type(collection, scopes, method_context);
+        if let TypeKind::Dictionary(key, _) = self.types.kind(collection_ty).clone() {
+            self.check_stage23_hashable_type(key, span, "Dictionary key");
+        }
+        if let TypeKind::SortedDictionary(key, _) = self.types.kind(collection_ty).clone() {
+            self.check_stage26_comparable_type(key, span, "SortedDictionary key");
+        }
         if matches!(
             self.types.kind(collection_ty),
             TypeKind::Set(_) | TypeKind::SortedSet(_)
@@ -22609,6 +22822,25 @@ impl<'program> Checker<'program> {
             return true;
         }
 
+        match (&kind, method) {
+            (TypeKind::Dictionary(key, _), "set" | "get" | "remove" | "containsKey")
+            | (
+                TypeKind::Set(key),
+                "add" | "remove" | "contains" | "union" | "intersect" | "difference",
+            ) => {
+                self.check_stage23_hashable_type(*key, span, "collection key/element");
+            }
+            (TypeKind::SortedDictionary(key, _), "set" | "get" | "remove" | "containsKey")
+            | (
+                TypeKind::SortedSet(key),
+                "add" | "remove" | "contains" | "union" | "intersect" | "difference",
+            )
+            | (TypeKind::PriorityQueue(key), "push" | "pop") => {
+                self.check_stage26_comparable_type(*key, span, "ordered collection key/element");
+            }
+            _ => {}
+        }
+
         if matches!(kind, TypeKind::List(_)) && matches!(method, "map" | "filter" | "reduce") {
             self.check_list_algorithm_call(
                 ty,
@@ -22981,26 +23213,21 @@ impl<'program> Checker<'program> {
                     );
                     return;
                 }
-                if self.type_is_move_type(*element)
-                    && self.gate_core_operation(*element, "Cloneable", span)
-                {
-                    return;
-                }
-                if self.type_is_move_type(*element) {
+                if !self.select_element_duplication(*element, span) {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0666",
                             format!(
-                                "List::filter cannot preserve source elements of Move type `{}`",
+                                "List::filter requires Cloneable for Move element type `{}`",
                                 self.types.display(*element)
                             ),
                             span,
                         )
-                        .with_title("List Filter Requires Copy Elements")
+                        .with_title("List Filter Requires Copy Or Cloneable Elements")
                         .with_explanation(
-                            "The preserving filter leaves the source unchanged and copies selected elements into a new List.",
+                            "The preserving filter leaves the source unchanged and duplicates only selected elements into a new List.",
                         )
-                        .with_help("Move-element preserving filter waits for `Cloneable`"),
+                        .with_help("Use elements with the Cloneable contract for preserving duplication."),
                     );
                     return;
                 }
@@ -23120,7 +23347,11 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span, operation: &str) {
-        if self.gate_core_operation(ty, "Equatable", span) {
+        if self.select_core_operation(
+            ty,
+            crate::compiler_known_contracts::CoreValueOperation::Equal,
+            span,
+        ) {
             return;
         }
         match self.types.kind(ty) {
@@ -23132,17 +23363,17 @@ impl<'program> Checker<'program> {
             | TypeKind::Enum(_)
             | TypeKind::Unknown => {}
             TypeKind::Class(_) => self.diagnostics.push(
-                Diagnostic::unsupported_stage(
+                Diagnostic::new(
                     "E0524",
                     format!(
-                        "{operation} cannot yet compare user-defined values of type `{}`",
+                        "{operation} requires `{}` to implement Equatable",
                         self.types.display(ty)
                     ),
                     span,
                 )
                 .with_title("Collection Value Cannot Be Compared")
                 .with_explanation(
-                    "The selected collection operation compares values for equality, but user-defined equality is not executable in the current language stage.",
+                    "Collection membership requires a declared Equatable contract for user-defined values; a same-named method alone does not provide that contract.",
                 ),
             ),
             _ => self.diagnostics.push(

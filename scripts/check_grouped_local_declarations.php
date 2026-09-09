@@ -97,7 +97,10 @@ function check_grouped_local_declarations(string $root): array
             continue;
         }
         foreach ($needles as $needle) {
-            if (!str_contains($contents, $needle)) {
+            $haystack = str_starts_with($needle, '|')
+                ? preg_replace('/[\t ]+/', ' ', $contents)
+                : $contents;
+            if (!str_contains($haystack, $needle)) {
                 $failures[] = "{$path}: missing grouped-local authority {$needle}";
             }
         }

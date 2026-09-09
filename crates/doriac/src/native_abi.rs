@@ -16,6 +16,7 @@ pub const STRING_COMPARE: &str = "dr_v1_string_compare";
 pub const STRING_DATA: &str = "dr_v1_string_data";
 pub const STRING_LENGTH: &str = "dr_v1_string_length";
 pub const STRING_BYTE_LENGTH: &str = "dr_v1_string_byte_length";
+pub const STRING_HASH: &str = "dr_v1_string_hash";
 pub const STRING_GRAPHEME_LENGTH: &str = "dr_v1_string_grapheme_length";
 pub const STRING_IS_EMPTY: &str = "dr_v1_string_is_empty";
 pub const STRING_TO_BYTES: &str = "dr_v1_string_to_bytes";
@@ -213,6 +214,18 @@ pub const MIXED_TAG: &str = "dr_v1_mixed_tag";
 pub const MIXED_TYPE_ID: &str = "dr_v1_mixed_type_id";
 pub const MIXED_PAYLOAD: &str = "dr_v1_mixed_payload";
 pub const COLLECTION_NEW: &str = "dr_v1_collection_new";
+pub const COLLECTION_ITERATOR_NEW: &str = "dr_v1_collection_iterator_new";
+pub const COLLECTION_ITERATOR_DROP: &str = "dr_v1_collection_iterator_drop";
+pub const COLLECTION_ITERATOR_SOURCE: &str = "dr_v1_collection_iterator_source";
+pub const COLLECTION_ITERATOR_POSITION: &str = "dr_v1_collection_iterator_position";
+pub const COLLECTION_ITERATOR_ADVANCE: &str = "dr_v1_collection_iterator_advance";
+pub const CORE_COLLECTION_NEW: &str = "dr_v1_core_collection_new";
+pub const CORE_COLLECTION_INSERT: &str = "dr_v1_core_collection_insert";
+pub const CORE_COLLECTION_REMOVE: &str = "dr_v1_core_collection_remove";
+pub const CORE_COLLECTION_SWAP: &str = "dr_v1_core_collection_swap";
+pub const CORE_COLLECTION_KEY_AT: &str = "dr_v1_core_collection_key_at";
+pub const CORE_COLLECTION_HASH_NEXT: &str = "dr_v1_core_collection_hash_next";
+pub const CORE_COLLECTION_HASH_POSITION: &str = "dr_v1_core_collection_hash_position";
 pub const COLLECTION_STAGE26_NEW: &str = "dr_v2_collection_new";
 pub const COLLECTION_AGGREGATE_NEW: &str = "dr_v4_collection_new_aggregate";
 pub const COLLECTION_AGGREGATE_VALUE_AT: &str = "dr_v4_collection_aggregate_value_at";
@@ -240,11 +253,14 @@ pub const fn nullable_collection_access_code(
         crate::mir::NullableCollectionAccess::PopFront => Some(5),
         crate::mir::NullableCollectionAccess::PopBack => Some(6),
         crate::mir::NullableCollectionAccess::At => Some(7),
+        crate::mir::NullableCollectionAccess::RemoveAt => Some(8),
     }
 }
 pub const COLLECTION_STAGE26_FINALIZE: &str = "dr_v2_collection_finalize";
 pub const COLLECTION_STAGE26_FROM_COPY: &str = "dr_v2_collection_from_copy";
 pub const COLLECTION_FILL_WORD: &str = "dr_v2_collection_fill_word";
+pub const COLLECTION_CONSTRUCTION_CAPACITY: &str = "dr_v5_collection_construction_capacity";
+pub const COLLECTION_INITIALIZE_KEY: &str = "dr_v5_collection_initialize_key";
 pub const COLLECTION_FILL_STRING: &str = "dr_v2_collection_fill_string";
 pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
 pub const COLLECTION_RESET_AFTER_CLEANUP: &str = "dr_v2_collection_reset_after_cleanup";
@@ -313,7 +329,8 @@ pub const COLLECTION_AGGREGATE_FIELD: u32 = 19;
 pub const fn collection_header_size(pointer_bytes: u32) -> u32 {
     let prefix = align_to(4 * pointer_bytes + 7, pointer_bytes);
     let legacy = align_to(prefix + 3 * pointer_bytes + 2, pointer_bytes);
-    align_to(legacy + 3 * pointer_bytes + 1, pointer_bytes)
+    let aggregate = align_to(legacy + 3 * pointer_bytes + 1, pointer_bytes);
+    align_to(aggregate + 2 * pointer_bytes + 1, pointer_bytes)
 }
 
 const fn align_to(value: u32, alignment: u32) -> u32 {
@@ -332,6 +349,7 @@ pub const fn stage26_collection_kind(kind: mir::CollectionKind) -> Option<u8> {
 
 pub const fn collection_comparator_code(comparator: mir::CollectionComparator) -> u8 {
     match comparator {
+        mir::CollectionComparator::Core => u8::MAX,
         mir::CollectionComparator::SignedInteger(8) => COLLECTION_COMPARE_SIGNED_8,
         mir::CollectionComparator::SignedInteger(16) => COLLECTION_COMPARE_SIGNED_16,
         mir::CollectionComparator::SignedInteger(32) => COLLECTION_COMPARE_SIGNED_32,

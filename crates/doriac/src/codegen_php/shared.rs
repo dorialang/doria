@@ -3,13 +3,15 @@
 use super::*;
 use crate::types::SharedHandleKind;
 
-pub(super) fn interface_payload(ty: &ResolvedType) -> bool {
+pub(super) fn supported_payload(ty: &ResolvedType) -> bool {
     match ty {
-        ResolvedType::SharedHandle(_, payload) => matches!(
-            payload.as_ref(),
-            ResolvedType::Interface(_) | ResolvedType::Error
-        ),
-        ResolvedType::Nullable(inner) => interface_payload(inner),
+        ResolvedType::SharedHandle(_, payload) => {
+            matches!(
+                payload.as_ref(),
+                ResolvedType::Interface(_) | ResolvedType::Error
+            ) || core_collection::uses(payload)
+        }
+        ResolvedType::Nullable(inner) => supported_payload(inner),
         _ => false,
     }
 }

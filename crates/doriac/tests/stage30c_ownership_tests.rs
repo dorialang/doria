@@ -2,8 +2,7 @@ use doriac::diagnostics::{
     Diagnostic, DiagnosticFormat, DiagnosticSeverity, FixApplicability, RenderOptions,
 };
 use doriac::ownership::{
-    CaptureAcquisitionKind, ClosureEscapeClassification, ClosureValueProvenance,
-    InvocationConsumption,
+    CaptureAcquisitionKind, ClosureEscapeClassification, InvocationConsumption, ValueProvenance,
 };
 
 fn analyze(source: &str) -> doriac::semantics::SemanticAnalysis {
@@ -183,10 +182,7 @@ function main(): void
         ]
     );
     assert_eq!(plan.release_order, vec![3, 2, 1, 0]);
-    assert!(matches!(
-        plan.provenance,
-        ClosureValueProvenance::BorrowBound(_)
-    ));
+    assert!(matches!(plan.provenance, ValueProvenance::BorrowBound(_)));
     assert_eq!(
         plan.invocation_consumption,
         InvocationConsumption::Repeatable
@@ -363,7 +359,7 @@ function makeOwned(): function(): int
     );
     assert!(owned.info.closure_ownership.values().any(|plan| {
         plan.escape == ClosureEscapeClassification::Owned
-            && plan.provenance == ClosureValueProvenance::Owned
+            && plan.provenance == ValueProvenance::Owned
     }));
 
     let local = analyze(
@@ -810,7 +806,7 @@ function main(): void
     assert_eq!(plans.len(), 2, "{:#?}", analysis.diagnostics);
     assert!(matches!(
         plans[1].provenance,
-        ClosureValueProvenance::BorrowBound(_)
+        ValueProvenance::BorrowBound(_)
     ));
     assert!(!plans[1].acquisitions[0].roots.is_empty());
 }
@@ -882,7 +878,7 @@ function main(): void
     );
     diagnostic(&analysis.diagnostics, "E0655");
     let plan = analysis.info.closure_ownership.values().next().unwrap();
-    assert_eq!(plan.provenance, ClosureValueProvenance::Owned);
+    assert_eq!(plan.provenance, ValueProvenance::Owned);
     assert!(plan.acquisitions.is_empty());
     assert!(plan.release_order.is_empty());
 }
@@ -1000,7 +996,7 @@ function bind(int $value): function(): int
     assert_eq!(plan.escape, ClosureEscapeClassification::ReturnedBorrow);
     assert!(matches!(
         plan.provenance,
-        ClosureValueProvenance::BorrowBound(ref roots) if roots.len() == 1
+        ValueProvenance::BorrowBound(ref roots) if roots.len() == 1
     ));
 
     let unrelated = analyze(

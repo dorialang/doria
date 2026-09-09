@@ -69,8 +69,8 @@ function check_stage30g_list_algorithms(string $root): array
         'No other collection family receives these algorithms in Stage 30',
     ]);
     $require($paths['audit'], $files['audit'], [
-        'Implemented for `map`, Copy-only `filter`, and writable-accumulator `reduce`',
-        'E0664-E0668',
+        'Implemented: map, Copy-or-Cloneable filter, writable-accumulator reduce',
+        'missing Cloneable is a capability error',
     ]);
 
     $require($paths['catalogue'], $files['catalogue'], [

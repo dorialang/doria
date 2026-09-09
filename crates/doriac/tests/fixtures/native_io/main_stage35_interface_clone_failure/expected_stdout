@@ -1,0 +1,23 @@
+clone 1
+clone 2
+drop 1
+clone failed
+clone 1
+drop 1
+predicate failed
+clone 1
+clone 2
+drop 1
+from failed
+clone 1
+clone 2
+drop 1
+drop 2
+drop 1
+sorted from failed
+source 1
+source 2
+source 3
+drop 3
+drop 2
+drop 1

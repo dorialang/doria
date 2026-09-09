@@ -1,0 +1,53 @@
+class Key implements Comparable<Key>, Equatable<Key>, Hashable, Cloneable
+{
+    function __construct(int $value) {}
+    function compare(Key $other): Ordering
+    {
+        if ($this->value < $other->value) { return Ordering::Less; }
+        if ($this->value > $other->value) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function hash(): uint64 { return 18446744073709551615; }
+    function clone(): self { return new Key($this->value); }
+}
+
+function main(): void
+{
+    List<Key> $source = [new Key(3), new Key(1), new Key(2), new Key(1)];
+    let writable $set = SortedSet::from($source);
+    echo $set->add(new Key(4));
+    echo $set->add(new Key(2));
+    echo $set->contains(new Key(3));
+    echo $set->remove(new Key(3));
+    foreach ($set as Key $key) { echo " {$key->value}"; }
+    echo "\n";
+    let $other = SortedSet::from([new Key(2), new Key(3)]);
+    let $union = $set->union($other);
+    let $intersection = $set->intersect($other);
+    let $difference = $set->difference($other);
+    foreach ($union as Key $key) { echo "u{$key->value}"; }
+    foreach ($intersection as Key $key) { echo "i{$key->value}"; }
+    foreach ($difference as Key $key) { echo "d{$key->value}"; }
+    echo "\n";
+    let writable $queue = PriorityQueue::from($source);
+    $queue->push(new Key(0));
+    while (!$queue->isEmpty) {
+        let $key = $queue->pop();
+        if ($key != null) { echo "q{$key->value}"; }
+    }
+    let $empty = $queue->pop();
+    echo $empty == null;
+    echo "\n";
+    Dictionary<Key, Key> $map = [new Key(3) => new Key(30), new Key(1) => new Key(10)];
+    let writable $sorted = SortedDictionary::from($map);
+    $sorted->set(new Key(2), new Key(20));
+    foreach ($sorted as Key $key => Key $value) { echo "m{$key->value}:{$value->value}"; }
+    let $removed = $sorted->remove(new Key(2));
+    if ($removed != null) { echo "r{$removed->value}"; }
+    echo $sorted->containsKey(new Key(2));
+    echo "\n";
+    foreach ($source as Key $key) { echo "s{$key->value}"; }
+    foreach ($map as Key $key => Key $value) { echo "m{$key->value}:{$value->value}"; }
+    echo "\n";
+}

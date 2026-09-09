@@ -426,10 +426,6 @@ fn nullable_equality_matches_the_native_lowering_boundary() {
     for source in [
         "function equal(?int $left, ?int $right): bool { return $left == $right; }",
         "function equal(): bool { return null == null; }",
-        r#"
-class Label {}
-function equal(?Label $left, ?Label $right): bool { return $left == $right; }
-"#,
     ] {
         assert_code(source, "E0420");
     }
@@ -444,6 +440,26 @@ function equal(?Label $left, ?Label $right): bool { return $left == $right; }
         "function empty(?int $value): bool { return $value == null; }",
     )
     .expect("literal null checks remain supported for every nullable payload");
+
+    let program = doriac::lower_source_to_mir(
+        "nullable-class-identity.doria",
+        r#"
+class Label {}
+function equal(?Label $left, ?Label $right): bool { return $left == $right; }
+function main(): void {
+    let $label = new Label();
+    echo equal(null, null);
+    echo equal($label, null);
+    echo equal($label, $label);
+    echo equal($label, new Label());
+}
+"#,
+    )
+    .expect("nullable classes preserve absence and identity equality");
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program).unwrap().stdout,
+        b"truefalsetruefalse"
+    );
 }
 
 #[test]

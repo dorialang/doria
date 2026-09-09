@@ -41,6 +41,62 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    pub(super) fn core_capability(
+        &self,
+        receiver: &ResolvedType,
+        operation: crate::compiler_known_contracts::CoreValueOperation,
+    ) -> bool {
+        let receiver = match receiver {
+            ResolvedType::Nullable(inner) => inner.as_ref(),
+            _ => receiver,
+        };
+        let canonical = |origins: &[crate::semantics::contracts::RequirementOrigin]| {
+            origins.iter().any(|origin| {
+                crate::compiler_known_contracts::CoreValueOperation::from_requirement(
+                    origin.declaration,
+                ) == Some(operation)
+            })
+        };
+        match receiver {
+            ResolvedType::Interface(interface) => self.semantic.contracts.interface_specializations.iter().any(|facts| {
+                facts.valid && &facts.specialization == interface && facts.requirements.iter().any(|requirement| canonical(&requirement.origins)
+                    && (!matches!(operation, crate::compiler_known_contracts::CoreValueOperation::Equal | crate::compiler_known_contracts::CoreValueOperation::Compare)
+                        || requirement.signature.parameters.first().is_some_and(|parameter| &parameter.r#type == receiver)))
+            }),
+            ResolvedType::Class(_) => self.semantic.contracts.conformances.iter().any(|conformance| {
+                conformance.status == crate::semantics::contracts::ConformanceStatus::Checked
+                    && &conformance.implementing_type == receiver
+                    && (!matches!(operation, crate::compiler_known_contracts::CoreValueOperation::Equal | crate::compiler_known_contracts::CoreValueOperation::Compare)
+                        || conformance.interface.arguments.as_slice() == [receiver.clone()])
+                    && conformance.implementations.iter().any(|implementation| canonical(&implementation.requirement_origins))
+            }),
+            _ => false,
+        }
+    }
+
+    pub(super) fn core_operation(
+        &self,
+        span: Span,
+        operation: crate::compiler_known_contracts::CoreValueOperation,
+        receiver: &ResolvedType,
+        substitutions: &HashMap<String, ResolvedType>,
+    ) -> bool {
+        let receiver = substitute_resolved_type(receiver, substitutions);
+        let receiver = match &receiver {
+            ResolvedType::Nullable(inner) => inner.as_ref(),
+            _ => &receiver,
+        };
+        self.semantic
+            .core_operation_calls
+            .get(&span)
+            .is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call.operation == operation
+                        && &substitute_resolved_type(&call.receiver_type, substitutions) == receiver
+                })
+            })
+    }
+
     pub fn build(program: &Program, closures: &PhpClosurePlan) -> Result<Self, BackendError> {
         let synthetic = monomorphization::synthetic_constructors(program);
         let declarations = monomorphization::callable_declarations(program, &synthetic);
@@ -384,7 +440,7 @@ impl Plan {
         let mut scopes = scopes.expression_scope();
         scopes.closure_owner = Some(mir::ClosureOwner::Callable(callable.id));
         scopes.substitutions = callable.substitutions.clone();
-        scopes.expression_types = self.semantic.expression_types.clone();
+        scopes.expression_types = php_expression_types(&self.semantic);
         scopes.type_test_types = self.semantic.type_test_types.clone();
         scopes.throw_error_types = self.semantic.throw_error_types.clone();
         scopes.catch_error_types = self.semantic.catch_error_types.clone();
@@ -595,9 +651,7 @@ impl Plan {
                 (*self.methods.get(&(class, method_name))?, Some(class))
             }
             CallableTarget::InterfaceMethod { .. } => return None,
-            CallableTarget::ConstrainedMethod { .. } => {
-                unreachable!("target specialization resolves constraints")
-            }
+            CallableTarget::ConstrainedMethod { .. } => return None,
         };
         let arguments = self.arguments(span, substitutions);
         self.callables.iter().find(|callable| {

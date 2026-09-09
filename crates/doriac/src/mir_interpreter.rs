@@ -293,6 +293,7 @@ enum OwnedDrop {
     },
     Error(InterfaceCarrier),
     Function(FunctionValue),
+    CollectionView(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +435,7 @@ impl MixedValue {
 struct CollectionValue {
     ty: mir::CollectionTypeId,
     entries: SharedCollectionEntries,
+    core_hashes: Rc<RefCell<Vec<u64>>>,
     nullable: bool,
     present: bool,
 }
@@ -446,6 +448,7 @@ impl CollectionValue {
         Self {
             ty,
             entries: Rc::new(RefCell::new(entries)),
+            core_hashes: Rc::new(RefCell::new(Vec::new())),
             nullable: false,
             present: true,
         }
@@ -456,6 +459,7 @@ impl CollectionValue {
             || Self {
                 ty,
                 entries: Rc::new(RefCell::new(Vec::new())),
+                core_hashes: Rc::new(RefCell::new(Vec::new())),
                 nullable: true,
                 present: false,
             },
@@ -628,6 +632,7 @@ enum EvaluationTask {
     BuildCollectionFill {
         collection: mir::CollectionTypeId,
         count_span: Span,
+        initialize: bool,
     },
     LoadCollectionValue {
         collection: mir::LocalId,
@@ -710,6 +715,7 @@ enum EvaluationTask {
     BuildNullableScalarSome(mir::ScalarType),
     BuildNullableClassSome(crate::class_layout::ClassId),
     BuildInterface(mir::InterfaceVtableId),
+    BuildCollectionInterface(mir::InterfaceVtableId),
     ErrorMessage,
     BuildNullableErrorSome(mir::InterfaceTypeId),
     ConvertInterfaceView {
@@ -979,6 +985,7 @@ enum EvaluationTask {
         object: usize,
         class: crate::class_layout::ClassId,
     },
+    ReleaseCollectionView(usize),
     DropObjectPhase {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -1031,6 +1038,8 @@ struct Interpreter<'program> {
     io_trace: MirIoTrace,
     files: BTreeMap<String, Vec<u8>>,
     heap: BTreeMap<usize, ObjectValue>,
+    interface_collections: BTreeMap<usize, CollectionValue>,
+    collection_iterators: BTreeMap<usize, (CollectionValue, usize)>,
     statics: Vec<LocalValue>,
     next_object: usize,
     next_frame: u64,
@@ -1233,6 +1242,8 @@ fn interpret_internal_observed(
         io_trace: MirIoTrace::default(),
         files: io.files,
         heap: BTreeMap::new(),
+        interface_collections: BTreeMap::new(),
+        collection_iterators: BTreeMap::new(),
         statics,
         next_object: 1,
         next_frame: 1,
@@ -1447,6 +1458,16 @@ impl Interpreter<'_> {
         statement: mir::Statement,
     ) -> Result<StepOutcome, InterpreterError> {
         match statement {
+            mir::Statement::AdvanceCollectionIterator { receiver, .. } => {
+                let carrier = self.error_local(receiver)?;
+                let (source, position) = self
+                    .collection_iterators
+                    .get_mut(&carrier.object)
+                    .ok_or_else(|| InterpreterError::new("cursor was used after destruction"))?;
+                if *position < source.entries().len() {
+                    *position += 1;
+                }
+            }
             mir::Statement::BindClosureEnvironment {
                 environment,
                 bindings,
@@ -2100,6 +2121,14 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::CollectionSet(collection));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
                 frame.tasks.push(EvaluationTask::Rvalue(key));
+            }
+            mir::Statement::CoreCollection {
+                collection,
+                operation,
+            } => {
+                if let Some(code) = self.core_collection_operation(collection, operation)? {
+                    return self.runtime_panic_step(code);
+                }
             }
             mir::Statement::AssignCollectionIndex {
                 positional,
@@ -3428,6 +3457,7 @@ impl Interpreter<'_> {
             EvaluationTask::BuildCollectionFill {
                 collection,
                 count_span,
+                initialize,
             } => {
                 let count = self.pop_local_value()?;
                 let LocalValue::Scalar(mir::ScalarValue::Integer(count)) = count else {
@@ -3455,6 +3485,18 @@ impl Interpreter<'_> {
                 let count = usize::try_from(count).map_err(|_| {
                     InterpreterError::new("MIR collection fill count exceeds host capacity")
                 })?;
+                if initialize {
+                    let mut entries = Vec::new();
+                    if entries.try_reserve_exact(count).is_err() {
+                        return self.runtime_panic_step_at("P1313", count_span);
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::Collection(CollectionValue::new(
+                            collection, entries,
+                        )));
+                    return Ok(StepOutcome::Continue);
+                }
                 let value = self.pop_local_value()?;
                 if !matches!(value, LocalValue::Scalar(_) | LocalValue::String(_)) {
                     return Err(InterpreterError::new(
@@ -3504,6 +3546,13 @@ impl Interpreter<'_> {
                 has_index,
             } => {
                 let value = self.pop_local_value()?;
+                if op == mir::CollectionMutationOp::Initialize {
+                    let key = has_index.then(|| self.pop_local_value()).transpose()?;
+                    self.collection_local(collection)?
+                        .entries_mut()
+                        .push((key, value));
+                    return Ok(StepOutcome::Continue);
+                }
                 let index = has_index
                     .then(|| self.pop_collection_offset())
                     .transpose()?;
@@ -3512,7 +3561,7 @@ impl Interpreter<'_> {
                     self.program.collection_types[collection.ty.0].kind
                 };
                 match op {
-                    mir::CollectionMutationOp::Add => {
+                    mir::CollectionMutationOp::Add | mir::CollectionMutationOp::Initialize => {
                         let collection = self.collection_local(collection)?;
                         if collection
                             .entries()
@@ -3799,12 +3848,45 @@ impl Interpreter<'_> {
                         .find(|(current, _)| current.as_ref() == Some(&key))
                         .map(|(_, value)| value.clone()),
                     mir::NullableCollectionAccess::Index => {
-                        let value = self
-                            .collection_local(collection)?
-                            .entries()
-                            .iter()
-                            .find(|(current, _)| current.as_ref() == Some(&key))
-                            .map(|(_, value)| value.clone());
+                        let entries = self.collection_local(collection)?;
+                        if let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = &key {
+                            if !self.program.collection_types[entries.ty.0]
+                                .kind
+                                .is_dictionary()
+                            {
+                                let index = index.signed_value() as i64;
+                                let length = entries.entries().len();
+                                if index < 0 || index as usize >= length {
+                                    return self.collection_access_panic_step(
+                                        CollectionAccessError::Bounds {
+                                            code: "P1310",
+                                            index,
+                                            length,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        let value = if self.program.collection_types[entries.ty.0]
+                            .kind
+                            .is_dictionary()
+                        {
+                            self.collection_local(collection)?
+                                .entries()
+                                .iter()
+                                .find(|(current, _)| current.as_ref() == Some(&key))
+                                .map(|(_, value)| value.clone())
+                        } else {
+                            let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = &key else {
+                                return Err(InterpreterError::new(
+                                    "MIR collection offset is not an integer",
+                                ));
+                            };
+                            entries
+                                .entries()
+                                .get(index.signed_value() as usize)
+                                .map(|(_, value)| value.clone())
+                        };
                         let Some(value) = value else {
                             return self.collection_access_panic_step(
                                 CollectionAccessError::Catalogued("P1312"),
@@ -3862,6 +3944,35 @@ impl Interpreter<'_> {
                         .entries_mut()
                         .pop()
                         .map(|(_, value)| value),
+                    mir::NullableCollectionAccess::RemoveAt => {
+                        let LocalValue::Scalar(mir::ScalarValue::Integer(offset)) = key else {
+                            return Err(InterpreterError::new(
+                                "MIR collection offset is not an integer",
+                            ));
+                        };
+                        let index = offset.signed_value() as i64;
+                        let values = self.collection_local(collection)?;
+                        let length = values.entries().len();
+                        let Ok(position) = usize::try_from(index) else {
+                            return self.collection_access_panic_step(
+                                CollectionAccessError::Bounds {
+                                    code: "P1310",
+                                    index,
+                                    length,
+                                },
+                            );
+                        };
+                        if position >= length {
+                            return self.collection_access_panic_step(
+                                CollectionAccessError::Bounds {
+                                    code: "P1310",
+                                    index,
+                                    length,
+                                },
+                            );
+                        }
+                        Some(values.entries_mut().remove(position).1)
+                    }
                     mir::NullableCollectionAccess::At => {
                         let LocalValue::Scalar(mir::ScalarValue::Integer(offset)) = key else {
                             return Err(InterpreterError::new(
@@ -4572,6 +4683,21 @@ impl Interpreter<'_> {
                     ));
                 }
                 self.push_nullable_class(actual, Some(object))?;
+            }
+            EvaluationTask::BuildCollectionInterface(vtable) => {
+                let collection = self.pop_collection_value()?;
+                if !collection.present {
+                    self.push_nullable_error(
+                        self.program.interface_vtables[vtable.0].interface,
+                        None,
+                    )?;
+                } else {
+                    let object = Rc::as_ptr(&collection.entries) as usize;
+                    self.interface_collections
+                        .entry(object)
+                        .or_insert(collection);
+                    self.push_error(InterfaceCarrier { object, vtable })?;
+                }
             }
             EvaluationTask::BuildInterface(vtable) => {
                 let interface = self
@@ -6277,6 +6403,9 @@ impl Interpreter<'_> {
             EvaluationTask::CollectionClear(local) => {
                 self.clear_collection_local(local)?;
             }
+            EvaluationTask::ReleaseCollectionView(identity) => {
+                self.interface_collections.remove(&identity);
+            }
             EvaluationTask::DropObject { object, class } => {
                 self.queue_object_drop(object, class)?;
             }
@@ -6547,11 +6676,11 @@ impl Interpreter<'_> {
         match condition {
             mir::BoolExpression::NominalIs { local, target } => {
                 let parts = self.nominal_local_parts(local, false)?;
-                let matches = parts.is_some_and(|(_, class)| match target {
-                    mir::Type::Class(target) => class_is_subtype(self.program, class, target),
+                let matches = parts.is_some_and(|(_, implementing)| match target {
+                    mir::Type::Class(target) => matches!(implementing, mir::ImplementingType::Class(class) if class_is_subtype(self.program, class, target)),
                     mir::Type::Interface(target) => self
                         .program
-                        .interface_vtable(mir::ImplementingType::Class(class), target)
+                        .interface_vtable(implementing, target)
                         .is_some(),
                     _ => false,
                 });
@@ -7312,6 +7441,20 @@ impl Interpreter<'_> {
         }: mir::InterfaceExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            mir::InterfaceValue::FromCollection { value, vtable } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildCollectionInterface(vtable));
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
+            }
+            mir::InterfaceValue::NewCollectionIterator { source, vtable } => {
+                let source = self.collection_local(source)?.clone().assume_non_null()?;
+                let object = self.next_object;
+                self.next_object += 1;
+                self.collection_iterators.insert(object, (source, 0));
+                self.push_error(InterfaceCarrier { object, vtable })?;
+            }
             mir::InterfaceValue::SharedPayload { local } => {
                 let value = self.shared_interface_payload(local)?.ok_or_else(|| {
                     InterpreterError::new("non-null shared interface projection is absent")
@@ -7327,11 +7470,11 @@ impl Interpreter<'_> {
                 if self.pending_panic.is_some() {
                     return Ok(());
                 }
-                let (object, class) =
+                let (object, implementing) =
                     parts.ok_or_else(|| InterpreterError::new("narrowed interface is null"))?;
                 let vtable = self
                     .program
-                    .interface_vtable(mir::ImplementingType::Class(class), interface)
+                    .interface_vtable(implementing, interface)
                     .ok_or_else(|| {
                         InterpreterError::new("narrowed interface has no matching view")
                     })?;
@@ -8099,6 +8242,11 @@ impl Interpreter<'_> {
                 let (object, actual) = self
                     .nominal_local_parts(local, transfer)?
                     .ok_or_else(|| InterpreterError::new("narrowed class is null"))?;
+                let mir::ImplementingType::Class(actual) = actual else {
+                    return Err(InterpreterError::new(
+                        "narrowed class payload is a collection",
+                    ));
+                };
                 if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "narrowed interface payload has another class",
@@ -8354,6 +8502,9 @@ impl Interpreter<'_> {
                 }
                 let (object, actual) =
                     parts.ok_or_else(|| InterpreterError::new("mixed payload is not nominal"))?;
+                let mir::ImplementingType::Class(actual) = actual else {
+                    return Err(InterpreterError::new("mixed class payload is a collection"));
+                };
                 if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "MIR mixed class payload observed another class",
@@ -9927,6 +10078,28 @@ impl Interpreter<'_> {
         expression: mir::CollectionExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            mir::CollectionExpression::InterfaceReceiver { receiver, .. } => {
+                let carrier = self.error_local(receiver)?;
+                let value = self
+                    .interface_collections
+                    .get(&carrier.object)
+                    .ok_or_else(|| {
+                        InterpreterError::new("collection interface payload was destroyed")
+                    })?
+                    .clone()
+                    .assume_non_null()?;
+                self.push_local_value(LocalValue::Collection(value))?;
+            }
+            mir::CollectionExpression::IteratorSource { receiver, .. } => {
+                let carrier = self.error_local(receiver)?;
+                let (value, _) =
+                    self.collection_iterators
+                        .get(&carrier.object)
+                        .ok_or_else(|| {
+                            InterpreterError::new("cursor source was used after destruction")
+                        })?;
+                self.push_local_value(LocalValue::Collection(value.clone()))?;
+            }
             mir::CollectionExpression::Local {
                 collection,
                 local,
@@ -9991,11 +10164,49 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::BuildCollectionFill {
                     collection,
                     count_span,
+                    initialize: false,
                 });
                 frame
                     .tasks
                     .push(EvaluationTask::Value(mir::ValueExpression::Integer(*count)));
                 frame.tasks.push(EvaluationTask::Rvalue(*value));
+            }
+            mir::CollectionExpression::FinishConstruction { source, .. } => {
+                let source = self
+                    .current_frame_mut()?
+                    .locals
+                    .get_mut(source.0)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        InterpreterError::new("construction output was moved before finalization")
+                    })?;
+                let LocalValue::Collection(value) = source else {
+                    return Err(InterpreterError::new(
+                        "construction output is not a collection",
+                    ));
+                };
+                order_collection_entries(
+                    &self.program.collection_types[value.ty.0],
+                    &mut value.entries_mut(),
+                )?;
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(value));
+            }
+            mir::CollectionExpression::ConstructionCapacity {
+                collection,
+                count,
+                count_span,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildCollectionFill {
+                    collection,
+                    count_span,
+                    initialize: true,
+                });
+                frame
+                    .tasks
+                    .push(EvaluationTask::Value(mir::ValueExpression::Integer(*count)));
             }
             mir::CollectionExpression::Index {
                 source,
@@ -13347,6 +13558,17 @@ impl Interpreter<'_> {
             )))
         };
         match kind {
+            Kind::Hash => {
+                let hash = local_string(&arguments, 0)?
+                    .as_bytes()
+                    .iter()
+                    .fold(0xcbf29ce484222325u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                    });
+                self.push_scalar(mir::ScalarValue::Integer(
+                    IntegerValue::from_i128(IntegerType::UInt64, i128::from(hash)).unwrap(),
+                ))?;
+            }
             Kind::GraphemeLength | Kind::ByteLength => {
                 let text = local_string(&arguments, 0)?;
                 let length = if kind == Kind::GraphemeLength {
@@ -13742,6 +13964,19 @@ impl Interpreter<'_> {
 
     fn eval_operand(&self, operand: &mir::Operand) -> Result<mir::ScalarValue, InterpreterError> {
         match operand {
+            mir::Operand::CollectionIteratorPosition { receiver, .. } => {
+                let carrier = self.error_local(*receiver)?;
+                let (_, position) =
+                    self.collection_iterators
+                        .get(&carrier.object)
+                        .ok_or_else(|| {
+                            InterpreterError::new("cursor position was used after destruction")
+                        })?;
+                Ok(mir::ScalarValue::Integer(
+                    IntegerValue::from_i128(IntegerType::Int64, *position as i128)
+                        .ok_or_else(|| InterpreterError::new("cursor position overflow"))?,
+                ))
+            }
             mir::Operand::Scalar(value) => Ok(*value),
             mir::Operand::Local(id) => match read_local(&self.current_frame()?.locals, *id)? {
                 LocalValue::Scalar(value) => Ok(*value),
@@ -14251,9 +14486,14 @@ impl Interpreter<'_> {
             )));
         }
         let mut drops = Vec::new();
-        for property in &mut object_value.properties[first_property..property_count] {
+        for (property, definition) in object_value.properties[first_property..property_count]
+            .iter_mut()
+            .zip(&class_definition.properties[first_property..property_count])
+        {
             if let Some(value) = property.take() {
-                collect_owned_objects_from_value(value, &mut drops);
+                if !definition.borrowed_source || !definition.ty.has_move_ownership() {
+                    collect_owned_objects_from_value(value, &mut drops);
+                }
             }
         }
         if let Some(parent) = parent {
@@ -14393,6 +14633,193 @@ impl Interpreter<'_> {
                 local.0
             ))),
         }
+    }
+
+    fn core_collection_operation(
+        &mut self,
+        local: mir::LocalId,
+        operation: mir::CoreCollectionOperation,
+    ) -> Result<Option<&'static str>, InterpreterError> {
+        use mir::CoreCollectionOperation as Op;
+        let collection = self.collection_local(local)?.clone();
+        let integer = |local| match read_local(&self.current_frame()?.locals, local)? {
+            LocalValue::Scalar(mir::ScalarValue::Integer(value)) => Ok(value.bits),
+            _ => Err(InterpreterError::new(
+                "core collection index/hash is not an integer",
+            )),
+        };
+        let int_value = |value| {
+            LocalValue::Scalar(mir::ScalarValue::Integer(IntegerValue::from_bits(
+                IntegerType::Int64,
+                value,
+            )))
+        };
+        let mut outputs = Vec::new();
+        match operation {
+            Op::RequireKey { position } => {
+                if (integer(position)? as i64) < 0 {
+                    return Ok(Some("P1312"));
+                }
+            }
+            Op::Insert {
+                position,
+                key,
+                value,
+                hash,
+            } => {
+                let position = integer(position)? as usize;
+                let hash = hash.map(integer).transpose()?;
+                if position > collection.entries.borrow().len() {
+                    return Err(InterpreterError::new(
+                        "core collection insertion is out of bounds",
+                    ));
+                }
+                let mut take = |local: mir::LocalId| {
+                    self.current_frame_mut()?.locals[local.0]
+                        .take()
+                        .ok_or_else(|| {
+                            InterpreterError::new("core collection transfers an ended local")
+                        })
+                };
+                let key = key.map(&mut take).transpose()?;
+                let value = take(value)?;
+                collection
+                    .entries
+                    .borrow_mut()
+                    .insert(position, (key, value));
+                if let Some(hash) = hash {
+                    collection.core_hashes.borrow_mut().insert(position, hash);
+                }
+            }
+            Op::Remove {
+                position,
+                key,
+                value,
+            } => {
+                let position = integer(position)? as usize;
+                if position >= collection.entries.borrow().len() {
+                    return Err(InterpreterError::new(
+                        "core collection removal is out of bounds",
+                    ));
+                }
+                let (removed_key, removed_value) = collection.entries.borrow_mut().remove(position);
+                if !collection.core_hashes.borrow().is_empty() {
+                    collection.core_hashes.borrow_mut().remove(position);
+                }
+                if let Some(key) = key {
+                    outputs.push((
+                        key,
+                        removed_key.ok_or_else(|| {
+                            InterpreterError::new("core collection key is missing")
+                        })?,
+                    ));
+                }
+                outputs.push((value, removed_value));
+            }
+            Op::Swap { left, right } => {
+                let left = integer(left)? as usize;
+                let right = integer(right)? as usize;
+                if left >= collection.entries.borrow().len()
+                    || right >= collection.entries.borrow().len()
+                {
+                    return Err(InterpreterError::new(
+                        "core collection swap is out of bounds",
+                    ));
+                }
+                collection.entries.borrow_mut().swap(left, right);
+                if !collection.core_hashes.borrow().is_empty() {
+                    collection.core_hashes.borrow_mut().swap(left, right);
+                }
+            }
+            Op::KeyAt { position, target } => {
+                let position = integer(position)? as usize;
+                let key = collection
+                    .entries
+                    .borrow()
+                    .get(position)
+                    .and_then(|entry| entry.0.clone())
+                    .ok_or_else(|| {
+                        InterpreterError::new("core collection key read is out of bounds")
+                    })?;
+                outputs.push((target, key));
+            }
+            Op::ValueAt { position, target } => {
+                let position = integer(position)? as usize;
+                let value = collection
+                    .entries
+                    .borrow()
+                    .get(position)
+                    .map(|entry| entry.1.clone())
+                    .ok_or_else(|| {
+                        InterpreterError::new("core collection value read is out of bounds")
+                    })?;
+                outputs.push((target, value));
+            }
+            Op::Exchange {
+                position,
+                value,
+                previous,
+            } => {
+                let position = integer(position)? as usize;
+                let replacement = self.current_frame_mut()?.locals[value.0]
+                    .take()
+                    .ok_or_else(|| {
+                        InterpreterError::new("core collection transfers an ended local")
+                    })?;
+                let mut entries = collection.entries.borrow_mut();
+                let entry = entries.get_mut(position).ok_or_else(|| {
+                    InterpreterError::new("core collection replacement is out of bounds")
+                })?;
+                outputs.push((previous, std::mem::replace(&mut entry.1, replacement)));
+            }
+            Op::HashNext {
+                hash,
+                previous,
+                target,
+            } => {
+                let hash = integer(hash)?;
+                let previous = integer(previous)?;
+                let start = if previous == u64::MAX {
+                    0
+                } else {
+                    previous as usize + 1
+                };
+                let position = collection
+                    .core_hashes
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .find_map(|(position, stored)| (*stored == hash).then_some(position as u64))
+                    .unwrap_or(u64::MAX);
+                outputs.push((target, int_value(position)));
+            }
+            Op::HashPosition { slot, target } => {
+                let position = integer(slot)?;
+                if position >= collection.entries.borrow().len() as u64 {
+                    return Err(InterpreterError::new(
+                        "core collection hash candidate is absent",
+                    ));
+                }
+                outputs.push((target, int_value(position)));
+            }
+        }
+        let function = function_in(self.program, self.current_frame()?.function)?;
+        for (target, value) in outputs {
+            let previous = assign_local(
+                self.program,
+                &function.locals,
+                &mut self.current_frame_mut()?.locals,
+                target,
+                value,
+            )?;
+            if previous.is_some() && function.locals[target.0].owned {
+                return Err(InterpreterError::new(
+                    "core collection overwrites an owned result",
+                ));
+            }
+        }
+        Ok(None)
     }
 
     fn shared_interface_payload(
@@ -14600,6 +15027,7 @@ impl Interpreter<'_> {
     fn clear_collection_local(&mut self, local: mir::LocalId) -> Result<(), InterpreterError> {
         let entries = {
             let collection = self.collection_local(local)?;
+            collection.core_hashes.borrow_mut().clear();
             std::mem::take(&mut *collection.entries_mut())
         };
         let mut drops = Vec::new();
@@ -14647,14 +15075,23 @@ impl Interpreter<'_> {
         &mut self,
         local: mir::LocalId,
         transfer: bool,
-    ) -> Result<Option<(usize, crate::class_layout::ClassId)>, InterpreterError> {
+    ) -> Result<Option<(usize, mir::ImplementingType)>, InterpreterError> {
         let value = read_local(&self.current_frame()?.locals, local)?;
         let mut mixed_owner = None;
+        let mut interface_type = None;
         let object = match value {
             LocalValue::Class { object, .. } => Some(*object),
             LocalValue::NullableClass { object, .. } => *object,
-            LocalValue::Error(value) => Some(value.object),
-            LocalValue::NullableError { value, .. } => value.map(|value| value.object),
+            LocalValue::Error(value) => {
+                interface_type =
+                    Some(self.program.interface_vtables[value.vtable.0].implementing_type);
+                Some(value.object)
+            }
+            LocalValue::NullableError { value, .. } => value.map(|value| {
+                interface_type =
+                    Some(self.program.interface_vtables[value.vtable.0].implementing_type);
+                value.object
+            }),
             LocalValue::Mixed(value) | LocalValue::NullableMixed(Some(value)) => match value {
                 MixedValue::Class {
                     object,
@@ -14672,6 +15109,8 @@ impl Interpreter<'_> {
                     ..
                 } => {
                     mixed_owner = Some((Rc::clone(owner), *payload_owned));
+                    interface_type =
+                        Some(self.program.interface_vtables[value.vtable.0].implementing_type);
                     Some(value.object)
                 }
                 _ => None,
@@ -14685,9 +15124,16 @@ impl Interpreter<'_> {
         };
         let parts = object
             .map(|object| {
+                if let Some(
+                    implementing @ (mir::ImplementingType::Collection(_)
+                    | mir::ImplementingType::CollectionIterator(_)),
+                ) = interface_type
+                {
+                    return Ok((object, implementing));
+                }
                 self.heap
                     .get(&object)
-                    .map(|value| (object, value.class))
+                    .map(|value| (object, mir::ImplementingType::Class(value.class)))
                     .ok_or_else(|| {
                         InterpreterError::new("nominal projection uses a destroyed object")
                     })
@@ -14718,9 +15164,11 @@ impl Interpreter<'_> {
             .ok_or_else(|| InterpreterError::new("MIR interface vtable does not exist"))?;
         match table.implementing_type {
             mir::ImplementingType::Class(class) => Ok(class),
-            mir::ImplementingType::Collection(_) => Err(InterpreterError::new(
-                "MIR interface payload is not a class",
-            )),
+            mir::ImplementingType::Collection(_) | mir::ImplementingType::CollectionIterator(_) => {
+                Err(InterpreterError::new(
+                    "MIR interface payload is not a class",
+                ))
+            }
         }
     }
 
@@ -14795,6 +15243,7 @@ impl Interpreter<'_> {
 
     fn push_owned_drop_task(&mut self, drop: OwnedDrop) -> Result<(), InterpreterError> {
         let task = match drop {
+            OwnedDrop::CollectionView(identity) => EvaluationTask::ReleaseCollectionView(identity),
             OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
             OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
             OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
@@ -14803,10 +15252,31 @@ impl Interpreter<'_> {
             OwnedDrop::SharedAccess { control, writable } => {
                 EvaluationTask::ReleaseSharedAccess { control, writable }
             }
-            OwnedDrop::Error(value) => EvaluationTask::DropObject {
-                object: value.object,
-                class: self.interface_class(value)?,
-            },
+            OwnedDrop::Error(value) => {
+                match self.program.interface_vtables[value.vtable.0].implementing_type {
+                    mir::ImplementingType::Class(class) => EvaluationTask::DropObject {
+                        object: value.object,
+                        class,
+                    },
+                    mir::ImplementingType::Collection(_) => {
+                        let collection = self
+                            .interface_collections
+                            .remove(&value.object)
+                            .ok_or_else(|| {
+                                InterpreterError::new("collection interface was destroyed twice")
+                            })?;
+                        return self.queue_value_drops(LocalValue::Collection(collection));
+                    }
+                    mir::ImplementingType::CollectionIterator(_) => {
+                        self.collection_iterators
+                            .remove(&value.object)
+                            .ok_or_else(|| {
+                                InterpreterError::new("collection cursor was destroyed twice")
+                            })?;
+                        return Ok(());
+                    }
+                }
+            }
             OwnedDrop::Function(value) => EvaluationTask::DropFunctionValue(value),
         };
         self.current_frame_mut()?.tasks.push(task);
@@ -15844,6 +16314,9 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
 }
 
 fn collect_owned_objects_from_collection(collection: CollectionValue, drops: &mut Vec<OwnedDrop>) {
+    drops.push(OwnedDrop::CollectionView(
+        Rc::as_ptr(&collection.entries) as usize
+    ));
     collect_owned_objects_from_entries(collection.entries().iter().cloned(), drops);
 }
 

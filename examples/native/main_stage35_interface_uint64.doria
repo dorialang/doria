@@ -1,0 +1,42 @@
+class Limits
+{
+    const uint64 HIGH = 9223372036854775808;
+    function __construct(uint64 $value = 18446744073709551615) {}
+}
+
+function identity(uint64 $value): uint64 { return $value; }
+function empty(): mixed { return null; }
+function consume(take mixed $value): void {}
+
+function main(): void
+{
+    let $limits = new Limits();
+    uint64 $maximum = identity($limits->value);
+    uint64 $high = Limits::HIGH;
+    uint64 $zero = 0;
+    echo "{$maximum} {$high} {$maximum > $high} {$zero < $high}\n";
+    echo sprintf("%d %x %o %b %s\n", $maximum, $maximum, $high, $high, $maximum);
+
+    ?uint64 $optional = $maximum;
+    if ($optional != null) { echo "optional {$optional}\n"; }
+    mixed $boxed = $high;
+    if ($boxed is uint64) { echo "boxed {$boxed}\n"; }
+    writable mixed $replacement = null;
+    $replacement = $high;
+    if ($replacement is uint64) { echo "replacement {$replacement}\n"; }
+    $replacement = empty();
+    $replacement = null;
+    consume(null);
+
+    Dictionary<uint64, uint64> $dictionary = [$maximum => $high, $zero => $maximum];
+    foreach ($dictionary as uint64 $key => uint64 $value) { echo "{$key}:{$value}\n"; }
+    SortedDictionary<uint64, uint64> $sorted = SortedDictionary::from($dictionary);
+    foreach ($sorted as uint64 $key => uint64 $value) { echo "sorted {$key}:{$value}\n"; }
+
+    SortedSet<uint64> $set = SortedSet::from([$maximum, $zero, $high]);
+    SortedSet<uint64> $empty = SortedSet::from([]);
+    let $union = $set->union($empty);
+    foreach ($union as uint64 $value) { echo "set {$value}\n"; }
+    let writable $queue = PriorityQueue::from([$maximum, $zero, $high]);
+    echo "queue " . ($queue->pop() ?? $maximum) . " " . ($queue->pop() ?? $maximum) . " " . ($queue->pop() ?? $maximum) . "\n";
+}

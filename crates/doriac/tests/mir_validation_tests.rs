@@ -38,6 +38,64 @@ fn assert_malformed(program: &Program, expected: &str) {
 }
 
 #[test]
+fn mixed_null_is_neutral_but_borrowed_values_cannot_become_owners() {
+    let source = r#"
+function inspect(mixed $value): void {
+    mixed $owned = 42;
+}
+function empty(): mixed { return null; }
+function consume(take mixed $value): void {}
+function main(): void {
+    writable mixed $value = null;
+    $value = 42;
+    $value = null;
+    $value = empty();
+    inspect(null);
+    consume(null);
+}
+"#;
+    let valid = doriac::lower_source_to_mir("mixed-null-ownership.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&valid).unwrap();
+    doriac::mir_interpreter::interpret(&valid).unwrap();
+    for (owned, expected) in [
+        (true, "receives a borrowed value"),
+        (false, "receives an owning value"),
+    ] {
+        let mut malformed = valid.clone();
+        let function = malformed
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "inspect")
+            .unwrap();
+        let local = function
+            .locals
+            .iter_mut()
+            .find(|local| local.name == "owned")
+            .unwrap();
+        local.owned = owned;
+        if owned {
+            let target_local = local.id;
+            let value = function
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.statements)
+                .find_map(|statement| match statement {
+                    Statement::AssignLocal { target, value } if *target == target_local => {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            *value = Rvalue::Mixed(MixedExpression::Local {
+                local: function.params[0],
+                transfer: false,
+            });
+        }
+        assert_malformed(&malformed, expected);
+    }
+}
+
+#[test]
 fn shared_validator_requires_a_dominating_hierarchy_proof_for_narrowed_class_locals() {
     let source = r#"
 open class Shape {}
@@ -3007,6 +3065,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
         ty: Type::String,
         writable: false,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(ClassId(0), [(label, FieldType::String)], 8);
     let mut receiver = class_local(0, ClassId(0));
@@ -3266,6 +3325,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         ty: Type::Class(ClassId(1)),
         writable: false,
         promoted: true,
+        borrowed_source: false,
     }];
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -3813,6 +3873,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
         writable: false,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -4064,6 +4125,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: true,
+            borrowed_source: false,
         },
         Property {
             id: second,
@@ -4071,6 +4133,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: true,
+            borrowed_source: false,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -4164,6 +4227,7 @@ fn shared_validator_rejects_reusing_a_class_local_for_properties() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
+            borrowed_source: false,
         },
         Property {
             id: second,
@@ -4171,6 +4235,7 @@ fn shared_validator_rejects_reusing_a_class_local_for_properties() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
+            borrowed_source: false,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -4241,6 +4306,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
+            borrowed_source: false,
         },
         Property {
             id: second,
@@ -4248,6 +4314,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
+            borrowed_source: false,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -4337,6 +4404,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         ty: Type::Class(ClassId(1)),
         writable: false,
         promoted: true,
+        borrowed_source: false,
     }];
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -4486,6 +4554,7 @@ fn shared_validator_keeps_initializer_borrows_live_through_constructor_arguments
         ty: Type::String,
         writable: false,
         promoted: false,
+        borrowed_source: false,
     }];
     program.classes[1].layout = compute_class_layout(ClassId(1), [(source, FieldType::String)], 8);
     program.functions[0].locals.push(class_local(1, ClassId(1)));
@@ -4565,6 +4634,7 @@ fn shared_validator_requires_class_properties_in_construction_order() {
         ty: Type::String,
         writable: false,
         promoted: true,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -4621,6 +4691,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         ty: Type::String,
         writable: false,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -4907,6 +4978,7 @@ function main(): void
         ty: Type::String,
         writable: true,
         promoted: false,
+        borrowed_source: false,
     });
     outside_constructor.classes[0].layout =
         compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -4972,6 +5044,7 @@ fn shared_validator_rejects_property_assignments_that_transfer_the_receiver() {
         ty: Type::Class(ClassId(0)),
         writable: true,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5018,6 +5091,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
             ty: Type::String,
             writable: true,
             promoted: false,
+            borrowed_source: false,
         },
         Property {
             id: other,
@@ -5025,6 +5099,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
             ty: Type::String,
             writable: false,
             promoted: false,
+            borrowed_source: false,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -5126,6 +5201,7 @@ fn shared_validator_enforces_property_and_receiver_mutability() {
             ty: Type::String,
             writable: property_writable,
             promoted: false,
+            borrowed_source: false,
         });
         program.classes[0].layout =
             compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -5245,6 +5321,7 @@ fn shared_validator_rejects_unknown_property_class_references() {
         ty: Type::Class(ClassId(99)),
         writable: false,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5682,6 +5759,7 @@ fn shared_validator_rejects_class_use_after_a_transfer_on_any_reachable_path() {
         ty: Type::String,
         writable: false,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout =
         compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -5801,6 +5879,7 @@ fn shared_validator_requires_owned_nullable_class_property_values() {
         ty: Type::NullableClass(ClassId(1)),
         writable: true,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5844,6 +5923,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         ty: Type::NullableClass(ClassId(1)),
         writable: false,
         promoted: true,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5931,6 +6011,7 @@ fn shared_validator_checks_nullable_class_property_references() {
         ty: Type::NullableClass(ClassId(99)),
         writable: false,
         promoted: false,
+        borrowed_source: false,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -6297,6 +6378,7 @@ fn class_new_program() -> Program {
         ty: Type::String,
         writable: false,
         promoted: true,
+        borrowed_source: false,
     });
     program.classes[0].layout =
         compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -6368,6 +6450,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         ty: Type::Class(ClassId(1)),
         writable: true,
         promoted: true,
+        borrowed_source: false,
     });
     program.classes[0].layout =
         compute_class_layout(ClassId(0), [(child, FieldType::Class(ClassId(1)))], 8);

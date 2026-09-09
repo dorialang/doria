@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete and Stage 35 interfaces and traits Slices 1 and 2 are complete and Slice 3 is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete and Stage 35 interfaces and traits Slices 1, 2, and 3 are complete and Slice 4 is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -481,7 +481,7 @@ lean compiler-private records, not reflective function signatures. Logical
 capture order remains source order; physical environment fields may reorder
 privately while preserving logical acquisition and destruction.
 
-Stage 30g adds `map`, Copy-only preserving `filter`, and writable-accumulator
+Stage 30g adds `map`, preserving `filter`, and writable-accumulator
 `reduce` to `List<T>` only. Their callbacks are nonescaping, process elements in
 insertion order, and propagate the callback's checked effects. A
 readonly-repeatable callback is borrowed readonly. A writable-repeatable callback
@@ -492,7 +492,9 @@ methods lower through explicit algorithm HIR and one validated MIR traversal CFG
 for the debug interpreter, Cranelift, and LLVM. PHP compatibility emits the same
 ordered behavior through compiler-generated loops rather than host array
 higher-order functions. Checked failure destroys a partial result or reduce
-accumulator exactly once and leaves the source list unchanged.
+accumulator exactly once and leaves the source list unchanged. Stage 35 Slice 3
+widens preserving `filter` to Copy-or-Cloneable elements: selected Move elements
+are cloned once, in traversal order, through the checked nominal contract.
 
 ### Current compiler support
 
@@ -848,6 +850,12 @@ Generic classes are instantiated in type positions and construction expressions 
 
 Constraint declarations use `<T implements A, B>`, and constraints may themselves be generic. Compiler-known `Comparable`, `Hashable`, `Equatable`, and `Displayable` constraints are checked at instantiation without boxing primitives. Stage 35 Slice 1 implements nominal user-interface constraints and statically specializes their concrete method calls. Type parameters are invariant. Doria v1.0 has no default type arguments, compile-time value arguments, call-site turbofish, or runtime generic reflection.
 
+Nullable types do not inherit `Hashable` or `Comparable` conformance from their
+payload. Hash collections, sorted collections, and priority queues require the
+key or element type itself to satisfy the applicable contract. Nullable equality
+and preserving duplication have explicit absence handling, not a null hash or
+null ordering.
+
 ### Fixed-width integers
 
 Stage 13 implements these canonical integer types through semantic analysis, typed MIR, the debug interpreter, and Cranelift:
@@ -1128,9 +1136,10 @@ let $zeros = [0; $count]; // List<int>
 runtime `int` count is evaluated once. A constant-negative count is a compile
 error, a runtime-negative count panics with `fill count is negative`, and zero
 produces an empty sequence. Copy scalars are bit-copied; immutable string
-handles are shared. The repeat form is rejected for `Set` and `Dictionary`, and
-move-type elements remain unavailable until the `Cloneable` contract can define
-their replication.
+handles are shared. Move elements require the nominal `Cloneable` contract and
+are cloned once per output slot in ascending order. Nullable absence is copied
+without calling `clone`; a present value uses its underlying duplication plan.
+The repeat form is rejected for `Set` and `Dictionary`.
 
 `let` declarations infer simple literal and constructor types:
 
@@ -1691,8 +1700,10 @@ through one two-word data/vtable carrier. Class and ancestor conversions retain
 the original allocation, ownership, and borrow root; vtables are immutable and
 calls use checked constant slots. Error and Displayable use this same machinery,
 including Error subinterfaces and all six shared/weak/access interface families.
-E0758 is retired and remains reserved. New core-contract operations and public
-iteration use E0759 (Slice 3); trait composition uses E0493 (Slice 4).
+Stage 35 Slice 3 executes core contracts, Copy-or-Cloneable preserving operations,
+and public iteration with retained source and current-element provenance.
+E0758 and E0759 are retired and remain reserved; trait composition uses E0493
+(Slice 4).
 Invalid declarations and primitive interface erasure receive language
 diagnostics, not a future-feature excuse. No conversion adds an object header,
 wrapper allocation, or owner; borrowed views cannot escape their root or lease.
@@ -2075,7 +2086,7 @@ As native code generation matures, Doria IR may lower into a simpler native-orie
 
 MIR is Doria's native-oriented, backend-independent control-flow representation for the executable subset. It contains typed scalar, string, nullable-string, and class locals, parameters, calls and returns; class allocation, compiler-known property initialization/load/store, explicit ownership transfer and drops; method identities with explicit receiver operands and receiver modes; static data operations; runtime string literal/local/call/concatenation/display expressions; string comparison; basic blocks; checked numeric operations/conversions; and panic termination. Constants are typed and evaluated before MIR, so consumers receive folded values rather than a second evaluator. The debug interpreter uses safe private string and class values, an explicit heap-backed Doria frame stack, per-program static storage, and exact stdout/stderr buffers. It models source value and lifetime behavior, not native pointer/refcount layout. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states.
 
-Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, headerless class payload allocation/free, typed-array/collection/byte-buffer/mixed-box/shared-control storage, immutable refcounted runtime strings, text and binary I/O, formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar/string conventions, one-word closed-class/collection/`Bytes`/`mixed` handles, two-word open-class/interface/shared-interface carriers, and their nullable ABI conventions. Normal cleanup drops still-owned class, collection, mixed, strong-reference, weak-reference, access-object, and nullable-strong locals and statement temporaries on fallthrough, `return`, `break`, and `continue`; invokes `__destruct` before reverse-order owned-property/element cleanup; releases writable-family access registrations before their strong claims; and frees the relevant payload or control block last. Ordinary instance/static calls preserve those obligations. Owning class, collection, mixed, shared-handle, access-object, nullable-class, nullable-mixed, and nullable-strong returns transfer ownership, while Decision 0089 returned-borrow elision preserves an inferred readonly or writable alias to `$this` or exactly one borrowed parameter; only explicit `take` parameters and collection ingestion consume move arguments. Copy-type statics are private compiler-generated data symbols; compile-time string statics use an immortal private runtime representation and remain Copy at the Doria surface. Ownership transfer suppresses source cleanup, assignment acquires the replacement before dropping the old value, and abort-only panic runs no cleanup. Constructor definite initialization follows Decision 0090: semantic dataflow checks every reachable normal path, and MIR validation independently rejects incomplete or multiply initialized readonly property state before either native backend runs. Runtime failures use the shared panic path, except that an ordinary program write to a closed stdout or stderr pipe exits cleanly with status 0 under Decision 0091; panic reporting remains fatal even when its stderr sink is unavailable. Only canonical int/void entry results cross the process boundary. Stage 35 Slice 2 adds general interface carriers, checked erased dispatch, and dynamic drop across those paths. Unsupported coverage remains for scalar/string writable-shared payload access, shared handles through `mixed`, Slice 3 core operations/public iteration, and Slice 4 trait composition.
+Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, headerless class payload allocation/free, typed-array/collection/byte-buffer/mixed-box/shared-control storage, immutable refcounted runtime strings, text and binary I/O, formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar/string conventions, one-word closed-class/collection/`Bytes`/`mixed` handles, two-word open-class/interface/shared-interface carriers, and their nullable ABI conventions. Normal cleanup drops still-owned class, collection, mixed, strong-reference, weak-reference, access-object, and nullable-strong locals and statement temporaries on fallthrough, `return`, `break`, and `continue`; invokes `__destruct` before reverse-order owned-property/element cleanup; releases writable-family access registrations before their strong claims; and frees the relevant payload or control block last. Ordinary instance/static calls preserve those obligations. Owning class, collection, mixed, shared-handle, access-object, nullable-class, nullable-mixed, and nullable-strong returns transfer ownership, while Decision 0089 returned-borrow elision preserves an inferred readonly or writable alias to `$this` or exactly one borrowed parameter; only explicit `take` parameters and collection ingestion consume move arguments. Copy-type statics are private compiler-generated data symbols; compile-time string statics use an immortal private runtime representation and remain Copy at the Doria surface. Ownership transfer suppresses source cleanup, assignment acquires the replacement before dropping the old value, and abort-only panic runs no cleanup. Constructor definite initialization follows Decision 0090: semantic dataflow checks every reachable normal path, and MIR validation independently rejects incomplete or multiply initialized readonly property state before either native backend runs. Runtime failures use the shared panic path, except that an ordinary program write to a closed stdout or stderr pipe exits cleanly with status 0 under Decision 0091; panic reporting remains fatal even when its stderr sink is unavailable. Only canonical int/void entry results cross the process boundary. Stage 35 Slice 2 adds general interface carriers, checked erased dispatch, and dynamic drop across those paths. Unsupported coverage remains for scalar/string writable-shared payload access, shared handles through `mixed`, and Slice 4 trait composition.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -2085,6 +2096,7 @@ The PHP backend is currently implemented as a compatibility/debugging backend. I
 - Typed arrays and collection aliases are emitted as `array` for the current PHP backend only.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
 - `int`/`int64` remain the exact supported signed-integer alias subset.
+- `uint64` transport, constants/defaults, display/formatting, comparison, and collection ordering preserve all 64 bits on 64-bit PHP. The backend uses a private signed bit-pattern representation, not a floating-point conversion; this does not enable otherwise unsupported arithmetic or conversions.
 - Checked arithmetic, nondefault widths, unsigned semantics, division/remainder, shifts/bitwise operations, and integer companion conversions produce a clear backend unsupported-feature diagnostic whenever PHP cannot preserve the Doria behavior exactly.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
@@ -2097,7 +2109,6 @@ Future work includes:
 
 - Better diagnostics with suggestions.
 - Full type inference for lists and dictionaries.
-- Core-contract operation activation and public iteration (Stage 35 Slice 3).
 - Class-body/trait-body `uses` trait composition (Stage 35 Slice 4).
 - Multi-file package-graph resolution for imports and qualified names.
 - Resolution of accepted `include` syntax as required include-once compile-time source inclusion.

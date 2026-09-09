@@ -231,6 +231,7 @@ pub struct TypeParamDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
+    pub borrow: bool,
     pub constructor_role: ConstructorParameterRole,
     pub inherited_property: Option<InheritedPropertyIdentity>,
     pub role_and_mode_prefix_span: Span,

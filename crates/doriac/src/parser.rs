@@ -1847,18 +1847,26 @@ impl Parser {
             };
         }
         let ownership_modifier_insert = self.span(self.peek().span.start, self.peek().span.start);
+        let mut borrow_span = None;
         let mut take_span = None;
         let mut writable_span = None;
-        while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
+        while matches!(
+            self.peek().kind,
+            TokenKind::Take | TokenKind::Writable | TokenKind::Borrow
+        ) {
             let token = self.advance().clone();
             match token.kind {
                 TokenKind::Take if take_span.is_none() => take_span = Some(token.span),
+                TokenKind::Borrow if borrow_span.is_none() => borrow_span = Some(token.span),
                 TokenKind::Writable if writable_span.is_none() => writable_span = Some(token.span),
                 TokenKind::Take => self.error("duplicate `take` parameter modifier", token.span),
+                TokenKind::Borrow => {
+                    self.error("duplicate `borrow` parameter modifier", token.span)
+                }
                 TokenKind::Writable => {
                     self.error("duplicate `writable` parameter modifier", token.span)
                 }
-                _ => unreachable!("modifier loop accepts only take/writable"),
+                _ => unreachable!("modifier loop accepts only parameter modes"),
             }
         }
         if matches!(
@@ -2024,6 +2032,7 @@ impl Parser {
         let param = Param {
             constructor_role,
             role_and_mode_prefix_span: self.span(start, type_start),
+            borrow_span,
             take: take_span.is_some(),
             take_span,
             writable: writable_span.is_some(),
@@ -5379,6 +5388,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Let => "let",
         TokenKind::With => "with",
         TokenKind::Take => "take",
+        TokenKind::Borrow => "borrow",
         TokenKind::Once => "once",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",

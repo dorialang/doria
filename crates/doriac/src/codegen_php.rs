@@ -18,6 +18,7 @@ use crate::source::Span;
 use crate::symbols::{BindingId, BuiltinInterface};
 use crate::types::{ResolvedType, TypeRef};
 
+mod core_collection;
 mod interface;
 mod shared;
 mod specialization;
@@ -180,6 +181,8 @@ function __doria_assertion_presentation(mixed $value, string $type): string
     } elseif ($type === "string" || $type === "?string") {
         $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         $presentation = $encoded === false ? "\"<invalid string>\"" : $encoded;
+    } elseif ($type === "uint64" || $type === "?uint64") {
+        $presentation = sprintf('%u', $value);
     } elseif ($type === "Bytes" || str_ends_with($type, "[]") ||
         preg_match('/^(List|Dictionary|SortedDictionary|Set|SortedSet|PriorityQueue|Deque)</', $type) === 1
     ) {
@@ -223,6 +226,7 @@ function __doria_assertion_item_presentation(mixed $value, string $type): string
 {
     if ($value === null) { return "null"; }
     $type = ltrim($type, '?');
+    if ($type === 'uint64') { return sprintf('%u', $value); }
     if ($type === 'string') {
         $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         return $encoded === false ? '"<invalid string>"' : $encoded;
@@ -489,8 +493,13 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
 const PHP_STAGE26_COLLECTION_HELPERS: &str = r#"
 abstract class __DoriaOrderedCollection
 {
-    protected static function compare(mixed $left, mixed $right): int
+    public function __construct(protected bool $unsigned = false) {}
+
+    abstract public function clear(): void;
+
+    protected function compare(mixed $left, mixed $right): int
     {
+        if ($this->unsigned) { return ($left ^ PHP_INT_MIN) <=> ($right ^ PHP_INT_MIN); }
         if (is_string($left)) { return strcmp($left, $right); }
         if (is_bool($left)) { return ((int) $left) <=> ((int) $right); }
         return $left <=> $right;
@@ -500,6 +509,7 @@ abstract class __DoriaOrderedCollection
     {
         $keys = array_keys($values);
         for ($index = count($keys) - 1; $index >= 0; --$index) {
+            __doria_drop_value($values[$keys[$index]]);
             unset($values[$keys[$index]]);
         }
     }
@@ -509,6 +519,8 @@ abstract class __DoriaOrderedCollection
         $keys = array_keys($pairs);
         for ($index = count($keys) - 1; $index >= 0; --$index) {
             $key = $keys[$index];
+            __doria_drop_value($pairs[$key][1]);
+            __doria_drop_value($pairs[$key][0]);
             unset($pairs[$key][1]);
             unset($pairs[$key][0]);
             unset($pairs[$key]);
@@ -521,13 +533,41 @@ function __doria_assertion_collection_count(mixed $collection): int
     return is_array($collection) ? count($collection) : $collection->count;
 }
 
-function __doria_assertion_collection_contains(mixed $collection, mixed $value): bool
+function __doria_collection_index_of(mixed $collection, mixed $value, ?callable $equals = null): ?int
 {
-    if (!is_array($collection)) { return $collection->contains($value); }
+    $index = 0;
     foreach ($collection as $candidate) {
-        if (__doria_equal($candidate, $value)) { return true; }
+        if ($equals === null ? __doria_equal($candidate, $value) : $equals($candidate, $value)) { return $index; }
+        ++$index;
     }
-    return false;
+    return null;
+}
+
+function __doria_primitive_set_from(array $source): array
+{
+    $seen = [];
+    $result = [];
+    foreach ($source as $value) {
+        $key = is_string($value) ? "s:" . $value : (is_bool($value) ? "b:" . (int) $value : "i:" . $value);
+        if (!isset($seen[$key])) { $seen[$key] = true; $result[] = $value; }
+    }
+    return $result;
+}
+
+function __doria_list_remove(array &$collection, mixed $value, ?callable $equals = null): bool
+{
+    $index = __doria_collection_index_of($collection, $value, $equals);
+    if ($index === null) { return false; }
+    $removed = array_splice($collection, $index, 1);
+    __doria_drop_value($removed[0]);
+    return true;
+}
+
+function __doria_assertion_collection_contains(mixed $collection, mixed $value, ?callable $equals = null): bool
+{
+    if ($collection instanceof __DoriaCoreCollection) { return $collection->contains($value); }
+    if ($equals === null && !is_array($collection)) { return $collection->contains($value); }
+    return __doria_collection_index_of($collection, $value, $equals) !== null;
 }
 
 function __doria_assertion_dictionary_has_key(mixed $collection, mixed $key): bool
@@ -537,29 +577,34 @@ function __doria_assertion_dictionary_has_key(mixed $collection, mixed $key): bo
         : $collection->containsKey($key);
 }
 
-function __doria_assertion_dictionary_has_value(mixed $collection, mixed $value): bool
+function __doria_assertion_dictionary_has_value(mixed $collection, mixed $value, ?callable $equals = null): bool
 {
-    if (!is_array($collection)) { return $collection->containsValue($value); }
-    foreach ($collection as $candidate) {
-        if (__doria_equal($candidate, $value)) { return true; }
-    }
-    return false;
+    if ($equals === null && !is_array($collection)) { return $collection->containsValue($value); }
+    return __doria_collection_index_of($collection, $value, $equals) !== null;
 }
 
 final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAccess, IteratorAggregate
 {
     private array $entries = [];
 
-    public static function from(array $source): self
+    public static function from(array $source, bool $unsigned = false, ?callable $duplicate = null): self
     {
-        $pairs = [];
-        foreach ($source as $key => $value) { $pairs[] = [$key, $value]; }
-        return self::fromPairs($pairs);
+        $result = new self($unsigned);
+        try {
+            foreach ($source as $key => $value) {
+                $result->entries[] = [$key, $duplicate === null ? $value : $duplicate($value)];
+            }
+            usort($result->entries, fn($left, $right) => $result->compare($left[0], $right[0]));
+        } catch (__DoriaCheckedError $error) {
+            $result->clear();
+            throw $error;
+        }
+        return $result;
     }
 
-    public static function fromPairs(array $pairs): self
+    public static function fromPairs(array $pairs, bool $unsigned = false): self
     {
-        $result = new self();
+        $result = new self($unsigned);
         foreach ($pairs as $pair) { $result->set($pair[0], $pair[1]); }
         return $result;
     }
@@ -570,7 +615,7 @@ final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAc
         $high = count($this->entries);
         while ($low < $high) {
             $middle = $low + intdiv($high - $low, 2);
-            $order = self::compare($this->entries[$middle][0], $key);
+            $order = $this->compare($this->entries[$middle][0], $key);
             if ($order < 0) { $low = $middle + 1; }
             elseif ($order > 0) { $high = $middle; }
             else { return [true, $middle]; }
@@ -652,9 +697,9 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
 {
     private array $values = [];
 
-    public static function from(array $source): self
+    public static function from(array $source, bool $unsigned = false): self
     {
-        $result = new self();
+        $result = new self($unsigned);
         foreach ($source as $value) { $result->add($value); }
         return $result;
     }
@@ -665,7 +710,7 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
         $high = count($this->values);
         while ($low < $high) {
             $middle = $low + intdiv($high - $low, 2);
-            $order = self::compare($this->values[$middle], $value);
+            $order = $this->compare($this->values[$middle], $value);
             if ($order < 0) { $low = $middle + 1; }
             elseif ($order > 0) { $high = $middle; }
             else { return [true, $middle]; }
@@ -700,7 +745,7 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
 
     private function algebra(self $other, string $operation): self
     {
-        $result = new self();
+        $result = new self($this->unsigned);
         foreach ($this->values as $value) {
             if ($operation === 'union' || ($operation === 'intersect') === $other->contains($value)) {
                 $result->add($value);
@@ -731,9 +776,9 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
 final class PriorityQueue extends __DoriaOrderedCollection
 {
     private array $heap = [];
-    public static function from(array $source): self
+    public static function from(array $source, bool $unsigned = false): self
     {
-        $result = new self();
+        $result = new self($unsigned);
         $result->heap = array_values($source);
         for ($root = intdiv(count($result->heap), 2) - 1; $root >= 0; --$root) {
             $result->siftDown($root);
@@ -745,9 +790,9 @@ final class PriorityQueue extends __DoriaOrderedCollection
         $length = count($this->heap);
         while (($left = $parent * 2 + 1) < $length) {
             $right = $left + 1;
-            $child = $right < $length && self::compare($this->heap[$right], $this->heap[$left]) < 0
+            $child = $right < $length && $this->compare($this->heap[$right], $this->heap[$left]) < 0
                 ? $right : $left;
-            if (self::compare($this->heap[$parent], $this->heap[$child]) <= 0) { return; }
+            if ($this->compare($this->heap[$parent], $this->heap[$child]) <= 0) { return; }
             [$this->heap[$parent], $this->heap[$child]] = [$this->heap[$child], $this->heap[$parent]];
             $parent = $child;
         }
@@ -758,7 +803,7 @@ final class PriorityQueue extends __DoriaOrderedCollection
         $child = count($this->heap) - 1;
         while ($child > 0) {
             $parent = intdiv($child - 1, 2);
-            if (self::compare($this->heap[$parent], $this->heap[$child]) <= 0) { break; }
+            if ($this->compare($this->heap[$parent], $this->heap[$child]) <= 0) { break; }
             [$this->heap[$parent], $this->heap[$child]] = [$this->heap[$child], $this->heap[$parent]];
             $child = $parent;
         }
@@ -799,10 +844,15 @@ final class Deque extends __DoriaOrderedCollection implements IteratorAggregate
     private int $head = 0;
     private int $count = 0;
     private int $capacity = 4;
-    public static function from(array $source): self
+    public static function from(array $source, ?callable $duplicate = null): self
     {
         $result = new self();
-        foreach ($source as $value) { $result->pushBack($value); }
+        try {
+            foreach ($source as $value) { $result->pushBack($duplicate === null ? $value : $duplicate($value)); }
+        } catch (__DoriaCheckedError $error) {
+            $result->clear();
+            throw $error;
+        }
         return $result;
     }
     private function grow(): void
@@ -865,6 +915,7 @@ final class Deque extends __DoriaOrderedCollection implements IteratorAggregate
         $this->head = 0;
         $this->count = 0;
         for ($offset = $count - 1; $offset >= 0; --$offset) {
+            __doria_drop_value($values[($head + $offset) % $capacity]);
             unset($values[($head + $offset) % $capacity]);
         }
     }
@@ -957,8 +1008,12 @@ function __doria_drop_value(mixed &$value): void
         __doria_drop_value($payload);
     } elseif ($value instanceof __DoriaFunctionValue) {
         $value->__doriaDrop();
+    } elseif ($value instanceof __DoriaCell) {
+        __doria_drop_cell($value);
     } elseif ($value instanceof __DoriaSharedHandle) {
         $value->drop();
+    } elseif ($value instanceof __DoriaOrderedCollection) {
+        $value->clear();
     } elseif ($value instanceof __DoriaOwnedObject) {
         $value->__destruct();
     } elseif (is_array($value)) {
@@ -1293,12 +1348,17 @@ fn php_mir_type(
         mir::Type::NullableFunction(_) => "?__DoriaFunctionValue".to_string(),
         mir::Type::Collection(id) | mir::Type::NullableCollection(id) => {
             let nullable = matches!(ty, mir::Type::NullableCollection(_));
-            let base = match program.collection_types[id.0].kind {
-                mir::CollectionKind::SortedDictionary => "__DoriaSortedDictionary",
-                mir::CollectionKind::SortedSet => "__DoriaSortedSet",
-                mir::CollectionKind::PriorityQueue => "__DoriaPriorityQueue",
-                mir::CollectionKind::Deque => "__DoriaDeque",
-                _ => "array",
+            let definition = &program.collection_types[id.0];
+            let base = if definition.uses_core_operations() {
+                "__DoriaCoreCollection"
+            } else {
+                match definition.kind {
+                    mir::CollectionKind::SortedDictionary => "__DoriaSortedDictionary",
+                    mir::CollectionKind::SortedSet => "__DoriaSortedSet",
+                    mir::CollectionKind::PriorityQueue => "__DoriaPriorityQueue",
+                    mir::CollectionKind::Deque => "__DoriaDeque",
+                    _ => "array",
+                }
             };
             if nullable {
                 format!("?{base}")
@@ -1352,6 +1412,7 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
     }
     interface::emit_declarations(&program.semantic_info, &mut output);
     output.push_str(PHP_STAGE26_COLLECTION_HELPERS);
+    output.push_str(core_collection::RUNTIME);
     emit_php_closure_runtime(&closure_plan, &specialization, mir, &mut output);
     output.push_str(shared::RUNTIME);
     output.push_str("$__doria_sources = [\n");
@@ -2219,7 +2280,8 @@ function __doria_printf(
     scopes.specialization = specialization;
     scopes.whens = program.semantic_info.whens.clone();
     scopes.given_preludes = program.semantic_info.given_preludes.clone();
-    scopes.expression_types = program.semantic_info.expression_types.clone();
+    scopes.expression_types = php_expression_types(&program.semantic_info);
+    scopes.interface_conversion_types = program.semantic_info.interface_conversion_types.clone();
     scopes.type_test_types = program.semantic_info.type_test_types.clone();
     scopes.mixed_box_plans = program.semantic_info.mixed_box_plans.clone();
     scopes.throw_error_types = program.semantic_info.throw_error_types.clone();
@@ -2296,6 +2358,17 @@ struct PhpValidation<'a> {
     shared_construction_types: HashMap<Span, ResolvedType>,
 }
 
+fn php_expression_types(semantic: &SemanticInfo) -> HashMap<Span, ResolvedType> {
+    let mut types = semantic.expression_types.clone();
+    types.extend(semantic.collection_construction_types.clone());
+    for (span, integer) in &semantic.integer_expression_types {
+        if matches!(types.get(span), Some(ResolvedType::Integer(_))) {
+            types.insert(*span, ResolvedType::Integer(*integer));
+        }
+    }
+    types
+}
+
 impl std::ops::Deref for PhpValidation<'_> {
     type Target = SemanticInfo;
     fn deref(&self) -> &Self::Target {
@@ -2324,7 +2397,7 @@ impl<'a> PhpValidation<'a> {
             semantic,
             plan,
             substitutions,
-            expression_types: specialize(&semantic.expression_types),
+            expression_types: specialize(&php_expression_types(semantic)),
             shared_construction_types: specialize(&semantic.shared_construction_types),
         }
     }
@@ -2498,17 +2571,15 @@ fn validate_evaluated_value(
 
 fn validate_const_value(value: &ConstValue, span: Span) -> Result<(), BackendError> {
     match value {
-        ConstValue::Integer(value) if !value.ty.is_default_int() => Err(unsupported_integer_shape(
-            span,
-            format!(
-                "Doria `{}` width and signedness with PHP's single signed integer type",
-                value.ty.source_name()
-            ),
-        )),
-        ConstValue::Integer(value) if value.mathematical_value() > i64::MAX as i128 => {
+        ConstValue::Integer(value)
+            if !value.ty.is_default_int() && value.ty != IntegerType::UInt64 =>
+        {
             Err(unsupported_integer_shape(
                 span,
-                "an integer constant outside PHP's signed integer range",
+                format!(
+                    "Doria `{}` width and signedness with PHP's single signed integer type",
+                    value.ty.source_name()
+                ),
             ))
         }
         ConstValue::Float(value) if !value.ty.is_default_float() => Err(unsupported_numeric_shape(
@@ -2659,6 +2730,7 @@ fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<Strin
                 ClassMember::Method(method) if method.name == "__construct" => {
                     method.params.iter().any(|parameter| {
                         parameter.constructor_role.is_promoted()
+                            && !parameter.borrow
                             && php_type_ref_needs_explicit_drop(
                                 &parameter.ty,
                                 &drop_classes,
@@ -2703,10 +2775,7 @@ fn validate_type(
 fn validate_resolved_type(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
     match ty {
         ResolvedType::SharedHandle(_, payload) => {
-            if !matches!(
-                payload.as_ref(),
-                ResolvedType::Interface(_) | ResolvedType::Error
-            ) {
+            if !shared::supported_payload(ty) {
                 return Err(unsupported_shared_ownership(span));
             }
             validate_resolved_type(payload, span)
@@ -2833,7 +2902,7 @@ fn validate_statement(
                         matches!(
                             ty,
                             ResolvedType::SortedDictionary(_, _) | ResolvedType::Deque(_)
-                        )
+                        ) || core_collection::uses_receiver(ty)
                     });
                 if !supported {
                     return Err(unsupported_collection_shape(
@@ -2989,7 +3058,9 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         | Expr::Bool { .. }
         | Expr::Null { .. } => Ok(()),
         Expr::Int { value, span } => {
-            if parse_decimal_magnitude(value).is_some_and(|value| value > i64::MAX as u128) {
+            if parse_decimal_magnitude(value).is_some_and(|value| value > i64::MAX as u128)
+                && !is_uint64(semantic_info.expression_type(*span))
+            {
                 return Err(unsupported_integer_shape(
                     *span,
                     format!(
@@ -3016,10 +3087,10 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             }
             Ok(())
         }
-        Expr::ArrayRepeat { span, .. } => Err(unsupported_collection_shape(
-            *span,
-            "sequence fill literals require the native collection runtime",
-        )),
+        Expr::ArrayRepeat { value, count, .. } => {
+            validate_expr(value, semantic_info)?;
+            validate_expr(count, semantic_info)
+        }
         Expr::Index {
             collection,
             index,
@@ -3046,11 +3117,10 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         } => {
             validate_expr(object, semantic_info)?;
             let receiver_type = semantic_info.expression_type(object.span());
-            let supported_list_property = matches!(
-                receiver_type,
-                Some(ResolvedType::List(_)) if matches!(property.as_str(), "count" | "isEmpty")
-            );
-            if receiver_type.is_some_and(is_stage23_runtime_type) && !supported_list_property {
+            if receiver_type.is_some_and(is_stage23_runtime_type)
+                && !receiver_type.is_some_and(core_collection::uses_receiver)
+                && !receiver_type.is_some_and(|ty| php_sequence_property(ty, property))
+            {
                 return Err(unsupported_collection_shape(
                     *span,
                     format!("collection property `{property}`"),
@@ -3082,8 +3152,13 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             validate_arguments(args, semantic_info)?;
             let receiver_type = semantic_info.expression_type(object.span());
             if receiver_type.is_some_and(is_stage23_runtime_type)
+                && !receiver_type.is_some_and(core_collection::uses_receiver)
                 && !matches!(receiver_type, Some(ResolvedType::List(_)) if method == "add")
                 && !matches!(receiver_type, Some(ResolvedType::Dictionary(_, _)) if method == "get")
+                && !php_collection_search(receiver_type, method)
+                && !matches!(semantic_info.plan.target(*span, semantic_info.substitutions),
+                    Some(crate::semantics::CallableTarget::ConstrainedMethod { requirement, .. })
+                    if crate::compiler_known_contracts::IterationOperation::from_requirement(requirement) == Some(crate::compiler_known_contracts::IterationOperation::Acquire))
             {
                 return Err(unsupported_collection_shape(
                     *span,
@@ -3119,7 +3194,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                     .shared_construction_types
                     .get(span)
                     .or_else(|| semantic_info.expression_type(*span))
-                    .is_some_and(shared::interface_payload)
+                    .is_some_and(shared::supported_payload)
             {
                 return Err(unsupported_shared_ownership(*span));
             }
@@ -3606,6 +3681,15 @@ fn unsupported_string_runtime_shape(span: Span, feature: impl Into<String>) -> B
     )])
 }
 
+fn php_sequence_property(ty: &ResolvedType, property: &str) -> bool {
+    match ty {
+        ResolvedType::TypedArray(_) => property == "length",
+        ResolvedType::List(_) => matches!(property, "count" | "isEmpty"),
+        ResolvedType::Nullable(inner) => php_sequence_property(inner, property),
+        _ => false,
+    }
+}
+
 fn is_stage23_runtime_type(ty: &ResolvedType) -> bool {
     match ty {
         ResolvedType::Bytes
@@ -3643,6 +3727,7 @@ struct PhpNameScopes {
     whens: HashMap<Span, WhenSemanticInfo>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     expression_types: HashMap<Span, ResolvedType>,
+    interface_conversion_types: HashMap<Span, ResolvedType>,
     type_test_types: HashMap<Span, ResolvedType>,
     mixed_box_plans: HashMap<Span, crate::semantics::MixedBoxPlan>,
     throw_error_types: HashMap<Span, ResolvedType>,
@@ -3699,6 +3784,7 @@ impl PhpNameScopes {
             whens: HashMap::new(),
             given_preludes: HashMap::new(),
             expression_types: HashMap::new(),
+            interface_conversion_types: HashMap::new(),
             type_test_types: HashMap::new(),
             mixed_box_plans: HashMap::new(),
             throw_error_types: HashMap::new(),
@@ -3728,6 +3814,7 @@ impl PhpNameScopes {
         scopes.whens = self.whens.clone();
         scopes.given_preludes = self.given_preludes.clone();
         scopes.expression_types = self.expression_types.clone();
+        scopes.interface_conversion_types = self.interface_conversion_types.clone();
         scopes.type_test_types = self.type_test_types.clone();
         scopes.mixed_box_plans = self.mixed_box_plans.clone();
         scopes.throw_error_types = self.throw_error_types.clone();
@@ -4239,6 +4326,7 @@ fn emit_class_instance(
                 .iter()
                 .filter(|parameter| {
                     parameter.constructor_role.is_promoted()
+                        && !parameter.borrow
                         && php_type_ref_needs_explicit_drop(
                             &parameter.ty,
                             &scopes.symbols.classes_with_php_destructors,
@@ -4961,6 +5049,9 @@ fn evaluated_value<'a>(evaluation: &'a Evaluation, key: &ConstKey) -> &'a ConstV
 
 fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
     match value {
+        ConstValue::Integer(value) if value.ty == IntegerType::UInt64 => {
+            emit_integer_bits(value.mathematical_value() as u64 as i64)
+        }
         ConstValue::Integer(value)
             if value.ty.is_default_int() && value.mathematical_value() == i64::MIN as i128 =>
         {
@@ -5678,8 +5769,8 @@ fn emit_statement(
         Stmt::Echo { expr, span } => {
             let expression = with_expression_temporaries(scopes, |scopes| {
                 format!(
-                    "__doria_write_stdout(__doria_display({}), {}, {}, {})",
-                    emit_expr(expr, scopes),
+                    "__doria_write_stdout({}, {}, {}, {})",
+                    emit_display_expr(expr, scopes),
                     php_source_location(*span, span.start),
                     php_source_location(*span, span.end),
                     scopes.callable_identity(),
@@ -6064,8 +6155,41 @@ fn emit_assertion_statement(
         format!("${threw}")
     } else {
         match assertion.matcher {
+            crate::assertions::AssertionMatcher::GreaterThan
+            | crate::assertions::AssertionMatcher::GreaterThanOrEqual
+            | crate::assertions::AssertionMatcher::LessThan
+            | crate::assertions::AssertionMatcher::LessThanOrEqual
+                if is_uint64(resolved_actual_type.as_ref()) =>
+            {
+                let operator = match assertion.matcher {
+                    crate::assertions::AssertionMatcher::GreaterThan => ">",
+                    crate::assertions::AssertionMatcher::GreaterThanOrEqual => ">=",
+                    crate::assertions::AssertionMatcher::LessThan => "<",
+                    _ => "<=",
+                };
+                emit_uint64_comparison(
+                    &format!("${actual}"),
+                    operator,
+                    &format!("${}", expected.as_ref().unwrap()),
+                )
+            }
             crate::assertions::AssertionMatcher::Equal => {
-                format!("__doria_equal(${actual}, ${})", expected.as_ref().unwrap())
+                if resolved_actual_type.as_ref().is_some_and(|ty| {
+                    scopes.specialization.core_operation(
+                        assertion.span,
+                        crate::compiler_known_contracts::CoreValueOperation::Equal,
+                        ty,
+                        &scopes.substitutions,
+                    )
+                }) {
+                    emit_core_equality(
+                        &format!("${actual}"),
+                        &format!("${}", expected.as_ref().unwrap()),
+                        "equals",
+                    )
+                } else {
+                    format!("__doria_equal(${actual}, ${})", expected.as_ref().unwrap())
+                }
             }
             crate::assertions::AssertionMatcher::Null => format!("${actual} === null"),
             crate::assertions::AssertionMatcher::True => format!("${actual} === true"),
@@ -6101,8 +6225,9 @@ fn emit_assertion_statement(
             }
             crate::assertions::AssertionMatcher::StringEmpty => format!("${actual} === \"\""),
             crate::assertions::AssertionMatcher::CollectionContains => format!(
-                "__doria_assertion_collection_contains(${actual}, ${})",
-                expected.as_ref().unwrap()
+                "__doria_assertion_collection_contains(${actual}, ${}, {})",
+                expected.as_ref().unwrap(),
+                php_equality_callback(assertion.span, resolved_expected_type.as_ref(), scopes)
             ),
             crate::assertions::AssertionMatcher::CollectionEmpty => {
                 format!("__doria_assertion_collection_count(${actual}) === 0")
@@ -6116,8 +6241,9 @@ fn emit_assertion_statement(
                 expected.as_ref().unwrap()
             ),
             crate::assertions::AssertionMatcher::DictionaryHasValue => format!(
-                "__doria_assertion_dictionary_has_value(${actual}, ${})",
-                expected.as_ref().unwrap()
+                "__doria_assertion_dictionary_has_value(${actual}, ${}, {})",
+                expected.as_ref().unwrap(),
+                php_equality_callback(assertion.span, resolved_expected_type.as_ref(), scopes)
             ),
             crate::assertions::AssertionMatcher::Throws => unreachable!(),
             crate::assertions::AssertionMatcher::Fail => unreachable!(),
@@ -6607,6 +6733,11 @@ fn emit_owned_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     if scopes.expression_temporaries.is_none() {
         return with_expression_temporaries(scopes, |scopes| emit_owned_expr(expr, scopes));
     }
+    let value = emit_owned_expr_unconverted(expr, scopes);
+    interface::convert_collection(expr, value, true, scopes)
+}
+
+fn emit_owned_expr_unconverted(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
         Expr::Grouped { expr: inner, .. } => emit_mixed_box_plan(
             expr,
@@ -6696,6 +6827,11 @@ fn emit_index_assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> Opt
         return None;
     };
     Some(with_expression_temporaries(scopes, |scopes| {
+        if let Some(value) =
+            core_collection::assignment(collection, index, &assignment.value, scopes)
+        {
+            return value;
+        }
         format!(
             "__doria_collection_set({}, {}, {}, {}, {}, {}, {})",
             emit_assignment_target(collection, scopes),
@@ -6899,11 +7035,22 @@ fn emit_foreach(
     let mut iterable_scopes = scopes.clone();
     let temporaries = Rc::new(RefCell::new(Vec::new()));
     iterable_scopes.expression_temporaries = Some(Rc::clone(&temporaries));
+    let emit_iterable = |expr: &Expr| {
+        if iterable_scopes
+            .expression_types
+            .get(&expr.span())
+            .is_some_and(core_collection::uses_receiver)
+        {
+            core_collection::receiver(expr, false, &iterable_scopes)
+        } else {
+            emit_expr(expr, &iterable_scopes)
+        }
+    };
     let iterable =
         if let Some((dictionary, projection)) = dictionary_foreach_projection(&foreach.iterable) {
             format!(
                 "__doria_collection_projection({}, {})",
-                emit_expr(dictionary, &iterable_scopes),
+                emit_iterable(dictionary),
                 if projection == DictionaryForeachProjection::Keys {
                     "true"
                 } else {
@@ -6911,7 +7058,7 @@ fn emit_foreach(
                 }
             )
         } else {
-            emit_expr(&foreach.iterable, &iterable_scopes)
+            emit_iterable(&foreach.iterable)
         };
     let temporaries = temporaries.borrow();
     if temporaries.is_empty() {
@@ -6941,6 +7088,10 @@ fn emit_foreach_body(
     indent: usize,
     scopes: &mut PhpNameScopes,
 ) {
+    if foreach.iterable_family == crate::semantics::ForeachIterableFamily::PublicIterable {
+        emit_public_foreach(foreach, iterable, output, indent, scopes);
+        return;
+    }
     scopes.push();
     let first_name = foreach
         .first_binding
@@ -6987,6 +7138,52 @@ fn emit_foreach_body(
     });
     scopes.pop();
     writeln(output, indent, "}");
+}
+
+fn emit_public_foreach(
+    foreach: &ForeachStmt,
+    iterable: &str,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    scopes.push();
+    let cursor = scopes.fresh_temp("__doria_iterator");
+    let value = scopes.declare(&foreach.value_binding.name);
+    writeln(
+        output,
+        indent,
+        &format!("${cursor} = ({iterable})->iterator();"),
+    );
+    writeln(output, indent, "try {");
+    writeln(
+        output,
+        indent + 1,
+        &format!("for (; ${cursor}->hasCurrent(); ${cursor}->advance()) {{"),
+    );
+    writeln(
+        output,
+        indent + 2,
+        &format!("${value} = ${cursor}->getCurrent();"),
+    );
+    writeln(output, indent + 2, "try {");
+    emit_owned_scope(output, indent + 3, scopes, |output, indent, scopes| {
+        for statement in &foreach.body.statements {
+            emit_statement(statement, output, indent, scopes);
+        }
+    });
+    writeln(output, indent + 2, "} finally {");
+    writeln(output, indent + 3, &format!("unset(${value});"));
+    writeln(output, indent + 2, "}");
+    writeln(output, indent + 1, "}");
+    writeln(output, indent, "} finally {");
+    writeln(
+        output,
+        indent + 1,
+        &format!("__doria_drop_value(${cursor});"),
+    );
+    writeln(output, indent, "}");
+    scopes.pop();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7094,13 +7291,22 @@ fn emit_range_foreach(
 }
 
 fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    if let Some(value) = emit_primitive_core_call(expr, scopes) {
+        return value;
+    }
     if scopes.expression_temporaries.is_none() {
         return with_expression_temporaries(scopes, |scopes| {
-            emit_mixed_box_plan(expr, emit_expr_unboxed(expr, scopes), scopes)
+            interface::convert_collection(
+                expr,
+                emit_mixed_box_plan(expr, emit_expr_unboxed(expr, scopes), scopes),
+                false,
+                scopes,
+            )
         });
     }
     let emitted = emit_expr_unboxed(expr, scopes);
     let emitted = emit_mixed_box_plan(expr, emitted, scopes);
+    let emitted = interface::convert_collection(expr, emitted, false, scopes);
     if expression_creates_owner(expr, scopes) {
         let temporary = scopes.expression_temp("__doria_owned_expression_", expr.span());
         let mut temporaries = scopes.expression_temporaries.as_ref().unwrap().borrow_mut();
@@ -7125,10 +7331,18 @@ fn expression_creates_owner(expr: &Expr, scopes: &PhpNameScopes) -> bool {
         Expr::New { .. } | Expr::Closure(_) | Expr::Array { .. } => true,
         Expr::FunctionCall { span, .. } | Expr::MethodCall { span, .. } | Expr::StaticCall { span, .. } => {
             !scopes.closure_plan.callable_at(*span).is_some_and(|plan| plan.returns_borrow)
-                && !matches!(expr, Expr::MethodCall { object, method, .. } if matches!(scopes.expression_types.get(&object.span()), Some(ResolvedType::Dictionary(_, _))) && method == "get")
+                && !matches!(expr, Expr::MethodCall { object, method, .. } if scopes.expression_types.get(&object.span()).is_some_and(|ty| php_collection_borrowed_get(ty, method)))
         }
         Expr::CallableCall(call) => scopes.closure_plan.callable_value_calls.get(&call.span)
             .is_some_and(|call| matches!(&call.function_type, ResolvedType::Function(function) if function.return_borrow.is_none())),
+        _ => false,
+    }
+}
+
+fn php_collection_borrowed_get(ty: &ResolvedType, method: &str) -> bool {
+    match ty {
+        ResolvedType::Nullable(inner) => php_collection_borrowed_get(inner, method),
+        ResolvedType::Dictionary(_, _) | ResolvedType::SortedDictionary(_, _) => method == "get",
         _ => false,
     }
 }
@@ -7301,7 +7515,18 @@ fn emit_list_algorithm_call(call: &ListAlgorithmCall, scopes: &PhpNameScopes) ->
             if call.kind == ListAlgorithmKind::Map {
                 body.push_str("$__doriaAlgorithmValue = ($__doriaAlgorithmCallback)($__doriaAlgorithmElement); $__doriaAlgorithmResult[] = $__doriaAlgorithmValue; ");
             } else {
-                body.push_str("if (($__doriaAlgorithmCallback)($__doriaAlgorithmElement)) { $__doriaAlgorithmResult[] = $__doriaAlgorithmElement; } ");
+                let clone = scopes.specialization.core_operation(
+                    call.span,
+                    crate::compiler_known_contracts::CoreValueOperation::Clone,
+                    &call.element_type,
+                    &scopes.substitutions,
+                );
+                let value = if clone {
+                    "($__doriaAlgorithmElement === null ? null : $__doriaAlgorithmElement->clone())"
+                } else {
+                    "$__doriaAlgorithmElement"
+                };
+                body.push_str(&format!("if (($__doriaAlgorithmCallback)($__doriaAlgorithmElement)) {{ $__doriaAlgorithmResult[] = {value}; }} "));
             }
             body.push_str("} } catch (__DoriaCheckedError $__doriaAlgorithmError) { __doria_drop_value($__doriaAlgorithmResult); throw $__doriaAlgorithmError; } return $__doriaAlgorithmResult; ");
         }
@@ -7321,7 +7546,52 @@ fn emit_list_algorithm_call(call: &ListAlgorithmCall, scopes: &PhpNameScopes) ->
     body
 }
 
+fn emit_core_equality(left: &str, right: &str, method: &str) -> String {
+    format!("(static function ($left, $right) {{ return $left === null || $right === null ? $left === $right : $left->{method}($right); }})({left}, {right})")
+}
+
+fn php_equality_callback(span: Span, ty: Option<&ResolvedType>, scopes: &PhpNameScopes) -> String {
+    if ty.is_some_and(|ty| {
+        scopes.specialization.core_operation(
+            span,
+            crate::compiler_known_contracts::CoreValueOperation::Equal,
+            ty,
+            &scopes.substitutions,
+        )
+    }) {
+        "static function ($left, $right): bool { return $left === null || $right === null ? $left === $right : $left->equals($right); }".into()
+    } else {
+        "null".into()
+    }
+}
+
+fn php_collection_search(ty: Option<&ResolvedType>, method: &str) -> bool {
+    matches!(
+        (ty, method),
+        (
+            Some(ResolvedType::List(_)),
+            "contains" | "indexOf" | "remove"
+        ) | (
+            Some(
+                ResolvedType::TypedArray(_)
+                    | ResolvedType::Deque(_)
+                    | ResolvedType::PriorityQueue(_)
+            ),
+            "contains"
+        ) | (
+            Some(ResolvedType::Dictionary(_, _) | ResolvedType::SortedDictionary(_, _)),
+            "containsValue"
+        )
+    )
+}
+
 fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    if let Some(value) = interface::builtin_acquire(expr, scopes) {
+        return value;
+    }
+    if let Some(value) = core_collection::expression(expr, scopes) {
+        return value;
+    }
     match expr {
         Expr::Assertion(_) => {
             unreachable!("checked assertions are emitted only from terminal statement position")
@@ -7355,6 +7625,10 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::Identifier { name, .. } => php_top_level_constant_name(name),
         Expr::String { value, .. } => emit_php_string_literal(value),
         Expr::InterpolatedString { parts, .. } => emit_interpolated_string(parts, scopes),
+        Expr::Int { value, span } if is_uint64(scopes.expression_types.get(span)) => {
+            let value = parse_decimal_magnitude(value).expect("checked uint64 literal") as u64;
+            emit_integer_bits(value as i64)
+        }
         Expr::Int { value, .. } | Expr::Float { value, .. } => value.clone(),
         Expr::Bool { value, .. } => {
             if *value {
@@ -7382,8 +7656,24 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .join(", ");
             format!("[{inner}]")
         }
-        Expr::ArrayRepeat { .. } => {
-            unreachable!("PHP validation rejects native sequence fill literals")
+        Expr::ArrayRepeat { value, count, .. } => {
+            let duplicate = if scopes
+                .expression_types
+                .get(&value.span())
+                .is_some_and(|ty| {
+                    scopes.specialization.core_operation(
+                        value.span(),
+                        crate::compiler_known_contracts::CoreValueOperation::Clone,
+                        ty,
+                        &scopes.substitutions,
+                    )
+                }) {
+                "($source === null ? null : $source->clone())"
+            } else {
+                "$source"
+            };
+            format!("(static function ($source, int $count) {{ if ($count < 0) {{ __doria_panic(\"P1311\", {}, {}, null, {}, [\"count\" => $count]); }} $result = []; try {{ for ($index = 0; $index < $count; ++$index) {{ $result[] = {duplicate}; }} }} catch (__DoriaCheckedError $error) {{ __doria_drop_value($result); throw $error; }} return $result; }})({}, {})",
+                count.span().start, count.span().end, scopes.callable_identity(), emit_expr(value, scopes), emit_expr(count, scopes))
         }
         Expr::Index {
             collection,
@@ -7404,18 +7694,27 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::PropertyAccess {
             object,
             property,
-            null_safe: false,
+            null_safe,
             ..
-        } if matches!(
-            scopes.expression_types.get(&object.span()),
-            Some(ResolvedType::List(_))
-        ) && matches!(property.as_str(), "count" | "isEmpty") =>
+        } if scopes
+            .expression_types
+            .get(&object.span())
+            .is_some_and(|ty| php_sequence_property(ty, property)) =>
         {
-            let count = format!("count({})", emit_expr(object, scopes));
-            if property == "isEmpty" {
+            let receiver = emit_expr(object, scopes);
+            let count = format!(
+                "count({})",
+                if *null_safe { "$sequence" } else { &receiver }
+            );
+            let value = if property == "isEmpty" {
                 format!("({count} === 0)")
             } else {
                 count
+            };
+            if *null_safe {
+                format!("(static fn($sequence) => $sequence === null ? null : {value})({receiver})")
+            } else {
+                value
             }
         }
         Expr::PropertyAccess {
@@ -7445,6 +7744,35 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 }
             } else {
                 format!("{receiver}{operator}{property}")
+            }
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+            ..
+        } if php_collection_search(scopes.expression_types.get(&object.span()), method) => {
+            let receiver_type = scopes.expression_types.get(&object.span()).unwrap();
+            let compared = match receiver_type {
+                ResolvedType::List(ty)
+                | ResolvedType::TypedArray(ty)
+                | ResolvedType::Deque(ty)
+                | ResolvedType::PriorityQueue(ty)
+                | ResolvedType::Dictionary(_, ty)
+                | ResolvedType::SortedDictionary(_, ty) => ty.as_ref(),
+                _ => unreachable!("checked collection search receiver"),
+            };
+            let callback = php_equality_callback(*span, Some(compared), scopes);
+            let object = emit_expr(object, scopes);
+            let value = emit_expr(&args[0].value, scopes);
+            match method.as_str() {
+                "remove" => format!("__doria_list_remove({object}, {value}, {callback})"),
+                "indexOf" => format!("__doria_collection_index_of({object}, {value}, {callback})"),
+                _ => {
+                    format!("(__doria_collection_index_of({object}, {value}, {callback}) !== null)")
+                }
             }
         }
         Expr::MethodCall {
@@ -7510,11 +7838,38 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             span,
             ..
         } => {
-            if ((class_name == "Bytes" && method == "fromArray")
-                || (class_name == "Set" && method == "from"))
+            if matches!(class_name.as_str(), "Deque" | "SortedDictionary")
+                && method == "from"
                 && args.len() == 1
             {
+                let ty = scopes.expression_types.get(&expr.span());
+                let element = match ty {
+                    Some(
+                        ResolvedType::Deque(element) | ResolvedType::SortedDictionary(_, element),
+                    ) => Some(element.as_ref()),
+                    _ => None,
+                };
+                if element.is_some_and(|ty| {
+                    scopes.specialization.core_operation(
+                        args[0].value.span(),
+                        crate::compiler_known_contracts::CoreValueOperation::Clone,
+                        ty,
+                        &scopes.substitutions,
+                    )
+                }) {
+                    return format!("{class_name}::from({}, {}static fn($value) => $value === null ? null : $value->clone())",
+                        emit_expr(&args[0].value, scopes),
+                        if class_name == "SortedDictionary" { format!("{}, ", php_unsigned_collection(expr, scopes)) } else { String::new() });
+                }
+            }
+            if class_name == "Bytes" && method == "fromArray" && args.len() == 1 {
                 return format!("array_values({})", emit_expr(&args[0].value, scopes));
+            }
+            if class_name == "Set" && method == "from" && args.len() == 1 {
+                return format!(
+                    "__doria_primitive_set_from({})",
+                    emit_expr(&args[0].value, scopes)
+                );
             }
             if class_name == "SortedDictionary" && method == "from" && args.len() == 1 {
                 if let Expr::Array { elements, .. } = &args[0].value {
@@ -7533,9 +7888,24 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
-                        return format!("SortedDictionary::fromPairs([{pairs}])");
+                        return format!(
+                            "SortedDictionary::fromPairs([{pairs}], {})",
+                            php_unsigned_collection(expr, scopes)
+                        );
                     }
                 }
+            }
+            if matches!(
+                class_name.as_str(),
+                "SortedDictionary" | "SortedSet" | "PriorityQueue"
+            ) && method == "from"
+                && args.len() == 1
+            {
+                return format!(
+                    "{class_name}::from({}, {})",
+                    emit_expr(&args[0].value, scopes),
+                    php_unsigned_collection(expr, scopes)
+                );
             }
             let qualifier = if scopes.direct_parent_calls.contains(span) {
                 "parent".to_string()
@@ -7653,8 +8023,40 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             }
         },
         Expr::Binary {
-            left, op, right, ..
+            left,
+            op,
+            right,
+            span,
         } => match op {
+            BinaryOp::Equal | BinaryOp::NotEqual
+                if scopes.expression_types.get(&left.span()).is_some_and(|ty| {
+                    scopes.specialization.core_operation(
+                        *span,
+                        crate::compiler_known_contracts::CoreValueOperation::Equal,
+                        ty,
+                        &scopes.substitutions,
+                    )
+                }) && matches!(
+                    scopes
+                        .expression_types
+                        .get(&left.span())
+                        .map(|ty| match ty {
+                            ResolvedType::Nullable(inner) => inner.as_ref(),
+                            other => other,
+                        }),
+                    Some(ResolvedType::Class(_) | ResolvedType::Interface(_))
+                ) =>
+            {
+                let method = scopes
+                    .specialization
+                    .call_symbol(*span, &scopes.substitutions)
+                    .unwrap_or("equals");
+                let negate = if *op == BinaryOp::NotEqual { "!" } else { "" };
+                format!(
+                    "{negate}{}",
+                    emit_core_equality(&emit_expr(left, scopes), &emit_expr(right, scopes), method)
+                )
+            }
             BinaryOp::Div => format!(
                 "fdiv({}, {})",
                 emit_expr(left, scopes),
@@ -7696,10 +8098,19 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 )
             }
             BinaryOp::Concat => format!(
-                "__doria_display({}) . __doria_display({})",
-                emit_expr(left, scopes),
-                emit_expr(right, scopes)
+                "{} . {}",
+                emit_display_expr(left, scopes),
+                emit_display_expr(right, scopes)
             ),
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual
+                if is_uint64(scopes.expression_types.get(&left.span())) =>
+            {
+                emit_uint64_comparison(
+                    &emit_expr(left, scopes),
+                    emit_binary_op(op),
+                    &emit_expr(right, scopes),
+                )
+            }
             BinaryOp::Less => format!(
                 "__doria_less({}, {})",
                 emit_expr(left, scopes),
@@ -8301,7 +8712,7 @@ fn emit_interpolated_string(parts: &[InterpolatedStringPart], scopes: &PhpNameSc
             }
             InterpolatedStringPart::Expr(expr) => {
                 has_expr = true;
-                emitted.push(format!("__doria_display({})", emit_expr(expr, scopes)));
+                emitted.push(emit_display_expr(expr, scopes));
             }
         }
     }
@@ -8360,6 +8771,92 @@ fn emit_php_string_literal(value: &str) -> String {
     format!("\"{}\"", escape_php_string(value))
 }
 
+fn is_uint64(ty: Option<&ResolvedType>) -> bool {
+    matches!(ty, Some(ResolvedType::Integer(IntegerType::UInt64)))
+}
+
+fn php_unsigned_collection(expr: &Expr, scopes: &PhpNameScopes) -> bool {
+    match scopes.expression_types.get(&expr.span()) {
+        Some(ResolvedType::SortedDictionary(key, _)) => is_uint64(Some(key)),
+        Some(ResolvedType::SortedSet(value) | ResolvedType::PriorityQueue(value)) => {
+            is_uint64(Some(value))
+        }
+        _ => false,
+    }
+}
+
+fn emit_integer_bits(value: i64) -> String {
+    if value == i64::MIN {
+        "(-9223372036854775807 - 1)".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn emit_uint64_comparison(left: &str, operator: &str, right: &str) -> String {
+    format!("((({left}) ^ PHP_INT_MIN) {operator} (({right}) ^ PHP_INT_MIN))")
+}
+
+fn emit_primitive_core_call(expr: &Expr, scopes: &PhpNameScopes) -> Option<String> {
+    use crate::compiler_known_contracts::CoreValueOperation;
+    let Expr::MethodCall {
+        object, args, span, ..
+    } = expr
+    else {
+        return None;
+    };
+    let crate::semantics::CallableTarget::ConstrainedMethod {
+        receiver,
+        requirement,
+        ..
+    } = scopes.specialization.target(*span, &scopes.substitutions)?
+    else {
+        return None;
+    };
+    if !matches!(
+        receiver,
+        ResolvedType::Integer(_)
+            | ResolvedType::Float(_)
+            | ResolvedType::Bool
+            | ResolvedType::String
+    ) {
+        return None;
+    }
+    let operation = CoreValueOperation::from_requirement(requirement)?;
+    let left = emit_expr(object, scopes);
+    Some(match operation {
+        CoreValueOperation::Equal => format!("({left} === {})", emit_expr(&args[0].value, scopes)),
+        CoreValueOperation::Hash => {
+            if receiver == ResolvedType::String {
+                format!("unpack('J', hash('fnv1a64', {left}, true))[1]")
+            } else {
+                format!("(int)({left})")
+            }
+        }
+        CoreValueOperation::Compare => {
+            let right = emit_expr(&args[0].value, scopes);
+            let less = if receiver == ResolvedType::String {
+                "strcmp($left, $right) < 0".to_string()
+            } else if is_uint64(Some(&receiver)) {
+                emit_uint64_comparison("$left", "<", "$right")
+            } else {
+                "$left < $right".to_string()
+            };
+            format!("(static function ($left, $right) {{ return $left === $right ? Ordering::Equal : ({less} ? Ordering::Less : Ordering::Greater); }})({left}, {right})")
+        }
+        CoreValueOperation::Clone => return None,
+    })
+}
+
+fn emit_display_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    let value = emit_expr(expr, scopes);
+    if is_uint64(scopes.expression_types.get(&expr.span())) {
+        format!("sprintf(\"%u\", {value})")
+    } else {
+        format!("__doria_display({value})")
+    }
+}
+
 fn emit_binary_op(op: &BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
@@ -8405,14 +8902,24 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
     if matches!(name, "sprintf" | "printf") {
         if let Some(Expr::String { value, span }) = args.first().map(|argument| &argument.value) {
             if let Ok(pieces) = format_string::parse(value, *span) {
-                emitted[0] = emit_php_string_literal(&php_format_from_plan(&pieces));
+                emitted[0] = emit_php_string_literal(&php_format_from_plan(&pieces, args, scopes));
                 let conversions = pieces.iter().filter_map(|piece| match piece {
                     FormatPiece::Argument { spec, .. } => Some(spec.conversion),
                     FormatPiece::Literal(_) => None,
                 });
-                for (argument, conversion) in emitted.iter_mut().skip(1).zip(conversions) {
+                for ((argument, source), conversion) in emitted
+                    .iter_mut()
+                    .skip(1)
+                    .zip(args.iter().skip(1))
+                    .zip(conversions)
+                {
                     if conversion == FormatConversion::Display {
-                        *argument = format!("__doria_display({argument})");
+                        *argument = if is_uint64(scopes.expression_types.get(&source.value.span()))
+                        {
+                            format!("sprintf(\"%u\", {argument})")
+                        } else {
+                            format!("__doria_display({argument})")
+                        };
                     }
                 }
             }
@@ -8451,12 +8958,16 @@ fn php_source_location(span: Span, offset: usize) -> u64 {
         | (u64::try_from(offset).expect("source offsets fit in u64") & 0xffff_ffff)
 }
 
-fn php_format_from_plan(pieces: &[FormatPiece]) -> String {
+fn php_format_from_plan(
+    pieces: &[FormatPiece],
+    args: &[Argument],
+    scopes: &PhpNameScopes,
+) -> String {
     let mut format = String::new();
     for piece in pieces {
         match piece {
             FormatPiece::Literal(value) => format.push_str(&value.replace('%', "%%")),
-            FormatPiece::Argument { spec, .. } => {
+            FormatPiece::Argument { index, spec } => {
                 format.push('%');
                 if spec.left_align {
                     format.push('-');
@@ -8473,6 +8984,13 @@ fn php_format_from_plan(pieces: &[FormatPiece]) -> String {
                 }
                 format.push(match spec.conversion {
                     FormatConversion::Display => 's',
+                    FormatConversion::Decimal
+                        if args.get(*index as usize + 1).is_some_and(|argument| {
+                            is_uint64(scopes.expression_types.get(&argument.value.span()))
+                        }) =>
+                    {
+                        'u'
+                    }
                     FormatConversion::Decimal => 'd',
                     FormatConversion::Float => 'F',
                     FormatConversion::HexLower => 'x',
@@ -8494,6 +9012,13 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
 }
 
 fn php_type(ty: &TypeRef, scopes: &PhpNameScopes) -> String {
+    if let Some(resolved) = scopes
+        .specialization
+        .resolve_type(ty, &scopes.substitutions)
+        .filter(core_collection::uses)
+    {
+        return php_resolved_type(&resolved, scopes);
+    }
     if scopes.substitutions.contains_key(&ty.name) {
         let resolved =
             crate::types::resolved_type_ref_with_substitutions(ty, &scopes.substitutions)
@@ -8531,6 +9056,16 @@ fn php_type(ty: &TypeRef, scopes: &PhpNameScopes) -> String {
 }
 
 fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
+    if core_collection::uses(ty) {
+        return format!(
+            "{}__DoriaCoreCollection",
+            if matches!(ty, ResolvedType::Nullable(_)) {
+                "?"
+            } else {
+                ""
+            }
+        );
+    }
     match ty {
         ResolvedType::Interface(ty) => interface::declaration_name(&ty.name),
         ResolvedType::InterfaceSelf(name) => interface::declaration_name(name),

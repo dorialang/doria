@@ -1,0 +1,27 @@
+class Key implements Hashable, Equatable<Key>, Cloneable
+{
+    function __construct(int $value) {}
+    function hash(): uint64 { return 18446744073709551615; }
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function clone(): self
+    {
+        echo "clone {$this->value}\n";
+        return new Key($this->value);
+    }
+}
+
+function main(): void
+{
+    List<Key> $source = [new Key(1), new Key(2), new Key(1)];
+    let $left = Set::from($source);
+    let $right = Set::from([new Key(2), new Key(3)]);
+    let $union = $left->union($right);
+    let $intersection = $left->intersect($right);
+    let $difference = $left->difference($right);
+    foreach ($union as Key $key) { echo "union {$key->value}\n"; }
+    foreach ($intersection as Key $key) { echo "intersection {$key->value}\n"; }
+    foreach ($difference as Key $key) { echo "difference {$key->value}\n"; }
+    foreach ($source as Key $key) { echo "source {$key->value}\n"; }
+    foreach ($left as Key $key) { echo "left {$key->value}\n"; }
+    foreach ($right as Key $key) { echo "right {$key->value}\n"; }
+}

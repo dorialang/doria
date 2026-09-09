@@ -1,0 +1,41 @@
+class Item implements Cloneable
+{
+    function __construct(int $id) {}
+
+    function clone(): self
+    {
+        echo "clone {$this->id}\n";
+        return new Item($this->id);
+    }
+
+    function __destruct(): void
+    {
+        try { echo "drop {$this->id}\n"; } catch (Error $error) {}
+    }
+}
+
+function count(): int
+{
+    echo "count\n";
+    return 2;
+}
+
+function makeItem(): Item
+{
+    echo "source\n";
+    return new Item(3);
+}
+
+function main(): void
+{
+    let $source = new Item(1);
+    List<Item> $copies = [$source; count()];
+    echo "source still {$source->id}\n";
+    Item[] $empty = [new Item(2); 0];
+    echo "empty\n";
+    Item[] $array = [makeItem(); count()];
+    foreach ($array as int $index => Item $item) { echo "{$index}:{$item->id}\n"; }
+    List<string> $strings = ["x"; 2];
+    foreach ($strings as string $text) { echo $text; }
+    echo "\n";
+}

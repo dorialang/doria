@@ -1,0 +1,51 @@
+class Book
+{
+    function __construct(string $title) {}
+    function __destruct() { try { echo "drop {$this->title}\n"; } catch (Error $error) {} }
+}
+
+class Catalog implements Iterable<?Book>
+{
+    function __construct(take List<?Book> $books) {}
+    function iterator(): Iterator<?Book> { return new Cursor($this->books); }
+    function __destruct() { try { echo "catalog released\n"; } catch (Error $error) {} }
+}
+
+class Cursor implements Iterator<?Book>
+{
+    writable int $position = 0;
+    function __construct(borrow List<?Book> $books) {}
+    function hasCurrent(): bool { return $this->position < $this->books->count; }
+    function getCurrent(): ?Book { return $this->books[$this->position]; }
+    writable function advance(): void
+    {
+        $this->position = match ($this->position) { 0 => 1, default => 2 };
+    }
+    function __destruct() { try { echo "cursor released\n"; } catch (Error $error) {} }
+}
+
+class Stop implements Error { function __construct(string $message) {} }
+
+function first<T implements Iterable<?Book>>(T $catalog): string
+{
+    foreach ($catalog as ?Book $book) {
+        if ($book != null) { return $book->title; }
+    }
+    return "empty";
+}
+
+function main(): void
+{
+    foreach (new Catalog([null, new Book("temporary")]) as ?Book $book) {
+        if ($book == null) { echo "null element\n"; continue; }
+        echo "{$book->title}\n";
+    }
+    Iterable<?Book> $catalog = new Catalog([null, new Book("erased")]);
+    echo first($catalog) . "\n";
+    try {
+        foreach ($catalog as ?Book $book) { throw new Stop("stop"); }
+    } catch (Stop $error) {
+        echo "caught\n";
+    }
+    echo first($catalog) . "\n";
+}

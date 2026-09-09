@@ -11,7 +11,7 @@ class Child extends Name {
     override function name(): string { return "child"; }
 }
 function display(Named $value): void { echo $value->name(); }
-function borrow(Detailed $value): Named { return $value; }
+function borrowView(Detailed $value): Named { return $value; }
 function maybe(?Named $value): void {
     if ($value != null) { display($value); } else { echo "null"; }
 }
@@ -20,7 +20,7 @@ function nullable(take ?Detailed $value): ?Named { return $value; }
 function main(): void {
     Detailed $value = new Child();
     display($value);
-    display(borrow($value));
+    display(borrowView($value));
     echo "{$value->detail()}";
     Named $moved = owned($value);
     display($moved);

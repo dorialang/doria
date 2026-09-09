@@ -1,0 +1,37 @@
+class Book
+{
+    function __construct(string $title) {}
+    function __destruct() { try { echo "drop {$this->title}\n"; } catch (Error $error) {} }
+}
+
+class BookShelf implements Iterable<Book>
+{
+    function __construct(take List<Book> $books) {}
+    function iterator(): Iterator<Book> { return new BookCursor($this->books); }
+}
+
+class BookCursor implements Iterator<Book>
+{
+    writable int $position = 0;
+    function __construct(borrow List<Book> $source) {}
+    function __destruct() { try { echo "cursor released\n"; } catch (Error $error) {} }
+    function hasCurrent(): bool { return $this->position < $this->source->count; }
+    function getCurrent(): Book { return $this->source[$this->position]; }
+    writable function advance(): void
+    {
+        $this->position = match ($this->position) { 0 => 1, 1 => 2, default => 3 };
+        try { echo "advance\n"; } catch (Error $error) {}
+    }
+}
+
+function main(): void
+{
+    let $shelf = new BookShelf([new Book("Doria"), new Book("Compiler"), new Book("Types")]);
+    foreach ($shelf as Book $book) {
+        if ($book->title == "Doria") { echo "skip\n"; continue; }
+        echo "{$book->title}\n";
+        break;
+    }
+    foreach ($shelf as Book $book) { echo "{$book->title}\n"; }
+    echo "shelf still owns books\n";
+}

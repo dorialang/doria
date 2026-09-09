@@ -68,6 +68,10 @@ use crate::native_abi::{
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE,
     WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
+use crate::native_abi::{
+    CORE_COLLECTION_HASH_NEXT, CORE_COLLECTION_HASH_POSITION, CORE_COLLECTION_INSERT,
+    CORE_COLLECTION_KEY_AT, CORE_COLLECTION_NEW, CORE_COLLECTION_REMOVE, CORE_COLLECTION_SWAP,
+};
 use crate::native_closure_abi;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -133,6 +137,7 @@ pub(crate) fn lower_validated_mir_to_object(
         program,
         &function_ids,
         &class_drop_function_ids,
+        &collection_drop_function_ids,
         &class_descriptor_ids,
     )?;
     let declarations = DeclaredNativeItems {
@@ -847,11 +852,127 @@ fn scalar_storage_bytes(ty: mir::ScalarType) -> u32 {
     }
 }
 
+fn define_nonclass_interface_vtable(
+    module: &mut ObjectModule,
+    program: &mir::Program,
+    table: &mir::InterfaceVtable,
+    functions: &[FuncId],
+    collection_drops: &[FuncId],
+) -> Result<DataId, BackendError> {
+    let width = usize::from(module.target_config().pointer_bytes());
+    let pointer = module.target_config().pointer_type();
+    let (collection, cursor) = match table.implementing_type {
+        mir::ImplementingType::Collection(collection) => (collection, false),
+        mir::ImplementingType::CollectionIterator(collection) => (collection, true),
+        _ => return Err(malformed_mir("nonclass metadata received a class")),
+    };
+    let symbol = format!("__doria_interface_vtable_{}", table.id.0);
+    let drop = if cursor {
+        let mut signature = module.make_signature();
+        signature.params = vec![AbiParam::new(pointer), AbiParam::new(pointer)];
+        module
+            .declare_function(
+                crate::native_abi::COLLECTION_ITERATOR_DROP,
+                Linkage::Import,
+                &signature,
+            )
+            .map_err(|error| backend_failure(error.to_string()))?
+    } else {
+        collection_drops[collection.0]
+    };
+    let mut define_bytes = |suffix: &str, bytes: Vec<u8>| -> Result<DataId, BackendError> {
+        let id = module
+            .declare_data(&format!("{symbol}_{suffix}"), Linkage::Local, false, false)
+            .map_err(|error| backend_failure(error.to_string()))?;
+        let mut data = DataDescription::new();
+        data.set_align(width as u64);
+        data.define(bytes.into_boxed_slice());
+        module
+            .define_data(id, &data)
+            .map_err(|error| backend_failure(error.to_string()))?;
+        Ok(id)
+    };
+    let name = format!(
+        "{}collection#{}",
+        if cursor { "iterator " } else { "" },
+        collection.0
+    );
+    let name_data = define_bytes("type_name", name.as_bytes().to_vec())?;
+    let ancestry = define_bytes(
+        "ancestry",
+        vec![0; program.classes.len().div_ceil(8).max(1)],
+    )?;
+    let views = module
+        .declare_data(&format!("{symbol}_views"), Linkage::Local, false, false)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    let mut data = DataDescription::new();
+    data.set_align(width as u64);
+    data.define(vec![0; width * program.interface_types.len()].into_boxed_slice());
+    for view in program
+        .interface_vtables
+        .iter()
+        .filter(|view| view.implementing_type == table.implementing_type)
+    {
+        let id = declare_interface_vtable(module, view.id)?;
+        let reference = module.declare_data_in_data(id, &mut data);
+        data.write_data_addr((width * view.interface.0) as u32, reference, 0);
+    }
+    module
+        .define_data(views, &data)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    let descriptor = module
+        .declare_data(&format!("{symbol}_type"), Linkage::Local, false, false)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    let mut data = DataDescription::new();
+    data.set_align(width as u64);
+    let mut bytes = vec![0; width * 6];
+    // Nonclass identities occupy a disjoint private descriptor domain.
+    let identity = u64::MAX - (collection.0 as u64 * 2 + u64::from(cursor));
+    bytes[width..width * 2].copy_from_slice(&identity.to_le_bytes()[..width]);
+    data.define(bytes.into_boxed_slice());
+    let drop_ref = module.declare_func_in_data(drop, &mut data);
+    data.write_function_addr((width * 2) as u32, drop_ref);
+    for (word, id) in [(4, ancestry), (5, views)] {
+        let reference = module.declare_data_in_data(id, &mut data);
+        data.write_data_addr((width * word) as u32, reference, 0);
+    }
+    module
+        .define_data(descriptor, &data)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    let id = declare_interface_vtable(module, table.id)?;
+    let mut data = DataDescription::new();
+    data.set_align(width as u64);
+    let mut bytes =
+        vec![0; width * (crate::native_abi::INTERFACE_VTABLE_HEADER_WORDS + table.methods.len())];
+    bytes[width..width * 2].copy_from_slice(&(name.len() as u64).to_le_bytes()[..width]);
+    bytes[width * 9..width * 10]
+        .copy_from_slice(&(table.interface.0 as u64).to_le_bytes()[..width]);
+    data.define(bytes.into_boxed_slice());
+    for (word, id) in [(0, name_data), (8, descriptor)] {
+        let reference = module.declare_data_in_data(id, &mut data);
+        data.write_data_addr((width * word) as u32, reference, 0);
+    }
+    let reference = module.declare_func_in_data(drop, &mut data);
+    data.write_function_addr((width * 3) as u32, reference);
+    for (slot, function) in table.methods.iter().enumerate() {
+        let reference = module.declare_func_in_data(functions[function.0], &mut data);
+        data.write_function_addr(
+            (width * (crate::native_abi::INTERFACE_VTABLE_HEADER_WORDS + slot)) as u32,
+            reference,
+        );
+    }
+    module
+        .define_data(id, &data)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    Ok(id)
+}
+
 fn define_static_data(
     module: &mut ObjectModule,
     program: &mir::Program,
     function_ids: &[FuncId],
     class_drop_function_ids: &[FuncId],
+    collection_drop_function_ids: &[FuncId],
     class_descriptor_ids: &[DataId],
 ) -> Result<Vec<DataId>, BackendError> {
     let pointer_bytes = usize::from(module.target_config().pointer_bytes());
@@ -944,9 +1065,14 @@ fn define_static_data(
     for table in &program.interface_vtables {
         let symbol = format!("__doria_interface_vtable_{}", table.id.0);
         let mir::ImplementingType::Class(class_id) = table.implementing_type else {
-            return Err(malformed_mir(
-                "collection interface vtable requires Stage 35 Slice 3",
-            ));
+            ids.push(define_nonclass_interface_vtable(
+                module,
+                program,
+                table,
+                function_ids,
+                collection_drop_function_ids,
+            )?);
+            continue;
         };
         let class = class_definition(program, class_id)?;
         let descriptor = table
@@ -1455,6 +1581,7 @@ fn define_function(
             class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses,
             writable_parameter_addresses,
             static_ids,
@@ -1473,6 +1600,16 @@ fn define_function(
             deferred_class_temporary_drops: Vec::new(),
         };
         retain_string_parameters(&mut builder, function, &mut resources)?;
+        for plan in crate::mir_validation::stack_collection_iterators(program, function) {
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                pointer_bytes * 2,
+                pointer_bytes.trailing_zeros() as u8,
+            ));
+            resources
+                .stack_collection_iterators
+                .insert(plan.source, (plan.cursor, slot));
+        }
         lower_block(
             &mut builder,
             &function.blocks[function.entry_block.0],
@@ -1540,6 +1677,7 @@ fn define_class_drop_function(
             class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             static_ids,
@@ -1611,6 +1749,7 @@ fn define_collection_drop_function(
             class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             static_ids,
@@ -1692,6 +1831,7 @@ fn define_closure_drop_function(
             class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             static_ids,
@@ -2563,6 +2703,7 @@ struct LoweringResources<'module, 'program> {
     class_descriptor_ids: &'program [DataId],
     closure_environment_slots: &'program [Option<StackSlot>],
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField>,
+    stack_collection_iterators: HashMap<mir::LocalId, (mir::LocalId, StackSlot)>,
     borrow_home_addresses: HashMap<mir::LocalId, Value>,
     writable_parameter_addresses: HashMap<mir::LocalId, Value>,
     static_ids: &'program [DataId],
@@ -2990,6 +3131,19 @@ fn lower_statement(
     debug_assert!(resources.deferred_class_temporary_drops.is_empty());
     resources.defer_class_temporary_drops = true;
     match statement {
+        mir::Statement::AdvanceCollectionIterator { receiver, .. } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let slot = local_slot(resources.local_slots, *receiver)?;
+            let cursor = builder.ins().stack_load(pointer, pointer, slot, 0);
+            runtime_call(
+                builder,
+                crate::native_abi::COLLECTION_ITERATOR_ADVANCE,
+                &[pointer],
+                None,
+                &[cursor],
+                resources,
+            )?;
+        }
         mir::Statement::BindClosureEnvironment {
             environment,
             bindings,
@@ -3788,6 +3942,10 @@ fn lower_statement(
         } => {
             lower_collection_add(builder, *collection, value, index.as_ref(), *op, resources)?;
         }
+        mir::Statement::CoreCollection {
+            collection,
+            operation,
+        } => lower_core_collection_operation(builder, *collection, operation, resources)?,
         mir::Statement::CollectionSet {
             collection,
             key,
@@ -3961,7 +4119,13 @@ fn lower_statement(
             builder
                 .ins()
                 .stack_store(pointer, zero, slot, pointer.bytes() as i32);
-            lower_drop_error_value(builder, value, resources)?;
+            if !resources
+                .stack_collection_iterators
+                .values()
+                .any(|(cursor, _)| cursor == local)
+            {
+                lower_drop_error_value(builder, value, resources)?;
+            }
         }
     }
     resources.defer_class_temporary_drops = false;
@@ -6618,6 +6782,45 @@ fn lower_error_expression(
             }
             Ok(value)
         }
+        mir::InterfaceValue::FromCollection { value, vtable } => {
+            let object = lower_rvalue(builder, value, resources)?.single()?;
+            let table = lower_interface_vtable_address(builder, *vtable, resources)?;
+            let present = builder.ins().icmp_imm_u(IntCC::NotEqual, object, 0);
+            let zero = builder.ins().iconst(pointer, 0);
+            Ok(LoweredValue::Nullable {
+                present: object,
+                payload: builder.ins().select(present, table, zero),
+            })
+        }
+        mir::InterfaceValue::NewCollectionIterator { source, vtable } => {
+            let slot = local_slot(resources.local_slots, *source)?;
+            let source_value = builder.ins().stack_load(pointer, pointer, slot, 0);
+            let object = if let Some((_, storage)) =
+                resources.stack_collection_iterators.get(source).copied()
+            {
+                builder.ins().stack_store(pointer, source_value, storage, 0);
+                let zero = builder.ins().iconst(pointer, 0);
+                builder
+                    .ins()
+                    .stack_store(pointer, zero, storage, pointer.bytes() as i32);
+                builder.ins().stack_addr(pointer, storage, 0)
+            } else {
+                runtime_call(
+                    builder,
+                    crate::native_abi::COLLECTION_ITERATOR_NEW,
+                    &[pointer, pointer],
+                    Some(pointer),
+                    &[resources.current_frame, source_value],
+                    resources,
+                )?
+                .expect("cursor allocation result")
+            };
+            let payload = lower_interface_vtable_address(builder, *vtable, resources)?;
+            Ok(LoweredValue::Nullable {
+                present: object,
+                payload,
+            })
+        }
         mir::InterfaceValue::FromClass { object, vtable } => {
             let (object, dynamic) =
                 lower_class_expression(builder, object, resources)?.class_parts()?;
@@ -6847,6 +7050,9 @@ fn lower_nullable_two_word_collection_get(
     access: mir::NullableCollectionAccess,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredValue, BackendError> {
+    if access == mir::NullableCollectionAccess::Index {
+        return lower_two_word_collection_index(builder, collection, key, false, false, resources);
+    }
     let pointer = resources.module.target_config().pointer_type();
     let local = local_definition(resources.program, resources.function_id, collection)?;
     let mir::Type::Collection(collection_type) = local.ty else {
@@ -7230,13 +7436,7 @@ fn lower_nullable_payload_enum_collection_get(
             .iadd_imm_u(result, i64::from(ty.nullable_payload_offset));
         copy_inline_bytes(builder, destination, raw, ty.size, pointer);
     }
-    let mutating = matches!(
-        access,
-        mir::NullableCollectionAccess::Remove
-            | mir::NullableCollectionAccess::Pop
-            | mir::NullableCollectionAccess::PopFront
-            | mir::NullableCollectionAccess::PopBack
-    );
+    let mutating = access.removes_element();
     if !mutating && matches!(mode, mir::PayloadEnumUseMode::Copy) {
         retain_payload_enum_at(builder, result, ty, true, resources)?;
     }
@@ -8756,6 +8956,24 @@ fn lower_collection_expression(
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
+        mir::CollectionExpression::InterfaceReceiver { receiver, .. }
+        | mir::CollectionExpression::IteratorSource { receiver, .. } => {
+            let slot = local_slot(resources.local_slots, *receiver)?;
+            let payload = builder.ins().stack_load(pointer, pointer, slot, 0);
+            if matches!(expression, mir::CollectionExpression::IteratorSource { .. }) {
+                Ok(runtime_call(
+                    builder,
+                    crate::native_abi::COLLECTION_ITERATOR_SOURCE,
+                    &[pointer],
+                    Some(pointer),
+                    &[payload],
+                    resources,
+                )?
+                .expect("cursor source result"))
+            } else {
+                Ok(payload)
+            }
+        }
         mir::CollectionExpression::StringIntrinsic(call) => {
             lower_string_intrinsic_call(builder, call, resources)?.single()
         }
@@ -8775,6 +8993,15 @@ fn lower_collection_expression(
             entries,
         } => {
             let definition = collection_definition(resources.program, *collection)?.clone();
+            if definition.uses_core_operations() {
+                if !entries.is_empty() {
+                    return Err(malformed_mir(
+                        "core collection literal lacks explicit comparison and insertion plans",
+                    ));
+                }
+                let capacity = builder.ins().iconst(pointer, 0);
+                return lower_core_collection_new(builder, &definition, capacity, resources);
+            }
             if type_uses_two_word_collection_storage(resources.program, definition.value) {
                 return lower_two_word_collection_literal(builder, &definition, entries, resources);
             }
@@ -8994,6 +9221,103 @@ fn lower_collection_expression(
                 )?;
             }
             Ok(result)
+        }
+        mir::CollectionExpression::FinishConstruction { collection, source } => {
+            let value = lower_collection_expression(
+                builder,
+                &mir::CollectionExpression::Local {
+                    collection: *collection,
+                    local: *source,
+                    transfer: true,
+                    assume_non_null: false,
+                },
+                resources,
+            )?;
+            if collection_definition(resources.program, *collection)?.uses_core_operations() {
+                return Ok(value);
+            }
+            runtime_call(
+                builder,
+                COLLECTION_STAGE26_FINALIZE,
+                &[pointer],
+                None,
+                &[value],
+                resources,
+            )?;
+            Ok(value)
+        }
+        mir::CollectionExpression::ConstructionCapacity {
+            collection,
+            count,
+            count_span,
+        } => {
+            let definition = collection_definition(resources.program, *collection)?.clone();
+            let count = lower_integer_expression(builder, count, resources)?;
+            set_active_panic_site(builder, *count_span, resources);
+            if definition.uses_core_operations() {
+                return lower_core_collection_new(builder, &definition, count, resources);
+            }
+            let fixed = builder.ins().iconst(
+                types::I8,
+                i64::from(definition.kind == mir::CollectionKind::TypedArray),
+            );
+            let aggregate_storage =
+                type_uses_two_word_collection_storage(resources.program, definition.value);
+            let width = if aggregate_storage {
+                Some(pointer.bytes() as u8 * 2)
+            } else {
+                collection_value_width(definition.value, pointer.bytes() as u8)
+            }
+            .ok_or_else(|| {
+                malformed_mir("sequence initialization requires a word-sized element")
+            })?;
+            let width = builder.ins().iconst(types::I8, i64::from(width));
+            let aggregate = builder
+                .ins()
+                .iconst(types::I8, i64::from(aggregate_storage));
+            let keyed = builder
+                .ins()
+                .iconst(types::I8, i64::from(definition.key.is_some()));
+            let kind = builder.ins().iconst(
+                types::I8,
+                i64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+            );
+            let comparator = builder.ins().iconst(
+                types::I8,
+                i64::from(
+                    definition
+                        .comparator
+                        .map(collection_comparator_code)
+                        .unwrap_or(COLLECTION_COMPARE_WORD),
+                ),
+            );
+            runtime_call(
+                builder,
+                crate::native_abi::COLLECTION_CONSTRUCTION_CAPACITY,
+                &[
+                    pointer,
+                    types::I64,
+                    types::I8,
+                    types::I8,
+                    types::I8,
+                    types::I8,
+                    types::I8,
+                    types::I8,
+                ],
+                Some(pointer),
+                &[
+                    resources.current_frame,
+                    count,
+                    fixed,
+                    width,
+                    aggregate,
+                    keyed,
+                    kind,
+                    comparator,
+                ],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("sequence allocation produced no result"))
         }
         mir::CollectionExpression::Fill {
             collection,
@@ -9373,17 +9697,23 @@ fn lower_dictionary_get(
         return Err(malformed_mir("nullable collection access type mismatch"));
     }
     let key_type = match access {
-        mir::NullableCollectionAccess::Get
-        | mir::NullableCollectionAccess::Index
-        | mir::NullableCollectionAccess::Remove => definition
+        mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => definition
             .key
             .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
+        mir::NullableCollectionAccess::Index => {
+            definition
+                .key
+                .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                )))
+        }
         mir::NullableCollectionAccess::First
         | mir::NullableCollectionAccess::Last
         | mir::NullableCollectionAccess::Pop
         | mir::NullableCollectionAccess::PopFront
         | mir::NullableCollectionAccess::PopBack
-        | mir::NullableCollectionAccess::At => {
+        | mir::NullableCollectionAccess::At
+        | mir::NullableCollectionAccess::RemoveAt => {
             mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
         }
     };
@@ -9399,6 +9729,23 @@ fn lower_dictionary_get(
     let key_kind = builder
         .ins()
         .iconst(types::I8, collection_compare_kind(key_type)?);
+    if access == mir::NullableCollectionAccess::Index && !definition.kind.is_dictionary() {
+        // Preserve indexed-read bounds diagnostics before reading nullable presence.
+        runtime_call(
+            builder,
+            COLLECTION_VALUE_AT,
+            &[pointer, pointer, pointer],
+            Some(types::I64),
+            &[resources.current_frame, collection, key_value],
+            resources,
+        )?;
+    }
+    let access =
+        if access == mir::NullableCollectionAccess::Index && !definition.kind.is_dictionary() {
+            mir::NullableCollectionAccess::At
+        } else {
+            access
+        };
     if access == mir::NullableCollectionAccess::Index {
         let present_slot =
             builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
@@ -9481,6 +9828,23 @@ fn lower_collection_add(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
+    if op == mir::CollectionMutationOp::Initialize {
+        if let Some(key) = index {
+            let key_value = lower_rvalue(builder, key, resources)?.single()?;
+            let key_word = value_to_collection_word(builder, key_value, key.ty(), pointer)?;
+            lower_collection_add(builder, collection, value, None, op, resources)?;
+            let destination = lower_collection_pointer(builder, collection, resources)?;
+            runtime_call(
+                builder,
+                crate::native_abi::COLLECTION_INITIALIZE_KEY,
+                &[pointer, types::I64],
+                None,
+                &[destination, key_word],
+                resources,
+            )?;
+            return Ok(());
+        }
+    }
     let local = local_definition(resources.program, resources.function_id, collection)?;
     let mir::Type::Collection(collection_type) = local.ty else {
         return Err(malformed_mir("collection add uses non-collection local"));
@@ -9608,6 +9972,7 @@ fn lower_collection_add(
         && matches!(
             op,
             mir::CollectionMutationOp::Add
+                | mir::CollectionMutationOp::Initialize
                 | mir::CollectionMutationOp::InsertAt
                 | mir::CollectionMutationOp::PushFront
                 | mir::CollectionMutationOp::PushBack
@@ -9807,6 +10172,261 @@ fn lower_collection_add(
         )?;
     }
     Ok(())
+}
+
+fn lower_core_collection_operation(
+    builder: &mut FunctionBuilder,
+    collection: mir::LocalId,
+    operation: &mir::CoreCollectionOperation,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    use mir::CoreCollectionOperation as Op;
+    let pointer = resources.module.target_config().pointer_type();
+    let receiver = lower_collection_pointer(builder, collection, resources)?;
+    let address = |builder: &mut FunctionBuilder, local| -> Result<Value, BackendError> {
+        Ok(builder
+            .ins()
+            .stack_addr(pointer, local_slot(resources.local_slots, local)?, 0))
+    };
+    let integer = |builder: &mut FunctionBuilder, local| -> Result<Value, BackendError> {
+        Ok(builder.ins().stack_load(
+            types::I64,
+            pointer,
+            local_slot(resources.local_slots, local)?,
+            0,
+        ))
+    };
+    match operation {
+        Op::RequireKey { position } => {
+            let position = integer(builder, *position)?;
+            let missing = builder.ins().icmp_imm_s(IntCC::SignedLessThan, position, 0);
+            lower_panic_if_code_at_active_site(builder, missing, "P1312", resources)?;
+        }
+        Op::Insert {
+            position,
+            key,
+            value,
+            hash,
+        } => {
+            let position = integer(builder, *position)?;
+            let key = key
+                .map(|key| address(builder, key))
+                .transpose()?
+                .unwrap_or_else(|| builder.ins().iconst(pointer, 0));
+            let value = address(builder, *value)?;
+            let hash = hash
+                .map(|hash| integer(builder, hash))
+                .transpose()?
+                .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
+            runtime_call(
+                builder,
+                CORE_COLLECTION_INSERT,
+                &[pointer, pointer, pointer, pointer, pointer, types::I64],
+                None,
+                &[
+                    resources.current_frame,
+                    receiver,
+                    position,
+                    key,
+                    value,
+                    hash,
+                ],
+                resources,
+            )?;
+            for local in operation.transfers() {
+                if local_definition(resources.program, resources.function_id, local)?.owned {
+                    let slot = local_slot(resources.local_slots, local)?;
+                    let size = builder.func.sized_stack_slots[slot].size;
+                    let address = builder.ins().stack_addr(pointer, slot, 0);
+                    zero_inline_bytes(builder, address, size, pointer);
+                }
+            }
+        }
+        Op::Remove {
+            position,
+            key,
+            value,
+        } => {
+            let position = integer(builder, *position)?;
+            let key = key
+                .map(|key| address(builder, key))
+                .transpose()?
+                .unwrap_or_else(|| builder.ins().iconst(pointer, 0));
+            let value = address(builder, *value)?;
+            runtime_call(
+                builder,
+                CORE_COLLECTION_REMOVE,
+                &[pointer, pointer, pointer, pointer, pointer],
+                None,
+                &[resources.current_frame, receiver, position, key, value],
+                resources,
+            )?;
+        }
+        Op::Swap { left, right } => {
+            let left = integer(builder, *left)?;
+            let right = integer(builder, *right)?;
+            runtime_call(
+                builder,
+                CORE_COLLECTION_SWAP,
+                &[pointer, pointer, pointer, pointer],
+                None,
+                &[resources.current_frame, receiver, left, right],
+                resources,
+            )?;
+        }
+        Op::KeyAt { position, target } => {
+            let position = integer(builder, *position)?;
+            let source = runtime_call(
+                builder,
+                CORE_COLLECTION_KEY_AT,
+                &[pointer, pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, receiver, position],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("core key read produced no address"))?;
+            let target_slot = local_slot(resources.local_slots, *target)?;
+            let target = builder.ins().stack_addr(pointer, target_slot, 0);
+            copy_inline_bytes(
+                builder,
+                target,
+                source,
+                builder.func.sized_stack_slots[target_slot].size,
+                pointer,
+            );
+        }
+        Op::ValueAt { position, target }
+        | Op::Exchange {
+            position,
+            previous: target,
+            ..
+        } => {
+            let position = integer(builder, *position)?;
+            let positional = builder.ins().iconst(types::I8, 1);
+            let kind = builder
+                .ins()
+                .iconst(types::I8, i64::from(COLLECTION_COMPARE_WORD));
+            let source = runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_VALUE_AT,
+                &[pointer, pointer, types::I64, types::I8, types::I8],
+                Some(pointer),
+                &[
+                    resources.current_frame,
+                    receiver,
+                    position,
+                    positional,
+                    kind,
+                ],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("core value read produced no address"))?;
+            let ty = local_definition(resources.program, resources.function_id, *target)?.ty;
+            let size =
+                native_closure_abi::value_layout(resources.program, ty, pointer.bytes()).size;
+            let destination = address(builder, *target)?;
+            copy_inline_bytes(builder, destination, source, size, pointer);
+            if let Op::Exchange { value, .. } = operation {
+                let replacement = address(builder, *value)?;
+                copy_inline_bytes(builder, source, replacement, size, pointer);
+                if local_definition(resources.program, resources.function_id, *value)?.owned {
+                    zero_inline_bytes(builder, replacement, size, pointer);
+                }
+            }
+        }
+        Op::HashNext {
+            hash,
+            previous,
+            target,
+        } => {
+            let hash = integer(builder, *hash)?;
+            let previous = integer(builder, *previous)?;
+            let slot = runtime_call(
+                builder,
+                CORE_COLLECTION_HASH_NEXT,
+                &[pointer, types::I64, pointer],
+                Some(pointer),
+                &[receiver, hash, previous],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("core hash probe produced no result"))?;
+            builder.ins().stack_store(
+                pointer,
+                slot,
+                local_slot(resources.local_slots, *target)?,
+                0,
+            );
+        }
+        Op::HashPosition { slot, target } => {
+            let slot = integer(builder, *slot)?;
+            let position = runtime_call(
+                builder,
+                CORE_COLLECTION_HASH_POSITION,
+                &[pointer, pointer],
+                Some(pointer),
+                &[receiver, slot],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("core hash position produced no result"))?;
+            builder.ins().stack_store(
+                pointer,
+                position,
+                local_slot(resources.local_slots, *target)?,
+                0,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn lower_core_collection_new(
+    builder: &mut FunctionBuilder,
+    definition: &mir::CollectionType,
+    capacity: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let layout =
+        native_closure_abi::value_layout(resources.program, definition.value, pointer.bytes());
+    let key_size = definition
+        .key
+        .map(|ty| native_closure_abi::value_layout(resources.program, ty, pointer.bytes()).size)
+        .unwrap_or(0);
+    let key_size = builder.ins().iconst(pointer, i64::from(key_size));
+    let size = builder.ins().iconst(pointer, i64::from(layout.size));
+    let alignment = builder.ins().iconst(pointer, i64::from(layout.align));
+    let kind = builder.ins().iconst(
+        types::I8,
+        i64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+    );
+    let hashed = builder
+        .ins()
+        .iconst(types::I8, i64::from(definition.uses_core_hash()));
+    runtime_call(
+        builder,
+        CORE_COLLECTION_NEW,
+        &[
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            types::I8,
+            types::I8,
+        ],
+        Some(pointer),
+        &[
+            resources.current_frame,
+            capacity,
+            key_size,
+            size,
+            alignment,
+            kind,
+            hashed,
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("core collection allocation produced no result"))
 }
 
 fn lower_collection_set(
@@ -10729,7 +11349,9 @@ fn lower_finish_collection_value(
     builder.switch_to_block(body);
     let one = builder.ins().iconst(pointer, 1);
     let index = builder.ins().isub(remaining, one);
-    if type_uses_two_word_collection_storage(resources.program, definition.value) {
+    if definition.uses_core_operations()
+        || type_uses_two_word_collection_storage(resources.program, definition.value)
+    {
         let index_word = if pointer == types::I64 {
             index
         } else {
@@ -10796,17 +11418,30 @@ fn lower_finish_collection_value(
         lower_drop_stored_value(builder, value, stored_value_type, resources)?;
     }
     if let Some(key_type) = definition.key {
-        let key_word = runtime_call(
-            builder,
-            COLLECTION_KEY_AT,
-            &[pointer, pointer, pointer],
-            Some(types::I64),
-            &[resources.current_frame, cleanup_collection, index],
-            resources,
-        )?
-        .ok_or_else(|| backend_failure("collection key read produced no result"))?;
-        let key = collection_word_to_value(builder, key_word, key_type, pointer)?;
-        lower_drop_stored_value(builder, key, key_type, resources)?;
+        if definition.uses_core_operations() {
+            let address = runtime_call(
+                builder,
+                crate::native_abi::CORE_COLLECTION_KEY_AT,
+                &[pointer, pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, cleanup_collection, index],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("core key cleanup has no address"))?;
+            lower_drop_value_at_address(builder, key_type, address, resources)?;
+        } else {
+            let key_word = runtime_call(
+                builder,
+                COLLECTION_KEY_AT,
+                &[pointer, pointer, pointer],
+                Some(types::I64),
+                &[resources.current_frame, cleanup_collection, index],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("collection key read produced no result"))?;
+            let key = collection_word_to_value(builder, key_word, key_type, pointer)?;
+            lower_drop_stored_value(builder, key, key_type, resources)?;
+        }
     }
     builder.ins().jump(header, &[BlockArg::Value(index)]);
     builder.switch_to_block(free);
@@ -12393,6 +13028,9 @@ fn lower_drop_class_value_impl(
             .transpose()?
             .unwrap_or(0);
         for property in phase_definition.properties[first_property..].iter().rev() {
+            if property.borrowed_source && property.ty.has_move_ownership() {
+                continue;
+            }
             let address =
                 lower_property_address_from_value(builder, object, property.id, resources)?;
             match property.ty {
@@ -14091,13 +14729,7 @@ fn lower_nullable_string_expression(
                 *access,
                 resources,
             )?;
-            let payload = if matches!(
-                access,
-                mir::NullableCollectionAccess::Remove
-                    | mir::NullableCollectionAccess::Pop
-                    | mir::NullableCollectionAccess::PopFront
-                    | mir::NullableCollectionAccess::PopBack
-            ) {
+            let payload = if access.removes_element() {
                 payload
             } else {
                 retain_string(builder, payload, resources)?
@@ -15267,6 +15899,20 @@ fn lower_integer_operand(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match operand {
+        mir::Operand::CollectionIteratorPosition { receiver, .. } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let slot = local_slot(resources.local_slots, *receiver)?;
+            let cursor = builder.ins().stack_load(pointer, pointer, slot, 0);
+            Ok(runtime_call(
+                builder,
+                crate::native_abi::COLLECTION_ITERATOR_POSITION,
+                &[pointer],
+                Some(types::I64),
+                &[cursor],
+                resources,
+            )?
+            .expect("cursor position result"))
+        }
         mir::Operand::StringIntrinsic(call) => {
             lower_string_intrinsic_call(builder, call, resources)?.single()
         }
@@ -15670,6 +16316,14 @@ fn lower_string_intrinsic_call(
     };
 
     let result = match call.kind {
+        Kind::Hash => LoweredValue::Single(call_runtime(
+            builder,
+            crate::native_abi::STRING_HASH,
+            &[pointer],
+            types::I64,
+            &[argument(0)?],
+            resources,
+        )?),
         Kind::GraphemeLength | Kind::ByteLength => {
             let name = if call.kind == Kind::GraphemeLength {
                 STRING_GRAPHEME_LENGTH

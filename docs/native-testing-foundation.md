@@ -16,7 +16,7 @@ Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - In Progress; Slices 1 And 2 Complete; Slice 3 Next
+Stage 35 Interfaces And Traits - In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -383,6 +383,12 @@ matchers become substantially cleaner after Stage 35 lands user interfaces,
 traits, `Equatable`, `Displayable`, and `Cloneable` conformance.
 
 They are deferred, not permanently rejected.
+
+Decision 0134 Slice 3 implements core value contracts. `toEqual`, `toContain`,
+`toHaveKey`, and `toHaveValue` use the same checked equality, hashing, and
+collection lookup plans as ordinary source operations, including collision
+checks and automatic effects. No assertion-only equality law is introduced.
+Custom matcher authoring remains a separate deferred surface.
 
 ## Invalidated Elsewhere
 

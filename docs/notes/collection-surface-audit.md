@@ -28,6 +28,13 @@ cleanup, state reset, and reuse; no Decision 0113 member remains behind E0559. T
 matrix below remains the historical input to the decision rather than being
 rewritten as if those operations existed at audit time.
 
+Decision 0134 Slice 3 now executes nominal equality, hashing, ordering, and
+duplication. Preserving `::from`, Set/SortedSet algebra, sequence fill, and
+List filter accept Copy-or-Cloneable elements; map keys and values satisfy
+duplication independently. Non-Cloneable Move inputs remain rejected rather
+than consumed. Public Iterable execution borrows Move elements; optimized
+built-in loops and foreach-only projections retain their existing contracts.
+
 ## 1. Correction to the reported symptom
 
 The audit was prompted by the report that `Dictionary` and `SortedDictionary`

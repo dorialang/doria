@@ -1,0 +1,50 @@
+class Item implements Cloneable
+{
+    function __construct(int $id) {}
+    function clone(): self
+    {
+        echo "clone {$this->id}\n";
+        return new Item($this->id);
+    }
+    function __destruct(): void
+    {
+        try { echo "drop {$this->id}\n"; } catch (Error $error) {}
+    }
+}
+
+function repeat(?Item $source): void
+{
+    List<?Item> $items = [$source; 2];
+    foreach ($items as ?Item $item) {
+        if ($item != null) { echo "item {$item->id}\n"; }
+        else { echo "absent\n"; }
+    }
+}
+
+function main(): void
+{
+    repeat(null);
+    repeat(new Item(1));
+    List<?Item> $source = [null, new Item(2)];
+    let $selected = $source->filter(fn(?Item $item) => true);
+    foreach ($selected as ?Item $item) {
+        if ($item != null) { echo "selected {$item->id}\n"; }
+        else { echo "selected absent\n"; }
+    }
+    erased(new Item(3));
+    nullableErased(null);
+    nullableErased(new Item(4));
+}
+
+function erased(Cloneable $source): void
+{
+    Cloneable[] $items = [$source; 2];
+    echo "erased {$items->length}\n";
+}
+
+function nullableErased(?Cloneable $source): void
+{
+    List<?Cloneable> $items = [$source; 1];
+    foreach ($items as ?Cloneable $item) { echo $item != null; }
+    echo "\n";
+}

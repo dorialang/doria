@@ -17,6 +17,8 @@ use crate::symbols::{
 };
 use crate::types::{FunctionInvocationMode, ResolvedType};
 
+mod retained;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorrowAccess {
     Readonly,
@@ -24,7 +26,7 @@ pub enum BorrowAccess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ClosureBorrowRoot {
+pub enum BorrowRoot {
     Binding(BindingId),
     Receiver,
     EnclosingEnvironment(ClosureId),
@@ -32,9 +34,9 @@ pub enum ClosureBorrowRoot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClosureValueProvenance {
+pub enum ValueProvenance {
     Owned,
-    BorrowBound(Vec<ClosureBorrowRoot>),
+    BorrowBound(Vec<BorrowRoot>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +53,7 @@ pub struct CaptureAcquisition {
     pub source_binding_id: BindingId,
     pub kind: CaptureAcquisitionKind,
     pub source_type: ResolvedType,
-    pub roots: Vec<ClosureBorrowRoot>,
+    pub roots: Vec<BorrowRoot>,
     pub source_span: Option<Span>,
     pub capture_span: Span,
 }
@@ -72,7 +74,7 @@ pub enum ClosureEscapeClassification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureOwnershipInfo {
     pub closure_id: ClosureId,
-    pub provenance: ClosureValueProvenance,
+    pub provenance: ValueProvenance,
     pub acquisitions: Vec<CaptureAcquisition>,
     pub release_order: Vec<usize>,
     pub escape: ClosureEscapeClassification,
@@ -84,6 +86,21 @@ pub(crate) struct OwnershipAnalysis {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) closures: HashMap<ClosureId, ClosureOwnershipInfo>,
     pub(crate) return_borrows: HashMap<Span, ReturnBorrow>,
+    pub(crate) retained_callables: HashMap<Span, RetainedCallableInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedSource {
+    pub source: BorrowSource,
+    /// Propagate the input carrier's loans instead of borrowing the input itself.
+    pub inherited: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedCallableInfo {
+    pub returns: Vec<RetainedSource>,
+    pub constructs: Vec<RetainedSource>,
+    pub requires_independent: Vec<BorrowSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,10 +111,12 @@ struct Parameter {
     generic: bool,
     take: bool,
     writable: bool,
+    borrow: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Signature {
+    declaration: Option<Span>,
     params: Vec<Parameter>,
     returns: Option<String>,
     returns_collection: Option<CollectionInfo>,
@@ -145,6 +164,7 @@ fn writable_shared_constructor_signature() -> Signature {
             generic: true,
             take: true,
             writable: false,
+            borrow: false,
         }],
         returns_move_type: true,
         ..Signature::default()
@@ -583,26 +603,34 @@ struct Binding {
     writable: bool,
     state: State,
     function_type: Option<crate::types::SemanticFunctionType<ResolvedType>>,
-    function_value: Option<FunctionValueState>,
+    retained_value: Option<RetainedValueState>,
     scope_depth: usize,
 }
 
 #[derive(Debug, Clone)]
-struct FunctionValueState {
+struct RetainedValueState {
+    kind: RetainedValueKind,
     closure_id: Option<ClosureId>,
-    provenance: ClosureValueProvenance,
-    leases: Vec<ClosureLease>,
+    provenance: ValueProvenance,
+    leases: Vec<RetainedLoan>,
     nonescaping_parameter: bool,
     take_parameter_insertion: Option<Span>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedValueKind {
+    Closure,
+    Iterator,
+}
+
 #[derive(Debug, Clone)]
-struct ClosureLease {
-    root: ClosureBorrowRoot,
+struct RetainedLoan {
+    root: BorrowRoot,
     root_key: String,
     access: BorrowAccess,
     capture_span: Span,
     source_depth: usize,
+    inherited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -718,7 +746,7 @@ impl Scopes {
         })
     }
 
-    fn active_closure_leases(&self) -> impl Iterator<Item = &ClosureLease> {
+    fn active_retained_loans(&self) -> impl Iterator<Item = (RetainedValueKind, &RetainedLoan)> {
         self.0.iter().flat_map(|scope| {
             scope
                 .values()
@@ -732,11 +760,11 @@ impl Scopes {
                             | State::MaybeGiven { .. }
                     );
                     binding
-                        .function_value
+                        .retained_value
                         .as_ref()
                         .filter(move |_| available)
                         .into_iter()
-                        .flat_map(|value| value.leases.iter())
+                        .flat_map(|value| value.leases.iter().map(|loan| (value.kind, loan)))
                 })
         })
     }
@@ -752,8 +780,13 @@ impl Scopes {
                 let Some(binding) = binding else {
                     continue;
                 };
-                if binding.function_value.is_some() && !statements_use_variable(remaining, name) {
-                    if let Some(value) = &mut binding.function_value {
+                if binding
+                    .retained_value
+                    .as_ref()
+                    .is_some_and(|value| value.kind == RetainedValueKind::Closure)
+                    && !statements_use_variable(remaining, name)
+                {
+                    if let Some(value) = &mut binding.retained_value {
                         value.leases.clear();
                     }
                 }
@@ -801,25 +834,27 @@ impl Scopes {
                     continue;
                 };
                 binding.state = join_state(&left_state.state, &right_state.state);
-                binding.function_value = join_function_value(
-                    left_state.function_value.as_ref(),
-                    right_state.function_value.as_ref(),
+                binding.retained_value = join_retained_value(
+                    left_state.retained_value.as_ref(),
+                    right_state.retained_value.as_ref(),
                 );
             }
         }
     }
 }
 
-fn join_function_value(
-    left: Option<&FunctionValueState>,
-    right: Option<&FunctionValueState>,
-) -> Option<FunctionValueState> {
+fn join_retained_value(
+    left: Option<&RetainedValueState>,
+    right: Option<&RetainedValueState>,
+) -> Option<RetainedValueState> {
     match (left, right) {
         (Some(left), Some(right)) if left.closure_id == right.closure_id => {
             let mut joined = left.clone();
             for lease in &right.leases {
                 if !joined.leases.iter().any(|candidate| {
-                    candidate.root == lease.root && candidate.access == lease.access
+                    candidate.root == lease.root
+                        && candidate.access == lease.access
+                        && candidate.inherited == lease.inherited
                 }) {
                     joined.leases.push(lease.clone());
                 }
@@ -831,7 +866,9 @@ fn join_function_value(
             joined.closure_id = None;
             for lease in &right.leases {
                 if !joined.leases.iter().any(|candidate| {
-                    candidate.root == lease.root && candidate.access == lease.access
+                    candidate.root == lease.root
+                        && candidate.access == lease.access
+                        && candidate.inherited == lease.inherited
                 }) {
                     joined.leases.push(lease.clone());
                 }
@@ -841,9 +878,9 @@ fn join_function_value(
             roots.sort();
             roots.dedup();
             joined.provenance = if roots.is_empty() {
-                ClosureValueProvenance::Owned
+                ValueProvenance::Owned
             } else {
-                ClosureValueProvenance::BorrowBound(roots)
+                ValueProvenance::BorrowBound(roots)
             };
             joined.nonescaping_parameter =
                 left.nonescaping_parameter || right.nonescaping_parameter;
@@ -854,10 +891,10 @@ fn join_function_value(
     }
 }
 
-fn provenance_roots(provenance: &ClosureValueProvenance) -> Vec<ClosureBorrowRoot> {
+fn provenance_roots(provenance: &ValueProvenance) -> Vec<BorrowRoot> {
     match provenance {
-        ClosureValueProvenance::Owned => Vec::new(),
-        ClosureValueProvenance::BorrowBound(roots) => roots.clone(),
+        ValueProvenance::Owned => Vec::new(),
+        ValueProvenance::BorrowBound(roots) => roots.clone(),
     }
 }
 
@@ -902,6 +939,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let callable_value_calls = HashMap::new();
     let assertion_callable_invocations = HashMap::new();
     let list_algorithm_calls = HashMap::new();
+    let call_targets = HashMap::new();
     check_program_with_inferred_move_returns(
         program,
         &OwnershipAnalysisContext {
@@ -919,6 +957,9 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
             callable_value_calls: &callable_value_calls,
             assertion_callable_invocations: &assertion_callable_invocations,
             list_algorithm_calls: &list_algorithm_calls,
+            call_targets: &call_targets,
+            contracts: &crate::semantics::contracts::ContractFacts::default(),
+            classes: &[],
         },
     )
     .diagnostics
@@ -939,6 +980,9 @@ pub(crate) struct OwnershipAnalysisContext<'a> {
     pub(crate) callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
     pub(crate) assertion_callable_invocations: &'a HashMap<Span, FunctionInvocationMode>,
     pub(crate) list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
+    pub(crate) call_targets: &'a HashMap<Span, crate::semantics::CallableTarget>,
+    pub(crate) contracts: &'a crate::semantics::contracts::ContractFacts,
+    pub(crate) classes: &'a [crate::semantics::ClassSemanticInfo],
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
@@ -960,6 +1004,9 @@ pub(crate) fn check_program_with_inferred_move_returns(
         callable_value_calls,
         assertion_callable_invocations,
         list_algorithm_calls,
+        call_targets,
+        contracts,
+        classes: class_semantics,
     } = *context;
     let classes = program
         .items
@@ -1132,6 +1179,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                         generic,
                                         take: move_type,
                                         writable: false,
+                                        borrow: false,
                                     }
                                 })
                                 .collect(),
@@ -1177,6 +1225,8 @@ pub(crate) fn check_program_with_inferred_move_returns(
         callable_value_calls,
         assertion_callable_invocations,
         list_algorithm_calls,
+        call_targets,
+        retained: retained::Analysis::new(class_semantics, contracts, move_enum_names),
         next_binding_id: 0,
         diagnostics: Vec::new(),
         closure_ownership: HashMap::new(),
@@ -1184,6 +1234,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         analyzed_closures: HashSet::new(),
         prepared_closure_evaluations: HashSet::new(),
     };
+    checker.infer_retained_callables(program);
     let mut top_level_scopes = Scopes::new();
     let mut top_level_falls_through = true;
     for item in &program.items {
@@ -1197,10 +1248,10 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 let previous_receiver =
                                     checker.receiver_class.replace(class.name.clone());
                                 let mut scopes = Scopes::new();
-                                let function_value =
-                                    checker.prepare_function_value(initializer, &mut scopes);
+                                let retained_value =
+                                    checker.prepare_retained_value(initializer, &mut scopes);
                                 let function_storage_valid =
-                                    function_value.as_ref().is_none_or(|value| {
+                                    retained_value.as_ref().is_none_or(|value| {
                                         if property.is_static {
                                             checker.reject_deferred_function_storage(
                                                 value,
@@ -1288,6 +1339,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         diagnostics: checker.diagnostics,
         closures: checker.closure_ownership,
         return_borrows: checker.return_borrows,
+        retained_callables: checker.retained.callables,
     }
 }
 
@@ -1669,6 +1721,7 @@ fn signature(
             })
         });
     Signature {
+        declaration: Some(function.span),
         params: function
             .params
             .iter()
@@ -1688,6 +1741,7 @@ fn signature(
                 ),
                 take: param.take,
                 writable: param.writable,
+                borrow: param.borrow_span.is_some(),
             })
             .collect(),
         returns: function
@@ -1706,7 +1760,7 @@ fn signature(
         }),
         returns_move_type: function.return_type.as_ref().is_some_and(|ty| {
             (type_ref_is_move_type_with_enums(ty, classes, move_enum_names, receiver_class)
-                || type_ref_mentions_potential_move_parameter(
+                || type_ref_mentions_any_parameter(
                     ty,
                     &function.type_params,
                     enclosing_type_params,
@@ -1739,24 +1793,6 @@ fn type_ref_mentions_any_parameter(
 ) -> bool {
     type_ref_mentions_parameter(ty, function_params)
         || type_ref_mentions_parameter(ty, enclosing_params)
-}
-
-fn type_ref_mentions_potential_move_parameter(
-    ty: &crate::types::TypeRef,
-    function_params: &[ast::TypeParamDecl],
-    enclosing_params: &[ast::TypeParamDecl],
-) -> bool {
-    function_params.iter().chain(enclosing_params).any(|param| {
-        param.name == ty.name
-            && !param.constraints.iter().any(|constraint| {
-                matches!(
-                    constraint.name.as_str(),
-                    "Comparable" | "Equatable" | "Hashable"
-                )
-            })
-    }) || ty.type_arguments().any(|argument| {
-        type_ref_mentions_potential_move_parameter(argument, function_params, enclosing_params)
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1878,10 +1914,12 @@ struct Checker<'a> {
     callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
     assertion_callable_invocations: &'a HashMap<Span, FunctionInvocationMode>,
     list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
+    call_targets: &'a HashMap<Span, crate::semantics::CallableTarget>,
+    retained: retained::Analysis,
     next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
     closure_ownership: HashMap<ClosureId, ClosureOwnershipInfo>,
-    closure_values: HashMap<ClosureId, FunctionValueState>,
+    closure_values: HashMap<ClosureId, RetainedValueState>,
     analyzed_closures: HashSet<ClosureId>,
     prepared_closure_evaluations: HashSet<ClosureId>,
 }
@@ -1915,16 +1953,15 @@ impl Checker<'_> {
         id: Option<BindingId>,
         ownership: BindingOwnership,
         take_parameter_insertion: Option<Span>,
-    ) -> Option<FunctionValueState> {
+    ) -> Option<RetainedValueState> {
         self.canonical_function_type(id)
-            .map(|_| FunctionValueState {
+            .map(|_| RetainedValueState {
+                kind: RetainedValueKind::Closure,
                 closure_id: None,
                 provenance: if ownership == BindingOwnership::Owned {
-                    ClosureValueProvenance::Owned
+                    ValueProvenance::Owned
                 } else {
-                    ClosureValueProvenance::BorrowBound(
-                        id.map(ClosureBorrowRoot::Binding).into_iter().collect(),
-                    )
+                    ValueProvenance::BorrowBound(id.map(BorrowRoot::Binding).into_iter().collect())
                 },
                 leases: Vec::new(),
                 nonescaping_parameter: ownership != BindingOwnership::Owned,
@@ -1989,6 +2026,7 @@ impl Checker<'_> {
         let Some(body) = function.body.as_block() else {
             return;
         };
+        let previous_retained_context = self.retained.enter_function(function);
         let enclosing_type_params = receiver_class
             .and_then(|class| self.class_type_params.get(class))
             .cloned()
@@ -2047,11 +2085,24 @@ impl Checker<'_> {
             } else {
                 BindingOwnership::ReadonlyBorrow
             };
-            let function_value = self.parameter_function_value(
-                canonical_id,
-                ownership,
-                (!param.take && !param.writable).then_some(param.ownership_modifier_insert),
-            );
+            let retained_value = self
+                .parameter_function_value(
+                    canonical_id,
+                    ownership,
+                    (!param.take && !param.writable).then_some(param.ownership_modifier_insert),
+                )
+                .or_else(|| self.parameter_retained_value(canonical_id));
+            if function.name == "__construct"
+                && param.constructor_role.is_promoted()
+                && param.borrow_span.is_none()
+            {
+                if let Some(value) = retained_value
+                    .as_ref()
+                    .filter(|value| value.kind == RetainedValueKind::Iterator)
+                {
+                    self.validate_iterator_storage(value, param.span, "an owned promoted property");
+                }
+            }
             scopes.declare(
                 param.name.clone(),
                 Binding {
@@ -2078,7 +2129,7 @@ impl Checker<'_> {
                         State::Borrowed
                     },
                     function_type,
-                    function_value,
+                    retained_value,
                     scope_depth: scopes.lexical_depth(),
                 },
             );
@@ -2089,7 +2140,7 @@ impl Checker<'_> {
                 &self.classes,
                 &self.move_enum_names,
                 self.receiver_class.as_deref(),
-            ) || type_ref_mentions_potential_move_parameter(ty, &self.current_type_params, &[]))
+            ) || type_ref_mentions_any_parameter(ty, &self.current_type_params, &[]))
                 && self.current_return_borrow.is_none()
         }) || (function.return_type.is_none()
             && self.inferred_move_returns.contains(&function.span));
@@ -2098,6 +2149,7 @@ impl Checker<'_> {
         self.current_type_params = previous_type_params;
         self.receiver_writable = previous_receiver_writable;
         self.receiver_class = previous_receiver;
+        self.retained.current = previous_retained_context;
     }
 
     fn check_block(
@@ -2172,7 +2224,6 @@ impl Checker<'_> {
                                 .cloned()
                         })?
                     });
-                let function_value = self.prepare_function_value(&decl.initializer, scopes);
                 let borrowed_function_value = match ungroup_expr(&decl.initializer) {
                     Expr::Variable { name, .. } => scopes.get(name).is_some_and(|binding| {
                         binding.function_type.is_some()
@@ -2253,7 +2304,18 @@ impl Checker<'_> {
                         ),
                     );
                 }
-                let function_destination_valid = function_value.as_ref().is_none_or(|value| {
+                let retained_value = self.evaluate_retained_value(
+                    &decl.initializer,
+                    scopes,
+                    if borrowed_owning_value {
+                        UseMode::Read
+                    } else if initializer_moves || class.is_some() || mixed || declared_move_type {
+                        UseMode::Give
+                    } else {
+                        UseMode::Read
+                    },
+                );
+                let function_destination_valid = retained_value.as_ref().is_none_or(|value| {
                     if decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed") {
                         self.validate_owned_function_storage(
                             value,
@@ -2268,17 +2330,6 @@ impl Checker<'_> {
                         )
                     }
                 });
-                self.use_expr(
-                    &decl.initializer,
-                    scopes,
-                    if !function_destination_valid || borrowed_owning_value {
-                        UseMode::Read
-                    } else if initializer_moves || class.is_some() || mixed || declared_move_type {
-                        UseMode::Give
-                    } else {
-                        UseMode::Read
-                    },
-                );
                 if function_type.is_some() && decl.bindings.len() > 1 {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -2331,8 +2382,8 @@ impl Checker<'_> {
                                 function_type: self
                                     .canonical_function_type(canonical_id)
                                     .or_else(|| function_type.clone()),
-                                function_value: (index == 0 && function_destination_valid)
-                                    .then(|| function_value.clone())
+                                retained_value: (index == 0 && function_destination_valid)
+                                    .then(|| retained_value.clone())
                                     .flatten(),
                                 scope_depth: scopes.lexical_depth(),
                             },
@@ -2352,8 +2403,8 @@ impl Checker<'_> {
                         .and_then(non_null_function_type)
                         .is_some()
                         || self
-                            .function_value_from_expr(&assignment.value, scopes)
-                            .is_some();
+                            .retained_value_from_expr(&assignment.value, scopes)
+                            .is_some_and(|value| value.kind == RetainedValueKind::Closure);
                     if self.expr_returns_borrow(&assignment.value, scopes)
                         && !value_is_function
                         && scopes.get(name).is_some()
@@ -2384,8 +2435,8 @@ impl Checker<'_> {
                     let mixed_assignment = target.as_ref().is_some_and(|binding| binding.mixed);
                     let move_assignment = target.is_some() && value_moves;
                     if mixed_assignment && value_is_function {
-                        let pending_value = self.prepare_function_value(&assignment.value, scopes);
-                        let valid = pending_value.as_ref().is_none_or(|value| {
+                        let pending_value = self.prepare_retained_value(&assignment.value, scopes);
+                        let mut valid = pending_value.as_ref().is_none_or(|value| {
                             self.validate_owned_function_storage(
                                 value,
                                 assignment.value.span(),
@@ -2397,10 +2448,20 @@ impl Checker<'_> {
                             scopes,
                             if valid { UseMode::Give } else { UseMode::Read },
                         );
+                        let evaluated = self.retained_value_from_expr(&assignment.value, scopes);
+                        if pending_value.is_none() {
+                            valid &= evaluated.as_ref().is_none_or(|value| {
+                                self.validate_owned_function_storage(
+                                    value,
+                                    assignment.value.span(),
+                                    "`mixed`",
+                                )
+                            });
+                        }
                         if valid {
                             if let Some(binding) = scopes.get_mut(name) {
                                 binding.state = State::Owned;
-                                binding.function_value = pending_value;
+                                binding.retained_value = evaluated;
                             }
                         }
                         return Flow::fallthrough();
@@ -2431,8 +2492,7 @@ impl Checker<'_> {
                             self.use_expr(&assignment.value, scopes, UseMode::Read);
                             return Flow::fallthrough();
                         }
-                        let pending_value = self.prepare_function_value(&assignment.value, scopes);
-                        self.use_expr(
+                        let pending_value = self.evaluate_retained_value(
                             &assignment.value,
                             scopes,
                             if matches!(&assignment.value, Expr::Null { .. }) {
@@ -2460,11 +2520,19 @@ impl Checker<'_> {
                         }
                         if let Some(binding) = scopes.get_mut(name) {
                             binding.state = State::Owned;
-                            binding.function_value = pending_value;
+                            binding.retained_value = pending_value;
                         }
                         return Flow::fallthrough();
                     }
                     if class_assignment || mixed_assignment || move_assignment {
+                        if let Some(root) = self.borrow_root_key(&assignment.target, scopes) {
+                            self.check_live_retained_conflict(
+                                &root,
+                                UseMode::Write,
+                                assignment.target.span(),
+                                scopes,
+                            );
+                        }
                         if variable_name(&assignment.value).is_some_and(|source| source == name) {
                             self.diagnostics.push(
                                 Diagnostic::new(
@@ -2492,7 +2560,7 @@ impl Checker<'_> {
                                 ),
                             );
                         }
-                        self.use_expr(
+                        let pending_value = self.evaluate_retained_value(
                             &assignment.value,
                             scopes,
                             if value_moves || class_assignment {
@@ -2501,7 +2569,26 @@ impl Checker<'_> {
                                 UseMode::Read
                             },
                         );
+                        if let Some(value) = &pending_value {
+                            if mixed_assignment {
+                                self.validate_owned_function_storage(
+                                    value,
+                                    assignment.value.span(),
+                                    "`mixed`",
+                                );
+                            } else {
+                                let target_depth = target
+                                    .as_ref()
+                                    .map_or(scopes.lexical_depth(), |binding| binding.scope_depth);
+                                self.validate_local_function_destination(
+                                    value,
+                                    target_depth,
+                                    assignment.value.span(),
+                                );
+                            }
+                        }
                         if let Some(binding) = scopes.get_mut(name) {
+                            binding.retained_value = pending_value;
                             binding.state = if binding.borrowed_place {
                                 State::Borrowed
                             } else {
@@ -2513,7 +2600,7 @@ impl Checker<'_> {
                         }
                     } else {
                         if let Some(root) = self.borrow_root_key(&assignment.target, scopes) {
-                            self.check_live_closure_conflict(
+                            self.check_live_retained_conflict(
                                 &root,
                                 UseMode::Write,
                                 assignment.target.span(),
@@ -2535,7 +2622,7 @@ impl Checker<'_> {
                                 .and_then(non_null_function_type)
                                 .is_some();
                     if static_function_storage {
-                        if let Some(value) = self.prepare_function_value(&assignment.value, scopes)
+                        if let Some(value) = self.prepare_retained_value(&assignment.value, scopes)
                         {
                             self.reject_deferred_function_storage(
                                 &value,
@@ -2560,8 +2647,8 @@ impl Checker<'_> {
                     };
                     if let Some(slot) = indexed_slot {
                         let borrowed_value = self.expr_returns_borrow(&assignment.value, scopes);
-                        let function_value = self.prepare_function_value(&assignment.value, scopes);
-                        let valid_function_storage = function_value.as_ref().is_none_or(|value| {
+                        let retained_value = self.prepare_retained_value(&assignment.value, scopes);
+                        let valid_function_storage = retained_value.as_ref().is_none_or(|value| {
                             self.validate_owned_function_storage(
                                 value,
                                 assignment.value.span(),
@@ -2598,9 +2685,9 @@ impl Checker<'_> {
                     let owning_property = property
                         .as_ref()
                         .is_some_and(|property| property.move_type || property.mixed);
-                    let function_value = self.prepare_function_value(&assignment.value, scopes);
+                    let retained_value = self.prepare_retained_value(&assignment.value, scopes);
                     let mut valid_function_storage = true;
-                    if let Some(value) = function_value.as_ref() {
+                    if let Some(value) = retained_value.as_ref() {
                         let stores_on_receiver = matches!(
                             ungroup_expr(&assignment.target),
                             Expr::PropertyAccess { object, .. }
@@ -2609,8 +2696,8 @@ impl Checker<'_> {
                         if stores_on_receiver
                             && matches!(
                                 &value.provenance,
-                                ClosureValueProvenance::BorrowBound(roots)
-                                    if roots.contains(&ClosureBorrowRoot::Receiver)
+                                ValueProvenance::BorrowBound(roots)
+                                    if roots.contains(&BorrowRoot::Receiver)
                             )
                         {
                             valid_function_storage = false;
@@ -2675,12 +2762,6 @@ impl Checker<'_> {
             }
             Stmt::Return { expr, .. } => {
                 if let Some(expr) = expr {
-                    if let Some(function_value) = self.prepare_function_value(expr, scopes) {
-                        if !self.validate_returned_function_value(&function_value, expr.span()) {
-                            self.use_expr(expr, scopes, UseMode::Read);
-                            return Flow::stops();
-                        }
-                    }
                     if let Some(mode) = self.when_result_modes.last().copied() {
                         if mode == UseMode::Give && self.expr_returns_borrow(expr, scopes) {
                             self.diagnostics.push(
@@ -2693,9 +2774,22 @@ impl Checker<'_> {
                             );
                             self.use_expr(expr, scopes, UseMode::Read);
                         } else {
-                            self.use_expr(expr, scopes, mode);
+                            let value = self.evaluate_retained_value(expr, scopes, mode);
+                            let previous = self
+                                .retained
+                                .yielded_values
+                                .last_mut()
+                                .expect("when result");
+                            *previous = join_retained_value(previous.as_ref(), value.as_ref());
                         }
                         return Flow::yields(scopes);
+                    }
+                    let prepared = self.prepare_retained_value(expr, scopes);
+                    if let Some(value) = &prepared {
+                        if !self.validate_returned_function_value(value, expr.span()) {
+                            self.use_expr(expr, scopes, UseMode::Read);
+                            return Flow::stops();
+                        }
                     }
                     if return_move_type
                         && self.current_return_borrow.is_none()
@@ -2723,6 +2817,11 @@ impl Checker<'_> {
                             self.current_return_borrow.unwrap_or(UseMode::Read)
                         },
                     );
+                    if prepared.is_none() {
+                        if let Some(value) = self.retained_value_from_expr(expr, scopes) {
+                            self.validate_returned_function_value(&value, expr.span());
+                        }
+                    }
                 }
                 Flow::returns(scopes)
             }
@@ -2957,7 +3056,7 @@ impl Checker<'_> {
             }
             Stmt::Increment(increment) => {
                 if let Some(root) = self.borrow_root_key(&increment.target, scopes) {
-                    self.check_live_closure_conflict(
+                    self.check_live_retained_conflict(
                         &root,
                         UseMode::Write,
                         increment.target.span(),
@@ -3044,7 +3143,7 @@ impl Checker<'_> {
                                 writable: false,
                                 state: State::Owned,
                                 function_type: None,
-                                function_value: None,
+                                retained_value: None,
                                 scope_depth: catch_scopes.lexical_depth(),
                             },
                         );
@@ -3271,7 +3370,7 @@ impl Checker<'_> {
                 writable: binding.writable,
                 state: State::Borrowed,
                 function_type: self.canonical_function_type(canonical_id),
-                function_value: self.parameter_function_value(
+                retained_value: self.parameter_function_value(
                     canonical_id,
                     if binding.writable {
                         BindingOwnership::WritableBorrow
@@ -3408,7 +3507,13 @@ impl Checker<'_> {
         let target_inserted = assignment_target
             .as_ref()
             .is_some_and(|target| self.active_assignment_targets.insert(target.clone()));
-        self.use_expr(value, scopes, value_mode);
+        let already_checked = self.retained_value_from_expr(value, scopes).is_some();
+        let retained = self.evaluate_retained_value(value, scopes, value_mode);
+        if tracked_target && !already_checked {
+            if let Some(retained) = retained {
+                self.validate_owned_function_storage(&retained, value.span(), "an owned aggregate");
+            }
+        }
         if target_inserted {
             self.active_assignment_targets
                 .remove(assignment_target.as_deref().expect("inserted target"));
@@ -3438,28 +3543,28 @@ impl Checker<'_> {
             let source_span = declaration.and_then(|declaration| declaration.span);
             let source_function_value = scopes
                 .get_by_canonical(capture.source_binding_id)
-                .and_then(|(_, binding)| binding.function_value.clone());
+                .and_then(|(_, binding)| binding.retained_value.clone());
             let source_is_move =
                 resolved_type_is_move_type(&capture.source_type, &self.move_enum_names)
                     || resolved_type_requires_conservative_move(&capture.source_type);
             let (root, root_key, source_depth) = if declaration
                 .is_some_and(|declaration| declaration.kind == BindingKind::MethodReceiver)
             {
-                (ClosureBorrowRoot::Receiver, "$this".to_string(), 0)
+                (BorrowRoot::Receiver, "$this".to_string(), 0)
             } else if let Some((name, binding)) = scopes.get_by_canonical(capture.source_binding_id)
             {
                 let root = declaration
                     .and_then(|declaration| match declaration.owner {
                         crate::symbols::LexicalOwner::Closure(owner) => {
-                            Some(ClosureBorrowRoot::EnclosingEnvironment(owner))
+                            Some(BorrowRoot::EnclosingEnvironment(owner))
                         }
                         _ => None,
                     })
-                    .unwrap_or(ClosureBorrowRoot::Binding(capture.source_binding_id));
+                    .unwrap_or(BorrowRoot::Binding(capture.source_binding_id));
                 (root, binding_root(binding, name), binding.scope_depth)
             } else {
                 (
-                    ClosureBorrowRoot::Binding(capture.source_binding_id),
+                    BorrowRoot::Binding(capture.source_binding_id),
                     format!("binding:{}", capture.source_binding_id.0),
                     scopes.lexical_depth(),
                 )
@@ -3481,7 +3586,7 @@ impl Checker<'_> {
                 | CaptureAcquisitionKind::MoveIntoEnvironment => None,
             };
             if let Some(access) = access {
-                if let Some(conflict) = scopes.active_closure_leases().find(|lease| {
+                if let Some((_, conflict)) = scopes.active_retained_loans().find(|(_, lease)| {
                     lease.root_key == root_key
                         && (access == BorrowAccess::Writable
                             || lease.access == BorrowAccess::Writable)
@@ -3532,12 +3637,13 @@ impl Checker<'_> {
                         );
                     }
                 }
-                leases.push(ClosureLease {
+                leases.push(RetainedLoan {
                     root: root.clone(),
                     root_key: root_key.clone(),
                     access,
                     capture_span: capture.declaration_span,
                     source_depth,
+                    inherited: false,
                 });
             }
 
@@ -3569,9 +3675,9 @@ impl Checker<'_> {
                     Some(_) => move_sources.push(capture.source_binding_id),
                     None => {}
                 }
-                if let Some(conflict) = scopes
-                    .active_closure_leases()
-                    .find(|lease| lease.root_key == root_key)
+                if let Some((_, conflict)) = scopes
+                    .active_retained_loans()
+                    .find(|(_, lease)| lease.root_key == root_key)
                 {
                     invalid = true;
                     self.diagnostics.push(
@@ -3606,8 +3712,8 @@ impl Checker<'_> {
                         .with_help("finish the earlier access before transferring ownership"),
                     );
                 }
-                if let Some(function_value) = source_function_value.as_ref() {
-                    for lease in &function_value.leases {
+                if let Some(retained_value) = source_function_value.as_ref() {
+                    for lease in &retained_value.leases {
                         if !leases.iter().any(|candidate| {
                             candidate.root == lease.root && candidate.access == lease.access
                         }) {
@@ -3653,9 +3759,9 @@ impl Checker<'_> {
         roots.sort();
         roots.dedup();
         let provenance = if roots.is_empty() {
-            ClosureValueProvenance::Owned
+            ValueProvenance::Owned
         } else {
-            ClosureValueProvenance::BorrowBound(roots)
+            ValueProvenance::BorrowBound(roots)
         };
         let mut release_order = (0..acquisitions.len()).collect::<Vec<_>>();
         release_order.reverse();
@@ -3676,7 +3782,8 @@ impl Checker<'_> {
         self.closure_ownership.insert(closure_id, info);
         self.closure_values.insert(
             closure_id,
-            FunctionValueState {
+            RetainedValueState {
+                kind: RetainedValueKind::Closure,
                 closure_id: Some(closure_id),
                 provenance,
                 leases,
@@ -3686,16 +3793,19 @@ impl Checker<'_> {
         );
     }
 
-    fn function_value_from_expr(&self, expr: &Expr, scopes: &Scopes) -> Option<FunctionValueState> {
+    fn retained_value_from_expr(&self, expr: &Expr, scopes: &Scopes) -> Option<RetainedValueState> {
         match expr {
+            Expr::When(_) | Expr::Match { .. } => {
+                self.retained.expression_values.get(&expr.span()).cloned()
+            }
             Expr::Closure(closure) => self
                 .closure_values
                 .get(&ClosureId::from_span(closure.span))
                 .cloned(),
             Expr::Variable { name, .. } => scopes
                 .get(name)
-                .and_then(|binding| binding.function_value.clone()),
-            Expr::Grouped { expr, .. } => self.function_value_from_expr(expr, scopes),
+                .and_then(|binding| binding.retained_value.clone()),
+            Expr::Grouped { expr, .. } => self.retained_value_from_expr(expr, scopes),
             Expr::Null { .. } => None,
             _ => self
                 .resolved_type(expr)
@@ -3703,11 +3813,11 @@ impl Checker<'_> {
                 .map(|_| {
                     let root = self.function_borrow_root(expr, scopes).or_else(|| {
                         self.expr_returns_borrow(expr, scopes)
-                            .then_some(ClosureBorrowRoot::Temporary)
+                            .then_some(BorrowRoot::Temporary)
                     });
                     let leases = root
                         .as_ref()
-                        .map(|root| ClosureLease {
+                        .map(|root| RetainedLoan {
                             root: root.clone(),
                             root_key: self
                                 .borrow_root_key(expr, scopes)
@@ -3719,19 +3829,22 @@ impl Checker<'_> {
                             },
                             capture_span: expr.span(),
                             source_depth: self.function_borrow_source_depth(expr, scopes),
+                            inherited: false,
                         })
                         .into_iter()
                         .collect::<Vec<_>>();
-                    FunctionValueState {
+                    RetainedValueState {
+                        kind: RetainedValueKind::Closure,
                         closure_id: None,
-                        provenance: root.map_or(ClosureValueProvenance::Owned, |root| {
-                            ClosureValueProvenance::BorrowBound(vec![root])
+                        provenance: root.map_or(ValueProvenance::Owned, |root| {
+                            ValueProvenance::BorrowBound(vec![root])
                         }),
                         leases,
                         nonescaping_parameter: false,
                         take_parameter_insertion: None,
                     }
-                }),
+                })
+                .or_else(|| self.iterator_value_from_expr(expr, scopes)),
         }
     }
 
@@ -3764,7 +3877,7 @@ impl Checker<'_> {
         }
     }
 
-    fn function_borrow_root(&self, expr: &Expr, scopes: &Scopes) -> Option<ClosureBorrowRoot> {
+    fn function_borrow_root(&self, expr: &Expr, scopes: &Scopes) -> Option<BorrowRoot> {
         if !self.expr_returns_borrow(expr, scopes) {
             return None;
         }
@@ -3772,8 +3885,8 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => scopes
                 .get(name)
                 .and_then(|binding| binding.canonical_id)
-                .map(ClosureBorrowRoot::Binding),
-            Expr::This { .. } => Some(ClosureBorrowRoot::Receiver),
+                .map(BorrowRoot::Binding),
+            Expr::This { .. } => Some(BorrowRoot::Receiver),
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name)?;
                 let borrow = signature.return_borrow?;
@@ -3784,8 +3897,8 @@ impl Checker<'_> {
                                 Expr::Variable { name, .. } => scopes
                                     .get(name)
                                     .and_then(|binding| binding.canonical_id)
-                                    .map(ClosureBorrowRoot::Binding),
-                                Expr::This { .. } => Some(ClosureBorrowRoot::Receiver),
+                                    .map(BorrowRoot::Binding),
+                                Expr::This { .. } => Some(BorrowRoot::Receiver),
                                 _ => None,
                             }
                         })
@@ -3805,8 +3918,8 @@ impl Checker<'_> {
                         Expr::Variable { name, .. } => scopes
                             .get(name)
                             .and_then(|binding| binding.canonical_id)
-                            .map(ClosureBorrowRoot::Binding),
-                        Expr::This { .. } => Some(ClosureBorrowRoot::Receiver),
+                            .map(BorrowRoot::Binding),
+                        Expr::This { .. } => Some(BorrowRoot::Receiver),
                         _ => None,
                     })
             }
@@ -3820,8 +3933,8 @@ impl Checker<'_> {
                     Expr::Variable { name, .. } => scopes
                         .get(name)
                         .and_then(|binding| binding.canonical_id)
-                        .map(ClosureBorrowRoot::Binding),
-                    Expr::This { .. } => Some(ClosureBorrowRoot::Receiver),
+                        .map(BorrowRoot::Binding),
+                    Expr::This { .. } => Some(BorrowRoot::Receiver),
                     _ => None,
                 }
             }
@@ -3832,11 +3945,11 @@ impl Checker<'_> {
     fn function_borrow_source_depth(&self, expr: &Expr, scopes: &Scopes) -> usize {
         self.function_borrow_root(expr, scopes)
             .and_then(|root| match root {
-                ClosureBorrowRoot::Binding(id) => scopes
+                BorrowRoot::Binding(id) => scopes
                     .get_by_canonical(id)
                     .map(|(_, binding)| binding.scope_depth),
-                ClosureBorrowRoot::Receiver => Some(0),
-                ClosureBorrowRoot::EnclosingEnvironment(_) | ClosureBorrowRoot::Temporary => None,
+                BorrowRoot::Receiver => Some(0),
+                BorrowRoot::EnclosingEnvironment(_) | BorrowRoot::Temporary => None,
             })
             .unwrap_or_else(|| scopes.lexical_depth())
     }
@@ -3858,22 +3971,38 @@ impl Checker<'_> {
         }
     }
 
-    fn prepare_function_value(
+    fn prepare_retained_value(
         &mut self,
         expr: &Expr,
         scopes: &mut Scopes,
-    ) -> Option<FunctionValueState> {
+    ) -> Option<RetainedValueState> {
+        if matches!(ungroup_expr(expr), Expr::When(_) | Expr::Match { .. }) {
+            self.retained
+                .expression_values
+                .remove(&ungroup_expr(expr).span());
+        }
         if let Expr::Closure(closure) = ungroup_expr(expr) {
             self.acquire_closure(closure, scopes);
             self.prepared_closure_evaluations
                 .insert(ClosureId::from_span(closure.span));
         }
-        self.function_value_from_expr(expr, scopes)
+        self.retained_value_from_expr(expr, scopes)
+    }
+
+    fn evaluate_retained_value(
+        &mut self,
+        expr: &Expr,
+        scopes: &mut Scopes,
+        mode: UseMode,
+    ) -> Option<RetainedValueState> {
+        self.prepare_retained_value(expr, scopes);
+        self.use_expr(expr, scopes, mode);
+        self.retained_value_from_expr(expr, scopes)
     }
 
     fn validate_local_function_destination(
         &mut self,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
         destination_depth: usize,
         span: Span,
     ) -> bool {
@@ -3884,6 +4013,14 @@ impl Checker<'_> {
         else {
             return true;
         };
+        if value.kind == RetainedValueKind::Iterator {
+            self.diagnostics.push(retained::iterator_escape(
+                span,
+                lease.capture_span,
+                "iterator cannot remain usable after its source leaves scope",
+            ));
+            return false;
+        }
         let diagnostic = Diagnostic::new(
                 "E0658",
                 "closure cannot remain usable after its captured value leaves scope",
@@ -3899,7 +4036,10 @@ impl Checker<'_> {
         false
     }
 
-    fn validate_returned_function_value(&mut self, value: &FunctionValueState, span: Span) -> bool {
+    fn validate_returned_function_value(&mut self, value: &RetainedValueState, span: Span) -> bool {
+        if value.kind == RetainedValueKind::Iterator {
+            return self.validate_returned_iterator(value, span);
+        }
         if value.nonescaping_parameter {
             let diagnostic = Diagnostic::new(
                     "E0657",
@@ -3913,15 +4053,15 @@ impl Checker<'_> {
                 .push(self.with_function_value_cause(diagnostic, value));
             return false;
         }
-        let ClosureValueProvenance::BorrowBound(roots) = &value.provenance else {
+        let ValueProvenance::BorrowBound(roots) = &value.provenance else {
             self.mark_closure_escape(value, ClosureEscapeClassification::Owned);
             return true;
         };
         let mut accepted_root = None;
         for root in roots {
             let accepted = match root {
-                ClosureBorrowRoot::Receiver => true,
-                ClosureBorrowRoot::Binding(id) => self
+                BorrowRoot::Receiver => true,
+                BorrowRoot::Binding(id) => self
                     .binding_resolution
                     .declarations_by_id
                     .get(id)
@@ -3931,7 +4071,7 @@ impl Checker<'_> {
                             BindingKind::FunctionParameter | BindingKind::MethodParameter
                         ) && declaration.ownership != BindingOwnership::Owned
                     }),
-                ClosureBorrowRoot::EnclosingEnvironment(_) | ClosureBorrowRoot::Temporary => false,
+                BorrowRoot::EnclosingEnvironment(_) | BorrowRoot::Temporary => false,
             };
             if !accepted {
                 self.diagnostics.push(self.with_function_value_cause(
@@ -3969,7 +4109,7 @@ impl Checker<'_> {
 
     fn mark_closure_escape(
         &mut self,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
         escape: ClosureEscapeClassification,
     ) {
         if let Some(info) = value
@@ -3983,7 +4123,7 @@ impl Checker<'_> {
     fn with_function_value_cause(
         &self,
         diagnostic: Diagnostic,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
     ) -> Diagnostic {
         if let Some(closure_id) = value.closure_id {
             diagnostic.with_cause(format!(
@@ -3998,7 +4138,7 @@ impl Checker<'_> {
     fn with_taking_capture_fix(
         &self,
         diagnostic: Diagnostic,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
     ) -> Diagnostic {
         let Some(ownership) = value
             .closure_id
@@ -4006,7 +4146,7 @@ impl Checker<'_> {
         else {
             return diagnostic;
         };
-        if !matches!(ownership.provenance, ClosureValueProvenance::BorrowBound(_)) {
+        if !matches!(ownership.provenance, ValueProvenance::BorrowBound(_)) {
             return diagnostic;
         }
 
@@ -4055,7 +4195,7 @@ impl Checker<'_> {
     fn with_take_parameter_fix(
         &self,
         diagnostic: Diagnostic,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
     ) -> Diagnostic {
         let Some(insertion) = value.take_parameter_insertion else {
             return diagnostic;
@@ -4073,10 +4213,13 @@ impl Checker<'_> {
 
     fn validate_owned_function_storage(
         &mut self,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
         span: Span,
         destination: &str,
     ) -> bool {
+        if value.kind == RetainedValueKind::Iterator {
+            return self.validate_iterator_storage(value, span, destination);
+        }
         if value.nonescaping_parameter {
             let diagnostic = Diagnostic::new(
                     "E0657",
@@ -4090,7 +4233,7 @@ impl Checker<'_> {
                 .push(self.with_function_value_cause(diagnostic, value));
             return false;
         }
-        if matches!(value.provenance, ClosureValueProvenance::BorrowBound(_)) {
+        if matches!(value.provenance, ValueProvenance::BorrowBound(_)) {
             let diagnostic = Diagnostic::new(
                     "E0658",
                     format!("borrow-bound closure cannot be stored in {destination}"),
@@ -4109,7 +4252,7 @@ impl Checker<'_> {
 
     fn reject_deferred_function_storage(
         &mut self,
-        value: &FunctionValueState,
+        value: &RetainedValueState,
         span: Span,
         destination: &str,
         title: &str,
@@ -4129,20 +4272,33 @@ impl Checker<'_> {
         false
     }
 
-    fn check_live_closure_conflict(
+    fn check_live_retained_conflict(
         &mut self,
         root: &str,
         requested: UseMode,
         span: Span,
         scopes: &Scopes,
     ) {
-        let Some(lease) = scopes.active_closure_leases().find(|lease| {
+        let Some((kind, lease)) = scopes.active_retained_loans().find(|(_, lease)| {
             lease.root_key == root
                 && (lease.access == BorrowAccess::Writable
                     || matches!(requested, UseMode::Write | UseMode::Give))
         }) else {
             return;
         };
+        if kind == RetainedValueKind::Iterator {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0763",
+                    "value remains in readonly use by an iterator",
+                    span,
+                )
+                .with_title("Iterator Keeps Source In Readonly Use")
+                .with_related(lease.capture_span, "Source Loan Starts Here")
+                .with_help("finish the iterator's scope before mutating or moving its source"),
+            );
+            return;
+        }
         let (title, access) = match lease.access {
             BorrowAccess::Readonly => ("Closure Keeps Value In Readonly Use", "readonly"),
             BorrowAccess::Writable => ("Closure Keeps Value In Writable Use", "writable"),
@@ -4170,11 +4326,21 @@ impl Checker<'_> {
             Some(FunctionInvocationMode::Once) => UseMode::Give,
             None => mode,
         };
+        // An owning destination may box a Copy value without taking its source.
+        let mode = if mode == UseMode::Give
+            && self.resolved_type(expr).is_some_and(|ty| {
+                !resolved_type_requires_conservative_move(ty)
+                    && !resolved_type_is_move_type(ty, &self.move_enum_names)
+            }) {
+            UseMode::Read
+        } else {
+            mode
+        };
         match expr {
             Expr::Variable { name, span } => {
                 let root = scopes.get(name).map(|binding| binding_root(binding, name));
                 if let Some(root) = root.as_deref() {
-                    self.check_live_closure_conflict(root, mode, *span, scopes);
+                    self.check_live_retained_conflict(root, mode, *span, scopes);
                 }
                 if matches!(mode, UseMode::Write | UseMode::Give) {
                     if let Some(alias) = root
@@ -4212,7 +4378,7 @@ impl Checker<'_> {
                     .then(|| {
                         scopes
                             .get(name)
-                            .and_then(|binding| binding.function_value.as_ref())
+                            .and_then(|binding| binding.retained_value.as_ref())
                             .filter(|value| value.nonescaping_parameter)
                             .cloned()
                     })
@@ -4314,7 +4480,7 @@ impl Checker<'_> {
                             .with_related(at, "Function Value Consumed Here")
                             .with_help("move or invoke a function value only once");
                             if let Some(closure_id) = binding
-                                .function_value
+                                .retained_value
                                 .as_ref()
                                 .and_then(|value| value.closure_id)
                             {
@@ -4418,8 +4584,13 @@ impl Checker<'_> {
                 class_type,
                 args,
                 span,
-                ..
+                shared,
             } => {
+                if *shared {
+                    if let Some(value) = self.iterator_value_from_expr(expr, scopes) {
+                        self.validate_iterator_storage(&value, *span, "shared ownership");
+                    }
+                }
                 let signature = if class_type.name == "WritableSharedReference" {
                     writable_shared_constructor_signature()
                 } else {
@@ -4480,8 +4651,8 @@ impl Checker<'_> {
                     return;
                 }
                 let signature = self
-                    .expr_class(object, scopes)
-                    .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
+                    .retained_call(expr, scopes)
+                    .map(|(signature, _, _)| signature)
                     .unwrap_or_default();
                 let execution = self.method_call_execution(*null_safe, object);
                 self.use_call_args(Some(object), args, &signature, execution, scopes);
@@ -4507,8 +4678,13 @@ impl Checker<'_> {
                     return;
                 }
                 let signature = self
-                    .static_call_signature(qualifier, method)
+                    .retained_call(expr, scopes)
+                    .map(|(signature, _, _)| signature)
+                    .or_else(|| self.static_call_signature(qualifier, method))
                     .unwrap_or_default();
+                if method == "__construct" && matches!(qualifier, ast::StaticQualifier::Parent) {
+                    self.retain_parent_constructor_sources(&signature, args, scopes);
+                }
                 let enum_payload = self
                     .qualifier_class(qualifier)
                     .is_some_and(|class| self.enum_cases.contains_key(&(class, method.clone())));
@@ -4545,22 +4721,14 @@ impl Checker<'_> {
                             self.activate_borrow(key, mode, scopes);
                         }
                     }
-                    let valid_function_storage = self
-                        .prepare_function_value(&element.value, scopes)
-                        .as_ref()
-                        .is_none_or(|value| {
-                            self.validate_owned_function_storage(
-                                value,
-                                element.value.span(),
-                                "an owned aggregate",
-                            )
-                        });
-                    let mode = if valid_function_storage {
-                        self.use_owned_expression(&element.value, scopes)
-                    } else {
-                        self.use_expr(&element.value, scopes, UseMode::Read);
-                        UseMode::Read
-                    };
+                    let mode = self.use_owned_expression(&element.value, scopes);
+                    if let Some(value) = self.retained_value_from_expr(&element.value, scopes) {
+                        self.validate_owned_function_storage(
+                            &value,
+                            element.value.span(),
+                            "an owned aggregate",
+                        );
+                    }
                     self.activate_place_input_borrows(&element.value, scopes);
                     if mode == UseMode::Read {
                         self.activate_borrow(&element.value, mode, scopes);
@@ -4570,26 +4738,16 @@ impl Checker<'_> {
             }
             Expr::ArrayRepeat { value, count, .. } => {
                 let borrow_depth = self.active_borrows.len();
-                let valid_function_storage = self
-                    .prepare_function_value(value, scopes)
-                    .as_ref()
-                    .is_none_or(|function| {
-                        self.validate_owned_function_storage(
-                            function,
-                            value.span(),
-                            "an owned aggregate",
-                        )
-                    });
-                let mode = if valid_function_storage {
-                    self.use_owned_expression(value, scopes)
-                } else {
-                    self.use_expr(value, scopes, UseMode::Read);
-                    UseMode::Read
-                };
-                self.activate_place_input_borrows(value, scopes);
-                if mode == UseMode::Read {
-                    self.activate_borrow(value, mode, scopes);
+                let retained = self.evaluate_retained_value(value, scopes, UseMode::Read);
+                if let Some(function) = retained {
+                    self.validate_owned_function_storage(
+                        &function,
+                        value.span(),
+                        "an owned aggregate",
+                    );
                 }
+                self.activate_place_input_borrows(value, scopes);
+                self.activate_borrow(value, UseMode::Read, scopes);
                 self.use_read_with_place_borrow(count, scopes);
                 self.active_borrows.truncate(borrow_depth);
             }
@@ -4674,7 +4832,7 @@ impl Checker<'_> {
                 self.active_borrows.truncate(borrow_depth);
             }
             Expr::This { span } => {
-                self.check_live_closure_conflict("$this", mode, *span, scopes);
+                self.check_live_retained_conflict("$this", mode, *span, scopes);
                 if matches!(mode, UseMode::Read | UseMode::Write) {
                     self.check_active_borrow_conflict("$this", mode, *span);
                 } else if mode == UseMode::Give {
@@ -4737,8 +4895,15 @@ impl Checker<'_> {
                 scrutinee,
                 mode: match_mode,
                 arms,
+                span,
                 ..
-            } => self.use_match_expression(scrutinee, *match_mode, arms, scopes, mode),
+            } => {
+                let value = self.use_match_expression(scrutinee, *match_mode, arms, scopes, mode);
+                self.retained.expression_values.remove(span);
+                if let Some(value) = value {
+                    self.retained.expression_values.insert(*span, value);
+                }
+            }
             Expr::When(when) => {
                 let has_given = when.given.is_some();
                 if let Some(given) = &when.given {
@@ -4748,6 +4913,7 @@ impl Checker<'_> {
                 let before = scopes.clone();
                 let mut outcomes = Vec::new();
                 self.when_result_modes.push(mode);
+                self.retained.yielded_values.push(None);
                 for branch in &when.branches {
                     let mut branch_scopes = before.clone();
                     if let Some(condition) = &branch.condition {
@@ -4766,6 +4932,10 @@ impl Checker<'_> {
                     outcomes.extend(branch_flow.yields);
                 }
                 self.when_result_modes.pop();
+                self.retained.expression_values.remove(&when.span);
+                if let Some(value) = self.retained.yielded_values.pop().flatten() {
+                    self.retained.expression_values.insert(when.span, value);
+                }
                 if let Some(first) = outcomes.first().cloned() {
                     let mut merged = first;
                     for outcome in outcomes.iter().skip(1) {
@@ -4814,7 +4984,7 @@ impl Checker<'_> {
                 if scopes.get(name).is_some_and(|binding| {
                     binding.borrowed_place
                         || binding
-                            .function_value
+                            .retained_value
                             .as_ref()
                             .is_some_and(|value| value.nonescaping_parameter)
                 }) {
@@ -4860,7 +5030,7 @@ impl Checker<'_> {
         arms: &[ast::MatchArm],
         scopes: &mut Scopes,
         mode: UseMode,
-    ) {
+    ) -> Option<RetainedValueState> {
         let borrow_depth = self.active_borrows.len();
         let consuming = matches!(match_mode, ast::MatchMode::Consumed { .. });
         self.use_expr(
@@ -4880,6 +5050,7 @@ impl Checker<'_> {
         let mut remaining = scopes.clone();
         let mut outcomes = Vec::with_capacity(arms.len());
         let mut has_default = false;
+        let mut result_value = None;
         for arm in arms {
             if let ast::MatchPattern::Expression(pattern) = &arm.pattern {
                 self.use_expr(pattern, &mut remaining, UseMode::Read);
@@ -4902,7 +5073,8 @@ impl Checker<'_> {
             for binding in match_pattern_bindings(&arm.pattern) {
                 self.declare_match_binding(binding, borrow_root.clone(), !consuming, &mut selected);
             }
-            self.use_expr(&arm.value, &mut selected, mode);
+            let value = self.evaluate_retained_value(&arm.value, &mut selected, mode);
+            result_value = join_retained_value(result_value.as_ref(), value.as_ref());
             selected.pop();
             outcomes.push(selected);
 
@@ -4923,6 +5095,7 @@ impl Checker<'_> {
             *scopes = joined;
         }
         self.active_borrows.truncate(borrow_depth);
+        result_value
     }
 
     fn declare_match_binding(
@@ -4953,7 +5126,7 @@ impl Checker<'_> {
                     State::Owned
                 },
                 function_type: non_null_function_type(ty).cloned(),
-                function_value: self.parameter_function_value(
+                retained_value: self.parameter_function_value(
                     canonical_id,
                     if borrowed {
                         BindingOwnership::ReadonlyBorrow
@@ -4993,13 +5166,14 @@ impl Checker<'_> {
             }
             let source_value = enclosing_scopes
                 .get_by_canonical(capture.source_binding_id)
-                .and_then(|(_, binding)| binding.function_value.clone());
+                .and_then(|(_, binding)| binding.retained_value.clone());
             let borrowed = capture.mode != ast::ClosureCaptureMode::Take;
-            let function_value = source_value.map(|mut value| {
+            let retained_value = source_value.map(|mut value| {
                 if borrowed {
-                    value.provenance = ClosureValueProvenance::BorrowBound(vec![
-                        ClosureBorrowRoot::EnclosingEnvironment(closure_id),
-                    ]);
+                    value.provenance =
+                        ValueProvenance::BorrowBound(vec![BorrowRoot::EnclosingEnvironment(
+                            closure_id,
+                        )]);
                     value.nonescaping_parameter = false;
                 }
                 value
@@ -5029,7 +5203,7 @@ impl Checker<'_> {
                         State::Owned
                     },
                     function_type: non_null_function_type(&capture.source_type).cloned(),
-                    function_value,
+                    retained_value,
                     scope_depth: scopes.lexical_depth(),
                 },
             );
@@ -5068,7 +5242,7 @@ impl Checker<'_> {
                         State::Borrowed
                     },
                     function_type: non_null_function_type(source_type).cloned(),
-                    function_value: self.parameter_function_value(
+                    retained_value: self.parameter_function_value(
                         canonical_id,
                         ownership,
                         (!parameter.take && !parameter.writable).then_some(Span::new(
@@ -5096,7 +5270,7 @@ impl Checker<'_> {
                 && self.current_return_borrow.is_none();
         match &closure.body {
             ast::ClosureBody::Expression { expression, .. } => {
-                if let Some(value) = self.prepare_function_value(expression, &mut scopes) {
+                if let Some(value) = self.prepare_retained_value(expression, &mut scopes) {
                     let _ = self.validate_returned_function_value(&value, expression.span());
                 }
                 self.use_expr(
@@ -5196,7 +5370,7 @@ impl Checker<'_> {
             });
             if mode == UseMode::Give {
                 if let (Some(boundary), Some(value)) =
-                    (function_storage, self.prepare_function_value(arg, scopes))
+                    (function_storage, self.prepare_retained_value(arg, scopes))
                 {
                     let valid = match boundary {
                         FunctionStorageBoundary::Owned(destination) => {
@@ -5260,10 +5434,27 @@ impl Checker<'_> {
                 }
             }
             self.use_expr(arg, scopes, mode);
+            if let Some(value) = self.retained_value_from_expr(arg, scopes) {
+                if mode == UseMode::Give {
+                    if let Some(FunctionStorageBoundary::Owned(destination)) = function_storage {
+                        self.validate_owned_function_storage(&value, arg.span(), destination);
+                    }
+                }
+                for loan in value.leases.iter().filter(|loan| !loan.inherited) {
+                    self.active_borrows.push(ActiveBorrow {
+                        root: loan.root_key.clone(),
+                        mode: UseMode::Read,
+                        span: loan.capture_span,
+                    });
+                }
+            }
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
                 self.activate_borrow(arg, mode, scopes);
             }
+        }
+        if execution != CallExecution::Never {
+            self.validate_retained_call_inputs(receiver, args, signature, scopes);
         }
         if let Some(without_call) = without_call {
             let with_call = scopes.clone();
@@ -5619,6 +5810,11 @@ impl Checker<'_> {
     }
 
     fn borrow_root_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
+        if let Some((signature, receiver, args)) = self.retained_call(expr, scopes) {
+            if let Some(borrow) = signature.return_borrow {
+                return self.call_borrow_root(borrow, receiver, &signature, args, scopes);
+            }
+        }
         match expr {
             Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
             Expr::Variable { name, .. } => {
@@ -5935,6 +6131,12 @@ impl Checker<'_> {
     }
 
     fn expr_returns_borrow(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        if self
+            .retained_call(expr, scopes)
+            .is_some_and(|(signature, _, _)| signature.return_borrow.is_some())
+        {
+            return true;
+        }
         match expr {
             Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
             Expr::FunctionCall { name, .. } => self
@@ -6272,7 +6474,7 @@ impl Checker<'_> {
             );
             if moves_in {
                 let valid_function_storage = self
-                    .prepare_function_value(&argument.value, scopes)
+                    .prepare_retained_value(&argument.value, scopes)
                     .as_ref()
                     .is_none_or(|value| {
                         self.validate_owned_function_storage(
@@ -6832,11 +7034,7 @@ fn type_ref_collection_info(
             classes,
             move_enum_names,
             receiver_class,
-        ) || type_ref_mentions_potential_move_parameter(
-            value,
-            type_params,
-            enclosing_type_params,
-        ),
+        ) || type_ref_mentions_any_parameter(value, type_params, enclosing_type_params),
         value_mixed: value.name == "mixed",
         value_class: type_ref_class_name(value, classes, receiver_class),
         value_collection: type_ref_collection_info(

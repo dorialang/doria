@@ -1,0 +1,47 @@
+class Key implements Equatable<Key>
+{
+    function __construct(int $value) {}
+
+    function equals(Key $other): bool
+    {
+        echo "equals {$this->value}:{$other->value}\n";
+        return $this->value == $other->value;
+    }
+}
+
+class Identity
+{
+    function equals(Identity $other): bool { return true; }
+}
+
+function makeKey(int $value): Key
+{
+    echo "make {$value}\n";
+    return new Key($value);
+}
+
+function equal<T implements Equatable>(T $left, T $right): bool
+{
+    return $left == $right;
+}
+
+function nullable(?Key $left, ?Key $right): void
+{
+    echo ($left == $right) . " " . ($left != $right) . "\n";
+}
+
+function main(): void
+{
+    echo (makeKey(1) == makeKey(1)) . "\n";
+    let $one = new Key(1);
+    let $two = new Key(2);
+    echo equal($one, $two) . "\n";
+    echo equal(1, 1) . "\n";
+    nullable(null, null);
+    nullable($one, null);
+    nullable(null, $two);
+    nullable($one, $two);
+    let $a = new Identity();
+    let $b = new Identity();
+    echo ($a == $a) . " " . ($a == $b) . "\n";
+}

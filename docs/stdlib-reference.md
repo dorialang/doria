@@ -46,7 +46,7 @@ Every primitive has a companion, and the set is a **complete, symmetric matrix**
 - **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width checked conversion families such as `Int32::from` (panics on overflow) / `Int32::tryFrom` (returns `?int32`). Each accepts one fixed-width integer expression; their callable declaration surface is TBD with conversion-overload work rather than published as an untyped Doria parameter.
 - **`Float`, `Float32`/`Float64`** — `Float::parse(string): ?float`, `Float::toInt(float): int` (checked, panics on NaN/out-of-range), `Float::pow(...)`. `float` is neither `Hashable` nor totally `Comparable` (0096).
 - **`Bool`** — `Bool::parse(string): ?bool` (returns `true`/`false` for exactly `"true"`/`"false"`, case-sensitive, no whitespace tolerance; `null` otherwise). No `MIN`/`MAX`/`pow`/wrapping (N/A for a two-valued type); `Bool::toInt` is a named v1.0+ furnishing (0104).
-- **`String`** — executable intrinsic properties are `$s->length` (Unicode grapheme clusters), `$s->byteLength` (UTF-8 bytes), `$s->isEmpty`, and `$s->bytes` (copy in v1.0). Executable companion operations are trimming/casing (`trim`, `trimStart`, `trimEnd`, `lower`, `upper`, `lowerFirst`, `upperFirst`); predicates (`contains`, `startsWith`, `endsWith`, `equalsIgnoreCase`, `containsIgnoreCase`, `startsWithIgnoreCase`, `endsWithIgnoreCase`); grapheme-indexed search (`indexOf`, `lastIndexOf`, `indexOfIgnoreCase`, `lastIndexOfIgnoreCase`); `countOccurrences`; `replace`; `split`/`join`; `slice`; `repeat`; `padStart`/`padEnd`; and UTF-8-validating `fromBytes` (decision 0103). The `$s->graphemes` / `$s->codePoints` views await the public traversal protocol, and `compare` / `compareIgnoreCase` await executable `Ordering`. There is no public `str_*` family, `$s->chars`, integer string indexing, or duplicate instance-method spelling.
+- **`String`** — executable intrinsic properties are `$s->length` (Unicode grapheme clusters), `$s->byteLength` (UTF-8 bytes), `$s->isEmpty`, and `$s->bytes` (copy in v1.0). Executable companion operations are trimming/casing (`trim`, `trimStart`, `trimEnd`, `lower`, `upper`, `lowerFirst`, `upperFirst`); predicates (`contains`, `startsWith`, `endsWith`, `equalsIgnoreCase`, `containsIgnoreCase`, `startsWithIgnoreCase`, `endsWithIgnoreCase`); grapheme-indexed search (`indexOf`, `lastIndexOf`, `indexOfIgnoreCase`, `lastIndexOfIgnoreCase`); `countOccurrences`; `replace`; `split`/`join`; `slice`; `repeat`; `padStart`/`padEnd`; and UTF-8-validating `fromBytes` (decision 0103). The `$s->graphemes` / `$s->codePoints` views await the public traversal protocol, and `compare` / `compareIgnoreCase` await their String ordering implementation. There is no public `str_*` family, `$s->chars`, integer string indexing, or duplicate instance-method spelling.
 
 ### Value interfaces (core contracts)
 Details: decisions 0096 (primitive conformance), 0134 (interfaces, traits, value
@@ -56,8 +56,11 @@ contracts, and public iteration), and 0079 (`Displayable`).
 - **`Equatable<T>`** — readonly `equals(T $other): bool`; explicit value-equality
   conformance for `==`/`!=`. Nonconforming class equality remains identity.
 - **`Hashable`** — readonly `hash(): uint64` for Dictionary/Set keys. Equal values
-  yield equal hashes; the value is stable while stored but is not a persistent
-  cross-version format. Hash tables add private per-process keyed mixing.
+  must yield equal hashes. Authors must preserve equality/hash-participating
+  state while a key is stored, including shared or external state; owned-key
+  storage is not a compiler guarantee of transitive immutability. Violations
+  must not compromise memory safety. Hashes are not a persistent cross-version
+  format. Hash tables add private per-process keyed mixing.
 - **`Displayable`** — `toString(): string`; Doria's answer to `__toString`, drives interpolation / `.` / `echo` (§4.6, 0079).
 - **`Cloneable`** — readonly nonthrowing `clone(): self`; author-provided explicit
   duplication returning an independently owned value of the same dynamic class.
@@ -80,10 +83,15 @@ and trait-free nominal conformance, including generic concrete specialization.
 Slice 2 executes interface values and erased calls, preserving readonly,
 writable, and take contracts through nullable, mixed, stored, and shared values.
 Error uses the general interface carrier; Displayable invokes the selected
-requirement once in every display context. New value operations, Cloneable
-widening, and public iteration remain Slice 3; trait composition remains
-Slice 4. Each pending operation receives its owning slice's diagnostic before
-executable lowering, including operations through a user subinterface.
+requirement once in every display context. Slice 3 executes `Ordering`, core
+value operations, Copy-or-Cloneable preserving collection operations, and public
+iteration. Concrete and constrained operations retain static selection;
+deliberate erasure uses the existing interface slots. Generated calls preserve
+the full automatic-effect profile and clean partial owned results on failure.
+Iterator carriers can retain a readonly source through a promoted `borrow`
+constructor parameter; neither the carrier nor an element borrow can outlive
+that source or its access lease. Trait composition remains Slice 4 (E0493),
+and primitive interface erasure remains rejected (E0760). E0759 is reserved.
 
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
@@ -118,14 +126,19 @@ object's lifetime before the surrounding function continues.
 
 ### Iteration
 - **`Iterable<T>`** — readonly `iterator(): Iterator<T>`.
-- **`Iterator<T>`** — readonly `hasCurrent(): bool`, readonly `current(): T`, and
+- **`Iterator<T>`** — readonly `hasCurrent(): bool`, readonly `getCurrent(): T`, and
   writable `advance(): void`. A borrowed iterator carries a compiler-owned
-  nonescaping readonly source loan; `current()` borrows one element and
+  nonescaping readonly source loan; `getCurrent()` borrows one element and
   `hasCurrent()` keeps nullable elements distinct from exhaustion. User-defined
   Stage 35 iteration is value-only and every binding remains explicitly typed.
   Built-in collections retain their optimized compiler-internal plans and exact
   sequence-index/dictionary-key roles; deliberate erasure alone uses the public
   protocol carrier.
+
+Decision 0134's `borrow` receiving mode on an iterator's promoted constructor
+parameter retains readonly source access instead of ownership. Cursor state
+remains independently owned; releasing the cursor does not destroy its source.
+This is an iterator-carrier facility, not general borrowed class fields.
 
 ### Ranges and math basics
 - **Range types** — `a..b` (inclusive) / `a..<b` (exclusive-end); `int` endpoints; used with `foreach` (SPEC control flow).
@@ -162,7 +175,7 @@ Sequence literals also have the repeat form **`[value; count]`** (decision 0102)
 - **`Bytes`** — owned mutable byte buffer for binary work; `uint8[]`↔`Bytes` interconvert only through explicit `Bytes::fromArray`/`->toArray` (copy in v1.0). Slice 2 provides `length`, indexed `uint8` reads/writes and RMW, and byte-wise `==`/`!=`; growable/slice/search members await a future method-surface record.
 - **`List<T>`** — the everyday growable sequence and default workhorse: `add`, `insertAt`, `removeAt` (returns the owned element), `pop` (`?T`), `contains`, `indexOf(T): ?int` (first equal position, `null` when absent), writable `remove(T): bool` (first equal element only), writable `clear(): void` (in-place emptying), `first`/`last` (`?T` properties), `count`, and `isEmpty` (properties). Stage 30g implements `map<U>(function(T): U $transform): List<U>`, preserving `filter(function(T): bool $predicate): List<T>`, and writable-accumulator `reduce<A>(take A $initial, function(writable A, T): void $reducer): A`. Each also accepts the corresponding `writable function writable(...)` callback through an exclusive function-value borrow; readonly callbacks use readonly borrows, callbacks never escape, and once callbacks are rejected. The source is visited in insertion order and remains unchanged. `map` owns its new results and supports Move results; Decision 0134 widens `filter` from Copy to Copy-or-Cloneable elements, invoking author-provided clone for retained Move values; `reduce` owns its initial accumulator and supports Copy or Move accumulators. Each method throws exactly the checked Errors declared by its callback's structural function type. Checked failure destroys the partial result or accumulator before propagating. No other collection family receives these algorithms in Stage 30.
 - **`Dictionary<K, V>` / `SortedDictionary<K, V>`** — `get` returning `?V`, `set`, `remove` returning `?V`, `containsKey` (key membership), executable O(n) `containsValue(V): bool` (value membership), writable `clear(): void` (in-place emptying), `keys`/`values` (`foreach`-only projections, not storable in v1.0), and `count`/`isEmpty` (properties). `Dictionary` iterates in insertion order, `SortedDictionary` by ascending `Comparable` key. The optional first main-loop binding is the actual readonly key, never an ordinal; values may be writable through the main iteration form. Projections remain value-only.
-- **`Set<T>` / `SortedSet<T>`** — `::from`, `add` (`bool`), `remove` (`bool`), `contains`, `union`, `intersect`, `difference`, writable `clear(): void` (in-place emptying), executable readonly `first: ?T` / `last: ?T` properties, and `count`/`isEmpty` (properties). `Set` endpoints follow insertion order; `SortedSet` endpoints are the ascending minimum and maximum. All endpoints are O(1), return `null` when empty, and borrow the retained element. Iteration is readonly: replacement is remove plus add. Existing-source construction and algebra preserve every input and require `Copy` or, once Stage 35 lands, `Cloneable`.
+- **`Set<T>` / `SortedSet<T>`** — `::from`, `add` (`bool`), `remove` (`bool`), `contains`, `union`, `intersect`, `difference`, writable `clear(): void` (in-place emptying), executable readonly `first: ?T` / `last: ?T` properties, and `count`/`isEmpty` (properties). `Set` endpoints follow insertion order; `SortedSet` endpoints are the ascending minimum and maximum. All endpoints are O(1), return `null` when empty, and borrow the retained element. Iteration is readonly: replacement is remove plus add. Existing-source construction and algebra preserve every input and require Copy-or-Cloneable elements.
 - **`PriorityQueue<T>`** — `push`, `pop` (`?T`), `peek` (`?T`), `contains`, writable `clear(): void`, and `count`/`isEmpty` (properties), min-first by `Comparable`. Duplicates are allowed, equal elements have no stable tie order, and there is no `foreach` (drain via `pop`). **`Deque<T>`** — `pushFront`/`pushBack`/`popFront`/`popBack`/`peekFront`/`peekBack`/`contains`, writable `clear(): void`, `count`/`isEmpty` (properties), and readonly or writable `foreach` front-to-back. It subsumes FIFO/LIFO, so there are no separate `Queue`/`Stack` types.
 
 Collection-member failures are compiler-owned structured diagnostics. E0521
@@ -172,7 +185,13 @@ called with parentheses receive E0557, and withdrawn `List::from` /
 class error. The same suggestion data is reserved for future migration tooling;
 editors consume compiler fixes rather than maintaining another spelling table.
 
-The four no-literal forms use positional-only `Type::from(source)`. Direct bracket assignment is not their construction surface. Existing sources remain unchanged; Stage 26 copies `Copy` values (including retained immutable strings), while move values are inserted individually into an empty destination. A consuming conversion remains deferred.
+The four no-literal forms use positional-only `Type::from(source)`. Direct bracket assignment is not their construction surface. Existing sources remain unchanged; Copy values (including retained immutable strings) are copied, and Move values must be Cloneable and are cloned. A consuming conversion remains deferred.
+
+Nullable keys and elements do not inherit `Hashable` or `Comparable` from their
+payload. `Set` and `Dictionary` require a Hashable element or key;
+`SortedSet`, `SortedDictionary`, and `PriorityQueue` require a Comparable element
+or key. Nullable equality and duplication remain available where required by
+unconstrained element or value positions, but supply no null hash or ordering.
 
 ---
 

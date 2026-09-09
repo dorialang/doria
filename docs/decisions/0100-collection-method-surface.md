@@ -191,17 +191,16 @@ construction path. Each `::from` accepts the
 element (or key/value pair, for the map types) sequence its own type expects — e.g.
 `Set::from([...])`, `PriorityQueue::from([...])`, `Deque::from([...])`, and
 `SortedDictionary::from(["k" => v, ...])`. Existing-source `::from` preserves
-its source. During Stage 26 its elements must therefore be `Copy`; for a map,
-both keys and values must be `Copy`. A `Comparable` or `Hashable` constraint does
-not imply `Copy`, and an otherwise unconstrained generic type parameter is not
-assumed to be `Copy`. Stage 35 widens these non-consuming operations to
-`Cloneable`. Until then, move-only values are moved individually into an empty
-destination. A separately named consuming conversion remains deferred; a
+its source. Stage 35 Slice 3 implements Decision 0134's widening from `Copy`
+to Copy-or-Cloneable elements; map keys and values satisfy duplication separately.
+`Comparable` and `Hashable` do not imply duplicability, nor does an unconstrained
+generic parameter. Non-Cloneable Move values can instead be moved individually
+into an empty destination. A separately named consuming conversion remains deferred; a
 non-empty temporary is not an implicit consuming exception.
 
 The same non-consuming rule applies to `Set` and `SortedSet` `union`,
-`intersect`, and `difference`: both operands remain unchanged, Stage 26 supports
-`Copy` elements, and Stage 35 widens the operations to `Cloneable` elements.
+`intersect`, and `difference`: both operands remain unchanged, and each selected
+representative is copied or cloned exactly once under Decision 0134.
 
 The runtime-sized **fill** constructor — a `T[]`/`List<T>` of
 `count` copies of a value — is spelled as the `[value; count]` repeat literal
@@ -284,8 +283,8 @@ Stage 30g updates SPEC for the implemented List algorithm members.
   elements are readonly borrows and replacement is remove plus add.
 - Any construction or set-algebra rule that consumes an existing source, treats
   a non-empty temporary specially, or equates `Comparable`/`Hashable` with
-  duplicability — Stage 26 requires `Copy`, Stage 35 reopens this for
-  `Cloneable`, and a consuming conversion remains separately deferred.
+  duplicability — Stage 35 Slice 3 implements Copy-or-Cloneable preserving
+  duplication, and a consuming conversion remains separately deferred.
 
 Decision 0132 clarifies the built-in `foreach` contract: `List<T>` and `T[]`
 optionally bind a readonly zero-based `int` sequence index; Dictionary families

@@ -112,13 +112,13 @@ function check_constructor_parameter_roles(string $root): array
         'Constructor Parameter Roles Corrective Beat — Complete',
         'Indexed Foreach And Scalar Display',
         'Decision 0132',
-        'Stage 35 — Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next',
+        'Stage 35 — Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
         'Constructor Parameter Roles Corrective Beat — Complete.',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete.',
-        'Stage 35 Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next.',
+        'Stage 35 Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next.',
     ]);
     $forbid($paths['decision'], $files['decision'], [
         'class-body property overrides are implemented',

@@ -2,7 +2,9 @@
 
 > **Stage 35 amendment:** Decision 0134 applies these ownership and provenance
 > rules to two-word interface values and adds one compiler-known nonescaping
-> source-loan rule for public iterators and borrowed `current()` results.
+> source-loan rule for public iterators and borrowed `getCurrent()` results.
+> Its Slice 3 amendment accepts promoted `borrow` constructor parameters for
+> iterator source retention without permitting general borrowed class fields.
 
 Status: Accepted
 

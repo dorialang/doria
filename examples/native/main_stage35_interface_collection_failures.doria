@@ -1,0 +1,80 @@
+class Key implements Hashable, Equatable<Key>, Comparable<Key>, Cloneable
+{
+    static writable float $live = 0.0;
+    static writable int $failure = 0;
+    static writable float $remaining = 1.0;
+
+    function __construct(int $value) { self::live = self::live + 1.0; }
+    function __destruct() { self::live = self::live - 1.0; }
+
+    static function fail(int $operation): void
+    {
+        if (self::failure == $operation) {
+            self::remaining = self::remaining - 1.0;
+            if (self::remaining == 0.0) { read_file("stage35-missing-core-operation.txt"); }
+        }
+    }
+    function hash(): uint64 { self::fail(1); return 18446744073709551615; }
+    function equals(Key $other): bool { self::fail(2); return $this->value == $other->value; }
+    function compare(Key $other): Ordering
+    {
+        self::fail(3);
+        if ($this->value < $other->value) { return Ordering::Less; }
+        if ($this->value > $other->value) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+    function clone(): self { self::fail(4); return new Key($this->value); }
+}
+
+function main(): void
+{
+    {
+        List<Key> $source = [new Key(3), new Key(1), new Key(2)];
+        let writable $set = Set::from($source);
+        let writable $sorted = SortedSet::from($source);
+        let writable $queue = PriorityQueue::from($source);
+        Dictionary<Key, Key> $map = [new Key(0) => new Key(10)];
+
+        Key::failure = 1;
+        try { $set->add(new Key(9)); }
+        catch (Error $error) { echo "hash {$set->count}:" . (Key::live == 14.0) . "\n"; }
+        Key::failure = 2;
+        Key::remaining = 1.0;
+        try { $set->contains(new Key(9)); }
+        catch (Error $error) { echo "equal {$set->count}:" . (Key::live == 14.0) . "\n"; }
+        Key::failure = 3;
+        Key::remaining = 2.0;
+        try { $sorted->add(new Key(9)); }
+        catch (Error $error) { echo "sorted {$sorted->count}:" . (Key::live == 14.0) . "\n"; }
+        Key::remaining = 2.0;
+        try { $queue->push(new Key(0)); }
+        catch (Error $error) { echo "push {$queue->count}:" . (Key::live == 14.0) . "\n"; }
+        Key::remaining = 1.0;
+        try { $queue->pop(); }
+        catch (Error $error) { echo "pop {$queue->count}:" . (Key::live == 14.0) . "\n"; }
+        Key::failure = 0;
+        while (!$queue->isEmpty) {
+            let $value = $queue->pop();
+            if ($value != null) { echo "q{$value->value}"; }
+        }
+        echo "\n";
+
+        Key::failure = 4;
+        Key::remaining = 2.0;
+        try { let $copy = Set::from($source); }
+        catch (Error $error) { echo "clone set " . (Key::live == 11.0) . "\n"; }
+        Key::remaining = 2.0;
+        try { let $copy = SortedDictionary::from($map); }
+        catch (Error $error) { echo "clone map " . (Key::live == 11.0) . "\n"; }
+        Key::remaining = 2.0;
+        try { let $copy = PriorityQueue::from($source); }
+        catch (Error $error) { echo "clone queue " . (Key::live == 11.0) . "\n"; }
+        Key::failure = 3;
+        Key::remaining = 2.0;
+        try { let $copy = PriorityQueue::from($source); }
+        catch (Error $error) { echo "compare queue " . (Key::live == 11.0) . "\n"; }
+        Key::failure = 0;
+        echo "source {$source->count}:{$map->count}\n";
+    }
+    echo "done " . (Key::live == 0.0) . "\n";
+}

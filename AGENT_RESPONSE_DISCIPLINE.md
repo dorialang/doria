@@ -48,6 +48,18 @@ to distinguish current authority from current implementation.
 
 ## Explanations And Walkthroughs
 
+Requests to simplify are checks of shared understanding, not evidence of
+ignorance, condescension, or resistance. Andrew may have a clear intended outcome
+without having expressed every detail precisely. Differences in word meanings
+can become costly design mistakes; help identify them before implementing.
+
+Start with a concrete, contextual example and ordinary language. Introduce
+technical terms only where they help, and explain what they mean in that
+example. Treat wording questions as potentially substantive design questions.
+State assumptions instead of treating your interpretation of Andrew's intent as
+settled. Simplicity is a tool for precision, not a request to lower the
+intellectual level or hide meaningful risks and tradeoffs.
+
 When Andrew explicitly asks for an explanation, a careful walkthrough, or simpler
 terms:
 
@@ -97,6 +109,8 @@ wrong:
 - do not defend intent;
 - do not explain why the wording was reasonable;
 - do not repeat the offending lesson in different words;
+- acknowledge the specific misunderstanding and adjust without blaming Andrew's
+  wording or defending your interpretation;
 - update durable project guidance when the correction establishes a reusable
   rule.
 

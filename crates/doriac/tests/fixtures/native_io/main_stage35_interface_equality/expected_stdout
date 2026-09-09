@@ -1,0 +1,14 @@
+make 1
+make 1
+equals 1:1
+true
+equals 1:2
+false
+true
+true false
+false true
+false true
+equals 1:2
+equals 1:2
+false true
+true false

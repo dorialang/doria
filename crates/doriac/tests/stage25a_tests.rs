@@ -504,6 +504,24 @@ fn referenced_value_exists_only_on_shared_reference() {
 }
 
 #[test]
+fn shared_collection_properties_use_the_payload_member_contract() {
+    for receiver in [
+        "$owner->acquireReadonlyAccess()",
+        "$owner->acquireWritableAccess()",
+    ] {
+        let setup = format!(
+            "let $owner = new WritableSharedReference<List<int>>([1]); let $view = {receiver};"
+        );
+        accepted(&format!("{setup} echo $view->count;"));
+        assert_code(&format!("{setup} echo $view->missing;"), "E0521");
+        assert_code(
+            &format!("{setup} let $bad = $view->referencedValue;"),
+            "E0521",
+        );
+    }
+}
+
+#[test]
 fn writes_through_referenced_value_are_rejected() {
     assert_code(
         r#"

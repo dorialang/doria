@@ -52,6 +52,8 @@ pub struct InterfaceVtableId(pub usize);
 pub enum ImplementingType {
     Class(ClassId),
     Collection(CollectionTypeId),
+    /// Private cursor state: a borrowed collection pointer and a position.
+    CollectionIterator(CollectionTypeId),
 }
 
 impl InterfaceTypeId {
@@ -297,6 +299,7 @@ pub enum CollectionComparator {
     UnsignedInteger(u8),
     Bool,
     StringBytes,
+    Core,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +311,121 @@ pub struct CollectionType {
     pub comparator: Option<CollectionComparator>,
 }
 
+impl CollectionType {
+    pub fn uses_core_operations(&self) -> bool {
+        self.comparator == Some(CollectionComparator::Core)
+            || (matches!(self.kind, CollectionKind::Dictionary | CollectionKind::Set)
+                && matches!(
+                    self.key.unwrap_or(self.value),
+                    Type::Class(_) | Type::Interface(_)
+                ))
+    }
+
+    pub fn uses_core_hash(&self) -> bool {
+        self.uses_core_operations()
+            && matches!(self.kind, CollectionKind::Dictionary | CollectionKind::Set)
+    }
+}
+
+/// The compiler performs all user comparisons before these storage operations.
+/// Operands are materialized locals so mutation cannot hide a call or transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreCollectionOperation {
+    Insert {
+        position: LocalId,
+        key: Option<LocalId>,
+        value: LocalId,
+        hash: Option<LocalId>,
+    },
+    Remove {
+        position: LocalId,
+        key: Option<LocalId>,
+        value: LocalId,
+    },
+    Swap {
+        left: LocalId,
+        right: LocalId,
+    },
+    KeyAt {
+        position: LocalId,
+        target: LocalId,
+    },
+    ValueAt {
+        position: LocalId,
+        target: LocalId,
+    },
+    Exchange {
+        position: LocalId,
+        value: LocalId,
+        previous: LocalId,
+    },
+    HashNext {
+        hash: LocalId,
+        previous: LocalId,
+        target: LocalId,
+    },
+    HashPosition {
+        slot: LocalId,
+        target: LocalId,
+    },
+    RequireKey {
+        position: LocalId,
+    },
+}
+
+impl CoreCollectionOperation {
+    pub fn inputs(&self) -> Vec<LocalId> {
+        match self {
+            Self::Insert {
+                position,
+                key,
+                value,
+                hash,
+            } => [Some(*position), *key, Some(*value), *hash]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Self::Remove { position, .. }
+            | Self::KeyAt { position, .. }
+            | Self::ValueAt { position, .. }
+            | Self::RequireKey { position } => vec![*position],
+            Self::Exchange {
+                position, value, ..
+            } => vec![*position, *value],
+            Self::Swap { left, right } => vec![*left, *right],
+            Self::HashNext { hash, previous, .. } => vec![*hash, *previous],
+            Self::HashPosition { slot, .. } => vec![*slot],
+        }
+    }
+
+    pub fn outputs(&self) -> Vec<LocalId> {
+        match self {
+            Self::Remove { key, value, .. } => [*key, Some(*value)].into_iter().flatten().collect(),
+            Self::KeyAt { target, .. }
+            | Self::ValueAt { target, .. }
+            | Self::HashNext { target, .. }
+            | Self::HashPosition { target, .. } => vec![*target],
+            Self::Exchange { previous, .. } => vec![*previous],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn transfers(&self) -> Vec<LocalId> {
+        match self {
+            Self::Insert { key, value, .. } => [*key, Some(*value)].into_iter().flatten().collect(),
+            Self::Exchange { value, .. } => vec![*value],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn mutates(&self) -> bool {
+        matches!(
+            self,
+            Self::Insert { .. } | Self::Remove { .. } | Self::Swap { .. } | Self::Exchange { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceType {
     pub id: InterfaceTypeId,
@@ -317,6 +435,23 @@ pub struct InterfaceType {
 }
 
 impl InterfaceType {
+    pub fn iteration_operation(
+        &self,
+        slot: usize,
+        interfaces: &[Self],
+    ) -> Option<crate::compiler_known_contracts::IterationOperation> {
+        let method = self.methods.get(slot)?;
+        std::iter::once(self)
+            .chain(self.ancestors.iter().filter_map(|id| interfaces.get(id.0)))
+            .flat_map(|interface| &interface.methods)
+            .filter(|candidate| candidate.name == method.name)
+            .find_map(|candidate| {
+                crate::compiler_known_contracts::IterationOperation::from_requirement(
+                    candidate.requirement,
+                )
+            })
+    }
+
     pub fn error() -> Self {
         Self {
             id: InterfaceTypeId::ERROR,
@@ -443,6 +578,7 @@ pub struct Property {
     pub ty: Type,
     pub writable: bool,
     pub promoted: bool,
+    pub borrowed_source: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -931,6 +1067,10 @@ pub enum Operand {
         property: PropertyId,
     },
     CollectionLength(LocalId),
+    CollectionIteratorPosition {
+        receiver: LocalId,
+        vtable: InterfaceVtableId,
+    },
     CollectionIndex {
         collection: LocalId,
         index: Box<Rvalue>,
@@ -951,6 +1091,8 @@ pub enum Operand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StringIntrinsicKind {
+    /// Compiler-private unboxed Hashable operation over exact UTF-8 bytes.
+    Hash,
     GraphemeLength,
     ByteLength,
     IsEmpty,
@@ -1424,6 +1566,8 @@ impl Rvalue {
                     NullableSharedReferenceAccessExpression::Null { .. }
                 )
                 | Self::NullableMixed(NullableMixedExpression::Null)
+                | Self::Mixed(MixedExpression::Null)
+                | Self::NullableMixed(NullableMixedExpression::Mixed(MixedExpression::Null))
                 | Self::NullableInterface(NullableInterfaceExpression {
                     value: NullableInterfaceValue::Null,
                     ..
@@ -1435,6 +1579,9 @@ impl Rvalue {
 
     pub const fn transferred_owned_local(&self) -> Option<LocalId> {
         match self {
+            Self::Collection(CollectionExpression::FinishConstruction { source, .. }) => {
+                Some(*source)
+            }
             Self::Interface(value) => value.value.transferred_owned_local(),
             Self::NullableInterface(value) => value.value.transferred_owned_local(),
             Self::Mixed(MixedExpression::Local {
@@ -1729,13 +1876,7 @@ pub(crate) fn nullable_function_expression_is_borrowed(value: &NullableFunctionE
         NullableFunctionExpression::Present(value) => function_expression_is_borrowed(value),
         NullableFunctionExpression::Local { transfer, .. } => !transfer,
         NullableFunctionExpression::Property { .. } => true,
-        NullableFunctionExpression::DictionaryGet { access, .. } => !matches!(
-            access,
-            NullableCollectionAccess::Remove
-                | NullableCollectionAccess::Pop
-                | NullableCollectionAccess::PopFront
-                | NullableCollectionAccess::PopBack
-        ),
+        NullableFunctionExpression::DictionaryGet { access, .. } => !access.removes_element(),
         NullableFunctionExpression::CollectionIndex { remove, .. } => !remove,
     }
 }
@@ -1780,6 +1921,14 @@ pub enum InterfaceValue {
     },
     FromNullableClass {
         object: Box<NullableClassExpression>,
+        vtable: InterfaceVtableId,
+    },
+    FromCollection {
+        value: Box<Rvalue>,
+        vtable: InterfaceVtableId,
+    },
+    NewCollectionIterator {
+        source: LocalId,
         vtable: InterfaceVtableId,
     },
     Property {
@@ -1876,6 +2025,7 @@ impl InterfaceValue {
                 } => Some(*local),
                 _ => None,
             },
+            Self::FromCollection { value, .. } => value.transferred_owned_local(),
             _ => None,
         }
     }
@@ -1892,6 +2042,8 @@ impl InterfaceValue {
             Self::Call { return_borrow, .. } => return_borrow.is_some(),
             Self::FromClass { object, .. } => object.borrows_class_value(),
             Self::FromNullableClass { object, .. } => object.borrows_class_value(),
+            Self::FromCollection { value, .. } => value.borrows_move_value(),
+            Self::NewCollectionIterator { .. } => false,
         }
     }
 }
@@ -1917,13 +2069,7 @@ impl NullableInterfaceValue {
             Self::Present(value) => value.is_borrowed(),
             Self::Local { transfer, .. } | Self::Property { transfer, .. } => !transfer,
             Self::Call { return_borrow, .. } => return_borrow.is_some(),
-            Self::DictionaryGet { access, .. } => !matches!(
-                access,
-                NullableCollectionAccess::Remove
-                    | NullableCollectionAccess::Pop
-                    | NullableCollectionAccess::PopFront
-                    | NullableCollectionAccess::PopBack
-            ),
+            Self::DictionaryGet { access, .. } => !access.removes_element(),
             Self::CollectionIndex { remove, .. } => !remove,
         }
     }
@@ -2353,13 +2499,7 @@ impl NullableSharedReferenceExpression {
                 }
             }
             Self::DictionaryGet { access, .. } => {
-                if matches!(
-                    access,
-                    NullableCollectionAccess::Remove
-                        | NullableCollectionAccess::Pop
-                        | NullableCollectionAccess::PopFront
-                        | NullableCollectionAccess::PopBack
-                ) {
+                if access.removes_element() {
                     Some(OwnedSharedTemporary::Strong)
                 } else {
                     None
@@ -2465,13 +2605,7 @@ impl NullableWeakReferenceExpression {
                 }
             }
             Self::DictionaryGet { access, .. } => {
-                if matches!(
-                    access,
-                    NullableCollectionAccess::Remove
-                        | NullableCollectionAccess::Pop
-                        | NullableCollectionAccess::PopFront
-                        | NullableCollectionAccess::PopBack
-                ) {
+                if access.removes_element() {
                     Some(OwnedSharedTemporary::Weak)
                 } else {
                     None
@@ -2703,13 +2837,7 @@ impl NullableWritableSharedReferenceExpression {
             Self::Acquire { .. } | Self::NullSafeShare { .. } | Self::NullSafeAcquire { .. } => {
                 true
             }
-            Self::DictionaryGet { access, .. } => matches!(
-                access,
-                NullableCollectionAccess::Remove
-                    | NullableCollectionAccess::Pop
-                    | NullableCollectionAccess::PopFront
-                    | NullableCollectionAccess::PopBack
-            ),
+            Self::DictionaryGet { access, .. } => access.removes_element(),
             Self::Null(_) | Self::Property { .. } => false,
         }
     }
@@ -2774,13 +2902,7 @@ impl NullableWritableWeakReferenceExpression {
             Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => *transfer,
             Self::Call { return_borrow, .. } => return_borrow.is_none(),
             Self::NullSafeCreate { .. } => true,
-            Self::DictionaryGet { access, .. } => matches!(
-                access,
-                NullableCollectionAccess::Remove
-                    | NullableCollectionAccess::Pop
-                    | NullableCollectionAccess::PopFront
-                    | NullableCollectionAccess::PopBack
-            ),
+            Self::DictionaryGet { access, .. } => access.removes_element(),
             Self::Null(_) | Self::Property { .. } => false,
         }
     }
@@ -2921,13 +3043,7 @@ impl NullableSharedReferenceAccessExpression {
             Self::Call { return_borrow, .. } => return_borrow.is_none(),
             Self::NullSafeAcquire { .. } => true,
             Self::CollectionIndex { remove, .. } => *remove,
-            Self::CollectionGet { access, .. } => matches!(
-                access,
-                NullableCollectionAccess::Remove
-                    | NullableCollectionAccess::Pop
-                    | NullableCollectionAccess::PopFront
-                    | NullableCollectionAccess::PopBack
-            ),
+            Self::CollectionGet { access, .. } => access.removes_element(),
             Self::Null { .. } | Self::Property { .. } => false,
         }
     }
@@ -2979,6 +3095,16 @@ impl SharedReferenceAccessExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectionExpression {
+    InterfaceReceiver {
+        collection: CollectionTypeId,
+        receiver: LocalId,
+        vtable: InterfaceVtableId,
+    },
+    IteratorSource {
+        collection: CollectionTypeId,
+        receiver: LocalId,
+        vtable: InterfaceVtableId,
+    },
     Local {
         collection: CollectionTypeId,
         local: LocalId,
@@ -2994,6 +3120,17 @@ pub enum CollectionExpression {
         value: Box<Rvalue>,
         count: Box<IntegerExpression>,
         count_span: Span,
+    },
+    /// Allocates capacity without creating live elements. Generated duplication
+    /// loops publish each element only after its owned value is complete.
+    ConstructionCapacity {
+        collection: CollectionTypeId,
+        count: Box<IntegerExpression>,
+        count_span: Span,
+    },
+    FinishConstruction {
+        collection: CollectionTypeId,
+        source: LocalId,
     },
     Index {
         collection: CollectionTypeId,
@@ -3125,6 +3262,7 @@ pub enum NullableCollectionAccess {
     Get,
     Index,
     Remove,
+    RemoveAt,
     First,
     Last,
     Pop,
@@ -3133,16 +3271,29 @@ pub enum NullableCollectionAccess {
     At,
 }
 
+impl NullableCollectionAccess {
+    pub const fn removes_element(self) -> bool {
+        matches!(
+            self,
+            Self::Remove | Self::RemoveAt | Self::Pop | Self::PopFront | Self::PopBack
+        )
+    }
+}
+
 impl CollectionExpression {
     pub const fn collection(&self) -> CollectionTypeId {
         match self {
-            Self::Local { collection, .. }
+            Self::InterfaceReceiver { collection, .. }
+            | Self::IteratorSource { collection, .. }
+            | Self::Local { collection, .. }
             | Self::Literal { collection, .. }
             | Self::Fill { collection, .. }
+            | Self::ConstructionCapacity { collection, .. }
             | Self::Index { collection, .. }
             | Self::Property { collection, .. }
             | Self::SharedAccessPayload { collection, .. }
             | Self::From { collection, .. }
+            | Self::FinishConstruction { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
             | Self::ReadFileBytes { collection, .. }
@@ -3164,12 +3315,14 @@ impl CollectionExpression {
             }
             | Self::Literal { collection, .. }
             | Self::Fill { collection, .. }
+            | Self::ConstructionCapacity { collection, .. }
             | Self::Index {
                 collection,
                 transfer: true,
                 ..
             }
             | Self::From { collection, .. }
+            | Self::FinishConstruction { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
             | Self::ReadFileBytes { collection, .. }
@@ -3183,7 +3336,9 @@ impl CollectionExpression {
                 Type::Collection(collection) => Some(collection),
                 _ => None,
             },
-            Self::Local {
+            Self::InterfaceReceiver { .. }
+            | Self::IteratorSource { .. }
+            | Self::Local {
                 transfer: false, ..
             }
             | Self::Index {
@@ -4178,13 +4333,7 @@ impl NullableClassExpression {
                 return_borrow: Some(_),
                 ..
             } => true,
-            Self::DictionaryGet { access, .. } => !matches!(
-                access,
-                NullableCollectionAccess::Remove
-                    | NullableCollectionAccess::Pop
-                    | NullableCollectionAccess::PopFront
-                    | NullableCollectionAccess::PopBack
-            ),
+            Self::DictionaryGet { access, .. } => !access.removes_element(),
             Self::Null(_)
             | Self::Call {
                 return_borrow: None,
@@ -4334,6 +4483,14 @@ pub enum BoolBinaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
+    CoreCollection {
+        collection: LocalId,
+        operation: CoreCollectionOperation,
+    },
+    AdvanceCollectionIterator {
+        receiver: LocalId,
+        vtable: InterfaceVtableId,
+    },
     /// Makes closure environment fields available through ordinary local IDs
     /// in a synthetic closure function. Borrowed fields remain stable places;
     /// owned fields transfer into owned locals for the invocation.
@@ -4556,13 +4713,87 @@ pub struct MatchArmPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlFlowPlan {
+    RetainedSources(RetainedSourcesPlan),
+    CoreValue(CoreValueCallPlan),
+    ElementDuplication(ElementDuplicationPlan),
+    CollectionBuild(CollectionBuildPlan),
     Assertion(Box<AssertionPlan>),
     Given(GivenControlFlowPlan),
     When(WhenResultPlan),
     DoWhile(DoWhilePlan),
     Foreach(ForeachPlan),
+    PublicForeach(Box<PublicForeachPlan>),
     Finalizer(FinalizerRegionPlan),
     ListAlgorithm(Box<ListAlgorithmPlan>),
+}
+
+/// Static lifetime contract; it does not change the native calling convention.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedSourcesPlan {
+    pub returns: Vec<RetainedSource>,
+    pub constructs: Vec<RetainedSource>,
+    pub independent_parameters: Vec<LocalId>,
+    pub promotions: Vec<(PropertyId, LocalId)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RetainedSource {
+    pub local: LocalId,
+    pub inherited: bool,
+}
+
+/// Selection evidence for an implicit core-contract call. Execution still uses
+/// the ordinary direct/indirect call and checked-outcome instructions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreValueCallPlan {
+    pub operation: crate::compiler_known_contracts::CoreValueOperation,
+    pub receiver: LocalId,
+    pub interface: InterfaceTypeId,
+    pub slot: usize,
+    pub target: CoreValueCallTarget,
+    pub result: LocalId,
+    pub call: BlockId,
+    pub success: BlockId,
+    pub source_span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreValueCallTarget {
+    Direct {
+        function: FunctionId,
+        vtable: InterfaceVtableId,
+    },
+    Erased,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementDuplicationPlan {
+    pub source: LocalId,
+    pub result: LocalId,
+    pub entry: BlockId,
+    pub call: BlockId,
+    pub absent: Option<BlockId>,
+    pub exit: BlockId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionBuildPlan {
+    pub kind: CollectionBuildKind,
+    pub output: LocalId,
+    pub source: LocalId,
+    pub count: LocalId,
+    pub index: LocalId,
+    pub setup: BlockId,
+    pub header: BlockId,
+    pub body: BlockId,
+    pub append: BlockId,
+    pub exit: BlockId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionBuildKind {
+    Fill,
+    PreservingFrom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4598,6 +4829,33 @@ pub struct ForeachPlan {
     pub exit: BlockId,
     pub continue_sources: Vec<BlockId>,
     pub source_span: Span,
+}
+
+/// Checked protocol calls and loop regions share one cursor and source loan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicForeachPlan {
+    pub source: LocalId,
+    pub cursor: LocalId,
+    pub value_binding: LocalId,
+    pub calls: [IterationCallPlan; 4],
+    pub header: BlockId,
+    pub body: BlockId,
+    pub update: BlockId,
+    pub exit: BlockId,
+    pub continue_sources: Vec<BlockId>,
+    pub source_span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IterationCallPlan {
+    pub operation: crate::compiler_known_contracts::IterationOperation,
+    pub receiver: LocalId,
+    pub interface: InterfaceTypeId,
+    pub slot: usize,
+    pub target: CoreValueCallTarget,
+    pub result: Option<LocalId>,
+    pub call: BlockId,
+    pub success: BlockId,
 }
 
 /// Validation identity for one compiler-known terminal expectation. Execution
@@ -4658,6 +4916,8 @@ pub struct ListAlgorithmPlan {
     pub callback_result: Option<LocalId>,
     pub callback_failure: Option<BlockId>,
     pub filter_selected: Option<BlockId>,
+    pub filter_append: Option<BlockId>,
+    pub filter_duplicate: Option<LocalId>,
     pub setup: BlockId,
     pub header: BlockId,
     pub body: BlockId,
@@ -4780,6 +5040,7 @@ pub struct DoWhilePlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionMutationOp {
+    Initialize,
     Add,
     InsertAt,
     Remove,
@@ -4913,6 +5174,7 @@ pub(crate) fn class_temporary_capacity(function: &Function) -> usize {
 
 fn statement_class_temporary_capacity(statement: &Statement) -> usize {
     match statement {
+        Statement::CoreCollection { .. } => 0,
         Statement::AssignLocal { value, .. }
         | Statement::AssignLocalGroup { value, .. }
         | Statement::AssignProperty { value, .. }
@@ -4924,7 +5186,8 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::AssignCollectionIndex { index, value, .. } => {
             rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
         }
-        Statement::EchoStringLiteral(_)
+        Statement::AdvanceCollectionIterator { .. }
+        | Statement::EchoStringLiteral(_)
         | Statement::BindClosureEnvironment { .. }
         | Statement::BindPayloadEnumFields { .. }
         | Statement::MatchResultPlan { .. }
@@ -5040,7 +5303,11 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::NullableString(value) => nullable_string_class_temporary_capacity(value),
             Rvalue::NullableMixed(value) => nullable_mixed_class_temporary_capacity(value),
             Rvalue::Interface(InterfaceExpression { value, .. }) => match value {
-                InterfaceValue::SharedPayload { .. } => 0,
+                InterfaceValue::SharedPayload { .. }
+                | InterfaceValue::NewCollectionIterator { .. } => 0,
+                InterfaceValue::FromCollection { value, .. } => {
+                    rvalue_class_temporary_capacity(value)
+                }
                 InterfaceValue::Upcast { source, .. } => {
                     rvalue_class_temporary_capacity(&Rvalue::Interface(*source.clone()))
                 }
@@ -5531,8 +5798,11 @@ fn nullable_mixed_class_temporary_capacity(value: &NullableMixedExpression) -> u
 fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
     usize::from(value.owned_temporary_collection().is_some())
         + match value {
-            CollectionExpression::Local { .. } => 0,
+            CollectionExpression::Local { .. }
+            | CollectionExpression::InterfaceReceiver { .. }
+            | CollectionExpression::IteratorSource { .. } => 0,
             CollectionExpression::From { .. }
+            | CollectionExpression::FinishConstruction { .. }
             | CollectionExpression::FromBytes { .. }
             | CollectionExpression::BytesFromArray { .. }
             | CollectionExpression::ReadStdinBytes { .. } => 0,
@@ -5554,6 +5824,9 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
                 .sum(),
             CollectionExpression::Fill { value, count, .. } => {
                 rvalue_class_temporary_capacity(value) + integer_class_temporary_capacity(count)
+            }
+            CollectionExpression::ConstructionCapacity { count, .. } => {
+                integer_class_temporary_capacity(count)
             }
             CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
             CollectionExpression::Property { .. }
@@ -6165,6 +6438,11 @@ impl fmt::Display for BasicBlock {
 impl fmt::Display for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Operand::CollectionIteratorPosition { receiver, vtable } => write!(
+                formatter,
+                "iterator_position(local{}, vtable#{})",
+                receiver.0, vtable.0
+            ),
             Operand::Scalar(value) => write!(formatter, "{value}"),
             Operand::Local(id) => write!(formatter, "local{}", id.0),
             Operand::NullablePayload(id) => write!(formatter, "payload(local{})", id.0),
@@ -6198,6 +6476,18 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Interface(InterfaceExpression {
+                value: InterfaceValue::FromCollection { value, vtable },
+                ..
+            }) => write!(formatter, "erase {value} with vtable#{}", vtable.0),
+            Self::Interface(InterfaceExpression {
+                value: InterfaceValue::NewCollectionIterator { source, vtable },
+                ..
+            }) => write!(
+                formatter,
+                "collection_iterator local{} with vtable#{}",
+                source.0, vtable.0
+            ),
             Self::Interface(InterfaceExpression {
                 value: InterfaceValue::SharedPayload { local },
                 ..
@@ -6554,6 +6844,20 @@ impl fmt::Display for NullableFunctionExpression {
 impl fmt::Display for CollectionExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InterfaceReceiver {
+                receiver, vtable, ..
+            } => write!(
+                formatter,
+                "collection_receiver local{} vtable#{}",
+                receiver.0, vtable.0
+            ),
+            Self::IteratorSource {
+                receiver, vtable, ..
+            } => write!(
+                formatter,
+                "iterator_source local{} vtable#{}",
+                receiver.0, vtable.0
+            ),
             Self::Local {
                 local,
                 transfer: true,
@@ -6586,6 +6890,12 @@ impl fmt::Display for CollectionExpression {
                 count,
                 ..
             } => write!(formatter, "collection#{}[{value}; {count}]", collection.0),
+            Self::ConstructionCapacity {
+                collection, count, ..
+            } => write!(formatter, "reserve collection#{}[{count}]", collection.0),
+            Self::FinishConstruction { source, .. } => {
+                write!(formatter, "finish collection local{}", source.0)
+            }
             Self::Index {
                 source,
                 index,
@@ -7049,6 +7359,7 @@ impl fmt::Display for IntegerExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IntegerExpression::Use { ty, operand } => match operand {
+                Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
                 Operand::Scalar(ScalarValue::Integer(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
                 Operand::NullablePayload(id) => {
@@ -7124,6 +7435,7 @@ impl fmt::Display for FloatExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Use { ty, operand } => match operand {
+                Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
                 Operand::Scalar(ScalarValue::Float(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
                 Operand::NullablePayload(id) => {
@@ -7292,6 +7604,7 @@ impl fmt::Display for BoolExpression {
         match self {
             Self::NominalIs { local, target } => write!(formatter, "local{} is {target}", local.0),
             Self::Use { operand } => match operand {
+                Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: bool"),
                 Operand::Scalar(ScalarValue::Bool(value)) => write!(formatter, "{value}: bool"),
                 Operand::Local(id) => write!(formatter, "local{}: bool", id.0),
                 Operand::NullablePayload(id) => {
@@ -7472,6 +7785,7 @@ impl fmt::Display for StringIntrinsicCall {
 impl fmt::Display for StringIntrinsicKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Hash => "hash",
             Self::GraphemeLength => "graphemeLength",
             Self::ByteLength => "byteLength",
             Self::IsEmpty => "isEmpty",
@@ -7578,6 +7892,19 @@ impl fmt::Display for BoolBinaryOp {
 impl fmt::Display for Statement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Statement::CoreCollection {
+                collection,
+                operation,
+            } => write!(
+                formatter,
+                "core-collection local{} {operation:?}",
+                collection.0
+            ),
+            Self::AdvanceCollectionIterator { receiver, vtable } => write!(
+                formatter,
+                "advance_collection_iterator local{} vtable#{}",
+                receiver.0, vtable.0
+            ),
             Statement::BindClosureEnvironment {
                 environment,
                 bindings,
@@ -7815,6 +8142,18 @@ impl fmt::Display for Statement {
 impl fmt::Display for ControlFlowPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RetainedSources(plan) => write!(formatter, "retained sources returns {:?} constructs {:?} independent {:?} promotions {:?}", plan.returns, plan.constructs, plan.independent_parameters, plan.promotions),
+            Self::PublicForeach(plan) => write!(formatter, "public foreach source {:?} cursor {:?} element {:?} calls {:?} header {:?} body {:?} update {:?} exit {:?}", plan.source, plan.cursor, plan.value_binding, plan.calls, plan.header, plan.body, plan.update, plan.exit),
+            Self::CoreValue(plan) => write!(formatter,
+                "core {:?} local{} interface#{} slot{} {:?} result local{} block{} -> block{}",
+                plan.operation, plan.receiver.0, plan.interface.0, plan.slot, plan.target,
+                plan.result.0, plan.call.0, plan.success.0),
+            Self::ElementDuplication(plan) => write!(formatter,
+                "duplicate local{} -> local{} block{} call block{} exit block{}",
+                plan.source.0, plan.result.0, plan.entry.0, plan.call.0, plan.exit.0),
+            Self::CollectionBuild(plan) => write!(formatter,
+                "fill local{} from local{} count local{} block{}..block{}",
+                plan.output.0, plan.source.0, plan.count.0, plan.header.0, plan.exit.0),
             Self::Assertion(plan) => write!(
                 formatter,
                 "assert {:?}{} block{} success block{} failure block{} error local{}",

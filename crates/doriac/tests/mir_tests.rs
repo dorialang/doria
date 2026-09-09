@@ -2864,8 +2864,8 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn stage_11f_rejects_calls_with_the_wrong_result_context() {
-    let ignored_int = unsupported_after_parsing(
+fn discarded_results_execute_but_void_calls_cannot_supply_a_scalar() {
+    let ignored_int = interpret(
         r#"function main(): void
 {
     one();
@@ -2877,7 +2877,7 @@ function one(): int
 }
 "#,
     );
-    assert_stage_11g_unsupported(&ignored_int, "cannot be used as a statement");
+    assert_eq!(ignored_int.exit_status, 0);
 
     let void_as_int = unsupported_after_parsing(
         r#"function hello(): void
