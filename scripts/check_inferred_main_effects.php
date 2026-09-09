@@ -90,7 +90,7 @@ function check_inferred_main_effects(string $root): array
         'Native Testing Foundation Slices 1 through 3 are complete',
         'foundation is complete',
         'Stage 34 is complete',
-        'Stage 35 Slices 1, 2, and 3 are complete and Slice 4 is next',
+        'Stage 35 Slices 1, 2, 3, and 4 are complete and Slice 5 is next',
     ]);
     $require($compatibilityPath, $compatibility, [
         'function main(): void throws Doria\Std\Io\IoError',

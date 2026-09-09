@@ -43,7 +43,7 @@ fn readonly_string_defaults_are_folded_by_callable_and_parameter_identity() {
         hir.semantic_info
             .parameter_defaults
             .get(&ParameterDefaultKey {
-                function_start: greeting.span.start,
+                function: greeting.span,
                 parameter_index: 0,
             }),
         Some(ConstValue::String(value)) if value == "hi"
@@ -52,7 +52,7 @@ fn readonly_string_defaults_are_folded_by_callable_and_parameter_identity() {
         hir.semantic_info
             .parameter_defaults
             .get(&ParameterDefaultKey {
-                function_start: constructor.span.start,
+                function: constructor.span,
                 parameter_index: 0,
             }),
         Some(ConstValue::String(value)) if value == "hi"

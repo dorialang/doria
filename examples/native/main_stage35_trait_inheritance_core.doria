@@ -1,0 +1,40 @@
+trait Value
+{
+    function number(): int;
+    function toString(): string { return "key {$this->number()}"; }
+    function equals(self $other): bool { return $this->number() == $other->number(); }
+    function hash(): uint64 { return 18446744073709551615; }
+    function compare(self $other): Ordering
+    {
+        if ($this->number() < $other->number()) { return Ordering::Less; }
+        if ($this->number() > $other->number()) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+    function clone(): self { return new self($this->number()); }
+}
+class Key implements Displayable, Equatable<Key>, Hashable, Comparable<Key>, Cloneable
+{
+    uses Value;
+    function __construct(int $value) {}
+    function number(): int { return $this->value; }
+}
+open class Base { open function render(): string { return "base"; } }
+trait Rendering { function render(): string { return "trait"; } }
+class Report extends Base
+{
+    uses Rendering { Rendering::render as internal renderTrait; }
+    override function render(): string { return parent::render() . ":" . $this->renderTrait(); }
+}
+function display(Displayable $value): string { return $value->toString(); }
+function duplicate(Cloneable $value): Cloneable { return $value->clone(); }
+function main(): void
+{
+    let $one = new Key(1);
+    let $two = new Key(2);
+    echo display($one) . " {$one->equals($two)} {$one->hash()}\n";
+    let $copy = duplicate($two);
+    if ($copy is Key) { echo "copy {$copy->value}\n"; }
+    SortedSet<Key> $sorted = SortedSet::from([$two->clone(), $one->clone()]);
+    foreach ($sorted as Key $key) { echo display($key) . ";"; }
+    echo "\n" . (new Report())->render() . "\n";
+}

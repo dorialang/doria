@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+pub mod composition;
+pub mod composition_rename;
 pub mod contracts;
 
 pub use crate::checked_effects::CatchCoverage;
@@ -181,6 +183,10 @@ pub struct SemanticInfo {
     /// Canonical global declaration/reference facts produced before checking.
     pub global_symbols: crate::names::GlobalSymbolFacts,
     pub contracts: contracts::ContractFacts,
+    pub composition: crate::trait_composition::CompositionPlan,
+    pub class_member_surfaces: Vec<composition::ClassMemberSurface>,
+    pub trait_adaptation_surfaces: Vec<composition::TraitAdaptationSurface>,
+    pub composition_rename: composition_rename::CompositionRenameFacts,
     /// Compiler-owned suites and unified test declarations. Runtime backends
     /// consume only the generated ordinary functions, never this metadata.
     pub test_semantics: crate::testing::TestSemanticFacts,
@@ -251,7 +257,8 @@ pub struct SemanticInfo {
     /// Declaring class selected for inherited static-property and class-constant access.
     /// HIR lowering canonicalizes storage through this map instead of reproducing
     /// hierarchy lookup in each backend.
-    pub static_member_targets: HashMap<Span, String>,
+    pub static_member_targets: HashMap<Span, ClassType<ResolvedType>>,
+    pub static_receiver_types: HashMap<Span, ClassType<ResolvedType>>,
     /// Concrete generic arguments selected for each checked user-defined call.
     ///
     /// The argument enum is intentionally kinded: Stage 24 supplies only type
@@ -339,6 +346,7 @@ pub struct CallableParameterSemanticInfo {
     pub r#type: ResolvedType,
     pub take: bool,
     pub writable: bool,
+    pub borrow: bool,
     pub has_default: bool,
 }
 
@@ -997,6 +1005,59 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     global_symbols: crate::names::GlobalSymbolFacts,
     test_semantics: crate::testing::TestSemanticFacts,
 ) -> SemanticAnalysis {
+    let authored_program = program;
+    let mut composition = crate::trait_composition::CompositionPlan::default();
+    let mut composition_diagnostics = Vec::new();
+    let mut composition_facts = contracts::ContractFacts::default();
+    if program.items.iter().any(|item| {
+        matches!(item, Item::Class(class)
+        if class.members.iter().any(|member| matches!(member, ClassMember::Uses(_))))
+    }) {
+        let mut declarations = Checker::new(
+            program,
+            crate::const_eval::evaluate_program_with_diagnostics(program).0,
+            source_texts,
+            compilation_context.clone(),
+            compilation_contexts.clone(),
+            global_symbols.clone(),
+            source_semantic_contexts.clone(),
+            test_semantics.clone(),
+        );
+        declarations.predeclare_classes();
+        declarations.collect_enums();
+        declarations.collect_classes();
+        declarations.collect_interface_declarations();
+        let before = declarations.diagnostics.len();
+        declarations.collect_trait_declarations();
+        composition_diagnostics.extend(declarations.diagnostics.into_iter().skip(before));
+        composition_facts = declarations.contracts;
+        let (plan, diagnostics) = crate::trait_composition::prepare(program, &composition_facts);
+        composition = plan;
+        composition_diagnostics.extend(diagnostics);
+    }
+    let expanded_program = composition.apply(program);
+    let program = &expanded_program;
+    let configure_composition = |checker: &mut Checker<'_>| {
+        checker.composition = composition.clone();
+        checker.contracts.compositions = composition_facts.compositions.clone();
+        checker.contracts.member_references = composition_facts.member_references.clone();
+        for reference in &composition.adaptation_references {
+            if let Some(existing) = checker
+                .contracts
+                .member_references
+                .iter_mut()
+                .find(|existing| existing.span == reference.span)
+            {
+                for origin in &reference.origins {
+                    if !existing.origins.contains(origin) {
+                        existing.origins.push(*origin);
+                    }
+                }
+            } else {
+                checker.contracts.member_references.push(reference.clone());
+            }
+        }
+    };
     let (const_evaluation, const_diagnostics) =
         crate::const_eval::evaluate_program_with_diagnostics(program);
     // Discover ambient I/O through the complete direct-call graph before the
@@ -1012,6 +1073,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
         source_semantic_contexts.clone(),
         test_semantics.clone(),
     );
+    configure_composition(&mut discovery);
     discovery.check();
     let mut ambient_effect_seed = discovery.inferred_ambient_effects();
     let generated_test_effect_seed = discovery
@@ -1038,6 +1100,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             test_semantics.clone(),
         );
         refinement.ambient_effect_seed = ambient_effect_seed.clone();
+        configure_composition(&mut refinement);
         refinement.generated_test_effect_seed = generated_test_effect_seed.clone();
         refinement.check();
         let refined = refinement.escaping_ambient_effects();
@@ -1059,6 +1122,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
         test_semantics,
     );
     checker.ambient_effect_seed = ambient_effect_seed;
+    configure_composition(&mut checker);
     checker.generated_test_effect_seed = generated_test_effect_seed;
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
@@ -1147,10 +1211,37 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let retained_callables = ownership_analysis.retained_callables;
     let return_borrows = ownership_analysis.return_borrows;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
+    checker.invalidate_erroneous_compositions();
     let class_hierarchy = collect_class_hierarchy_semantics(&checker);
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let enums = collect_ordered_enum_semantics(&checker);
     let property_families = collect_property_family_semantics(&checker);
+    let retained_parameters = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(class) => Some(class.members.iter().filter_map(|member| match member {
+                ClassMember::Method(method) if method.name == "__construct" => Some(method),
+                _ => None,
+            })),
+            _ => None,
+        })
+        .flatten()
+        .flat_map(|method| {
+            method
+                .params
+                .iter()
+                .enumerate()
+                .filter_map(|(index, parameter)| {
+                    parameter
+                        .borrow_span
+                        .is_some()
+                        .then_some((method.span, index))
+                })
+        })
+        .collect::<HashSet<_>>();
+    let class_member_surfaces = checker.collect_class_member_surfaces(&classes, &return_borrows);
+    let trait_adaptation_surfaces = checker.collect_trait_adaptation_surfaces();
     let callable_signatures = checker
         .function_signatures
         .iter()
@@ -1162,11 +1253,13 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
                     parameters: signature
                         .params
                         .iter()
-                        .map(|parameter| CallableParameterSemanticInfo {
+                        .enumerate()
+                        .map(|(index, parameter)| CallableParameterSemanticInfo {
                             name: parameter.name.clone(),
                             r#type: checker.types.resolved(parameter.ty),
                             take: parameter.take,
                             writable: parameter.writable,
+                            borrow: retained_parameters.contains(&(*span, index)),
                             has_default: parameter.has_default,
                         })
                         .collect(),
@@ -1175,20 +1268,43 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             )
         })
         .collect();
-    checker.diagnostics.extend(
-        checker
-            .contracts
-            .boundaries
-            .iter()
-            .map(|boundary| boundary.operation.diagnostic(boundary.span)),
-    );
-    SemanticAnalysis {
+    for diagnostic in composition_diagnostics {
+        if !checker.diagnostics.contains(&diagnostic) {
+            checker.diagnostics.push(diagnostic);
+        }
+    }
+    for diagnostic in &mut checker.diagnostics {
+        if let Some(origin) = checker.composition.origin(diagnostic.span) {
+            *diagnostic = diagnostic.clone().with_related(
+                origin.authored_declaration,
+                "the trait member is authored here",
+            );
+            if let Some(class) = checker.composition.class(&origin.composing_class) {
+                *diagnostic = diagnostic.clone().with_related(
+                    class.name_span,
+                    format!("the member is composed into `{}`", class.name),
+                );
+            }
+            for path in &origin.paths {
+                if let Some(site) = path.first() {
+                    *diagnostic = diagnostic
+                        .clone()
+                        .with_related(*site, "the trait is used here");
+                }
+            }
+        }
+    }
+    let mut analysis = SemanticAnalysis {
         info: SemanticInfo {
             compilation_context: checker.compilation_context,
             compilation_contexts: checker.compilation_contexts,
             source_semantic_contexts: checker.source_semantic_contexts,
             global_symbols: checker.global_symbols,
             contracts: checker.contracts,
+            composition: checker.composition,
+            class_member_surfaces,
+            trait_adaptation_surfaces,
+            composition_rename: composition_rename::CompositionRenameFacts::default(),
             test_semantics: checker.test_semantics,
             assertions: checker.assertions,
             assertion_completions: checker.assertion_completions,
@@ -1213,6 +1329,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             property_families,
             method_call_targets: checker.method_call_targets,
             static_member_targets: checker.static_member_targets,
+            static_receiver_types: checker.static_receiver_types,
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
             display_conversion_sites: checker.display_conversion_sites,
@@ -1242,7 +1359,10 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             writable_object_paths: checker.writable_object_paths,
         },
         diagnostics: checker.diagnostics,
-    }
+    };
+    analysis.info.composition_rename =
+        composition_rename::composition_rename_facts(authored_program, program, &analysis.info);
+    analysis
 }
 
 fn ambient_effect_maps_equal(
@@ -1800,9 +1920,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
             .call_targets
             .iter()
             .filter_map(|(span, target)| {
-                (span.source == function.span.source
-                    && span.start >= function.span.start
-                    && span.end <= function.span.end
+                (function.span.contains(*span)
                     && matches!(target, CallableTarget::ConstrainedMethod { .. }))
                 .then_some(*span)
             })
@@ -1835,10 +1953,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
         }
 
         for (span, pending) in &calls {
-            if span.source != function.span.source
-                || span.start < function.span.start
-                || span.end > function.span.end
-            {
+            if !function.span.contains(*span) {
                 continue;
             }
             let mut bindings = pending
@@ -2003,13 +2118,18 @@ fn expand_class_instantiations(
             })
             .unwrap_or_default();
         checker.check_specialized_class_shared_payloads(&instance, instance_span);
-        let Some(templates) = checker
+        let mut templates = checker
             .class_instantiation_templates
             .get(&instance.name)
             .cloned()
-        else {
-            continue;
-        };
+            .unwrap_or_default();
+        if let Some(parent) = checker
+            .classes
+            .get(&instance.name)
+            .and_then(|class| class.parent.clone())
+        {
+            templates.insert(parent);
+        }
         let substitutions = checker.class_type_substitutions(&instance);
         for template in templates {
             let arguments = template
@@ -2127,6 +2247,7 @@ struct Checker<'program> {
     assertion_completions: HashMap<Span, AssertionCompletionInfo>,
     classes: HashMap<String, ClassInfo>,
     contracts: contracts::ContractFacts,
+    composition: crate::trait_composition::CompositionPlan,
     interface_definitions: HashMap<String, contracts::InterfaceDefinition>,
     interface_requirements:
         HashMap<crate::types::InterfaceType<TypeId>, contracts::InterfaceRequirements>,
@@ -2149,7 +2270,8 @@ struct Checker<'program> {
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
     method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
-    static_member_targets: HashMap<Span, String>,
+    static_member_targets: HashMap<Span, ClassType<ResolvedType>>,
+    static_receiver_types: HashMap<Span, ClassType<ResolvedType>>,
     generic_call_specializations: HashMap<Span, GenericSpecialization>,
     constrained_display_calls: HashSet<Span>,
     display_conversion_sites: HashSet<Span>,
@@ -2194,7 +2316,7 @@ struct Checker<'program> {
     catch_coverage: crate::checked_effects::CatchCoverageMap,
     function_types_by_span: HashMap<Span, FunctionTypeSemanticInfo>,
     binding_resolution: BindingResolution,
-    binding_ids: HashMap<(usize, usize, BindingKind, LexicalOwner, String), BindingId>,
+    binding_ids: HashMap<(Span, BindingKind, LexicalOwner, String), BindingId>,
     next_binding_id: usize,
     current_lexical_owner: LexicalOwner,
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
@@ -2865,6 +2987,7 @@ impl<'program> Checker<'program> {
             assertion_completions: HashMap::new(),
             classes: HashMap::new(),
             contracts: contracts::ContractFacts::default(),
+            composition: crate::trait_composition::CompositionPlan::default(),
             interface_definitions: HashMap::new(),
             interface_requirements: HashMap::new(),
             enums: HashMap::new(),
@@ -2887,6 +3010,7 @@ impl<'program> Checker<'program> {
             call_targets: HashMap::new(),
             method_call_targets: HashMap::new(),
             static_member_targets: HashMap::new(),
+            static_receiver_types: HashMap::new(),
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
             display_conversion_sites: HashSet::new(),
@@ -2999,6 +3123,7 @@ impl<'program> Checker<'program> {
             }
         }
         self.materialize_override_parameter_defaults();
+        self.invalidate_erroneous_compositions();
         self.check_nominal_conformances();
         self.validate_parent_constructor_protocols();
         self.report_unresolved_generic_calls();
@@ -4396,7 +4521,11 @@ impl<'program> Checker<'program> {
                             inherited_method.declaration,
                             format!("the inherited open method is declared on `{}`", declaring_class.name),
                         )
-                        .with_help("add `override` before `function`"),
+                        .with_help(if self.composition.origin(method.declaration).is_some() {
+                            "declare a compatible class-authored override wrapper; retain the trait body with an internal alias if the wrapper needs it"
+                        } else {
+                            "add `override` before `function`"
+                        }),
                     );
                     continue;
                 }
@@ -4657,7 +4786,7 @@ impl<'program> Checker<'program> {
             };
             for parameter_index in 0..signature.params.len() {
                 let root_key = crate::const_eval::ParameterDefaultKey {
-                    function_start: root.start,
+                    function: root,
                     parameter_index,
                 };
                 let Some(value) = self.parameter_defaults.get(&root_key).cloned() else {
@@ -4665,7 +4794,7 @@ impl<'program> Checker<'program> {
                 };
                 self.parameter_defaults.insert(
                     crate::const_eval::ParameterDefaultKey {
-                        function_start: declaration.start,
+                        function: declaration,
                         parameter_index,
                     },
                     value,
@@ -4747,9 +4876,7 @@ impl<'program> Checker<'program> {
                     .call_targets
                     .iter()
                     .filter_map(|(span, target)| {
-                        (span.source == member.span.source
-                            && span.start >= member.span.start
-                            && span.end <= member.span.end
+                        (member.span.contains(*span)
                             && matches!(
                                 target,
                                 CallableTarget::Method {
@@ -6011,15 +6138,20 @@ impl<'program> Checker<'program> {
         self.type_parameter_scopes
             .push(type_parameter_scope(params));
         for param in params {
+            let source_name = if param.span.expansion.0 == 0 {
+                &param.name
+            } else {
+                crate::trait_composition::authored_type_parameter_name(&param.name)
+            };
             let valid_name =
-                param.name.len() == 1 && param.name.bytes().all(|byte| byte.is_ascii_uppercase());
+                source_name.len() == 1 && source_name.bytes().all(|byte| byte.is_ascii_uppercase());
             if !valid_name {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0530",
                         format!(
                             "type parameter `{}` must be a single Pascal capital",
-                            param.name
+                            source_name
                         ),
                         param.span,
                     )
@@ -7451,13 +7583,7 @@ impl<'program> Checker<'program> {
         kind: BindingKind,
         ownership: BindingOwnership,
     ) {
-        let key = (
-            span.start,
-            span.end,
-            kind,
-            self.current_lexical_owner,
-            name.clone(),
-        );
+        let key = (span, kind, self.current_lexical_owner, name.clone());
         let id = if let Some(id) = self.binding_ids.get(&key) {
             *id
         } else {
@@ -7565,7 +7691,7 @@ impl<'program> Checker<'program> {
         let previous_callable = self.current_callable.replace(function.span);
         let previous_owner = std::mem::replace(
             &mut self.current_lexical_owner,
-            LexicalOwner::Callable(function.span.start),
+            LexicalOwner::Callable(function.span),
         );
         self.binding_resolution
             .lexical_parents
@@ -8118,7 +8244,7 @@ impl<'program> Checker<'program> {
 
         self.parameter_defaults.insert(
             crate::const_eval::ParameterDefaultKey {
-                function_start: function.span.start,
+                function: function.span,
                 parameter_index,
             },
             value,
@@ -13575,7 +13701,11 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
-                let class_name = self.static_member_targets.get(span).unwrap_or(class_name);
+                let class_name = self
+                    .static_member_targets
+                    .get(span)
+                    .map(|class| &class.name)
+                    .unwrap_or(class_name);
                 self.const_evaluation
                     .values
                     .get(&crate::const_eval::ConstKey::Class {
@@ -14093,7 +14223,11 @@ impl<'program> Checker<'program> {
                 .copied()
                 .map(crate::const_eval::ConstValue::Enum)
                 .or_else(|| {
-                    let class_name = self.static_member_targets.get(span).unwrap_or(class_name);
+                    let class_name = self
+                        .static_member_targets
+                        .get(span)
+                        .map(|class| &class.name)
+                        .unwrap_or(class_name);
                     self.const_evaluation
                         .values
                         .get(&crate::const_eval::ConstKey::Class {
@@ -17726,7 +17860,7 @@ impl<'program> Checker<'program> {
             return None;
         }
 
-        match access.qualifier {
+        let resolved = match access.qualifier {
             StaticQualifier::Class(name)
                 if self
                     .classes
@@ -17806,7 +17940,27 @@ impl<'program> Checker<'program> {
                 );
                 None
             }
+        };
+        if let Some(name) = &resolved {
+            if self.classes.contains_key(name) {
+                if let Some(class) =
+                    self.static_access_class_type(access.qualifier, name, method_context)
+                {
+                    let receiver = ClassType::new(
+                        class.name,
+                        class
+                            .arguments
+                            .iter()
+                            .map(|argument| self.types.resolved(*argument))
+                            .collect(),
+                    );
+                    self.static_receiver_types
+                        .insert(access.qualifier_span, receiver.clone());
+                    self.static_receiver_types.insert(access.span, receiver);
+                }
+            }
         }
+        resolved
     }
 
     fn check_resolved_static_member(
@@ -17841,8 +17995,17 @@ impl<'program> Checker<'program> {
             ));
             return None;
         };
-        self.static_member_targets
-            .insert(access.span, declaring_class.name.clone());
+        self.static_member_targets.insert(
+            access.span,
+            ClassType::new(
+                declaring_class.name.clone(),
+                declaring_class
+                    .arguments
+                    .iter()
+                    .map(|argument| self.types.resolved(*argument))
+                    .collect(),
+            ),
+        );
         let member_access = match &member_info {
             StaticMemberInfo::Constant(constant) => constant.access,
             StaticMemberInfo::Property(property) => property.access,
@@ -18980,7 +19143,7 @@ impl<'program> Checker<'program> {
             } => self
                 .static_member_targets
                 .get(span)
-                .cloned()
+                .map(|class| class.name.clone())
                 .or_else(|| self.static_qualifier_class_name(qualifier, method_context))
                 .and_then(|class_name| self.classes.get(&class_name))
                 .is_none_or(|class| !class.static_properties.contains_key(member)),
@@ -21577,8 +21740,17 @@ impl<'program> Checker<'program> {
                     .static_access_class_type(qualifier, &class_name, method_context)
                     .and_then(|requested| self.lookup_static_member(&requested, member))
                     .map(|(declaring_class, member)| {
-                        self.static_member_targets
-                            .insert(*span, declaring_class.name);
+                        self.static_member_targets.insert(
+                            *span,
+                            ClassType::new(
+                                declaring_class.name,
+                                declaring_class
+                                    .arguments
+                                    .iter()
+                                    .map(|argument| self.types.resolved(*argument))
+                                    .collect(),
+                            ),
+                        );
                         match member {
                             StaticMemberInfo::Constant(constant) => constant.ty,
                             StaticMemberInfo::Property(property) => property.ty,

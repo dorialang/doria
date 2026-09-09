@@ -1,0 +1,25 @@
+interface Renderable { function render(): string; }
+trait HasTitle
+{
+    string $title = "Doria";
+    function formatPrefix(): string;
+    function render(): string { return $this->formatPrefix() . $this->title; }
+}
+trait CompactFormatting { function format(): string { return "compact"; } }
+trait VerboseFormatting { function format(): string { return "verbose"; } }
+class Report implements Renderable
+{
+    uses HasTitle, CompactFormatting, VerboseFormatting {
+        CompactFormatting::format insteadof VerboseFormatting;
+        VerboseFormatting::format as formatVerbose;
+    }
+    function formatPrefix(): string { return "Title: "; }
+}
+function renderReport(Renderable $report): string { return $report->render(); }
+function main(): void
+{
+    let $report = new Report();
+    echo renderReport($report) . "\n";
+    echo $report->format() . "\n";
+    echo $report->formatVerbose() . "\n";
+}

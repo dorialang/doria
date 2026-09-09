@@ -22,7 +22,8 @@ builds.
 | Backend codes | 7 |
 | Internal compiler codes | 10 |
 
-The 16 development-only codes are `E0493`, `E0496`, `E0509`, `E0510`,
+E0493 is retired and reserved after Stage 35 Slice 4 trait composition.
+The 15 development-only codes are `E0496`, `E0509`, `E0510`,
 `E0513`, `E0521`, `E0523`, `E0524`, `E0525`, `E0528`, `E0533`, `E0534`,
 `E0536`, `E0559`, `M1101`, and `M1102`. Development-only is a property of the emitted
 diagnostic, not permanently of the code: a stable code can cease to use the

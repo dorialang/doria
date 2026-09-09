@@ -13,6 +13,7 @@ pub struct ClosureId {
     pub source: SourceId,
     pub start: usize,
     pub end: usize,
+    pub expansion: crate::source::ExpansionId,
 }
 
 impl ClosureId {
@@ -21,6 +22,7 @@ impl ClosureId {
             source: span.source,
             start: span.start,
             end: span.end,
+            expansion: span.expansion,
         }
     }
 }
@@ -28,7 +30,7 @@ impl ClosureId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LexicalOwner {
     TopLevel,
-    Callable(usize),
+    Callable(Span),
     Closure(ClosureId),
 }
 

@@ -1055,7 +1055,10 @@ fn durable_interface_fixtures_preserve_php_execution_and_cleanup() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for path in include_str!("fixtures/native_parity_examples.txt")
         .lines()
-        .filter(|path| path.starts_with("examples/native/main_stage35_interface_"))
+        .filter(|path| {
+            path.starts_with("examples/native/main_stage35_interface_")
+                || path.starts_with("examples/native/main_stage35_trait_")
+        })
     {
         let source = std::fs::read_to_string(root.join(path)).unwrap();
         let hir = doriac::lower_source(path, source).unwrap();

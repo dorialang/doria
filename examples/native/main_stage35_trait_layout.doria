@@ -1,0 +1,37 @@
+class Part
+{
+    function __construct(string $name) { echo "init {$name};"; }
+    function __destruct() { try { echo "drop {$this->name};"; } catch (Error $error) {} }
+}
+open class StorageBase
+{
+    Part $parent = new Part("parent");
+    function __construct() {}
+}
+trait Storage
+{
+    Part $root = new Part("root");
+    writable List<int> $items = [];
+    writable function add(int $value): void { $this->items->add($value); }
+    function count(): int { return $this->items->count; }
+}
+trait Left { uses Storage; }
+trait Right { uses Storage; }
+trait Diamond { uses Left, Right; }
+class Box extends StorageBase
+{
+    Part $first = new Part("first");
+    uses Diamond { Diamond::count as size; }
+    Part $last = new Part("last");
+    function __construct(take Part $promoted) { parent::__construct(); }
+}
+function main(): void
+{
+    {
+        let writable $a = new Box(new Part("a"));
+        let writable $b = new Box(new Part("b"));
+        $a->add(7);
+        echo "counts {$a->size()} {$b->count()};";
+    }
+    echo "\n";
+}

@@ -60,7 +60,7 @@ foreach ($paths as $key => $path) {
 $require($paths['decision'], $files['decision'], [
     '# Decision 0134:',
     '**Status:** Accepted',
-    '**Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, And 3 Complete; Slice 4 Next',
+    '**Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, 3, And 4 Complete; Slice 5 Next',
     'interface Equatable<T>',
     'function equals(T $other): bool;',
     'function hash(): uint64;',
@@ -87,12 +87,12 @@ $require($paths['decision'], $files['decision'], [
 ]);
 
 $require($paths['plan'], $files['plan'], [
-    'Stage 35 — Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next',
+    'Stage 35 — Interfaces And Traits — In Progress; Slices 1, 2, 3, And 4 Complete; Slice 5 Next',
     'Slice 1 — Complete: Grammar, Graphs, And Conformance',
     'Slice 2 — Complete: Interface Runtime And Ownership',
     'Slice 3 — Complete: Core Contracts And Public Iteration',
-    'Slice 4 — Next: Trait Composition',
-    'Slice 5 — Scheduled: Cross-Repository Closure',
+    'Slice 4 — Complete: Trait Composition',
+    'Slice 5 — Next: Cross-Repository Closure',
 ]);
 
 $require($paths['pipeline'], $files['pipeline'], [
@@ -102,8 +102,8 @@ $require($paths['pipeline'], $files['pipeline'], [
     'Stage 35 Slice 1 Grammar, Graphs, And Conformance — Complete',
     'Stage 35 Slice 2 Interface Runtime And Ownership — Complete',
     'Stage 35 Slice 3 Core Contracts And Public Iteration — Complete',
-    'Stage 35 Slice 4 Trait Composition — Next',
-    'Stage 35 Slice 5 Cross-Repository Closure — Scheduled',
+    'Stage 35 Slice 4 Trait Composition — Complete',
+    'Stage 35 Slice 5 Cross-Repository Closure — Next',
     'Stage 35 — In Progress',
 ]);
 
@@ -159,7 +159,7 @@ $staleStatus = [
 ];
 
 $require('crates/doriac/src/semantics/contracts.rs', $read('crates/doriac/src/semantics/contracts.rs'), [
-    'ConformanceStatus', 'DeferredComposition', 'ContractMismatch',
+    'ConformanceStatus', 'ContractMismatch', 'invalidate_erroneous_compositions',
 ]);
 $require('crates/doriac/src/ast.rs', $read('crates/doriac/src/ast.rs'), [
     'enum FunctionBody', 'Requirement', 'TraitAdaptation',
@@ -167,10 +167,23 @@ $require('crates/doriac/src/ast.rs', $read('crates/doriac/src/ast.rs'), [
 $require('crates/doriac/tests/stage35_contract_tests.rs', $read('crates/doriac/tests/stage35_contract_tests.rs'), [
     'every_callable_substitution_axis_is_retained_in_conformance_facts',
     'interface_value_matrix_checks_and_lowers_through_public_entrypoints',
-    'unused_traits_are_compile_time_declarations_and_composition_defers_conformance',
+    'unused_traits_are_compile_time_declarations_and_composition_checks_conformance',
 ]);
 
-$forbid('crates/doriac/src/semantics/contracts.rs', $read('crates/doriac/src/semantics/contracts.rs'), ['InterfaceValue', 'E0758']);
+$forbid('crates/doriac/src/semantics/contracts.rs', $read('crates/doriac/src/semantics/contracts.rs'), ['InterfaceValue', 'E0758', 'E0493', 'DeferredComposition']);
+$require('crates/doriac/src/trait_composition.rs', $read('crates/doriac/src/trait_composition.rs'), [
+    'EffectiveMemberOrigin', 'MethodObligation', 'CompositionPlan', 'fn deduplicate',
+]);
+$require('crates/doriac/src/trait_composition/validation.rs', $read('crates/doriac/src/trait_composition/validation.rs'), [
+    'malformed_class_plans_do_not_cross_executable_lowering',
+    'duplicate physical trait property', 'unsatisfied trait method obligation',
+]);
+$require('crates/doriac/tests/stage35_trait_tests.rs', $read('crates/doriac/tests/stage35_trait_tests.rs'), [
+    'durable_trait_fixtures_preserve_interpreter_results',
+    'two_composers_and_aliases_keep_independent_expression_and_closure_identities',
+    'invalid_composed_bodies_hierarchy_and_initialization_revoke_conformance',
+    'trait_aliases_preserve_checked_effects_and_retained_cursor_loans',
+]);
 $require('crates/doriac/tests/stage35_runtime_tests.rs', $read('crates/doriac/tests/stage35_runtime_tests.rs'), [
     'interface_erasure_keeps_headerless_layout_and_constrained_calls_direct',
     'durable_interface_fixtures_preserve_php_execution_and_cleanup',

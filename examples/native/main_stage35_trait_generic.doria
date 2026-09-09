@@ -1,0 +1,24 @@
+trait Identity<T>
+{
+    function identity(take T $value): T { return $value; }
+    function choose<U>(T $left, take U $right): U
+    {
+        let $select = fn(take U $value) => $value;
+        return $select($right);
+    }
+}
+trait Nested<T>
+{
+    uses Identity<List<T>>;
+    function size(take List<T> $values): int { return $this->identity($values)->count; }
+}
+class Numbers { uses Nested<int>; }
+class Words { uses Nested<string>; }
+class Choice<U> { uses Identity<U> { Identity<U>::choose as select; } }
+function main(): void
+{
+    echo (new Numbers())->size([1, 2]) . "\n";
+    echo (new Words())->size(["a", "b", "c"]) . "\n";
+    echo (new Choice<int>())->select(right: true, left: 7) . "\n";
+    echo (new Choice<bool>())->choose(false, 42) . "\n";
+}

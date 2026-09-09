@@ -505,6 +505,11 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
             append_type_params(surface, &value.type_params);
             for member in &value.members {
                 append_member_signature(surface, member, source_text);
+                if let ClassMember::Method(method) = member {
+                    if let Some(body) = method.body.as_block() {
+                        surface.push_str(&source_text[body.span.start..body.span.end]);
+                    }
+                }
             }
         }
         Item::Function(function) => {

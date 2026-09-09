@@ -423,6 +423,20 @@ impl Plan {
         self.class_symbols.get(&class).map(String::as_str)
     }
 
+    pub fn class_symbol_for_static_member(
+        &self,
+        span: Span,
+        substitutions: &HashMap<String, ResolvedType>,
+    ) -> Option<&str> {
+        let class = self.semantic.static_member_targets.get(&span)?;
+        let ResolvedType::Class(class) =
+            substitute_resolved_type(&ResolvedType::Class(class.clone()), substitutions)
+        else {
+            unreachable!("a checked static owner remains a class");
+        };
+        self.class_symbols.get(&class).map(String::as_str)
+    }
+
     pub fn resolve_type(
         &self,
         ty: &TypeRef,

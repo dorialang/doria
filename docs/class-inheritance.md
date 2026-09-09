@@ -184,5 +184,10 @@ first two slices execute checked nominal conformance and interface runtime
 views. An open-parent-to-interface conversion selects the exact dynamic class's
 checked vtable without changing the payload or acquiring another owner.
 Ancestor and sibling interface narrowing preserve that identity, destruction,
-and borrow provenance. Core operations/public iteration and trait composition
-remain separate later slices; they are not activated by runtime erasure.
+and borrow provenance. Slice 3 implements core operations and public iteration;
+Slice 4 implements trait composition before ordinary hierarchy validation.
+Trait methods cannot override a parent silently: an inherited open method needs
+a compatible class-authored override wrapper, with an internal trait alias when
+the wrapper needs that body. Closed inherited members still reject collisions.
+Trait fields occupy their lexical expansion positions after the parent prefix
+and before actual constructor promotion. Slice 5 owns cross-repository closure.

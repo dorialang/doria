@@ -1,0 +1,1 @@
+init a;init parent;init first;init root;init last;init b;init parent;init first;init root;init last;counts 1 0;drop b;drop last;drop root;drop first;drop parent;drop a;drop last;drop root;drop first;drop parent;

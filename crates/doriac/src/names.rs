@@ -1247,11 +1247,7 @@ impl<'a> Resolver<'a> {
         self.authored
             .qualified_names
             .iter()
-            .filter(|name| {
-                name.canonical() == source_name
-                    && name.span.start >= within.start
-                    && name.span.end <= within.end
-            })
+            .filter(|name| name.canonical() == source_name && within.contains(name.span))
             .min_by_key(|name| name.span.start)
             .map_or(within, |name| name.span)
     }

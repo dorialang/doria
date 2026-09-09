@@ -90,8 +90,10 @@ deliberate erasure uses the existing interface slots. Generated calls preserve
 the full automatic-effect profile and clean partial owned results on failure.
 Iterator carriers can retain a readonly source through a promoted `borrow`
 constructor parameter; neither the carrier nor an element borrow can outlive
-that source or its access lease. Trait composition remains Slice 4 (E0493),
-and primitive interface erasure remains rejected (E0760). E0759 is reserved.
+that source or its access lease. Slice 4 supplies these same contracts through
+checked trait composition, including selected aliases, composer-bound `self`,
+and retained iterator-source provenance. Primitive interface erasure remains
+rejected (E0760); E0493, E0758, and E0759 are reserved.
 
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 

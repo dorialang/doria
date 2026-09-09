@@ -61,10 +61,7 @@ pub(crate) fn synthetic_constructors(program: &hir::Program) -> Vec<(String, hir
                 _ => None,
             }) {
                 for (span, effects) in &program.semantic_info.checked_effect_sites {
-                    if span.source == initializer.span().source
-                        && span.start >= initializer.span().start
-                        && span.end <= initializer.span().end
-                    {
+                    if initializer.span().contains(*span) {
                         for effect in effects {
                             if !checked_effects.contains(effect) {
                                 checked_effects.push(effect.clone());
@@ -359,10 +356,7 @@ pub(crate) fn collect_callable_instances(
                     continue;
                 };
                 for (span, specialization) in &calls {
-                    if span.source != initializer.span().source
-                        || span.start < initializer.span().start
-                        || span.end > initializer.span().end
-                    {
+                    if !initializer.span().contains(**span) {
                         continue;
                     }
                     for target in specialize_callable_instances(
@@ -395,9 +389,7 @@ pub(crate) fn collect_callable_instances(
         let callable = declarations[instance.declaration];
         let substitutions = type_substitutions(callable, &instance.arguments)?;
         for (span, specialization) in &calls {
-            let in_function = span.source == callable.function.span.source
-                && span.start >= callable.function.span.start
-                && span.end <= callable.function.span.end;
+            let in_function = callable.function.span.contains(**span);
             if !in_function {
                 continue;
             }

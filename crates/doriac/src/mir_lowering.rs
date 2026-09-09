@@ -1342,10 +1342,7 @@ fn lower_program_impl(
             &substitutions,
         );
         for (span, ty) in &program.semantic_info.expression_types {
-            if span.source == function.span.source
-                && span.start >= function.span.start
-                && span.end <= function.span.end
-            {
+            if function.span.contains(*span) {
                 let specialized = substitute_resolved_type(ty, &substitutions);
                 let _ = intern_resolved_collection_types(
                     &specialized,
@@ -1355,10 +1352,7 @@ fn lower_program_impl(
             }
         }
         for (span, ty) in &program.semantic_info.type_test_types {
-            if span.source == function.span.source
-                && span.start >= function.span.start
-                && span.end <= function.span.end
-            {
+            if function.span.contains(*span) {
                 let specialized = substitute_resolved_type(ty, &substitutions);
                 let _ = intern_resolved_collection_types(
                     &specialized,
@@ -1955,9 +1949,7 @@ fn lower_program_impl(
 }
 
 fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String> {
-    let contains = |outer: Span| {
-        origin.source == outer.source && origin.start >= outer.start && origin.end <= outer.end
-    };
+    let contains = |outer: Span| outer.contains(origin);
     program
         .items
         .iter()
@@ -2593,7 +2585,7 @@ fn collect_function_signature(
         let default = semantic_info
             .parameter_defaults
             .get(&crate::const_eval::ParameterDefaultKey {
-                function_start: function.span.start,
+                function: function.span,
                 parameter_index,
             })
             .cloned();
@@ -8573,6 +8565,7 @@ impl<'semantic> LoweringContext<'semantic> {
                     .semantic_info
                     .static_member_targets
                     .get(span)
+                    .map(|class| &class.name)
                     .unwrap_or(class_name)
                     .clone(),
                 name: member.clone(),
@@ -8613,7 +8606,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .semantic_info
             .static_member_targets
             .get(&span)
-            .map(String::as_str)
+            .map(|class| class.name.as_str())
             .unwrap_or(class_name);
         let class = self
             .class_id_for_static_access(class_name)

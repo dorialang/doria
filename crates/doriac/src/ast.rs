@@ -2,9 +2,10 @@ use crate::lexer::StringQuoteKind;
 use crate::source::{QualifiedNameRef, Span};
 use crate::types::TypeRef;
 
+pub mod transform;
 pub mod visit;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub namespace: Option<NamespaceDecl>,
     pub imports: Vec<UseDecl>,
@@ -21,7 +22,7 @@ pub struct Program {
     pub items: Vec<Item>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeGroup {
     pub open_span: Span,
     pub attributes: Vec<AttributeRef>,
@@ -30,7 +31,7 @@ pub struct AttributeGroup {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeRef {
     pub name: QualifiedNameRef,
     /// Canonical identity selected by name resolution. Authored segments stay
@@ -40,7 +41,7 @@ pub struct AttributeRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeArgumentList {
     pub open_paren_span: Span,
     pub arguments: Vec<Argument>,
@@ -49,13 +50,13 @@ pub struct AttributeArgumentList {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeAttachment {
     pub groups: Vec<AttributeGroup>,
     pub target: AttributeTargetSyntax,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeTargetSyntax {
     pub kind: AttributeTargetKind,
     pub target_span: Span,
@@ -119,7 +120,7 @@ impl AttributeTargetRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceDecl {
     pub keyword_span: Span,
     pub name: QualifiedNameRef,
@@ -127,7 +128,7 @@ pub struct NamespaceDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UseDecl {
     pub keyword_span: Span,
     pub prefix: Option<QualifiedNameRef>,
@@ -140,7 +141,7 @@ pub struct UseDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UseEntry {
     pub target: QualifiedNameRef,
     pub as_span: Option<Span>,
@@ -154,7 +155,7 @@ pub struct NameRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncludeDecl {
     pub keyword_span: Span,
     pub raw: String,
@@ -165,7 +166,7 @@ pub struct IncludeDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Item {
     Class(ClassDecl),
@@ -177,7 +178,7 @@ pub enum Item {
     Statement(Stmt),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
@@ -189,7 +190,7 @@ pub struct EnumDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumCaseDecl {
     pub name: String,
     pub name_span: Span,
@@ -198,14 +199,14 @@ pub struct EnumCaseDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumPayloadField {
     pub ty: TypeRef,
     pub name: String,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
@@ -217,7 +218,7 @@ pub struct TraitDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
@@ -230,7 +231,7 @@ pub struct InterfaceDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeDeclarationSyntax {
     pub keyword_span: Span,
     pub type_parameters: Option<DelimitedListSpans>,
@@ -241,7 +242,7 @@ pub struct TypeDeclarationSyntax {
     pub close_brace_span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelimitedListSpans {
     pub open_span: Span,
     pub comma_spans: Vec<Span>,
@@ -262,7 +263,7 @@ impl TypeDeclarationSyntax {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
@@ -281,7 +282,7 @@ pub struct ClassDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassMember {
     Property(PropertyDecl),
     Method(FunctionDecl),
@@ -289,7 +290,7 @@ pub enum ClassMember {
     Uses(TraitUse),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitUse {
     pub keyword_span: Span,
     pub traits: Vec<TypeRef>,
@@ -302,7 +303,7 @@ pub struct TraitUse {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitAdaptation {
     pub origin: TypeRef,
     pub origin_span: Span,
@@ -313,7 +314,7 @@ pub struct TraitAdaptation {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraitAdaptationKind {
     InsteadOf {
         keyword_span: Span,
@@ -334,18 +335,19 @@ pub enum MemberAccess {
     Internal,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyDecl {
     pub access: MemberAccess,
     pub is_static: bool,
     pub writable: bool,
     pub ty: TypeRef,
     pub name: String,
+    pub name_span: Span,
     pub initializer: Option<Expr>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
@@ -356,7 +358,7 @@ pub struct ConstDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
@@ -380,7 +382,7 @@ pub struct FunctionDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionBody {
     Block(Block),
     Requirement { semicolon_span: Span },
@@ -413,7 +415,7 @@ impl FunctionBody {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionSyntax {
     pub keyword_span: Span,
     pub type_parameters: Option<DelimitedListSpans>,
@@ -438,14 +440,14 @@ impl FunctionSyntax {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThrowsClause {
     pub keyword_span: Span,
     pub entries: Vec<ThrowsEntry>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThrowsEntry {
     pub ty: TypeRef,
     pub span: Span,
@@ -459,7 +461,7 @@ pub struct TypeParamDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     pub constructor_role: ConstructorParameterRole,
     pub role_and_mode_prefix_span: Span,
@@ -519,7 +521,7 @@ impl ConstructorParameterRole {
 /// The name written before a named call argument (`name: value`), with the
 /// span of the identifier for diagnostics. `None` on an `Argument` means the
 /// argument was supplied positionally.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgumentName {
     pub text: String,
     pub span: Span,
@@ -528,20 +530,20 @@ pub struct ArgumentName {
 /// A single call-site argument. Arguments are stored in source (written) order
 /// regardless of the parameter each named argument binds to; name-resolution
 /// binding (decision 0098) maps them onto parameters in a later step.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argument {
     pub name: Option<ArgumentName>,
     pub value: Expr,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub statements: Vec<Stmt>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Block(Block),
     VarDecl(VarDecl),
@@ -561,7 +563,7 @@ pub enum Stmt {
     Expr { expr: Expr, span: Span },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThrowStmt {
     pub keyword_span: Span,
     pub expr: Expr,
@@ -569,7 +571,7 @@ pub struct ThrowStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TryStmt {
     pub keyword_span: Span,
     pub body: Block,
@@ -578,7 +580,7 @@ pub struct TryStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchClause {
     pub keyword_span: Span,
     pub ty: TypeRef,
@@ -588,20 +590,20 @@ pub struct CatchClause {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchBinding {
     pub name: String,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TryFinally {
     pub keyword_span: Span,
     pub body: Block,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarDecl {
     pub writable: bool,
     pub ty: Option<TypeRef>,
@@ -613,13 +615,13 @@ pub struct VarDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarBinding {
     pub name: String,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub target: Expr,
     pub op: AssignOp,
@@ -627,7 +629,7 @@ pub struct Assignment {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfStmt {
     pub given: Option<GivenPrelude>,
     pub condition: Expr,
@@ -637,7 +639,7 @@ pub struct IfStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElseBranch {
     If(Box<IfStmt>),
     Block(Block),
@@ -652,7 +654,7 @@ impl ElseBranch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhileStmt {
     pub given: Option<GivenPrelude>,
     pub condition: Expr,
@@ -661,7 +663,7 @@ pub struct WhileStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoWhileStmt {
     pub body: Block,
     pub condition: Expr,
@@ -670,20 +672,20 @@ pub struct DoWhileStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GivenPrelude {
     pub block: Block,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlFlowFinally {
     pub keyword_span: Span,
     pub block: Block,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForStmt {
     pub initializer: Option<ForInitializer>,
     pub condition: Option<Expr>,
@@ -692,13 +694,13 @@ pub struct ForStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForInitializer {
     VarDecl(VarDecl),
     Assignment(Assignment),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForIncrement {
     Increment(Box<IncrementStmt>),
     Assignment(Box<Assignment>),
@@ -719,7 +721,7 @@ pub enum AssignOp {
     BitwiseXorAssign,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementStmt {
     pub target: Expr,
     pub op: IncrementOp,
@@ -739,7 +741,7 @@ pub enum IncrementPosition {
     Post,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeachStmt {
     pub iterable: Expr,
     pub first_binding: Option<ForeachBinding>,
@@ -748,7 +750,7 @@ pub struct ForeachStmt {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeachBinding {
     pub writable: bool,
     pub writable_span: Option<Span>,
@@ -759,7 +761,7 @@ pub struct ForeachBinding {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureExpression {
     pub form: ClosureForm,
     pub keyword_span: Span,
@@ -777,7 +779,7 @@ pub enum ClosureForm {
     AnonymousBlock,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureParameter {
     pub take: bool,
     pub take_span: Option<Span>,
@@ -790,7 +792,7 @@ pub struct ClosureParameter {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureReturnType {
     pub colon_span: Span,
     pub ty: TypeRef,
@@ -798,7 +800,7 @@ pub struct ClosureReturnType {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureCaptureClause {
     pub keyword_span: Span,
     pub open_span: Span,
@@ -807,7 +809,7 @@ pub struct ClosureCaptureClause {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureCapture {
     pub mode: ClosureCaptureMode,
     pub modifier_span: Option<Span>,
@@ -823,7 +825,7 @@ pub enum ClosureCaptureMode {
     Take,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClosureBody {
     Expression {
         arrow_span: Span,
@@ -832,7 +834,7 @@ pub enum ClosureBody {
     Block(Block),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     Variable {
         name: String,
@@ -976,7 +978,7 @@ pub enum Expr {
     Closure(Box<ClosureExpression>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhenExpression {
     pub given: Option<GivenPrelude>,
     pub result_type: Option<TypeRef>,
@@ -985,7 +987,7 @@ pub struct WhenExpression {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhenBranch {
     pub condition: Option<Expr>,
     pub block: Block,
@@ -1004,7 +1006,7 @@ pub enum MatchMode {
     Consumed { take_span: Span },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
     pub guard: Option<MatchGuard>,
@@ -1012,14 +1014,14 @@ pub struct MatchArm {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchGuard {
     pub condition: Expr,
     pub keyword_span: Span,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchPattern {
     Default {
         span: Span,
@@ -1042,7 +1044,7 @@ pub enum MatchPattern {
     Expression(Expr),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchBinding {
     pub name: String,
     pub span: Span,
@@ -1056,13 +1058,13 @@ pub enum StaticQualifier {
     InvalidStatic,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterpolatedStringPart {
     Text { value: String, span: Span },
     Expr(Expr),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayElement {
     pub key: Option<Expr>,
     pub value: Expr,

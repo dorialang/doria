@@ -1231,6 +1231,7 @@ impl Parser {
             writable: writable_span.is_some(),
             ty,
             name,
+            name_span,
             initializer,
             span: self.span(start.min(name_span.start), end),
         });

@@ -2610,7 +2610,7 @@ fn validate_function(
             let default = semantic_info
                 .parameter_defaults
                 .get(&ParameterDefaultKey {
-                    function_start: function.span.start,
+                    function: function.span,
                     parameter_index,
                 })
                 .ok_or_else(|| {
@@ -3837,6 +3837,13 @@ impl PhpNameScopes {
             .contains(&(class_name.to_string(), member.to_string()))
     }
 
+    fn static_member_class_symbol(&self, class_name: &str, span: Span) -> String {
+        self.specialization
+            .class_symbol_for_static_member(span, &self.substitutions)
+            .map(str::to_string)
+            .unwrap_or_else(|| php_symbol_name(class_name))
+    }
+
     fn is_payload_unit_case(&self, enum_name: &str, case_name: &str) -> bool {
         self.symbols
             .payload_unit_cases
@@ -3909,9 +3916,9 @@ impl PhpNameScopes {
             .values()
             .find(|declaration| {
                 declaration.name == name
-                    && declaration.span.is_some_and(|declared| {
-                        declared.start >= span.start && declared.end <= span.end
-                    })
+                    && declaration
+                        .span
+                        .is_some_and(|declared| span.contains(declared))
             })
             .map(|declaration| declaration.id)
     }
@@ -5210,7 +5217,7 @@ fn emit_function_instance(
                 emit_param(
                     param,
                     semantic_info.parameter_defaults.get(&ParameterDefaultKey {
-                        function_start: function.span.start,
+                        function: function.span,
                         parameter_index,
                     }),
                     &semantic_info.const_evaluation,
@@ -5276,7 +5283,7 @@ fn emit_function_instance(
             for (parameter_index, param) in function.params.iter().enumerate() {
                 let Some(default @ ConstValue::PayloadEnum(_)) =
                     semantic_info.parameter_defaults.get(&ParameterDefaultKey {
-                        function_start: function.span.start,
+                        function: function.span,
                         parameter_index,
                     })
                 else {
@@ -6636,7 +6643,9 @@ fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bo
         ResolvedType::Interface(_)
         | ResolvedType::InterfaceSelf(_)
         | ResolvedType::SharedHandle(_, _) => true,
-        ResolvedType::TraitSelf(_) => unreachable!("trait execution is pending Stage 35 Slice 4"),
+        ResolvedType::TraitSelf(_) => {
+            unreachable!("unsubstituted trait self reached executable PHP lowering")
+        }
         ResolvedType::Mixed
         | ResolvedType::Error
         | ResolvedType::Function(_)
@@ -7940,9 +7949,14 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             )
         }
         Expr::StaticMember {
-            class_name, member, ..
+            class_name,
+            member,
+            span,
         } if scopes.is_static_property(class_name, member) => {
-            format!("{}::${member}", php_symbol_name(class_name))
+            format!(
+                "{}::${member}",
+                scopes.static_member_class_symbol(class_name, *span)
+            )
         }
         Expr::StaticMember {
             class_name, member, ..
@@ -7954,13 +7968,23 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             )
         }
         Expr::StaticMember {
-            class_name, member, ..
+            class_name,
+            member,
+            span,
         } if scopes.is_payload_class_constant(class_name, member) => {
-            format!("{}::__doriaConst{member}()", php_symbol_name(class_name))
+            format!(
+                "{}::__doriaConst{member}()",
+                scopes.static_member_class_symbol(class_name, *span)
+            )
         }
         Expr::StaticMember {
-            class_name, member, ..
-        } => format!("{}::{member}", php_symbol_name(class_name)),
+            class_name,
+            member,
+            span,
+        } => format!(
+            "{}::{member}",
+            scopes.static_member_class_symbol(class_name, *span)
+        ),
         Expr::New {
             class_type,
             args,
@@ -8609,7 +8633,9 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
             list(ty.arguments.iter().map(resolved_type_identity))
         ),
         ResolvedType::InterfaceSelf(name) => format!("self:{}:{name}", name.len()),
-        ResolvedType::TraitSelf(_) => unreachable!("trait execution is pending Stage 35 Slice 4"),
+        ResolvedType::TraitSelf(_) => {
+            unreachable!("unsubstituted trait self reached executable PHP lowering")
+        }
         ResolvedType::Function(function) => {
             let invocation = match function.invocation_mode {
                 crate::types::FunctionInvocationMode::Readonly => "readonly",
@@ -9069,7 +9095,9 @@ fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
     match ty {
         ResolvedType::Interface(ty) => interface::declaration_name(&ty.name),
         ResolvedType::InterfaceSelf(name) => interface::declaration_name(name),
-        ResolvedType::TraitSelf(_) => unreachable!("trait execution is pending Stage 35 Slice 4"),
+        ResolvedType::TraitSelf(_) => {
+            unreachable!("unsubstituted trait self reached executable PHP lowering")
+        }
         ResolvedType::Void => "void".to_string(),
         ResolvedType::Integer(_) => "int".to_string(),
         ResolvedType::Float(_) => "float".to_string(),

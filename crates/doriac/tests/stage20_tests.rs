@@ -1177,17 +1177,9 @@ trait UsesLimit
     ));
     doriac::check_source("trait.doria", trait_source)
         .expect("unused trait declarations are supported by Stage 35 Slice 1");
-    let trait_diagnostics = diagnostics(&format!(
-        "{trait_source} class Limited {{ uses UsesLimit; const int MAX_DEPTH = 3; }}"
-    ));
-    assert_eq!(
-        trait_diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "P0001")
-            .count(),
-        0
-    );
-    assert!(trait_diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0493" && diagnostic.message.contains("Stage 35 Slice 4")
-    }));
+    doriac::check_source(
+        "trait.doria",
+        format!("{trait_source} class Limited {{ uses UsesLimit; const int MAX_DEPTH = 3; }}"),
+    )
+    .expect("composed lexical self resolves to the class");
 }

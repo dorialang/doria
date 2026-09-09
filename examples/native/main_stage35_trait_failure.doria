@@ -1,0 +1,49 @@
+class Failure implements Error { string $message = "failure"; }
+class OtherFailure implements Error { string $message = "other failure"; }
+trait Raises<E implements Error>
+{
+    function raise(take E $error): void throws E { throw $error; }
+}
+class First { uses Raises<Failure> { Raises<Failure>::raise as again; } }
+class Second { uses Raises<OtherFailure>; }
+class Part
+{
+    function __construct(string $name) {}
+    function __destruct() { try { echo "drop {$this->name};"; } catch (Error $error) {} }
+}
+function fail(): Part throws Failure { throw new Failure(); }
+trait Fails
+{
+    Part $first = new Part("trait");
+    Part $second = fail();
+    function check(): void throws Failure { throw new Failure(); }
+}
+class Broken
+{
+    Part $before = new Part("class");
+    uses Fails;
+    function __construct(parameter take Part $input) throws Failure {}
+    function __destruct() { try { echo "wrong;"; } catch (Error $error) {} }
+}
+trait Checked
+{
+    function check(): void throws Failure;
+    function run(): void throws Failure { $this->check(); }
+}
+class Worker
+{
+    uses Checked;
+    function check(): void throws Failure { throw new Failure(); }
+}
+function main(): void
+{
+    try { let $broken = new Broken(new Part("input")); }
+    catch (Failure $error) { echo "caught constructor;"; }
+    try { (new Worker())->run(); }
+    catch (Failure $error) { echo "caught method;"; }
+    try { (new First())->again(new Failure()); }
+    catch (Failure $error) { echo "first;"; }
+    try { (new Second())->raise(new OtherFailure()); }
+    catch (OtherFailure $error) { echo "second;"; }
+    echo "\n";
+}
