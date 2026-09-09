@@ -932,6 +932,15 @@ operation/effect lookups. Static targets retain their checked owner arguments;
 parent types enter the existing specialization worklist; effective span lookups
 include source and expansion identity.
 
+Linux leak validation exposed an ordinary checked-call lowering gap: owned
+temporary method receivers were left inline without a cleanup owner. Both
+composed and class-authored calls now materialize those receivers in the
+existing statement-owned local scope before arguments, preserving cleanup on
+success, argument failure, method failure, and borrowed chains. Borrowed receiver
+expressions also evaluate before arguments without acquiring ownership.
+Shared-payload receivers retain a temporary shared handle, never ownership of
+the projected class payload.
+
 Official tooling must pin the delivered compiler revision and consume its
 composition facts. The separately owned website needs synchronization in both
 `doria-website/src/Docs/Guide/Content/<release>/` and

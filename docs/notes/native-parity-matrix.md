@@ -46,12 +46,13 @@ two-word carrier/element widths, static vtables, direct constrained calls,
 constant-slot erased calls, allocation-free conversion, and entry-only scratch.
 Malformed-MIR tests independently reject invalid conformance/slot/ABI plans,
 unproved refinements, expired roots, and escaped access leases. Slice 3 adds
-Cloneable widening and user-defined iteration loans. Slice 4 adds the seven
+Cloneable widening and user-defined iteration loans. Slice 4 adds the eight
 `main_stage35_trait_*` fixtures: requirement/alias/interface smoke, generic
 nesting with independent closures, diamond/interleaved layout and reverse drop,
 per-composer generic statics and generic parent controls, checked constructor
 and method failure with distinct error specializations,
-inheritance/core contracts, and retained iterator sources. Their exact sidecars
+inheritance/core contracts, retained iterator sources, and owned method receivers
+across successful calls, checked failures, and borrowed chains. Their exact sidecars
 are shared by interpreter/Cranelift/LLVM differential runs and PHP lint/execution.
 Malformed class-plan tests independently reject missing origins, wrong
 specializations/composers, aliases, requirements, and physical property order.

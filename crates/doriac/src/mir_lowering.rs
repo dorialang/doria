@@ -12814,12 +12814,60 @@ fn lower_instance_method_call(
             ),
         )]);
     }
+    let receiver = lower_class_expression(object, class, false, context)?;
+    let receiver = match receiver {
+        mir::ClassExpression::SharedPayload { class, reference }
+            if reference.owned_temporary().is_some() =>
+        {
+            let payload = mir::SharedPayload::Class(class);
+            let local = context.declare_owned_temp(mir::Type::SharedReference(payload));
+            context.push_statement(mir::Statement::AssignLocal {
+                target: local,
+                value: mir::Rvalue::SharedReference(*reference),
+            });
+            mir::ClassExpression::SharedPayload {
+                class,
+                reference: Box::new(mir::SharedReferenceExpression::Local {
+                    payload,
+                    local,
+                    transfer: false,
+                }),
+            }
+        }
+        receiver => receiver,
+    };
+    // Evaluate receivers before arguments, including borrowed call results.
+    // Checked calls also need an explicit owner for cleanup on either exit.
+    let receiver = if !matches!(
+        receiver,
+        mir::ClassExpression::Local { .. }
+            | mir::ClassExpression::NullableLocalAssumeNonNull { .. }
+    ) {
+        let writable = context
+            .semantic_info
+            .writable_object_paths
+            .contains(&object.span());
+        let local = if !receiver.borrows_class_value() {
+            context.declare_owned_temp(mir::Type::Class(class))
+        } else {
+            context.declare_borrowed_temp(mir::Type::Class(class), writable)
+        };
+        context.locals[local.0].writable = writable;
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::Class(receiver),
+        });
+        mir::ClassExpression::Local {
+            class,
+            local,
+            transfer: false,
+        }
+    } else {
+        receiver
+    };
     let mut lowered =
         lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
-    lowered.insert(
-        0,
-        mir::Rvalue::Class(lower_class_expression(object, class, false, context)?),
-    );
+    lowered.insert(0, mir::Rvalue::Class(receiver));
     if context.lifecycle_phase && matches!(unparenthesized_place(object), hir::Expr::This { .. }) {
         if let Some(direct) = signature.direct_id {
             signature.id = direct;

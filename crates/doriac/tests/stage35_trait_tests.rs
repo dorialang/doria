@@ -46,6 +46,42 @@ fn durable_trait_fixtures_preserve_interpreter_results() {
 }
 
 #[test]
+fn checked_method_receivers_have_statement_owners() {
+    use doriac::mir::{ClassExpression, Rvalue, Statement, Terminator};
+    let program = doriac::lower_source_to_mir(
+        "receivers.doria",
+        include_str!("../../../examples/native/main_stage35_trait_generic.doria"),
+    )
+    .unwrap();
+    let main = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .unwrap();
+    let mut receivers = 0;
+    for block in &main.blocks {
+        if let Terminator::CheckedCall { args, .. } = &block.terminator {
+            if let Some(Rvalue::Class(receiver)) = args.first() {
+                let ClassExpression::Local {
+                    local,
+                    transfer: false,
+                    ..
+                } = receiver
+                else {
+                    panic!("checked receiver must borrow a tracked owner: {receiver:?}");
+                };
+                assert!(main.locals[local.0].owned);
+                assert!(main.blocks.iter().flat_map(|block| &block.statements).any(|statement| {
+                    matches!(statement, Statement::DropClass { local: dropped, .. } if dropped == local)
+                }));
+                receivers += 1;
+            }
+        }
+    }
+    assert_eq!(receivers, 2);
+}
+
+#[test]
 fn selected_and_aliased_methods_satisfy_requirements_and_interfaces() {
     assert_eq!(
         run(r#"

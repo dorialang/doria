@@ -361,6 +361,7 @@ examples/native/main_stage35_trait_smoke.doria
 examples/native/main_stage35_trait_generic.doria
 examples/native/main_stage35_trait_layout.doria
 examples/native/main_stage35_trait_statics.doria
+examples/native/main_stage35_trait_temporary_receivers.doria
 examples/native/main_stage35_trait_failure.doria
 examples/native/main_stage35_trait_inheritance_core.doria
 examples/native/main_stage35_trait_iteration.doria

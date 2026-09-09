@@ -1,5 +1,7 @@
 class Node
 {
+    static writable bool $observed = false;
+
     function __construct(string $name)
     {
     }
@@ -16,6 +18,23 @@ class Node
     {
         return $this->name;
     }
+
+    function inspect(): self
+    {
+        self::observed = true;
+        return $this;
+    }
+
+    function checked(int $value): int throws Doria\Std\Io\IoError
+    {
+        return $value;
+    }
+}
+
+function observedArgument(): int throws Doria\Std\Io\IoError
+{
+    if (Node::observed) { return 2; }
+    return 99;
 }
 
 function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError
@@ -72,6 +91,7 @@ function main(): void
     let $chained = makeStrong("chained")->share();
     inspect($chained);
     echo makeStrong("payload")->referencedValue->label() . "\n";
+    echo makeStrong("checked payload")->referencedValue->inspect()->checked(observedArgument()) . "\n";
 
     let $root = shared new Node("root");
     let $weak = $root->createWeakReference();
