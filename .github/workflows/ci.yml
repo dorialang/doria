@@ -196,9 +196,9 @@ jobs:
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
 
-      - name: Leak-check interface runtime ownership with Cranelift
+      - name: Leak-check interface and optimizer ownership with Cranelift
         run: |
-          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria; do
+          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria examples/native/main_stage35a_*.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
@@ -455,6 +455,8 @@ jobs:
           cargo test -p doriac --test stage17_io_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage18_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage35_runtime_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage35a_optimizer_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test performance_report_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test native_testing_slice1_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --lib --features llvm-backend --locked
 
@@ -543,11 +545,11 @@ jobs:
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage26a_grouped_locals.doria --release --out build/native/main_stage26a_grouped_locals_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage26a_grouped_locals_release
 
-      - name: Leak-check interface runtime ownership with LLVM
+      - name: Leak-check interface and optimizer ownership with LLVM
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria; do
+          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria examples/native/main_stage35a_*.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi

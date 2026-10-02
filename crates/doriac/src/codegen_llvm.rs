@@ -94,7 +94,18 @@ pub fn lower_mir_to_llvm_ir(program: &mir::Program) -> Result<String, BackendErr
     mir_validation::validate_program(program)?;
     let target_machine = host_target_machine()?;
     let context = Context::create();
-    let module = build_module(&context, &target_machine, program)?;
+    let module = build_module(&context, &target_machine, program, None)?;
+    Ok(module.print_to_string().to_string())
+}
+
+/// The actual release pass pipeline, exposed separately for optimizer contract
+/// tests. Keep pre-pass structural tests on `lower_mir_to_llvm_ir`.
+pub fn lower_mir_to_optimized_llvm_ir(program: &mir::Program) -> Result<String, BackendError> {
+    mir_validation::validate_program(program)?;
+    let target_machine = host_target_machine()?;
+    let context = Context::create();
+    let module = build_module(&context, &target_machine, program, None)?;
+    optimize_module(&module, &target_machine)?;
     Ok(module.print_to_string().to_string())
 }
 
@@ -118,18 +129,18 @@ fn host_target_machine() -> Result<TargetMachine, BackendError> {
 pub(crate) fn lower_validated_mir_to_object(
     program: &mir::Program,
 ) -> Result<Vec<u8>, BackendError> {
+    lower_validated_mir_to_object_with_metrics(program, None)
+}
+
+pub(crate) fn lower_validated_mir_to_object_with_metrics(
+    program: &mir::Program,
+    metrics: Option<&mut mir_validation::OptimizationMetrics>,
+) -> Result<Vec<u8>, BackendError> {
     let target_machine = host_target_machine()?;
     let context = Context::create();
-    let module = build_module(&context, &target_machine, program)?;
+    let module = build_module(&context, &target_machine, program, metrics)?;
 
-    let pass_options = PassBuilderOptions::create();
-    pass_options.set_verify_each(true);
-    module
-        .run_passes("default<O3>", &target_machine, pass_options)
-        .map_err(|error| backend_failure(format!("LLVM optimization failed: {error}")))?;
-    module
-        .verify()
-        .map_err(|error| backend_failure(format!("optimized LLVM verification failed: {error}")))?;
+    optimize_module(&module, &target_machine)?;
 
     let object = target_machine
         .write_to_memory_buffer(&module, FileType::Object)
@@ -137,10 +148,27 @@ pub(crate) fn lower_validated_mir_to_object(
     Ok(object.as_slice().to_vec())
 }
 
+fn optimize_module(
+    module: &Module<'_>,
+    target_machine: &TargetMachine,
+) -> Result<(), BackendError> {
+    let pass_options = PassBuilderOptions::create();
+    pass_options.set_verify_each(true);
+    module
+        .run_passes("default<O3>", target_machine, pass_options)
+        .map_err(|error| backend_failure(format!("LLVM optimization failed: {error}")))?;
+    module
+        .verify()
+        .map_err(|error| backend_failure(format!("optimized LLVM verification failed: {error}")))?;
+
+    Ok(())
+}
+
 fn build_module<'ctx>(
     context: &'ctx Context,
     target_machine: &TargetMachine,
     program: &mir::Program,
+    metrics: Option<&mut mir_validation::OptimizationMetrics>,
 ) -> Result<Module<'ctx>, BackendError> {
     let triple = TargetMachine::get_default_triple();
     let module = context.create_module("doria_stage_15");
@@ -148,7 +176,40 @@ fn build_module<'ctx>(
     let target_data = target_machine.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
 
+    let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
     let functions = declare_functions(context, &module, &target_data, program)?;
+    for function in &program.functions {
+        let offset = native_closure_abi::NativeCallableSignaturePlan::direct(function)
+            .source_parameter_offset() as u32;
+        for (index, facts) in optimization.functions[function.id.0]
+            .parameters
+            .iter()
+            .enumerate()
+        {
+            for (name, value) in [
+                ("readonly", u64::from(facts.readonly)),
+                ("nocapture", u64::from(facts.nocapture)),
+                ("noalias", u64::from(facts.noalias)),
+                ("nonnull", u64::from(facts.nonnull)),
+                ("dereferenceable", u64::from(facts.dereferenceable)),
+                ("align", u64::from(facts.alignment)),
+            ] {
+                if value == 0 {
+                    continue;
+                }
+                let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+                let value = if matches!(name, "dereferenceable" | "align") {
+                    value
+                } else {
+                    0
+                };
+                functions[function.id.0].add_attribute(
+                    AttributeLoc::Param(offset + index as u32),
+                    context.create_enum_attribute(kind, value),
+                );
+            }
+        }
+    }
     let class_drop_functions = declare_class_drop_functions(context, &module, program);
     let collection_drop_functions = declare_collection_drop_functions(context, &module, program);
     let closure_drop_functions = declare_closure_drop_functions(context, &module, program);
@@ -200,6 +261,7 @@ fn build_module<'ctx>(
             program,
             function,
             &declarations,
+            &optimization.functions[function.id.0],
         )?;
     }
     define_class_drop_functions(context, &module, &target_data, program, &declarations)?;
@@ -1021,6 +1083,7 @@ fn define_function<'ctx>(
     program: &mir::Program,
     function: &mir::Function,
     declarations: &DeclaredProgram<'ctx>,
+    optimization: &mir_validation::FunctionOptimizationFacts,
 ) -> Result<(), BackendError> {
     let llvm_function = *declarations
         .functions
@@ -1055,7 +1118,9 @@ fn define_function<'ctx>(
         .closure_descriptors
         .iter()
         .map(|descriptor| {
-            if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::Stack {
+            if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::Stack
+                || !optimization.constructed_closures.contains(&descriptor.id)
+            {
                 return Ok(None);
             }
             let logical = descriptor.environment_layout.ok_or_else(|| {
@@ -1286,6 +1351,7 @@ fn define_function<'ctx>(
         closure_environment_slots,
         closure_bound_fields: HashMap::new(),
         stack_collection_iterators: HashMap::new(),
+        stack_classes: HashMap::new(),
         borrow_home_addresses,
         writable_parameter_addresses,
         blocks,
@@ -1299,6 +1365,23 @@ fn define_function<'ctx>(
         deferred_class_temporary_drops: Vec::new(),
     };
     lowerer.retain_string_parameters()?;
+    for local in &function.locals {
+        if let Some(class) = optimization.stack_classes.get(&local.id) {
+            let layout = &program.classes[class.0].layout;
+            let storage = lowerer.entry_alloca(
+                context.i8_type().array_type(layout.size.max(1)),
+                &format!("class.stack.{}", local.id.0),
+            )?;
+            storage
+                .as_instruction_value()
+                .unwrap()
+                .set_alignment(layout.align)
+                .map_err(|error| {
+                    backend_failure(format!("failed to align class storage: {error}"))
+                })?;
+            lowerer.stack_classes.insert(local.id, storage);
+        }
+    }
     for plan in crate::mir_validation::stack_collection_iterators(program, function) {
         let storage = lowerer.entry_alloca(error_carrier_type(context), "iterator.state")?;
         lowerer
@@ -1365,6 +1448,7 @@ fn define_class_drop_functions<'ctx>(
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
@@ -1423,6 +1507,7 @@ fn define_collection_drop_functions<'ctx>(
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
@@ -1485,6 +1570,7 @@ fn define_closure_drop_functions<'ctx>(
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
@@ -1981,6 +2067,7 @@ struct FunctionLowerer<'ctx, 'program> {
     closure_environment_slots: Vec<Option<PointerValue<'ctx>>>,
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField<'ctx>>,
     stack_collection_iterators: HashMap<mir::LocalId, (mir::LocalId, PointerValue<'ctx>)>,
+    stack_classes: HashMap<mir::LocalId, PointerValue<'ctx>>,
     borrow_home_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     writable_parameter_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     blocks: Vec<BasicBlock<'ctx>>,
@@ -3704,7 +3791,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         }
                         _ => None,
                     };
-                let value = self.lower_rvalue(value)?;
+                let value = match (value, self.stack_classes.get(target).copied()) {
+                    (mir::Rvalue::Class(expression), Some(storage)) => {
+                        self.lower_class_expression_with_storage(expression, Some(storage))?
+                    }
+                    _ => self.lower_rvalue(value)?,
+                };
                 if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
                     local.ty
                 {
@@ -4139,7 +4231,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let llvm_ty = llvm_type(self.context, self.target_data, self.program, ty);
                 let value = build(self.builder.build_load(llvm_ty, slot, "class.drop"))?;
                 build(self.builder.build_store(slot, llvm_ty.const_zero()))?;
-                self.drop_class_carrier_checked(value, class)?;
+                if self.stack_classes.contains_key(local) {
+                    self.drop_class_storage_checked(value.into_pointer_value(), class, false)?;
+                } else {
+                    self.drop_class_carrier_checked(value, class)?;
+                }
             }
             mir::Statement::DropString { local } => {
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -4722,7 +4818,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 span,
             } => {
                 self.set_active_panic_site(*span)?;
-                let (object, lowered) = self.lower_class_allocation(*class, properties, args)?;
+                let (object, lowered) =
+                    self.lower_class_allocation(*class, properties, args, None)?;
                 let callee = *self.functions.get(constructor.0).ok_or_else(|| {
                     malformed_mir(format!("function{} does not exist", constructor.0))
                 })?;
@@ -11946,6 +12043,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::ClassExpression,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_class_expression_with_storage(expression, None)
+    }
+
+    fn lower_class_expression_with_storage(
+        &mut self,
+        expression: &mir::ClassExpression,
+        storage: Option<PointerValue<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
             mir::ClassExpression::InterfacePayload {
@@ -12141,7 +12246,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 args,
             } => {
                 let (object, lowered) =
-                    self.lower_class_allocation(*concrete_class, properties, args)?;
+                    self.lower_class_allocation(*concrete_class, properties, args, storage)?;
                 if let Some(constructor) = constructor {
                     let callee = *self.functions.get(constructor.0).ok_or_else(|| {
                         malformed_mir(format!("function{} does not exist", constructor.0))
@@ -15966,6 +16071,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         object: PointerValue<'ctx>,
         class: crate::class_layout::ClassId,
     ) -> Result<(), BackendError> {
+        self.drop_class_storage_checked(object, class, true)
+    }
+
+    fn drop_class_storage_checked(
+        &mut self,
+        object: PointerValue<'ctx>,
+        class: crate::class_layout::ClassId,
+        free_storage: bool,
+    ) -> Result<(), BackendError> {
         let function = current_function(&self.builder)?;
         let drop_block = self.context.append_basic_block(function, "class.drop");
         let continue_block = self
@@ -15977,6 +16091,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .build_conditional_branch(condition, drop_block, continue_block),
         )?;
         self.builder.position_at_end(drop_block);
+        if !free_storage {
+            self.drop_class_value_impl(object, class, true, false)?;
+            build(self.builder.build_unconditional_branch(continue_block))?;
+            self.builder.position_at_end(continue_block);
+            return Ok(());
+        }
         let drop_function = *self.class_drop_functions.get(class.0).ok_or_else(|| {
             malformed_mir(format!("class{} drop function does not exist", class.0))
         })?;
@@ -15995,7 +16115,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         object: PointerValue<'ctx>,
         class: crate::class_layout::ClassId,
     ) -> Result<(), BackendError> {
-        self.drop_class_value_impl(object, class, true)
+        self.drop_class_value_impl(object, class, true, true)
     }
 
     fn drop_failed_class_value(
@@ -16003,7 +16123,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         object: PointerValue<'ctx>,
         class: crate::class_layout::ClassId,
     ) -> Result<(), BackendError> {
-        self.drop_class_value_impl(object, class, false)
+        self.drop_class_value_impl(object, class, false, true)
     }
 
     fn drop_class_value_impl(
@@ -16011,6 +16131,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         object: PointerValue<'ctx>,
         class: crate::class_layout::ClassId,
         run_destructor: bool,
+        free_storage: bool,
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let mut phase = Some(class);
@@ -16150,7 +16271,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             phase = phase_definition.parent;
         }
-        let _ = self.call_runtime(CLASS_FREE, &[pointer.into()], None, &[object.into()])?;
+        if free_storage {
+            let _ = self.call_runtime(CLASS_FREE, &[pointer.into()], None, &[object.into()])?;
+        }
         Ok(())
     }
 
@@ -17816,6 +17939,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         class: crate::class_layout::ClassId,
         properties: &[mir::PropertyValue],
         args: &[mir::Rvalue],
+        storage: Option<PointerValue<'ctx>>,
     ) -> Result<(PointerValue<'ctx>, LoweredCallArguments<'ctx>), BackendError> {
         // Property initializers precede constructor arguments in Doria source order.
         let mut lowered_properties = Vec::with_capacity(properties.len());
@@ -17830,8 +17954,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         let class_definition = class_definition(self.program, class)?;
-        let object = self
-            .call_runtime(
+        let object = if let Some(storage) = storage {
+            let bytes = self
+                .context
+                .i8_type()
+                .array_type(class_definition.layout.size.max(1));
+            build(self.builder.build_store(storage, bytes.const_zero()))?;
+            storage
+        } else {
+            self.call_runtime(
                 CLASS_ALLOCATE,
                 &[pointer.into(), usize_type.into(), usize_type.into()],
                 Some(pointer.into()),
@@ -17846,7 +17977,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ],
             )?
             .ok_or_else(|| backend_failure("class allocation produced no result"))?
-            .into_pointer_value();
+            .into_pointer_value()
+        };
         for (property, lowered_property) in properties.iter().zip(lowered_properties) {
             let value = match &property.source {
                 mir::PropertyValueSource::Expression(_) => lowered_property,

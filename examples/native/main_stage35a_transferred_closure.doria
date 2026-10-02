@@ -1,0 +1,18 @@
+class CallbackOwner {
+    function __construct(take function(): int $callback) {}
+
+    function invoke(): int { return ($this->callback)(); }
+}
+
+function makeOwner(): CallbackOwner {
+    let $value = 42;
+    return new CallbackOwner(fn() with (take $value) => $value);
+}
+
+function main(): void {
+    let $owner = makeOwner();
+    echo "retained {$owner->invoke()}\n";
+    let $consume = fn(take function(): int $callback) => $callback();
+    let $number = 7;
+    echo "indirect {$consume(fn() with (take $number) => $number)}\n";
+}

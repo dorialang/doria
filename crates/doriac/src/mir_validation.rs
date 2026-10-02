@@ -8,13 +8,20 @@ use crate::mir;
 use crate::numeric::{FloatType, IntegerType};
 
 mod borrowed_views;
+mod closure_storage;
 mod core_value;
 mod exact_return;
 mod iteration;
 mod iterator_storage;
+mod optimization;
 mod retained;
 
 pub use iterator_storage::{stack_collection_iterators, StackCollectionIterator};
+pub(crate) use optimization::optimization_facts_with_metrics;
+pub use optimization::{
+    optimization_facts, FunctionOptimizationFacts, OptimizationFacts, OptimizationMetrics,
+    ParameterFacts,
+};
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     validate_graph_metadata(program)?;
@@ -185,6 +192,7 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         validate_function(program, function)?;
     }
     exact_return::validate(program)?;
+    closure_storage::validate(program)?;
     Ok(())
 }
 
@@ -8994,6 +9002,8 @@ struct ClassLocalAccesses<'a> {
     iterator_acquisitions: Vec<mir::LocalId>,
     construction_capacities: Vec<&'a mir::CollectionExpression>,
     independent_values: Vec<&'a mir::Rvalue>,
+    closure_constructions: Vec<mir::ClosureDescriptorId>,
+    method_receivers: Vec<(mir::FunctionId, &'a mir::NullableClassExpression)>,
     nullable_assumptions: Vec<(usize, mir::LocalId)>,
     mixed_assumptions: Vec<(usize, mir::LocalId, mir::MixedTag)>,
     nominal_assumptions: Vec<(usize, mir::LocalId, mir::Type)>,
@@ -9040,7 +9050,13 @@ impl<'a> ClassLocalAccesses<'a> {
         ));
     }
 
-    fn method_call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
+    fn method_call(
+        &mut self,
+        function: mir::FunctionId,
+        object: &'a mir::NullableClassExpression,
+        args: &'a [mir::Rvalue],
+    ) {
+        self.method_receivers.push((function, object));
         self.accesses.push(ClassLocalAccess::Call(
             CallTarget::Direct {
                 function,
@@ -9059,6 +9075,7 @@ impl<'a> ClassLocalAccesses<'a> {
     }
 
     fn assume_mixed_tag(&mut self, local: mir::LocalId, tag: mir::MixedTag) {
+        self.resource_reads.push(local);
         self.mixed_assumptions
             .push((self.accesses.len(), local, tag));
     }
@@ -9235,7 +9252,12 @@ fn collect_function_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::FunctionExpression::Create { captures, .. } => {
+        mir::FunctionExpression::Create {
+            descriptor,
+            captures,
+            ..
+        } => {
+            accesses.closure_constructions.push(*descriptor);
             for capture in captures {
                 match capture {
                     mir::ClosureCaptureOperand::BorrowLocal { local, .. } => {
@@ -9402,11 +9424,12 @@ fn collect_payload_enum_place_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(index, accesses)
         }
         mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => {
+            accesses.resource_reads.push(*local);
             accesses.assume_nullable_present(*local)
         }
-        mir::PayloadEnumPlace::Local(_)
-        | mir::PayloadEnumPlace::Static(_)
-        | mir::PayloadEnumPlace::MixedPayload { .. } => {}
+        mir::PayloadEnumPlace::Local(local) => accesses.resource_reads.push(*local),
+        mir::PayloadEnumPlace::MixedPayload { mixed, .. } => accesses.resource_reads.push(*mixed),
+        mir::PayloadEnumPlace::Static(_) => {}
     }
 }
 
@@ -9728,9 +9751,9 @@ fn collect_mixed_class_local_accesses<'a>(
             accesses.collection_access(*collection, *remove);
             collect_rvalue_class_local_accesses(index, accesses)
         }
-        mir::MixedExpression::Null
-        | mir::MixedExpression::Local { .. }
-        | mir::MixedExpression::Property { .. } => {}
+        mir::MixedExpression::Local { local, .. } => accesses.resource_reads.push(*local),
+        mir::MixedExpression::Property { object, .. } => accesses.borrow(*object),
+        mir::MixedExpression::Null => {}
     }
 }
 
@@ -9876,9 +9899,9 @@ fn collect_nullable_mixed_class_local_accesses<'a>(
             collect_nullable_mixed_class_local_accesses(left, accesses);
             collect_nullable_mixed_class_local_accesses(right, accesses);
         }
-        mir::NullableMixedExpression::Null
-        | mir::NullableMixedExpression::Local { .. }
-        | mir::NullableMixedExpression::Property { .. } => {}
+        mir::NullableMixedExpression::Local { local, .. } => accesses.resource_reads.push(*local),
+        mir::NullableMixedExpression::Property { object, .. } => accesses.borrow(*object),
+        mir::NullableMixedExpression::Null => {}
     }
 }
 
@@ -10115,7 +10138,7 @@ fn collect_nullable_string_class_local_accesses<'a>(
             if !nullable_class_expression_is_definitely_null(object) {
                 accesses.begin_call();
                 collect_rvalue_args_class_local_accesses(args, accesses);
-                accesses.method_call(*function, args);
+                accesses.method_call(*function, object, args);
             }
         }
         mir::NullableStringExpression::Coalesce { left, right } => {
@@ -10420,7 +10443,7 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
             if !nullable_class_expression_is_definitely_null(object) {
                 accesses.begin_call();
                 collect_rvalue_args_class_local_accesses(args, accesses);
-                accesses.method_call(*function, args);
+                accesses.method_call(*function, object, args);
             }
         }
         mir::NullableScalarExpression::Coalesce { left, right, .. } => {
@@ -10492,7 +10515,7 @@ fn collect_nullable_class_local_accesses<'a>(
             if !nullable_class_expression_is_definitely_null(object) {
                 accesses.begin_call();
                 collect_rvalue_args_class_local_accesses(args, accesses);
-                accesses.method_call(*function, args);
+                accesses.method_call(*function, object, args);
             }
         }
         mir::NullableClassExpression::Coalesce { left, right, .. } => {
@@ -10581,7 +10604,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             if !nullable_class_expression_is_definitely_null(object) {
                 accesses.begin_call();
                 collect_rvalue_args_class_local_accesses(args, &mut accesses);
-                accesses.method_call(*function, args);
+                accesses.method_call(*function, object, args);
             }
         }
         mir::Statement::Printf(format) => {

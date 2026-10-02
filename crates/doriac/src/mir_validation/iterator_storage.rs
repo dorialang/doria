@@ -199,7 +199,7 @@ fn protocol_only(
         )
 }
 
-fn repeated_block(function: &mir::Function, start: mir::BlockId) -> bool {
+pub(super) fn repeated_block(function: &mir::Function, start: mir::BlockId) -> bool {
     let mut pending = terminator_targets(&function.blocks[start.0].terminator);
     let mut seen = HashSet::new();
     while let Some(block) = pending.pop() {

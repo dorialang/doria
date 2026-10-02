@@ -23,6 +23,73 @@ pub struct PerformanceCompilation {
     pub report: Value,
 }
 
+struct FrontendMeasurement {
+    source: Value,
+    ast_items: usize,
+    phases: Value,
+    load: Duration,
+    started: Instant,
+}
+
+pub fn compile_native_graph(
+    graph: &crate::compilation_graph::CompilationGraph,
+    plan_path: &str,
+    graph_load: Duration,
+    command: Vec<String>,
+) -> Result<PerformanceCompilation, Vec<Diagnostic>> {
+    let started = Instant::now();
+    let options = crate::compilation_graph_options(graph)?;
+    if options.target != crate::backend::BackendTarget::Native {
+        return Err(backend_diagnostics(BackendError::new(
+            "performance reports require a native target",
+        )));
+    }
+    let hir = crate::lower_compilation_graph(graph)?;
+    let frontend = started.elapsed();
+    let files = graph
+        .sources
+        .values()
+        .map(|file| {
+            json!({
+                "identity": file.identity.0,
+                "path": file.display_path,
+                "bytes": file.source.text.len(),
+                "lines": file.source.text.lines().count(),
+                "fingerprint": file.content_fingerprint
+            })
+        })
+        .collect::<Vec<_>>();
+    emit_native(
+        hir,
+        options,
+        command,
+        FrontendMeasurement {
+            source: json!({
+                "path": plan_path,
+                "bytes": graph.sources.values().map(|file| file.source.text.len()).sum::<usize>(),
+                "lines": graph.sources.values().map(|file| file.source.text.lines().count()).sum::<usize>(),
+                "graphFingerprint": graph.fingerprint,
+                "files": files
+            }),
+            ast_items: graph
+                .sources
+                .values()
+                .map(|file| file.authored.items.len())
+                .sum(),
+            phases: json!({
+                "sourceLoad": unavailable("integrated into graphLoad"),
+                "parse": unavailable("integrated into graphLoad"),
+                "semanticAnalysis": unavailable("integrated into graphFrontend"),
+                "hirLowering": unavailable("integrated into graphFrontend"),
+                "graphLoad": available(graph_load),
+                "graphFrontend": available(frontend)
+            }),
+            load: graph_load,
+            started,
+        },
+    )
+}
+
 pub fn compile_native(
     path: String,
     text: String,
@@ -49,6 +116,31 @@ pub fn compile_native(
     let hir = lowering::lower_program_with_semantics(&prepared.resolved, semantic_info)?;
     let hir = crate::complete_standalone_hir(hir, source.clone(), &context);
     let hir_lowering = started.elapsed();
+    emit_native(
+        hir,
+        options,
+        command,
+        FrontendMeasurement {
+            source: json!({"path": path, "bytes": text.len(), "lines": text.lines().count()}),
+            ast_items: ast_item_count,
+            phases: json!({
+                "sourceLoad": available(source_load),
+                "parse": available(parse),
+                "semanticAnalysis": available(semantic),
+                "hirLowering": available(hir_lowering)
+            }),
+            load: source_load,
+            started: total_started,
+        },
+    )
+}
+
+fn emit_native(
+    hir: crate::hir::Program,
+    options: CompileOptions,
+    command: Vec<String>,
+    frontend: FrontendMeasurement,
+) -> Result<PerformanceCompilation, Vec<Diagnostic>> {
     let started = Instant::now();
     let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;
     let mir_lowering = started.elapsed();
@@ -56,14 +148,7 @@ pub fn compile_native(
     let (bytes, native) =
         codegen_native::generate_executable_with_performance(&mir, options.native_profile)
             .map_err(backend_diagnostics)?;
-    let total = source_load + total_started.elapsed();
-    let source_line_count = if text.is_empty() {
-        0
-    } else {
-        source
-            .line_count()
-            .saturating_sub(usize::from(text.ends_with('\n')))
-    };
+    let total = frontend.load + frontend.started.elapsed();
     let output_size = bytes.len();
     let runtime_artifact_bytes = fs::metadata(&native.runtime_artifact)
         .ok()
@@ -76,8 +161,8 @@ pub fn compile_native(
         crate::backend::NativeProfile::Release => "llvm",
     };
     let mut metrics = json!({
-        "sourceLineCount": source_line_count,
-        "astItemCount": ast_item_count,
+        "sourceLineCount": frontend.source["lines"],
+        "astItemCount": frontend.ast_items,
         "outputBytes": output_size,
         "functionCount": mir.functions.len(),
         "classCount": mir.classes.len(),
@@ -133,10 +218,15 @@ pub fn compile_native(
     let metrics_object = metrics
         .as_object_mut()
         .expect("performance metrics are emitted as an object");
+    metrics_object.insert("objectBytes".into(), json!(native.object_bytes));
+    metrics_object.insert("nativeCodeBytes".into(), json!(native.native_code_bytes));
     for (name, value) in finalizer_facts {
         metrics_object.insert(name.to_string(), json!(value));
     }
-    let report = json!({
+    if let serde_json::Value::Object(optimization) = json!(native.optimization) {
+        metrics_object.extend(optimization);
+    }
+    let mut report = json!({
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "compiler": {
             "component": "doriac",
@@ -144,11 +234,7 @@ pub fn compile_native(
             "commit": crate::BUILD_COMMIT
         },
         "command": command,
-        "source": {
-            "path": path,
-            "bytes": text.len(),
-            "lines": source_line_count
-        },
+        "source": frontend.source,
         "target": options.target.name(),
         "profile": options.native_profile.name(),
         "backend": backend,
@@ -178,14 +264,10 @@ pub fn compile_native(
             }
         },
         "phases": {
-            "sourceLoad": available(source_load),
             "lexing": unavailable("integrated into parse"),
-            "parse": available(parse),
             "constantEvaluation": unavailable("integrated into semanticAnalysis"),
-            "semanticAnalysis": available(semantic),
             "ownershipChecking": unavailable("integrated into semanticAnalysis"),
             "borrowChecking": unavailable("integrated into semanticAnalysis"),
-            "hirLowering": available(hir_lowering),
             "mirLowering": available(mir_lowering),
             "mirValidation": available(native.mir_validation),
             "craneliftCodeGeneration": if backend == "cranelift" { available(native.code_generation) } else { unavailable("LLVM profile selected") },
@@ -196,6 +278,16 @@ pub fn compile_native(
         },
         "metrics": metrics
     });
+    report["phases"]
+        .as_object_mut()
+        .expect("phase object")
+        .extend(
+            frontend
+                .phases
+                .as_object()
+                .expect("frontend phase object")
+                .clone(),
+        );
     Ok(PerformanceCompilation {
         output: BackendOutput::Executable {
             extension: crate::backend::native_executable_extension().to_string(),

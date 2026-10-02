@@ -47,6 +47,16 @@ measurement and promotion workflows. Timing thresholds still require a separate
 review of eligible evidence. This is not an unlimited optimization campaign and
 does not displace Stage 36a's stream gate.
 
+Stage 35a adds object/native-code byte sizes, source dispatch counts, proven
+pointer-parameter contracts, and stack-allocation counts to the opt-in report.
+Both standalone source and `compile --build-plan <plan.json>` use the same native
+measurement path. Project reports include every loaded source's identity and
+fingerprint plus the graph fingerprint; source-size counts aggregate those files.
+Project loading includes parsing (`graphLoad`), while semantic analysis and HIR
+lowering share `graphFrontend`. Their separate phase timings are explicitly
+unavailable, not zero or separately estimated. These structural facts are not
+controlled timing evidence or a promise that LLVM retains the source call shape.
+
 Eligible physical-host timing is a release-evidence gate, not a compiler-stage
 gate. Docker, WSL, containers, and virtual machines may run the suite for
 correctness, workflow rehearsal, optimization guidance, and local regression

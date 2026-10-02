@@ -101,6 +101,24 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     assert!(report["metrics"]["outputBytes"]
         .as_u64()
         .is_some_and(|value| value > 0));
+    let object_bytes = report["metrics"]["objectBytes"].as_u64().unwrap();
+    let code_bytes = report["metrics"]["nativeCodeBytes"].as_u64().unwrap();
+    assert!(object_bytes >= code_bytes && code_bytes > 0);
+    for metric in [
+        "directCallSiteCount",
+        "virtualCallSiteCount",
+        "interfaceCallSiteCount",
+        "closureCallSiteCount",
+        "stackClassAllocationCount",
+        "stackClosureEnvironmentCount",
+        "pointerReadonlyParameterCount",
+        "pointerNocaptureParameterCount",
+        "pointerNoaliasParameterCount",
+    ] {
+        assert!(report["metrics"][metric].as_u64().is_some(), "{metric}");
+    }
+    assert_eq!(report["metrics"]["stackClassAllocationCount"], 0);
+    assert_eq!(report["metrics"]["stackClosureEnvironmentCount"], 0);
     assert!(report["metrics"]["functionCount"].as_u64().is_some());
     assert_eq!(report["metrics"]["sourceLineCount"], source.lines().count());
     assert_eq!(report["metrics"]["astItemCount"], 1);
@@ -212,6 +230,105 @@ fn report_path_cannot_alias_source_or_compiler_output() {
         );
         assert!(!directory.join(executable_name()).exists());
     }
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn build_plan_reports_use_the_project_pipeline_and_protect_every_input() {
+    if !host_linker_is_available() {
+        eprintln!("performance report test unavailable: host linker was not found");
+        return;
+    }
+    let directory = fixture_directory("graph");
+    fs::create_dir_all(&directory).unwrap();
+    let main = "include \"Number.doria\";\nfunction main(): void { let $value = new Number(); echo read($value); }\n";
+    let helper = "class Number { int $value = 7; }\nfunction read(Number $value): int { return $value->value; }\n";
+    fs::write(directory.join("main.doria"), main).unwrap();
+    fs::write(directory.join("Number.doria"), helper).unwrap();
+    let mut plan = serde_json::json!({
+        "schemaVersion": 1, "edition": "2026", "rootPackage": "test/report",
+        "selectedTarget": {"package": "test/report", "name": "report", "kind": "binary", "entrySource": "test/report:main.doria", "activeScopes": ["main"]},
+        "packages": [{"identity": "test/report", "root": ".", "namespaceMappings": [{"prefix": "", "path": "", "scope": "main"}],
+            "sources": [
+                {"identity": "test/report:main.doria", "path": "main.doria", "scope": "main", "origin": "entry"},
+                {"identity": "test/report:Number.doria", "path": "Number.doria", "scope": "main", "origin": "explicit"}
+            ], "dependencies": []}],
+        "compiler": {"target": "native", "nativeProfile": "fast", "targetTriple": null}
+    });
+    let run = |report: &str| {
+        Command::new(doriac_bin())
+            .current_dir(&directory)
+            .args([
+                "compile",
+                "--build-plan",
+                "plan.json",
+                "--out",
+                executable_name(),
+                "--performance-report",
+                report,
+            ])
+            .output()
+            .unwrap()
+    };
+    for profile in ["fast", "release"] {
+        if profile == "release" && !cfg!(feature = "llvm-backend") {
+            continue;
+        }
+        plan["compiler"]["nativeProfile"] = profile.into();
+        fs::write(
+            directory.join("plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        let output = run("report.json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("report.json")).unwrap()).unwrap();
+        assert_eq!(report["source"]["files"].as_array().unwrap().len(), 2);
+        assert_eq!(report["source"]["bytes"], main.len() + helper.len());
+        assert_eq!(
+            report["metrics"]["sourceLineCount"],
+            main.lines().count() + helper.lines().count()
+        );
+        assert_eq!(report["phases"]["graphLoad"]["available"], true);
+        assert_eq!(report["phases"]["graphFrontend"]["available"], true);
+        assert_eq!(report["phases"]["parse"]["available"], false);
+        assert_eq!(report["phases"]["semanticAnalysis"]["available"], false);
+        assert_eq!(report["profile"], profile);
+        assert!(report["metrics"]["nativeCodeBytes"].as_u64().unwrap() > 0);
+        assert!(
+            report["metrics"]["pointerNocaptureParameterCount"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(report["metrics"]["stackClassAllocationCount"], 1);
+    }
+    for input in ["plan.json", "main.doria", "Number.doria", executable_name()] {
+        let before = fs::read(directory.join(input)).unwrap();
+        let output = run(input);
+        assert!(!output.status.success(), "{input}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("would overwrite"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(directory.join(input)).unwrap(), before);
+    }
+    plan["compiler"] =
+        serde_json::json!({"target": "php", "nativeProfile": null, "targetTriple": null});
+    fs::write(
+        directory.join("plan.json"),
+        serde_json::to_vec(&plan).unwrap(),
+    )
+    .unwrap();
+    let output = run("report.json");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a native build-plan target"));
     let _ = fs::remove_dir_all(directory);
 }
 

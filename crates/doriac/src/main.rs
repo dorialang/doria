@@ -356,14 +356,12 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
 
     let source_load_started = Instant::now();
     if let Some(plan_path) = plan_path {
-        if performance_report.is_some() {
-            return Err("--performance-report is not available with --build-plan".into());
-        }
-        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
-        let output = doriac::compile_compilation_graph(&graph).map_err(|diagnostics| {
-            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
-        })?;
+        let (document, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        let graph_load = source_load_started.elapsed();
         let target = backend_target_for_plan(&graph.build_plan)?;
+        if performance_report.is_some() && target != BackendTarget::Native {
+            return Err("--performance-report requires a native build-plan target".into());
+        }
         let out_path = out.map_or_else(
             || default_build_plan_output_path(&graph.build_plan, target),
             PathBuf::from,
@@ -376,9 +374,46 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
                     .unwrap_or_else(|| Path::new(&source.display_path))
             })),
             &out_path,
-            None,
+            performance_report.as_deref().map(Path::new),
         )?;
+        let (output, report) = if performance_report.is_some() {
+            let compilation = doriac::performance::compile_native_graph(
+                &graph,
+                plan_path,
+                graph_load,
+                utf8_cli_arguments(&invocation)?,
+            )
+            .map_err(|diagnostics| {
+                CliError::graph_diagnostics(
+                    graph.source_map.clone(),
+                    diagnostics,
+                    diagnostic_options,
+                )
+            })?;
+            (compilation.output, Some(compilation.report))
+        } else {
+            let output = doriac::compile_compilation_graph(&graph).map_err(|diagnostics| {
+                CliError::graph_diagnostics(
+                    graph.source_map.clone(),
+                    diagnostics,
+                    diagnostic_options,
+                )
+            })?;
+            (output, None)
+        };
         write_backend_output(&out_path, output)?;
+        if let (Some(report_path), Some(mut report)) = (performance_report, report) {
+            report["totalDurationNs"] = serde_json::Value::from(
+                u64::try_from(source_load_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            write_performance_report(
+                Path::new(&report_path),
+                &report,
+                &document.path,
+                &document.text,
+                diagnostic_options,
+            )?;
+        }
         println!("{}", out_path.display());
         return Ok(());
     }
@@ -1808,7 +1843,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [--schema-version 1|2|3] [diagnostic options]\n    doriac metadata --build-plan <plan.json> [--schema-version 1|2|3] [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [--schema-version 1|2|3] [diagnostic options]\n    doriac metadata --build-plan <plan.json> [--schema-version 1|2|3] [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

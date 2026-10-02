@@ -25,6 +25,9 @@ pub struct NativePerformance {
     pub linker: String,
     pub link_command: Vec<String>,
     pub linking: Duration,
+    pub object_bytes: usize,
+    pub native_code_bytes: u64,
+    pub optimization: crate::mir_validation::OptimizationMetrics,
 }
 
 pub fn generate_executable(
@@ -49,11 +52,25 @@ pub(crate) fn generate_executable_with_performance(
     let mir_validation = started.elapsed();
 
     let started = Instant::now();
+    let mut optimization = crate::mir_validation::OptimizationMetrics::default();
     let object_bytes = match profile {
-        NativeProfile::Fast => codegen_cranelift::lower_validated_mir_to_object(program)?,
-        NativeProfile::Release => lower_validated_release_object(program)?,
+        NativeProfile::Fast => codegen_cranelift::lower_validated_mir_to_object_with_metrics(
+            program,
+            Some(&mut optimization),
+        )?,
+        NativeProfile::Release => lower_validated_release_object(program, &mut optimization)?,
     };
     let code_generation = started.elapsed();
+    // Reuse Cranelift's cross-platform object parser; never guess file offsets
+    // or equate a linked runtime's size with generated Doria machine code.
+    use cranelift_object::object::{Object, ObjectSection, SectionKind};
+    let object = cranelift_object::object::File::parse(object_bytes.as_slice())
+        .map_err(|error| BackendError::new(format!("cannot measure generated object: {error}")))?;
+    let native_code_bytes = object
+        .sections()
+        .filter(|section| section.kind() == SectionKind::Text)
+        .map(|section| section.size())
+        .sum();
 
     let started = Instant::now();
     let runtime = runtime_artifact::locate(profile)?;
@@ -75,6 +92,9 @@ pub(crate) fn generate_executable_with_performance(
             linker,
             link_command,
             linking,
+            object_bytes: object_bytes.len(),
+            native_code_bytes,
+            optimization,
         },
     ))
 }
@@ -85,12 +105,18 @@ fn lower_release_object(program: &mir::Program) -> Result<Vec<u8>, BackendError>
 }
 
 #[cfg(feature = "llvm-backend")]
-fn lower_validated_release_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
-    crate::codegen_llvm::lower_validated_mir_to_object(program)
+fn lower_validated_release_object(
+    program: &mir::Program,
+    metrics: &mut crate::mir_validation::OptimizationMetrics,
+) -> Result<Vec<u8>, BackendError> {
+    crate::codegen_llvm::lower_validated_mir_to_object_with_metrics(program, Some(metrics))
 }
 
 #[cfg(not(feature = "llvm-backend"))]
-fn lower_validated_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError> {
+fn lower_validated_release_object(
+    _program: &mir::Program,
+    _metrics: &mut crate::mir_validation::OptimizationMetrics,
+) -> Result<Vec<u8>, BackendError> {
     Err(BackendError::new(
         "LLVM release support is not available in this doriac build\nhelp: rebuild doriac with the llvm-backend feature",
     ))

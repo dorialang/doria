@@ -40,6 +40,44 @@ fn php_function_name(name: &str) -> String {
 }
 
 #[test]
+fn php_preserves_optimizer_fixture_ownership_and_cleanup() {
+    for (name, source, expected) in [
+        (
+            "stack classes",
+            include_str!("../../../examples/native/main_stage35a_stack_classes.doria"),
+            include_str!("fixtures/native_io/main_stage35a_stack_classes/expected_stdout"),
+        ),
+        (
+            "transferred closure",
+            include_str!("../../../examples/native/main_stage35a_transferred_closure.doria"),
+            include_str!("fixtures/native_io/main_stage35a_transferred_closure/expected_stdout"),
+        ),
+    ] {
+        let php = doriac::compile_source_to_php(name, source).unwrap();
+        let script = format!(
+            "{}\n{}();",
+            php.strip_prefix("<?php").unwrap(),
+            php_function_name("main")
+        );
+        let output = Command::new("php")
+            .args(["-r", &script])
+            .output()
+            .expect("PHP fixture runner");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "{name}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn unhandled_error_cleanup_does_not_depend_on_php_shutdown() {
     let php = doriac::compile_source_to_php(
         "unhandled-cleanup.doria",

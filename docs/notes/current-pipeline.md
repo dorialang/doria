@@ -15,7 +15,9 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   backends; effective member identities retain their authored source origins.
   E0493 is retired and reserved. Slice 5 closes the parity, structural,
   documentation, and cross-repository integration matrix; Stage 35 is complete.
-  Stage 35a is next and has not begun.
+  Stage 35a is in progress: shared optimizer proofs, native stack storage, dispatch
+  regressions, and benchmark/tooling integration. Validation and publication are
+  pending; Stage 36 has not begun.
 - Stage 35 Slice 3 implements canonical value equality/hash/order/clone,
   Copy-or-Cloneable preserving collections, and public iteration. Promoted
   `borrow` constructor parameters retain readonly sources; `getCurrent()` lends
@@ -269,7 +271,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   - Stage 35 Slice 4 Trait Composition — Complete.
   - Stage 35 Slice 5 Cross-Repository Closure — Complete.
   - Stage 35 — Complete.
-- Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Next.
+- Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — In Progress.
 - Stage 36 Property Hooks — Scheduled.
 - Pre-Stage-45 Doria-Native Baton Transition — Scheduled, Mandatory Before Unsuffixed `2026.03.1`.
 - Stage 36a — Scheduled, Not Implemented.
