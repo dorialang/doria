@@ -972,13 +972,18 @@ fn interface_erasure_keeps_headerless_layout_and_constrained_calls_direct() {
             .iter()
             .find(|function| function.name.starts_with(name))
             .unwrap();
-        let indirect = function.blocks.iter().any(|block| {
-            matches!(
-                block.terminator,
-                mir::Terminator::IndirectCall { .. } | mir::Terminator::CheckedIndirectCall { .. }
-            )
-        });
-        assert_eq!(indirect, name == "erased", "{function}");
+        let indirect = function
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.terminator,
+                    mir::Terminator::IndirectCall { .. }
+                        | mir::Terminator::CheckedIndirectCall { .. }
+                )
+            })
+            .count();
+        assert_eq!(indirect, usize::from(name == "erased"), "{function}");
     }
     let output = doriac::mir_interpreter::interpret(&program).unwrap();
     assert_eq!(output.stdout, b"7\n");

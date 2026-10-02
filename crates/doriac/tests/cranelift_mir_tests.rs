@@ -20,6 +20,57 @@ fn object_contains(object: &[u8], symbol: &str) -> bool {
 }
 
 #[test]
+fn interface_upcasts_and_trait_dispatch_need_only_static_metadata() {
+    use cranelift_object::object::{Object, ObjectSection, ObjectSymbol, SectionKind};
+
+    // Borrowed inputs isolate dispatch from the caller's object allocation.
+    let program = doriac::lower_source_to_mir(
+        "interface-object-structure.doria",
+        r#"
+interface Value { function read(): int; }
+trait Reading { function read(): int { return 7; } }
+class Number implements Value { uses Reading; }
+function concrete(Number $value): int { return $value->read(); }
+function constrained<T implements Value>(T $value): int { return $value->read(); }
+function erased(Value $value): int { return $value->read(); }
+function inspect(Number $value): int {
+    return concrete($value) + constrained($value) + erased($value);
+}
+function main(): void {}
+"#,
+    )
+    .unwrap();
+    let bytes = doriac::codegen_cranelift::lower_mir_to_object(&program).unwrap();
+    let object = cranelift_object::object::File::parse(bytes.as_slice()).unwrap();
+    let table = object
+        .symbols()
+        .find(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.trim_start_matches('_') == "doria_interface_vtable_0")
+        })
+        .expect("interface dispatch must have a static vtable");
+    let section = object
+        .section_by_index(table.section_index().unwrap())
+        .unwrap();
+    assert!(
+        matches!(
+            section.kind(),
+            SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel
+        ),
+        "interface metadata must be immutable: {:?}",
+        section.kind()
+    );
+    for symbol in object.symbols().filter(|symbol| symbol.is_undefined()) {
+        let name = symbol.name().unwrap();
+        assert!(
+            !name.contains("allocate") && !name.contains("_new") && !name.contains("mixed_box"),
+            "borrowed upcasts and trait/interface calls must not allocate: {name}"
+        );
+    }
+}
+
+#[test]
 fn closure_objects_use_static_descriptors_and_escape_selected_environments() {
     let local = doriac::lower_source_to_mir(
         "cranelift-local-closure.doria",

@@ -52,7 +52,7 @@ function check_grouped_local_declarations(string $root): array
             'Stage 26a — Grouped local declarations — Complete.',
             'Stage 26b — Performance Baseline Foundation — Complete; All Three Slices Complete.',
             'Stage 27 — Enums + payload cases — Complete; No Performance-Evidence Dependency.',
-            'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.',
+            'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit',
             'Stage 43 — Engine Performance And Optimization Hardening.',
             'Continuous performance rule',
             '`Performance Impact` section',
@@ -75,7 +75,7 @@ function check_grouped_local_declarations(string $root): array
             'Stage 26a — Complete.',
             'Stage 26b — Performance Baseline Foundation — Complete.',
             'Stage 27 — Complete; No Performance-Evidence Dependency.',
-            'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.',
+            'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit',
             'Stage 36a — Scheduled, Not Implemented.',
         ],
         'docs/notes/native-parity-matrix.md' => [

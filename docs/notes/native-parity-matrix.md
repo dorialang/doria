@@ -91,8 +91,13 @@ All fixtures join the same differential, PHP execution, and CI leak selection.
 | Errors, Displayable, finalizers, dynamic cleanup | Covered     | Covered   | Covered | Covered |
 
 `main_stage35_interface_structure.doria` supplies the direct/constrained/erased
-comparison without a timing threshold. MIR and LLVM object tests separately
-assert the carrier layout, vtable shape, and allocation/stack-placement rules.
+comparison without a timing threshold. MIR checks the headerless layout and
+exact indirect-call count; LLVM checks each function's dispatch and allocation
+shape. Cranelift object checks additionally isolate borrowed upcasts and
+trait-provided methods, requiring immutable vtable data and no allocator import.
+The stack-cursor tests contrast local fixed-frame storage with an escaping
+returned cursor. These are portable structural checks, not controlled timing
+evidence or completion of Stage 35a's optimizer audit.
 
 Stage 27 Slice 1 adds nominal unit and backed enum MIR and registers
 `main_unit_enums.doria`, `main_backed_enums.doria`, `main_nullable_enums.doria`,

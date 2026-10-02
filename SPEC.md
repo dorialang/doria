@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete and Stage 35 interfaces and traits Slices 1, 2, 3, and 4 are complete and Slice 5 is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -651,8 +651,8 @@ function withName(string $name): self
 accessible static member. Instance calls use the current complete-object
 pointer and bypass virtual dispatch. `parent::__construct(...)` is the one
 lifecycle protocol form; `parent::__destruct()` is invalid. Trait-local
-`self::member` parses under the accepted-language clock, while trait composition
-remains Stage 35. `static::` is permanently rejected with a fix to `self::`;
+`self::member` resolves to the composing class during compile-time trait
+composition under Decision 0134. `static::` is permanently rejected with a fix to `self::`;
 Doria has no late static binding.
 
 Writing a writable static inside `__construct` is ordinary static mutation.
@@ -983,7 +983,8 @@ access on a possibly-null class value is an error until the value is narrowed.
 For class targets, `is` and match type patterns test whether the dynamic class
 is the target or a descendant. The narrowed value preserves ownership, borrow
 mode, provenance, and the existing non-null proof. Interface conformance tests
-remain deferred to Stage 35. Primitive, string, enum, and closed non-hierarchy
+use the checked nominal interface graph and static metadata from Decision 0134.
+Primitive, string, enum, and closed non-hierarchy
 tests retain their exact Stage 22 behavior.
 
 Nullable concrete classes use a null pointer for absence. Other nullable values
@@ -1182,7 +1183,7 @@ class Label implements Displayable
 }
 ```
 
-Conformance requires the explicit `implements Displayable` declaration and exactly an externally accessible readonly instance `function toString(): string` with no parameters. Method-name coincidence does not conform, and Doria has no `__toString` magic method. Display conversion is limited to interpolation, `echo`, `.`, and `%s`; it does not permit implicit class-to-string assignment. For a statically known concrete class, the interpreter, Cranelift, LLVM, and PHP compatibility backend execute conversion through the ordinary `toString()` method machinery exactly once and left-to-right. Interface-typed values, vtables, and erased interface dispatch remain Stage 35 Slice 2.
+Conformance requires the explicit `implements Displayable` declaration and exactly an externally accessible readonly instance `function toString(): string` with no parameters. Method-name coincidence does not conform, and Doria has no `__toString` magic method. Display conversion is limited to interpolation, `echo`, `.`, and `%s`; it does not permit implicit class-to-string assignment. For a statically known concrete class, the interpreter, Cranelift, LLVM, and PHP compatibility backend execute conversion through the ordinary `toString()` method machinery exactly once and left-to-right. Interface-typed values use the checked vtable entry through the general interface runtime, preserving the same evaluation and ownership rules.
 
 The `.` operator is runtime string concatenation. Each operand may be a display-convertible primitive, but at least one operand of that binary operation must already be statically `string`; therefore `"x=" . 1` is valid while `1 . 2` is rejected. The result is `string`, evaluation is left-to-right, and no conversion is implied outside display contexts. `echo`, `.`, and current interpolation parts use decimal integers, shortest-round-trip locale-independent binary32/binary64 floats, lowercase `true`/`false`, and strings unchanged.
 

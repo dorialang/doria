@@ -218,6 +218,11 @@ These are identity, not scope deferral. They do not become available later, and 
 ## Working rules
 
 - Treat `docs/doria-end-to-end-plan.md` as the master execution plan for future work. It answers future-work forks unless Andrew later amends it.
+- Keep current sequencing in that plan and `docs/notes/current-pipeline.md`.
+  Completed decision records and feature guards retain their own delivered
+  contracts, not a copied claim about which unrelated stage or slice is next.
+  Link to the master plan for continuation instead of making every subsequent
+  delivery rewrite historical records and unrelated guards.
 - Treat supporting specification, notes, and decision files as subordinate where they conflict with the end-to-end plan.
 - Treat `docs/doria-end-to-end-plan.md`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, and `docs/information-architecture.md` according to the documentation authority model. Supporting design notes are subordinate to the end-to-end plan and accepted decisions.
 - Doria has a real ownership/borrow checker model in Doria spelling: readonly is shared borrow, writable is exclusive borrow, and `take` transfers ownership.

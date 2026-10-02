@@ -49,10 +49,16 @@ fn interface_ir_keeps_static_vtables_and_allocation_free_loop_dispatch() {
             .next()
             .unwrap();
         assert!(
-            !body
-                .lines()
-                .any(|line| line.contains("call ") && line.contains("@dr_v2_class_allocate(")),
+            !body.lines().any(|line| line.contains("call ")
+                && (line.contains("allocate")
+                    || line.contains("_new(")
+                    || line.contains("mixed_box"))),
             "{body}"
+        );
+        assert_eq!(
+            body.matches("%interface.method.entry(").count(),
+            usize::from(function.name.starts_with("erased")),
+            "only the erased call may use one indirect interface entry: {body}"
         );
     }
     assert!(scan_alloca_placement(&ir).escaped.is_empty(), "{ir}");
