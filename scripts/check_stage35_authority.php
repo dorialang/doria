@@ -25,6 +25,8 @@ $require = static function (string $path, string $contents, array $needles) use 
 };
 
 $forbid = static function (string $path, string $contents, array $needles) use (&$failures): void {
+    // Wrapped prose must not hide an obsolete implementation claim.
+    $contents = preg_replace('/\s+/u', ' ', $contents) ?? $contents;
     foreach ($needles as $needle) {
         if (str_contains($contents, $needle)) {
             $failures[] = "{$path}: contains stale or forbidden Stage 35 claim `{$needle}`";
@@ -60,7 +62,7 @@ foreach ($paths as $key => $path) {
 $require($paths['decision'], $files['decision'], [
     '# Decision 0134:',
     '**Status:** Accepted',
-    '**Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, 3, And 4 Complete; Slice 5 Next',
+    '**Implementation Status:** Stage 35 Complete; Slices 1 Through 5 Complete',
     'interface Equatable<T>',
     'function equals(T $other): bool;',
     'function hash(): uint64;',
@@ -87,12 +89,13 @@ $require($paths['decision'], $files['decision'], [
 ]);
 
 $require($paths['plan'], $files['plan'], [
-    'Stage 35 — Interfaces And Traits — In Progress; Slices 1, 2, 3, And 4 Complete; Slice 5 Next',
+    '  - **Stage 35:** Interfaces And Traits — Complete under Decision 0134; all five slices complete.',
+    'Stage 35 — Interfaces And Traits — Complete; All Five Slices Complete',
     'Slice 1 — Complete: Grammar, Graphs, And Conformance',
     'Slice 2 — Complete: Interface Runtime And Ownership',
     'Slice 3 — Complete: Core Contracts And Public Iteration',
     'Slice 4 — Complete: Trait Composition',
-    'Slice 5 — Next: Cross-Repository Closure',
+    'Slice 5 — Complete: Cross-Repository Closure',
 ]);
 
 $require($paths['pipeline'], $files['pipeline'], [
@@ -103,8 +106,8 @@ $require($paths['pipeline'], $files['pipeline'], [
     'Stage 35 Slice 2 Interface Runtime And Ownership — Complete',
     'Stage 35 Slice 3 Core Contracts And Public Iteration — Complete',
     'Stage 35 Slice 4 Trait Composition — Complete',
-    'Stage 35 Slice 5 Cross-Repository Closure — Next',
-    'Stage 35 — In Progress',
+    'Stage 35 Slice 5 Cross-Repository Closure — Complete',
+    'Stage 35 — Complete',
 ]);
 
 $require($paths['spec'], $files['spec'], [
@@ -140,12 +143,19 @@ $require($paths['collectionsAudit'], $files['collectionsAudit'], [
 ]);
 
 $staleStatus = [
+    'Slice 5 Next',
+    'Slice 5 is next',
+    'Slice 5 cross-repository closure remains pending',
+    'Stage 35 remains in progress',
     'Slices 1 And 2 Complete; Slice 3 Next',
     'Slice 3 is not delivered yet',
     'core operations and public iteration: Slice 3 / E0759',
     'Slice 1 Complete; Slice 2 Next',
     'Stage 35 Slice 1 is complete and Slice 2 is next',
     'interface-typed values and general interface dispatch remain deferred',
+    'trait composition is next',
+    'erased interface dispatch remain Stage 35 Slice 2',
+    'Interface conformance tests remain deferred',
     'Interface values, erased calls, conversions/tests, and shared-interface execution until Stage 35 Slice 2',
     'Collection/interface `is`',
     'The PHP backend still refuses shared ownership',

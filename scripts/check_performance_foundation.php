@@ -31,7 +31,6 @@ function check_performance_foundation(string $root): array
             'Stage 33 Slices 1 through 3 and Phase F are complete',
             'Native Testing Foundation',
             'Stage 34 is complete',
-            'Stage 35 Slices 1, 2, 3, and 4 are complete and Slice 5 is next',
             'Doria Median / Fastest Valid Native Peer Median <= 1.30',
             'A ratio greater than `1.30` is',
             'Inconclusive**, never Pass',

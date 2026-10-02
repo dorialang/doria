@@ -4434,8 +4434,8 @@ extern "system" {
 }
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
-// byte copies/fills and floating-point use to these MSVC support symbols, so the runtime owns the
-// small subset they require. Hosted Rust binaries link the CRT instead and disable this feature
+// memory operations, string scans, and floating-point use to these support symbols. The runtime
+// owns the small subset they require. Hosted Rust binaries link the CRT and disable this feature
 // through their dependency declaration so both providers can never define the same symbol.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
@@ -4558,8 +4558,24 @@ pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count
 /// `value` must point to a readable null-terminated byte string.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
-pub unsafe extern "C" fn strlen(value: *const u8) -> usize {
+pub unsafe extern "C" fn strlen(value: *const core::ffi::c_char) -> usize {
     let mut length = 0;
+    while ptr::read_volatile(value.add(length)) != 0 {
+        length += 1;
+    }
+    length
+}
+
+/// Returns the UTF-16 code-unit length of a null-terminated Windows wide string.
+///
+/// # Safety
+///
+/// `value` must point to a readable null-terminated UTF-16 code-unit sequence.
+#[cfg(all(windows, feature = "standalone-windows-support"))]
+#[no_mangle]
+pub unsafe extern "C" fn wcslen(value: *const u16) -> usize {
+    let mut length = 0;
+    // Prevent the optimizer from replacing this support implementation with itself.
     while ptr::read_volatile(value.add(length)) != 0 {
         length += 1;
     }
@@ -5129,8 +5145,13 @@ mod tests {
             assert_eq!(memcmp(b"abc".as_ptr().cast(), b"abc".as_ptr().cast(), 3), 0);
             assert!(memcmp(b"abc".as_ptr().cast(), b"abd".as_ptr().cast(), 3) < 0);
             assert!(memcmp(b"abe".as_ptr().cast(), b"abd".as_ptr().cast(), 3) > 0);
-            assert_eq!(strlen(b"\0".as_ptr()), 0);
-            assert_eq!(strlen(b"doria\0".as_ptr()), 5);
+            assert_eq!(strlen(c"".as_ptr()), 0);
+            assert_eq!(strlen(c"doria".as_ptr()), 5);
+
+            assert_eq!(wcslen([0_u16].as_ptr()), 0);
+            assert_eq!(wcslen([0x0041_u16, 0x65e5, 0xd83d, 0xde00, 0].as_ptr()), 4);
+            assert_eq!(wcslen([0x0041_u16, 0, 0x0042, 0].as_ptr()), 1);
+            assert_eq!(wcslen([0xd800_u16, 0].as_ptr()), 1);
 
             #[cfg(target_env = "msvc")]
             assert_eq!(

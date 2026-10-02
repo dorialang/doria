@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-04
-- **Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, 3, And 4 Complete; Slice 5 Next
+- **Implementation Status:** Stage 35 Complete; Slices 1 Through 5 Complete
 - **Amends:** Decisions 0029, 0030, 0079, 0082, 0087, 0089, 0093, 0096, 0100, 0102, 0105, 0106, 0110, 0113, 0119, 0121, 0125, 0129, 0130, 0131, 0132, and 0133
 
 ## Context
@@ -12,9 +12,9 @@ compile-time trait composition, headerless class objects, two-word erased
 interface values, monomorphized generic constraints, explicit ownership, and
 checked Errors. At authority acceptance, the compiler implemented only the compiler-known
 `Displayable` and `Error` contracts and accepted incomplete interface and trait
-syntax behind Stage 35 diagnostics. Slice 1 now implements grammar, declaration
-graphs, and trait-free conformance; the implementation sequence below records
-the remaining runtime boundaries.
+syntax behind Stage 35 diagnostics. The completed slices below record grammar,
+declaration graphs, conformance, runtime ownership, core contracts, public
+iteration, trait composition, and cross-repository closure.
 
 This decision completes the source, ownership, ABI, iteration, and composition
 contract before implementation begins. It does not accept property hooks,
@@ -855,7 +855,7 @@ Durable `main_stage35_interface_*` fixtures cover the runtime cross-product;
 malformed-MIR tests and emitted-IR checks cover independent soundness and
 allocation/layout invariants. E0758 is retired and reserved; Slice 3 also retires
 E0759 after implementing core operations/public iteration. Slice 4 retires E0493, and
-E0760 still rejects primitive erasure. Stage 35 remains in progress.
+E0760 still rejects primitive erasure.
 
 ### Slice 3: Core Contracts And Public Iteration
 
@@ -949,10 +949,23 @@ playground example. No website source or release lock is changed by this slice.
 
 ### Slice 5: Cross-Repository Closure
 
-Complete parity, malformed-MIR negatives, structural performance checks,
-installed-toolchain UAT, documentation, editor artifacts, website handoff, and
-Stage 35 status closure. Stage 35a, Stage 36 property hooks, and Stage 36a stream
-surface work remain separate.
+The closure matrix reuses the durable native manifest, PHP execution fixtures,
+and shared MIR validator negatives rather than introducing another runner.
+It covers interface ABI and ownership, nullable proofs, all six shared families,
+core contracts, iterator source/element loans, and flattened trait cleanup.
+MIR and LLVM checks require exactly one indirect entry at an erased call and
+none at concrete or constrained calls. Cranelift object inspection verifies
+immutable static vtables and allocation-free borrowed upcasts/trait dispatch;
+the existing fixed-frame cursor checks retain bounded loop storage.
+
+Official tooling consumes the compiler's conformance and composition facts;
+editor artifacts, installed binaries, and website guide/API/playground content
+are synchronized in the same delivery. Installed compiler and language-server
+identities must agree before delivery is reported complete. Exact-head CI owns
+Linux/Windows validation and Linux leak checks; local macOS checks do not
+substitute for them. See the native parity matrix for the durable test owners.
+Stage 35a optimization, Stage 36 property hooks, and Stage 36a streams remain
+separate. Controlled timing remains Pending Available Runner, not a pass.
 
 At every intermediate slice, accepted-but-unimplemented behavior is rejected
 before HIR with one precise slice/stage diagnostic. No backend reinterprets an
@@ -978,7 +991,7 @@ unsupported path.
 
 ## Non-Goals
 
-This decision does not implement Stage 35. It does not accept property hooks,
+This decision does not accept property hooks,
 general interface properties, default interface methods, static interface
 members, abstract classes, primitive boxing, external implementations, generic
 variance/defaults/reflection, runtime traits, async, FFI, Stage 35a optimizer

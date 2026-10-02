@@ -33,7 +33,6 @@ $required = [
         'Native Testing Foundation Slice 3 - Complete',
         'Native Testing Foundation - Complete',
         'Stage 34 Single Class Inheritance - Complete',
-        'Stage 35 Interfaces And Traits - In Progress; Slices 1, 2, 3, And 4 Complete; Slice 5 Next',
         '| `Bytes` | yes | yes | no | no | no |',
         '| `Dictionary<K, V>` / `SortedDictionary<K, V>` | yes | yes | no | yes | yes |',
         'ordinary once-call consumption',
