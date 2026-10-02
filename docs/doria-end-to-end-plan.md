@@ -1049,7 +1049,9 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   - **Post-Stage-34 Corrective Beat:** Constructor Parameter Roles — Complete under Decision 0131.
   - **Post-Stage-34 Corrective Beat:** Indexed Foreach And Scalar Display — Complete under Decision 0132.
   - **Post-Stage-34 Corrective Beat:** Explicit Foreach Binding Types — Complete under Decision 0133.
-- **Scheduled:** Stage 36 Property Hooks — Scheduled; Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
+  - **Stage 35:** Interfaces And Traits — Complete under Decision 0134; all five slices complete.
+  - **Stage 35a:** Optimizer Contracts, Dispatch, And Escape Audit — Next.
+  - **Scheduled:** Stage 36 Property Hooks — Scheduled; Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
   - **Non-blocking evidence:** Stage 26b controlled timing remains `Measurement Status: Pending Available Runner`; this is not a performance pass.
   - **Release gate:** the unsuffixed `2026.03.1` release remains blocked on the Doria-native Baton cutover.
 

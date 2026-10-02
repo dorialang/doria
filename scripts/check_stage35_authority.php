@@ -89,6 +89,7 @@ $require($paths['decision'], $files['decision'], [
 ]);
 
 $require($paths['plan'], $files['plan'], [
+    '  - **Stage 35:** Interfaces And Traits — Complete under Decision 0134; all five slices complete.',
     'Stage 35 — Interfaces And Traits — Complete; All Five Slices Complete',
     'Slice 1 — Complete: Grammar, Graphs, And Conformance',
     'Slice 2 — Complete: Interface Runtime And Ownership',
