@@ -1,3 +1,4 @@
+use cranelift_object::object::{BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionKind};
 use doriac::mir::{
     self, BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId,
     IntegerExpression, LocalId, Operand, Program, ReturnType, Rvalue, ScalarType, Statement,
@@ -19,10 +20,51 @@ fn object_contains(object: &[u8], symbol: &str) -> bool {
         .any(|window| window == symbol.as_bytes())
 }
 
+fn is_readonly_metadata_section<'data>(
+    format: BinaryFormat,
+    section: &impl ObjectSection<'data>,
+) -> bool {
+    matches!(
+        section.kind(),
+        SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel
+    ) || (format == BinaryFormat::Elf
+        && section.kind() == SectionKind::Data
+        // ELF needs writable relocations before the linker/loader applies RELRO.
+        // The object reader reports these sections as Data, not ReadOnlyDataWithRel.
+        && section.name().is_ok_and(|name| {
+            name == ".data.rel.ro" || name.starts_with(".data.rel.ro.")
+        }))
+}
+
+#[test]
+fn readonly_metadata_detection_preserves_object_format_contracts() {
+    use cranelift_object::object::{write, Architecture, Endianness};
+
+    for format in [BinaryFormat::Elf, BinaryFormat::MachO, BinaryFormat::Coff] {
+        for (kind, readonly) in [
+            (write::StandardSection::ReadOnlyData, true),
+            (write::StandardSection::ReadOnlyDataWithRel, true),
+            (write::StandardSection::Data, false),
+        ] {
+            let mut object = write::Object::new(format, Architecture::X86_64, Endianness::Little);
+            let section = object.section_id(kind);
+            object.append_section_data(section, &[1; 8], 8);
+            let name = object.section(section).name().unwrap().to_owned();
+            let bytes = object.write().unwrap();
+            let object = cranelift_object::object::File::parse(bytes.as_slice()).unwrap();
+            let section = object.section_by_name(&name).unwrap();
+            assert_eq!(
+                is_readonly_metadata_section(format, &section),
+                readonly,
+                "{format:?} {kind:?}: {name} ({:?})",
+                section.kind()
+            );
+        }
+    }
+}
+
 #[test]
 fn interface_upcasts_and_trait_dispatch_need_only_static_metadata() {
-    use cranelift_object::object::{Object, ObjectSection, ObjectSymbol, SectionKind};
-
     // Borrowed inputs isolate dispatch from the caller's object allocation.
     let program = doriac::lower_source_to_mir(
         "interface-object-structure.doria",
@@ -54,11 +96,9 @@ function main(): void {}
         .section_by_index(table.section_index().unwrap())
         .unwrap();
     assert!(
-        matches!(
-            section.kind(),
-            SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel
-        ),
-        "interface metadata must be immutable: {:?}",
+        is_readonly_metadata_section(object.format(), &section),
+        "interface metadata must use read-only storage: {:?} {:?}",
+        section.name(),
         section.kind()
     );
     for symbol in object.symbols().filter(|symbol| symbol.is_undefined()) {
