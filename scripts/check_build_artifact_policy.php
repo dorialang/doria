@@ -59,6 +59,9 @@ if (substr_count($cargo, 'debug = false') < 2) {
 if (str_contains($validator, "'rm'")) {
     $failures[] = 'the managed validator must reclaim through Cargo, not recursive deletion';
 }
+if (str_contains($ci, 'DORIA_RT_PATH')) {
+    $failures[] = 'canonical CI must exercise compiler-selected runtimes; explicit override cases belong in isolated runtime-artifact tests';
+}
 if (str_contains($agents, 'cargo build --workspace --all-targets --locked --verbose')) {
     $failures[] = 'AGENTS.md still requires the redundant all-target development build';
 }

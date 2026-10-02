@@ -428,15 +428,9 @@ jobs:
           & "$env:LLVM_SYS_181_PREFIX\bin\llvm-config.exe" --version
           cl.exe /? | Out-Null
 
-      - name: Build optimized doria-rt and select it explicitly
+      - name: Build optimized doria-rt
         shell: bash
-        run: |
-          cargo build -p doria-rt --release --locked --verbose
-          if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            echo "DORIA_RT_PATH=${GITHUB_WORKSPACE}/target/release/doria_rt.lib" >> "$GITHUB_ENV"
-          else
-            echo "DORIA_RT_PATH=${GITHUB_WORKSPACE}/target/release/libdoria_rt.a" >> "$GITHUB_ENV"
-          fi
+        run: cargo build -p doria-rt --release --locked --verbose
 
       - name: Run tier-1 Stage 17 runtime I/O tests
         run: cargo test -p doria-rt --release --locked --verbose

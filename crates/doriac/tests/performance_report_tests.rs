@@ -152,6 +152,12 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         .as_str()
         .is_some_and(|path| !path.is_empty()));
     assert_eq!(report["artifacts"]["runtime"]["profile"], "debug");
+    assert_eq!(report["artifacts"]["runtime"]["origin"], "compiler-bundled");
+    assert_eq!(report["artifacts"]["runtime"]["identified"], true);
+    assert_eq!(
+        report["artifacts"]["runtime"]["digestMatchesMetadata"],
+        true
+    );
     assert_eq!(
         report["artifacts"]["runtime"]["bytes"],
         report["metrics"]["runtimeArtifactBytes"]
@@ -734,6 +740,12 @@ fn release_report_identifies_llvm_without_cranelift_phase_data() {
     let report = compilation.report;
     assert_eq!(report["backend"], "llvm");
     assert_eq!(report["artifacts"]["runtime"]["profile"], "release");
+    assert_eq!(report["artifacts"]["runtime"]["origin"], "compiler-bundled");
+    assert_eq!(report["artifacts"]["runtime"]["identified"], true);
+    assert_eq!(
+        report["artifacts"]["runtime"]["digestMatchesMetadata"],
+        true
+    );
     assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], true);
     assert_eq!(
         report["phases"]["craneliftCodeGeneration"]["available"],

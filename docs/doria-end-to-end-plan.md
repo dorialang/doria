@@ -1050,8 +1050,9 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   - **Post-Stage-34 Corrective Beat:** Indexed Foreach And Scalar Display — Complete under Decision 0132.
   - **Post-Stage-34 Corrective Beat:** Explicit Foreach Binding Types — Complete under Decision 0133.
   - **Stage 35:** Interfaces And Traits — Complete under Decision 0134; all five slices complete.
-  - **Stage 35a:** Optimizer Contracts, Dispatch, And Escape Audit — In Progress.
-  - **Scheduled:** Stage 36 Property Hooks — Scheduled; Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
+  - **Stage 35a:** Optimizer Contracts, Dispatch, And Escape Audit — Complete.
+  - **Next:** Stage 36 Property Hooks — Scheduled.
+  - **Scheduled:** Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
   - **Non-blocking evidence:** Stage 26b controlled timing remains `Measurement Status: Pending Available Runner`; this is not a performance pass.
   - **Release gate:** the unsuffixed `2026.03.1` release remains blocked on the Doria-native Baton cutover.
 
@@ -1203,22 +1204,24 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
     user iterable runs through explicitly typed `foreach`; Cloneable widening
     and shared interface payloads preserve ownership/drop; traits initialize and
     destroy each flattened property once; no backend reconstructs semantics.
-- **Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — In Progress.** Decision 0134's representation and soundness contracts remain unchanged.
-  - **Dispatch and metadata:** audit direct/open virtual calls, exact devirtualization,
+- **Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Complete.** Decision 0134's representation and soundness contracts remain unchanged.
+  - **Dispatch and metadata:** shared proof analysis and structural tests cover direct/open virtual calls, exact devirtualization,
     interface fat-pointer dispatch, generic static dispatch, flattened traits, and
-    primitive constraint specialization. Encode proven alias, readonly, nonnull,
+    primitive constraint specialization. Native lowering consumes proven alias, readonly, nonnull,
     dereferenceability, alignment, and `nocapture` facts in shared MIR analysis.
-  - **Escape and storage:** deliver at least one real nonescaping class or closure
-    stack-promotion path, preserving ownership and cleanup. Broader escape analysis
+  - **Escape and storage:** both native backends promote proven nonescaping closed
+    classes within a bounded frame, preserving ownership and cleanup. Closure
+    storage validation prevents stack environments from escaping. Broader escape analysis
     remains incremental; uncertain or escaping values retain heap storage.
-  - **Evidence and integration:** measure specialization/code-size growth and keep
-    specialized and deliberately erased workloads separate. Complete tooling,
-    benchmark, and website integration. Controlled timing remains non-blocking
+  - **Evidence and integration:** opt-in reports cover standalone and multi-file
+    code size and optimizer facts. Pinned benchmark workloads record specialization
+    growth and keep specialized and deliberately erased cases separate; tooling
+    distinguishes source dispatch from optimized code shape. Controlled timing remains non-blocking
     **Pending Available Runner** under Decision 0112, never a performance pass.
   - **Acceptance:** dispatch-shape IR checks, metadata soundness negatives, code-size
     evidence, separate specialized/erased measurements, and one proven allocation
     promotion across the native backends.
-- **Stage 36 — Property hooks — Scheduled.** §6.4 hooks. AC: `Temperature` example. (`when` moved to Stage 28a — it is basic control flow, not OOP completion.)
+- **Stage 36 — Property hooks — Next.** §6.4 hooks. AC: `Temperature` example. (`when` moved to Stage 28a — it is basic control flow, not OOP completion.)
 - **Stage 36a — Stream, readiness, and standard I/O foundation.** **Scheduled, not implemented.** Decision 0110 accepts both the semantic architecture and its binding performance/memory contract: small byte-stream capabilities; owned handles with consuming explicit close/finish and nonthrowing best-effort destruction; first-class non-owning standard streams over the intrinsic device substrate; data/would-block/EOF/timed-out reads; partial-progress writes; capability-gated blocking modes; one multi-stream readiness, duration/deadline, cancellation, and backpressure model; typed buffering and incremental UTF-8 text adapters; typed file requests and locking; bounded streaming copy; and owned child processes with concurrently drained pipes. The steady-state data plane has no mandatory allocation per operation or loop iteration, exposes reusable caller/adapter buffers and safe readable/writable byte regions, avoids hidden whole-chunk and unread-suffix copies, keeps common outcomes and standard-stream views allocation-free, reuses readiness registrations/event storage, forbids ordinary busy polling and one-thread-per-stream designs, and initializes no executor/task/scheduler infrastructure in synchronous programs. Concrete adapters remain eligible for static specialization and inlining; deliberate interface erasure may dispatch dynamically without a heap object per call or layer. Exact public interface, member, result-case, readiness, byte-region, reusable-buffer, standard-stream, file, adapter, and process spellings are deferred to a decision-0110 appendix before implementation begins; this is a naming deferral, not a semantic or performance review gate. Prerequisites: Stage 29 checked errors, Stage 31 namespaces/multi-file support, Stage 35 interfaces/capability contracts, existing ownership/RAII, the existing standard-device runtime substrate, and decision 0109's unified diagnostics/runtime outcomes. Property hooks are not intrinsically required, but Stage 36a remains after Stage 36 to preserve the accepted linear sequence. Non-goals: async state-machine lowering, a multithreaded executor, TCP/UDP product APIs, HTTP, TLS implementation, terminal raw mode/key/resize/cursor/screen/color/styling, PHP-compatible dynamic wrapper or string-filter registries, global stream contexts, and mixed metadata bags. Stage 36a owns the initial Linux/macOS/Windows stream benchmark and memory-regression gate: cold startup; throughput and latency; wall/user/system time; peak RSS; allocation count where available; syscall count where available; development/release/stripped binary size; and correctness hashes or exact output. Its required cases are large streaming file copy, repeated small writes, non-blocking pipe transfer, child stdout/stderr drainage, incremental UTF-8 line processing, first-class versus intrinsic standard-output writes, many stable readiness registrations, synchronous startup, a concrete adapter chain, and an erased interface stream. Equivalent direct OS/C/Rust implementations are comparison baselines, never unsupported superiority claims. Structural allocation/copy/readiness assertions run in ordinary CI; curated timing regressions run on controlled runners. Stage 43 continues and broadens this suite instead of postponing the initial gate. AC: the semantic fixtures above agree across interpreter/Cranelift/LLVM; the benchmark cases produce identical correctness hashes; reusable-buffer loops show no mandatory steady-state allocation or hidden whole-chunk copy; standard-stream/common-outcome and readiness-reuse structural checks pass; synchronous startup initializes no async infrastructure; all three native OS backends meet the accepted regression thresholds recorded with the benchmark harness. No speculative source spelling is accepted syntax here.
 
 ### Phase H — Concurrency (Stages 37–39)

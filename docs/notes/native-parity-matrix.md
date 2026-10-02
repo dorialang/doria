@@ -96,8 +96,20 @@ exact indirect-call count; LLVM checks each function's dispatch and allocation
 shape. Cranelift object checks additionally isolate borrowed upcasts and
 trait-provided methods, requiring immutable vtable data and no allocator import.
 The stack-cursor tests contrast local fixed-frame storage with an escaping
-returned cursor. These are portable structural checks, not controlled timing
-evidence or completion of Stage 35a's optimizer audit.
+returned cursor. These establish the Stage 35 structural baseline, not controlled
+timing evidence.
+
+Stage 35a extends it in `stage35a_optimizer_tests.rs`: optimized direct versus
+unknown virtual/interface calls, static generic/trait calls, unboxed primitive
+constraints, proven pointer attributes, conservative escape negatives, a bounded
+class-promotion frame, and closure storage confined to its owning activation.
+`main_stage35a_stack_classes.doria` and `main_stage35a_transferred_closure.doria`
+join the durable interpreter/Cranelift/LLVM manifest and PHP execution checks.
+Their sidecars require identical output and reverse destruction on normal and
+checked exits; Linux CI includes both in each native profile's leak checks.
+`performance_report_tests.rs` covers opt-in code-size/optimizer evidence for
+standalone and multi-file builds. Specialized/erased workloads and specialization
+growth belong to the pinned benchmarks repository, not a second runner here.
 
 Stage 27 Slice 1 adds nominal unit and backed enum MIR and registers
 `main_unit_enums.doria`, `main_backed_enums.doria`, `main_nullable_enums.doria`,
