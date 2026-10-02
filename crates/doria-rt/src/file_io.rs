@@ -430,11 +430,11 @@ unsafe fn last_errno() -> i32 {
 
 #[cfg(unix)]
 extern "C" {
-    fn open(path: *const u8, flags: i32, ...) -> i32;
+    fn open(path: *const core::ffi::c_char, flags: i32, ...) -> i32;
     fn read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
     fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn close(descriptor: i32) -> i32;
-    fn unlink(path: *const u8) -> i32;
+    fn unlink(path: *const core::ffi::c_char) -> i32;
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
@@ -511,8 +511,9 @@ mod tests {
             write_file(&path_bytes, b"").expect("empty write");
             let empty = read_file(&path_bytes).expect("empty read");
             assert_eq!(empty.length, 0);
+            remove_file(&path_bytes).expect("runtime fixture cleanup");
         }
-        fs::remove_file(path).expect("fixture cleanup");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -532,6 +533,11 @@ mod tests {
                 write_file(b"bad\0path", b"x"),
                 Err(FileError::PathNul)
             ));
+            assert!(matches!(
+                append_file(b"bad\0path", b"x"),
+                Err(FileError::PathNul)
+            ));
+            assert!(matches!(remove_file(b"bad\0path"), Err(FileError::PathNul)));
         }
     }
 }
