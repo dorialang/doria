@@ -1,0 +1,35 @@
+class Marker {
+    function __construct(string $name) {}
+    function __destruct() {
+        try { echo "drop {$this->name}\n"; } catch (Error) { panic("output failed"); }
+    }
+}
+
+class Counter {
+    writable int $value = 1;
+    Marker $marker = new Marker("child");
+    writable function setValue(int $value): void { $this->value = $value; }
+    function __destruct() {
+        try { echo "drop counter {$this->value}\n"; } catch (Error) { panic("output failed"); }
+    }
+}
+
+class Failure implements Error {
+    function __construct(string $message) {}
+}
+
+function inspect(Counter $counter): int { return $counter->value; }
+function fail(): void throws Failure { throw new Failure("expected"); }
+function exercise(bool $stop): void throws Failure {
+    let $first = new Marker("first");
+    let writable $counter = new Counter();
+    $counter->setValue(2);
+    echo "value {inspect($counter)}\n";
+    if ($stop) { fail(); }
+    let $last = new Marker("last");
+}
+
+function main(): void {
+    try { exercise(false); } catch (Failure $error) { echo "unexpected\n"; }
+    try { exercise(true); } catch (Failure $error) { echo "caught {$error->message}\n"; }
+}

@@ -244,7 +244,7 @@ These are identity, not scope deferral. They do not become available later, and 
 - `--release` must select LLVM explicitly and may never silently fall back to Cranelift. Compiler builds without the optional LLVM feature must fail clearly.
 - Native backends must call shared MIR validation. LLVM lowering must not use fast-math flags or unchecked undefined/poison-producing operations for defined Doria behavior.
 - Do not let Cranelift or LLVM semantics decide Doria semantics. Backend-specific assumptions must remain behind Doria IR or native-oriented IR lowering.
-- Class instances are a headerless, data-only heap payload with static per-type drop glue. Interface dispatch, when it lands, uses fat pointers rather than per-object headers.
+- Class instances have a headerless, data-only payload with static per-type drop glue. Allocation normally uses the heap; proven nonescaping instances may use stack storage without changing layout, ownership, or destruction. Interface dispatch uses fat pointers rather than per-object headers.
 - The object-representation machinery must not assume every aggregate with methods is a heap-allocated move type. Compiler-known inline Copy aggregates exist and share layout machinery with, but not the heap/move classification of, classes.
 
 ### Two clocks

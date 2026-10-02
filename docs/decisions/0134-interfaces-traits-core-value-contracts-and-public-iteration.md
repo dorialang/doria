@@ -803,10 +803,43 @@ checked effects, nullability, ownership, and writable lease state. Trait
 flattening initializes and destroys each property once. Incremental keys include
 every interface/trait contract and dependent specialization.
 
-Stage 35a remains responsible for broad devirtualization, optimizer metadata,
-code-size measurement, generalized escape analysis, and additional stack
-promotion. It consumes this sound nonallocating base representation and does not
-redesign it.
+### Stage 35a Optimizer Proofs
+
+Optimization consumes validated MIR, not source modifiers or editor hover text.
+Both native backends share effect summaries and storage decisions. Direct-call
+effects reach a fixed point; unknown calls, virtual receivers, ownership
+transfers, and retained/returned aliases cannot establish noncapture. LLVM
+pointer attributes apply only to the actual pointer ABI, never to an erased
+carrier or a closure's writable parameter home. Readonly and exclusive-alias
+facts additionally require scalar-only class payloads; readonly source access
+does not promise that string retain counts or shared interior state cannot change.
+
+Single-definition, nonescaping closed-class allocations outside CFG cycles can
+use fixed entry-frame storage. The initial promotion budget is 4 KiB per function;
+larger, repeated, escaping, or uncertain allocations retain the heap path. Checked
+construction remains on its established heap/failure-cleanup path. Promotion
+preserves field initialization, nested ownership, destructor order, and checked
+exit cleanup; only the promoted root allocation/free disappears. Broader escape
+analysis can extend these proofs without changing the language. Closure storage
+is reserved only by functions that construct that environment, and shared MIR
+validation checks that a stack environment cannot escape its owning activation.
+Passing a captured closure to a taking parameter transfers its environment;
+direct, constructor, and indirect calls classify that environment as owned before
+lowering, rather than relying on a backend to repair a local placement.
+
+Exact/static calls remain direct. Constant carriers may devirtualize during the
+normal LLVM release pipeline; unknown receivers must retain slot dispatch.
+Optimized-IR tests distinguish these cases, including the checked call ABI.
+Traits remain flattened and primitive constraints remain unboxed.
+
+Opt-in reports expose object bytes, native text-section bytes, specialization
+counts, MIR call-site counts by dispatch kind, and proven stack/parameter facts.
+MIR call-site counts are not post-optimization machine-call counts. The separate
+benchmarks repository owns matched specialized/erased workloads and generic
+code-size growth cases. Portable correctness/structure evidence is distinct from
+controlled timing, which remains **Pending Available Runner** when no eligible
+runner is available (Decision 0112); pending timing is neither a pass nor a block
+on later language work.
 
 ## Implementation Slices
 
@@ -994,8 +1027,7 @@ unsupported path.
 This decision does not accept property hooks,
 general interface properties, default interface methods, static interface
 members, abstract classes, primitive boxing, external implementations, generic
-variance/defaults/reflection, runtime traits, async, FFI, Stage 35a optimizer
-work, or Stage 36a stream names.
+variance/defaults/reflection, runtime traits, async, FFI, or Stage 36a stream names.
 
 ## Invalidated Elsewhere
 

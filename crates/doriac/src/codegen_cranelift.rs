@@ -95,6 +95,13 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
 pub(crate) fn lower_validated_mir_to_object(
     program: &mir::Program,
 ) -> Result<Vec<u8>, BackendError> {
+    lower_validated_mir_to_object_with_metrics(program, None)
+}
+
+pub(crate) fn lower_validated_mir_to_object_with_metrics(
+    program: &mir::Program,
+    metrics: Option<&mut mir_validation::OptimizationMetrics>,
+) -> Result<Vec<u8>, BackendError> {
     let isa_builder =
         cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
     let mut flag_builder = settings::builder();
@@ -164,8 +171,15 @@ pub(crate) fn lower_validated_mir_to_object(
         .declare_function("main", Linkage::Export, &process_signature)
         .map_err(|error| backend_failure(error.to_string()))?;
 
+    let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
     for function in &program.functions {
-        define_function(&mut module, program, function, &declarations)?;
+        define_function(
+            &mut module,
+            program,
+            function,
+            &declarations,
+            &optimization.functions[function.id.0],
+        )?;
     }
     for class in &program.classes {
         define_class_drop_function(&mut module, program, class.id, &declarations)?;
@@ -1287,6 +1301,7 @@ fn define_function(
     program: &mir::Program,
     function: &mir::Function,
     declarations: &DeclaredNativeItems<'_>,
+    optimization: &mir_validation::FunctionOptimizationFacts,
 ) -> Result<(), BackendError> {
     let DeclaredNativeItems {
         function_ids,
@@ -1404,7 +1419,9 @@ fn define_function(
             .closure_descriptors
             .iter()
             .map(|descriptor| {
-                if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::Stack {
+                if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::Stack
+                    || !optimization.constructed_closures.contains(&descriptor.id)
+                {
                     return Ok(None);
                 }
                 let logical = descriptor.environment_layout.ok_or_else(|| {
@@ -1582,6 +1599,7 @@ fn define_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses,
             writable_parameter_addresses,
             static_ids,
@@ -1600,6 +1618,17 @@ fn define_function(
             deferred_class_temporary_drops: Vec::new(),
         };
         retain_string_parameters(&mut builder, function, &mut resources)?;
+        for local in &function.locals {
+            if let Some(class) = optimization.stack_classes.get(&local.id) {
+                let layout = &program.classes[class.0].layout;
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    layout.size.max(1),
+                    layout.align.trailing_zeros() as u8,
+                ));
+                resources.stack_classes.insert(local.id, slot);
+            }
+        }
         for plan in crate::mir_validation::stack_collection_iterators(program, function) {
             let slot = builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
@@ -1678,6 +1707,7 @@ fn define_class_drop_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             static_ids,
@@ -1750,6 +1780,7 @@ fn define_collection_drop_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             static_ids,
@@ -1832,6 +1863,7 @@ fn define_closure_drop_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             stack_collection_iterators: HashMap::new(),
+            stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             static_ids,
@@ -2704,6 +2736,7 @@ struct LoweringResources<'module, 'program> {
     closure_environment_slots: &'program [Option<StackSlot>],
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField>,
     stack_collection_iterators: HashMap<mir::LocalId, (mir::LocalId, StackSlot)>,
+    stack_classes: HashMap<mir::LocalId, StackSlot>,
     borrow_home_addresses: HashMap<mir::LocalId, Value>,
     writable_parameter_addresses: HashMap<mir::LocalId, Value>,
     static_ids: &'program [DataId],
@@ -3304,7 +3337,17 @@ fn lower_statement(
         }
         mir::Statement::AssignLocal { target, value } => {
             let definition = local_definition(resources.program, resources.function_id, *target)?;
-            let new_value = lower_rvalue(builder, value, resources)?;
+            let new_value = match (value, resources.stack_classes.get(target).copied()) {
+                (mir::Rvalue::Class(expression), Some(storage)) => {
+                    lower_class_expression_with_storage(
+                        builder,
+                        expression,
+                        Some(storage),
+                        resources,
+                    )?
+                }
+                _ => lower_rvalue(builder, value, resources)?,
+            };
             let slot = local_slot(resources.local_slots, *target)?;
             let pointer = resources.module.target_config().pointer_type();
             let owns_replaced_value =
@@ -3910,7 +3953,17 @@ fn lower_statement(
                     .ins()
                     .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
             }
-            lower_drop_class_carrier_checked(builder, value, class, resources)?;
+            if resources.stack_classes.contains_key(local) {
+                lower_drop_class_storage_checked(
+                    builder,
+                    value.class_parts()?.0,
+                    class,
+                    false,
+                    resources,
+                )?;
+            } else {
+                lower_drop_class_carrier_checked(builder, value, class, resources)?;
+            }
         }
         mir::Statement::DropString { local } => {
             let pointer = resources.module.target_config().pointer_type();
@@ -4832,7 +4885,7 @@ fn lower_terminator(
             set_active_panic_site(builder, *span, resources);
             let pointer = resources.module.target_config().pointer_type();
             let (object, lowered) =
-                lower_class_allocation(builder, *class, properties, args, resources)?;
+                lower_class_allocation(builder, *class, properties, args, None, resources)?;
             let error_slot = local_slot(resources.local_slots, *error)?;
             let constructor_definition = function_in(resources.program, *constructor)?;
             let receiver_ty =
@@ -11477,6 +11530,15 @@ fn lower_class_expression(
     expression: &mir::ClassExpression,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredValue, BackendError> {
+    lower_class_expression_with_storage(builder, expression, None, resources)
+}
+
+fn lower_class_expression_with_storage(
+    builder: &mut FunctionBuilder,
+    expression: &mir::ClassExpression,
+    storage: Option<StackSlot>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
     let pointer_type = resources.module.target_config().pointer_type();
     match expression {
         mir::ClassExpression::InterfacePayload {
@@ -11643,8 +11705,14 @@ fn lower_class_expression(
             constructor,
             args,
         } => {
-            let (object, lowered_args) =
-                lower_class_allocation(builder, *concrete_class, properties, args, resources)?;
+            let (object, lowered_args) = lower_class_allocation(
+                builder,
+                *concrete_class,
+                properties,
+                args,
+                storage,
+                resources,
+            )?;
             if let Some(constructor) = constructor {
                 let receiver_ty = local_in(
                     function_in(resources.program, *constructor)?,
@@ -11959,6 +12027,7 @@ fn lower_class_allocation(
     class: crate::class_layout::ClassId,
     properties: &[mir::PropertyValue],
     args: &[mir::Rvalue],
+    storage: Option<StackSlot>,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(Value, LoweredCallArgs), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -11980,15 +12049,25 @@ fn lower_class_allocation(
     let align = builder
         .ins()
         .iconst(pointer, i64::from(class_definition.layout.align));
-    let object = runtime_call(
-        builder,
-        CLASS_ALLOCATE,
-        &[pointer, pointer, pointer],
-        Some(pointer),
-        &[resources.current_frame, size, align],
-        resources,
-    )?
-    .ok_or_else(|| backend_failure("class allocation produced no result"))?;
+    let object = if let Some(storage) = storage {
+        let address = builder.ins().stack_addr(pointer, storage, 0);
+        let zero = builder.ins().iconst(types::I8, 0);
+        let size = builder
+            .ins()
+            .iconst(pointer, i64::from(class_definition.layout.size.max(1)));
+        builder.call_memset(resources.module.target_config(), address, zero, size);
+        address
+    } else {
+        runtime_call(
+            builder,
+            CLASS_ALLOCATE,
+            &[pointer, pointer, pointer],
+            Some(pointer),
+            &[resources.current_frame, size, align],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("class allocation produced no result"))?
+    };
     for (property, lowered_property) in properties.iter().zip(lowered_properties) {
         let value = match &property.source {
             mir::PropertyValueSource::Expression(_) => lowered_property,
@@ -12926,6 +13005,16 @@ fn lower_drop_class_value_checked(
     class: crate::class_layout::ClassId,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
+    lower_drop_class_storage_checked(builder, object, class, true, resources)
+}
+
+fn lower_drop_class_storage_checked(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    class: crate::class_layout::ClassId,
+    free_storage: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
     let pointer_type = resources.module.target_config().pointer_type();
     let zero = builder.ins().iconst(pointer_type, 0);
     let has_object = builder.ins().icmp(IntCC::NotEqual, object, zero);
@@ -12935,6 +13024,12 @@ fn lower_drop_class_value_checked(
         .ins()
         .brif(has_object, drop_block, &[], continue_block, &[]);
     builder.switch_to_block(drop_block);
+    if !free_storage {
+        lower_drop_class_value_impl(builder, object, class, true, false, resources)?;
+        builder.ins().jump(continue_block, &[]);
+        builder.switch_to_block(continue_block);
+        return Ok(());
+    }
     let drop_function = *resources
         .class_drop_function_ids
         .get(class.0)
@@ -12990,7 +13085,7 @@ fn lower_drop_class_value(
     class: crate::class_layout::ClassId,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
-    lower_drop_class_value_impl(builder, object, class, true, resources)
+    lower_drop_class_value_impl(builder, object, class, true, true, resources)
 }
 
 fn lower_drop_failed_class_value(
@@ -12999,7 +13094,7 @@ fn lower_drop_failed_class_value(
     class: crate::class_layout::ClassId,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
-    lower_drop_class_value_impl(builder, object, class, false, resources)
+    lower_drop_class_value_impl(builder, object, class, false, true, resources)
 }
 
 fn lower_drop_class_value_impl(
@@ -13007,6 +13102,7 @@ fn lower_drop_class_value_impl(
     object: Value,
     class: crate::class_layout::ClassId,
     run_destructor: bool,
+    free_storage: bool,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer_type = resources.module.target_config().pointer_type();
@@ -13173,14 +13269,16 @@ fn lower_drop_class_value_impl(
         }
         phase = phase_definition.parent;
     }
-    let _ = runtime_call(
-        builder,
-        CLASS_FREE,
-        &[pointer_type],
-        None,
-        &[object],
-        resources,
-    )?;
+    if free_storage {
+        let _ = runtime_call(
+            builder,
+            CLASS_FREE,
+            &[pointer_type],
+            None,
+            &[object],
+            resources,
+        )?;
+    }
     Ok(())
 }
 

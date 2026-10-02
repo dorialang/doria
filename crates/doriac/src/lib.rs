@@ -561,6 +561,18 @@ pub fn lower_build_plan_file_to_mir(path: impl AsRef<Path>) -> DiagnosticResult<
 pub fn compile_compilation_graph(
     graph: &compilation_graph::CompilationGraph,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    let options = compilation_graph_options(graph)?;
+    let hir = lower_compilation_graph(graph)?;
+    backend::emit_with_options(&hir, options).map_err(|error| {
+        error
+            .diagnostics
+            .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
+    })
+}
+
+pub(crate) fn compilation_graph_options(
+    graph: &compilation_graph::CompilationGraph,
+) -> Result<CompileOptions, Vec<Diagnostic>> {
     if graph.build_plan.selected_target.kind == build_plan::TargetKind::Library {
         return Err(vec![build_plan::compiler_input_diagnostic(
             "E0685",
@@ -585,12 +597,7 @@ pub fn compile_compilation_graph(
             unreachable!("validated native plan has a profile")
         }
     };
-    let hir = lower_compilation_graph(graph)?;
-    backend::emit_with_options(&hir, options).map_err(|error| {
-        error
-            .diagnostics
-            .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
-    })
+    Ok(options)
 }
 
 pub fn compile_build_plan_file(

@@ -127,9 +127,10 @@ function check_performance_foundation(string $root): array
             'link_command',
             'generate_executable_with_performance',
         ],
+        // Revision validation belongs to check_benchmark_revision and the shared
+        // cross-repository reachability guard, not a second hard-coded pin here.
         'benchmarks-revision.json' => [
             '"repository": "dorialang/benchmarks"',
-            '"revision": "3802863768db3877b64f78712d0cd41bff8f8de8"',
         ],
         'scripts/check_benchmark_revision.php' => [
             'check_benchmark_revision',

@@ -1670,7 +1670,9 @@ runs derived to root, dropping each class phase's remaining properties in
 reverse order and freeing the allocation once. During construction or
 destruction, `$this` virtual calls stop at the currently active class phase.
 
-The heap payload remains headerless and data-only. Closed exact class values
+The payload remains headerless and data-only, including when a proven
+nonescaping allocation uses stack storage instead of the heap. Placement does
+not change ownership or destruction order. Closed exact class values
 remain one-word payload pointers. A statically open class value carries the
 payload pointer and a static hierarchy-descriptor pointer; an upcast constructs
 that carrier without allocating or copying the object. Parent-prefix property

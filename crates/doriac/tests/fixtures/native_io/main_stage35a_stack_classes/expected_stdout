@@ -1,0 +1,10 @@
+value 2
+drop last
+drop counter 2
+drop child
+drop first
+value 2
+drop counter 2
+drop child
+drop first
+caught expected

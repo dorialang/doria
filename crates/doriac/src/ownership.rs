@@ -5315,6 +5315,7 @@ impl Checker<'_> {
                     }
                 })
                 .unwrap_or(UseMode::Read);
+            self.mark_transferred_closure(&argument.value, mode, scopes);
             self.use_expr(&argument.value, scopes, mode);
             self.activate_place_input_borrows(&argument.value, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
@@ -5322,6 +5323,16 @@ impl Checker<'_> {
             }
         }
         self.active_borrows.truncate(borrow_depth);
+    }
+
+    fn mark_transferred_closure(&mut self, argument: &Expr, mode: UseMode, scopes: &mut Scopes) {
+        if mode == UseMode::Give {
+            if let Some(value) = self.prepare_retained_value(argument, scopes) {
+                // A taking callee owns the environment and may retain it beyond
+                // this activation. Borrow/lifetime validation remains separate.
+                self.mark_closure_escape(&value, ClosureEscapeClassification::Owned);
+            }
+        }
     }
 
     fn use_call_args(
@@ -5433,6 +5444,7 @@ impl Checker<'_> {
                     self.check_give_against_active_borrows(&root, arg.span());
                 }
             }
+            self.mark_transferred_closure(arg, mode, scopes);
             self.use_expr(arg, scopes, mode);
             if let Some(value) = self.retained_value_from_expr(arg, scopes) {
                 if mode == UseMode::Give {
