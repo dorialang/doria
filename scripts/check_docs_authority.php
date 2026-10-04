@@ -20,6 +20,16 @@ declare(strict_types=1);
 (static function (): void {
     require __DIR__ . '/check_stage35_authority.php';
 })();
+(static function (): void {
+    require __DIR__ . '/check_stage25a_completion.php';
+})();
+(static function (): void {
+    require __DIR__ . '/check_checked_error_foundation.php';
+})();
+(static function (): void {
+    require __DIR__ . '/check_stage29_completion.php';
+})();
+require_once __DIR__ . '/check_stage30f_php_closure_compatibility.php';
 
 require_once __DIR__ . '/check_stream_io_completeness.php';
 require_once __DIR__ . '/check_grouped_local_declarations.php';

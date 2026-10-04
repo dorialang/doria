@@ -147,13 +147,17 @@ function default_commands(string $root, string $target): array
     $native = $root . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'native';
 
     return [
+        command(['php', 'scripts/check_build_artifact_policy.php'], $target),
+        command(['php', 'scripts/check_docs_authority.php'], $target),
+        command(['php', 'scripts/check_diagnostic_style.php'], $target),
+        command(['php', 'scripts/check_panic_catalogue.php'], $target),
+        command(['php', 'scripts/check_runtime_diagnostic_architecture.php'], $target),
+        command(['php', 'scripts/check_indexed_foreach_and_scalar_display.php'], $target),
         command(['cargo', 'fmt', '--all', '--', '--check'], $target),
         command(['cargo', 'build', '-p', 'doria-rt', '--locked'], $target),
         command(['cargo', 'build', '-p', 'doriac', '--bin', 'doriac', '--locked'], $target),
         command(['cargo', 'clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '--workspace', '--all-targets', '--locked'], $target),
-        command(['php', 'scripts/check_indexed_foreach_and_scalar_display.php'], $target),
-        command(['php', 'scripts/check_stage35_authority.php'], $target),
         command([$executable, 'check', 'examples/php/person.doria'], $target),
         command([$executable, 'hir', 'examples/php/person.doria'], $target, true),
         command([$executable, 'compile', 'examples/native/main_return_zero.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_zero'], $target),

@@ -37,7 +37,7 @@ if ($kindBlockStart === false || $kindBlockEnd === false) {
 
 $semantics = $read('crates/doriac/src/semantics.rs');
 foreach ([
-    'kind != SharedHandleKind::SharedReference || property != "referencedValue"',
+    'if !kind.projects_payload_property(property)',
     'SharedHandleKind::WritableSharedReference => (',
     'SharedHandleKind::WeakReference | SharedHandleKind::WritableWeakReference => (',
 ] as $needle) {
@@ -45,10 +45,21 @@ foreach ([
         $failures[] = "semantics.rs: missing Stage 25a member rule `{$needle}`";
     }
 }
+if (!str_contains($types, 'self == Self::SharedReference && property == "referencedValue"')) {
+    $failures[] = 'types.rs: referencedValue must remain exclusive to SharedReference';
+}
 
 $tests = $read('crates/doriac/tests/stage25a_tests.rs');
-if (!str_contains($tests, 'fn shared_collection_properties_use_the_payload_member_contract()')) {
-    $failures[] = 'Stage 25a tests: missing shared collection property contract coverage';
+foreach ([
+    'referenced_value_resolves_as_the_readonly_payload',
+    'referenced_value_cannot_move_the_payload_out',
+    'referenced_value_exists_only_on_shared_reference',
+    'writes_through_referenced_value_are_rejected',
+    'shared_collection_properties_use_the_payload_member_contract',
+] as $test) {
+    if (!str_contains($tests, "fn {$test}()")) {
+        $failures[] = "Stage 25a tests: missing shared property contract coverage `{$test}`";
+    }
 }
 
 $runtime = $read('crates/doria-rt/src/lib.rs');
