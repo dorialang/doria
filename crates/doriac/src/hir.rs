@@ -153,6 +153,37 @@ pub enum ClassMember {
     Constant(ConstDecl),
 }
 
+impl ClassMember {
+    pub fn callables(&self) -> impl Iterator<Item = &FunctionDecl> {
+        let (method, hooks) = match self {
+            Self::Method(method) => (Some(method), None),
+            Self::Property(property) => (None, property.hooks.as_ref()),
+            Self::Constant(_) => (None, None),
+        };
+        method.into_iter().chain(
+            hooks
+                .into_iter()
+                .flat_map(|hooks| hooks.accessors.iter().map(|accessor| &accessor.function)),
+        )
+    }
+
+    pub fn callables_mut(&mut self) -> impl Iterator<Item = &mut FunctionDecl> {
+        let (method, hooks) = match self {
+            Self::Method(method) => (Some(method), None),
+            Self::Property(property) => (None, property.hooks.as_mut()),
+            Self::Constant(_) => (None, None),
+        };
+        method
+            .into_iter()
+            .chain(hooks.into_iter().flat_map(|hooks| {
+                hooks
+                    .accessors
+                    .iter_mut()
+                    .map(|accessor| &mut accessor.function)
+            }))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PropertyDecl {
     pub access: MemberAccess,
@@ -161,7 +192,33 @@ pub struct PropertyDecl {
     pub ty: TypeRef,
     pub name: String,
     pub initializer: Option<Expr>,
+    pub hooks: Option<PropertyHooks>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyHooks {
+    pub storage: crate::property_hooks::PropertyHookStorage,
+    pub backing_field: Option<crate::property_hooks::PropertyBackingField>,
+    pub accessors: Vec<PropertyAccessor>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropertyAccessor {
+    pub identity: crate::property_hooks::PropertyAccessorIdentity,
+    pub function: FunctionDecl,
+}
+
+impl PropertyDecl {
+    pub fn has_storage(&self) -> bool {
+        !self.hooks.as_ref().is_some_and(|hooks| {
+            hooks.storage == crate::property_hooks::PropertyHookStorage::Computed
+                || hooks
+                    .backing_field
+                    .as_ref()
+                    .is_some_and(|field| field.declaration != self.span)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

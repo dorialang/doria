@@ -1,0 +1,22 @@
+class Item {
+    function __construct(string $name) {}
+    function __destruct() { try { echo "drop {$this->name}\n"; } catch (Error) {} }
+}
+interface Shelf { Item $item { borrowed get; } }
+interface Factory { Item $created { get; } }
+class Store implements Shelf, Factory {
+    Item $item = new Item("stored") { borrowed get => $this->item; }
+    Item $created { get => new Item("temporary"); }
+    function __destruct() { try { echo "drop store\n"; } catch (Error) {} }
+}
+function maybe(?Factory $factory): ?Item { return $factory?->created; }
+function ignored(Factory $factory): void { $factory->created; }
+function borrowed(Shelf $shelf): void { echo $shelf->item->name . "\n"; }
+function main(): void {
+    let $store = new Store();
+    borrowed($store);
+    ignored($store);
+    { let $item = maybe($store); if ($item != null) { echo $item->name . "\n"; } }
+    echo (maybe(null) == null) . "\n";
+    borrowed($store);
+}

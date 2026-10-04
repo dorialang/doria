@@ -125,7 +125,7 @@ function check_stage31_slice1_namespaces(string $root): array
     ]);
     $require($paths['hir'], $files['hir'], ['pub semantic_info: crate::semantics::SemanticInfo']);
     $require($paths['mir'], $files['mir'], ['CompilationContext', 'GlobalSymbolFacts']);
-    $require($paths['php'], $files['php'], ['php_symbol_name', "SCRIPT_FILENAME", '__FILE__']);
+    $require($paths['php'], $files['php'], ['php_type_symbol', 'php_constant_symbol', '__DoriaType_', "SCRIPT_FILENAME", '__FILE__']);
     $require($paths['tests'], $files['tests'], [
         'one_resolver_canonicalizes_every_name_bearing_semantic_role',
         'canonical_io_requires_qualification_or_an_explicit_import',

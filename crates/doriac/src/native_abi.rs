@@ -229,6 +229,7 @@ pub const CORE_COLLECTION_HASH_POSITION: &str = "dr_v1_core_collection_hash_posi
 pub const COLLECTION_STAGE26_NEW: &str = "dr_v2_collection_new";
 pub const COLLECTION_AGGREGATE_NEW: &str = "dr_v4_collection_new_aggregate";
 pub const COLLECTION_AGGREGATE_VALUE_AT: &str = "dr_v4_collection_aggregate_value_at";
+pub const COLLECTION_BORROW_SLOT: &str = "dr_v1_collection_borrow_slot";
 pub const COLLECTION_AGGREGATE_PUSH_SLOT: &str = "dr_v4_collection_aggregate_push_slot";
 pub const COLLECTION_AGGREGATE_PUSH_FRONT_SLOT: &str = "dr_v4_collection_aggregate_push_front_slot";
 pub const COLLECTION_AGGREGATE_INSERT_SLOT: &str = "dr_v4_collection_aggregate_insert_slot";
@@ -254,6 +255,22 @@ pub const fn nullable_collection_access_code(
         crate::mir::NullableCollectionAccess::PopBack => Some(6),
         crate::mir::NullableCollectionAccess::At => Some(7),
         crate::mir::NullableCollectionAccess::RemoveAt => Some(8),
+    }
+}
+
+/// Read-only slot selection shares the nullable access codes. Checked indexing
+/// is distinct: unlike optional reads, an absent entry must report its normal
+/// bounds/key diagnostic. Removing operations cannot lend storage they erase.
+pub const fn collection_borrow_access_code(
+    access: crate::mir::NullableCollectionAccess,
+) -> Option<u8> {
+    match access {
+        crate::mir::NullableCollectionAccess::Index => Some(9),
+        crate::mir::NullableCollectionAccess::Get
+        | crate::mir::NullableCollectionAccess::First
+        | crate::mir::NullableCollectionAccess::Last
+        | crate::mir::NullableCollectionAccess::At => nullable_collection_access_code(access),
+        _ => None,
     }
 }
 pub const COLLECTION_STAGE26_FINALIZE: &str = "dr_v2_collection_finalize";
@@ -467,6 +484,29 @@ pub fn function_symbol(function: &mir::Function) -> String {
 mod tests {
     use super::{collection_header_size, collection_value_width, nullable_payload_type};
     use crate::mir::{InterfaceTypeId, Type};
+
+    #[test]
+    fn borrowed_collection_slots_only_accept_readonly_accesses() {
+        use crate::mir::NullableCollectionAccess as Access;
+        for (access, code) in [
+            (Access::Get, 0),
+            (Access::First, 2),
+            (Access::Last, 3),
+            (Access::At, 7),
+            (Access::Index, 9),
+        ] {
+            assert_eq!(super::collection_borrow_access_code(access), Some(code));
+        }
+        for access in [
+            Access::Remove,
+            Access::Pop,
+            Access::PopFront,
+            Access::PopBack,
+            Access::RemoveAt,
+        ] {
+            assert_eq!(super::collection_borrow_access_code(access), None);
+        }
+    }
 
     #[test]
     fn every_interface_specialization_uses_a_paired_carrier() {

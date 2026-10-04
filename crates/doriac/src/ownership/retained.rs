@@ -96,7 +96,9 @@ impl Analysis {
                         returns_move_type: resolved_type_is_move_type(
                             &requirement.signature.return_type,
                             move_enums,
-                        ),
+                        ) && requirement
+                            .return_borrow
+                            .is_none_or(|borrow| borrow.kind == ReturnBorrowKind::Retained),
                         return_borrow: requirement.return_borrow,
                         receiver: Some(if requirement.writable_receiver {
                             UseMode::Write
@@ -237,8 +239,11 @@ impl Checker<'_> {
                     Item::Function(function) => self.check_function(function, None),
                     Item::Class(class) => {
                         for member in &class.members {
-                            if let ClassMember::Method(method) = member {
-                                self.check_function(method, Some(&class.name));
+                            for callable in crate::property_hooks::member_callables(
+                                member,
+                                crate::property_hooks::PropertyHookContext::Class,
+                            ) {
+                                self.check_function(&callable, Some(&class.name));
                             }
                         }
                     }
@@ -309,6 +314,9 @@ impl Checker<'_> {
         scopes: &Scopes,
     ) -> Option<(Signature, Option<&'a Expr>, &'a [Argument])> {
         let (receiver, args) = match ungroup_expr(expr) {
+            Expr::PropertyAccess { object, .. } => {
+                return Some((self.getter_signature(expr)?, Some(object), &[]));
+            }
             Expr::New {
                 class_type, args, ..
             } => {
@@ -399,6 +407,7 @@ impl Checker<'_> {
         for source in self.constructor_sources(signature) {
             let Some(input) = self.call_borrow_source_expr(
                 ReturnBorrow {
+                    kind: ReturnBorrowKind::Retained,
                     source: source.source,
                     writable: false,
                 },
@@ -408,7 +417,10 @@ impl Checker<'_> {
             ) else {
                 continue;
             };
-            let loan = self.retained_source_loan(input, scopes);
+            let Some(loan) = self.retained_source_loan(input, scopes, BorrowAccess::Readonly)
+            else {
+                continue;
+            };
             if let Some(source) = self.parameter_source(&loan) {
                 sources.push(source);
             } else {
@@ -485,6 +497,7 @@ impl Checker<'_> {
         for source in sources {
             let input = self.call_borrow_source_expr(
                 ReturnBorrow {
+                    kind: ReturnBorrowKind::Retained,
                     source: source.source,
                     writable: false,
                 },
@@ -497,14 +510,26 @@ impl Checker<'_> {
                     append_loans(&mut loans, &value.leases);
                 }
             } else {
-                append_loans(&mut loans, &[self.retained_source_loan(input, scopes)]);
+                if let Some(loan) = self.retained_source_loan(input, scopes, BorrowAccess::Readonly)
+                {
+                    append_loans(&mut loans, &[loan]);
+                }
             }
         }
         Some(iterator_value(loans))
     }
 
-    fn retained_source_loan(&self, expr: &Expr, scopes: &Scopes) -> RetainedLoan {
-        let key = self.borrow_root_key(expr, scopes);
+    pub(super) fn retained_source_loan(
+        &self,
+        expr: &Expr,
+        scopes: &Scopes,
+        access: BorrowAccess,
+    ) -> Option<RetainedLoan> {
+        let source = self.borrow_source_root(expr, scopes);
+        if access == BorrowAccess::Readonly && source == Some(BorrowSourceRoot::ImmutableNull) {
+            return None;
+        }
+        let key = source.and_then(|source| source.place_key().map(str::to_string));
         let binding = key.as_ref().and_then(|key| {
             scopes
                 .0
@@ -529,14 +554,14 @@ impl Checker<'_> {
         } else {
             (BorrowRoot::Temporary, scopes.lexical_depth() + 1)
         };
-        RetainedLoan {
+        Some(RetainedLoan {
             root,
             root_key: key.unwrap_or_else(|| format!("temporary:{}", expr.span().start)),
-            access: BorrowAccess::Readonly,
+            access,
             capture_span: expr.span(),
             source_depth,
             inherited: false,
-        }
+        })
     }
 
     fn parameter_source(&self, loan: &RetainedLoan) -> Option<RetainedSource> {
@@ -650,6 +675,7 @@ impl Checker<'_> {
         for source in required {
             let Some(input) = self.call_borrow_source_expr(
                 ReturnBorrow {
+                    kind: ReturnBorrowKind::Retained,
                     source,
                     writable: false,
                 },

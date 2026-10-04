@@ -26,6 +26,26 @@ pub struct ClassMemberSurfaceEntry {
     pub checked_effects: Vec<ResolvedType>,
     pub automatic_effects: Vec<ResolvedType>,
     pub return_borrow: Option<ReturnBorrow>,
+    /// Ordinary fields and methods have no accessor contract. Property
+    /// writability alone does not imply that a getter or setter exists.
+    pub hooks: Option<PropertyHooksSurface>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyHooksSurface {
+    pub storage: Option<crate::property_hooks::PropertyHookStorage>,
+    pub getter: Option<PropertyAccessorSurface>,
+    pub setter: Option<PropertyAccessorSurface>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyAccessorSurface {
+    pub declaration: Span,
+    pub receiver_mode: ReceiverMode,
+    pub signature: CallableSignatureSemanticInfo,
+    pub checked_effects: Vec<ResolvedType>,
+    pub automatic_effects: Vec<ResolvedType>,
+    pub return_borrow: Option<ReturnBorrow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,7 +190,7 @@ impl Checker<'_> {
                 let mut entry = ClassMemberSurfaceEntry { name: name.clone(), kind: member.kind, declaration: member.span, name_span,
                     declaring_class: ClassType::new(owner.name.clone(), owner.arguments.iter().map(|argument| self.types.resolved(*argument)).collect()),
                     access: MemberAccess::External, writable: false, is_open: false, is_override: false, ty: None, signature: None,
-                    generic_parameters: Vec::new(), checked_effects: Vec::new(), automatic_effects: Vec::new(), return_borrow: None };
+                    generic_parameters: Vec::new(), checked_effects: Vec::new(), automatic_effects: Vec::new(), return_borrow: None, hooks: None };
                 match member.kind {
                     MemberKind::InstanceMethod | MemberKind::StaticMethod => {
                         let method = self.specialize_method_for_class(&info.methods[&name], &owner);
@@ -188,11 +208,21 @@ impl Checker<'_> {
                         });
                         if let Some(ClassMember::Method(method)) = syntax { entry.generic_parameters = method.type_params; }
                         (entry.automatic_effects, entry.checked_effects) = method.checked_effects.iter().map(|effect| self.types.resolved(*effect)).partition(crate::checked_effects::is_automatic_effect);
-                        entry.return_borrow = return_borrows.get(&method.declaration).copied().or(method.return_borrow);
+                        entry.return_borrow = return_borrows.get(&method.declaration).copied().or(method.return_borrow)
+                            .filter(|_| self.type_is_move_type(method.return_ty));
                     }
                     MemberKind::InstanceProperty | MemberKind::PromotedProperty => {
                         let property = self.specialize_property_for_class(&info.properties[&name], &owner);
                         entry.access = property.access; entry.writable = property.writable; entry.ty = Some(self.types.resolved(property.ty));
+                        if let Some(hooks) = &property.hooks {
+                            entry.is_open = hooks.is_open;
+                            entry.is_override = hooks.is_override;
+                            entry.hooks = Some(PropertyHooksSurface {
+                                storage: hooks.storage,
+                                getter: self.property_accessor_surface(&property, &owner, PropertyHookKind::Get, return_borrows),
+                                setter: self.property_accessor_surface(&property, &owner, PropertyHookKind::Set, return_borrows),
+                            });
+                        }
                     }
                     MemberKind::StaticProperty => {
                         let property = &info.static_properties[&name];
@@ -209,5 +239,47 @@ impl Checker<'_> {
             let valid = self.class_composition_is_valid(&class.name);
             ClassMemberSurface { receiver, members, valid }
         }).collect()
+    }
+
+    fn property_accessor_surface(
+        &mut self,
+        property: &PropertyInfo,
+        owner: &ClassType<TypeId>,
+        kind: PropertyHookKind,
+        return_borrows: &HashMap<Span, ReturnBorrow>,
+    ) -> Option<PropertyAccessorSurface> {
+        let method = self.property_accessor_method(property, owner, kind)?;
+        let (automatic_effects, checked_effects) = method
+            .checked_effects
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .partition(crate::checked_effects::is_automatic_effect);
+        Some(PropertyAccessorSurface {
+            declaration: method.declaration,
+            receiver_mode: method.receiver_mode.expect("instance accessor"),
+            signature: CallableSignatureSemanticInfo {
+                generic_parameter_count: method.type_params.len(),
+                parameters: method
+                    .params
+                    .iter()
+                    .map(|parameter| CallableParameterSemanticInfo {
+                        name: parameter.name.clone(),
+                        r#type: self.types.resolved(parameter.ty),
+                        take: parameter.take,
+                        writable: parameter.writable,
+                        borrow: false,
+                        has_default: parameter.has_default,
+                    })
+                    .collect(),
+                return_type: self.types.resolved(method.return_ty),
+            },
+            checked_effects,
+            automatic_effects,
+            return_borrow: return_borrows
+                .get(&method.declaration)
+                .copied()
+                .or(method.return_borrow)
+                .filter(|_| self.type_is_move_type(method.return_ty)),
+        })
     }
 }

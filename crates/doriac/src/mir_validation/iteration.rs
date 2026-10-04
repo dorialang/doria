@@ -116,6 +116,7 @@ pub(super) fn builtin_vtable(
         let expected_borrow = (operation == Op::GetCurrent
             && collection.value.has_move_ownership())
         .then_some(mir::ReturnBorrow {
+            kind: mir::ReturnBorrowKind::Value,
             source: mir::BorrowSource::Parameter(0),
             writable: false,
         });

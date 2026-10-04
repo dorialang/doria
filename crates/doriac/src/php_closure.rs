@@ -52,6 +52,8 @@ pub(crate) struct PhpCallableParameter {
 #[derive(Debug, Clone)]
 pub(crate) struct PhpCallablePlan {
     pub(crate) parameters: Vec<PhpCallableParameter>,
+    // True only when the returned carrier is borrowed. An owned closure may
+    // retain source borrows without lending its carrier or environment.
     pub(crate) returns_borrow: bool,
 }
 
@@ -295,7 +297,7 @@ fn callable_names(program: &hir::Program) -> HashMap<Option<String>, HashSet<Str
                     .entry(Some(class.name.clone()))
                     .or_insert_with(HashSet::new);
                 for member in &class.members {
-                    if let ClassMember::Method(method) = member {
+                    for method in member.callables() {
                         members.insert(method.name.clone());
                     }
                 }
@@ -333,10 +335,11 @@ fn callable_classes(program: &hir::Program) -> HashMap<crate::source::Span, Stri
             _ => None,
         })
         .flat_map(|class| {
-            class.members.iter().filter_map(|member| match member {
-                ClassMember::Method(method) => Some((method.span, class.name.clone())),
-                _ => None,
-            })
+            class
+                .members
+                .iter()
+                .flat_map(ClassMember::callables)
+                .map(|method| (method.span, class.name.clone()))
         })
         .collect()
 }
@@ -386,7 +389,7 @@ fn mark_parameter_home_bindings(program: &hir::Program, cells: &mut HashSet<Bind
             }
             Item::Class(class) => {
                 for member in &class.members {
-                    if let ClassMember::Method(method) = member {
+                    for method in member.callables() {
                         mark_callable_parameter_homes(method, program, cells);
                     }
                 }
@@ -464,7 +467,7 @@ fn collect_callable_plans(
             }
             Item::Class(class) => {
                 for member in &class.members {
-                    if let ClassMember::Method(method) = member {
+                    for method in member.callables() {
                         callables.insert(method.span, callable_plan(method, program, cells));
                     }
                 }
@@ -478,7 +481,9 @@ fn collect_callable_plans(
     for interface in &program.semantic_info.contracts.interface_specializations {
         for requirement in &interface.requirements {
             let plan = PhpCallablePlan {
-                returns_borrow: requirement.return_borrow.is_some(),
+                returns_borrow: requirement
+                    .return_borrow
+                    .is_some_and(|borrow| borrow.kind == crate::types::ReturnBorrowKind::Value),
                 parameters: requirement
                     .signature
                     .parameters
@@ -558,7 +563,8 @@ fn callable_plan(
         returns_borrow: program
             .semantic_info
             .return_borrows
-            .contains_key(&function.span),
+            .get(&function.span)
+            .is_some_and(|borrow| borrow.kind == crate::types::ReturnBorrowKind::Value),
         parameters: function
             .params
             .iter()
@@ -591,12 +597,11 @@ fn collect_call_targets(program: &hir::Program) -> HashMap<Span, Span> {
             _ => None,
         })
         .flat_map(|class| {
-            class.members.iter().filter_map(|member| match member {
-                ClassMember::Method(method) => {
-                    Some(((class.name.clone(), method.name.clone()), method.span))
-                }
-                _ => None,
-            })
+            class
+                .members
+                .iter()
+                .flat_map(ClassMember::callables)
+                .map(|method| ((class.name.clone(), method.name.clone()), method.span))
         })
         .collect::<HashMap<_, _>>();
 

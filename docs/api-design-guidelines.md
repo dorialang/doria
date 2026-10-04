@@ -91,10 +91,10 @@ Decision 0110 supplies reusable rules for hosted resource APIs:
 - Decision 0134 makes interface conformance nominal. Keep concrete generic paths
   statically specialized and erase to a two-word interface value only when the API needs
   heterogeneous dynamic dispatch. Do not require callers to allocate adapters.
-- User interfaces are method-only. Keep property-shaped capability contracts
-  out of public APIs until the property-hook authority defines their ownership,
-  effects, and mutation surface; the compiler-known Error message is the narrow
-  exception.
+- Decision 0135 permits property-shaped interface capabilities through separate
+  getter and setter contracts. State receiver access, result ownership, and
+  checked effects explicitly; interface requirements do not introduce storage.
+  The compiler-known stored Error message remains a narrow exception.
 - Use `Cloneable` only when an API preserves its input and must duplicate an
   owned Move value. Sharing remains explicit through `share()` and is not a
   synonym for cloning.
@@ -182,11 +182,29 @@ class Message<T>
 }
 ```
 
-The exact property-hook syntax is not settled, but the API design principle is settled: property hooks should preserve clear property-style access for members that are conceptually values.
+The master plan's [property-hook section](doria-end-to-end-plan.md#64-property-hooks)
+accepts `get` and explicitly typed `set` hooks. Decision 0135 additionally
+accepts automatic backing storage, `writable` properties for setters,
+`writable get` for mutating reads, `borrowed get` for borrowed results, and
+interface/trait/override integration. Receiver access and result ownership are
+independent: `writable borrowed get` combines those two qualities.
+Setter input types match their property's type; overriding backed hooks reuse
+inherited storage. A newly returned callback may own its environment while
+borrowing the receiver, and cannot outlive that receiver. Lending a stored
+callback instead uses `borrowed get`.
+Stage 36 owns their implementation and the accepted backing-access rules;
+the example above is illustrative, not an additional accepted contract.
+
+Decision 0135 permits checked `throws` and
+side effects, but forbids blocking and async work in v1.0. This includes the
+ORM-shaped lazy-relation design case. Property-shaped access is a readability
+convention, not a purity guarantee or permission to bypass borrowing rules.
+The nonblocking rule includes output and calls through helpers; put logging
+outside the hook rather than making output an implicit property-read effect.
 
 ## Methods are for actions
 
-Use methods for commands, mutations, operations with meaningful work, I/O, async operations, fallible operations, operations with required arguments, and behavior that is not simply exposing a value.
+Use methods for commands, mutations, operations with meaningful work, I/O, async operations, operations with required arguments, and behavior that is not simply exposing a value. Fallibility alone does not require a method: a property hook may declare checked errors under the plan's nonblocking, non-async contract.
 
 Examples:
 
@@ -239,6 +257,7 @@ Settled:
 - Verbs should be methods.
 - Data-shaped members should not become vague zero-argument noun methods.
 - Property hooks should preserve property-style access when values need validation, computation, lazy decoding, or guarded behavior.
+- Hooks may declare checked errors and have side effects, but may not block or perform async work in v1.0.
 - Methods should clearly communicate action, mutation, I/O, or meaningful work.
 - Doria examples should avoid Rust-flavored API vocabulary unless that vocabulary has been intentionally adopted.
 - Set and SortedSet iteration is readonly; replace an element through remove plus add.
@@ -254,7 +273,5 @@ Settled:
 Open:
 
 ```text
-- Exact property-hook grammar.
 - Whether heavy computed properties should require an annotation or lint.
-- Whether async property access should be disallowed entirely or represented through explicit methods only.
 ```

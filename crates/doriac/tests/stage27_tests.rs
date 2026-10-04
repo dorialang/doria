@@ -4,6 +4,9 @@ use doriac::mir;
 use doriac::source::SourceFile;
 use doriac::{ast, ast::Item};
 
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 fn diagnostics(source: &str) -> Vec<Diagnostic> {
     doriac::check_source("stage27.doria", source).expect_err("source should be rejected")
 }
@@ -19,6 +22,63 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
     let mir = doriac::lower_source_to_mir("stage27.doria", source)
         .expect("Stage 27 source should lower through shared MIR");
     doriac::mir_interpreter::interpret(&mir).expect("Stage 27 MIR should execute")
+}
+
+#[test]
+fn nullable_payload_results_preserve_source_places_and_once_only_removal() {
+    for (payload, value, observation) in [
+        ("int", "42", "$payload"),
+        ("Item", "new Item()", "$payload->number"),
+    ] {
+        let source = r#"
+class Item { int $number = 42; }
+enum Packet { case Value(PAYLOAD $payload); }
+class Holder {
+    Packet $stored = Packet::Value(VALUE);
+    function fetch(): Packet { return $this->stored; }
+}
+function fromArray(Packet[] $values): ?Packet { return $values[0]; }
+function fromList(List<Packet> $values): ?Packet { return $values[0]; }
+function fromDictionary(Dictionary<string, Packet> $values): ?Packet { return $values["x"]; }
+function fromProperty(Holder $holder): ?Packet { return $holder->stored; }
+function fromMethod(Holder $holder): ?Packet { return $holder->fetch(); }
+function remove(writable List<Packet> $values): ?Packet { return $values->removeAt(0); }
+function observe(?Packet $value): int {
+    if ($value == null) { return -1; }
+    return match ($value) { Packet::Value($payload) => OBSERVATION };
+}
+function main(): void {
+    Packet[] $array = [Packet::Value(VALUE)];
+    writable List<Packet> $list = [Packet::Value(VALUE)];
+    Dictionary<string, Packet> $dictionary = ["x" => Packet::Value(VALUE)];
+    let $holder = new Holder();
+    echo "{observe(fromArray($array))} {observe(fromList($list))} ";
+    echo "{observe(fromDictionary($dictionary))} {observe(fromProperty($holder))} ";
+    echo "{observe(fromMethod($holder))} {observe(remove($list))} ";
+    echo "{$list->count}\n";
+}
+"#
+        .replace("PAYLOAD", payload)
+        .replace("VALUE", value)
+        .replace("OBSERVATION", observation);
+        let program = doriac::lower_source_to_mir("nullable-enum-places.doria", &source).unwrap();
+        let output = doriac::mir_interpreter::interpret(&program).unwrap();
+        let stdout = "42 42 42 42 42 42 0\n";
+        assert_eq!(output.stdout, stdout.as_bytes());
+        assert_eq!(output.stderr, b"");
+        assert_eq!(output.exit_status, 0);
+        native_execution::assert_native_execution(
+            &program,
+            doriac::backend::NativeProfile::Fast,
+            stdout,
+        );
+        #[cfg(feature = "llvm-backend")]
+        native_execution::assert_native_execution(
+            &program,
+            doriac::backend::NativeProfile::Release,
+            stdout,
+        );
+    }
 }
 
 #[test]

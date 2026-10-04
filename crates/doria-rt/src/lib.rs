@@ -555,6 +555,34 @@ pub unsafe extern "C" fn dr_v4_collection_aggregate_value_at(
     )
 }
 
+/// Returns an exact read-only collection element address, or null for a
+/// missing optional entry. Stored null values retain their nonnull address.
+///
+/// # Safety
+///
+/// `collection` must be live and borrowed for the lifetime of the returned
+/// address. Access/key representations must come from validated MIR; mutation
+/// or destruction of the collection cannot overlap that loan. `current_frame`
+/// must be null or a live Doria stack frame.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_borrow_slot(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    access: u8,
+    positional: u8,
+) -> *mut u8 {
+    collection::borrow_slot(
+        current_frame,
+        collection,
+        key,
+        key_kind,
+        access,
+        positional != 0,
+    )
+}
+
 /// Appends an uninitialized aggregate slot and returns its address.
 ///
 /// # Safety

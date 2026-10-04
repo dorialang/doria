@@ -1,6 +1,193 @@
 use doriac::ast::{ClassMember, Expr, Item, Stmt};
 use doriac::semantics::{analyze_program_for_ide, CallableTarget};
 
+#[test]
+fn constrained_member_surfaces_keep_lexical_bounds_and_substituted_contracts() {
+    use doriac::ast::PropertyHookKind::Get;
+    use doriac::source::Span;
+    use doriac::types::ResolvedType;
+
+    let source = r#"
+interface Reader<T> {
+    function read(): T;
+    function(): T $callback { get; }
+}
+interface Fault extends Error { function code(): int; }
+function number<T implements Reader<int>>(T $number): void { $number->read(); }
+function text<T implements Reader<string>>(T $text): void { $text->read(); }
+function failure<T implements Fault>(T $failure): void { $failure->code(); }
+class Container<T implements Reader<bool>> {
+    function outer(T $outer): void { $outer->read(); }
+    function inner<U implements Reader<float>>(U $inner): void { $inner->read(); }
+}
+"#;
+    let (_, analysis) = doriac::analyze_source_for_ide("members.doria", source).unwrap();
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for (name, expected) in [
+        (
+            "number",
+            ResolvedType::Integer(doriac::types::IntegerType::Int64),
+        ),
+        ("text", ResolvedType::String),
+        ("outer", ResolvedType::Bool),
+        (
+            "inner",
+            ResolvedType::Float(doriac::types::FloatType::Float64),
+        ),
+    ] {
+        let start = source.find(&format!("${name}->")).unwrap();
+        let surface = &analysis.info.contracts.constrained_member_surfaces
+            [&Span::new(start, start + name.len() + 1)];
+        assert!(!surface.has_error_message);
+        assert_eq!(surface.requirements.len(), 2);
+        let read = surface
+            .requirements
+            .iter()
+            .find(|member| member.name == "read")
+            .unwrap();
+        assert_eq!(read.signature.return_type, expected);
+        let callback = surface
+            .requirements
+            .iter()
+            .find(|member| member.name == "callback")
+            .unwrap();
+        assert_eq!(callback.accessor, Some(Get));
+        let ResolvedType::Function(function) = &callback.signature.return_type else {
+            panic!("{:?}", callback.signature.return_type);
+        };
+        assert_eq!(function.return_type, expected);
+    }
+    let start = source.find("$failure->").unwrap();
+    assert!(
+        analysis.info.contracts.constrained_member_surfaces
+            [&Span::new(start, start + "$failure".len())]
+            .has_error_message
+    );
+}
+
+#[test]
+fn constrained_member_surfaces_share_intersection_selection_with_calls() {
+    use doriac::source::Span;
+    for constraints in ["Read, Cached, Conflict", "Conflict, Cached, Read"] {
+        let source = format!(
+            r#"
+interface Read {{
+    int $value {{ get; }}
+    function read(): int;
+    function clash(): int;
+}}
+interface Cached {{
+    int $value {{ writable get; }}
+    writable function read(): int;
+}}
+interface Conflict {{ function clash(): string; }}
+function inspect<T implements {constraints}>(T $receiver): int {{ return $receiver->value; }}
+"#
+        );
+        let (_, analysis) = doriac::analyze_source_for_ide("intersection.doria", &source).unwrap();
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{:?}",
+            analysis.diagnostics
+        );
+        let start = source.find("$receiver->").unwrap();
+        let surface = &analysis.info.contracts.constrained_member_surfaces
+            [&Span::new(start, start + "$receiver".len())];
+        assert_eq!(surface.requirements.len(), 2, "{surface:?}");
+        for requirement in &surface.requirements {
+            assert!(matches!(requirement.name.as_str(), "read" | "value"));
+            assert!(!requirement.writable_receiver);
+            assert_eq!(requirement.origins.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn member_receivers_expose_checked_access_without_inventing_writable_capability() {
+    use doriac::semantics::ObjectPathAccess::{ConstructionRoot, Readonly, Writable};
+    let source = r#"
+interface Reading { function read(): int; }
+class Leaf implements Reading {
+    writable int $value = 0;
+    function read(): int { return $this->value; }
+}
+class Holder {
+    writable Leaf $child = new Leaf();
+    Leaf $fixed = new Leaf();
+    function __construct() { $this->child->read(); }
+    function inspect(): int { return $this->fixed->read(); }
+    writable function change(): void { $this->child->value = 1; }
+}
+function borrowLeaf(writable Leaf $source): Leaf { return $source; }
+function inspect(Leaf $readonly, writable Leaf $writable,
+    Reading $interface, writable Reading $writableInterface,
+    SharedReference<Leaf> $shared,
+    ReadonlySharedReferenceAccess<Leaf> $readAccess,
+    WritableSharedReferenceAccess<Leaf> $writeAccess): void {
+    $readonly->read();
+    $writable->read();
+    $interface->read();
+    $writableInterface->read();
+    $shared->read();
+    $readAccess->read();
+    $writeAccess->read();
+    borrowLeaf($writable)->read();
+    new Leaf()->read();
+    let $local = new Leaf();
+    let writable $writableLocal = new Leaf();
+    $local->read();
+    $writableLocal->read();
+    $writableLocal->value = 2;
+}
+function constrained<T implements Reading>(T $generic, writable T $writableGeneric): void {
+    $generic->read();
+    $writableGeneric->read();
+}
+"#;
+    let (_, analysis) = doriac::analyze_source_for_ide("access.doria", source).unwrap();
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for (operation, expected) in [
+        ("$this->value", Readonly),
+        ("$this->child->read()", Writable),
+        ("$this->child", ConstructionRoot),
+        ("$this->fixed->read()", Readonly),
+        ("$this->fixed", Readonly),
+        ("$this->child->value = 1", Writable),
+        ("$readonly->read()", Readonly),
+        ("$writable->read()", Writable),
+        ("$interface->read()", Readonly),
+        ("$writableInterface->read()", Writable),
+        ("$shared->read()", Readonly),
+        ("$readAccess->read()", Readonly),
+        ("$writeAccess->read()", Writable),
+        ("borrowLeaf($writable)->read()", Writable),
+        ("new Leaf()->read()", Writable),
+        ("$local->read()", Readonly),
+        ("$writableLocal->read()", Writable),
+        ("$writableLocal->value = 2", Writable),
+        ("$generic->read()", Readonly),
+        ("$writableGeneric->read()", Writable),
+    ] {
+        let start = source.find(operation).unwrap();
+        let end = start + operation.rfind("->").unwrap();
+        assert_eq!(
+            analysis
+                .info
+                .member_receiver_access(doriac::source::Span::new(start, end)),
+            Some(expected),
+            "{operation}"
+        );
+    }
+}
+
 fn method_declaration_span(
     program: &doriac::ast::Program,
     class_name: &str,

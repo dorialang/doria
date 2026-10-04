@@ -108,7 +108,7 @@ pub(super) fn nominal_type_name(ty: &ResolvedType, scopes: &PhpNameScopes) -> Op
                 .class_symbols
                 .get(class)
                 .cloned()
-                .unwrap_or_else(|| php_symbol_name(&class.name)),
+                .unwrap_or_else(|| php_type_symbol(&class.name)),
         ),
         ResolvedType::Interface(interface) => Some(specialization_name(interface)),
         ResolvedType::Error => Some(declaration_name("Error")),

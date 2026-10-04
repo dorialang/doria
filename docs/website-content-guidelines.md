@@ -114,11 +114,13 @@ canonical Doria examples using a `str_*` free function or a string-operation
 instance method. PHP migration examples may show PHP spellings when they are
 clearly identified as PHP input.
 
-Interface and trait examples follow Decision 0134. Teach explicit nominal
-`implements`, method-only interface requirements, `uses` composition,
-bodyless trait requirements, and Doria's `insteadof`/`as internal` vocabulary.
-Do not teach structural conformance, primitive boxing, interface properties,
-property hooks, runtime mixins, PHP visibility words, or PHP trait precedence.
+Interface and trait examples follow Decision 0134 and Decision 0135. Teach
+explicit nominal `implements`, bodyless method and accessor requirements,
+`uses` composition, bodyless trait requirements, and Doria's
+`insteadof`/`as internal` vocabulary. Hook examples preserve automatic backing
+storage, typed setters, `writable get`, `borrowed get`, and checked effects.
+Do not teach structural conformance, primitive boxing, stored interface fields,
+runtime mixins, PHP visibility words, or PHP trait precedence.
 Every user-defined `foreach` binding remains explicitly typed and value-only;
 built-in sequence indexes and Dictionary keys retain Decision 0132's separate
 roles.

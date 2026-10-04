@@ -2,6 +2,22 @@
 
 use super::*;
 
+pub fn property(property: &PropertyDecl, visitor: &mut dyn FnMut(&Expr)) {
+    optional(&property.initializer, visitor);
+    for hook in &property.hooks {
+        property_hook(hook, visitor);
+    }
+}
+
+pub fn property_hook(hook: &PropertyHook, visitor: &mut dyn FnMut(&Expr)) {
+    if let Some(parameter) = &hook.parameter {
+        optional(&parameter.default, visitor);
+    }
+    if let Some(body) = hook.body.as_block() {
+        block(body, visitor);
+    }
+}
+
 pub fn block(block: &Block, visitor: &mut dyn FnMut(&Expr)) {
     for statement in &block.statements {
         stmt(statement, visitor);

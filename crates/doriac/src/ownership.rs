@@ -15,8 +15,10 @@ use crate::symbols::{
     BindingId, BindingKind, BindingOwnership, BindingResolution, BorrowSource, ClosureId,
     ReturnBorrow,
 };
-use crate::types::{FunctionInvocationMode, ResolvedType};
+use crate::types::{CollectionFamily, FunctionInvocationMode, ResolvedType, ReturnBorrowKind};
 
+pub mod cleanup;
+mod property_hooks;
 mod retained;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +87,12 @@ pub struct ClosureOwnershipInfo {
 pub(crate) struct OwnershipAnalysis {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) closures: HashMap<ClosureId, ClosureOwnershipInfo>,
+    /// Final local carrier ownership, keyed by the canonical binding identity.
+    /// Name/type checking cannot decide this before returned-loan inference.
+    pub(crate) binding_ownership: HashMap<BindingId, BindingOwnership>,
     pub(crate) return_borrows: HashMap<Span, ReturnBorrow>,
     pub(crate) retained_callables: HashMap<Span, RetainedCallableInfo>,
+    pub(crate) cleanup: cleanup::Analysis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +132,9 @@ struct Signature {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReturnedClosureProvenance {
+pub(crate) enum ReturnedClosureProvenance {
     Owned,
-    Borrowed(ReturnBorrow),
+    Retained(ReturnBorrow),
     Invalid,
 }
 
@@ -171,11 +177,17 @@ fn writable_shared_constructor_signature() -> Signature {
     }
 }
 
-fn returned_closure_provenance(
+pub(crate) fn returned_closure_provenance(
     function: &ast::FunctionDecl,
     closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     binding_resolution: &BindingResolution,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
 ) -> Option<ReturnedClosureProvenance> {
+    struct ClosureSources<'a> {
+        values: HashMap<BindingId, Vec<Expr>>,
+        resolve_call: std::cell::RefCell<&'a mut dyn FnMut(&Expr) -> ReturnBorrowLookup>,
+    }
+
     fn merge(
         current: ReturnedClosureProvenance,
         incoming: ReturnedClosureProvenance,
@@ -187,20 +199,23 @@ fn returned_closure_provenance(
             (ReturnedClosureProvenance::Owned, ReturnedClosureProvenance::Owned) => {
                 ReturnedClosureProvenance::Owned
             }
-            (ReturnedClosureProvenance::Owned, ReturnedClosureProvenance::Borrowed(borrow))
-            | (ReturnedClosureProvenance::Borrowed(borrow), ReturnedClosureProvenance::Owned) => {
-                ReturnedClosureProvenance::Borrowed(borrow)
+            (ReturnedClosureProvenance::Owned, ReturnedClosureProvenance::Retained(borrow))
+            | (ReturnedClosureProvenance::Retained(borrow), ReturnedClosureProvenance::Owned) => {
+                ReturnedClosureProvenance::Retained(borrow)
             }
             (
-                ReturnedClosureProvenance::Borrowed(current),
-                ReturnedClosureProvenance::Borrowed(incoming),
+                ReturnedClosureProvenance::Retained(current),
+                ReturnedClosureProvenance::Retained(incoming),
             ) if current.source == incoming.source => {
-                ReturnedClosureProvenance::Borrowed(ReturnBorrow {
+                ReturnedClosureProvenance::Retained(ReturnBorrow {
+                    kind: ReturnBorrowKind::Retained,
                     source: current.source,
-                    writable: current.writable && incoming.writable,
+                    writable: current
+                        .kind
+                        .join_writable(current.writable, incoming.writable),
                 })
             }
-            (ReturnedClosureProvenance::Borrowed(_), ReturnedClosureProvenance::Borrowed(_)) => {
+            (ReturnedClosureProvenance::Retained(_), ReturnedClosureProvenance::Retained(_)) => {
                 ReturnedClosureProvenance::Invalid
             }
         }
@@ -337,7 +352,7 @@ fn returned_closure_provenance(
         function: &ast::FunctionDecl,
         closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
         binding_resolution: &BindingResolution,
-        sources: &HashMap<BindingId, Vec<Expr>>,
+        sources: &ClosureSources<'_>,
         visiting: &mut HashSet<BindingId>,
     ) -> Option<ReturnedClosureProvenance> {
         match ungroup_expr(expr) {
@@ -345,28 +360,53 @@ fn returned_closure_provenance(
                 let semantic = closures.get(&ClosureId::from_span(closure.span))?;
                 let mut borrow: Option<ReturnBorrow> = None;
                 for capture in &semantic.captures {
-                    if capture.mode == ast::ClosureCaptureMode::Take {
-                        continue;
-                    }
                     let declaration = binding_resolution
                         .declarations_by_id
                         .get(&capture.source_binding_id)?;
-                    let candidate = match declaration.kind {
-                        BindingKind::MethodReceiver => ReturnBorrow {
-                            source: BorrowSource::Receiver,
-                            writable: capture.mode == ast::ClosureCaptureMode::Writable,
-                        },
-                        BindingKind::FunctionParameter | BindingKind::MethodParameter => {
-                            let index = function
-                                .params
-                                .iter()
-                                .position(|parameter| parameter.name == declaration.name)?;
-                            ReturnBorrow {
-                                source: BorrowSource::Parameter(index),
-                                writable: capture.mode == ast::ClosureCaptureMode::Writable,
+                    let candidate = if capture.mode == ast::ClosureCaptureMode::Take {
+                        // Moving an owned callback moves its environment, not
+                        // the sources that environment may still borrow.
+                        // Taking noncallable values (including Copy captures)
+                        // has no callback-source dependency to propagate.
+                        if non_null_function_type(&capture.source_type).is_none() {
+                            continue;
+                        }
+                        match from_binding(
+                            capture.source_binding_id,
+                            function,
+                            closures,
+                            binding_resolution,
+                            sources,
+                            visiting,
+                        )? {
+                            ReturnedClosureProvenance::Owned => continue,
+                            ReturnedClosureProvenance::Retained(borrow) => borrow,
+                            ReturnedClosureProvenance::Invalid => {
+                                return Some(ReturnedClosureProvenance::Invalid);
                             }
                         }
-                        _ => return Some(ReturnedClosureProvenance::Invalid),
+                    } else {
+                        match declaration.kind {
+                            BindingKind::MethodReceiver => ReturnBorrow {
+                                kind: ReturnBorrowKind::Retained,
+                                source: BorrowSource::Receiver,
+                                writable: capture.mode == ast::ClosureCaptureMode::Writable,
+                            },
+                            BindingKind::FunctionParameter
+                            | BindingKind::MethodParameter
+                            | BindingKind::ClosureParameter => {
+                                let index = function
+                                    .params
+                                    .iter()
+                                    .position(|parameter| parameter.name == declaration.name)?;
+                                ReturnBorrow {
+                                    kind: ReturnBorrowKind::Retained,
+                                    source: BorrowSource::Parameter(index),
+                                    writable: capture.mode == ast::ClosureCaptureMode::Writable,
+                                }
+                            }
+                            _ => return Some(ReturnedClosureProvenance::Invalid),
+                        }
                     };
                     match borrow {
                         Some(existing) if existing.source != candidate.source => {
@@ -374,7 +414,9 @@ fn returned_closure_provenance(
                         }
                         Some(existing) => {
                             borrow = Some(ReturnBorrow {
-                                writable: existing.writable && candidate.writable,
+                                writable: existing
+                                    .kind
+                                    .join_writable(existing.writable, candidate.writable),
                                 ..existing
                             });
                         }
@@ -383,31 +425,116 @@ fn returned_closure_provenance(
                 }
                 Some(borrow.map_or(
                     ReturnedClosureProvenance::Owned,
-                    ReturnedClosureProvenance::Borrowed,
+                    ReturnedClosureProvenance::Retained,
                 ))
             }
             Expr::Variable { span, .. } => {
                 let id = *binding_resolution.uses_by_span.get(span)?;
-                if !visiting.insert(id) {
-                    return Some(ReturnedClosureProvenance::Invalid);
+                from_binding(
+                    id,
+                    function,
+                    closures,
+                    binding_resolution,
+                    sources,
+                    visiting,
+                )
+            }
+            Expr::FunctionCall { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::CallableCall { .. }
+            | Expr::PropertyAccess { .. } => {
+                let lookup = (sources.resolve_call.borrow_mut())(expr);
+                if matches!(lookup, ReturnBorrowLookup::Resolved(None)) {
+                    return Some(ReturnedClosureProvenance::Owned);
                 }
-                let mut found = None;
-                for source in sources.get(&id)? {
-                    let candidate = from_expr(
-                        source,
-                        function,
-                        closures,
-                        binding_resolution,
-                        sources,
-                        visiting,
-                    )?;
-                    found = Some(found.map_or(candidate, |current| merge(current, candidate)));
-                }
-                visiting.remove(&id);
-                found
+                let mut resolve = |source: &Expr| {
+                    if source.span() == expr.span() {
+                        return lookup;
+                    }
+                    if let Expr::Variable { span, .. } = source {
+                        let Some(id) = binding_resolution.uses_by_span.get(span) else {
+                            return ReturnBorrowLookup::Unresolved;
+                        };
+                        let declaration = &binding_resolution.declarations_by_id[id];
+                        if matches!(
+                            declaration.kind,
+                            BindingKind::FunctionParameter
+                                | BindingKind::MethodParameter
+                                | BindingKind::ClosureParameter
+                        ) {
+                            return ReturnBorrowLookup::Resolved(
+                                function.params.iter().enumerate().find_map(
+                                    |(index, parameter)| {
+                                        (parameter.name == declaration.name && !parameter.take)
+                                            .then_some(ReturnBorrow {
+                                                kind: ReturnBorrowKind::Value,
+                                                source: BorrowSource::Parameter(index),
+                                                writable: parameter.writable,
+                                            })
+                                    },
+                                ),
+                            );
+                        }
+                        return ReturnBorrowLookup::Resolved(
+                            match from_binding(
+                                *id,
+                                function,
+                                closures,
+                                binding_resolution,
+                                sources,
+                                visiting,
+                            ) {
+                                Some(ReturnedClosureProvenance::Retained(borrow)) => Some(borrow),
+                                _ => None,
+                            },
+                        );
+                    }
+                    (sources.resolve_call.borrow_mut())(source)
+                };
+                expr_return_borrow(expr, function, &mut resolve, &HashSet::new())
+                    .filter(|borrow| borrow.kind == ReturnBorrowKind::Retained)
+                    .map(ReturnedClosureProvenance::Retained)
             }
             _ => None,
         }
+    }
+
+    fn from_binding(
+        id: BindingId,
+        function: &ast::FunctionDecl,
+        closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
+        binding_resolution: &BindingResolution,
+        sources: &ClosureSources<'_>,
+        visiting: &mut HashSet<BindingId>,
+    ) -> Option<ReturnedClosureProvenance> {
+        let Some(values) = sources.values.get(&id) else {
+            return binding_resolution
+                .declarations_by_id
+                .get(&id)
+                .filter(|declaration| declaration.ownership == BindingOwnership::Owned)
+                .map(|_| ReturnedClosureProvenance::Owned);
+        };
+        if !visiting.insert(id) {
+            return Some(ReturnedClosureProvenance::Invalid);
+        }
+        let result = (|| {
+            let mut found = None;
+            for source in values {
+                let candidate = from_expr(
+                    source,
+                    function,
+                    closures,
+                    binding_resolution,
+                    sources,
+                    visiting,
+                )?;
+                found = Some(found.map_or(candidate, |current| merge(current, candidate)));
+            }
+            found
+        })();
+        visiting.remove(&id);
+        result
     }
 
     fn visit_block(
@@ -415,7 +542,7 @@ fn returned_closure_provenance(
         function: &ast::FunctionDecl,
         closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
         binding_resolution: &BindingResolution,
-        sources: &HashMap<BindingId, Vec<Expr>>,
+        sources: &ClosureSources<'_>,
         found: &mut Option<ReturnedClosureProvenance>,
     ) {
         for statement in &block.statements {
@@ -554,6 +681,10 @@ fn returned_closure_provenance(
     let mut sources = HashMap::new();
     let body = function.body.as_block()?;
     collect_sources(body, binding_resolution, &mut sources);
+    let sources = ClosureSources {
+        values: sources,
+        resolve_call: std::cell::RefCell::new(resolve_call),
+    };
     let mut found = None;
     visit_block(
         body,
@@ -599,7 +730,7 @@ struct Binding {
     collection: Option<CollectionInfo>,
     mixed: bool,
     borrowed_place: bool,
-    borrow_root: Option<String>,
+    borrow_root: Option<BorrowSourceRoot>,
     writable: bool,
     state: State,
     function_type: Option<crate::types::SemanticFunctionType<ResolvedType>>,
@@ -633,6 +764,23 @@ struct RetainedLoan {
     inherited: bool,
 }
 
+/// An immutable absent value has no owner to keep alive. Keep that fact
+/// distinct from an expression whose owning temporary cannot be retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BorrowSourceRoot {
+    Place(String),
+    ImmutableNull,
+}
+
+impl BorrowSourceRoot {
+    fn place_key(&self) -> Option<&str> {
+        match self {
+            Self::Place(key) => Some(key),
+            Self::ImmutableNull => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OwnershipSlotId(usize);
 
@@ -645,17 +793,6 @@ struct PropertyInfo {
     writable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CollectionFamily {
-    TypedArray,
-    List,
-    Dictionary,
-    Set,
-    PriorityQueue,
-    Deque,
-    Bytes,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CollectionInfo {
     family: CollectionFamily,
@@ -666,11 +803,11 @@ struct CollectionInfo {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Scopes(Vec<HashMap<String, Option<Binding>>>);
+struct Scopes(Vec<HashMap<String, Option<Binding>>>, cleanup::State);
 
 impl Scopes {
     fn new() -> Self {
-        Self(vec![HashMap::new()])
+        Self(vec![HashMap::new()], cleanup::State::default())
     }
 
     fn push(&mut self) {
@@ -719,7 +856,13 @@ impl Scopes {
             scope.iter().find_map(|(name, binding)| {
                 binding
                     .as_ref()
-                    .is_some_and(|binding| binding.borrow_root.as_deref() == Some(root))
+                    .is_some_and(|binding| {
+                        binding
+                            .borrow_root
+                            .as_ref()
+                            .and_then(BorrowSourceRoot::place_key)
+                            == Some(root)
+                    })
                     .then_some(name.as_str())
             })
         })
@@ -812,6 +955,7 @@ impl Scopes {
     }
 
     fn merge_from(&mut self, left: &Self, right: &Self) {
+        self.1.merge_from(&left.1, &right.1);
         for (index, scope) in self.0.iter_mut().enumerate() {
             for (name, binding) in scope {
                 let Some(binding) = binding else {
@@ -940,6 +1084,8 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let assertion_callable_invocations = HashMap::new();
     let list_algorithm_calls = HashMap::new();
     let call_targets = HashMap::new();
+    let property_accessor_calls = HashMap::new();
+    let property_writes = HashMap::new();
     check_program_with_inferred_move_returns(
         program,
         &OwnershipAnalysisContext {
@@ -958,6 +1104,11 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
             assertion_callable_invocations: &assertion_callable_invocations,
             list_algorithm_calls: &list_algorithm_calls,
             call_targets: &call_targets,
+            property_accessor_calls: &property_accessor_calls,
+            property_writes: &property_writes,
+            matches: &HashMap::new(),
+            enum_semantics: &[],
+            enum_case_constructions: &HashMap::new(),
             contracts: &crate::semantics::contracts::ContractFacts::default(),
             classes: &[],
         },
@@ -967,7 +1118,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
 
 pub(crate) struct OwnershipAnalysisContext<'a> {
     pub(crate) inferred_move_returns: &'a HashSet<Span>,
-    pub(crate) return_borrows: &'a HashMap<Span, ReturnBorrow>,
+    pub(crate) return_borrows: &'a HashMap<Span, Option<ReturnBorrow>>,
     pub(crate) resolved_types: &'a HashMap<Span, crate::types::ResolvedType>,
     pub(crate) flow_facts: &'a FactsByUse,
     pub(crate) move_enum_names: &'a HashSet<String>,
@@ -981,6 +1132,11 @@ pub(crate) struct OwnershipAnalysisContext<'a> {
     pub(crate) assertion_callable_invocations: &'a HashMap<Span, FunctionInvocationMode>,
     pub(crate) list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
     pub(crate) call_targets: &'a HashMap<Span, crate::semantics::CallableTarget>,
+    pub(crate) property_accessor_calls: &'a HashMap<Span, crate::semantics::PropertyAccessorCalls>,
+    pub(crate) property_writes: &'a HashMap<Span, crate::semantics::PropertyWriteSemanticInfo>,
+    pub(crate) matches: &'a HashMap<Span, crate::semantics::MatchSemanticInfo>,
+    pub(crate) enum_semantics: &'a [crate::semantics::EnumSemanticInfo],
+    pub(crate) enum_case_constructions: &'a HashMap<Span, crate::enums::EnumCaseId>,
     pub(crate) contracts: &'a crate::semantics::contracts::ContractFacts,
     pub(crate) classes: &'a [crate::semantics::ClassSemanticInfo],
 }
@@ -1005,6 +1161,11 @@ pub(crate) fn check_program_with_inferred_move_returns(
         assertion_callable_invocations,
         list_algorithm_calls,
         call_targets,
+        property_accessor_calls,
+        property_writes,
+        matches,
+        enum_semantics,
+        enum_case_constructions,
         contracts,
         classes: class_semantics,
     } = *context;
@@ -1044,11 +1205,14 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     None,
                     &[],
                 );
-                if let Some(ReturnedClosureProvenance::Borrowed(borrow)) =
-                    returned_closure_provenance(function, closures, binding_resolution)
+                if let Some(ReturnedClosureProvenance::Retained(borrow)) =
+                    returned_closure_provenance(function, closures, binding_resolution, &mut |_| {
+                        ReturnBorrowLookup::Unresolved
+                    })
                 {
                     function_signature.return_borrow = Some(borrow);
-                    resolved_return_borrows.insert(function.span, borrow);
+                    function_signature.returns_move_type = true;
+                    resolved_return_borrows.insert(function.span, Some(borrow));
                 }
                 signatures.insert(function.name.clone(), function_signature);
             }
@@ -1089,60 +1253,69 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 },
                             );
                         }
-                        ClassMember::Constant(_) | ClassMember::Uses(_) => {}
-                        ClassMember::Method(method) => {
-                            let mut method_signature = signature(
-                                method,
-                                &classes,
-                                move_enum_names,
-                                inferred_move_returns,
-                                return_borrows,
-                                Some(&class.name),
-                                &class.type_params,
-                            );
-                            if let Some(ReturnedClosureProvenance::Borrowed(borrow)) =
-                                returned_closure_provenance(method, closures, binding_resolution)
-                            {
-                                method_signature.return_borrow = Some(borrow);
-                                resolved_return_borrows.insert(method.span, borrow);
-                            }
-                            methods.insert(
-                                (class.name.clone(), method.name.clone()),
-                                method_signature.clone(),
-                            );
-                            if method.name == "__construct" {
-                                constructors.insert(class.name.clone(), method_signature);
-                                for param in &method.params {
-                                    let property_class =
-                                        type_ref_class_name(&param.ty, &classes, Some(&class.name));
-                                    let move_type = type_ref_is_move_type_with_enums(
+                        ClassMember::Constant(_)
+                        | ClassMember::Uses(_)
+                        | ClassMember::Method(_) => {}
+                    }
+                    for callable in crate::property_hooks::member_callables(
+                        member,
+                        crate::property_hooks::PropertyHookContext::Class,
+                    ) {
+                        let mut method_signature = signature(
+                            &callable,
+                            &classes,
+                            move_enum_names,
+                            inferred_move_returns,
+                            return_borrows,
+                            Some(&class.name),
+                            &class.type_params,
+                        );
+                        if let Some(ReturnedClosureProvenance::Retained(borrow)) =
+                            returned_closure_provenance(
+                                &callable,
+                                closures,
+                                binding_resolution,
+                                &mut |_| ReturnBorrowLookup::Unresolved,
+                            )
+                        {
+                            method_signature.return_borrow = Some(borrow);
+                            method_signature.returns_move_type = true;
+                            resolved_return_borrows.insert(callable.span, Some(borrow));
+                        }
+                        methods.insert(
+                            (class.name.clone(), callable.name.clone()),
+                            method_signature.clone(),
+                        );
+                        if callable.name == "__construct" {
+                            constructors.insert(class.name.clone(), method_signature);
+                            for param in &callable.params {
+                                let property_class =
+                                    type_ref_class_name(&param.ty, &classes, Some(&class.name));
+                                let move_type =
+                                    type_ref_is_move_type_with_enums(
                                         &param.ty,
                                         &classes,
                                         move_enum_names,
                                         Some(&class.name),
-                                    ) || type_ref_mentions_parameter(
-                                        &param.ty,
-                                        &class.type_params,
+                                    ) || type_ref_mentions_parameter(&param.ty, &class.type_params);
+                                if param.constructor_role.is_promoted() {
+                                    properties.insert(
+                                        (class.name.clone(), param.name.clone()),
+                                        PropertyInfo {
+                                            class: property_class,
+                                            collection: type_ref_collection_info(
+                                                &param.ty,
+                                                &classes,
+                                                move_enum_names,
+                                                Some(&class.name),
+                                                &class.type_params,
+                                                &[],
+                                            ),
+                                            mixed: param.ty.name == "mixed",
+                                            move_type,
+                                            writable: param.writable,
+                                        },
                                     );
-                                    if param.constructor_role.is_promoted() {
-                                        properties.insert(
-                                            (class.name.clone(), param.name.clone()),
-                                            PropertyInfo {
-                                                class: property_class,
-                                                collection: type_ref_collection_info(
-                                                    &param.ty,
-                                                    &classes,
-                                                    move_enum_names,
-                                                    Some(&class.name),
-                                                    &class.type_params,
-                                                    &[],
-                                                ),
-                                                mixed: param.ty.name == "mixed",
-                                                move_type,
-                                                writable: param.writable,
-                                            },
-                                        );
-                                    }
                                 }
                             }
                         }
@@ -1189,7 +1362,26 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     );
                 }
             }
-            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Trait(declaration) => {
+                for member in &declaration.members {
+                    for callable in crate::property_hooks::member_callables(
+                        member,
+                        crate::property_hooks::PropertyHookContext::Trait,
+                    ) {
+                        if let Some(ReturnedClosureProvenance::Retained(borrow)) =
+                            returned_closure_provenance(
+                                &callable,
+                                closures,
+                                binding_resolution,
+                                &mut |_| ReturnBorrowLookup::Unresolved,
+                            )
+                        {
+                            resolved_return_borrows.insert(callable.span, Some(borrow));
+                        }
+                    }
+                }
+            }
+            Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
         }
     }
 
@@ -1226,13 +1418,22 @@ pub(crate) fn check_program_with_inferred_move_returns(
         assertion_callable_invocations,
         list_algorithm_calls,
         call_targets,
+        property_accessor_calls,
+        property_writes,
+        matches,
+        enum_semantics,
+        enum_case_constructions,
         retained: retained::Analysis::new(class_semantics, contracts, move_enum_names),
         next_binding_id: 0,
         diagnostics: Vec::new(),
         closure_ownership: HashMap::new(),
+        binding_ownership: HashMap::new(),
         closure_values: HashMap::new(),
         analyzed_closures: HashSet::new(),
         prepared_closure_evaluations: HashSet::new(),
+        cleanup_owner: None,
+        cleanup_analysis: cleanup::Analysis::default(),
+        cleanup_yield_regions: Vec::new(),
     };
     checker.infer_retained_callables(program);
     let mut top_level_scopes = Scopes::new();
@@ -1245,6 +1446,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     match member {
                         ClassMember::Property(property) => {
                             if let Some(initializer) = &property.initializer {
+                                let cleanup_context = checker.cleanup_begin_callable(property.span);
                                 let previous_receiver =
                                     checker.receiver_class.replace(class.name.clone());
                                 let mut scopes = Scopes::new();
@@ -1315,13 +1517,28 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                         UseMode::Read
                                     },
                                 );
+                                // Stored initialization transfers only its result;
+                                // argument and receiver temporaries still expire here.
+                                checker.cleanup_take_expr(initializer, &mut scopes);
+                                let mut flow = Flow::fallthrough();
+                                checker.cleanup_end_callable(
+                                    cleanup_context,
+                                    &mut scopes,
+                                    &mut flow,
+                                    property.span,
+                                );
                                 checker.receiver_class = previous_receiver;
                             }
                         }
-                        ClassMember::Method(method) => {
-                            checker.check_function(method, Some(&class.name))
-                        }
-                        ClassMember::Constant(_) | ClassMember::Uses(_) => {}
+                        ClassMember::Constant(_)
+                        | ClassMember::Uses(_)
+                        | ClassMember::Method(_) => {}
+                    }
+                    for callable in crate::property_hooks::member_callables(
+                        member,
+                        crate::property_hooks::PropertyHookContext::Class,
+                    ) {
+                        checker.check_function(&callable, Some(&class.name));
                     }
                 }
             }
@@ -1338,35 +1555,290 @@ pub(crate) fn check_program_with_inferred_move_returns(
     OwnershipAnalysis {
         diagnostics: checker.diagnostics,
         closures: checker.closure_ownership,
-        return_borrows: checker.return_borrows,
+        binding_ownership: checker.binding_ownership,
+        return_borrows: checker
+            .return_borrows
+            .into_iter()
+            .filter_map(|(span, borrow)| borrow.map(|borrow| (span, borrow)))
+            .collect(),
         retained_callables: checker.retained.callables,
+        cleanup: checker.cleanup_analysis,
     }
 }
 
-pub(crate) fn function_return_borrow_in_context(
+/// An unresolved property may still be a stored-field projection. A resolved
+/// owned getter must not fall back to borrowing that field's receiver.
+#[derive(Clone, Copy)]
+pub(crate) enum ReturnBorrowLookup {
+    Unresolved,
+    Resolved(Option<ReturnBorrow>),
+    /// A selected callee's parameter has already been bound to source-order
+    /// arguments by the shared argument binder (including named arguments).
+    ResolvedArgument {
+        borrow: ReturnBorrow,
+        argument_index: usize,
+    },
+}
+
+pub(crate) fn return_borrow_parameters(
+    parameters: impl Iterator<Item = (bool, bool)>,
+) -> Vec<usize> {
+    let borrowed = parameters
+        .enumerate()
+        .filter(|(_, (borrowed, _))| *borrowed)
+        .collect::<Vec<_>>();
+    // Symbolic parameters retain source provenance until substitution decides
+    // whether the result is Copy or Move (Decision 0105).
+    borrowed
+        .iter()
+        .filter(|(_, (_, symbolic))| borrowed.len() == 1 || *symbolic)
+        .map(|(index, _)| *index)
+        .collect()
+}
+
+/// After body checking, infer through the canonical binding identities and
+/// control-flow graph. The earlier signature pass has neither local binding
+/// facts nor checked call targets and remains deliberately conservative.
+pub(crate) fn function_return_borrow_with_bindings(
     function: &ast::FunctionDecl,
-    enclosing_type_params: &[ast::TypeParamDecl],
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    borrowed_parameters: Vec<usize>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
+    bindings: &BindingResolution,
+    graph: &crate::control_flow::ControlFlowGraph,
 ) -> Option<ReturnBorrow> {
-    if enclosing_type_params.is_empty() {
-        return function_return_borrow_with_calls(function, resolve_call);
+    use crate::control_flow::NodeAction;
+    let mut entry = HashMap::new();
+    for index in borrowed_parameters {
+        let parameter = &function.params[index];
+        if let Some(id) = bindings.declaration_by_span.get(&parameter.span) {
+            entry.insert(
+                *id,
+                ReturnBorrowAlias::Borrowed(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    source: BorrowSource::Parameter(index),
+                    writable: parameter.writable,
+                }),
+            );
+        }
     }
-    let mut scoped_function = function.clone();
-    scoped_function
-        .type_params
-        .extend_from_slice(enclosing_type_params);
-    function_return_borrow_with_calls(&scoped_function, resolve_call)
+    let analysis = ReturnBorrowAliases {
+        function,
+        bindings,
+        entry,
+        resolve_call: std::cell::RefCell::new(resolve_call),
+    };
+    let solved = crate::dataflow::solve_forward(graph, &analysis);
+    let mut returned = ReturnBorrowAlias::Null;
+    for node in &graph.nodes {
+        let Some(state) = &solved.inputs[node.id.0] else {
+            continue;
+        };
+        if let NodeAction::Statement(Stmt::Return { expr, .. }) = &node.action {
+            returned = returned.join(expr.as_ref().map_or(ReturnBorrowAlias::Unknown, |expr| {
+                analysis.expression(expr, state)
+            }));
+        }
+    }
+    match returned {
+        ReturnBorrowAlias::Borrowed(borrow) => Some(borrow),
+        ReturnBorrowAlias::Null | ReturnBorrowAlias::Unknown => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReturnBorrowAlias {
+    // Unknown includes independent ownership and incompatible branch roots.
+    Unknown,
+    Null,
+    Borrowed(ReturnBorrow),
+}
+
+impl ReturnBorrowAlias {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Null, value) | (value, Self::Null) => value,
+            (Self::Borrowed(left), Self::Borrowed(right))
+                if left.source == right.source && left.kind == right.kind =>
+            {
+                Self::Borrowed(ReturnBorrow {
+                    writable: left.kind.join_writable(left.writable, right.writable),
+                    ..left
+                })
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+struct ReturnBorrowAliases<'a> {
+    function: &'a ast::FunctionDecl,
+    bindings: &'a BindingResolution,
+    entry: HashMap<BindingId, ReturnBorrowAlias>,
+    resolve_call: std::cell::RefCell<&'a mut dyn FnMut(&Expr) -> ReturnBorrowLookup>,
+}
+
+impl ReturnBorrowAliases<'_> {
+    fn expression(
+        &self,
+        expr: &Expr,
+        state: &HashMap<BindingId, ReturnBorrowAlias>,
+    ) -> ReturnBorrowAlias {
+        match ungroup_expr(expr) {
+            Expr::Null { .. } => ReturnBorrowAlias::Null,
+            Expr::Variable { span, .. } => self
+                .bindings
+                .uses_by_span
+                .get(span)
+                .and_then(|id| state.get(id))
+                .copied()
+                .unwrap_or(ReturnBorrowAlias::Unknown),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => self
+                .expression(left, state)
+                .join(self.expression(right, state)),
+            expr => {
+                let mut resolve_call = self.resolve_call.borrow_mut();
+                let mut resolve = |expr: &Expr| {
+                    if let Expr::Variable { span, .. } = expr {
+                        return ReturnBorrowLookup::Resolved(
+                            self.bindings
+                                .uses_by_span
+                                .get(span)
+                                .and_then(|id| state.get(id))
+                                .and_then(|value| match value {
+                                    ReturnBorrowAlias::Borrowed(borrow) => Some(*borrow),
+                                    _ => None,
+                                }),
+                        );
+                    }
+                    resolve_call(expr)
+                };
+                expr_return_borrow(expr, self.function, &mut resolve, &HashSet::new())
+                    .map_or(ReturnBorrowAlias::Unknown, ReturnBorrowAlias::Borrowed)
+            }
+        }
+    }
+
+    fn declare(
+        &self,
+        declaration: &ast::VarDecl,
+        state: &mut HashMap<BindingId, ReturnBorrowAlias>,
+    ) {
+        let value = self.expression(&declaration.initializer, state);
+        for binding in &declaration.bindings {
+            if let Some(id) = self.bindings.declaration_by_span.get(&binding.span) {
+                state.insert(*id, value);
+            }
+        }
+    }
+
+    fn assign(
+        &self,
+        assignment: &ast::Assignment,
+        state: &mut HashMap<BindingId, ReturnBorrowAlias>,
+    ) {
+        let Expr::Variable { span, .. } = ungroup_expr(&assignment.target) else {
+            return;
+        };
+        let Some(id) = self.bindings.uses_by_span.get(span) else {
+            return;
+        };
+        let value = if assignment.op == AssignOp::Assign {
+            self.expression(&assignment.value, state)
+        } else {
+            ReturnBorrowAlias::Unknown
+        };
+        state.insert(*id, value);
+    }
+}
+
+impl crate::dataflow::ForwardAnalysis for ReturnBorrowAliases<'_> {
+    // None is unreachable, distinct from a reachable value with unknown roots.
+    type State = Option<HashMap<BindingId, ReturnBorrowAlias>>;
+
+    fn bottom(&self) -> Self::State {
+        None
+    }
+    fn entry_state(&self) -> Self::State {
+        Some(self.entry.clone())
+    }
+
+    fn transfer(&self, node: &crate::control_flow::Node, input: &Self::State) -> Self::State {
+        use crate::control_flow::NodeAction;
+        let mut output = input.clone()?;
+        match &node.action {
+            NodeAction::Statement(Stmt::VarDecl(declaration))
+            | NodeAction::ForInitializer(ast::ForInitializer::VarDecl(declaration)) => {
+                self.declare(declaration, &mut output);
+            }
+            NodeAction::Statement(Stmt::Assignment(assignment))
+            | NodeAction::ForInitializer(ast::ForInitializer::Assignment(assignment)) => {
+                self.assign(assignment, &mut output);
+            }
+            NodeAction::ForIncrement(ast::ForIncrement::Assignment(assignment)) => {
+                self.assign(assignment, &mut output);
+            }
+            _ => {}
+        }
+        Some(output)
+    }
+
+    fn join(&self, state: &mut Self::State, incoming: &Self::State) -> bool {
+        let Some(incoming) = incoming else {
+            return false;
+        };
+        let Some(current) = state else {
+            *state = Some(incoming.clone());
+            return true;
+        };
+        let mut merged = current.clone();
+        for id in current.keys().chain(incoming.keys()) {
+            let left = current
+                .get(id)
+                .copied()
+                .unwrap_or(ReturnBorrowAlias::Unknown);
+            let right = incoming
+                .get(id)
+                .copied()
+                .unwrap_or(ReturnBorrowAlias::Unknown);
+            merged.insert(*id, left.join(right));
+        }
+        if *current == merged {
+            return false;
+        }
+        *current = merged;
+        true
+    }
 }
 
 pub(crate) fn function_return_borrow_with_calls(
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    borrowed_parameters: Vec<usize>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
 ) -> Option<ReturnBorrow> {
+    let mut resolve_source = |expr: &Expr| {
+        if let Expr::Variable { name, .. } = expr {
+            return ReturnBorrowLookup::Resolved(borrowed_parameters.iter().find_map(|&index| {
+                let parameter = &function.params[index];
+                (parameter.name == *name).then_some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    source: BorrowSource::Parameter(index),
+                    writable: parameter.writable,
+                })
+            }));
+        }
+        resolve_call(expr)
+    };
     let mut borrow = None;
     if block_return_borrow(
         function.body.as_block()?,
         function,
-        resolve_call,
+        &mut resolve_source,
         &HashSet::new(),
         &mut borrow,
     )
@@ -1381,7 +1853,7 @@ pub(crate) fn function_return_borrow_with_calls(
 fn block_return_borrow(
     block: &ast::Block,
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
     inherited_shadowed: &HashSet<String>,
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
@@ -1400,7 +1872,7 @@ fn block_return_borrow(
 fn statement_return_borrow(
     statement: &Stmt,
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
     shadowed: &mut HashSet<String>,
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
@@ -1409,11 +1881,20 @@ fn statement_return_borrow(
         Stmt::Return {
             expr: Some(expr), ..
         } => {
+            if matches!(ungroup_expr(expr), Expr::Null { .. }) {
+                return Some(false);
+            }
             let candidate = expr_return_borrow(expr, function, resolve_call, shadowed)?;
             match borrow {
-                Some(existing) if existing.source != candidate.source => None,
+                Some(existing)
+                    if existing.source != candidate.source || existing.kind != candidate.kind =>
+                {
+                    None
+                }
                 Some(existing) => {
-                    existing.writable &= candidate.writable;
+                    existing.writable = existing
+                        .kind
+                        .join_writable(existing.writable, candidate.writable);
                     Some(false)
                 }
                 slot @ None => {
@@ -1521,7 +2002,7 @@ fn statement_return_borrow(
 fn else_branch_return_borrow(
     branch: &ast::ElseBranch,
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
     shadowed: &HashSet<String>,
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
@@ -1545,41 +2026,19 @@ fn else_branch_return_borrow(
 fn expr_return_borrow(
     expr: &Expr,
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
     shadowed: &HashSet<String>,
 ) -> Option<ReturnBorrow> {
     match expr {
         Expr::This { .. } if !function.is_static => Some(ReturnBorrow {
+            kind: ReturnBorrowKind::Value,
             source: BorrowSource::Receiver,
             writable: function.writable_this,
         }),
-        Expr::Variable { name, .. }
-            if !shadowed.contains(name)
-                && (function.params.iter().any(|param| {
-                    param.name == *name
-                        && !param.take
-                        && (type_ref_mentions_parameter(&param.ty, &function.type_params)
-                            || matches!(
-                                param.ty.name.as_str(),
-                                "List" | "Dictionary" | "Set" | "Bytes" | "[]"
-                            ))
-                }) || function
-                    .params
-                    .iter()
-                    .filter(|param| !param.take && param.ty.as_class_name().is_some())
-                    .count()
-                    == 1) =>
-        {
-            function
-                .params
-                .iter()
-                .enumerate()
-                .find(|(_, param)| param.name == *name && !param.take)
-                .map(|(index, param)| ReturnBorrow {
-                    source: BorrowSource::Parameter(index),
-                    writable: param.writable,
-                })
-        }
+        Expr::Variable { name, .. } if !shadowed.contains(name) => match resolve_call(expr) {
+            ReturnBorrowLookup::Resolved(borrow) => borrow,
+            ReturnBorrowLookup::Unresolved | ReturnBorrowLookup::ResolvedArgument { .. } => None,
+        },
         Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, resolve_call, shadowed),
         Expr::Binary {
             left,
@@ -1588,6 +2047,17 @@ fn expr_return_borrow(
             ..
         } => coalesced_return_borrow(left, right, function, resolve_call, shadowed),
         Expr::PropertyAccess { object, .. } => {
+            if let ReturnBorrowLookup::Resolved(borrow) = resolve_call(expr) {
+                let borrow = borrow?;
+                return returned_borrow_source(
+                    borrow,
+                    Some(object),
+                    &[],
+                    function,
+                    resolve_call,
+                    shadowed,
+                );
+            }
             expr_return_borrow(object, function, resolve_call, shadowed).map(|borrow| {
                 ReturnBorrow {
                     writable: false,
@@ -1603,7 +2073,9 @@ fn expr_return_borrow(
                 }
             })
         }
-        Expr::FunctionCall { args, .. } | Expr::StaticCall { args, .. } => {
+        Expr::FunctionCall { args, .. }
+        | Expr::StaticCall { args, .. }
+        | Expr::CallableCall { args, .. } => {
             returned_call_borrow(expr, None, args, function, resolve_call, shadowed)
         }
         Expr::MethodCall { object, args, .. } => {
@@ -1617,7 +2089,7 @@ fn coalesced_return_borrow(
     left: &Expr,
     right: &Expr,
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
     shadowed: &HashSet<String>,
 ) -> Option<ReturnBorrow> {
     let left_null = matches!(ungroup_expr(left), Expr::Null { .. });
@@ -1631,8 +2103,10 @@ fn coalesced_return_borrow(
 
     match (left, right, left_null, right_null) {
         (Some(borrow), None, _, true) | (None, Some(borrow), true, _) => Some(borrow),
-        (Some(mut left), Some(right), _, _) if left.source == right.source => {
-            left.writable &= right.writable;
+        (Some(mut left), Some(right), _, _)
+            if left.source == right.source && left.kind == right.kind =>
+        {
+            left.writable = left.kind.join_writable(left.writable, right.writable);
             Some(left)
         }
         _ => None,
@@ -1651,10 +2125,39 @@ fn returned_call_borrow(
     receiver: Option<&Expr>,
     args: &[Argument],
     function: &ast::FunctionDecl,
-    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
     shadowed: &HashSet<String>,
 ) -> Option<ReturnBorrow> {
-    let returned = resolve_call(call)?;
+    match resolve_call(call) {
+        ReturnBorrowLookup::Resolved(Some(returned)) => {
+            returned_borrow_source(returned, receiver, args, function, resolve_call, shadowed)
+        }
+        ReturnBorrowLookup::ResolvedArgument {
+            borrow: returned,
+            argument_index,
+        } => expr_return_borrow(
+            &args.get(argument_index)?.value,
+            function,
+            resolve_call,
+            shadowed,
+        )
+        .map(|borrow| ReturnBorrow {
+            kind: returned.kind,
+            writable: returned_source_access(borrow, returned),
+            ..borrow
+        }),
+        ReturnBorrowLookup::Unresolved | ReturnBorrowLookup::Resolved(None) => None,
+    }
+}
+
+fn returned_borrow_source(
+    returned: ReturnBorrow,
+    receiver: Option<&Expr>,
+    args: &[Argument],
+    function: &ast::FunctionDecl,
+    resolve_call: &mut dyn FnMut(&Expr) -> ReturnBorrowLookup,
+    shadowed: &HashSet<String>,
+) -> Option<ReturnBorrow> {
     let source = match returned.source {
         BorrowSource::Receiver => receiver?,
         BorrowSource::Parameter(index) => {
@@ -1662,9 +2165,16 @@ fn returned_call_borrow(
         }
     };
     expr_return_borrow(source, function, resolve_call, shadowed).map(|mut borrow| {
-        borrow.writable &= returned.writable;
+        borrow.writable = returned_source_access(borrow, returned);
+        borrow.kind = returned.kind;
         borrow
     })
+}
+
+fn returned_source_access(source: ReturnBorrow, returned: ReturnBorrow) -> bool {
+    returned
+        .kind
+        .compose_writable(source.kind, source.writable, returned.writable)
 }
 
 /// Resolve the source-order argument bound to parameter `param_index` of
@@ -1700,19 +2210,39 @@ fn signature(
     classes: &HashSet<String>,
     move_enum_names: &HashSet<String>,
     inferred_move_returns: &HashSet<Span>,
-    return_borrows: &HashMap<Span, ReturnBorrow>,
+    return_borrows: &HashMap<Span, Option<ReturnBorrow>>,
     receiver_class: Option<&str>,
     enclosing_type_params: &[ast::TypeParamDecl],
 ) -> Signature {
     let return_borrow = return_borrows
         .get(&function.span)
         .copied()
-        .or_else(|| {
-            function_return_borrow_in_context(function, enclosing_type_params, &mut |_| None)
+        .unwrap_or_else(|| {
+            function_return_borrow_with_calls(
+                function,
+                return_borrow_parameters(function.params.iter().map(|param| {
+                    let symbolic = type_ref_mentions_any_parameter(
+                        &param.ty,
+                        &function.type_params,
+                        enclosing_type_params,
+                    );
+                    (
+                        !param.take
+                            && (type_ref_is_move_type_with_enums(
+                                &param.ty,
+                                classes,
+                                move_enum_names,
+                                receiver_class,
+                            ) || symbolic),
+                        symbolic,
+                    )
+                })),
+                &mut |_| ReturnBorrowLookup::Unresolved,
+            )
         })
         .filter(|_| {
             function.return_type.as_ref().is_some_and(|ty| {
-                type_ref_class_name(ty, classes, receiver_class).is_some()
+                type_ref_is_move_type_with_enums(ty, classes, move_enum_names, receiver_class)
                     || type_ref_mentions_any_parameter(
                         ty,
                         &function.type_params,
@@ -1765,7 +2295,7 @@ fn signature(
                     &function.type_params,
                     enclosing_type_params,
                 ))
-                && return_borrow.is_none()
+                && return_borrow.is_none_or(|borrow| borrow.kind == ReturnBorrowKind::Retained)
         }) || (function.return_type.is_none()
             && inferred_move_returns.contains(&function.span)),
         return_borrow,
@@ -1821,6 +2351,8 @@ struct Flow {
 #[derive(Debug, Clone)]
 struct ExceptionalExit {
     effect: crate::types::ResolvedType,
+    site: Span,
+    values: HashSet<cleanup::ValueId>,
     scopes: Scopes,
 }
 
@@ -1892,7 +2424,7 @@ struct Checker<'a> {
     properties: HashMap<(String, String), PropertyInfo>,
     static_properties: HashMap<(String, String), bool>,
     inferred_move_returns: HashSet<Span>,
-    return_borrows: HashMap<Span, ReturnBorrow>,
+    return_borrows: HashMap<Span, Option<ReturnBorrow>>,
     resolved_types: &'a HashMap<Span, crate::types::ResolvedType>,
     given_preludes: &'a HashMap<Span, crate::semantics::GivenSemanticInfo>,
     checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
@@ -1915,13 +2447,22 @@ struct Checker<'a> {
     assertion_callable_invocations: &'a HashMap<Span, FunctionInvocationMode>,
     list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
     call_targets: &'a HashMap<Span, crate::semantics::CallableTarget>,
+    property_accessor_calls: &'a HashMap<Span, crate::semantics::PropertyAccessorCalls>,
+    property_writes: &'a HashMap<Span, crate::semantics::PropertyWriteSemanticInfo>,
+    matches: &'a HashMap<Span, crate::semantics::MatchSemanticInfo>,
+    enum_semantics: &'a [crate::semantics::EnumSemanticInfo],
+    enum_case_constructions: &'a HashMap<Span, crate::enums::EnumCaseId>,
     retained: retained::Analysis,
     next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
     closure_ownership: HashMap<ClosureId, ClosureOwnershipInfo>,
+    binding_ownership: HashMap<BindingId, BindingOwnership>,
     closure_values: HashMap<ClosureId, RetainedValueState>,
     analyzed_closures: HashSet<ClosureId>,
     prepared_closure_evaluations: HashSet<ClosureId>,
+    cleanup_owner: Option<Span>,
+    cleanup_analysis: cleanup::Analysis,
+    cleanup_yield_regions: Vec<(Span, usize)>,
 }
 
 impl Checker<'_> {
@@ -1984,27 +2525,83 @@ impl Checker<'_> {
     }
 
     fn record_exceptional_exits(&mut self, span: Span, scopes: &Scopes) {
-        let Some(exception_scope) = self.exception_scopes.last_mut() else {
+        self.record_exceptional_effects_at(
+            span,
+            crate::checked_effects::effects_at(self.checked_effect_sites, span),
+            scopes,
+        );
+    }
+
+    fn record_exceptional_effects_at(
+        &mut self,
+        span: Span,
+        effects: &[ResolvedType],
+        scopes: &Scopes,
+    ) {
+        self.record_exceptional_effects_with_values(span, effects, scopes, None);
+    }
+
+    fn record_exceptional_effects_with_values(
+        &mut self,
+        span: Span,
+        effects: &[ResolvedType],
+        scopes: &Scopes,
+        transferred: Option<&HashSet<cleanup::ValueId>>,
+    ) {
+        let Some(depth) = self
+            .exception_scopes
+            .last()
+            .map(|scope| scope.lexical_depth)
+        else {
             return;
         };
-        let effects = crate::checked_effects::effects_at(self.checked_effect_sites, span);
         for effect in effects {
-            let mut exit_scopes = scopes.clone();
-            exit_scopes.truncate_to(exception_scope.lexical_depth);
-            exception_scope.exits.push(ExceptionalExit {
-                effect: effect.clone(),
-                scopes: exit_scopes,
+            let values = transferred.cloned().unwrap_or_else(|| {
+                self.cleanup_owner
+                    .map(|owner| {
+                        HashSet::from([self.cleanup_analysis.acquire(
+                            owner,
+                            cleanup::Source::Expression(span),
+                            effect.clone(),
+                            HashSet::new(),
+                        )])
+                    })
+                    .unwrap_or_default()
             });
+            let mut exit_scopes = scopes.clone();
+            let dropped = exit_scopes.1.drain_for_exception(depth);
+            self.cleanup_release(span, dropped, cleanup::Cause::CheckedError);
+            exit_scopes.truncate_to(depth);
+            self.exception_scopes
+                .last_mut()
+                .expect("exception scope")
+                .exits
+                .push(ExceptionalExit {
+                    effect: effect.clone(),
+                    site: span,
+                    values,
+                    scopes: exit_scopes,
+                });
         }
     }
 
     fn propagate_exceptional_exits(&mut self, exits: impl IntoIterator<Item = ExceptionalExit>) {
-        let Some(parent) = self.exception_scopes.last_mut() else {
+        let Some(depth) = self
+            .exception_scopes
+            .last()
+            .map(|scope| scope.lexical_depth)
+        else {
             return;
         };
         for mut exit in exits {
-            exit.scopes.truncate_to(parent.lexical_depth);
-            parent.exits.push(exit);
+            let values = exit.scopes.1.drain_for_exception(depth);
+            self.cleanup_release(exit.site, values, cleanup::Cause::CheckedError);
+            exit.scopes.truncate_to(depth);
+            self.exception_scopes
+                .last_mut()
+                .expect("parent exception scope")
+                .exits
+                .push(exit);
         }
     }
 
@@ -2013,19 +2610,35 @@ impl Checker<'_> {
         finally: &ast::Block,
         exits: &mut Vec<ExceptionalExit>,
         return_move_type: bool,
-    ) {
+    ) -> Flow {
         let diagnostics_before = self.diagnostics.len();
+        let mut overrides = Flow::stops();
         exits.retain_mut(|exit| {
-            self.check_block(finally, &mut exit.scopes, return_move_type, true)
-                .falls_through
+            exit.scopes.1.put(
+                cleanup::Slot::PendingError(exit.site),
+                exit.values.clone(),
+                0,
+            );
+            let mut flow = self.check_block(finally, &mut exit.scopes, return_move_type, true);
+            self.cleanup_superseded_control_exit(&mut flow, finally.span);
+            if flow.falls_through {
+                exit.values = exit.scopes.1.take(&cleanup::Slot::PendingError(exit.site));
+            }
+            overrides.backedges.append(&mut flow.backedges);
+            overrides.breaks.append(&mut flow.breaks);
+            overrides.returns.append(&mut flow.returns);
+            overrides.yields.append(&mut flow.yields);
+            flow.falls_through
         });
         self.deduplicate_diagnostics_from(diagnostics_before);
+        overrides
     }
 
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
         let Some(body) = function.body.as_block() else {
             return;
         };
+        let cleanup_context = self.cleanup_begin_callable(function.span);
         let previous_retained_context = self.retained.enter_function(function);
         let enclosing_type_params = receiver_class
             .and_then(|class| self.class_type_params.get(class))
@@ -2044,26 +2657,47 @@ impl Checker<'_> {
             .return_type
             .as_ref()
             .is_some_and(|ty| {
-                type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()).is_some()
-                    || type_ref_mentions_any_parameter(
-                        ty,
-                        &function.type_params,
-                        &enclosing_type_params,
-                    )
+                type_ref_is_move_type_with_enums(
+                    ty,
+                    &self.classes,
+                    &self.move_enum_names,
+                    self.receiver_class.as_deref(),
+                ) || type_ref_mentions_any_parameter(
+                    ty,
+                    &function.type_params,
+                    &enclosing_type_params,
+                )
             })
             .then(|| {
                 self.return_borrows
                     .get(&function.span)
                     .copied()
-                    .or_else(|| {
-                        function_return_borrow_in_context(
+                    .unwrap_or_else(|| {
+                        function_return_borrow_with_calls(
                             function,
-                            &enclosing_type_params,
-                            &mut |_| None,
+                            return_borrow_parameters(function.params.iter().map(|param| {
+                                let symbolic = type_ref_mentions_any_parameter(
+                                    &param.ty,
+                                    &function.type_params,
+                                    &enclosing_type_params,
+                                );
+                                (
+                                    !param.take
+                                        && (type_ref_is_move_type_with_enums(
+                                            &param.ty,
+                                            &self.classes,
+                                            &self.move_enum_names,
+                                            self.receiver_class.as_deref(),
+                                        ) || symbolic),
+                                    symbolic,
+                                )
+                            })),
+                            &mut |_| ReturnBorrowLookup::Unresolved,
                         )
                     })
             })
             .flatten()
+            .filter(|borrow| borrow.kind == ReturnBorrowKind::Value)
             .map(|borrow| {
                 if borrow.writable {
                     UseMode::Write
@@ -2133,6 +2767,11 @@ impl Checker<'_> {
                     scope_depth: scopes.lexical_depth(),
                 },
             );
+            if param.take && !param.constructor_role.is_promoted() {
+                if let Some(binding) = canonical_id {
+                    self.cleanup_owned_parameter(binding, &mut scopes);
+                }
+            }
         }
         let return_move_type = function.return_type.as_ref().is_some_and(|ty| {
             (type_ref_is_move_type_with_enums(
@@ -2144,7 +2783,8 @@ impl Checker<'_> {
                 && self.current_return_borrow.is_none()
         }) || (function.return_type.is_none()
             && self.inferred_move_returns.contains(&function.span));
-        self.check_block(body, &mut scopes, return_move_type, false);
+        let mut flow = self.check_block(body, &mut scopes, return_move_type, false);
+        self.cleanup_end_callable(cleanup_context, &mut scopes, &mut flow, body.span);
         self.current_return_borrow = previous_return_borrow;
         self.current_type_params = previous_type_params;
         self.receiver_writable = previous_receiver_writable;
@@ -2169,7 +2809,20 @@ impl Checker<'_> {
             }
             scopes.release_unused_borrows(&block.statements[index..], nested);
             scopes.release_unused_closure_leases(&block.statements[index..], nested);
-            let statement_flow = self.check_statement(statement, scopes, return_move_type);
+            let mut statement_flow = self.check_statement(statement, scopes, return_move_type);
+            let site = cleanup::statement_span(statement);
+            if statement_flow.falls_through {
+                self.cleanup_release_temporaries(scopes, site);
+            }
+            for exit in statement_flow
+                .backedges
+                .iter_mut()
+                .chain(&mut statement_flow.breaks)
+                .chain(&mut statement_flow.returns)
+                .chain(&mut statement_flow.yields)
+            {
+                self.cleanup_release_temporaries(exit, site);
+            }
             flow.falls_through = statement_flow.falls_through;
             flow.backedges.extend(statement_flow.backedges);
             flow.breaks.extend(statement_flow.breaks);
@@ -2177,19 +2830,7 @@ impl Checker<'_> {
             flow.yields.extend(statement_flow.yields);
         }
         if nested {
-            scopes.pop();
-            for backedge in &mut flow.backedges {
-                backedge.pop();
-            }
-            for break_exit in &mut flow.breaks {
-                break_exit.pop();
-            }
-            for return_exit in &mut flow.returns {
-                return_exit.pop();
-            }
-            for yield_exit in &mut flow.yields {
-                yield_exit.pop();
-            }
+            self.cleanup_pop_flow_scope(scopes, &mut flow, block.span);
         }
         flow
     }
@@ -2224,24 +2865,37 @@ impl Checker<'_> {
                                 .cloned()
                         })?
                     });
-                let borrowed_function_value = match ungroup_expr(&decl.initializer) {
+                let borrowed_carrier_alias = match ungroup_expr(&decl.initializer) {
                     Expr::Variable { name, .. } => scopes.get(name).is_some_and(|binding| {
-                        binding.function_type.is_some()
+                        (binding.function_type.is_some()
+                            || binding.class.is_some()
+                            || binding.collection.is_some()
+                            || binding.mixed
+                            || self.resolved_type(&decl.initializer).is_some_and(|ty| {
+                                resolved_type_is_move_type(ty, &self.move_enum_names)
+                                    || resolved_type_requires_conservative_move(ty)
+                            }))
                             && matches!(binding.state, State::Borrowed | State::BorrowedOrOwned)
                     }),
                     _ => false,
                 };
                 let borrowed_initializer =
-                    self.expr_returns_borrow(&decl.initializer, scopes) || borrowed_function_value;
-                let borrowed_carrier = if function_type.is_some() {
-                    borrowed_function_value
-                } else {
-                    borrowed_initializer
-                };
+                    self.expr_returns_borrow(&decl.initializer, scopes) || borrowed_carrier_alias;
+                let borrowed_carrier = borrowed_initializer;
                 let borrowed_mixed_index = borrowed_initializer
                     && self.expr_is_mixed_collection_index(&decl.initializer, scopes);
-                let borrow_root = borrowed_carrier
-                    .then(|| self.borrow_root_key(&decl.initializer, scopes))
+                let initializer_source = self.borrow_source_root(&decl.initializer, scopes);
+                // A readonly alias of an owner-free returned value retains its
+                // source fact even though no active loan remains. A retained
+                // callback owns its environment separately, and an ordinary
+                // nullable local initialized from null still has its own place.
+                let immutable_null_alias = !decl.writable
+                    && function_type.is_none()
+                    && initializer_source == Some(BorrowSourceRoot::ImmutableNull)
+                    && (self.expr_has_return_borrow_contract(&decl.initializer, scopes)
+                        || variable_name(&decl.initializer).is_some());
+                let borrow_root = (borrowed_carrier || immutable_null_alias)
+                    .then_some(initializer_source)
                     .flatten();
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
@@ -2358,6 +3012,16 @@ impl Checker<'_> {
                         .or_else(|| self.expr_collection_info(&decl.initializer, scopes));
                     for (index, declaration) in decl.bindings.iter().enumerate() {
                         let canonical_id = self.canonical_binding_id(declaration.span);
+                        if let Some(binding) = canonical_id {
+                            self.binding_ownership.insert(
+                                binding,
+                                if borrowed_owning_value {
+                                    BindingOwnership::ReadonlyBorrow
+                                } else {
+                                    BindingOwnership::Owned
+                                },
+                            );
+                        }
                         scopes.declare(
                             declaration.name.clone(),
                             Binding {
@@ -2367,9 +3031,9 @@ impl Checker<'_> {
                                 collection: collection.clone(),
                                 mixed,
                                 borrowed_place: borrowed_owning_value,
-                                // New and returned closures own their carriers even when their
-                                // environments contain leases. Only an alias of an existing
-                                // borrowed callback borrows the carrier itself.
+                                // Fresh callback environments remain owned even
+                                // with retained loans; an existing carrier lent
+                                // by a getter or alias remains borrowed.
                                 borrow_root: borrow_root.clone(),
                                 writable: decl.writable,
                                 state: if function_type.is_some() && index > 0 {
@@ -2388,12 +3052,31 @@ impl Checker<'_> {
                                 scope_depth: scopes.lexical_depth(),
                             },
                         );
+                        if index == 0 && !borrowed_owning_value {
+                            if let Some(binding) = canonical_id {
+                                self.cleanup_bind_result(
+                                    binding,
+                                    &decl.initializer,
+                                    scopes,
+                                    decl.span,
+                                );
+                            }
+                        }
                     }
                 }
                 Flow::fallthrough()
             }
             Stmt::Assignment(assignment) => {
+                if assignment.op == AssignOp::Assign
+                    && self.use_property_setter(&assignment.target, &assignment.value, scopes)
+                {
+                    return Flow::fallthrough();
+                }
                 if assignment.op != AssignOp::Assign {
+                    if self.use_property_update(&assignment.target, Some(&assignment.value), scopes)
+                    {
+                        return Flow::fallthrough();
+                    }
                     self.use_assignment_operands(&assignment.target, &assignment.value, scopes);
                     return Flow::fallthrough();
                 }
@@ -2406,7 +3089,6 @@ impl Checker<'_> {
                             .retained_value_from_expr(&assignment.value, scopes)
                             .is_some_and(|value| value.kind == RetainedValueKind::Closure);
                     if self.expr_returns_borrow(&assignment.value, scopes)
-                        && !value_is_function
                         && scopes.get(name).is_some()
                     {
                         self.diagnostics.push(
@@ -2459,6 +3141,16 @@ impl Checker<'_> {
                             });
                         }
                         if valid {
+                            if let Some(binding) =
+                                target.as_ref().and_then(|binding| binding.canonical_id)
+                            {
+                                self.cleanup_bind_result(
+                                    binding,
+                                    &assignment.value,
+                                    scopes,
+                                    assignment.span,
+                                );
+                            }
                             if let Some(binding) = scopes.get_mut(name) {
                                 binding.state = State::Owned;
                                 binding.retained_value = evaluated;
@@ -2517,6 +3209,16 @@ impl Checker<'_> {
                             ) {
                                 return Flow::fallthrough();
                             }
+                        }
+                        if let Some(binding) =
+                            target.as_ref().and_then(|binding| binding.canonical_id)
+                        {
+                            self.cleanup_bind_result(
+                                binding,
+                                &assignment.value,
+                                scopes,
+                                assignment.span,
+                            );
                         }
                         if let Some(binding) = scopes.get_mut(name) {
                             binding.state = State::Owned;
@@ -2584,6 +3286,24 @@ impl Checker<'_> {
                                     value,
                                     target_depth,
                                     assignment.value.span(),
+                                );
+                            }
+                        }
+                        if let Some(target) = &target {
+                            if target.borrowed_place {
+                                self.cleanup_store_place(
+                                    &assignment.target,
+                                    &assignment.value,
+                                    scopes,
+                                    assignment.span,
+                                    true,
+                                );
+                            } else if let Some(binding) = target.canonical_id {
+                                self.cleanup_bind_result(
+                                    binding,
+                                    &assignment.value,
+                                    scopes,
+                                    assignment.span,
                                 );
                             }
                         }
@@ -2679,6 +3399,18 @@ impl Checker<'_> {
                                 UseMode::Read
                             },
                         );
+                        if !borrowed_value
+                            && valid_function_storage
+                            && (slot.value_move || slot.value_mixed)
+                        {
+                            self.cleanup_store_place(
+                                &assignment.target,
+                                &assignment.value,
+                                scopes,
+                                assignment.span,
+                                true,
+                            );
+                        }
                         return Flow::fallthrough();
                     }
                     let property = self.assignment_property_info(&assignment.target, scopes);
@@ -2745,6 +3477,21 @@ impl Checker<'_> {
                             UseMode::Read
                         },
                     );
+                    if owning_property && !borrowed_value && valid_function_storage {
+                        if let Some(write) = self
+                            .property_writes
+                            .get(&assignment.target.span())
+                            .or_else(|| self.property_writes.get(&assignment.span))
+                        {
+                            self.cleanup_store_place(
+                                &assignment.target,
+                                &assignment.value,
+                                scopes,
+                                assignment.span,
+                                write.kind != crate::semantics::PropertyWriteKind::Initialize,
+                            );
+                        }
+                    }
                 }
                 Flow::fallthrough()
             }
@@ -2760,7 +3507,7 @@ impl Checker<'_> {
                     Flow::fallthrough()
                 }
             }
-            Stmt::Return { expr, .. } => {
+            Stmt::Return { expr, span } => {
                 if let Some(expr) = expr {
                     if let Some(mode) = self.when_result_modes.last().copied() {
                         if mode == UseMode::Give && self.expr_returns_borrow(expr, scopes) {
@@ -2782,6 +3529,7 @@ impl Checker<'_> {
                                 .expect("when result");
                             *previous = join_retained_value(previous.as_ref(), value.as_ref());
                         }
+                        self.cleanup_stage_yield(expr, scopes);
                         return Flow::yields(scopes);
                     }
                     let prepared = self.prepare_retained_value(expr, scopes);
@@ -2823,6 +3571,7 @@ impl Checker<'_> {
                         }
                     }
                 }
+                self.cleanup_stage_return(expr.as_ref(), scopes, *span);
                 Flow::returns(scopes)
             }
             Stmt::If(statement) => {
@@ -2833,8 +3582,7 @@ impl Checker<'_> {
                     attached.given = None;
                     let mut flow =
                         self.check_statement(&Stmt::If(attached), scopes, return_move_type);
-                    scopes.pop();
-                    pop_flow_scope(&mut flow);
+                    self.cleanup_pop_flow_scope(scopes, &mut flow, statement.span);
                     return flow;
                 }
                 if let Some(finally) = &statement.finally {
@@ -2849,6 +3597,7 @@ impl Checker<'_> {
                     );
                 }
                 self.use_expr(&statement.condition, scopes, UseMode::Read);
+                self.cleanup_release_temporaries(scopes, statement.condition.span());
                 if let Some(condition) = constant_bool(&statement.condition) {
                     if condition {
                         return self.check_block(
@@ -2926,8 +3675,7 @@ impl Checker<'_> {
                         scopes,
                         return_move_type,
                     );
-                    scopes.pop();
-                    pop_flow_scope(&mut flow);
+                    self.cleanup_pop_flow_scope(scopes, &mut flow, statement.span);
                     flow
                 } else {
                     self.check_while_with_finally(statement, &[], scopes, return_move_type)
@@ -2955,6 +3703,7 @@ impl Checker<'_> {
                 }
                 for repeat in &mut body_flow.backedges {
                     self.use_expr(&statement.condition, repeat, UseMode::Read);
+                    self.cleanup_release_temporaries(repeat, statement.condition.span());
                 }
                 self.check_second_iteration(
                     &statement.body,
@@ -3002,8 +3751,9 @@ impl Checker<'_> {
                 }
                 if let Some(condition) = &statement.condition {
                     self.use_expr(condition, scopes, UseMode::Read);
+                    self.cleanup_release_temporaries(scopes, condition.span());
                     if constant_bool(condition) == Some(false) {
-                        scopes.pop();
+                        self.cleanup_pop_scope(scopes, statement.span, cleanup::Cause::ScopeExit);
                         return Flow::fallthrough();
                     }
                 }
@@ -3018,18 +3768,25 @@ impl Checker<'_> {
                     self.check_for_tail(statement, repeat, return_move_type);
                 }
                 self.check_for_second_iteration(statement, &body_flow.backedges, return_move_type);
-                let mut returns = body_flow.returns;
-                let mut exits = body_flow.backedges;
-                exits.extend(body_flow.breaks);
-                merge_loop_exit(scopes, &before, &exits);
-                scopes.pop();
-                for return_exit in &mut returns {
-                    return_exit.pop();
+                let returns = body_flow.returns;
+                let mut exits = body_flow.breaks;
+                if statement.condition.as_ref().and_then(constant_bool) != Some(true)
+                    && statement.condition.is_some()
+                {
+                    exits.push(before);
+                    exits.extend(body_flow.backedges);
                 }
-                Flow {
+                let falls_through = !exits.is_empty();
+                if falls_through {
+                    merge_reachable_states(scopes, &exits);
+                }
+                let mut flow = Flow {
+                    falls_through,
                     returns,
-                    ..Flow::fallthrough()
-                }
+                    ..Flow::stops()
+                };
+                self.cleanup_pop_flow_scope(scopes, &mut flow, statement.span);
+                flow
             }
             Stmt::Foreach(statement) => {
                 self.use_expr(&statement.iterable, scopes, UseMode::Read);
@@ -3055,6 +3812,9 @@ impl Checker<'_> {
                 }
             }
             Stmt::Increment(increment) => {
+                if self.use_property_update(&increment.target, None, scopes) {
+                    return Flow::fallthrough();
+                }
                 if let Some(root) = self.borrow_root_key(&increment.target, scopes) {
                     self.check_live_retained_conflict(
                         &root,
@@ -3078,7 +3838,13 @@ impl Checker<'_> {
                         diagnostic.help = Some(help);
                     }
                 }
-                self.record_exceptional_exits(statement.span, scopes);
+                let transferred = self.cleanup_take_expr(&statement.expr, scopes);
+                self.record_exceptional_effects_with_values(
+                    statement.span,
+                    crate::checked_effects::effects_at(self.checked_effect_sites, statement.span),
+                    scopes,
+                    Some(&transferred),
+                );
                 Flow::stops()
             }
             Stmt::Try(statement) => {
@@ -3103,6 +3869,7 @@ impl Checker<'_> {
                         continue;
                     }
                     let mut caught_states = Vec::new();
+                    let mut caught_values = HashSet::new();
                     let mut remaining = Vec::new();
                     for exit in unmatched_exits {
                         let coverage = crate::checked_effects::catch_coverage(
@@ -3112,6 +3879,7 @@ impl Checker<'_> {
                         );
                         if coverage != crate::checked_effects::CatchCoverage::None {
                             caught_states.push(exit.scopes.clone());
+                            caught_values.extend(&exit.values);
                         }
                         if coverage != crate::checked_effects::CatchCoverage::Complete {
                             remaining.push(exit);
@@ -3147,11 +3915,23 @@ impl Checker<'_> {
                                 scope_depth: catch_scopes.lexical_depth(),
                             },
                         );
+                        if let Some(id) = self.canonical_binding_id(binding.span) {
+                            catch_scopes.1.put(
+                                cleanup::Slot::Binding(id),
+                                caught_values,
+                                catch_scopes.lexical_depth(),
+                            );
+                        }
+                    } else {
+                        catch_scopes.1.put(
+                            cleanup::Slot::CaughtError(catch.span),
+                            caught_values,
+                            catch_scopes.lexical_depth(),
+                        );
                     }
                     let mut catch_flow =
                         self.check_block(&catch.body, &mut catch_scopes, return_move_type, false);
-                    catch_scopes.pop();
-                    pop_flow_scope(&mut catch_flow);
+                    self.cleanup_pop_flow_scope(&mut catch_scopes, &mut catch_flow, catch.span);
                     if catch_flow.falls_through {
                         fallthrough_states.push(catch_scopes);
                     }
@@ -3172,18 +3952,23 @@ impl Checker<'_> {
                 }
 
                 if let Some(finally) = &statement.finally {
-                    self.apply_finally_to_exceptional_exits(
+                    let mut overrides = self.apply_finally_to_exceptional_exits(
                         &finally.body,
                         &mut propagating_exits,
                         return_move_type,
                     );
                     self.propagate_exceptional_exits(propagating_exits);
-                    self.apply_finally_to_flow(
+                    let mut finalized = self.apply_finally_to_flow(
                         &finally.body,
                         scopes,
                         protected_flow,
                         return_move_type,
-                    )
+                    );
+                    finalized.backedges.append(&mut overrides.backedges);
+                    finalized.breaks.append(&mut overrides.breaks);
+                    finalized.returns.append(&mut overrides.returns);
+                    finalized.yields.append(&mut overrides.yields);
+                    finalized
                 } else {
                     self.propagate_exceptional_exits(propagating_exits);
                     protected_flow
@@ -3204,31 +3989,39 @@ impl Checker<'_> {
         &mut self,
         finally: &ast::Block,
         scopes: &mut Scopes,
-        mut flow: Flow,
+        flow: Flow,
         return_move_type: bool,
     ) -> Flow {
-        if flow.falls_through {
-            flow.falls_through = self
-                .check_block(finally, scopes, return_move_type, true)
-                .falls_through;
+        let mut result = if flow.falls_through {
+            self.check_block(finally, scopes, return_move_type, true)
+        } else {
+            Flow::stops()
+        };
+        self.cleanup_superseded_control_exit(&mut result, finally.span);
+        for (kind, exits) in [
+            (0, flow.backedges),
+            (1, flow.breaks),
+            (2, flow.returns),
+            (3, flow.yields),
+        ] {
+            for mut state in exits {
+                let mut finalized = self.check_block(finally, &mut state, return_move_type, true);
+                self.cleanup_superseded_control_exit(&mut finalized, finally.span);
+                if finalized.falls_through {
+                    match kind {
+                        0 => result.backedges.push(state),
+                        1 => result.breaks.push(state),
+                        2 => result.returns.push(state),
+                        _ => result.yields.push(state),
+                    }
+                }
+                result.backedges.append(&mut finalized.backedges);
+                result.breaks.append(&mut finalized.breaks);
+                result.returns.append(&mut finalized.returns);
+                result.yields.append(&mut finalized.yields);
+            }
         }
-        flow.backedges.retain_mut(|state| {
-            self.check_block(finally, state, return_move_type, true)
-                .falls_through
-        });
-        flow.breaks.retain_mut(|state| {
-            self.check_block(finally, state, return_move_type, true)
-                .falls_through
-        });
-        flow.returns.retain_mut(|state| {
-            self.check_block(finally, state, return_move_type, true)
-                .falls_through
-        });
-        flow.yields.retain_mut(|state| {
-            self.check_block(finally, state, return_move_type, true)
-                .falls_through
-        });
-        flow
+        result
     }
 
     fn check_given_setup<'a>(
@@ -3256,6 +4049,7 @@ impl Checker<'_> {
                 predicates.push(expr);
             }
             let _ = self.check_statement(statement, scopes, return_move_type);
+            self.cleanup_release_temporaries(scopes, cleanup::statement_span(statement));
         }
         predicates
     }
@@ -3268,6 +4062,7 @@ impl Checker<'_> {
         return_move_type: bool,
     ) -> Flow {
         self.use_expr(&statement.condition, scopes, UseMode::Read);
+        self.cleanup_release_temporaries(scopes, statement.condition.span());
         if predicates
             .iter()
             .any(|predicate| constant_bool(predicate) == Some(false))
@@ -3286,15 +4081,23 @@ impl Checker<'_> {
                 self.use_expr(predicate, repeat, UseMode::Read);
             }
             self.use_expr(&statement.condition, repeat, UseMode::Read);
+            self.cleanup_release_temporaries(repeat, statement.condition.span());
         }
         self.check_second_iteration(&statement.body, &body_flow.backedges, return_move_type);
         let returns = body_flow.returns;
-        let mut exits = body_flow.backedges;
-        exits.extend(body_flow.breaks);
-        merge_loop_exit(scopes, &before, &exits);
+        let mut exits = body_flow.breaks;
+        if constant_bool(&statement.condition) != Some(true) {
+            exits.push(before);
+            exits.extend(body_flow.backedges);
+        }
+        let falls_through = !exits.is_empty();
+        if falls_through {
+            merge_reachable_states(scopes, &exits);
+        }
         Flow {
+            falls_through,
             returns,
-            ..Flow::fallthrough()
+            ..Flow::stops()
         }
     }
 
@@ -3328,19 +4131,7 @@ impl Checker<'_> {
         }
         self.declare_foreach_binding(&statement.value_binding, scopes);
         let mut flow = self.check_block(&statement.body, scopes, return_move_type, false);
-        scopes.pop();
-        for backedge in &mut flow.backedges {
-            backedge.pop();
-        }
-        for break_exit in &mut flow.breaks {
-            break_exit.pop();
-        }
-        for return_exit in &mut flow.returns {
-            return_exit.pop();
-        }
-        for yield_exit in &mut flow.yields {
-            yield_exit.pop();
-        }
+        self.cleanup_pop_flow_scope(scopes, &mut flow, statement.span);
         self.active_borrows.truncate(borrow_depth);
         flow
     }
@@ -3460,6 +4251,7 @@ impl Checker<'_> {
         }
         if let Some(condition) = &statement.condition {
             self.use_expr(condition, scopes, UseMode::Read);
+            self.cleanup_release_temporaries(scopes, condition.span());
         }
     }
 
@@ -3544,6 +4336,11 @@ impl Checker<'_> {
             let source_function_value = scopes
                 .get_by_canonical(capture.source_binding_id)
                 .and_then(|(_, binding)| binding.retained_value.clone());
+            let immutable_null_source = scopes
+                .get_by_canonical(capture.source_binding_id)
+                .is_some_and(|(_, binding)| {
+                    binding.borrow_root == Some(BorrowSourceRoot::ImmutableNull)
+                });
             let source_is_move =
                 resolved_type_is_move_type(&capture.source_type, &self.move_enum_names)
                     || resolved_type_requires_conservative_move(&capture.source_type);
@@ -3555,7 +4352,9 @@ impl Checker<'_> {
             {
                 let root = declaration
                     .and_then(|declaration| match declaration.owner {
-                        crate::symbols::LexicalOwner::Closure(owner) => {
+                        crate::symbols::LexicalOwner::Closure(owner)
+                            if declaration.kind != BindingKind::ClosureParameter =>
+                        {
                             Some(BorrowRoot::EnclosingEnvironment(owner))
                         }
                         _ => None,
@@ -3580,6 +4379,7 @@ impl Checker<'_> {
             };
 
             let access = match kind {
+                CaptureAcquisitionKind::ReadonlyLease if immutable_null_source => None,
                 CaptureAcquisitionKind::ReadonlyLease => Some(BorrowAccess::Readonly),
                 CaptureAcquisitionKind::WritableLease => Some(BorrowAccess::Writable),
                 CaptureAcquisitionKind::CopyIntoEnvironment
@@ -3745,12 +4545,27 @@ impl Checker<'_> {
             self.closure_values.remove(&closure_id);
             return;
         }
+        let mut cleanup_contents = HashSet::new();
         for source in move_sources {
+            cleanup_contents.extend(scopes.1.take(&cleanup::Slot::Binding(source)));
             if let Some(binding) = scopes.get_mut_by_canonical(source) {
                 binding.state = State::Given {
                     at: semantic.execution_boundary_span,
                 };
             }
+        }
+        if let Some(owner) = self.cleanup_owner {
+            let value = self.cleanup_analysis.acquire(
+                owner,
+                cleanup::Source::Expression(closure.span),
+                semantic.function_type.clone(),
+                cleanup_contents,
+            );
+            scopes.1.put(
+                cleanup::Slot::Temporary(closure.span),
+                HashSet::from([value]),
+                scopes.lexical_depth(),
+            );
         }
         let mut roots = leases
             .iter()
@@ -3811,35 +4626,25 @@ impl Checker<'_> {
                 .resolved_type(expr)
                 .and_then(non_null_function_type)
                 .map(|_| {
-                    let root = self.function_borrow_root(expr, scopes).or_else(|| {
-                        self.expr_returns_borrow(expr, scopes)
-                            .then_some(BorrowRoot::Temporary)
-                    });
-                    let leases = root
-                        .as_ref()
-                        .map(|root| RetainedLoan {
-                            root: root.clone(),
-                            root_key: self
-                                .borrow_root_key(expr, scopes)
-                                .unwrap_or_else(|| "temporary".to_string()),
-                            access: if self.function_result_borrow_is_writable(expr, scopes) {
+                    let loan = self
+                        .expr_has_return_contract(expr, scopes, None)
+                        .then(|| {
+                            let access = if self.function_result_borrow_is_writable(expr, scopes) {
                                 BorrowAccess::Writable
                             } else {
                                 BorrowAccess::Readonly
-                            },
-                            capture_span: expr.span(),
-                            source_depth: self.function_borrow_source_depth(expr, scopes),
-                            inherited: false,
+                            };
+                            self.retained_source_loan(expr, scopes, access)
                         })
-                        .into_iter()
-                        .collect::<Vec<_>>();
+                        .flatten();
+                    let provenance = loan.as_ref().map_or(ValueProvenance::Owned, |loan| {
+                        ValueProvenance::BorrowBound(vec![loan.root.clone()])
+                    });
                     RetainedValueState {
                         kind: RetainedValueKind::Closure,
                         closure_id: None,
-                        provenance: root.map_or(ValueProvenance::Owned, |root| {
-                            ValueProvenance::BorrowBound(vec![root])
-                        }),
-                        leases,
+                        provenance,
+                        leases: loan.into_iter().collect(),
                         nonescaping_parameter: false,
                         take_parameter_insertion: None,
                     }
@@ -3849,24 +4654,12 @@ impl Checker<'_> {
     }
 
     fn function_result_borrow_is_writable(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        if let Some((signature, _, _)) = self.retained_call(expr, scopes) {
+            return signature
+                .return_borrow
+                .is_some_and(|borrow| borrow.writable);
+        }
         match ungroup_expr(expr) {
-            Expr::FunctionCall { name, .. } => self
-                .signatures
-                .get(name)
-                .and_then(|signature| signature.return_borrow)
-                .is_some_and(|borrow| borrow.writable),
-            Expr::MethodCall { object, method, .. } => self
-                .expr_class(object, scopes)
-                .and_then(|class| self.methods.get(&(class, method.clone())))
-                .and_then(|signature| signature.return_borrow)
-                .is_some_and(|borrow| borrow.writable),
-            Expr::StaticCall {
-                qualifier, method, ..
-            } => self
-                .qualifier_class(qualifier)
-                .and_then(|class| self.methods.get(&(class, method.clone())))
-                .and_then(|signature| signature.return_borrow)
-                .is_some_and(|borrow| borrow.writable),
             Expr::CallableCall { span, .. } => self
                 .callable_value_calls
                 .get(span)
@@ -3875,83 +4668,6 @@ impl Checker<'_> {
                 .is_some_and(|borrow| borrow.writable),
             _ => false,
         }
-    }
-
-    fn function_borrow_root(&self, expr: &Expr, scopes: &Scopes) -> Option<BorrowRoot> {
-        if !self.expr_returns_borrow(expr, scopes) {
-            return None;
-        }
-        match ungroup_expr(expr) {
-            Expr::Variable { name, .. } => scopes
-                .get(name)
-                .and_then(|binding| binding.canonical_id)
-                .map(BorrowRoot::Binding),
-            Expr::This { .. } => Some(BorrowRoot::Receiver),
-            Expr::FunctionCall { name, args, .. } => {
-                let signature = self.signatures.get(name)?;
-                let borrow = signature.return_borrow?;
-                self.call_borrow_source_expr(borrow, None, signature, args)
-                    .and_then(|source| {
-                        self.function_borrow_root(source, scopes).or_else(|| {
-                            match ungroup_expr(source) {
-                                Expr::Variable { name, .. } => scopes
-                                    .get(name)
-                                    .and_then(|binding| binding.canonical_id)
-                                    .map(BorrowRoot::Binding),
-                                Expr::This { .. } => Some(BorrowRoot::Receiver),
-                                _ => None,
-                            }
-                        })
-                    })
-            }
-            Expr::MethodCall {
-                object,
-                method,
-                args,
-                ..
-            } => {
-                let class = self.expr_class(object, scopes)?;
-                let signature = self.methods.get(&(class, method.clone()))?;
-                let borrow = signature.return_borrow?;
-                self.call_borrow_source_expr(borrow, Some(object), signature, args)
-                    .and_then(|source| match ungroup_expr(source) {
-                        Expr::Variable { name, .. } => scopes
-                            .get(name)
-                            .and_then(|binding| binding.canonical_id)
-                            .map(BorrowRoot::Binding),
-                        Expr::This { .. } => Some(BorrowRoot::Receiver),
-                        _ => None,
-                    })
-            }
-            Expr::CallableCall { args, span, .. } => {
-                let call = self.callable_value_calls.get(span)?;
-                let function = non_null_function_type(&call.function_type)?;
-                let borrow = function.return_borrow?;
-                let crate::types::FunctionBorrowSource::Parameter(index) = borrow.source;
-                let source = &args.get(index)?.value;
-                match ungroup_expr(source) {
-                    Expr::Variable { name, .. } => scopes
-                        .get(name)
-                        .and_then(|binding| binding.canonical_id)
-                        .map(BorrowRoot::Binding),
-                    Expr::This { .. } => Some(BorrowRoot::Receiver),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn function_borrow_source_depth(&self, expr: &Expr, scopes: &Scopes) -> usize {
-        self.function_borrow_root(expr, scopes)
-            .and_then(|root| match root {
-                BorrowRoot::Binding(id) => scopes
-                    .get_by_canonical(id)
-                    .map(|(_, binding)| binding.scope_depth),
-                BorrowRoot::Receiver => Some(0),
-                BorrowRoot::EnclosingEnvironment(_) | BorrowRoot::Temporary => None,
-            })
-            .unwrap_or_else(|| scopes.lexical_depth())
     }
 
     fn call_borrow_source_expr<'a>(
@@ -3982,9 +4698,12 @@ impl Checker<'_> {
                 .remove(&ungroup_expr(expr).span());
         }
         if let Expr::Closure(closure) = ungroup_expr(expr) {
-            self.acquire_closure(closure, scopes);
-            self.prepared_closure_evaluations
-                .insert(ClosureId::from_span(closure.span));
+            if self
+                .prepared_closure_evaluations
+                .insert(ClosureId::from_span(closure.span))
+            {
+                self.acquire_closure(closure, scopes);
+            }
         }
         self.retained_value_from_expr(expr, scopes)
     }
@@ -4068,7 +4787,9 @@ impl Checker<'_> {
                     .is_some_and(|declaration| {
                         matches!(
                             declaration.kind,
-                            BindingKind::FunctionParameter | BindingKind::MethodParameter
+                            BindingKind::FunctionParameter
+                                | BindingKind::MethodParameter
+                                | BindingKind::ClosureParameter
                         ) && declaration.ownership != BindingOwnership::Owned
                     }),
                 BorrowRoot::EnclosingEnvironment(_) | BorrowRoot::Temporary => false,
@@ -4336,6 +5057,163 @@ impl Checker<'_> {
         } else {
             mode
         };
+        let moving_binding = if mode == UseMode::Give {
+            match expr {
+                Expr::Variable { name, .. } => scopes.get(name).and_then(|binding| {
+                    matches!(
+                        binding.state,
+                        State::Owned | State::BorrowedOrOwned | State::MaybeGiven { .. }
+                    )
+                    .then_some(binding.canonical_id)
+                    .flatten()
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.use_expr_inner(expr, scopes, mode);
+        self.cleanup_expression_result(expr, scopes, moving_binding);
+    }
+
+    fn cleanup_expression_result(
+        &mut self,
+        expr: &Expr,
+        scopes: &mut Scopes,
+        moving_binding: Option<BindingId>,
+    ) {
+        let Some(owner) = self.cleanup_owner else {
+            return;
+        };
+        let target = cleanup::Slot::Temporary(expr.span());
+        if let Some(binding) = moving_binding {
+            let values = scopes.1.take(&cleanup::Slot::Binding(binding));
+            scopes.1.put(target, values, scopes.lexical_depth());
+            return;
+        }
+        if let Expr::Grouped { expr: inner, .. } = expr {
+            let values = self.cleanup_take_expr(inner, scopes);
+            scopes.1.put(target, values, scopes.lexical_depth());
+            return;
+        }
+        if !scopes.1.values(&target).is_empty() {
+            return;
+        }
+        let creates_owner = match expr {
+            Expr::New { .. } | Expr::Array { .. } | Expr::ArrayRepeat { .. } | Expr::Closure(_) => {
+                true
+            }
+            Expr::MethodCall {
+                object,
+                null_safe: true,
+                ..
+            }
+            | Expr::PropertyAccess {
+                object,
+                null_safe: true,
+                ..
+            } if self.flow_fact(object) == Some(&Fact::Null) => false,
+            Expr::FunctionCall { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::CallableCall { .. } => !self.expr_returns_borrow(expr, scopes),
+            Expr::PropertyAccess { .. } => self.getter_signature(expr).is_some_and(|signature| {
+                signature
+                    .return_borrow
+                    .is_none_or(|borrow| borrow.kind != ReturnBorrowKind::Value)
+            }),
+            Expr::Binary {
+                op: BinaryOp::Coalesce,
+                ..
+            } => !self.expr_returns_borrow(expr, scopes),
+            _ => false,
+        };
+        if !creates_owner {
+            return;
+        }
+        let Some(ty) = self.resolved_type(expr).cloned() else {
+            return;
+        };
+        if !resolved_type_is_move_type(&ty, &self.move_enum_names)
+            && !resolved_type_requires_conservative_move(&ty)
+        {
+            return;
+        }
+        let mut contents = HashSet::new();
+        match expr {
+            Expr::Array { elements, .. } => {
+                for element in elements {
+                    if let Some(key) = &element.key {
+                        self.cleanup_analysis.source_flows.insert((
+                            cleanup::Source::Expression(key.span()),
+                            cleanup::Source::CollectionElement {
+                                collection: expr.span(),
+                                key: true,
+                            },
+                        ));
+                        contents.extend(self.cleanup_take_expr(key, scopes));
+                    }
+                    self.cleanup_analysis.source_flows.insert((
+                        cleanup::Source::Expression(element.value.span()),
+                        cleanup::Source::CollectionElement {
+                            collection: expr.span(),
+                            key: false,
+                        },
+                    ));
+                    contents.extend(self.cleanup_take_expr(&element.value, scopes));
+                }
+            }
+            Expr::ArrayRepeat { value, .. } => {
+                let element = cleanup::Source::CollectionElement {
+                    collection: expr.span(),
+                    key: false,
+                };
+                if let Some(element_type) = self.resolved_type(value).cloned() {
+                    if resolved_type_is_move_type(&element_type, &self.move_enum_names)
+                        || resolved_type_requires_conservative_move(&element_type)
+                    {
+                        // Fill borrows its seed and owns independently cloned
+                        // elements. A fresh seed remains a temporary to release
+                        // after construction, even when the array is returned.
+                        // The clone's nested state is not the seed's ownership.
+                        contents.insert(self.cleanup_analysis.acquire(
+                            owner,
+                            element,
+                            element_type,
+                            HashSet::new(),
+                        ));
+                    } else {
+                        self.cleanup_analysis
+                            .source_flows
+                            .insert((cleanup::Source::Expression(value.span()), element));
+                    }
+                }
+            }
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => {
+                contents.extend(self.cleanup_take_expr(left, scopes));
+                contents.extend(self.cleanup_take_expr(right, scopes));
+                scopes.1.put(target, contents, scopes.lexical_depth());
+                return;
+            }
+            _ => {}
+        }
+        let value = self.cleanup_analysis.acquire(
+            owner,
+            cleanup::Source::Expression(expr.span()),
+            ty,
+            contents,
+        );
+        scopes
+            .1
+            .put(target, HashSet::from([value]), scopes.lexical_depth());
+    }
+
+    fn use_expr_inner(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
         match expr {
             Expr::Variable { name, span } => {
                 let root = scopes.get(name).map(|binding| binding_root(binding, name));
@@ -4513,7 +5391,18 @@ impl Checker<'_> {
                 }
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
-            Expr::PropertyAccess { object, span, .. } => {
+            Expr::PropertyAccess {
+                object,
+                span,
+                null_safe,
+                ..
+            } => {
+                if let Some(signature) = self.getter_signature(expr) {
+                    let execution = self.method_call_execution(*null_safe, object);
+                    self.use_call_args(*span, Some(object), &[], &signature, execution, scopes);
+                    self.record_exceptional_exits(*span, scopes);
+                    return;
+                }
                 if mode == UseMode::Write {
                     if let Some(place) = self.assignment_place_key(expr, scopes) {
                         self.check_active_borrow_conflict(&place, mode, *span);
@@ -4577,7 +5466,7 @@ impl Checker<'_> {
             }
             Expr::FunctionCall { name, args, span } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
-                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
+                self.use_call_args(*span, None, args, &signature, CallExecution::Always, scopes);
                 self.record_exceptional_exits(*span, scopes);
             }
             Expr::New {
@@ -4601,6 +5490,7 @@ impl Checker<'_> {
                 };
                 if class_type.name == "WritableSharedReference" {
                     self.use_call_args_with_storage(
+                        *span,
                         None,
                         args,
                         &signature,
@@ -4612,7 +5502,14 @@ impl Checker<'_> {
                         }),
                     );
                 } else {
-                    self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
+                    self.use_call_args(
+                        *span,
+                        None,
+                        args,
+                        &signature,
+                        CallExecution::Always,
+                        scopes,
+                    );
                 }
                 self.record_exceptional_exits(*span, scopes);
             }
@@ -4645,9 +5542,9 @@ impl Checker<'_> {
                         method,
                         args,
                         *span,
+                        self.method_call_execution(*null_safe, object),
                         scopes,
                     );
-                    self.record_exceptional_exits(*span, scopes);
                     return;
                 }
                 let signature = self
@@ -4655,7 +5552,7 @@ impl Checker<'_> {
                     .map(|(signature, _, _)| signature)
                     .unwrap_or_default();
                 let execution = self.method_call_execution(*null_safe, object);
-                self.use_call_args(Some(object), args, &signature, execution, scopes);
+                self.use_call_args(*span, Some(object), args, &signature, execution, scopes);
                 self.record_exceptional_exits(*span, scopes);
             }
             Expr::StaticCall {
@@ -4690,6 +5587,7 @@ impl Checker<'_> {
                     .is_some_and(|class| self.enum_cases.contains_key(&(class, method.clone())));
                 if enum_payload {
                     self.use_call_args_with_storage(
+                        *span,
                         None,
                         args,
                         &signature,
@@ -4697,8 +5595,30 @@ impl Checker<'_> {
                         scopes,
                         Some(FunctionStorageBoundary::Owned("an enum payload")),
                     );
+                    if let Some(case) = self.enum_case_constructions.get(span).copied() {
+                        let bound = signature.bind_arguments(args);
+                        for (index, argument) in args.iter().enumerate() {
+                            if let Some(field) = bound.arg_to_param.get(index).copied().flatten() {
+                                self.cleanup_analysis.source_flows.insert((
+                                    cleanup::Source::Expression(argument.value.span()),
+                                    cleanup::Source::EnumPayload {
+                                        scrutinee: *span,
+                                        case,
+                                        field,
+                                    },
+                                ));
+                            }
+                        }
+                    }
                 } else {
-                    self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
+                    self.use_call_args(
+                        *span,
+                        None,
+                        args,
+                        &signature,
+                        CallExecution::Always,
+                        scopes,
+                    );
                 }
                 self.record_exceptional_exits(*span, scopes);
             }
@@ -4898,13 +5818,16 @@ impl Checker<'_> {
                 span,
                 ..
             } => {
-                let value = self.use_match_expression(scrutinee, *match_mode, arms, scopes, mode);
+                let value =
+                    self.use_match_expression(*span, scrutinee, *match_mode, arms, scopes, mode);
                 self.retained.expression_values.remove(span);
                 if let Some(value) = value {
                     self.retained.expression_values.insert(*span, value);
                 }
             }
             Expr::When(when) => {
+                let result_depth = scopes.lexical_depth();
+                self.cleanup_yield_regions.push((when.span, result_depth));
                 let has_given = when.given.is_some();
                 if let Some(given) = &when.given {
                     scopes.push();
@@ -4945,8 +5868,13 @@ impl Checker<'_> {
                     *scopes = merged;
                 }
                 if has_given {
-                    scopes.pop();
+                    self.cleanup_pop_scope(scopes, when.span, cleanup::Cause::ScopeExit);
                 }
+                self.cleanup_yield_regions.pop();
+                let result = scopes.1.take(&cleanup::Slot::PendingYield(when.span));
+                scopes
+                    .1
+                    .put(cleanup::Slot::Temporary(when.span), result, result_depth);
             }
             Expr::Identifier { .. }
             | Expr::String { .. }
@@ -4974,6 +5902,7 @@ impl Checker<'_> {
             FunctionInvocationMode::Once => UseMode::Give,
         };
         let stored_once_source = call.invocation_mode == FunctionInvocationMode::Once
+            && self.getter_signature(callee).is_none()
             && matches!(
                 ungroup_expr(callee),
                 Expr::PropertyAccess { .. } | Expr::Index { .. }
@@ -5012,19 +5941,31 @@ impl Checker<'_> {
                 callee_mode
             },
         );
+        if callee_mode == UseMode::Give && !stored_once_source && !borrowed_once_source {
+            let values = self.cleanup_take_expr(callee, scopes);
+            scopes.1.put(
+                cleanup::Slot::PendingCallee(span),
+                values,
+                scopes.lexical_depth(),
+            );
+        }
         if let Some(function_type) = function_type {
-            self.use_callable_args(args, &function_type, scopes);
+            self.use_callable_args(span, args, &function_type, scopes);
         } else {
             for argument in args {
                 self.use_expr(&argument.value, scopes, UseMode::Read);
             }
         }
+        // The environment stays caller-owned while arguments are evaluated.
+        // Only invocation transfers it to the once body, including its unwind.
+        scopes.1.take(&cleanup::Slot::PendingCallee(span));
         self.record_exceptional_exits(span, scopes);
         true
     }
 
     fn use_match_expression(
         &mut self,
+        site: Span,
         scrutinee: &Expr,
         match_mode: ast::MatchMode,
         arms: &[ast::MatchArm],
@@ -5033,6 +5974,30 @@ impl Checker<'_> {
     ) -> Option<RetainedValueState> {
         let borrow_depth = self.active_borrows.len();
         let consuming = matches!(match_mode, ast::MatchMode::Consumed { .. });
+        let checked = self.matches.get(&site).cloned();
+        let enum_definition = checked.as_ref().and_then(|info| {
+            let ty = match &info.scrutinee_type {
+                ResolvedType::Nullable(inner) => inner.as_ref(),
+                ty => ty,
+            };
+            let ResolvedType::Enum(ty) = ty else {
+                return None;
+            };
+            self.enum_semantics
+                .iter()
+                .find(|definition| definition.id == ty.id)
+                .cloned()
+        });
+        let mut remaining_cases = enum_definition
+            .as_ref()
+            .map(|definition| {
+                definition
+                    .cases
+                    .iter()
+                    .map(|case| case.id)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         self.use_expr(
             scrutinee,
             scopes,
@@ -5042,7 +6007,7 @@ impl Checker<'_> {
                 UseMode::Read
             },
         );
-        let borrow_root = self.borrow_root_key(scrutinee, scopes);
+        let borrow_root = self.borrow_source_root(scrutinee, scopes);
         if !consuming {
             self.activate_place_borrow(scrutinee, UseMode::Read, scopes);
         }
@@ -5051,40 +6016,266 @@ impl Checker<'_> {
         let mut outcomes = Vec::with_capacity(arms.len());
         let mut has_default = false;
         let mut result_value = None;
-        for arm in arms {
+        for (arm_index, arm) in arms.iter().enumerate() {
+            let arm_info = checked.as_ref().and_then(|info| info.arms.get(arm_index));
             if let ast::MatchPattern::Expression(pattern) = &arm.pattern {
                 self.use_expr(pattern, &mut remaining, UseMode::Read);
             }
 
             let mut selected = remaining.clone();
+            let scrutinee_slot = cleanup::Slot::Temporary(scrutinee.span());
+            let original_scrutinee = selected.1.values(&scrutinee_slot);
+            let mut payloads = HashMap::new();
+            if arm_info.is_some_and(|info| {
+                matches!(info.pattern, crate::semantics::ResolvedMatchPattern::Null)
+            }) {
+                // The selected null path carries no owned payload. Preserve
+                // the original on the unmatched/failed-guard path only.
+                selected.1.take(&scrutinee_slot);
+            }
+            if !original_scrutinee.is_empty() {
+                if let (Some(owner), Some(definition), Some(arm_info)) = (
+                    self.cleanup_owner,
+                    enum_definition.as_ref(),
+                    arm_info.filter(|info| {
+                        matches!(
+                            info.pattern,
+                            crate::semantics::ResolvedMatchPattern::EnumCase { .. }
+                                | crate::semantics::ResolvedMatchPattern::Default
+                                | crate::semantics::ResolvedMatchPattern::Null
+                        )
+                    }),
+                ) {
+                    let cases = match &arm_info.pattern {
+                        crate::semantics::ResolvedMatchPattern::EnumCase { case_id, .. } => {
+                            HashSet::from([*case_id])
+                        }
+                        crate::semantics::ResolvedMatchPattern::Default => remaining_cases.clone(),
+                        crate::semantics::ResolvedMatchPattern::Null => HashSet::new(),
+                        _ => remaining_cases.clone(),
+                    };
+                    let mut residual = HashSet::new();
+                    for case in definition
+                        .cases
+                        .iter()
+                        .filter(|case| cases.contains(&case.id))
+                    {
+                        for (field, payload) in case.payload.iter().enumerate() {
+                            if !resolved_type_is_move_type(&payload.ty, &self.move_enum_names)
+                                && !resolved_type_requires_conservative_move(&payload.ty)
+                            {
+                                continue;
+                            }
+                            let value = self.cleanup_analysis.acquire(
+                                owner,
+                                cleanup::Source::EnumPayload {
+                                    scrutinee: scrutinee.span(),
+                                    case: case.id,
+                                    field,
+                                },
+                                payload.ty.clone(),
+                                HashSet::new(),
+                            );
+                            residual.insert(value);
+                            payloads.insert((case.id, field), value);
+                        }
+                    }
+                    selected
+                        .1
+                        .put(scrutinee_slot, residual, scopes.lexical_depth());
+                }
+            }
             if let Some(guard) = &arm.guard {
                 selected.push();
-                for binding in match_pattern_bindings(&arm.pattern) {
-                    self.declare_match_binding(binding, borrow_root.clone(), true, &mut selected);
+                for (field, binding) in match_pattern_bindings(&arm.pattern).into_iter().enumerate()
+                {
+                    let source = arm_info.and_then(|info| match info.pattern {
+                        crate::semantics::ResolvedMatchPattern::EnumCase { case_id, .. } => {
+                            Some(cleanup::Source::EnumPayload {
+                                scrutinee: scrutinee.span(),
+                                case: case_id,
+                                field,
+                            })
+                        }
+                        crate::semantics::ResolvedMatchPattern::ExactType(_) => {
+                            Some(cleanup::Source::Expression(scrutinee.span()))
+                        }
+                        _ => None,
+                    });
+                    self.declare_match_binding(
+                        binding,
+                        borrow_root.clone(),
+                        true,
+                        source,
+                        None,
+                        &mut selected,
+                    );
                 }
                 self.use_expr(&guard.condition, &mut selected, UseMode::Read);
-                selected.pop();
+                self.cleanup_pop_scope(
+                    &mut selected,
+                    guard.condition.span(),
+                    cleanup::Cause::ScopeExit,
+                );
 
                 let before_guard = remaining.clone();
-                remaining.merge_from(&before_guard, &selected);
+                let mut failed_guard = selected.clone();
+                // A guard is a view: failure leaves the whole scrutinee owned
+                // by the selection region for the following arm.
+                failed_guard
+                    .1
+                    .put(scrutinee_slot, original_scrutinee, scopes.lexical_depth());
+                remaining.merge_from(&before_guard, &failed_guard);
+                if arm_info.is_some_and(|info| {
+                    info.guard == crate::semantics::MatchGuardSemanticInfo::AlwaysFalse
+                }) {
+                    continue;
+                }
             }
 
             selected.push();
-            for binding in match_pattern_bindings(&arm.pattern) {
-                self.declare_match_binding(binding, borrow_root.clone(), !consuming, &mut selected);
+            for (field, binding) in match_pattern_bindings(&arm.pattern).into_iter().enumerate() {
+                let binding_info = arm_info.and_then(|info| info.bindings.get(field));
+                let borrowed = binding_info.map_or(!consuming, |info| info.borrowed);
+                let source = arm_info.and_then(|info| match info.pattern {
+                    crate::semantics::ResolvedMatchPattern::EnumCase { case_id, .. } => {
+                        Some(cleanup::Source::EnumPayload {
+                            scrutinee: scrutinee.span(),
+                            case: case_id,
+                            field,
+                        })
+                    }
+                    crate::semantics::ResolvedMatchPattern::ExactType(_) => {
+                        Some(cleanup::Source::Expression(scrutinee.span()))
+                    }
+                    _ => None,
+                });
+                let mut transferred = None;
+                if consuming && !borrowed {
+                    match arm_info.map(|info| &info.pattern) {
+                        Some(crate::semantics::ResolvedMatchPattern::EnumCase {
+                            case_id, ..
+                        }) => {
+                            let value = payloads.get(&(*case_id, field)).copied();
+                            let mut residual = selected.1.take(&scrutinee_slot);
+                            if let Some(value) = value {
+                                residual.remove(&value);
+                            }
+                            selected
+                                .1
+                                .put(scrutinee_slot, residual, scopes.lexical_depth());
+                            transferred = Some(value.into_iter().collect());
+                        }
+                        Some(crate::semantics::ResolvedMatchPattern::ExactType(ty))
+                            if resolved_type_is_move_type(ty, &self.move_enum_names)
+                                || resolved_type_requires_conservative_move(ty) =>
+                        {
+                            let values = selected.1.take(&scrutinee_slot);
+                            if values.iter().all(|value| {
+                                self.cleanup_analysis
+                                    .values
+                                    .get(value)
+                                    .is_some_and(|value| value.ty == *ty)
+                            }) {
+                                transferred = Some(values);
+                            } else if let (Some(owner), Some(binding)) =
+                                (self.cleanup_owner, self.canonical_binding_id(binding.span))
+                            {
+                                let contents = values
+                                    .iter()
+                                    .filter_map(|value| self.cleanup_analysis.values.get(value))
+                                    .flat_map(|value| value.contents.iter().copied())
+                                    .collect();
+                                let value = self.cleanup_analysis.acquire(
+                                    owner,
+                                    cleanup::Source::Binding(binding),
+                                    ty.clone(),
+                                    contents,
+                                );
+                                transferred = Some(HashSet::from([value]));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.declare_match_binding(
+                    binding,
+                    borrow_root.clone(),
+                    borrowed,
+                    source,
+                    transferred,
+                    &mut selected,
+                );
             }
-            let value = self.evaluate_retained_value(&arm.value, &mut selected, mode);
+            let result_mode = if consuming
+                && checked.as_ref().is_some_and(|info| {
+                    resolved_type_is_move_type(&info.result_type, &self.move_enum_names)
+                        || resolved_type_requires_conservative_move(&info.result_type)
+                }) {
+                UseMode::Give
+            } else {
+                mode
+            };
+            let value = self.evaluate_retained_value(&arm.value, &mut selected, result_mode);
             result_value = join_retained_value(result_value.as_ref(), value.as_ref());
-            selected.pop();
+            let result = self.cleanup_take_expr(&arm.value, &mut selected);
+            for value in &result {
+                if let Some(value) = self.cleanup_analysis.values.get(value) {
+                    self.cleanup_analysis
+                        .source_flows
+                        .insert((value.source, cleanup::Source::Expression(site)));
+                }
+            }
+            selected.1.put(
+                cleanup::Slot::Temporary(site),
+                result,
+                scopes.lexical_depth(),
+            );
+            self.cleanup_pop_scope(&mut selected, arm.value.span(), cleanup::Cause::ScopeExit);
             outcomes.push(selected);
 
-            if matches!(arm.pattern, ast::MatchPattern::Default { .. }) {
+            let covers_pattern = arm_info.is_none_or(|info| {
+                matches!(
+                    info.guard,
+                    crate::semantics::MatchGuardSemanticInfo::None
+                        | crate::semantics::MatchGuardSemanticInfo::AlwaysTrue
+                )
+            });
+            if covers_pattern {
+                if let Some(crate::semantics::ResolvedMatchPattern::EnumCase { case_id, .. }) =
+                    arm_info.map(|info| &info.pattern)
+                {
+                    remaining_cases.remove(case_id);
+                }
+                if let Some(crate::semantics::ResolvedMatchPattern::ExactType(ty)) =
+                    arm_info.map(|info| &info.pattern)
+                {
+                    let mut values = remaining.1.take(&scrutinee_slot);
+                    values.retain(|value| {
+                        self.cleanup_analysis.values.get(value).is_none_or(|value| {
+                            // Removing T from ?T leaves only null, which
+                            // cannot run T's destructor in a later arm.
+                            // An open mixed/interface remainder is still
+                            // retained; matching one type cannot clear it.
+                            value.ty != *ty
+                                && !matches!(&value.ty, ResolvedType::Nullable(inner)
+                                        if inner.as_ref() == ty)
+                        })
+                    });
+                    remaining
+                        .1
+                        .put(scrutinee_slot, values, scopes.lexical_depth());
+                }
+            }
+            if covers_pattern && matches!(arm.pattern, ast::MatchPattern::Default { .. }) {
                 has_default = true;
                 break;
             }
         }
 
-        if !has_default {
+        // Checked matches are exhaustive; MIR's final fallback is unreachable.
+        // An invented unmatched path would drop values every real arm moved.
+        if !has_default && checked.is_none() {
             outcomes.push(remaining);
         }
         if let Some(mut joined) = outcomes.pop() {
@@ -5101,8 +6292,10 @@ impl Checker<'_> {
     fn declare_match_binding(
         &mut self,
         binding: &ast::MatchBinding,
-        borrow_root: Option<String>,
+        borrow_root: Option<BorrowSourceRoot>,
         borrowed: bool,
+        source: Option<cleanup::Source>,
+        transferred: Option<HashSet<cleanup::ValueId>>,
         scopes: &mut Scopes,
     ) {
         let Some(ty) = self.resolved_types.get(&binding.span) else {
@@ -5138,6 +6331,37 @@ impl Checker<'_> {
                 scope_depth: scopes.lexical_depth(),
             },
         );
+        if let Some(binding) = canonical_id {
+            let destination = cleanup::Source::Binding(binding);
+            // A match binding denotes its selected payload, including while a
+            // guard only lends it. Whole-enum flow would merge sibling fields'
+            // callback origins and charge unrelated cleanup to this binding.
+            if let Some(source) = source {
+                self.cleanup_analysis
+                    .source_flows
+                    .insert((source, destination));
+            }
+            for value in transferred.iter().flatten() {
+                if let Some(value) = self.cleanup_analysis.values.get(value) {
+                    self.cleanup_analysis
+                        .source_flows
+                        .insert((value.source, destination));
+                }
+            }
+        }
+        if !borrowed {
+            if let Some(binding) = canonical_id {
+                if let Some(values) = transferred {
+                    scopes.1.put(
+                        cleanup::Slot::Binding(binding),
+                        values,
+                        scopes.lexical_depth(),
+                    );
+                } else {
+                    self.cleanup_owned_parameter(binding, scopes);
+                }
+            }
+        }
     }
 
     fn analyze_closure_body(
@@ -5152,6 +6376,7 @@ impl Checker<'_> {
         let Some(semantic) = self.closures.get(&closure_id).cloned() else {
             return;
         };
+        let cleanup_context = self.cleanup_begin_callable(closure.span);
         let mut scopes = Scopes::new();
         for capture in &semantic.captures {
             let Some(declaration) = self
@@ -5191,10 +6416,10 @@ impl Checker<'_> {
                     mixed: resolved_type_is_mixed(&capture.source_type),
                     borrowed_place: borrowed,
                     borrow_root: borrowed.then(|| {
-                        format!(
+                        BorrowSourceRoot::Place(format!(
                             "closure:{}:{}:binding:{}",
                             closure_id.start, closure_id.end, capture.environment_binding_id.0
-                        )
+                        ))
                     }),
                     writable: capture.mode == ast::ClosureCaptureMode::Writable,
                     state: if borrowed {
@@ -5207,6 +6432,16 @@ impl Checker<'_> {
                     scope_depth: scopes.lexical_depth(),
                 },
             );
+            if !borrowed {
+                self.cleanup_owned_parameter(capture.environment_binding_id, &mut scopes);
+                if semantic.inferred_invocation_mode != FunctionInvocationMode::Once {
+                    // Repeatable captures belong to the surviving environment,
+                    // not to an individual invocation's lexical frame.
+                    let slot = cleanup::Slot::Binding(capture.environment_binding_id);
+                    let values = scopes.1.take(&slot);
+                    scopes.1.put(slot, values, 0);
+                }
+            }
         }
         for parameter in &closure.parameters {
             let canonical_id = self.canonical_binding_id(parameter.name_span);
@@ -5253,11 +6488,17 @@ impl Checker<'_> {
                     scope_depth: scopes.lexical_depth(),
                 },
             );
+            if parameter.take {
+                if let Some(binding) = canonical_id {
+                    self.cleanup_owned_parameter(binding, &mut scopes);
+                }
+            }
         }
 
         let previous_return_borrow = self.current_return_borrow;
         self.current_return_borrow = non_null_function_type(&semantic.function_type)
             .and_then(|function| function.return_borrow)
+            .filter(|borrow| borrow.kind == ReturnBorrowKind::Value)
             .map(|borrow| {
                 if borrow.writable {
                     UseMode::Write
@@ -5268,7 +6509,7 @@ impl Checker<'_> {
         let return_move_type =
             resolved_type_is_move_type(&semantic.inferred_return_type, &self.move_enum_names)
                 && self.current_return_borrow.is_none();
-        match &closure.body {
+        let mut flow = match &closure.body {
             ast::ClosureBody::Expression { expression, .. } => {
                 if let Some(value) = self.prepare_retained_value(expression, &mut scopes) {
                     let _ = self.validate_returned_function_value(&value, expression.span());
@@ -5282,16 +6523,20 @@ impl Checker<'_> {
                         self.current_return_borrow.unwrap_or(UseMode::Read)
                     },
                 );
+                self.cleanup_stage_return(Some(expression), &mut scopes, expression.span());
+                Flow::returns(&scopes)
             }
             ast::ClosureBody::Block(block) => {
-                self.check_block(block, &mut scopes, return_move_type, false);
+                self.check_block(block, &mut scopes, return_move_type, false)
             }
-        }
+        };
+        self.cleanup_end_callable(cleanup_context, &mut scopes, &mut flow, closure.span);
         self.current_return_borrow = previous_return_borrow;
     }
 
     fn use_callable_args(
         &mut self,
+        site: Span,
         args: &[Argument],
         function: &crate::types::SemanticFunctionType<ResolvedType>,
         scopes: &mut Scopes,
@@ -5317,12 +6562,28 @@ impl Checker<'_> {
                 .unwrap_or(UseMode::Read);
             self.mark_transferred_closure(&argument.value, mode, scopes);
             self.use_expr(&argument.value, scopes, mode);
+            if mode == UseMode::Give {
+                let values = scopes
+                    .1
+                    .take(&cleanup::Slot::Temporary(argument.value.span()));
+                scopes.1.put(
+                    cleanup::Slot::PendingArgument { call: site, index },
+                    values,
+                    scopes.lexical_depth(),
+                );
+            }
             self.activate_place_input_borrows(&argument.value, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
                 self.activate_borrow(&argument.value, mode, scopes);
             }
         }
         self.active_borrows.truncate(borrow_depth);
+        for index in 0..args.len() {
+            // Only after all arguments succeed does the callee own them.
+            scopes
+                .1
+                .take(&cleanup::Slot::PendingArgument { call: site, index });
+        }
     }
 
     fn mark_transferred_closure(&mut self, argument: &Expr, mode: UseMode, scopes: &mut Scopes) {
@@ -5337,17 +6598,20 @@ impl Checker<'_> {
 
     fn use_call_args(
         &mut self,
+        site: Span,
         receiver: Option<&Expr>,
         args: &[Argument],
         signature: &Signature,
         execution: CallExecution,
         scopes: &mut Scopes,
     ) {
-        self.use_call_args_with_storage(receiver, args, signature, execution, scopes, None);
+        self.use_call_args_with_storage(site, receiver, args, signature, execution, scopes, None);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn use_call_args_with_storage(
         &mut self,
+        site: Span,
         receiver: Option<&Expr>,
         args: &[Argument],
         signature: &Signature,
@@ -5446,6 +6710,14 @@ impl Checker<'_> {
             }
             self.mark_transferred_closure(arg, mode, scopes);
             self.use_expr(arg, scopes, mode);
+            if mode == UseMode::Give {
+                let values = scopes.1.take(&cleanup::Slot::Temporary(arg.span()));
+                scopes.1.put(
+                    cleanup::Slot::PendingArgument { call: site, index },
+                    values,
+                    scopes.lexical_depth(),
+                );
+            }
             if let Some(value) = self.retained_value_from_expr(arg, scopes) {
                 if mode == UseMode::Give {
                     if let Some(FunctionStorageBoundary::Owned(destination)) = function_storage {
@@ -5467,6 +6739,11 @@ impl Checker<'_> {
         }
         if execution != CallExecution::Never {
             self.validate_retained_call_inputs(receiver, args, signature, scopes);
+        }
+        for index in 0..args.len() {
+            scopes
+                .1
+                .take(&cleanup::Slot::PendingArgument { call: site, index });
         }
         if let Some(without_call) = without_call {
             let with_call = scopes.clone();
@@ -5511,6 +6788,7 @@ impl Checker<'_> {
     }
 
     fn activate_borrow_root(&mut self, root: String, mode: UseMode, span: Span, scopes: &Scopes) {
+        self.check_live_retained_conflict(&root, mode, span, scopes);
         if mode == UseMode::Write {
             if let Some(alias) = scopes.borrowed_from(&root) {
                 self.diagnostics.push(
@@ -5533,6 +6811,12 @@ impl Checker<'_> {
     }
 
     fn activate_place_input_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
+        if let Expr::PropertyAccess { object, .. } = ungroup_expr(expr) {
+            if let Some(signature) = self.getter_signature(expr) {
+                self.activate_nested_call_property_borrows(Some(object), &[], &signature, scopes);
+                return;
+            }
+        }
         match expr {
             Expr::Grouped { expr, .. } | Expr::PropertyAccess { object: expr, .. } => {
                 self.activate_place_input_borrows(expr, scopes);
@@ -5542,6 +6826,12 @@ impl Checker<'_> {
     }
 
     fn activate_nested_property_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
+        if let Expr::PropertyAccess { object, .. } = ungroup_expr(expr) {
+            if let Some(signature) = self.getter_signature(expr) {
+                self.activate_nested_call_property_borrows(Some(object), &[], &signature, scopes);
+                return;
+            }
+        }
         match expr {
             Expr::PropertyAccess { object, .. } => {
                 if self
@@ -5713,6 +7003,9 @@ impl Checker<'_> {
     }
 
     fn readonly_writable_path(&self, expr: &Expr, scopes: &Scopes) -> Option<(String, Span)> {
+        if let Some(signature) = self.getter_signature(expr) {
+            return self.readonly_return_borrow_path(&signature, expr.span());
+        }
         match expr {
             Expr::Grouped { expr, .. } => self.readonly_writable_path(expr, scopes),
             // Direct bindings are checked by `use_expr` in write mode. This
@@ -5775,7 +7068,9 @@ impl Checker<'_> {
         signature: &Signature,
         span: Span,
     ) -> Option<(String, Span)> {
-        let borrow = signature.return_borrow?;
+        let borrow = signature
+            .return_borrow
+            .filter(|borrow| borrow.kind == ReturnBorrowKind::Value)?;
         (!borrow.writable).then(|| ("returned borrow".to_string(), span))
     }
 
@@ -5822,31 +7117,49 @@ impl Checker<'_> {
     }
 
     fn borrow_root_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
+        self.borrow_source_root(expr, scopes)
+            .and_then(|root| root.place_key().map(str::to_string))
+    }
+
+    fn borrow_source_root(&self, expr: &Expr, scopes: &Scopes) -> Option<BorrowSourceRoot> {
         if let Some((signature, receiver, args)) = self.retained_call(expr, scopes) {
-            if let Some(borrow) = signature.return_borrow {
-                return self.call_borrow_root(borrow, receiver, &signature, args, scopes);
-            }
+            return signature.return_borrow.and_then(|borrow| {
+                self.call_borrow_source_root(borrow, receiver, &signature, args, scopes)
+            });
         }
         match expr {
-            Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
-            Expr::Variable { name, .. } => {
-                scopes.get(name).map(|binding| binding_root(binding, name))
+            Expr::Null { .. } => Some(BorrowSourceRoot::ImmutableNull),
+            Expr::This { .. } if self.receiver_class.is_some() => {
+                Some(BorrowSourceRoot::Place("$this".to_string()))
             }
+            Expr::Variable { name, .. } => scopes.get(name).map(|binding| {
+                binding.borrow_root.clone().unwrap_or_else(|| {
+                    BorrowSourceRoot::Place(binding_identity_key(binding.id, name))
+                })
+            }),
             Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
-                self.borrow_root_key(object, scopes)
+                self.borrow_source_root(object, scopes)
             }
-            Expr::Index { collection, .. } => self.borrow_root_key(collection, scopes),
+            Expr::Index { collection, .. } => self.borrow_source_root(collection, scopes),
+            Expr::CallableCall { args, span, .. } => {
+                let call = self.callable_value_calls.get(span)?;
+                let function = non_null_function_type(&call.function_type)?;
+                let borrow = function.return_borrow?;
+                let crate::types::FunctionBorrowSource::Parameter(index) = borrow.source;
+                self.borrow_source_root(&args.get(index)?.value, scopes)
+                    .filter(|root| !borrow.writable || *root != BorrowSourceRoot::ImmutableNull)
+            }
             Expr::StaticMember {
                 qualifier, member, ..
             } => self.qualifier_class(qualifier).and_then(|class| {
                 self.static_properties
                     .contains_key(&(class.clone(), member.clone()))
-                    .then(|| format!("static:{class}::{member}"))
+                    .then(|| BorrowSourceRoot::Place(format!("static:{class}::{member}")))
             }),
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name)?;
                 let borrow = signature.return_borrow?;
-                self.call_borrow_root(borrow, None, signature, args, scopes)
+                self.call_borrow_source_root(borrow, None, signature, args, scopes)
             }
             Expr::MethodCall {
                 object,
@@ -5860,12 +7173,12 @@ impl Checker<'_> {
                         collection.family == CollectionFamily::Dictionary && method == "get"
                     })
                 {
-                    return self.borrow_root_key(object, scopes);
+                    return self.borrow_source_root(object, scopes);
                 }
                 let class = self.expr_class(object, scopes)?;
                 let signature = self.methods.get(&(class, method.clone()))?;
                 let borrow = signature.return_borrow?;
-                self.call_borrow_root(borrow, Some(object), signature, args, scopes)
+                self.call_borrow_source_root(borrow, Some(object), signature, args, scopes)
             }
             Expr::StaticCall {
                 qualifier,
@@ -5876,13 +7189,16 @@ impl Checker<'_> {
                 let class = self.qualifier_class(qualifier)?;
                 let signature = self.methods.get(&(class, method.clone()))?;
                 let borrow = signature.return_borrow?;
-                self.call_borrow_root(borrow, None, signature, args, scopes)
+                self.call_borrow_source_root(borrow, None, signature, args, scopes)
             }
             _ => None,
         }
     }
 
     fn assignment_place_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
+        if self.getter_signature(expr).is_some() {
+            return None;
+        }
         match expr {
             Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
             Expr::Variable { name, .. } => scopes
@@ -5899,24 +7215,17 @@ impl Checker<'_> {
         }
     }
 
-    fn call_borrow_root(
+    fn call_borrow_source_root(
         &self,
         borrow: ReturnBorrow,
         receiver: Option<&Expr>,
         signature: &Signature,
         args: &[Argument],
         scopes: &Scopes,
-    ) -> Option<String> {
-        match borrow.source {
-            BorrowSource::Receiver => self.borrow_root_key(receiver?, scopes),
-            BorrowSource::Parameter(index) => {
-                // The annotation names a parameter position; named binding may
-                // place that argument anywhere in the written call.
-                let bound = signature.bind_arguments(args);
-                let arg_index = bound.param_to_arg.get(index).copied().flatten()?;
-                self.borrow_root_key(&args.get(arg_index)?.value, scopes)
-            }
-        }
+    ) -> Option<BorrowSourceRoot> {
+        let source = self.call_borrow_source_expr(borrow, receiver, signature, args)?;
+        self.borrow_source_root(source, scopes)
+            .filter(|root| !borrow.writable || *root != BorrowSourceRoot::ImmutableNull)
     }
 
     fn check_active_borrow_conflict(&mut self, root: &str, mode: UseMode, span: Span) {
@@ -6113,6 +7422,11 @@ impl Checker<'_> {
     }
 
     fn expr_is_non_transferable_property(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        if let Some(signature) = self.getter_signature(expr) {
+            return signature
+                .return_borrow
+                .is_some_and(|borrow| borrow.kind == ReturnBorrowKind::Value);
+        }
         let Expr::PropertyAccess {
             object, property, ..
         } = expr
@@ -6143,18 +7457,42 @@ impl Checker<'_> {
     }
 
     fn expr_returns_borrow(&self, expr: &Expr, scopes: &Scopes) -> bool {
-        if self
-            .retained_call(expr, scopes)
-            .is_some_and(|(signature, _, _)| signature.return_borrow.is_some())
-        {
-            return true;
-        }
         match expr {
             Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => self.expr_returns_borrow(left, scopes) || self.expr_returns_borrow(right, scopes),
+            _ => {
+                self.expr_has_return_borrow_contract(expr, scopes)
+                    && self.borrow_source_root(expr, scopes)
+                        != Some(BorrowSourceRoot::ImmutableNull)
+            }
+        }
+    }
+
+    fn expr_has_return_borrow_contract(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        self.expr_has_return_contract(expr, scopes, Some(ReturnBorrowKind::Value))
+    }
+
+    fn expr_has_return_contract(
+        &self,
+        expr: &Expr,
+        scopes: &Scopes,
+        kind: Option<ReturnBorrowKind>,
+    ) -> bool {
+        let matches_kind = |borrow: ReturnBorrow| kind.is_none_or(|kind| borrow.kind == kind);
+        if let Some((signature, _, _)) = self.retained_call(expr, scopes) {
+            return signature.return_borrow.is_some_and(matches_kind);
+        }
+        match expr {
+            Expr::Grouped { expr, .. } => self.expr_has_return_contract(expr, scopes, kind),
             Expr::FunctionCall { name, .. } => self
                 .signatures
                 .get(name)
-                .is_some_and(|signature| signature.return_borrow.is_some()),
+                .is_some_and(|signature| signature.return_borrow.is_some_and(matches_kind)),
             Expr::MethodCall { object, method, .. } => {
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
                     return collection.value_move
@@ -6168,25 +7506,32 @@ impl Checker<'_> {
                 };
                 self.methods
                     .get(&(class, method.clone()))
-                    .is_some_and(|signature| signature.return_borrow.is_some())
+                    .is_some_and(|signature| signature.return_borrow.is_some_and(matches_kind))
             }
             Expr::StaticCall {
                 qualifier, method, ..
             } => self
                 .qualifier_class(qualifier)
                 .and_then(|class| self.methods.get(&(class, method.clone())))
-                .is_some_and(|signature| signature.return_borrow.is_some()),
+                .is_some_and(|signature| signature.return_borrow.is_some_and(matches_kind)),
             Expr::CallableCall { span, .. } => self
                 .callable_value_calls
                 .get(span)
                 .and_then(|call| non_null_function_type(&call.function_type))
-                .is_some_and(|function| function.return_borrow.is_some()),
+                .is_some_and(|function| {
+                    function
+                        .return_borrow
+                        .is_some_and(|borrow| kind.is_none_or(|kind| borrow.kind == kind))
+                }),
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
                 right,
                 ..
-            } => self.expr_returns_borrow(left, scopes) || self.expr_returns_borrow(right, scopes),
+            } => {
+                self.expr_has_return_contract(left, scopes, kind)
+                    || self.expr_has_return_contract(right, scopes, kind)
+            }
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .is_some_and(|collection| collection.value_move && !collection.value_mixed),
@@ -6421,6 +7766,7 @@ impl Checker<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn use_collection_call(
         &mut self,
         collection: CollectionFamily,
@@ -6428,34 +7774,14 @@ impl Checker<'_> {
         method: &str,
         args: &[Argument],
         span: Span,
+        execution: CallExecution,
         scopes: &mut Scopes,
     ) {
-        if let Some(plan) = self.list_algorithm_calls.get(&span).cloned() {
-            let borrow_depth = self.active_borrows.len();
-            self.use_expr(object, scopes, UseMode::Read);
-            self.activate_place_input_borrows(object, scopes);
-            self.activate_borrow(object, UseMode::Read, scopes);
-            for (index, argument) in args.iter().enumerate() {
-                let is_initial =
-                    plan.kind == crate::semantics::ListAlgorithmKind::Reduce && index == 0;
-                if is_initial {
-                    self.use_owned_expression(&argument.value, scopes);
-                    continue;
-                }
-                let mode = match plan.callback_access {
-                    crate::semantics::ListCallbackAccess::Readonly => UseMode::Read,
-                    crate::semantics::ListCallbackAccess::Writable => UseMode::Write,
-                };
-                self.use_expr(&argument.value, scopes, mode);
-            }
-            self.active_borrows.truncate(borrow_depth);
-            return;
-        }
         let mutating = matches!(
             (collection, method),
             (
                 CollectionFamily::List,
-                "add" | "insertAt" | "removeAt" | "pop" | "clear"
+                "add" | "insertAt" | "remove" | "removeAt" | "pop" | "clear"
             ) | (CollectionFamily::Dictionary, "set" | "remove" | "clear")
                 | (CollectionFamily::Set, "add" | "remove" | "clear")
                 | (CollectionFamily::PriorityQueue, "push" | "pop" | "clear")
@@ -6473,17 +7799,92 @@ impl Checker<'_> {
                 UseMode::Read
             },
         );
-
-        for (index, argument) in args.iter().enumerate() {
-            let moves_in = matches!(
-                (collection, method, index),
-                (CollectionFamily::List, "add", 0)
-                    | (CollectionFamily::List, "insertAt", 1)
-                    | (CollectionFamily::Dictionary, "set", 0 | 1)
-                    | (CollectionFamily::Set, "add", 0)
-                    | (CollectionFamily::PriorityQueue, "push", 0)
-                    | (CollectionFamily::Deque, "pushFront" | "pushBack", 0)
+        if execution == CallExecution::Never {
+            return;
+        }
+        let without_call = (execution == CallExecution::Maybe).then(|| scopes.clone());
+        if let Some(plan) = self.list_algorithm_calls.get(&span).cloned() {
+            let borrow_depth = self.active_borrows.len();
+            self.activate_place_input_borrows(object, scopes);
+            self.activate_borrow(object, UseMode::Read, scopes);
+            for (index, argument) in args.iter().enumerate() {
+                let is_initial =
+                    plan.kind == crate::semantics::ListAlgorithmKind::Reduce && index == 0;
+                if is_initial {
+                    self.use_owned_expression(&argument.value, scopes);
+                    let values = self.cleanup_take_expr(&argument.value, scopes);
+                    scopes.1.put(
+                        cleanup::Slot::PendingArgument { call: span, index },
+                        values,
+                        scopes.lexical_depth(),
+                    );
+                    continue;
+                }
+                let mode = match plan.callback_access {
+                    crate::semantics::ListCallbackAccess::Readonly => UseMode::Read,
+                    crate::semantics::ListCallbackAccess::Writable => UseMode::Write,
+                };
+                self.use_expr(&argument.value, scopes, mode);
+            }
+            // The algorithm, not its caller, owns the accumulator/partial
+            // output while callbacks execute. A checked callback failure drops
+            // that owner; successful completion transfers it as the result.
+            let result = if plan.kind == crate::semantics::ListAlgorithmKind::Reduce {
+                if let Some(initial) = args.first() {
+                    self.cleanup_analysis
+                        .value_flows
+                        .insert((initial.value.span(), span));
+                }
+                scopes.1.take(&cleanup::Slot::PendingArgument {
+                    call: span,
+                    index: 0,
+                })
+            } else {
+                let element_source = if plan.kind == crate::semantics::ListAlgorithmKind::Map {
+                    cleanup::Source::CallbackReturn {
+                        callback: plan.callback_span,
+                    }
+                } else {
+                    cleanup::Source::CollectionElement {
+                        collection: object.span(),
+                        key: false,
+                    }
+                };
+                self.cleanup_analysis.source_flows.insert((
+                    element_source,
+                    cleanup::Source::CollectionElement {
+                        collection: span,
+                        key: false,
+                    },
+                ));
+                let contents = match &plan.result_type {
+                    ResolvedType::List(element) => {
+                        self.cleanup_acquire_value(element_source, *element.clone(), HashSet::new())
+                    }
+                    _ => HashSet::new(),
+                };
+                self.cleanup_acquire_value(
+                    cleanup::Source::Expression(span),
+                    plan.result_type.clone(),
+                    contents,
+                )
+            };
+            scopes.1.put(
+                cleanup::Slot::Temporary(span),
+                result,
+                scopes.lexical_depth(),
             );
+            self.record_exceptional_exits(span, scopes);
+            self.active_borrows.truncate(borrow_depth);
+            if let Some(without_call) = without_call {
+                let with_call = scopes.clone();
+                scopes.merge_from(&without_call, &with_call);
+            }
+            return;
+        }
+        let mut moved_arguments = Vec::new();
+        for (index, argument) in args.iter().enumerate() {
+            let moves_in = collection.ingested_arguments(method).contains(&index);
             if moves_in {
                 let valid_function_storage = self
                     .prepare_retained_value(&argument.value, scopes)
@@ -6497,12 +7898,129 @@ impl Checker<'_> {
                     });
                 if valid_function_storage {
                     self.use_owned_expression(&argument.value, scopes);
+                    let values = self.cleanup_take_expr(&argument.value, scopes);
+                    scopes.1.put(
+                        cleanup::Slot::PendingArgument { call: span, index },
+                        values,
+                        scopes.lexical_depth(),
+                    );
+                    moved_arguments.push(index);
                 } else {
                     self.use_expr(&argument.value, scopes, UseMode::Read);
                 }
             } else {
                 self.use_expr(&argument.value, scopes, UseMode::Read);
             }
+        }
+        // Lookup, hashing and comparison run before ownership is installed in
+        // the collection. Pending arguments therefore remain live on failure.
+        self.record_exceptional_exits(span, scopes);
+        let roots = self.cleanup_collection_roots(object, scopes);
+        for index in moved_arguments {
+            let values = scopes
+                .1
+                .take(&cleanup::Slot::PendingArgument { call: span, index });
+            let key = collection == CollectionFamily::Dictionary && index == 0;
+            self.cleanup_analysis
+                .value_flows
+                .insert((args[index].value.span(), object.span()));
+            self.cleanup_analysis.source_flows.insert((
+                cleanup::Source::Expression(args[index].value.span()),
+                cleanup::Source::CollectionElement {
+                    collection: object.span(),
+                    key,
+                },
+            ));
+            for root in &roots {
+                if let Some(value) = self.cleanup_analysis.values.get_mut(root) {
+                    value.contents.extend(&values);
+                }
+            }
+            if (collection == CollectionFamily::Set && method == "add")
+                || (collection == CollectionFamily::Dictionary && method == "set" && key)
+            {
+                // Duplicate insertion keeps the stored element/key and drops
+                // the newly supplied owner. These are conditional releases.
+                self.cleanup_release(span, values, cleanup::Cause::Replacement);
+            }
+        }
+        let receiver_type = self.resolved_type(object).cloned();
+        let receiver_type = match &receiver_type {
+            Some(ResolvedType::Nullable(inner)) => Some(inner.as_ref()),
+            other => other.as_ref(),
+        };
+        let (key_type, value_type) = match receiver_type {
+            Some(
+                ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value),
+            ) => (Some(*key.clone()), Some(*value.clone())),
+            Some(
+                ResolvedType::TypedArray(value)
+                | ResolvedType::List(value)
+                | ResolvedType::Set(value)
+                | ResolvedType::SortedSet(value)
+                | ResolvedType::PriorityQueue(value)
+                | ResolvedType::Deque(value),
+            ) => (None, Some(*value.clone())),
+            _ => (None, None),
+        };
+        let removes_value = matches!(
+            (collection, method),
+            (CollectionFamily::List | CollectionFamily::Set, "remove")
+        );
+        let replaces_value = collection == CollectionFamily::Dictionary && method == "set";
+        let clears = mutating && method == "clear";
+        let removes_key = collection == CollectionFamily::Dictionary && method == "remove";
+        for (key, ty, released) in [
+            (true, key_type, clears || removes_key),
+            (false, value_type, clears || removes_value || replaces_value),
+        ] {
+            if released {
+                if let Some(ty) = ty {
+                    let values = self.cleanup_acquire_value(
+                        cleanup::Source::CollectionElement {
+                            collection: object.span(),
+                            key,
+                        },
+                        ty,
+                        HashSet::new(),
+                    );
+                    self.cleanup_release(span, values, cleanup::Cause::Replacement);
+                }
+            }
+        }
+        if matches!(
+            (collection, method),
+            (CollectionFamily::List, "removeAt" | "pop")
+                | (CollectionFamily::Dictionary, "remove")
+                | (CollectionFamily::PriorityQueue, "pop")
+                | (CollectionFamily::Deque, "popFront" | "popBack")
+        ) {
+            self.cleanup_analysis.source_flows.insert((
+                cleanup::Source::CollectionElement {
+                    collection: object.span(),
+                    key: false,
+                },
+                cleanup::Source::Expression(span),
+            ));
+            if let Some(ty) = self.resolved_types.get(&span).cloned() {
+                let result = self.cleanup_acquire_value(
+                    cleanup::Source::CollectionElement {
+                        collection: object.span(),
+                        key: false,
+                    },
+                    ty,
+                    HashSet::new(),
+                );
+                scopes.1.put(
+                    cleanup::Slot::Temporary(span),
+                    result,
+                    scopes.lexical_depth(),
+                );
+            }
+        }
+        if let Some(without_call) = without_call {
+            let with_call = scopes.clone();
+            scopes.merge_from(&without_call, &with_call);
         }
     }
 
@@ -6574,7 +8092,9 @@ fn binding_identity_key(id: OwnershipSlotId, name: &str) -> String {
 fn binding_root(binding: &Binding, name: &str) -> String {
     binding
         .borrow_root
-        .clone()
+        .as_ref()
+        .and_then(BorrowSourceRoot::place_key)
+        .map(str::to_string)
         .unwrap_or_else(|| binding_identity_key(binding.id, name))
 }
 
@@ -7201,17 +8721,51 @@ fn merge_reachable_states(scopes: &mut Scopes, states: &[Scopes]) {
     *scopes = merged;
 }
 
-fn pop_flow_scope(flow: &mut Flow) {
-    for backedge in &mut flow.backedges {
-        backedge.pop();
+#[cfg(test)]
+mod return_contract_tests {
+    use super::*;
+
+    fn contract(kind: ReturnBorrowKind, writable: bool) -> ReturnBorrow {
+        ReturnBorrow {
+            kind,
+            source: BorrowSource::Parameter(0),
+            writable,
+        }
     }
-    for break_exit in &mut flow.breaks {
-        break_exit.pop();
+
+    #[test]
+    fn aliases_join_output_capabilities_and_retained_demands_separately() {
+        for kind in [ReturnBorrowKind::Value, ReturnBorrowKind::Retained] {
+            let readonly = ReturnBorrowAlias::Borrowed(contract(kind, false));
+            let writable = ReturnBorrowAlias::Borrowed(contract(kind, true));
+            let expected =
+                ReturnBorrowAlias::Borrowed(contract(kind, kind == ReturnBorrowKind::Retained));
+            assert_eq!(readonly.join(writable), expected);
+            assert_eq!(writable.join(readonly), expected);
+            assert_eq!(ReturnBorrowAlias::Null.join(writable), writable);
+        }
+        assert_eq!(
+            ReturnBorrowAlias::Borrowed(contract(ReturnBorrowKind::Value, false)).join(
+                ReturnBorrowAlias::Borrowed(contract(ReturnBorrowKind::Retained, false))
+            ),
+            ReturnBorrowAlias::Unknown
+        );
     }
-    for return_exit in &mut flow.returns {
-        return_exit.pop();
-    }
-    for yield_exit in &mut flow.yields {
-        yield_exit.pop();
+
+    #[test]
+    fn forwarding_preserves_retained_source_demands_without_upgrading_value_access() {
+        let source = contract(ReturnBorrowKind::Value, false);
+        assert!(!returned_source_access(
+            source,
+            contract(ReturnBorrowKind::Value, true)
+        ));
+        assert!(returned_source_access(
+            source,
+            contract(ReturnBorrowKind::Retained, true)
+        ));
+        assert!(returned_source_access(
+            contract(ReturnBorrowKind::Retained, true),
+            contract(ReturnBorrowKind::Retained, false)
+        ));
     }
 }

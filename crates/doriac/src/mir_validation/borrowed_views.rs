@@ -155,6 +155,10 @@ impl State {
                             if checking {
                                 self.conflicts(local)?;
                             }
+                            // A writable call returns its input borrow to the
+                            // caller. Invalidate dependent views, not the place
+                            // passed to the call itself.
+                            mutated.insert(local);
                             mutated.extend(self.roots[local.0].iter().copied());
                         }
                         if checking && self.ended.contains(&local) {
@@ -353,7 +357,8 @@ impl State {
             mir::Statement::ExtractErrorObject { target, .. } => {
                 self.assign(*target, HashSet::new())
             }
-            mir::Statement::DropClass { local, .. }
+            mir::Statement::CleanupConstructorPhase { object: local, .. }
+            | mir::Statement::DropClass { local, .. }
             | mir::Statement::DropError { local }
             | mir::Statement::DropMixed { local }
             | mir::Statement::DropFunction { local, .. }

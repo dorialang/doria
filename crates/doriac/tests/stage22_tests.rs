@@ -893,9 +893,12 @@ function main(): void
     ] {
         let diagnostics = doriac::lower_source_to_mir(file, source)
             .expect_err("a possible coalesce borrow must conflict with a later transfer");
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "B0001" && diagnostic.message.contains("both borrows and transfers")
-        }));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0001" && diagnostic.message.contains("source ownership ended")
+            }),
+            "expected a coalesce borrow/transfer conflict, got {diagnostics:#?}"
+        );
     }
 }
 
@@ -1704,7 +1707,7 @@ function main(): void
         .contains("requires a writable nullable class value"));
 
     let mut transferred = program;
-    let object = transferred
+    let receiver = transferred
         .functions
         .iter_mut()
         .find(|function| function.name == "main")
@@ -1713,28 +1716,23 @@ function main(): void
                 block.statements.iter_mut().find_map(|statement| {
                     let doriac::mir::Statement::AssignLocal {
                         value:
-                            doriac::mir::Rvalue::NullableScalar(
-                                doriac::mir::NullableScalarExpression::NullSafeCall {
-                                    object, ..
-                                },
+                            doriac::mir::Rvalue::NullableClass(
+                                doriac::mir::NullableClassExpression::Local { transfer, .. },
                             ),
                         ..
                     } = statement
                     else {
                         return None;
                     };
-                    Some(object.as_mut())
+                    Some(transfer)
                 })
             })
         })
-        .expect("fixture should contain a null-safe call");
-    let doriac::mir::NullableClassExpression::Local { transfer, .. } = object else {
-        panic!("fixture should lower its receiver as a nullable local")
-    };
-    *transfer = true;
+        .expect("fixture should materialize a borrowed nullable receiver for the null-safe CFG");
+    *receiver = true;
     let error = doriac::mir_validation::validate_program(&transferred)
         .expect_err("a null-safe method receiver cannot be transferred");
-    assert!(error.message.contains("transfers its receiver"));
+    assert!(error.message.contains("receives an owning value"));
 }
 
 #[test]

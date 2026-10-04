@@ -1,0 +1,24 @@
+class Item {
+    function __construct(int $id) {}
+    function __destruct() { try { echo "drop {$this->id}\n"; } catch (Error) {} }
+}
+class Cache {
+    internal writable int $reads = 0;
+    writable int $value = 0 {
+        writable get { $this->reads++; return $this->value; }
+        set (int $next) => $this->value = $next;
+    }
+    Item $created { get => new Item(7); }
+    function __destruct() { try { echo "reads {$this->reads}\n"; } catch (Error) {} }
+}
+function main(): void {
+    writable ?Cache $cache = new Cache();
+    if ($cache != null) {
+        $cache->value = 2;
+        $cache->value++;
+        echo "{$cache->value}\n";
+        $cache->created;
+    }
+    echo ($cache?->value ?? -1) . "\n";
+    (new Cache())->created;
+}

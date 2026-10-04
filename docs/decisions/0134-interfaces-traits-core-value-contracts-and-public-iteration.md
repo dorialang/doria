@@ -73,11 +73,15 @@ Stage 35 interface requirements do not permit:
 dynamic implementing class. It is not accepted in an interface parameter
 position in Stage 35.
 
-User interfaces remain method-only. The compiler-known `Error` contract keeps
+Stage 35 interface requirements are method-only. The compiler-known `Error` contract keeps
 its existing externally accessible readonly stored `string $message`
 requirement as a narrow exception. Stage 35 does not decide readable properties,
 setters, backing storage, accessor ownership, accessor effects, or any other
 property-hook syntax. Stage 36 remains their sole owner.
+
+Decision 0135 extends this Stage 35 scope with distinct getter and setter
+requirements. Its accessor contracts replace the method-only boundary, not the
+prohibition on stored user-interface fields or default method bodies.
 
 ## Interface Inheritance
 

@@ -1,0 +1,12 @@
+1 2 3
+4
+element 1
+drop 4
+nullable 1 2 3
+drop 4
+no list
+alive
+drop store
+drop 3
+drop 2
+drop 1

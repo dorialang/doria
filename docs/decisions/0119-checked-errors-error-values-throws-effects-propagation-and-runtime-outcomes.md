@@ -209,6 +209,10 @@ drop once in reverse initialization order; uninitialized properties are
 ignored; constructor parameters and temporaries clean normally; allocation is
 freed; then the checked error propagates.
 
+Decision 0130 extends this rule to inherited construction phases: the incomplete
+class has no destructor, but successfully completed ancestor phases clean
+normally after the incomplete phase's initialized fields.
+
 ## Native ABI And MIR
 
 Nonthrowing callables preserve their ABI. A throwing non-void callable uses its

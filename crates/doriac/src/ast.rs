@@ -227,6 +227,7 @@ pub struct InterfaceDecl {
     pub type_params: Vec<TypeParamDecl>,
     pub parents: Vec<TypeRef>,
     pub requirements: Vec<FunctionDecl>,
+    pub properties: Vec<PropertyDecl>,
     pub syntax: TypeDeclarationSyntax,
     pub span: Span,
 }
@@ -338,12 +339,37 @@ pub enum MemberAccess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyDecl {
     pub access: MemberAccess,
+    pub open_span: Option<Span>,
+    pub override_span: Option<Span>,
     pub is_static: bool,
     pub writable: bool,
     pub ty: TypeRef,
     pub name: String,
     pub name_span: Span,
     pub initializer: Option<Expr>,
+    pub hooks: Vec<PropertyHook>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropertyHookKind {
+    Get,
+    Set,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyHook {
+    pub kind: PropertyHookKind,
+    pub keyword_span: Span,
+    pub writable_span: Option<Span>,
+    /// Authored result-borrow declaration, independent of receiver writability.
+    pub borrowed_span: Option<Span>,
+    pub parameter: Option<Param>,
+    pub throws: Option<ThrowsClause>,
+    pub arrow_span: Option<Span>,
+    /// Arrow bodies normalize to a single-statement block whose span starts at
+    /// the authored arrow. A getter returns its expression; a setter executes it.
+    pub body: FunctionBody,
     pub span: Span,
 }
 

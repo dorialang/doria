@@ -8,8 +8,11 @@ pub(crate) fn expressions<'a>(program: &'a Program, visitor: &mut impl FnMut(&'a
             Item::Function(function) => block(&function.body, visitor),
             Item::Class(class) => {
                 for member in &class.members {
+                    for function in member.callables() {
+                        block(&function.body, visitor);
+                    }
                     match member {
-                        ClassMember::Method(function) => block(&function.body, visitor),
+                        ClassMember::Method(_) => {}
                         ClassMember::Property(property) => {
                             if let Some(value) = &property.initializer {
                                 expression(value, visitor);

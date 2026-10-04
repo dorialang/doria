@@ -26,7 +26,12 @@ pub(super) fn value_at(
         let offset = collection_offset_rvalue(position);
         return collection_value_rvalue(collection, offset.clone(), offset, ty, true);
     }
-    let target = context.declare_borrowed_temp(ty, false);
+    let writable = context.locals[collection.0].writable
+        && context
+            .collection_type(id)
+            .kind
+            .supports_writable_element_iteration();
+    let target = context.declare_borrowed_temp(ty, writable);
     operation(collection, Op::ValueAt { position, target }, context);
     Ok(local_rvalue(target, ty, false))
 }

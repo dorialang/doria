@@ -15,7 +15,7 @@ pub(super) struct MethodKey {
 #[derive(Clone)]
 pub(super) struct CallPlan {
     pub(super) slot: usize,
-    signature: FunctionSignature,
+    pub(super) signature: FunctionSignature,
 }
 
 pub(super) fn collection_vtable(
@@ -205,11 +205,8 @@ pub(super) fn materialize_lowered_call(
         .signature
         .0]
         .clone();
-    let local = context.declare_borrowed_temp(mir::Type::Interface(interface), false);
-    context.push_statement(mir::Statement::AssignLocal {
-        target: local,
-        value: receiver,
-    });
+    let writable = definition.parameters[0].mode == mir::FunctionParameterMode::Writable;
+    let local = materialize_call_receiver(receiver, writable, context);
     let mut lowered = vec![local_rvalue(local, mir::Type::Interface(interface), false)];
     lowered.extend(args);
     emit_indirect_call(
@@ -232,15 +229,28 @@ pub(super) fn materialize_call(
     consume_result: bool,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
-    let hir::Expr::MethodCall {
-        object,
-        method,
-        args,
-        span,
-        null_safe,
-    } = expr
-    else {
-        unreachable!("interface call plan")
+    let (object, method, args, span, null_safe) = match expr {
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe,
+        } => (
+            object.as_ref(),
+            method.as_str(),
+            args.as_slice(),
+            span,
+            null_safe,
+        ),
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            span,
+            null_safe,
+            ..
+        } => (object.as_ref(), property.as_str(), &[][..], span, null_safe),
+        _ => unreachable!("interface member call plan"),
     };
     let definition = context.collection_registry.function_types[context
         .collection_registry
@@ -312,17 +322,9 @@ fn materialize_receiver_call(
     consume_result: bool,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
-    let owned = !value.is_borrowed();
-    let receiver = context.declare_checked_call_slot(mir::Type::Interface(interface), owned);
-    context.locals[receiver.0].writable =
-        definition.parameters[0].mode == mir::FunctionParameterMode::Writable;
-    context.push_statement(mir::Statement::AssignLocal {
-        target: receiver,
-        value: mir::Rvalue::Interface(mir::InterfaceExpression { interface, value }),
-    });
-    if owned {
-        context.track_statement_owned_local(receiver, mir::Type::Interface(interface));
-    }
+    let writable = definition.parameters[0].mode == mir::FunctionParameterMode::Writable;
+    let receiver =
+        materialize_call_receiver(mir::Rvalue::interface(interface, value), writable, context);
     let mut lowered = vec![local_rvalue(
         receiver,
         mir::Type::Interface(interface),
@@ -497,7 +499,10 @@ pub(super) fn register_methods(
                     .methods
                     .push(mir::InterfaceMethod {
                         requirement: requirement.origins[0].declaration,
-                        name: requirement.name.clone(),
+                        name: requirement.accessor.map_or_else(
+                            || requirement.name.clone(),
+                            |kind| crate::property_hooks::accessor_name(&requirement.name, kind),
+                        ),
                         arguments: mir_arguments,
                         signature,
                         writable_receiver: requirement.writable_receiver,
@@ -618,6 +623,7 @@ fn requirement_signature(
         return_borrow: requirement
             .return_borrow
             .map(|borrow| FunctionReturnBorrow {
+                kind: borrow.kind,
                 source: FunctionBorrowSource::Parameter(match borrow.source {
                     crate::symbols::BorrowSource::Receiver => 0,
                     crate::symbols::BorrowSource::Parameter(index) => index + 1,
@@ -1007,12 +1013,13 @@ fn build_entry(
     let mut blocks = Vec::new();
     let result = if let mir::ReturnType::Value(ty) = signature.return_type {
         let local = mir::LocalId(locals.len());
+        let owned = ty.has_move_ownership() && !ty.borrows_returned_value(signature.return_borrow);
         locals.push(mir::Local {
             id: local,
             name: "__interface_result".into(),
             ty,
-            writable: true,
-            owned: ty.has_move_ownership() && signature.return_borrow.is_none(),
+            writable: call_result_is_writable(owned, signature.return_borrow),
+            owned,
             synthetic: true,
         });
         Some((local, ty))
@@ -1022,7 +1029,11 @@ fn build_entry(
     let return_value = match (result, contract.return_type) {
         (None, mir::ReturnType::Void) => mir::Terminator::ReturnVoid,
         (Some((local, actual)), mir::ReturnType::Value(target)) => {
-            let value = local_rvalue(local, actual, signature.return_borrow.is_none());
+            let value = local_rvalue(
+                local,
+                actual,
+                !actual.borrows_returned_value(signature.return_borrow),
+            );
             let value = if target == actual {
                 value
             } else if let (mir::Type::Interface(interface), mir::Rvalue::Class(object)) =
@@ -1050,7 +1061,7 @@ fn build_entry(
                     local,
                     target,
                     actual,
-                    signature.return_borrow.is_none(),
+                    !actual.borrows_returned_value(signature.return_borrow),
                     span,
                 )?
             };
@@ -1254,11 +1265,19 @@ pub(super) fn direct_call_result(
             args,
             return_borrow,
         }),
-        Type::PayloadEnum(ty) => {
-            Rvalue::PayloadEnum(PayloadEnumExpression::Call { ty, function, args })
-        }
+        Type::PayloadEnum(ty) => Rvalue::PayloadEnum(PayloadEnumExpression::Call {
+            ty,
+            function,
+            args,
+            return_borrow,
+        }),
         Type::NullablePayloadEnum(ty) => {
-            Rvalue::NullablePayloadEnum(NullablePayloadEnumExpression::Call { ty, function, args })
+            Rvalue::NullablePayloadEnum(NullablePayloadEnumExpression::Call {
+                ty,
+                function,
+                args,
+                return_borrow,
+            })
         }
         Type::SharedReference(class) => Rvalue::SharedReference(SharedReferenceExpression::Call {
             payload: class,

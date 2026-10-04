@@ -1199,16 +1199,6 @@ impl Parser {
             return member;
         }
 
-        if let Some(modifier) = open_span.or(override_span) {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "P0001",
-                    "`open` and `override` apply only to methods",
-                    modifier,
-                )
-                .with_title("Property Cannot Have A Method Modifier"),
-            );
-        }
         let start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let (name, name_span) = self.expect_variable("expected property variable name")?;
@@ -1217,22 +1207,40 @@ impl Parser {
         } else {
             None
         };
-        let end = self
-            .expect(
-                TokenKind::Semicolon,
-                "expected `;` after property declaration",
-            )?
-            .span
-            .end;
+        let (hooks, end) = if self.match_kind(&TokenKind::LeftBrace) {
+            self.parse_property_hooks()?
+        } else {
+            if let Some(modifier) = open_span.or(override_span) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "`open` and `override` require a method or a hooked property",
+                        modifier,
+                    )
+                    .with_title("Property Cannot Have A Method Modifier"),
+                );
+            }
+            let end = self
+                .expect(
+                    TokenKind::Semicolon,
+                    "expected `;` after property declaration",
+                )?
+                .span
+                .end;
+            (Vec::new(), end)
+        };
 
         let member = ClassMember::Property(PropertyDecl {
             access,
+            open_span,
+            override_span,
             is_static: static_span.is_some(),
             writable: writable_span.is_some(),
             ty,
             name,
             name_span,
             initializer,
+            hooks,
             span: self.span(start.min(name_span.start), end),
         });
         self.attach_attributes(
@@ -1246,6 +1254,173 @@ impl Parser {
             vec![AttributeTargetRole::Declaration],
         );
         Some(member)
+    }
+
+    fn parse_property_hooks(&mut self) -> Option<(Vec<PropertyHook>, usize)> {
+        let open_span = self.previous().span;
+        let mut hooks: Vec<PropertyHook> = Vec::new();
+        if self.check(&TokenKind::RightBrace) {
+            self.error("expected `get` or `set` in property hooks", open_span);
+        }
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let before = self.current;
+            if let Some(hook) = self.parse_property_hook() {
+                if hooks.iter().any(|previous| previous.kind == hook.kind) {
+                    self.error("a property cannot repeat the same hook", hook.keyword_span);
+                }
+                hooks.push(hook);
+            } else {
+                if self.current == before {
+                    self.advance();
+                }
+                self.synchronize_property_hook(before);
+            }
+        }
+        let end = self
+            .expect(TokenKind::RightBrace, "expected `}` after property hooks")?
+            .span
+            .end;
+        Some((hooks, end))
+    }
+
+    fn parse_property_hook(&mut self) -> Option<PropertyHook> {
+        let start = self.peek().span.start;
+        let writable_span = self
+            .match_kind(&TokenKind::Writable)
+            .then(|| self.previous().span);
+        let borrowed_span = if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "borrowed")
+        {
+            Some(self.advance().span)
+        } else {
+            None
+        };
+        if self.check(&TokenKind::Borrow) {
+            self.error(
+                "use `borrowed get` to declare a borrowed getter result",
+                self.peek().span,
+            );
+            return None;
+        }
+        let keyword_span = self.peek().span;
+        let kind = match &self.peek().kind {
+            TokenKind::Identifier(name) if name == "get" => PropertyHookKind::Get,
+            TokenKind::Identifier(name) if name == "set" => PropertyHookKind::Set,
+            _ => {
+                self.error("expected `get` or `set` in property hooks", keyword_span);
+                return None;
+            }
+        };
+        self.advance();
+        let parameter = match kind {
+            PropertyHookKind::Get => {
+                if self.check(&TokenKind::LeftParen) {
+                    self.error("a getter has no parameter list", self.peek().span);
+                    return None;
+                }
+                None
+            }
+            PropertyHookKind::Set => {
+                if let Some(span) = borrowed_span {
+                    self.error("`borrowed` is only allowed on a getter", span);
+                }
+                self.expect(TokenKind::LeftParen, "expected `(` after `set`")?;
+                let parameter = self.parse_param(false)?;
+                if let Some(span) = parameter.default_span {
+                    self.error("a setter parameter cannot have a default value", span);
+                }
+                self.expect(
+                    TokenKind::RightParen,
+                    "expected `)` after the single setter parameter",
+                )?;
+                Some(parameter)
+            }
+        };
+        let throws = if self.match_kind(&TokenKind::Throws) {
+            Some(self.parse_throws_clause()?)
+        } else {
+            None
+        };
+        let mut arrow_span = None;
+        let body = if self.match_kind(&TokenKind::Semicolon) {
+            FunctionBody::Requirement {
+                semicolon_span: self.previous().span,
+            }
+        } else if self.match_kind(&TokenKind::FatArrow) {
+            let arrow = self.previous().span;
+            arrow_span = Some(arrow);
+            let statement = match kind {
+                PropertyHookKind::Get => {
+                    let expr = self.parse_expression()?;
+                    let end = self
+                        .expect(TokenKind::Semicolon, "expected `;` after getter expression")?
+                        .span
+                        .end;
+                    Stmt::Return {
+                        span: self.span(expr.span().start, end),
+                        expr: Some(expr),
+                    }
+                }
+                PropertyHookKind::Set => self.parse_expression_statement()?,
+            };
+            FunctionBody::Block(Block {
+                span: self.span(arrow.start, self.previous().span.end),
+                statements: vec![statement],
+            })
+        } else {
+            FunctionBody::Block(self.parse_block()?)
+        };
+        Some(PropertyHook {
+            kind,
+            keyword_span,
+            writable_span,
+            borrowed_span,
+            parameter,
+            throws,
+            arrow_span,
+            span: self.span(start, body.span().end),
+            body,
+        })
+    }
+
+    fn synchronize_property_hook(&mut self, start: usize) {
+        self.pending_type_argument_close = None;
+        // Include delimiters consumed before the error so a nested body does
+        // not get mistaken for the end of the property or the containing class.
+        let mut depth = 0usize;
+        for token in &self.tokens[start..self.current] {
+            match token.kind {
+                TokenKind::LeftBrace => depth += 1,
+                TokenKind::RightBrace => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        while !self.is_at_end() {
+            if depth == 0 {
+                match &self.peek().kind {
+                    TokenKind::RightBrace | TokenKind::Writable => return,
+                    TokenKind::Identifier(name)
+                        if name == "get" || name == "set" || name == "borrowed" =>
+                    {
+                        return;
+                    }
+                    TokenKind::Semicolon => {
+                        self.advance();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            match self.advance().kind {
+                TokenKind::LeftBrace => depth += 1,
+                TokenKind::RightBrace => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn parse_const_decl(&mut self, access: MemberAccess, start: usize) -> Option<ConstDecl> {
@@ -1496,9 +1671,13 @@ impl Parser {
             .expect(TokenKind::LeftBrace, "expected `{` after interface name")?
             .span;
         let mut requirements = Vec::new();
+        let mut properties = Vec::new();
         for member in self.parse_declaration_members(true) {
             match member {
                 ClassMember::Method(requirement) => requirements.push(requirement),
+                ClassMember::Property(property) if !property.hooks.is_empty() => {
+                    properties.push(property);
+                }
                 ClassMember::Property(property) => self.invalid_interface_member(property.span),
                 ClassMember::Constant(constant) => self.invalid_interface_member(constant.span),
                 ClassMember::Uses(composition) => self.invalid_interface_member(composition.span),
@@ -1513,6 +1692,7 @@ impl Parser {
             type_params,
             parents,
             requirements,
+            properties,
             syntax: TypeDeclarationSyntax {
                 keyword_span,
                 type_parameters,
@@ -1529,7 +1709,7 @@ impl Parser {
     fn invalid_interface_member(&mut self, span: Span) {
         self.diagnostics.push(Diagnostic::new(
             "E0749",
-            "interfaces contain only instance method requirements",
+            "interfaces contain only instance method and property hook requirements",
             span,
         ));
     }
@@ -2619,6 +2799,10 @@ impl Parser {
             self.restore_checkpoint(checkpoint);
         }
 
+        self.parse_expression_statement()
+    }
+
+    fn parse_expression_statement(&mut self) -> Option<Stmt> {
         let expr = self.parse_expression()?;
         if self.reject_disallowed_finally() {
             return None;

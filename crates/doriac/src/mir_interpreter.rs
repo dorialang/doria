@@ -1,8 +1,8 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use doria_unicode::{CaseMapping, PadSide, StringError, TrimMode};
 
@@ -26,7 +26,20 @@ struct ClosureEnvironmentHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InterpreterPlace {
+struct InterpreterPlace {
+    storage: InterpreterPlaceStorage,
+    ty: mir::Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterpreterPlaceStorage {
+    // An absent readonly borrowed result has no addressable source slot.
+    Absent(mir::Type),
+    CollectionElement(CollectionElementPlace),
+    ObjectProperty {
+        object: usize,
+        property: crate::class_layout::PropertyId,
+    },
     FrameLocal {
         frame: u64,
         local: mir::LocalId,
@@ -443,6 +456,19 @@ struct CollectionValue {
 type CollectionEntries = Vec<(Option<LocalValue>, LocalValue)>;
 type SharedCollectionEntries = Rc<RefCell<CollectionEntries>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectionElementPlace {
+    collection: usize,
+    generation: u64,
+    index: usize,
+    ty: mir::Type,
+}
+
+struct BorrowedCollection {
+    generation: u64,
+    entries: Weak<RefCell<CollectionEntries>>,
+}
+
 impl CollectionValue {
     fn new(ty: mir::CollectionTypeId, entries: CollectionEntries) -> Self {
         Self {
@@ -540,6 +566,7 @@ struct CheckedConstruction {
 #[derive(Debug, Clone)]
 enum EvaluationTask {
     Rvalue(mir::Rvalue),
+    SetResultPlace(InterpreterPlace),
     Value(mir::ValueExpression),
     Enum(mir::EnumExpression),
     String(mir::StringExpression),
@@ -957,6 +984,10 @@ enum EvaluationTask {
     FinishStatement,
     DropTemporaryValues(Vec<OwnedDrop>),
     Assign(mir::LocalId),
+    AssignOrigin {
+        target: mir::LocalId,
+        origin: Option<InterpreterPlace>,
+    },
     AssignStatic(mir::StaticId),
     AssignProperty {
         object: mir::LocalId,
@@ -999,7 +1030,10 @@ enum EvaluationTask {
         class: crate::class_layout::ClassId,
     },
     CleanupFrame,
-    ReturnValue(mir::Type),
+    ReturnValue {
+        ty: mir::Type,
+        place: Option<InterpreterPlace>,
+    },
     ReturnVoid,
     Branch {
         then_block: mir::BlockId,
@@ -1016,7 +1050,8 @@ struct CallFrame {
     locals: Vec<Option<LocalValue>>,
     local_origins: Vec<Option<InterpreterPlace>>,
     tasks: Vec<EvaluationTask>,
-    values: Vec<EvaluationValue>,
+    values: EvaluationStack,
+    returned_place: Option<InterpreterPlace>,
     statement_temporary_drops: Vec<OwnedDrop>,
     caller_expectation: Option<ReturnExpectation>,
     checked_continuation: Option<CheckedContinuation>,
@@ -1026,6 +1061,44 @@ struct CallFrame {
     closure_environment: Option<ClosureEnvironmentHandle>,
     consume_closure_environment: bool,
     write_back_writable_parameters: bool,
+}
+
+/// Evaluated borrowed call results carry their actual place alongside the
+/// value. Ordinary operations discard that identity; view conversions preserve
+/// it explicitly. A lifetime root is never used as a replacement address.
+#[derive(Default)]
+struct EvaluationStack {
+    values: Vec<EvaluationValue>,
+    places: Vec<Option<InterpreterPlace>>,
+}
+
+impl EvaluationStack {
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn push(&mut self, value: EvaluationValue) {
+        self.values.push(value);
+        self.places.push(None);
+    }
+
+    fn pop(&mut self) -> Option<EvaluationValue> {
+        self.places.pop();
+        self.values.pop()
+    }
+
+    fn drain(&mut self, range: std::ops::RangeFrom<usize>) -> std::vec::Drain<'_, EvaluationValue> {
+        self.places.truncate(range.start);
+        self.values.drain(range)
+    }
+
+    fn place(&self) -> Option<InterpreterPlace> {
+        self.places.last().copied().flatten()
+    }
+
+    fn set_place(&mut self, place: Option<InterpreterPlace>) {
+        *self.places.last_mut().expect("evaluated result value") = place;
+    }
 }
 
 struct Interpreter<'program> {
@@ -1040,6 +1113,9 @@ struct Interpreter<'program> {
     heap: BTreeMap<usize, ObjectValue>,
     interface_collections: BTreeMap<usize, CollectionValue>,
     collection_iterators: BTreeMap<usize, (CollectionValue, usize)>,
+    borrowed_collections: BTreeMap<usize, BorrowedCollection>,
+    next_borrowed_collection: u64,
+    transferred_collection_elements: BTreeSet<(u64, usize)>,
     statics: Vec<LocalValue>,
     next_object: usize,
     next_frame: u64,
@@ -1132,6 +1208,7 @@ pub struct InterpreterIoOutput {
 struct InterpreterMetrics {
     closure_environment_allocations: usize,
     live_closure_environments: usize,
+    borrowed_collection_sources: usize,
 }
 
 enum StepOutcome {
@@ -1244,6 +1321,9 @@ fn interpret_internal_observed(
         heap: BTreeMap::new(),
         interface_collections: BTreeMap::new(),
         collection_iterators: BTreeMap::new(),
+        borrowed_collections: BTreeMap::new(),
+        next_borrowed_collection: 0,
+        transferred_collection_elements: BTreeSet::new(),
         statics,
         next_object: 1,
         next_frame: 1,
@@ -1273,6 +1353,7 @@ fn interpret_internal_observed(
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
+                    borrowed_collection_sources: interpreter.borrowed_collections.len(),
                 };
                 return Ok((
                     InterpreterIoOutput {
@@ -1293,6 +1374,7 @@ fn interpret_internal_observed(
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
+                    borrowed_collection_sources: interpreter.borrowed_collections.len(),
                 };
                 return Ok((
                     InterpreterIoOutput {
@@ -1308,6 +1390,7 @@ fn interpret_internal_observed(
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
+                    borrowed_collection_sources: interpreter.borrowed_collections.len(),
                 };
                 return Ok((
                     InterpreterIoOutput {
@@ -1547,12 +1630,16 @@ impl Interpreter<'_> {
             mir::Statement::MatchResultPlan { .. } => {}
             mir::Statement::ControlFlowPlan(_) => {}
             mir::Statement::AssignLocalGroup { targets, value } => {
+                for target in &targets {
+                    self.queue_assignment_origin(function, *target, &value)?;
+                }
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AssignGroup(targets));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
             }
             mir::Statement::AssignLocal { target, value } => {
                 let definition = local_in(function, target)?;
+                self.queue_assignment_origin(function, target, &value)?;
                 match (definition.ty, value) {
                     (mir::Type::String, mir::Rvalue::String(expression)) => {
                         let frame = self.current_frame_mut()?;
@@ -2009,6 +2096,19 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::DropClass(local));
             }
+            mir::Statement::CleanupConstructorPhase { object, class } => {
+                let LocalValue::Class { object, .. } =
+                    read_local(&self.current_frame()?.locals, object)?
+                else {
+                    return Err(InterpreterError::new(
+                        "constructor cleanup receiver is not a class value",
+                    ));
+                };
+                let object = *object;
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropObjectProperties { object, class });
+            }
             mir::Statement::DropSharedReference { local, .. } => {
                 self.current_frame_mut()?
                     .tasks
@@ -2187,8 +2287,16 @@ impl Interpreter<'_> {
                         operand.ty()
                     )));
                 }
+                let place = if expected.borrows_returned_value(function.return_borrow) {
+                    self.argument_place(&operand)?
+                } else {
+                    None
+                };
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::ReturnValue(expected));
+                frame.tasks.push(EvaluationTask::ReturnValue {
+                    ty: expected,
+                    place,
+                });
                 frame.tasks.push(EvaluationTask::CleanupFrame);
                 frame.tasks.push(EvaluationTask::FinishStatement);
                 frame.tasks.push(EvaluationTask::Rvalue(operand));
@@ -2474,7 +2582,144 @@ impl Interpreter<'_> {
     }
 
     fn execute_task(&mut self, task: EvaluationTask) -> Result<StepOutcome, InterpreterError> {
+        // Evaluation carries a value and, for a borrow, its exact storage. A
+        // call may select that storage at runtime, so reconstructing it from
+        // the syntactic return-borrow root would lose child/property aliases.
+        let expression = match &task {
+            EvaluationTask::Mixed(value) => Some(mir::Rvalue::Mixed(value.clone())),
+            EvaluationTask::NullableMixed(value) => Some(mir::Rvalue::NullableMixed(value.clone())),
+            EvaluationTask::Error(value) => Some(mir::Rvalue::Interface(value.clone())),
+            EvaluationTask::NullableError(value) => {
+                Some(mir::Rvalue::NullableInterface(value.clone()))
+            }
+            EvaluationTask::Class(value) => Some(mir::Rvalue::Class(value.clone())),
+            EvaluationTask::NullableClass(value) => Some(mir::Rvalue::NullableClass(value.clone())),
+            EvaluationTask::Collection(value) => Some(mir::Rvalue::Collection(value.clone())),
+            EvaluationTask::NullableCollection(value) => {
+                Some(mir::Rvalue::NullableCollection(value.clone()))
+            }
+            EvaluationTask::PayloadEnum(value) => Some(mir::Rvalue::PayloadEnum(value.clone())),
+            EvaluationTask::NullablePayloadEnum(value) => {
+                Some(mir::Rvalue::NullablePayloadEnum(value.clone()))
+            }
+            EvaluationTask::Function(value) => Some(mir::Rvalue::Function(value.clone())),
+            EvaluationTask::NullableFunction(value) => {
+                Some(mir::Rvalue::NullableFunction(value.clone()))
+            }
+            EvaluationTask::SharedReference(value) => {
+                Some(mir::Rvalue::SharedReference(value.clone()))
+            }
+            EvaluationTask::WeakReference(value) => Some(mir::Rvalue::WeakReference(value.clone())),
+            EvaluationTask::NullableSharedReference(value) => {
+                Some(mir::Rvalue::NullableSharedReference(value.clone()))
+            }
+            EvaluationTask::NullableWeakReference(value) => {
+                Some(mir::Rvalue::NullableWeakReference(value.clone()))
+            }
+            EvaluationTask::WritableSharedReference(value) => {
+                Some(mir::Rvalue::WritableSharedReference(value.clone()))
+            }
+            EvaluationTask::WritableWeakReference(value) => {
+                Some(mir::Rvalue::WritableWeakReference(value.clone()))
+            }
+            EvaluationTask::NullableWritableSharedReference(value) => {
+                Some(mir::Rvalue::NullableWritableSharedReference(value.clone()))
+            }
+            EvaluationTask::NullableWritableWeakReference(value) => {
+                Some(mir::Rvalue::NullableWritableWeakReference(value.clone()))
+            }
+            EvaluationTask::SharedReferenceAccess(value) => {
+                Some(mir::Rvalue::SharedReferenceAccess(value.clone()))
+            }
+            EvaluationTask::NullableSharedReferenceAccess(value) => {
+                Some(mir::Rvalue::NullableSharedReferenceAccess(value.clone()))
+            }
+            _ => None,
+        };
+        if let Some(expression) = expression.filter(mir::Rvalue::borrows_move_value) {
+            if let Some(place) = self.argument_place(&expression)? {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::SetResultPlace(place));
+            }
+        }
+        // These tasks only change a view or select one coalesce operand. If
+        // coalescing schedules the right operand, the stack shrinks and its
+        // later evaluation supplies its own place instead of inheriting left.
+        let preserves_place = matches!(
+            &task,
+            EvaluationTask::BuildNullableClassSome(_)
+                | EvaluationTask::BuildInterface(_)
+                | EvaluationTask::BuildCollectionInterface(_)
+                | EvaluationTask::BuildNullableErrorSome(_)
+                | EvaluationTask::ConvertInterfaceView { .. }
+                | EvaluationTask::BuildNullableMixedSome
+                | EvaluationTask::WrapNullable(_)
+                | EvaluationTask::BuildNullableSharedSome(_)
+                | EvaluationTask::BuildNullableWeakSome(_)
+                | EvaluationTask::BuildNullableWritableSharedSome(_)
+                | EvaluationTask::BuildNullableWritableWeakSome(_)
+                | EvaluationTask::BuildNullableFunctionSome(_)
+                | EvaluationTask::AssumeNullableFunctionPresent(_)
+                | EvaluationTask::BuildNullablePayloadEnumSome(_)
+                | EvaluationTask::BuildNullableCollectionSome(_)
+                | EvaluationTask::AfterPayloadEnumCoalesce { .. }
+                | EvaluationTask::AfterNullablePayloadEnumCoalesce { .. }
+                | EvaluationTask::FinishNullableCollectionCoalesce { .. }
+                | EvaluationTask::AfterClassCoalesce { .. }
+                | EvaluationTask::FinishClassCoalesceRight(_)
+                | EvaluationTask::AfterNullableClassCoalesce { .. }
+                | EvaluationTask::FinishNullableClassCoalesceRight(_)
+                | EvaluationTask::AfterSharedCoalesce { .. }
+                | EvaluationTask::FinishSharedCoalesceRight(_)
+                | EvaluationTask::AfterNullableSharedCoalesce { .. }
+                | EvaluationTask::FinishNullableSharedCoalesceRight(_)
+                | EvaluationTask::AfterWeakCoalesce { .. }
+                | EvaluationTask::FinishWeakCoalesceRight(_)
+                | EvaluationTask::AfterNullableWeakCoalesce { .. }
+                | EvaluationTask::FinishNullableWeakCoalesceRight(_)
+                | EvaluationTask::AfterWritableSharedCoalesce { .. }
+                | EvaluationTask::FinishWritableSharedCoalesceRight(_)
+                | EvaluationTask::AfterNullableWritableSharedCoalesce { .. }
+                | EvaluationTask::FinishNullableWritableSharedCoalesceRight(_)
+                | EvaluationTask::AfterWritableWeakCoalesce { .. }
+                | EvaluationTask::FinishWritableWeakCoalesceRight(_)
+                | EvaluationTask::AfterNullableWritableWeakCoalesce { .. }
+                | EvaluationTask::FinishNullableWritableWeakCoalesceRight(_)
+                | EvaluationTask::AfterNullableMixedCoalesce {
+                    left_ownership: mir::MixedOwnership::None,
+                    ..
+                }
+                | EvaluationTask::OwnNullableMixed(mir::MixedOwnership::None)
+        );
+        let prior = if preserves_place {
+            let frame = self.current_frame()?;
+            frame
+                .values
+                .place()
+                .map(|place| (frame.id, frame.values.len(), place))
+        } else {
+            None
+        };
+        let outcome = self.execute_task_inner(task)?;
+        if let Some((id, len, place)) = prior {
+            if let Some(frame) = self.frames.last_mut() {
+                if frame.id == id && frame.values.len() == len {
+                    frame.values.set_place(Some(place));
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn execute_task_inner(
+        &mut self,
+        task: EvaluationTask,
+    ) -> Result<StepOutcome, InterpreterError> {
         match task {
+            EvaluationTask::SetResultPlace(place) => {
+                self.current_frame_mut()?.values.set_place(Some(place))
+            }
             EvaluationTask::Rvalue(expression) => match expression {
                 mir::Rvalue::Value(value) => self
                     .current_frame_mut()?
@@ -3840,60 +4085,63 @@ impl Interpreter<'_> {
                 access,
             } => {
                 let key = self.pop_local_value()?;
-                let value = match access {
-                    mir::NullableCollectionAccess::Get => self
-                        .collection_local(collection)?
-                        .entries()
-                        .iter()
-                        .find(|(current, _)| current.as_ref() == Some(&key))
-                        .map(|(_, value)| value.clone()),
-                    mir::NullableCollectionAccess::Index => {
-                        let entries = self.collection_local(collection)?;
-                        if let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = &key {
-                            if !self.program.collection_types[entries.ty.0]
-                                .kind
-                                .is_dictionary()
-                            {
-                                let index = index.signed_value() as i64;
-                                let length = entries.entries().len();
-                                if index < 0 || index as usize >= length {
-                                    return self.collection_access_panic_step(
-                                        CollectionAccessError::Bounds {
-                                            code: "P1310",
-                                            index,
-                                            length,
-                                        },
-                                    );
-                                }
-                            }
+                // Resolve readonly accesses once. The selected slot travels
+                // with the value, including through nullable result wrapping.
+                let borrowed_access = matches!(
+                    access,
+                    mir::NullableCollectionAccess::Get
+                        | mir::NullableCollectionAccess::Index
+                        | mir::NullableCollectionAccess::First
+                        | mir::NullableCollectionAccess::Last
+                        | mir::NullableCollectionAccess::At
+                );
+                let position = if borrowed_access {
+                    let entries = self.collection_local(collection)?;
+                    match access {
+                        mir::NullableCollectionAccess::First => {
+                            (!entries.entries().is_empty()).then_some(0)
                         }
-                        let value = if self.program.collection_types[entries.ty.0]
-                            .kind
-                            .is_dictionary()
-                        {
-                            self.collection_local(collection)?
-                                .entries()
-                                .iter()
-                                .find(|(current, _)| current.as_ref() == Some(&key))
-                                .map(|(_, value)| value.clone())
-                        } else {
-                            let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = &key else {
+                        mir::NullableCollectionAccess::Last => {
+                            entries.entries().len().checked_sub(1)
+                        }
+                        mir::NullableCollectionAccess::At => {
+                            let LocalValue::Scalar(mir::ScalarValue::Integer(offset)) = &key else {
                                 return Err(InterpreterError::new(
                                     "MIR collection offset is not an integer",
                                 ));
                             };
-                            entries
-                                .entries()
-                                .get(index.signed_value() as usize)
-                                .map(|(_, value)| value.clone())
-                        };
-                        let Some(value) = value else {
-                            return self.collection_access_panic_step(
-                                CollectionAccessError::Catalogued("P1312"),
-                            );
-                        };
-                        Some(value)
+                            let offset = usize::try_from(offset.signed_value()).map_err(|_| {
+                                InterpreterError::new("MIR collection offset is negative")
+                            })?;
+                            (offset < entries.entries().len()).then_some(offset)
+                        }
+                        _ => match self.collection_position(collection, &key, false) {
+                            Ok(position) => Some(position),
+                            Err(_) if access == mir::NullableCollectionAccess::Get => None,
+                            Err(error) => return self.collection_access_panic_step(error),
+                        },
                     }
+                } else {
+                    None
+                };
+                let place =
+                    if let Some(position) = position.filter(|_| expected.has_move_ownership()) {
+                        Some(self.place_for_collection_element(collection, position)?)
+                    } else {
+                        None
+                    };
+                let value = match access {
+                    mir::NullableCollectionAccess::Get
+                    | mir::NullableCollectionAccess::Index
+                    | mir::NullableCollectionAccess::First
+                    | mir::NullableCollectionAccess::Last
+                    | mir::NullableCollectionAccess::At => position.map(|position| {
+                        self.collection_local(collection)
+                            .expect("resolved collection")
+                            .entries()[position]
+                            .1
+                            .clone()
+                    }),
                     mir::NullableCollectionAccess::Remove => {
                         let position = self
                             .collection_local(collection)?
@@ -3913,16 +4161,6 @@ impl Interpreter<'_> {
                             None
                         }
                     }
-                    mir::NullableCollectionAccess::First => self
-                        .collection_local(collection)?
-                        .entries()
-                        .first()
-                        .map(|(_, value)| value.clone()),
-                    mir::NullableCollectionAccess::Last => self
-                        .collection_local(collection)?
-                        .entries()
-                        .last()
-                        .map(|(_, value)| value.clone()),
                     mir::NullableCollectionAccess::Pop => {
                         let collection = self.collection_local(collection)?;
                         if self.program.collection_types[collection.ty.0].kind
@@ -3972,20 +4210,6 @@ impl Interpreter<'_> {
                             );
                         }
                         Some(values.entries_mut().remove(position).1)
-                    }
-                    mir::NullableCollectionAccess::At => {
-                        let LocalValue::Scalar(mir::ScalarValue::Integer(offset)) = key else {
-                            return Err(InterpreterError::new(
-                                "MIR collection offset is not an integer",
-                            ));
-                        };
-                        let offset = usize::try_from(offset.signed_value()).map_err(|_| {
-                            InterpreterError::new("MIR collection offset is negative")
-                        })?;
-                        self.collection_local(collection)?
-                            .entries()
-                            .get(offset)
-                            .map(|(_, value)| value.clone())
                     }
                 };
                 match (expected, value) {
@@ -4299,6 +4523,9 @@ impl Interpreter<'_> {
                         ))
                     }
                 }
+                if borrowed_access {
+                    self.current_frame_mut()?.values.set_place(place);
+                }
             }
             EvaluationTask::CollectionIndexClass {
                 collection,
@@ -4515,6 +4742,8 @@ impl Interpreter<'_> {
                 temporary_arg_drops,
                 checked,
             } => {
+                let argument_places =
+                    self.evaluated_argument_places(argument_count, argument_places)?;
                 let arguments = self.take_call_arguments(argument_count)?;
                 let property_expressions = self.take_call_arguments(property_expression_count)?;
                 let object_id = self.next_object;
@@ -5624,6 +5853,12 @@ impl Interpreter<'_> {
                     }
                     let value = self.read_object_property(object, property)?;
                     self.push_nullable_from_value(result, value)?;
+                    self.current_frame_mut()?
+                        .values
+                        .set_place(Some(InterpreterPlace {
+                            storage: InterpreterPlaceStorage::ObjectProperty { object, property },
+                            ty: result,
+                        }));
                 } else {
                     self.push_null(result)?;
                 }
@@ -5634,6 +5869,7 @@ impl Interpreter<'_> {
                 result,
                 owned_receiver,
             } => {
+                let receiver_place = self.current_frame()?.values.place();
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
                     if owned_receiver.is_some() {
@@ -5642,6 +5878,7 @@ impl Interpreter<'_> {
                             .push(OwnedDrop::Class { object, class });
                     }
                     self.queue_null_safe_call(object, class, function, args, result)?;
+                    self.current_frame_mut()?.values.set_place(receiver_place);
                 } else {
                     self.push_null(result)?;
                 }
@@ -5652,6 +5889,7 @@ impl Interpreter<'_> {
                 owned_receiver,
                 call_site,
             } => {
+                let receiver_place = self.current_frame()?.values.place();
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
                     if owned_receiver.is_some() {
@@ -5660,6 +5898,7 @@ impl Interpreter<'_> {
                             .push(OwnedDrop::Class { object, class });
                     }
                     self.queue_null_safe_statement_call(object, class, function, args, call_site)?;
+                    self.current_frame_mut()?.values.set_place(receiver_place);
                 }
             }
             EvaluationTask::NullableStringCompare(op) => {
@@ -6061,6 +6300,8 @@ impl Interpreter<'_> {
                 temporary_arg_drops,
                 call_site,
             } => {
+                let argument_places =
+                    self.evaluated_argument_places(argument_count, argument_places)?;
                 let args = self.take_call_arguments(argument_count)?;
                 let function = self.resolve_virtual_function(function, &args)?;
                 let mut drops = Vec::new();
@@ -6089,6 +6330,8 @@ impl Interpreter<'_> {
                 temporary_arg_drops,
                 call_site,
             } => {
+                let argument_places =
+                    self.evaluated_argument_places(argument_count, argument_places)?;
                 let args = self.take_call_arguments(argument_count)?;
                 let function = self.resolve_virtual_function(function, &args)?;
                 let mut drops = Vec::new();
@@ -6118,6 +6361,8 @@ impl Interpreter<'_> {
                 continuation,
                 call_site,
             } => {
+                let argument_places =
+                    self.evaluated_argument_places(argument_count, argument_places)?;
                 if let Some(entry) = interface_entry {
                     let values = self.take_call_arguments(argument_count)?;
                     self.push_frame(
@@ -6153,6 +6398,8 @@ impl Interpreter<'_> {
                 continuation,
                 call_site,
             } => {
+                let argument_places =
+                    self.evaluated_argument_places(argument_count, argument_places)?;
                 if let Some(entry) = interface_entry {
                     let values = self.take_call_arguments(argument_count)?;
                     self.push_checked_frame(
@@ -6191,9 +6438,19 @@ impl Interpreter<'_> {
                     self.push_owned_drop_task(drop)?;
                 }
             }
+            EvaluationTask::AssignOrigin { target, origin } => {
+                // The assignment has already installed any dynamic call-result
+                // place, or cleared the previous alias. An explicit MIR place
+                // overrides that only when the initializer denotes one.
+                if origin.is_some() {
+                    self.current_frame_mut()?.local_origins[target.0] = origin;
+                }
+            }
             EvaluationTask::Assign(target) => {
+                let place = self.current_frame()?.values.place();
                 let value = self.pop_local_value()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
+                self.assign_result_origin(function, target, place)?;
                 let owned = local_in(function, target)?.owned;
                 let writable_origin = self
                     .current_frame()?
@@ -6234,9 +6491,11 @@ impl Interpreter<'_> {
                 }
             }
             EvaluationTask::AssignGroup(targets) => {
+                let place = self.current_frame()?.values.place();
                 let value = self.pop_local_value()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 for target in targets {
+                    self.assign_result_origin(function, target, place)?;
                     let old = assign_local(
                         self.program,
                         &function.locals,
@@ -6421,7 +6680,11 @@ impl Interpreter<'_> {
             EvaluationTask::CleanupFrame => {
                 self.cleanup_current_frame()?;
             }
-            EvaluationTask::ReturnValue(expected) => {
+            EvaluationTask::ReturnValue {
+                ty: expected,
+                place,
+            } => {
+                let evaluated_place = self.current_frame()?.values.place();
                 let value = self.pop_local_value()?;
                 if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
@@ -6429,6 +6692,27 @@ impl Interpreter<'_> {
                         local_value_type(self.program, &value)
                     )));
                 }
+                let function = function_in(self.program, self.current_frame()?.function)?;
+                self.current_frame_mut()?.returned_place =
+                    if expected.borrows_returned_value(function.return_borrow) {
+                        let place = place
+                            .or(evaluated_place)
+                            .or_else(|| {
+                                is_absent_nullable_value(&value).then_some(InterpreterPlace {
+                                    storage: InterpreterPlaceStorage::Absent(expected),
+                                    ty: expected,
+                                })
+                            })
+                            .ok_or_else(|| {
+                                InterpreterError::new("borrowed return value has no source place")
+                            })?;
+                        Some(InterpreterPlace {
+                            ty: expected,
+                            ..place
+                        })
+                    } else {
+                        None
+                    };
                 return self.complete_frame(FunctionOutcome::Value(value));
             }
             EvaluationTask::ReturnVoid => {
@@ -10671,7 +10955,9 @@ impl Interpreter<'_> {
             mir::PayloadEnumExpression::Use { ty, place, mode } => {
                 self.queue_payload_enum_place(place, mir::Type::PayloadEnum(ty), mode)?;
             }
-            mir::PayloadEnumExpression::Call { ty, function, args } => self.queue_call(
+            mir::PayloadEnumExpression::Call {
+                ty, function, args, ..
+            } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::PayloadEnum(ty)),
@@ -10708,7 +10994,9 @@ impl Interpreter<'_> {
             mir::NullablePayloadEnumExpression::Use { ty, place, mode } => {
                 self.queue_payload_enum_place(place, mir::Type::NullablePayloadEnum(ty), mode)?;
             }
-            mir::NullablePayloadEnumExpression::Call { ty, function, args } => self.queue_call(
+            mir::NullablePayloadEnumExpression::Call {
+                ty, function, args, ..
+            } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullablePayloadEnum(ty)),
@@ -10844,6 +11132,74 @@ impl Interpreter<'_> {
         self.push_local_value(value)
     }
 
+    fn queue_assignment_origin(
+        &mut self,
+        function: &mir::Function,
+        target: mir::LocalId,
+        value: &mir::Rvalue,
+    ) -> Result<(), InterpreterError> {
+        // Parameters and capture bindings denote caller-owned places already.
+        // Materialized borrowed aliases must instead inherit the initializer's
+        // original place, and replace that provenance on each assignment.
+        if local_in(function, target)?.owned
+            || function.params.contains(&target)
+            || function.closure.as_ref().is_some_and(|closure| {
+                closure
+                    .capture_locals
+                    .iter()
+                    .any(|(_, local)| *local == target)
+            })
+        {
+            return Ok(());
+        }
+        let origin = if value.borrows_move_value() {
+            self.argument_place(value)?
+        } else {
+            None
+        };
+        self.current_frame_mut()?
+            .tasks
+            .push(EvaluationTask::AssignOrigin { target, origin });
+        Ok(())
+    }
+
+    fn assign_result_origin(
+        &mut self,
+        function: &mir::Function,
+        target: mir::LocalId,
+        place: Option<InterpreterPlace>,
+    ) -> Result<(), InterpreterError> {
+        if !local_in(function, target)?.owned
+            && !function.params.contains(&target)
+            && !function.closure.as_ref().is_some_and(|closure| {
+                closure
+                    .capture_locals
+                    .iter()
+                    .any(|(_, local)| *local == target)
+            })
+        {
+            self.current_frame_mut()?.local_origins[target.0] = place;
+        }
+        Ok(())
+    }
+
+    fn evaluated_argument_places(
+        &self,
+        count: usize,
+        mut places: Vec<Option<InterpreterPlace>>,
+    ) -> Result<Vec<Option<InterpreterPlace>>, InterpreterError> {
+        let values = &self.current_frame()?.values;
+        let start = values.len().checked_sub(count).ok_or_else(|| {
+            InterpreterError::new("call argument place evaluation produced too few values")
+        })?;
+        for (place, evaluated) in places.iter_mut().zip(&values.places[start..]) {
+            if place.is_none() {
+                *place = *evaluated;
+            }
+        }
+        Ok(places)
+    }
+
     fn queue_value_assignment(
         &mut self,
         target: mir::LocalId,
@@ -10857,13 +11213,238 @@ impl Interpreter<'_> {
 
     fn place_for_local(&self, local: mir::LocalId) -> Result<InterpreterPlace, InterpreterError> {
         let frame = self.current_frame()?;
+        let ty = local_in(function_in(self.program, frame.function)?, local)?.ty;
         let origin = frame.local_origins.get(local.0).ok_or_else(|| {
             InterpreterError::new(format!("MIR local local{} does not exist", local.0))
         })?;
-        Ok(origin.unwrap_or(InterpreterPlace::FrameLocal {
-            frame: frame.id,
-            local,
+        Ok(InterpreterPlace {
+            storage: origin.map_or(
+                InterpreterPlaceStorage::FrameLocal {
+                    frame: frame.id,
+                    local,
+                },
+                |origin| origin.storage,
+            ),
+            ty,
+        })
+    }
+
+    // An interface entry or a nullable projection changes the representation,
+    // not the storage whose lifetime the returned closure borrows.
+    fn argument_place(
+        &self,
+        argument: &mir::Rvalue,
+    ) -> Result<Option<InterpreterPlace>, InterpreterError> {
+        let place = if argument.is_null_value() && argument.ty().has_move_ownership() {
+            Some(InterpreterPlace {
+                storage: InterpreterPlaceStorage::Absent(argument.ty()),
+                ty: argument.ty(),
+            })
+        } else if let Some(local) = argument.direct_place_local() {
+            Some(self.place_for_local(local)?)
+        } else if let Some(value) = crate::native_shared::Expression::from_rvalue(argument) {
+            self.shared_argument_place(value)?
+        } else {
+            match argument {
+                mir::Rvalue::Class(mir::ClassExpression::Property {
+                    object, property, ..
+                })
+                | mir::Rvalue::NullableClass(mir::NullableClassExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::Collection(mir::CollectionExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::Mixed(mir::MixedExpression::Property {
+                    object, property, ..
+                })
+                | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::Function(mir::FunctionExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::String(mir::StringExpression::Property {
+                    object, property, ..
+                })
+                | mir::Rvalue::NullableString(mir::NullableStringExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Property {
+                    object,
+                    property,
+                    ..
+                })
+                | mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+                    place: mir::PayloadEnumPlace::Property { object, property },
+                    ..
+                })
+                | mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+                    place: mir::PayloadEnumPlace::Property { object, property },
+                    ..
+                }) => Some(self.place_for_property(*object, *property)?),
+                mir::Rvalue::Value(value) => {
+                    let operand = match value {
+                        mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                            operand,
+                            ..
+                        })
+                        | mir::ValueExpression::Float(mir::FloatExpression::Use {
+                            operand, ..
+                        })
+                        | mir::ValueExpression::Bool(mir::BoolExpression::Use { operand })
+                        | mir::ValueExpression::Enum(mir::EnumExpression::Use {
+                            operand, ..
+                        }) => Some(operand),
+                        _ => None,
+                    };
+                    match operand {
+                        Some(mir::Operand::Property { object, property }) => {
+                            Some(self.place_for_property(*object, *property)?)
+                        }
+                        _ => None,
+                    }
+                }
+                mir::Rvalue::NullableClass(mir::NullableClassExpression::Class(value)) => {
+                    self.argument_place(&mir::Rvalue::Class(value.clone()))?
+                }
+                mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(
+                    value,
+                )) => self.argument_place(&mir::Rvalue::Collection(value.clone()))?,
+                mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Present(value)) => {
+                    self.argument_place(&mir::Rvalue::Function(value.clone()))?
+                }
+                mir::Rvalue::Function(mir::FunctionExpression::AssumePresent { value, .. }) => {
+                    self.argument_place(&mir::Rvalue::NullableFunction((**value).clone()))?
+                }
+                mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Mixed(value)) => {
+                    self.argument_place(&mir::Rvalue::Mixed(value.clone()))?
+                }
+                mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(
+                    value,
+                )) => self.argument_place(&mir::Rvalue::PayloadEnum(value.clone()))?,
+                mir::Rvalue::Class(mir::ClassExpression::InterfaceReceiver {
+                    receiver, ..
+                })
+                | mir::Rvalue::Collection(mir::CollectionExpression::InterfaceReceiver {
+                    receiver,
+                    ..
+                }) => Some(self.place_for_local(*receiver)?),
+                mir::Rvalue::Class(mir::ClassExpression::InterfacePayload { local, .. })
+                | mir::Rvalue::Interface(mir::InterfaceExpression {
+                    value: mir::InterfaceValue::NarrowedLocal { local, .. },
+                    ..
+                }) => Some(self.place_for_local(*local)?),
+                mir::Rvalue::Interface(mir::InterfaceExpression { value, .. }) => {
+                    self.interface_argument_place(value)?
+                }
+                mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression {
+                    value, ..
+                }) => match value {
+                    mir::NullableInterfaceValue::Present(value) => {
+                        self.interface_argument_place(value)?
+                    }
+                    mir::NullableInterfaceValue::Property {
+                        object, property, ..
+                    } => Some(self.place_for_property(*object, *property)?),
+                    mir::NullableInterfaceValue::Upcast { source, .. } => {
+                        self.argument_place(&mir::Rvalue::NullableInterface((**source).clone()))?
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        Ok(place.map(|place| InterpreterPlace {
+            ty: argument.ty(),
+            ..place
         }))
+    }
+
+    fn shared_argument_place(
+        &self,
+        value: crate::native_shared::Expression<'_>,
+    ) -> Result<Option<InterpreterPlace>, InterpreterError> {
+        use crate::native_shared::Operation;
+        match value.operation() {
+            Operation::Local { local, .. } => self.place_for_local(local).map(Some),
+            Operation::Property { object, property } => {
+                self.place_for_property(object, property).map(Some)
+            }
+            Operation::Present(value) => self.shared_argument_place(value),
+            _ => Ok(None),
+        }
+    }
+
+    fn interface_argument_place(
+        &self,
+        value: &mir::InterfaceValue,
+    ) -> Result<Option<InterpreterPlace>, InterpreterError> {
+        match value {
+            mir::InterfaceValue::Property {
+                object, property, ..
+            } => self.place_for_property(*object, *property).map(Some),
+            mir::InterfaceValue::FromClass { object, .. } => {
+                self.argument_place(&mir::Rvalue::Class((**object).clone()))
+            }
+            mir::InterfaceValue::FromNullableClass { object, .. } => {
+                self.argument_place(&mir::Rvalue::NullableClass((**object).clone()))
+            }
+            mir::InterfaceValue::FromCollection { value, .. } => self.argument_place(value),
+            mir::InterfaceValue::Upcast { source, .. } => {
+                self.argument_place(&mir::Rvalue::Interface((**source).clone()))
+            }
+            mir::InterfaceValue::Local { local, .. }
+            | mir::InterfaceValue::NullableLocalAssumeNonNull { local, .. }
+            | mir::InterfaceValue::NarrowedLocal { local, .. } => {
+                self.place_for_local(*local).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn place_for_property(
+        &self,
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    ) -> Result<InterpreterPlace, InterpreterError> {
+        let object = match read_local(&self.current_frame()?.locals, object)? {
+            LocalValue::Class { object, .. }
+            | LocalValue::NullableClass {
+                object: Some(object),
+                ..
+            } => *object,
+            _ => {
+                return Err(InterpreterError::new(
+                    "borrowed property source is not a class",
+                ))
+            }
+        };
+        let storage = InterpreterPlaceStorage::ObjectProperty { object, property };
+        Ok(InterpreterPlace {
+            storage,
+            ty: self.place_storage_type(storage)?,
+        })
     }
 
     fn argument_places(
@@ -10877,10 +11458,7 @@ impl Interpreter<'_> {
                 if mode == mir::FunctionParameterMode::Take {
                     return Ok(None);
                 }
-                argument
-                    .direct_place_local()
-                    .map(|local| self.place_for_local(local))
-                    .transpose()
+                self.argument_place(argument)
             })
             .collect()
     }
@@ -11112,7 +11690,8 @@ impl Interpreter<'_> {
             locals,
             local_origins,
             tasks: Vec::new(),
-            values: Vec::new(),
+            values: EvaluationStack::default(),
+            returned_place: None,
             statement_temporary_drops: Vec::new(),
             caller_expectation,
             checked_continuation: None,
@@ -11287,11 +11866,13 @@ impl Interpreter<'_> {
         &mut self,
         target: mir::BlockId,
         assignment: Option<(mir::LocalId, LocalValue)>,
+        place: Option<InterpreterPlace>,
     ) -> Result<(), InterpreterError> {
         let caller_id = self.current_frame()?.function;
         let caller = function_in(self.program, caller_id)?;
         block_in(caller, target)?;
         if let Some((local, value)) = assignment {
+            self.assign_result_origin(caller, local, place)?;
             let old = assign_local(
                 self.program,
                 &caller.locals,
@@ -11334,9 +11915,365 @@ impl Interpreter<'_> {
             .ok_or_else(|| InterpreterError::new("closure environment field does not exist"))
     }
 
+    fn place_storage_type(
+        &self,
+        storage: InterpreterPlaceStorage,
+    ) -> Result<mir::Type, InterpreterError> {
+        match storage {
+            InterpreterPlaceStorage::Absent(ty) => Ok(ty),
+            InterpreterPlaceStorage::CollectionElement(place) => Ok(place.ty),
+            InterpreterPlaceStorage::ObjectProperty { property, .. } => {
+                class_in(self.program, property.class)?
+                    .properties
+                    .get(property.index)
+                    .filter(|definition| definition.id == property)
+                    .map(|definition| definition.ty)
+                    .ok_or_else(|| InterpreterError::new("borrowed property source does not exist"))
+            }
+            InterpreterPlaceStorage::FrameLocal { frame, local } => {
+                let frame = self
+                    .frames
+                    .iter()
+                    .find(|candidate| candidate.id == frame)
+                    .ok_or_else(|| {
+                        InterpreterError::new("closure capture source frame is unavailable")
+                    })?;
+                Ok(local_in(function_in(self.program, frame.function)?, local)?.ty)
+            }
+            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
+                let index = self.closure_environment_field_index(environment, field)?;
+                Ok(self.program.closure_environment_layouts[environment.layout.0].fields[index].ty)
+            }
+        }
+    }
+
+    // The native home points at a representation, not necessarily the callee's
+    // representation. Keep that distinction in the interpreter too: reads view
+    // the same value and writes restore the storage's declared representation.
+    // This does not acquire ownership or change the captured source's lifetime.
+    fn project_place_value(
+        &self,
+        value: LocalValue,
+        ty: mir::Type,
+    ) -> Result<LocalValue, InterpreterError> {
+        if local_value_matches_type(self.program, ty, &value) {
+            return Ok(value);
+        }
+        let nominal = match &value {
+            LocalValue::Class { object, class } => {
+                Some((Some(*object), Some(mir::ImplementingType::Class(*class))))
+            }
+            LocalValue::NullableClass { object, class } => {
+                Some((*object, Some(mir::ImplementingType::Class(*class))))
+            }
+            LocalValue::Error(carrier) => Some((
+                Some(carrier.object),
+                Some(self.program.interface_vtables[carrier.vtable.0].implementing_type),
+            )),
+            LocalValue::NullableError { value, .. } => Some((
+                value.map(|carrier| carrier.object),
+                value.map(|carrier| {
+                    self.program.interface_vtables[carrier.vtable.0].implementing_type
+                }),
+            )),
+            LocalValue::Collection(collection) => Some((
+                collection
+                    .present
+                    .then_some(Rc::as_ptr(&collection.entries) as usize),
+                Some(mir::ImplementingType::Collection(collection.ty)),
+            )),
+            _ => None,
+        };
+        if let Some((object, implementing)) = nominal {
+            match ty {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                    if let Some(object) = object {
+                        let actual = self
+                            .heap
+                            .get(&object)
+                            .ok_or_else(|| {
+                                InterpreterError::new("borrowed class source was destroyed")
+                            })?
+                            .class;
+                        if !matches!(implementing, Some(mir::ImplementingType::Class(_)))
+                            || !class_is_subtype(self.program, actual, class)
+                        {
+                            return Err(InterpreterError::new(
+                                "borrowed place has an incompatible class view",
+                            ));
+                        }
+                        return Ok(if matches!(ty, mir::Type::NullableClass(_)) {
+                            LocalValue::NullableClass {
+                                object: Some(object),
+                                class: actual,
+                            }
+                        } else {
+                            LocalValue::Class {
+                                object,
+                                class: actual,
+                            }
+                        });
+                    }
+                    if matches!(ty, mir::Type::NullableClass(_)) {
+                        return Ok(LocalValue::NullableClass {
+                            object: None,
+                            class,
+                        });
+                    }
+                }
+                mir::Type::Interface(interface) | mir::Type::NullableInterface(interface) => {
+                    let carrier = object
+                        .map(|object| {
+                            let implementing = match implementing {
+                                Some(mir::ImplementingType::Class(_)) => {
+                                    mir::ImplementingType::Class(
+                                        self.heap
+                                            .get(&object)
+                                            .ok_or_else(|| {
+                                                InterpreterError::new(
+                                                    "borrowed interface source was destroyed",
+                                                )
+                                            })?
+                                            .class,
+                                    )
+                                }
+                                Some(implementing) => implementing,
+                                None => {
+                                    return Err(InterpreterError::new(
+                                        "borrowed interface source has no payload type",
+                                    ))
+                                }
+                            };
+                            let vtable = self
+                                .program
+                                .interface_vtable(implementing, interface)
+                                .ok_or_else(|| {
+                                    InterpreterError::new(
+                                        "borrowed place has no matching interface view",
+                                    )
+                                })?;
+                            Ok(InterfaceCarrier { object, vtable })
+                        })
+                        .transpose()?;
+                    if matches!(ty, mir::Type::NullableInterface(_)) {
+                        return Ok(LocalValue::NullableError {
+                            interface,
+                            value: carrier,
+                        });
+                    }
+                    if let Some(carrier) = carrier {
+                        return Ok(LocalValue::Error(carrier));
+                    }
+                }
+                mir::Type::Collection(expected) | mir::Type::NullableCollection(expected) => {
+                    if let Some(object) = object {
+                        let collection = match &value {
+                            LocalValue::Collection(collection) => collection.clone(),
+                            _ => self
+                                .interface_collections
+                                .get(&object)
+                                .ok_or_else(|| {
+                                    InterpreterError::new(
+                                        "borrowed collection source was destroyed",
+                                    )
+                                })?
+                                .clone(),
+                        };
+                        if collection.ty != expected {
+                            return Err(InterpreterError::new(
+                                "borrowed place has an incompatible collection view",
+                            ));
+                        }
+                        return Ok(LocalValue::Collection(
+                            if matches!(ty, mir::Type::NullableCollection(_)) {
+                                CollectionValue::nullable(
+                                    expected,
+                                    Some(collection.assume_non_null()?),
+                                )
+                            } else {
+                                collection.assume_non_null()?
+                            },
+                        ));
+                    }
+                    if matches!(ty, mir::Type::NullableCollection(_)) {
+                        return Ok(LocalValue::Collection(CollectionValue::nullable(
+                            expected, None,
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let projected = match (ty, value) {
+            (
+                mir::Type::Scalar(expected),
+                LocalValue::NullableScalar {
+                    ty,
+                    value: Some(value),
+                },
+            ) if expected == ty => LocalValue::Scalar(value),
+            (mir::Type::NullableScalar(expected), LocalValue::Scalar(value))
+                if expected == value.ty() =>
+            {
+                LocalValue::NullableScalar {
+                    ty: expected,
+                    value: Some(value),
+                }
+            }
+            (mir::Type::String, LocalValue::NullableString(Some(value))) => {
+                LocalValue::String(value)
+            }
+            (mir::Type::NullableString, LocalValue::String(value)) => {
+                LocalValue::NullableString(Some(value))
+            }
+            (mir::Type::Mixed, LocalValue::NullableMixed(Some(value))) => LocalValue::Mixed(value),
+            (mir::Type::NullableMixed, LocalValue::Mixed(value)) => {
+                LocalValue::NullableMixed(Some(value))
+            }
+            (
+                mir::Type::Function(expected),
+                LocalValue::NullableFunction {
+                    function_type,
+                    value: Some(value),
+                },
+            ) if expected == function_type => LocalValue::Function(value),
+            (mir::Type::NullableFunction(expected), LocalValue::Function(value))
+                if expected == value.function_type =>
+            {
+                LocalValue::NullableFunction {
+                    function_type: expected,
+                    value: Some(value),
+                }
+            }
+            (
+                mir::Type::PayloadEnum(expected),
+                LocalValue::NullablePayloadEnum {
+                    ty,
+                    value: Some(value),
+                },
+            ) if expected == ty => LocalValue::PayloadEnum(value),
+            (mir::Type::NullablePayloadEnum(expected), LocalValue::PayloadEnum(value))
+                if expected == value.ty =>
+            {
+                LocalValue::NullablePayloadEnum {
+                    ty: expected,
+                    value: Some(value),
+                }
+            }
+            (
+                mir::Type::SharedReference(expected),
+                LocalValue::NullableSharedReference {
+                    control: Some(control),
+                    class,
+                },
+            ) if expected == class => LocalValue::SharedReference { control, class },
+            (
+                mir::Type::NullableSharedReference(expected),
+                LocalValue::SharedReference { control, class },
+            ) if expected == class => LocalValue::NullableSharedReference {
+                control: Some(control),
+                class,
+            },
+            (
+                mir::Type::WeakReference(expected),
+                LocalValue::NullableWeakReference {
+                    control: Some(control),
+                    class,
+                },
+            ) if expected == class => LocalValue::WeakReference { control, class },
+            (
+                mir::Type::NullableWeakReference(expected),
+                LocalValue::WeakReference { control, class },
+            ) if expected == class => LocalValue::NullableWeakReference {
+                control: Some(control),
+                class,
+            },
+            (
+                mir::Type::WritableSharedReference(expected),
+                LocalValue::NullableWritableSharedReference {
+                    control: Some(control),
+                    payload,
+                },
+            ) if expected == payload => LocalValue::WritableSharedReference { control, payload },
+            (
+                mir::Type::NullableWritableSharedReference(expected),
+                LocalValue::WritableSharedReference { control, payload },
+            ) if expected == payload => LocalValue::NullableWritableSharedReference {
+                control: Some(control),
+                payload,
+            },
+            (
+                mir::Type::WritableWeakReference(expected),
+                LocalValue::NullableWritableWeakReference {
+                    control: Some(control),
+                    payload,
+                },
+            ) if expected == payload => LocalValue::WritableWeakReference { control, payload },
+            (
+                mir::Type::NullableWritableWeakReference(expected),
+                LocalValue::WritableWeakReference { control, payload },
+            ) if expected == payload => LocalValue::NullableWritableWeakReference {
+                control: Some(control),
+                payload,
+            },
+            (
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+                | mir::Type::WritableSharedReferenceAccess(expected),
+                LocalValue::NullableSharedReferenceAccess {
+                    control: Some(control),
+                    payload,
+                    writable,
+                },
+            ) if expected == payload
+                && writable == matches!(ty, mir::Type::WritableSharedReferenceAccess(_)) =>
+            {
+                LocalValue::SharedReferenceAccess {
+                    control,
+                    payload,
+                    writable,
+                }
+            }
+            (
+                mir::Type::NullableReadonlySharedReferenceAccess(expected)
+                | mir::Type::NullableWritableSharedReferenceAccess(expected),
+                LocalValue::SharedReferenceAccess {
+                    control,
+                    payload,
+                    writable,
+                },
+            ) if expected == payload
+                && writable
+                    == matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)) =>
+            {
+                LocalValue::NullableSharedReferenceAccess {
+                    control: Some(control),
+                    payload,
+                    writable,
+                }
+            }
+            _ => {
+                return Err(InterpreterError::new(
+                    "borrowed place representation does not match its requested view",
+                ))
+            }
+        };
+        Ok(projected)
+    }
+
     fn read_place(&self, place: InterpreterPlace) -> Result<LocalValue, InterpreterError> {
-        match place {
-            InterpreterPlace::FrameLocal { frame, local } => self
+        let value = match place.storage {
+            InterpreterPlaceStorage::Absent(ty) => typed_null_value(ty),
+            InterpreterPlaceStorage::CollectionElement(id) => {
+                let (entries, index) = self.collection_element_storage(id, false)?;
+                let value = entries.borrow().get(index).map(|(_, value)| value.clone());
+                value.ok_or_else(|| {
+                    InterpreterError::new("borrowed collection element is unavailable")
+                })
+            }
+            InterpreterPlaceStorage::ObjectProperty { object, property } => {
+                self.read_object_property(object, property)
+            }
+            InterpreterPlaceStorage::FrameLocal { frame, local } => self
                 .frames
                 .iter()
                 .find(|candidate| candidate.id == frame)
@@ -11346,13 +12283,16 @@ impl Interpreter<'_> {
                 .ok_or_else(|| {
                     InterpreterError::new("closure capture source place is unavailable")
                 }),
-            InterpreterPlace::EnvironmentField { environment, field } => {
+            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
                 if let Some(active) = self
                     .active_closure_fields
                     .get(&(environment, field.0))
                     .copied()
                 {
-                    return self.read_place(active);
+                    return self.read_place(InterpreterPlace {
+                        ty: place.ty,
+                        ..active
+                    });
                 }
                 let index = self.closure_environment_field_index(environment, field)?;
                 match &self
@@ -11368,12 +12308,39 @@ impl Interpreter<'_> {
                     )),
                 }
             }
-        }
+        }?;
+        self.project_place_value(value, place.ty)
     }
 
     fn take_place(&mut self, place: InterpreterPlace) -> Result<LocalValue, InterpreterError> {
-        match place {
-            InterpreterPlace::FrameLocal { frame, local } => self
+        let value = match place.storage {
+            InterpreterPlaceStorage::Absent(_) => Err(InterpreterError::new(
+                "absent readonly borrowed place cannot be transferred",
+            )),
+            InterpreterPlaceStorage::CollectionElement(id) => {
+                let (entries, index) = self.collection_element_storage(id, false)?;
+                let value = entries
+                    .borrow_mut()
+                    .get_mut(index)
+                    .map(|(_, value)| {
+                        // This inert placeholder owns nothing. The place remains
+                        // unavailable until the exclusive capture restores it.
+                        std::mem::replace(value, LocalValue::Mixed(MixedValue::Null))
+                    })
+                    .ok_or_else(|| {
+                        InterpreterError::new("borrowed collection element is unavailable")
+                    })?;
+                self.transferred_collection_elements
+                    .insert((id.generation, id.index));
+                Ok(value)
+            }
+            InterpreterPlaceStorage::ObjectProperty { object, property } => self
+                .heap
+                .get_mut(&object)
+                .and_then(|value| value.properties.get_mut(property.index))
+                .and_then(Option::take)
+                .ok_or_else(|| InterpreterError::new("borrowed property source is unavailable")),
+            InterpreterPlaceStorage::FrameLocal { frame, local } => self
                 .frames
                 .iter_mut()
                 .find(|candidate| candidate.id == frame)
@@ -11382,13 +12349,16 @@ impl Interpreter<'_> {
                 .ok_or_else(|| {
                     InterpreterError::new("closure capture source place is unavailable")
                 }),
-            InterpreterPlace::EnvironmentField { environment, field } => {
+            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
                 if let Some(active) = self
                     .active_closure_fields
                     .get(&(environment, field.0))
                     .copied()
                 {
-                    return self.take_place(active);
+                    return self.take_place(InterpreterPlace {
+                        ty: place.ty,
+                        ..active
+                    });
                 }
                 let index = self.closure_environment_field_index(environment, field)?;
                 let borrowed = match &self
@@ -11407,8 +12377,11 @@ impl Interpreter<'_> {
                     }
                     ClosureEnvironmentFieldValue::Owned(_) => None,
                 };
-                if let Some(place) = borrowed {
-                    return self.take_place(place);
+                if let Some(origin) = borrowed {
+                    return self.take_place(InterpreterPlace {
+                        ty: place.ty,
+                        ..origin
+                    });
                 }
                 let environment = self
                     .closure_environments
@@ -11421,7 +12394,8 @@ impl Interpreter<'_> {
                 slot.take()
                     .ok_or_else(|| InterpreterError::new("closure owned capture was already moved"))
             }
-        }
+        }?;
+        self.project_place_value(value, place.ty)
     }
 
     fn restore_place(
@@ -11429,8 +12403,41 @@ impl Interpreter<'_> {
         place: InterpreterPlace,
         value: LocalValue,
     ) -> Result<(), InterpreterError> {
-        match place {
-            InterpreterPlace::FrameLocal { frame, local } => {
+        if matches!(place.storage, InterpreterPlaceStorage::Absent(_)) {
+            return Err(InterpreterError::new(
+                "absent readonly borrowed place cannot be restored",
+            ));
+        }
+        let value = self.project_place_value(value, self.place_storage_type(place.storage)?)?;
+        match place.storage {
+            InterpreterPlaceStorage::Absent(_) => unreachable!("absent place rejected above"),
+            InterpreterPlaceStorage::CollectionElement(id) => {
+                let (entries, index) = self.collection_element_storage(id, true)?;
+                let mut entries = entries.borrow_mut();
+                let (_, slot) = entries.get_mut(index).ok_or_else(|| {
+                    InterpreterError::new("borrowed collection element is unavailable")
+                })?;
+                *slot = value;
+                self.transferred_collection_elements
+                    .remove(&(id.generation, id.index));
+                Ok(())
+            }
+            InterpreterPlaceStorage::ObjectProperty { object, property } => {
+                let slot = self
+                    .heap
+                    .get_mut(&object)
+                    .and_then(|value| value.properties.get_mut(property.index))
+                    .ok_or_else(|| {
+                        InterpreterError::new("borrowed property source is unavailable")
+                    })?;
+                if slot.replace(value).is_some() {
+                    return Err(InterpreterError::new(
+                        "transferred property source was unexpectedly occupied",
+                    ));
+                }
+                Ok(())
+            }
+            InterpreterPlaceStorage::FrameLocal { frame, local } => {
                 let slot = self
                     .frames
                     .iter_mut()
@@ -11446,7 +12453,7 @@ impl Interpreter<'_> {
                 }
                 Ok(())
             }
-            InterpreterPlace::EnvironmentField { environment, field } => {
+            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
                 if let Some(active) = self
                     .active_closure_fields
                     .get(&(environment, field.0))
@@ -11497,8 +12504,32 @@ impl Interpreter<'_> {
         place: InterpreterPlace,
         value: LocalValue,
     ) -> Result<LocalValue, InterpreterError> {
-        match place {
-            InterpreterPlace::FrameLocal { frame, local } => self
+        if matches!(place.storage, InterpreterPlaceStorage::Absent(_)) {
+            return Err(InterpreterError::new(
+                "absent readonly borrowed place cannot be written",
+            ));
+        }
+        let value = self.project_place_value(value, self.place_storage_type(place.storage)?)?;
+        let old = match place.storage {
+            InterpreterPlaceStorage::Absent(_) => unreachable!("absent place rejected above"),
+            InterpreterPlaceStorage::CollectionElement(id) => {
+                let (entries, index) = self.collection_element_storage(id, false)?;
+                let old = entries
+                    .borrow_mut()
+                    .get_mut(index)
+                    .map(|(_, slot)| std::mem::replace(slot, value));
+                old.ok_or_else(|| {
+                    InterpreterError::new("borrowed collection element is unavailable")
+                })
+            }
+            InterpreterPlaceStorage::ObjectProperty { object, property } => self
+                .heap
+                .get_mut(&object)
+                .and_then(|value| value.properties.get_mut(property.index))
+                .ok_or_else(|| InterpreterError::new("borrowed property source is unavailable"))?
+                .replace(value)
+                .ok_or_else(|| InterpreterError::new("borrowed property source is empty")),
+            InterpreterPlaceStorage::FrameLocal { frame, local } => self
                 .frames
                 .iter_mut()
                 .find(|candidate| candidate.id == frame)
@@ -11508,13 +12539,19 @@ impl Interpreter<'_> {
                 })?
                 .replace(value)
                 .ok_or_else(|| InterpreterError::new("closure capture source place is empty")),
-            InterpreterPlace::EnvironmentField { environment, field } => {
+            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
                 if let Some(active) = self
                     .active_closure_fields
                     .get(&(environment, field.0))
                     .copied()
                 {
-                    return self.write_place(active, value);
+                    return self.write_place(
+                        InterpreterPlace {
+                            ty: place.ty,
+                            ..active
+                        },
+                        value,
+                    );
                 }
                 let index = self.closure_environment_field_index(environment, field)?;
                 let borrowed = match &self
@@ -11533,8 +12570,14 @@ impl Interpreter<'_> {
                     }
                     ClosureEnvironmentFieldValue::Owned(_) => None,
                 };
-                if let Some(place) = borrowed {
-                    return self.write_place(place, value);
+                if let Some(origin) = borrowed {
+                    return self.write_place(
+                        InterpreterPlace {
+                            ty: place.ty,
+                            ..origin
+                        },
+                        value,
+                    );
                 }
                 let environment = self
                     .closure_environments
@@ -11548,7 +12591,8 @@ impl Interpreter<'_> {
                     InterpreterError::new("closure owned capture was moved before replacement")
                 })
             }
-        }
+        }?;
+        self.project_place_value(old, place.ty)
     }
 
     fn drop_function_value(&mut self, value: FunctionValue) -> Result<(), InterpreterError> {
@@ -11602,6 +12646,12 @@ impl Interpreter<'_> {
         environment_local: mir::LocalId,
         bindings: &[(mir::ClosureEnvironmentFieldId, mir::LocalId)],
     ) -> Result<(), InterpreterError> {
+        let invocation_mode = function
+            .closure
+            .as_ref()
+            .and_then(|closure| self.program.function_types.get(closure.function_type.0))
+            .ok_or_else(|| InterpreterError::new("closure function type does not exist"))?
+            .invocation_mode;
         let environment = match read_local(&self.current_frame()?.locals, environment_local)? {
             LocalValue::ClosureEnvironment(Some(environment)) => *environment,
             LocalValue::ClosureEnvironment(None) if bindings.is_empty() => return Ok(()),
@@ -11641,7 +12691,8 @@ impl Interpreter<'_> {
                 ClosureEnvironmentFieldValue::Owned(_) => None,
             };
             let field = &layout.fields[index];
-            let transfer = field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+            let binding = field.storage.invocation_binding(invocation_mode);
+            let transfer = binding == mir::ClosureEnvironmentStorage::WritableBorrow
                 && field.ty.transfers_writable_capture_ownership();
             let (value, origin, owned) = if let Some(place) = borrowed_place {
                 let value = if transfer {
@@ -11660,15 +12711,20 @@ impl Interpreter<'_> {
                 else {
                     unreachable!("borrowed environment field handled above");
                 };
+                let owned = binding == mir::ClosureEnvironmentStorage::Owned;
+                let bound_value = if owned { value.take() } else { value.clone() };
                 (
-                    value.take().ok_or_else(|| {
+                    bound_value.ok_or_else(|| {
                         InterpreterError::new("closure owned capture was already moved")
                     })?,
-                    InterpreterPlace::EnvironmentField {
-                        environment,
-                        field: *field_id,
+                    InterpreterPlace {
+                        storage: InterpreterPlaceStorage::EnvironmentField {
+                            environment,
+                            field: *field_id,
+                        },
+                        ty: field.ty,
                     },
-                    true,
+                    owned,
                 )
             };
             values.push((*field_id, *target, value, origin, owned));
@@ -11685,9 +12741,12 @@ impl Interpreter<'_> {
             if owned {
                 self.active_closure_fields.insert(
                     (environment, field.0),
-                    InterpreterPlace::FrameLocal {
-                        frame: frame_id,
-                        local: target,
+                    InterpreterPlace {
+                        storage: InterpreterPlaceStorage::FrameLocal {
+                            frame: frame_id,
+                            local: target,
+                        },
+                        ty: local_in(function, target)?.ty,
                     },
                 );
             }
@@ -11707,6 +12766,12 @@ impl Interpreter<'_> {
         let Some(environment) = frame.closure_environment else {
             return Ok(Vec::new());
         };
+        let invocation_mode = self
+            .program
+            .function_types
+            .get(closure.function_type.0)
+            .ok_or_else(|| InterpreterError::new("closure function type does not exist"))?
+            .invocation_mode;
         let layout_id = closure
             .environment_layout
             .ok_or_else(|| InterpreterError::new("capturing closure has no environment layout"))?;
@@ -11750,11 +12815,16 @@ impl Interpreter<'_> {
                 .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
                 .fields[physical_index]
             {
-                ClosureEnvironmentFieldValue::Owned(_) => actions.push(SyncAction::Owned {
-                    index: physical_index,
-                    field: *field_id,
-                    value: slot.take(),
-                }),
+                ClosureEnvironmentFieldValue::Owned(_)
+                    if field.storage.invocation_binding(invocation_mode)
+                        == mir::ClosureEnvironmentStorage::Owned =>
+                {
+                    actions.push(SyncAction::Owned {
+                        index: physical_index,
+                        field: *field_id,
+                        value: slot.take(),
+                    })
+                }
                 ClosureEnvironmentFieldValue::Borrowed { place, writable } if *writable => {
                     let transferred = field.ty.transfers_writable_capture_ownership();
                     let value = if transferred {
@@ -11772,7 +12842,8 @@ impl Interpreter<'_> {
                         transferred,
                     });
                 }
-                ClosureEnvironmentFieldValue::Borrowed { .. } => {}
+                ClosureEnvironmentFieldValue::Owned(_)
+                | ClosureEnvironmentFieldValue::Borrowed { .. } => {}
             }
         }
         let mut drops = Vec::new();
@@ -11873,7 +12944,7 @@ impl Interpreter<'_> {
                     ));
                 }
             };
-            self.finish_indirect_continuation(target, assignment)?;
+            self.finish_indirect_continuation(target, assignment, frame.returned_place)?;
             return Ok(StepOutcome::Continue);
         }
         if let Some(continuation) = frame.checked_continuation {
@@ -11982,6 +13053,7 @@ impl Interpreter<'_> {
             let caller = function_in(self.program, caller_id)?;
             block_in(caller, target)?;
             if let Some((local, value)) = assignment {
+                self.assign_result_origin(caller, local, frame.returned_place)?;
                 let replaced = assign_local(
                     self.program,
                     &caller.locals,
@@ -12000,14 +13072,12 @@ impl Interpreter<'_> {
             caller.statement_index = 0;
             caller.entered_block = false;
             if let Some((object, class)) = failed_construction {
-                // Failed construction drops initialized fields and frees storage,
-                // but never invokes the class destructor.
+                // The failing constructor phase already cleaned initialized
+                // fields and completed ancestors through shared MIR cleanup.
+                // Only this allocation owner frees the complete payload.
                 caller
                     .tasks
                     .push(EvaluationTask::FreeObject { object, class });
-                caller
-                    .tasks
-                    .push(EvaluationTask::DropObjectProperties { object, class });
             }
             return Ok(StepOutcome::Continue);
         }
@@ -12023,6 +13093,9 @@ impl Interpreter<'_> {
                     )));
                 }
                 self.push_local_value(value)?;
+                self.current_frame_mut()?
+                    .values
+                    .set_place(frame.returned_place);
             }
             (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
                 if !local_value_matches_type(self.program, expected, &value) {
@@ -13046,63 +14119,7 @@ impl Interpreter<'_> {
     }
 
     fn push_null(&mut self, ty: mir::Type) -> Result<(), InterpreterError> {
-        match ty {
-            mir::Type::NullableScalar(ty) => self.push_nullable_scalar(ty, None),
-            mir::Type::NullableString => self.push_nullable_string(None),
-            mir::Type::NullableMixed => self.push_nullable_mixed(None),
-            mir::Type::NullableInterface(interface) => self.push_nullable_error(interface, None),
-            mir::Type::NullableClass(class) => self.push_nullable_class(class, None),
-            mir::Type::NullableSharedReference(class) => {
-                self.current_frame_mut()?
-                    .values
-                    .push(EvaluationValue::NullableSharedReference {
-                        control: None,
-                        class,
-                    });
-                Ok(())
-            }
-            mir::Type::NullableWeakReference(class) => {
-                self.current_frame_mut()?
-                    .values
-                    .push(EvaluationValue::NullableWeakReference {
-                        control: None,
-                        class,
-                    });
-                Ok(())
-            }
-            mir::Type::NullableWritableSharedReference(payload) => {
-                self.current_frame_mut()?.values.push(
-                    EvaluationValue::NullableWritableSharedReference {
-                        control: None,
-                        payload,
-                    },
-                );
-                Ok(())
-            }
-            mir::Type::NullableWritableWeakReference(payload) => {
-                self.current_frame_mut()?.values.push(
-                    EvaluationValue::NullableWritableWeakReference {
-                        control: None,
-                        payload,
-                    },
-                );
-                Ok(())
-            }
-            mir::Type::NullableReadonlySharedReferenceAccess(payload)
-            | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
-                self.current_frame_mut()?.values.push(
-                    EvaluationValue::NullableSharedReferenceAccess {
-                        control: None,
-                        payload,
-                        writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
-                    },
-                );
-                Ok(())
-            }
-            _ => Err(InterpreterError::new(
-                "null result does not have nullable type",
-            )),
-        }
+        self.push_local_value(typed_null_value(ty)?)
     }
 
     fn push_nullable_from_value(
@@ -14191,7 +15208,10 @@ impl Interpreter<'_> {
                     "MIR property initialization targets initialized storage",
                 ));
             }
-            (mir::PropertyWriteKind::Replace, false) => {
+            (
+                mir::PropertyWriteKind::Replace | mir::PropertyWriteKind::InitializeOverride,
+                false,
+            ) => {
                 return Err(InterpreterError::new(
                     "MIR property replacement targets uninitialized storage",
                 ));
@@ -14983,10 +16003,84 @@ impl Interpreter<'_> {
                 .map(|collection| collection.entries_mut().remove(position).1)
                 .map_err(|_| CollectionAccessError::Catalogued("P1001"))
         } else {
-            self.collection_local(local)
+            let value = self
+                .collection_local(local)
                 .map(|collection| collection.entries()[position].1.clone())
-                .map_err(|_| CollectionAccessError::Catalogued("P1001"))
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
+            if local_value_type(self.program, &value).has_move_ownership() {
+                let place = self
+                    .place_for_collection_element(local, position)
+                    .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
+                self.current_frame_mut()
+                    .map_err(|_| CollectionAccessError::Catalogued("P1001"))?
+                    .tasks
+                    .push(EvaluationTask::SetResultPlace(place));
+            }
+            Ok(value)
         }
+    }
+
+    fn place_for_collection_element(
+        &mut self,
+        local: mir::LocalId,
+        index: usize,
+    ) -> Result<InterpreterPlace, InterpreterError> {
+        let collection = self.collection_local(local)?;
+        let ty = self.program.collection_types[collection.ty.0].value;
+        let entries = Rc::downgrade(&collection.entries);
+        // A weak handle does not extend the owner's lifetime. Repeated reads
+        // reuse its entry; newly borrowed owners reclaim expired entries.
+        // Generations prevent an expired place from aliasing a later owner
+        // whose allocation happens to reuse the same address.
+        let identity = entries.as_ptr() as usize;
+        let generation = if let Some(source) = self.borrowed_collections.get(&identity) {
+            source.generation
+        } else {
+            self.borrowed_collections
+                .retain(|_, source| source.entries.strong_count() != 0);
+            let generation = self.next_borrowed_collection;
+            self.next_borrowed_collection += 1;
+            self.borrowed_collections.insert(
+                identity,
+                BorrowedCollection {
+                    generation,
+                    entries,
+                },
+            );
+            generation
+        };
+        Ok(InterpreterPlace {
+            storage: InterpreterPlaceStorage::CollectionElement(CollectionElementPlace {
+                collection: identity,
+                generation,
+                index,
+                ty,
+            }),
+            ty,
+        })
+    }
+
+    fn collection_element_storage(
+        &self,
+        place: CollectionElementPlace,
+        transferred: bool,
+    ) -> Result<(SharedCollectionEntries, usize), InterpreterError> {
+        if self
+            .transferred_collection_elements
+            .contains(&(place.generation, place.index))
+            != transferred
+        {
+            return Err(InterpreterError::new(
+                "borrowed collection element has incompatible transfer state",
+            ));
+        }
+        let entries = self
+            .borrowed_collections
+            .get(&place.collection)
+            .filter(|source| source.generation == place.generation)
+            .and_then(|source| source.entries.upgrade())
+            .ok_or_else(|| InterpreterError::new("borrowed collection owner is unavailable"))?;
+        Ok((entries, place.index))
     }
 
     fn pop_collection_offset(&mut self) -> Result<usize, InterpreterError> {
@@ -16157,6 +17251,86 @@ fn collection_bytes(collection: &CollectionValue) -> Result<Vec<u8>, Interpreter
         .collect()
 }
 
+fn typed_null_value(ty: mir::Type) -> Result<LocalValue, InterpreterError> {
+    let value = match ty {
+        mir::Type::Mixed => LocalValue::Mixed(MixedValue::Null),
+        mir::Type::NullableScalar(ty) => LocalValue::NullableScalar { ty, value: None },
+        mir::Type::NullableString => LocalValue::NullableString(None),
+        mir::Type::NullableMixed => LocalValue::NullableMixed(None),
+        mir::Type::NullableInterface(interface) => LocalValue::NullableError {
+            interface,
+            value: None,
+        },
+        mir::Type::NullableClass(class) => LocalValue::NullableClass {
+            object: None,
+            class,
+        },
+        mir::Type::NullableSharedReference(class) => LocalValue::NullableSharedReference {
+            control: None,
+            class,
+        },
+        mir::Type::NullableWeakReference(class) => LocalValue::NullableWeakReference {
+            control: None,
+            class,
+        },
+        mir::Type::NullableWritableSharedReference(payload) => {
+            LocalValue::NullableWritableSharedReference {
+                control: None,
+                payload,
+            }
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            LocalValue::NullableWritableWeakReference {
+                control: None,
+                payload,
+            }
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            LocalValue::NullableSharedReferenceAccess {
+                control: None,
+                payload,
+                writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
+            }
+        }
+        mir::Type::NullableCollection(collection) => {
+            LocalValue::Collection(CollectionValue::nullable(collection, None))
+        }
+        mir::Type::NullablePayloadEnum(ty) => LocalValue::NullablePayloadEnum { ty, value: None },
+        mir::Type::NullableFunction(function_type) => LocalValue::NullableFunction {
+            function_type,
+            value: None,
+        },
+        _ => {
+            return Err(InterpreterError::new(
+                "null result does not have nullable type",
+            ));
+        }
+    };
+    Ok(value)
+}
+
+fn is_absent_nullable_value(value: &LocalValue) -> bool {
+    match value {
+        LocalValue::NullableScalar { value: None, .. }
+        | LocalValue::Mixed(MixedValue::Null)
+        | LocalValue::NullableMixed(Some(MixedValue::Null))
+        | LocalValue::NullableString(None)
+        | LocalValue::NullableMixed(None)
+        | LocalValue::NullableError { value: None, .. }
+        | LocalValue::NullableClass { object: None, .. }
+        | LocalValue::NullableSharedReference { control: None, .. }
+        | LocalValue::NullableWeakReference { control: None, .. }
+        | LocalValue::NullableWritableSharedReference { control: None, .. }
+        | LocalValue::NullableWritableWeakReference { control: None, .. }
+        | LocalValue::NullableSharedReferenceAccess { control: None, .. }
+        | LocalValue::NullablePayloadEnum { value: None, .. }
+        | LocalValue::NullableFunction { value: None, .. } => true,
+        LocalValue::Collection(value) => value.nullable && !value.present,
+        _ => false,
+    }
+}
+
 fn local_value_type(program: &mir::Program, value: &LocalValue) -> mir::Type {
     match value {
         LocalValue::Scalar(value) => mir::Type::Scalar(value.ty()),
@@ -17308,6 +18482,37 @@ fn block_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_collection_places_reuse_live_sources_and_reclaim_expired_sources() {
+        for (setup, iteration) in [
+            (
+                "Item[] $items = [new Item()];",
+                "let $view = first($items);",
+            ),
+            (
+                "",
+                "Item[] $items = [new Item()]; let $view = first($items);",
+            ),
+        ] {
+            let source = format!(
+                r#"
+class Item {{ int $value = 42; }}
+function first(Item[] $items): Item {{ return $items[0]; }}
+function main(): void {{
+    {setup}
+    let writable $count = 0;
+    while ($count < 1000) {{
+        {iteration}
+        $count++;
+    }}
+}}
+"#
+            );
+            let metrics = closure_metrics(&source);
+            assert_eq!(metrics.borrowed_collection_sources, 1, "{source}");
+        }
+    }
 
     fn closure_metrics(source: &str) -> InterpreterMetrics {
         let program = crate::lower_source_to_mir("closure-allocation.doria", source)

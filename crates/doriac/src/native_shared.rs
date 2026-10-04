@@ -39,6 +39,7 @@ pub(crate) enum Operation<'a> {
     Call {
         function: FunctionId,
         args: &'a [Rvalue],
+        return_borrow: Option<mir::ReturnBorrow>,
     },
     Runtime {
         value: Expression<'a>,
@@ -158,9 +159,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Share { value, .. } => O::Runtime {
                         value: Self::Strong(value),
@@ -210,9 +217,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Create { value, .. } => O::Runtime {
                         value: Self::Strong(value),
@@ -261,9 +274,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Acquire { value, .. } => O::Runtime {
                         value: Self::Weak(value),
@@ -340,9 +359,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::NullSafeCreate { value, .. } => O::Runtime {
                         value: Self::NullableStrong(value),
@@ -412,9 +437,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Share { value, .. } => O::Runtime {
                         value: Self::WritableStrong(value),
@@ -464,9 +495,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Create { value, .. } => O::Runtime {
                         value: Self::WritableStrong(value),
@@ -515,9 +552,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Acquire { value, .. } => O::Runtime {
                         value: Self::WritableWeak(value),
@@ -582,9 +625,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::NullSafeCreate { value, .. } => O::Runtime {
                         value: Self::NullableWritableStrong(value),
@@ -638,9 +687,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::Acquire {
                         value,
@@ -688,9 +743,15 @@ impl<'a> Expression<'a> {
                         object: *object,
                         property: *property,
                     },
-                    E::Call { function, args, .. } => O::Call {
+                    E::Call {
+                        function,
+                        args,
+                        return_borrow,
+                        ..
+                    } => O::Call {
                         function: *function,
                         args,
+                        return_borrow: *return_borrow,
                     },
                     E::NullSafeAcquire {
                         value,

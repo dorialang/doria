@@ -38,6 +38,729 @@ fn assert_malformed(program: &Program, expected: &str) {
 }
 
 #[test]
+fn writable_class_aliases_cannot_escalate_readonly_source_access() {
+    for nullable in [false, true] {
+        let ty = if nullable { "?Box" } else { "Box" };
+        let source =
+            format!("class Box {{}} function main(): void {{ writable {ty} $value = new Box(); }}");
+        let mut program = doriac::lower_source_to_mir("class-alias-access.doria", &source).unwrap();
+        let function = program
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .unwrap();
+        let owner = function
+            .locals
+            .iter()
+            .find(|local| local.name == "value")
+            .unwrap()
+            .clone();
+        let alias = LocalId(function.locals.len());
+        function.locals.push(Local {
+            id: alias,
+            name: "alias".into(),
+            owned: false,
+            synthetic: true,
+            ..owner.clone()
+        });
+        let value = match owner.ty {
+            Type::Class(class) => Rvalue::Class(ClassExpression::Local {
+                class,
+                local: owner.id,
+                transfer: false,
+            }),
+            Type::NullableClass(class) => Rvalue::NullableClass(NullableClassExpression::Local {
+                class,
+                local: owner.id,
+                transfer: false,
+            }),
+            _ => panic!("fixture must contain a class owner"),
+        };
+        let block = &mut function.blocks[0];
+        let initialized = block.statements.iter().position(|statement| {
+            matches!(statement, Statement::AssignLocal { target, .. } if *target == owner.id)
+        }).unwrap();
+        block.statements.insert(
+            initialized + 1,
+            Statement::AssignLocal {
+                target: alias,
+                value,
+            },
+        );
+        doriac::mir_validation::validate_program(&program).unwrap();
+
+        program
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .unwrap()
+            .locals[owner.id.0]
+            .writable = false;
+        assert_malformed(
+            &program,
+            if nullable {
+                "requires a writable nullable class value"
+            } else {
+                "requires a writable class value"
+            },
+        );
+    }
+}
+
+#[test]
+fn core_collection_value_views_preserve_storage_capability_without_exposing_keys() {
+    for (type_name, expected_kind, permits_writable_value) in [
+        ("Dictionary<Key, Key>", CollectionKind::Dictionary, true),
+        (
+            "SortedDictionary<Key, Key>",
+            CollectionKind::SortedDictionary,
+            true,
+        ),
+        ("Set<Key>", CollectionKind::Set, false),
+        ("SortedSet<Key>", CollectionKind::SortedSet, false),
+        ("PriorityQueue<Key>", CollectionKind::PriorityQueue, false),
+    ] {
+        let source = format!(
+            r#"
+class Key implements Hashable, Equatable<Key>, Comparable<Key>
+{{
+    function hash(): uint64 {{ return 0; }}
+    function equals(Key $other): bool {{ return true; }}
+    function compare(Key $other): Ordering {{ return Ordering::Equal; }}
+}}
+function inspect(writable {type_name} $items): void {{}}
+function main(): void {{}}
+"#
+        );
+        let mut valid = doriac::lower_source_to_mir(
+            "core-collection-view-capability.doria",
+            source,
+        )
+        .expect(
+            "compiler-known collection contracts should lower without invoking user comparisons",
+        );
+        let function_index = valid
+            .functions
+            .iter()
+            .position(|function| function.name == "inspect")
+            .expect("the collection-parameter fixture should be present");
+        let function = &mut valid.functions[function_index];
+        let collection = function.params[0];
+        let Type::Collection(collection_type) = function.locals[collection.0].ty else {
+            panic!("fixture parameter must be a concrete collection");
+        };
+        let definition = &valid.collection_types[collection_type.0];
+        assert_eq!(definition.kind, expected_kind);
+        assert!(definition.uses_core_operations());
+        let position = LocalId(function.locals.len());
+        function.locals.push(Local {
+            id: position,
+            name: "element_position".into(),
+            ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+            writable: false,
+            owned: false,
+            synthetic: true,
+        });
+        let target = LocalId(function.locals.len());
+        function.locals.push(Local {
+            id: target,
+            name: "element_view".into(),
+            ty: definition.value,
+            writable: permits_writable_value,
+            owned: false,
+            synthetic: true,
+        });
+        let entry = function.entry_block;
+        function.blocks[entry.0].statements.extend([
+            Statement::AssignLocal {
+                target: position,
+                value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::constant(
+                    IntegerValue::from_bits(IntegerType::Int64, 0),
+                ))),
+            },
+            Statement::CoreCollection {
+                collection,
+                operation: mir::CoreCollectionOperation::ValueAt { position, target },
+            },
+        ]);
+        doriac::mir_validation::validate_program(&valid)
+            .expect("value-view capability must follow the established collection-family contract");
+
+        if permits_writable_value {
+            let mut readonly_source = valid.clone();
+            let function = &mut readonly_source.functions[function_index];
+            function.locals[collection.0].writable = false;
+            function.parameter_modes[0] = FunctionParameterMode::Readonly;
+            assert_malformed(
+                &readonly_source,
+                "core collection writable value view lacks a writable source or eligible collection family",
+            );
+            readonly_source.functions[function_index].locals[target.0].writable = false;
+            doriac::mir_validation::validate_program(&readonly_source)
+                .expect("a readonly dictionary source still permits a readonly value view");
+
+            let mut writable_key = valid.clone();
+            let function = &mut writable_key.functions[function_index];
+            let operation = function.blocks[entry.0]
+                .statements
+                .iter_mut()
+                .find_map(|statement| match statement {
+                    Statement::CoreCollection { operation, .. } => Some(operation),
+                    _ => None,
+                })
+                .expect("the injected core collection read should remain present");
+            *operation = mir::CoreCollectionOperation::KeyAt { position, target };
+            assert_malformed(&writable_key, "collection key is exposed writable");
+            writable_key.functions[function_index].locals[target.0].writable = false;
+            doriac::mir_validation::validate_program(&writable_key)
+                .expect("dictionary keys remain readable as non-owning readonly views");
+        } else {
+            let mut writable_member = valid.clone();
+            writable_member.functions[function_index].locals[target.0].writable = true;
+            assert_malformed(
+                &writable_member,
+                "core collection writable value view lacks a writable source or eligible collection family",
+            );
+        }
+    }
+}
+
+#[test]
+fn constructor_child_views_require_the_exact_root_and_initialized_writable_field() {
+    for nullable in [false, true] {
+        let child_type = if nullable { "?Child" } else { "Child" };
+        let source = format!(
+            r#"
+class Child {{}}
+class Holder
+{{
+    writable {child_type} $child;
+    function __construct() {{ $this->child = new Child(); }}
+    function inspect(): int {{ return 1; }}
+    function __destruct() {{}}
+    function callback(): function(): int {{ return fn() with ($this) => $this->inspect(); }}
+}}
+function main(): void {{ let $holder = new Holder(); $holder->inspect(); }}
+"#
+        );
+        let base = doriac::lower_source_to_mir("constructor-child-view-validation.doria", source)
+            .expect("the baseline initializes its child without taking a writable receiver borrow");
+        let holder = base
+            .classes
+            .iter()
+            .find(|class| class.name == "Holder")
+            .unwrap();
+        let holder_id = holder.id;
+        let property = holder
+            .properties
+            .iter()
+            .find(|property| property.name == "child")
+            .unwrap()
+            .clone();
+        let constructor_id = holder.constructor.unwrap();
+        let constructor = &base.functions[constructor_id.0];
+        let receiver = constructor.params[0];
+        assert!(
+            !constructor.locals[receiver.0].writable,
+            "constructor this remains readonly"
+        );
+        let entry = constructor.entry_block;
+        let initialized_at = constructor.blocks[entry.0].statements.iter().position(|statement| {
+            matches!(statement, Statement::AssignProperty { property: target, kind: mir::PropertyWriteKind::Initialize, .. } if *target == property.id)
+        }).expect("the child must be directly initialized in the constructor entry");
+
+        let property_value = |object| match property.ty {
+            Type::Class(class) => Rvalue::Class(ClassExpression::Property {
+                class,
+                object,
+                property: property.id,
+            }),
+            Type::NullableClass(class) => {
+                Rvalue::NullableClass(NullableClassExpression::Property {
+                    class,
+                    object,
+                    property: property.id,
+                })
+            }
+            _ => panic!("the child must retain its declared class or nullable-class type"),
+        };
+        let append_view = |function: &mut Function| {
+            let id = LocalId(function.locals.len());
+            function.locals.push(Local {
+                id,
+                name: "constructor_child_view".into(),
+                ty: property.ty,
+                writable: true,
+                owned: false,
+                synthetic: true,
+            });
+            id
+        };
+        let expected_writable_error = if nullable {
+            "requires a writable nullable class value"
+        } else {
+            "requires a writable class value"
+        };
+
+        let mut valid = base.clone();
+        let function = &mut valid.functions[constructor_id.0];
+        let view = append_view(function);
+        function.blocks[entry.0].statements.insert(
+            initialized_at + 1,
+            Statement::AssignLocal {
+                target: view,
+                value: property_value(receiver),
+            },
+        );
+        doriac::mir_validation::validate_program(&valid)
+            .expect("initialized writable child views may derive from the exact constructor root");
+
+        let mut readonly_field = valid.clone();
+        readonly_field.classes[holder_id.0].properties[property.id.index].writable = false;
+        assert_malformed(&readonly_field, expected_writable_error);
+
+        let mut indirect_root = base.clone();
+        let function = &mut indirect_root.functions[constructor_id.0];
+        let alias_root = LocalId(function.locals.len());
+        function.locals.push(Local {
+            id: alias_root,
+            name: "readonly_root_alias".into(),
+            ty: Type::Class(holder_id),
+            writable: false,
+            owned: false,
+            synthetic: true,
+        });
+        let view = append_view(function);
+        function.blocks[entry.0].statements.splice(
+            initialized_at + 1..initialized_at + 1,
+            [
+                Statement::AssignLocal {
+                    target: alias_root,
+                    value: Rvalue::Class(ClassExpression::Local {
+                        class: holder_id,
+                        local: receiver,
+                        transfer: false,
+                    }),
+                },
+                Statement::AssignLocal {
+                    target: view,
+                    value: property_value(alias_root),
+                },
+            ],
+        );
+        assert_malformed(&indirect_root, expected_writable_error);
+
+        let mut before_initialization = base.clone();
+        let function = &mut before_initialization.functions[constructor_id.0];
+        let view = append_view(function);
+        function.blocks[entry.0].statements.insert(
+            initialized_at,
+            Statement::AssignLocal {
+                target: view,
+                value: property_value(receiver),
+            },
+        );
+        assert_malformed(&before_initialization, "reads or exposes property");
+
+        for name in ["Holder::inspect", "Holder::__destruct"] {
+            let mut outside_constructor = base.clone();
+            let function = outside_constructor
+                .functions
+                .iter_mut()
+                .find(|function| function.name == name)
+                .expect("the readonly nonconstructor method should be lowered");
+            let object = function.params[0];
+            assert!(
+                !function.locals[object.0].writable,
+                "fixture receiver must be readonly"
+            );
+            let view = append_view(function);
+            function.blocks[function.entry_block.0]
+                .statements
+                .push(Statement::AssignLocal {
+                    target: view,
+                    value: property_value(object),
+                });
+            assert_malformed(&outside_constructor, expected_writable_error);
+        }
+
+        let mut closure = base.clone();
+        let function = closure
+            .functions
+            .iter_mut()
+            .find(|function| function.closure.is_some())
+            .expect("the readonly receiver capture should lower into its own function");
+        let object = function
+            .locals
+            .iter()
+            .find(|local| local.ty == Type::Class(holder_id))
+            .expect("the closure must bind its captured receiver")
+            .id;
+        assert!(!function.locals[object.0].writable);
+        let view = append_view(function);
+        function.blocks[function.entry_block.0]
+            .statements
+            .push(Statement::AssignLocal {
+                target: view,
+                value: property_value(object),
+            });
+        assert_malformed(&closure, expected_writable_error);
+    }
+}
+
+#[test]
+fn closure_capture_binding_ownership_matches_invocation_not_environment_storage() {
+    for (body, invocation_mode, owned) in [
+        (
+            "$child->value",
+            mir::FunctionInvocationMode::Readonly,
+            false,
+        ),
+        ("$child", mir::FunctionInvocationMode::Once, true),
+    ] {
+        let source = format!(
+            r#"
+class Child {{ int $value = 42; }}
+function main(): void {{
+    let $child = new Child();
+    let $callback = fn() with (take $child) => {body};
+}}
+"#
+        );
+        let mut program = doriac::lower_source_to_mir("capture-binding.doria", &source).unwrap();
+        doriac::mir_validation::validate_program(&program).unwrap();
+        let descriptor = &program.closure_descriptors[0];
+        assert_eq!(descriptor.invocation_mode, invocation_mode);
+        let layout = &program.closure_environment_layouts[descriptor
+            .environment_layout
+            .expect("owned capture has an environment")
+            .0];
+        assert_eq!(
+            layout.fields[0].storage,
+            mir::ClosureEnvironmentStorage::Owned
+        );
+        let function_id = descriptor.entry_function;
+        let function = program
+            .functions
+            .iter_mut()
+            .find(|function| function.id == function_id)
+            .unwrap();
+        let capture = function.closure.as_ref().unwrap().capture_locals[0].1;
+        assert_eq!(function.locals[capture.0].owned, owned);
+        function.locals[capture.0].owned = !owned;
+        assert_malformed(
+            &program,
+            "closure environment field binding has incompatible type or access",
+        );
+    }
+}
+
+#[test]
+fn nullable_callable_absence_is_neutral_but_conflicting_provenance_is_rejected() {
+    let mut program = doriac::lower_source_to_mir(
+        "nullable-callable-provenance.doria",
+        r#"
+class Source {
+    int $value = 42;
+    function make(): function(): int { return fn() with ($this) => $this->value; }
+}
+function forward(?Source $source): ?function(): int { return $source?->make(); }
+function independent(): function(): int { return fn() => 0; }
+function main(): void {}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+
+    let mut missing_provenance = program.clone();
+    missing_provenance
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "forward")
+        .unwrap()
+        .return_borrow = None;
+    assert_malformed(
+        &missing_provenance,
+        "function-value return loses its declared borrow provenance",
+    );
+
+    let independent = program
+        .functions
+        .iter()
+        .find(|function| function.name == "independent")
+        .unwrap()
+        .id;
+    let forward = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "forward")
+        .unwrap();
+    let null_value = forward
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value:
+                    Rvalue::NullableFunction(value @ mir::NullableFunctionExpression::Null { .. }),
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .expect("null-safe call must assign an absent result on its null branch");
+    let mir::NullableFunctionExpression::Null { function_type } = *null_value else {
+        unreachable!();
+    };
+    *null_value = mir::NullableFunctionExpression::Present(mir::FunctionExpression::Call {
+        function_type,
+        function: independent,
+        args: Vec::new(),
+        return_borrow: None,
+    });
+    // Independent owned callbacks can satisfy the conservative retained-source
+    // contract. They must not be relabeled as borrowed callback carriers.
+    doriac::mir_validation::validate_program(&program).unwrap();
+    program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "forward")
+        .unwrap()
+        .return_borrow
+        .as_mut()
+        .unwrap()
+        .kind = mir::ReturnBorrowKind::Value;
+    assert_malformed(
+        &program,
+        "function-value return loses its declared borrow provenance",
+    );
+}
+
+#[test]
+fn callable_arguments_preserve_returned_capture_provenance() {
+    for (callback_type, body) in [
+        ("function(): int", "$callback() == 42"),
+        ("?function(): int", "$callback == null"),
+    ] {
+        let source = format!(
+            r#"
+function capture({callback_type} $callback): function(): bool {{
+    return fn() with ($callback) => {body};
+}}
+function forward({callback_type} $callback): function(): bool {{
+    return capture($callback);
+}}
+function main(): void {{}}
+"#
+        );
+        let program = doriac::lower_source_to_mir("callable-provenance.doria", &source).unwrap();
+        doriac::mir_validation::validate_program(&program).unwrap();
+        let mut missing_provenance = program.clone();
+        let forward = missing_provenance
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "forward")
+            .unwrap();
+        assert_eq!(
+            forward.return_borrow,
+            Some(mir::ReturnBorrow {
+                kind: mir::ReturnBorrowKind::Retained,
+                source: mir::BorrowSource::Parameter(0),
+                writable: false,
+            })
+        );
+        forward.return_borrow = None;
+        assert_malformed(
+            &missing_provenance,
+            "function-value return loses its declared borrow provenance",
+        );
+    }
+}
+
+#[test]
+fn callable_carrier_ownership_is_validated_separately_from_retained_sources() {
+    let program = doriac::lower_source_to_mir(
+        "callable-carrier-ownership.doria",
+        r#"
+class Source {
+    int $value = 42;
+    function __construct(take function(): int $stored) {}
+    function lend(): function(): int { return $this->stored; }
+    function fresh(): function(): int { return fn() with ($this) => $this->value; }
+    function optional(): ?function(): int { return $this->stored; }
+}
+function main(): void {
+    let $source = new Source(fn() => 41);
+    let $borrowed = $source->lend();
+    let $owned = $source->fresh();
+    let $optional = $source->optional();
+    echo "{$borrowed()} {$owned()}";
+    if ($optional != null) { echo $optional(); }
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+
+    for (name, kind) in [
+        ("Source::lend", mir::ReturnBorrowKind::Value),
+        ("Source::fresh", mir::ReturnBorrowKind::Retained),
+        ("Source::optional", mir::ReturnBorrowKind::Value),
+    ] {
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap();
+        assert_eq!(function.return_borrow.unwrap().kind, kind, "{name}");
+        let mut forged = program.clone();
+        let function = &mut forged.functions[function.id.0];
+        function.return_borrow.as_mut().unwrap().kind = match kind {
+            mir::ReturnBorrowKind::Value => mir::ReturnBorrowKind::Retained,
+            mir::ReturnBorrowKind::Retained => mir::ReturnBorrowKind::Value,
+        };
+        assert_malformed(
+            &forged,
+            "function-value return loses its declared borrow provenance",
+        );
+    }
+
+    for (name, owns) in [("borrowed", false), ("owned", true), ("optional", false)] {
+        let mut forged = program.clone();
+        let main = forged
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .unwrap();
+        let local = main
+            .locals
+            .iter_mut()
+            .find(|local| local.name == name)
+            .unwrap();
+        assert_eq!(local.owned, owns, "{name}");
+        local.owned = !owns;
+        assert!(
+            doriac::mir_validation::validate_program(&forged).is_err(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn writable_calls_preserve_the_passed_view_but_invalidate_other_views() {
+    let mut valid = doriac::lower_source_to_mir(
+        "writable-view-lifetime.doria",
+        r#"
+class Box { writable int $value = 0; }
+function change(writable Box $value): void { $value->value++; }
+function overlap(writable Box $left, Box $right): void {}
+function main(): void {
+    let writable $owner = new Box();
+    change($owner);
+}
+"#,
+    )
+    .unwrap();
+    let overlap = valid
+        .functions
+        .iter()
+        .find(|function| function.name == "overlap")
+        .unwrap()
+        .id;
+    let main = valid.entry.0;
+    let function = &mut valid.functions[main];
+    let owner = function
+        .locals
+        .iter()
+        .find(|local| local.name == "owner")
+        .unwrap()
+        .id;
+    let Type::Class(class) = function.locals[owner.0].ty else {
+        panic!("fixture owner must be a class");
+    };
+    let view = LocalId(function.locals.len());
+    let passed = LocalId(view.0 + 1);
+    for local in [view, passed] {
+        let mut slot = borrowed_class_local(local.0, class);
+        slot.writable = true;
+        function.locals.push(slot);
+    }
+    let borrow = |local| {
+        Rvalue::Class(ClassExpression::Local {
+            class,
+            local,
+            transfer: false,
+        })
+    };
+    let block = function
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            block
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::CallVoid { .. }))
+        })
+        .unwrap();
+    let block_id = block.id;
+    let call_index = block
+        .statements
+        .iter()
+        .position(|statement| matches!(statement, Statement::CallVoid { .. }))
+        .unwrap();
+    let mut call = block.statements[call_index].clone();
+    let Statement::CallVoid { args, .. } = &mut call else {
+        unreachable!()
+    };
+    args[0] = borrow(passed);
+    block.statements.splice(
+        call_index..=call_index,
+        [
+            Statement::AssignLocal {
+                target: view,
+                value: borrow(owner),
+            },
+            Statement::AssignLocal {
+                target: passed,
+                value: borrow(view),
+            },
+            call.clone(),
+            call,
+        ],
+    );
+    doriac::mir_validation::validate_program(&valid)
+        .expect("a writable call must leave its passed receiver view usable");
+    doriac::mir_interpreter::interpret(&valid).unwrap();
+
+    let mut stale = valid.clone();
+    let Statement::CallVoid { args, .. } =
+        &mut stale.functions[main].blocks[block_id.0].statements[call_index + 2]
+    else {
+        unreachable!()
+    };
+    args[0] = borrow(view);
+    assert_malformed(&stale, "is used after its source ownership ended");
+
+    let mut ended = valid.clone();
+    ended.functions[main].blocks[block_id.0].statements.insert(
+        call_index + 3,
+        Statement::DropClass {
+            class,
+            local: owner,
+        },
+    );
+    assert_malformed(&ended, "is used after its source ownership ended");
+
+    let mut conflicting = valid;
+    conflicting.functions[main].blocks[block_id.0].statements[call_index + 2] =
+        Statement::CallVoid {
+            span: Default::default(),
+            function: overlap,
+            args: vec![borrow(view), borrow(passed)],
+        };
+    assert_malformed(&conflicting, "takes overlapping writable borrows of");
+}
+
+#[test]
 fn mixed_null_is_neutral_but_borrowed_values_cannot_become_owners() {
     let source = r#"
 function inspect(mixed $value): void {
@@ -1571,6 +2294,55 @@ function main(): void
     malformed(
         &move_as_copy,
         "move payload enum is copied instead of transferred",
+    );
+}
+
+#[test]
+fn collection_enum_reads_distinguish_copy_borrow_and_removal() {
+    use doriac::mir::{PayloadEnumExpression, PayloadEnumPlace, PayloadEnumUseMode};
+    let source = r#"
+class Item {}
+enum CopyPacket { case Value(int $value); }
+enum MovePacket { case Value(Item $value); }
+function main(): void {
+    writable List<CopyPacket> $copies = [CopyPacket::Value(42)];
+    CopyPacket $copied = $copies[0];
+    CopyPacket $removedCopy = $copies->removeAt(0);
+    writable List<MovePacket> $moves = [MovePacket::Value(new Item())];
+    MovePacket $removedMove = $moves->removeAt(0);
+}
+"#;
+    let valid = doriac::lower_source_to_mir("enum-removal.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&valid).unwrap();
+
+    for name in ["removedCopy", "removedMove"] {
+        let mut borrowed_removal = valid.clone();
+        let Rvalue::PayloadEnum(PayloadEnumExpression::Use { mode, .. }) =
+            assignment_rvalue(&mut borrowed_removal, name)
+        else {
+            panic!("expected enum removal");
+        };
+        *mode = PayloadEnumUseMode::Borrow;
+        assert!(doriac::mir_validation::validate_program(&borrowed_removal)
+            .unwrap_err()
+            .message
+            .contains("payload enum collection transfer mode disagrees with removal"));
+    }
+
+    let mut move_without_removal = valid;
+    let Rvalue::PayloadEnum(PayloadEnumExpression::Use {
+        place: PayloadEnumPlace::CollectionIndex { remove, .. },
+        ..
+    }) = assignment_rvalue(&mut move_without_removal, "removedMove")
+    else {
+        panic!("expected enum removal");
+    };
+    *remove = false;
+    assert!(
+        doriac::mir_validation::validate_program(&move_without_removal)
+            .unwrap_err()
+            .message
+            .contains("payload enum collection transfer mode disagrees with removal")
     );
 }
 
@@ -5612,6 +6384,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
                         transfer: false,
                     })],
                     return_borrow: Some(doriac::mir::ReturnBorrow {
+                        kind: mir::ReturnBorrowKind::Value,
                         source: doriac::mir::BorrowSource::Parameter(0),
                         writable: false,
                     }),
@@ -5633,7 +6406,11 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
-        return_borrow: None,
+        return_borrow: Some(mir::ReturnBorrow {
+            kind: mir::ReturnBorrowKind::Value,
+            source: mir::BorrowSource::Parameter(0),
+            writable: false,
+        }),
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
         test_assertion_checked_effects: Vec::new(),
@@ -5684,9 +6461,13 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
 
     let error = doriac::mir_validation::validate_program(&program)
         .expect_err("a returned borrow must conflict with a later transfer in the outer call");
-    assert!(error
-        .message
-        .contains("both borrows and transfers class local local0"));
+    assert!(
+        error
+            .message
+            .contains("both borrows and transfers class local local0"),
+        "{:?}",
+        error.message,
+    );
 }
 
 #[test]

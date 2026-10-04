@@ -1,0 +1,18 @@
+interface Reading { int $value { get; } }
+open class Base implements Reading {
+    open int $value { get => 1; }
+}
+class Derived extends Base { override int $value { get => 2; } }
+trait GenericReading<T> { T $value { get => $this->stored; } }
+class Box<T> { uses GenericReading<T>; function __construct(take T $stored) {} }
+function constrained<T implements Reading>(T $receiver): int { return $receiver->value; }
+function erased(Reading $receiver): int { return $receiver->value; }
+function base(Base $receiver): int { return $receiver->value; }
+function maybe(?Reading $receiver): int { return $receiver?->value ?? -1; }
+function main(): void {
+    let $receiver = new Derived();
+    echo "{$receiver->value} {base($receiver)} {erased($receiver)} {constrained($receiver)}\n";
+    echo "{maybe($receiver)} {maybe(null)}\n";
+    let $box = new Box<int>(3);
+    echo "{$box->value}\n";
+}

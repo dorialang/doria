@@ -7,8 +7,9 @@ use crate::ast::{
 use crate::builtins::Builtin;
 use crate::control_flow::{build_function_cfg, Node, NodeAction};
 use crate::dataflow::{solve_forward, ForwardAnalysis};
+use crate::property_hooks::{member_callables, PropertyHookContext};
 use crate::source::Span;
-use crate::types::TypeRef;
+use crate::types::{SharedHandleKind, TypeRef};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fact {
@@ -72,10 +73,10 @@ struct Resolution {
     declarations: HashMap<usize, BindingId>,
     declaration_types: HashMap<BindingId, Option<TypeRef>>,
     declaration_callable_modes: HashMap<BindingId, ParamModes>,
-    declaration_classes: HashMap<BindingId, String>,
+    declaration_member_types: HashMap<BindingId, TypeRef>,
     current_class: Option<String>,
     nullability: NullabilityCatalog,
-    member_classes: MemberClassCatalog,
+    member_types: MemberTypeCatalog,
     closure_bodies: Vec<(Block, Span)>,
     entry_facts: BTreeMap<BindingId, Fact>,
     constructor_properties: HashMap<String, BindingId>,
@@ -138,15 +139,16 @@ struct NullabilityCatalog {
 }
 
 #[derive(Default, Clone)]
-struct MemberClassCatalog {
-    methods: HashMap<(String, String), String>,
-    properties: HashMap<(String, String), String>,
+struct MemberTypeCatalog {
+    functions: HashMap<String, TypeRef>,
+    methods: HashMap<(String, String), TypeRef>,
+    properties: HashMap<(String, String), TypeRef>,
 }
 
 struct FlowCatalog {
     mutations: MutationCatalog,
     nullability: NullabilityCatalog,
-    member_classes: MemberClassCatalog,
+    member_types: MemberTypeCatalog,
 }
 
 impl FlowCatalog {
@@ -154,27 +156,34 @@ impl FlowCatalog {
         Self {
             mutations: MutationCatalog::from_program(program),
             nullability: NullabilityCatalog::from_program(program),
-            member_classes: MemberClassCatalog::from_program(program),
+            member_types: MemberTypeCatalog::from_program(program),
         }
     }
 }
 
-impl MemberClassCatalog {
+impl MemberTypeCatalog {
     fn from_program(program: &Program) -> Self {
         let mut catalog = Self::default();
         for item in &program.items {
+            if let Item::Function(function) = item {
+                if let Some(return_type) = &function.return_type {
+                    catalog
+                        .functions
+                        .insert(function.name.clone(), return_type.clone());
+                }
+            }
             let Item::Class(class) = item else {
                 continue;
             };
+            let self_type = TypeRef::named(&class.name);
             for member in &class.members {
                 match member {
                     crate::ast::ClassMember::Method(method) => {
                         if let Some(return_type) = &method.return_type {
-                            if let Some(result) = class_name_in(return_type, &class.name) {
-                                catalog
-                                    .methods
-                                    .insert((class.name.clone(), method.name.clone()), result);
-                            }
+                            catalog.methods.insert(
+                                (class.name.clone(), method.name.clone()),
+                                return_type.resolve_self_in(&self_type),
+                            );
                         }
                         if method.name == "__construct" {
                             for parameter in method
@@ -182,21 +191,18 @@ impl MemberClassCatalog {
                                 .iter()
                                 .filter(|parameter| parameter.constructor_role.is_promoted())
                             {
-                                if let Some(result) = class_name_in(&parameter.ty, &class.name) {
-                                    catalog.properties.insert(
-                                        (class.name.clone(), parameter.name.clone()),
-                                        result,
-                                    );
-                                }
+                                catalog.properties.insert(
+                                    (class.name.clone(), parameter.name.clone()),
+                                    parameter.ty.resolve_self_in(&self_type),
+                                );
                             }
                         }
                     }
                     crate::ast::ClassMember::Property(property) => {
-                        if let Some(result) = class_name_in(&property.ty, &class.name) {
-                            catalog
-                                .properties
-                                .insert((class.name.clone(), property.name.clone()), result);
-                        }
+                        catalog.properties.insert(
+                            (class.name.clone(), property.name.clone()),
+                            property.ty.resolve_self_in(&self_type),
+                        );
                     }
                     crate::ast::ClassMember::Constant(_) | crate::ast::ClassMember::Uses(_) => {}
                 }
@@ -204,16 +210,6 @@ impl MemberClassCatalog {
         }
         catalog
     }
-}
-
-fn class_name_in(ty: &TypeRef, declaring_class: &str) -> Option<String> {
-    ty.as_class_name().map(|name| {
-        if name == "self" {
-            declaring_class.to_string()
-        } else {
-            name.to_string()
-        }
-    })
 }
 
 impl NullabilityCatalog {
@@ -287,6 +283,14 @@ impl NullabilityCatalog {
     }
 
     fn method_is_non_null(&self, method: &str) -> Option<bool> {
+        // An unresolved receiver may be a compiler-known wrapper. Its operation
+        // cannot inherit a guarantee from unrelated user methods with that name.
+        if SharedHandleKind::ALL
+            .into_iter()
+            .any(|kind| kind.method_result(method).is_some())
+        {
+            return None;
+        }
         self.methods.get(method).copied()
     }
 
@@ -297,13 +301,18 @@ impl NullabilityCatalog {
         resolution: &Resolution,
         state: &State,
     ) -> Option<bool> {
-        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
-            return self
-                .qualified_methods
-                .get(&(class, method.to_string()))
-                .copied();
+        match expression_member_type(object, resolution, Some(state)) {
+            Some(ty) => match method_owner(&ty, method) {
+                MemberOwner::Declared(class) => self
+                    .qualified_methods
+                    .get(&(class, method.to_string()))
+                    .copied(),
+                // Intrinsic flow facts remain conservative. User declarations
+                // must never supply facts for a compiler-owned operation.
+                MemberOwner::CompilerKnown => None,
+            },
+            None => self.method_is_non_null(method),
         }
-        self.method_is_non_null(method)
     }
 
     fn static_method_is_non_null(
@@ -323,6 +332,12 @@ impl NullabilityCatalog {
     }
 
     fn property_is_non_null(&self, property: &str) -> Option<bool> {
+        if SharedHandleKind::ALL
+            .into_iter()
+            .any(|kind| kind.projects_payload_property(property))
+        {
+            return None;
+        }
         self.properties.get(property).copied()
     }
 
@@ -333,13 +348,16 @@ impl NullabilityCatalog {
         resolution: &Resolution,
         state: &State,
     ) -> Option<bool> {
-        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
-            return self
-                .qualified_properties
-                .get(&(class, property.to_string()))
-                .copied();
+        match expression_member_type(object, resolution, Some(state)) {
+            Some(ty) => match property_owner(&ty, property) {
+                MemberOwner::Declared(class) => self
+                    .qualified_properties
+                    .get(&(class, property.to_string()))
+                    .copied(),
+                MemberOwner::CompilerKnown => None,
+            },
+            None => self.property_is_non_null(property),
         }
-        self.property_is_non_null(property)
     }
 
     fn static_property_is_non_null(
@@ -457,10 +475,15 @@ impl MutationCatalog {
         resolution: &Resolution,
         state: &State,
     ) -> Option<&ParamModes> {
-        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
-            return self.qualified_methods.get(&(class, method.to_string()));
+        match expression_member_type(object, resolution, Some(state)) {
+            Some(ty) => match method_owner(&ty, method) {
+                MemberOwner::Declared(class) => {
+                    self.qualified_methods.get(&(class, method.to_string()))
+                }
+                MemberOwner::CompilerKnown => None,
+            },
+            None => self.method_modes(method),
         }
-        self.method_modes(method)
     }
 
     fn static_method_modes(
@@ -573,19 +596,36 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
 
     for item in &program.items {
         match item {
-            Item::Function(function) => analyze_function(function, None, &mut facts, &catalog),
+            Item::Function(function) => {
+                analyze_function(function, None, None, &mut facts, &catalog)
+            }
             Item::Class(class) => {
                 for member in &class.members {
-                    if let crate::ast::ClassMember::Method(method) = member {
-                        analyze_function(method, Some(class), &mut facts, &catalog);
+                    for callable in member_callables(member, PropertyHookContext::Class) {
+                        analyze_function(
+                            &callable,
+                            Some(&class.name),
+                            (callable.name == "__construct").then_some(class),
+                            &mut facts,
+                            &catalog,
+                        );
                     }
                 }
             }
-            Item::Enum(_)
-            | Item::Interface(_)
-            | Item::Trait(_)
-            | Item::Constant(_)
-            | Item::Statement(_) => {}
+            Item::Trait(declaration) => {
+                for member in &declaration.members {
+                    for callable in member_callables(member, PropertyHookContext::Trait) {
+                        analyze_function(
+                            &callable,
+                            Some(&declaration.name),
+                            None,
+                            &mut facts,
+                            &catalog,
+                        );
+                    }
+                }
+            }
+            Item::Enum(_) | Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
         }
     }
     facts
@@ -614,7 +654,8 @@ fn statement_span(statement: &Stmt) -> Span {
 
 fn analyze_function(
     function: &FunctionDecl,
-    current_class: Option<&crate::ast::ClassDecl>,
+    current_class: Option<&str>,
+    constructor_class: Option<&crate::ast::ClassDecl>,
     facts: &mut FactsByUse,
     catalog: &FlowCatalog,
 ) {
@@ -625,8 +666,8 @@ fn analyze_function(
         body,
         &function.params,
         function.span,
-        current_class.map(|class| class.name.as_str()),
-        current_class.filter(|_| function.name == "__construct"),
+        current_class,
+        constructor_class,
         facts,
         catalog,
     );
@@ -647,7 +688,7 @@ fn analyze_body(
         current_class,
         constructor_class,
         &catalog.nullability,
-        &catalog.member_classes,
+        &catalog.member_types,
     );
     analyze_resolved_body(body, span, &resolution, facts, catalog);
     for (closure_body, closure_span) in &resolution.closure_bodies {
@@ -2018,48 +2059,136 @@ fn apply_match_pattern_fact(
     }
 }
 
-fn expression_class_name(
+enum MemberOwner {
+    Declared(String),
+    CompilerKnown,
+}
+
+fn shared_member_type(ty: &TypeRef) -> Option<(SharedHandleKind, &TypeRef)> {
+    let kind = SharedHandleKind::from_source_name(&ty.name)?;
+    Some((kind, ty.type_arguments().next()?))
+}
+
+fn method_owner(ty: &TypeRef, method: &str) -> MemberOwner {
+    if let Some((kind, payload)) = shared_member_type(ty) {
+        if kind.method_result(method).is_some() || !kind.forwards_payload() {
+            return MemberOwner::CompilerKnown;
+        }
+        return method_owner(payload, method);
+    }
+    MemberOwner::Declared(ty.name.clone())
+}
+
+fn property_owner(ty: &TypeRef, property: &str) -> MemberOwner {
+    if let Some((kind, payload)) = shared_member_type(ty) {
+        if kind.projects_payload_property(property) || !kind.forwards_payload() {
+            return MemberOwner::CompilerKnown;
+        }
+        return property_owner(payload, property);
+    }
+    MemberOwner::Declared(ty.name.clone())
+}
+
+/// Preserve the receiver's type identity separately from its nullability fact.
+/// In particular, a shared construction owns a wrapper, not its payload class.
+fn expression_member_type(
     expr: &Expr,
     resolution: &Resolution,
     state: Option<&State>,
-) -> Option<String> {
+) -> Option<TypeRef> {
     match ungroup(expr) {
-        Expr::New { class_type, .. } => Some(class_type.name.clone()),
-        Expr::This { .. } => resolution.current_class.clone(),
+        Expr::New {
+            class_type,
+            shared,
+            args,
+            ..
+        } => {
+            if *shared {
+                return Some(TypeRef::generic(
+                    SharedHandleKind::SharedReference.source_name(),
+                    vec![class_type.clone()],
+                ));
+            }
+            if SharedHandleKind::from_source_name(&class_type.name)
+                .is_some_and(SharedHandleKind::is_directly_constructible)
+                && class_type.type_argument_count() == 0
+            {
+                let payload = expression_member_type(&args.first()?.value, resolution, state)?;
+                return Some(TypeRef::generic(&class_type.name, vec![payload]));
+            }
+            Some(class_type.clone())
+        }
+        Expr::This { .. } => resolution.current_class.as_ref().map(TypeRef::named),
         Expr::Variable { .. } => {
             let binding = variable_binding(expr, resolution)?;
             if let Some(ty) = state
                 .and_then(|state| state.facts.get(&binding))
                 .and_then(Fact::tested_type)
             {
-                return class_name_in(ty, resolution.current_class.as_deref().unwrap_or(&ty.name));
+                return Some(ty.resolve_self_in(&TypeRef::named(
+                    resolution.current_class.as_deref().unwrap_or(&ty.name),
+                )));
             }
-            resolution.declaration_classes.get(&binding).cloned()
+            resolution.declaration_member_types.get(&binding).cloned()
         }
+        Expr::FunctionCall { name, .. } => resolution.member_types.functions.get(name).cloned(),
         Expr::PropertyAccess {
-            object, property, ..
+            object,
+            property,
+            null_safe,
+            ..
         } => {
-            let class = expression_class_name(object, resolution, state)?;
-            resolution
-                .member_classes
+            let receiver = expression_member_type(object, resolution, state)?;
+            if let Some((kind, payload)) = shared_member_type(&receiver) {
+                if kind.projects_payload_property(property) {
+                    let mut result = payload.clone();
+                    result.nullable |= *null_safe;
+                    return Some(result);
+                }
+            }
+            let MemberOwner::Declared(class) = property_owner(&receiver, property) else {
+                return None;
+            };
+            let mut result = resolution
+                .member_types
                 .properties
                 .get(&(class, property.clone()))
-                .cloned()
+                .cloned()?;
+            result.nullable |= *null_safe;
+            Some(result)
         }
-        Expr::MethodCall { object, method, .. } => {
-            let class = expression_class_name(object, resolution, state)?;
-            resolution
-                .member_classes
+        Expr::MethodCall {
+            object,
+            method,
+            null_safe,
+            ..
+        } => {
+            let receiver = expression_member_type(object, resolution, state)?;
+            if let Some((kind, payload)) = shared_member_type(&receiver) {
+                if let Some((result_kind, nullable)) = kind.method_result(method) {
+                    let mut result =
+                        TypeRef::generic(result_kind.source_name(), vec![payload.clone()]);
+                    result.nullable = nullable || *null_safe;
+                    return Some(result);
+                }
+            }
+            let MemberOwner::Declared(class) = method_owner(&receiver, method) else {
+                return None;
+            };
+            let mut result = resolution
+                .member_types
                 .methods
                 .get(&(class, method.clone()))
-                .cloned()
+                .cloned()?;
+            result.nullable |= *null_safe;
+            Some(result)
         }
         Expr::StaticMember {
             qualifier, member, ..
         } => {
             let class = static_qualifier_class_name(qualifier, resolution)?;
             resolution
-                .member_classes
+                .member_types
                 .properties
                 .get(&(class, member.clone()))
                 .cloned()
@@ -2069,7 +2198,7 @@ fn expression_class_name(
         } => {
             let class = static_qualifier_class_name(qualifier, resolution)?;
             resolution
-                .member_classes
+                .member_types
                 .methods
                 .get(&(class, method.clone()))
                 .cloned()
@@ -2129,7 +2258,7 @@ impl Resolver {
         current_class: Option<&str>,
         constructor_class: Option<&crate::ast::ClassDecl>,
         nullability: &NullabilityCatalog,
-        member_classes: &MemberClassCatalog,
+        member_types: &MemberTypeCatalog,
     ) -> Resolution {
         let mut resolver = Self {
             next_binding: 0,
@@ -2137,7 +2266,7 @@ impl Resolver {
             resolution: Resolution {
                 current_class: current_class.map(str::to_string),
                 nullability: nullability.clone(),
-                member_classes: member_classes.clone(),
+                member_types: member_types.clone(),
                 ..Resolution::default()
             },
         };
@@ -2200,15 +2329,11 @@ impl Resolver {
         let id = BindingId(self.next_binding);
         self.next_binding += 1;
         if let Some(ty) = ty.as_ref() {
-            let class_name = if ty.name == "self" {
-                self.resolution
-                    .current_class
-                    .clone()
-                    .unwrap_or_else(|| ty.name.clone())
-            } else {
-                ty.name.clone()
-            };
-            self.resolution.declaration_classes.insert(id, class_name);
+            let self_type =
+                TypeRef::named(self.resolution.current_class.as_deref().unwrap_or(&ty.name));
+            self.resolution
+                .declaration_member_types
+                .insert(id, ty.resolve_self_in(&self_type));
         }
         self.resolution.declaration_types.insert(id, ty);
         id
@@ -2231,7 +2356,7 @@ impl Resolver {
             Stmt::Block(block) => self.resolve_block(block),
             Stmt::VarDecl(declaration) => {
                 self.resolve_expr(&declaration.initializer);
-                let inferred_class = self.resolved_expr_class(&declaration.initializer);
+                let inferred_member_type = self.resolved_member_type(&declaration.initializer);
                 let inferred_callable =
                     inferred_callable_parameter_modes(&declaration.initializer, &self.resolution);
                 for declaration_binding in &declaration.bindings {
@@ -2241,8 +2366,8 @@ impl Resolver {
                         declaration.ty.clone(),
                     );
                     if declaration.ty.is_none() {
-                        if let Some(class) = inferred_class.clone() {
-                            self.resolution.declaration_classes.insert(binding, class);
+                        if let Some(ty) = inferred_member_type.clone() {
+                            self.resolution.declaration_member_types.insert(binding, ty);
                         }
                     }
                     if let Some(modes) = inferred_callable.clone() {
@@ -2328,7 +2453,8 @@ impl Resolver {
                     match initializer {
                         ForInitializer::VarDecl(declaration) => {
                             self.resolve_expr(&declaration.initializer);
-                            let inferred_class = self.resolved_expr_class(&declaration.initializer);
+                            let inferred_member_type =
+                                self.resolved_member_type(&declaration.initializer);
                             let inferred_callable = inferred_callable_parameter_modes(
                                 &declaration.initializer,
                                 &self.resolution,
@@ -2340,8 +2466,10 @@ impl Resolver {
                                     declaration.ty.clone(),
                                 );
                                 if declaration.ty.is_none() {
-                                    if let Some(class) = inferred_class.clone() {
-                                        self.resolution.declaration_classes.insert(binding, class);
+                                    if let Some(ty) = inferred_member_type.clone() {
+                                        self.resolution
+                                            .declaration_member_types
+                                            .insert(binding, ty);
                                     }
                                 }
                                 if let Some(modes) = inferred_callable.clone() {
@@ -2468,7 +2596,10 @@ impl Resolver {
                                         .get(&binding)
                                         .cloned()
                                         .flatten(),
-                                    self.resolution.declaration_classes.get(&binding).cloned(),
+                                    self.resolution
+                                        .declaration_member_types
+                                        .get(&binding)
+                                        .cloned(),
                                     self.resolution
                                         .declaration_callable_modes
                                         .get(&binding)
@@ -2479,10 +2610,12 @@ impl Resolver {
                     .collect::<Vec<_>>();
 
                 self.scopes.push(HashMap::new());
-                for (name, span_start, ty, class, callable_modes) in captured {
+                for (name, span_start, ty, member_type, callable_modes) in captured {
                     let binding = self.declare(&name, span_start, ty);
-                    if let Some(class) = class {
-                        self.resolution.declaration_classes.insert(binding, class);
+                    if let Some(member_type) = member_type {
+                        self.resolution
+                            .declaration_member_types
+                            .insert(binding, member_type);
                     }
                     if let Some(modes) = callable_modes {
                         self.resolution
@@ -2614,14 +2747,43 @@ impl Resolver {
         }
     }
 
-    fn resolved_expr_class(&self, expr: &Expr) -> Option<String> {
-        expression_class_name(expr, &self.resolution, None)
+    fn resolved_member_type(&self, expr: &Expr) -> Option<TypeRef> {
+        expression_member_type(expr, &self.resolution, None)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_shared_member_names_do_not_inherit_user_nullability_guarantees() {
+        let program = crate::parse_source(
+            "shared-member-flow-owner.doria",
+            r#"
+class Payload
+{
+    string $referencedValue = "payload";
+    string $label = "label";
+    function share(): string { return "payload share"; }
+    function describe(): string { return "description"; }
+}
+"#,
+        )
+        .expect("member declarations should parse");
+        let catalog = NullabilityCatalog::from_program(&program);
+        assert_eq!(catalog.property_is_non_null("referencedValue"), None);
+        assert_eq!(catalog.method_is_non_null("share"), None);
+        assert_eq!(catalog.property_is_non_null("label"), Some(true));
+        assert_eq!(catalog.method_is_non_null("describe"), Some(true));
+        assert_eq!(
+            catalog
+                .qualified_properties
+                .get(&("Payload".into(), "referencedValue".into())),
+            Some(&true),
+            "the resolved payload declaration retains its own guarantee",
+        );
+    }
 
     #[test]
     fn ordinary_constructor_parameters_do_not_become_property_type_facts() {
@@ -2647,12 +2809,12 @@ class Owner
         };
         constructor.params[0].constructor_role = crate::ast::ConstructorParameterRole::Ordinary;
 
-        let catalog = MemberClassCatalog::from_program(&program);
+        let catalog = MemberTypeCatalog::from_program(&program);
         assert_eq!(
             catalog
                 .properties
                 .get(&("Owner".to_string(), "item".to_string()))
-                .map(String::as_str),
+                .map(|ty| ty.name.as_str()),
             Some("Right")
         );
     }

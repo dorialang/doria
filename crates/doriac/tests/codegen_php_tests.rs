@@ -39,6 +39,91 @@ fn php_function_name(name: &str) -> String {
     format!("__DoriaFunction_{encoded}")
 }
 
+fn php_type_name(name: &str) -> String {
+    let encoded = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("__DoriaType_{encoded}")
+}
+
+#[test]
+fn php_backend_isolates_nominal_types_from_host_names_and_case_folding() {
+    let source = r#"
+open class Parent {
+    open string $label = "parent" { get => $this->label; }
+}
+class Child extends Parent {
+    override string $label = "child" { get => $this->label; }
+}
+class Exception { function __construct(string $label) {} }
+class DateTime { function __construct(string $label) {} }
+class Label { function __construct(string $text) {} }
+class LABEL { function __construct(string $text) {} }
+enum Match { case Ready; }
+enum MATCH { case Waiting; }
+enum Switch { case Value(string $text); }
+class Key implements Comparable<Key>, Cloneable {
+    function __construct(string $text) {}
+    function compare(Key $other): Ordering {
+        if ($this->text < $other->text) { return Ordering::Less; }
+        if ($this->text > $other->text) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+    function clone(): self { return new Key($this->text); }
+}
+function order<T implements Comparable<T>>(T $left, T $right): Ordering {
+    return $left->compare($right);
+}
+function label(Parent $value): string { return $value->label; }
+function main(): void {
+    let $child = new Child();
+    let $exception = new Exception("exception");
+    let $date = new DateTime("date");
+    let $first = new Label("first");
+    let $second = new LABEL("second");
+    let $state = Match::Ready;
+    let $other = MATCH::Waiting;
+    let $payload = Switch::Value("payload");
+    echo "{label($child)} {$exception->label} {$date->label} {$first->text} {$second->text} ";
+    echo match ($state) { Match::Ready => "ready " };
+    echo match ($other) { MATCH::Waiting => "waiting " };
+    echo match ($payload) { Switch::Value($text) => $text };
+    echo " " . (order("a", "b") == Ordering::Less) . " ";
+    SortedSet<Key> $keys = SortedSet::from([new Key("b"), new Key("a")]);
+    foreach ($keys as Key $key) { echo $key->text; }
+    let $identity = fn(Match $value) => $value;
+    let $nullable = fn(?Match $value) => $value;
+    echo " " . ($identity(Match::Ready) == Match::Ready);
+    echo " " . ($nullable(null) == null);
+    echo match (order("a", "b")) {
+        Ordering::Less => " less",
+        Ordering::Equal => " equal",
+        Ordering::Greater => " greater",
+    };
+}
+"#;
+    let php = doriac::compile_source_to_php("host-type-collisions.doria", source).unwrap();
+    assert!(php.contains(&format!("class {}", php_type_name("Parent"))));
+    assert!(php.contains(&format!("extends {}", php_type_name("Parent"))));
+    let script = format!(
+        "{}\n{}();",
+        php.strip_prefix("<?php").unwrap(),
+        php_function_name("main")
+    );
+    let Ok(output) = Command::new("php").args(["-r", &script]).output() else {
+        eprintln!("PHP unavailable; host type-name execution skipped");
+        return;
+    };
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"child exception date first second ready waiting payload true ab true true less"
+    );
+}
+
 #[test]
 fn php_preserves_optimizer_fixture_ownership_and_cleanup() {
     for (name, source, expected) in [
@@ -232,11 +317,11 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("unit and backed enums should lower to PHP native enums");
 
-    assert!(php.contains("enum Status"));
+    assert!(php.contains(&format!("enum {}", php_type_name("Status"))));
     assert!(php.contains("case Draft;"));
-    assert!(php.contains("enum Priority: int"));
+    assert!(php.contains(&format!("enum {}: int", php_type_name("Priority"))));
     assert!(php.contains("case High = 10;"));
-    assert!(php.contains("enum Transport: string"));
+    assert!(php.contains(&format!("enum {}: string", php_type_name("Transport"))));
     assert!(php.contains("case Rail = 'rail';") || php.contains("case Rail = \"rail\";"));
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
@@ -475,8 +560,11 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("payload enum compatibility lowering should compile");
 
-    assert!(php.contains("final class Coordinate implements __DoriaValueEquatable"));
-    assert!(!php.contains("enum Coordinate"));
+    assert!(php.contains(&format!(
+        "final class {} implements __DoriaValueEquatable",
+        php_type_name("Coordinate")
+    )));
+    assert!(!php.contains(&format!("enum {}", php_type_name("Coordinate"))));
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
         return;
@@ -531,7 +619,10 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("nullable Copy payload defaults should lower to PHP");
 
-    assert!(php.contains("Coordinate|array|null $value = []"));
+    assert!(php.contains(&format!(
+        "{}|array|null $value = []",
+        php_type_name("Coordinate")
+    )));
     assert!(php.contains("if ($value === [])"));
     assert!(!php.contains("$value ??="));
 
@@ -581,10 +672,16 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("internal static payload initializers should lower to PHP");
 
-    assert!(php.contains("private static Label $label;"));
+    assert!(php.contains(&format!(
+        "private static {} $label;",
+        php_type_name("Label")
+    )));
     assert!(php.contains("(\\Closure::bind(static function (): void {"));
-    assert!(php.contains("self::$label = Label::Text(\"secret\");"));
-    assert!(!php.contains("Vault::$label ="));
+    assert!(php.contains(&format!(
+        "self::$label = {}::Text(\"secret\");",
+        php_type_name("Label")
+    )));
+    assert!(!php.contains(&format!("{}::$label =", php_type_name("Vault"))));
 
     let script = format!(
         "{}\n__DoriaFunction_6d61696e();",
@@ -2345,7 +2442,11 @@ function main(): void
     )
     .expect("PHP compatibility output should preserve inherited destruction");
 
-    assert!(php.contains("class Child extends Base"));
+    assert!(php.contains(&format!(
+        "class {} extends {}",
+        php_type_name("Child"),
+        php_type_name("Base")
+    )));
     assert!(php.contains("parent::__destruct();"));
     assert!(!php.contains("Reflection"));
     assert!(!php.contains("static::"));
@@ -3017,7 +3118,10 @@ fn php_backend_preserves_the_exact_displayable_contract() {
     .expect("the exact Displayable subset should lower to PHP");
 
     assert!(php.contains("interface __DoriaDisplayable"));
-    assert!(php.contains("class Label implements __DoriaDisplayable"));
+    assert!(php.contains(&format!(
+        "class {} implements __DoriaDisplayable",
+        php_type_name("Label")
+    )));
     assert!(php.contains("public function toString(): string"));
     assert!(php.contains("$value->toString()"));
     assert!(!php.contains("__toString"));
@@ -3106,9 +3210,12 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(php.contains("public static int $initial = 42;"));
     assert!(php.contains("public static string $current = \"ready\";"));
     assert!(php.contains("public static function read(): string"));
-    assert!(php.contains("return Counter::$current;"));
-    assert!(php.contains("Counter::$current = \"done\";"));
-    assert!(php.contains("Counter::LABEL"));
+    assert!(php.contains(&format!("return {}::$current;", php_type_name("Counter"))));
+    assert!(php.contains(&format!(
+        "{}::$current = \"done\";",
+        php_type_name("Counter")
+    )));
+    assert!(php.contains(&format!("{}::LABEL", php_type_name("Counter"))));
 }
 
 #[test]
@@ -3139,7 +3246,7 @@ function main(): void throws Doria\Std\Io\IoError
     assert!(php.contains("public static int $initial = 42;"));
     assert!(php.contains("public static int $value = 43;"));
     assert!(!php.contains("= LATER + 1"));
-    assert!(!php.contains("= Counter::$initial + 1"));
+    assert!(!php.contains(&format!("= {}::$initial + 1", php_type_name("Counter"))));
 
     let script = format!(
         "{}\n__DoriaFunction_6d61696e();",
@@ -3211,7 +3318,10 @@ class Counter
     let php = doriac::compile_source_to_php("static-read-in-property.doria", source)
         .expect("runtime Doria initializers should lower into the PHP constructor");
     assert!(php.contains("public int $value;"));
-    assert!(php.contains("$this->value = Counter::$seed;"));
+    assert!(php.contains(&format!(
+        "$this->value = {}::$seed;",
+        php_type_name("Counter")
+    )));
 }
 
 #[test]
@@ -3228,7 +3338,10 @@ class Factory
     let php = doriac::compile_source_to_php("static-call-in-property.doria", source)
         .expect("runtime Doria initializers should lower into the PHP constructor");
     assert!(php.contains("public int $value;"));
-    assert!(php.contains("$this->value = Factory::seed();"));
+    assert!(php.contains(&format!(
+        "$this->value = {}::seed();",
+        php_type_name("Factory")
+    )));
 }
 
 #[test]
@@ -3248,7 +3361,7 @@ class Counter { int $value = seed(); }
 class Person {}
 class Office { Person $manager = new Person(); }
 "#,
-            "$this->manager = new Person();".to_string(),
+            format!("$this->manager = new {}();", php_type_name("Person")),
         ),
     ];
 
@@ -3312,7 +3425,10 @@ class Config
     )
     .expect("PHP constant expressions remain valid property defaults");
 
-    assert!(php.contains("public array $values = [__DORIA_CONST_SEED, Config::OFFSET];"));
+    assert!(php.contains(&format!(
+        "public array $values = [__DORIA_CONST_SEED, {}::OFFSET];",
+        php_type_name("Config")
+    )));
     assert!(php.contains("public bool $enabled = ((true) && (!(false)));"));
 }
 
@@ -3339,8 +3455,10 @@ class SceneManager
     }
 
     let script = format!(
-        "{}\n$left = new SceneManager(); $right = new SceneManager(); $left->scenes[] = new Scene(); echo count($left->scenes) . ':' . count($right->scenes);",
-        php.strip_prefix("<?php").expect("generated PHP header")
+        "{}\n$left = new {manager}(); $right = new {manager}(); $left->scenes[] = new {scene}(); echo count($left->scenes) . ':' . count($right->scenes);",
+        php.strip_prefix("<?php").expect("generated PHP header"),
+        manager = php_type_name("SceneManager"),
+        scene = php_type_name("Scene"),
     );
     let run = Command::new("php")
         .arg("-d")
@@ -4027,8 +4145,11 @@ function main(): void
 
     assert_eq!(php.matches("parent::__construct(\"typed\");").count(), 1);
     assert!(php.contains("return parent::describe();"));
-    assert!(!php.contains("Base::__construct(\"typed\")"));
-    assert!(!php.contains("Base::describe()"));
+    assert!(!php.contains(&format!(
+        "{}::__construct(\"typed\")",
+        php_type_name("Base")
+    )));
+    assert!(!php.contains(&format!("{}::describe()", php_type_name("Base"))));
 }
 
 #[test]
@@ -4057,7 +4178,11 @@ function main(): void
 "#;
     let php = doriac::compile_source_to_php("constructor-roles.doria", source)
         .expect("constructor roles should compile to PHP");
-    assert!(php.contains("class Child extends Base"));
+    assert!(php.contains(&format!(
+        "class {} extends {}",
+        php_type_name("Child"),
+        php_type_name("Base")
+    )));
     assert!(
         php.contains("public function __construct(string $title, string $raw, string $category)")
     );

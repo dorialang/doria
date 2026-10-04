@@ -1553,8 +1553,156 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_match_binding_plans(function)?;
     validate_control_flow_plans(program, function)?;
     core_value::validate_constructions(function)?;
+    validate_constructor_phase_cleanup(program, function)?;
     validate_class_local_lifetimes(function)?;
     borrowed_views::validate(program, function)
+}
+
+/// Construction progress belongs to the constructor CFG, not the allocated
+/// object. Every entered own phase cleans exactly once when failure escapes;
+/// a failed parent call has already cleaned the phases it entered.
+fn validate_constructor_phase_cleanup(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    let Some(class) = program
+        .classes
+        .iter()
+        .find(|class| class.constructor == Some(function.id))
+    else {
+        return Ok(());
+    };
+    let receiver = *function
+        .params
+        .first()
+        .ok_or_else(|| malformed_mir("constructor phase has no receiver"))?;
+    let parent_constructor = class
+        .parent
+        .map(|parent| class_in(program, parent).map(|class| class.constructor))
+        .transpose()?
+        .flatten();
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Phase {
+        BeforeParent,
+        Own,
+        Cleaned,
+    }
+    let is_parent_call = |callee: mir::FunctionId, args: &[mir::Rvalue]| {
+        parent_constructor == Some(callee)
+            && matches!(args.first(), Some(mir::Rvalue::Class(mir::ClassExpression::Local {
+                local, transfer: false, ..
+            })) if *local == receiver)
+    };
+    let initial = if parent_constructor.is_some() {
+        Phase::BeforeParent
+    } else {
+        Phase::Own
+    };
+    let mut pending = VecDeque::from([(function.entry_block, initial)]);
+    let mut visited = HashSet::new();
+    while let Some((block_id, mut phase)) = pending.pop_front() {
+        if !visited.insert((block_id, phase)) {
+            continue;
+        }
+        let block = block_in(function, block_id)?;
+        for statement in &block.statements {
+            match statement {
+                mir::Statement::CleanupConstructorPhase { .. } => {
+                    if phase != Phase::Own {
+                        return Err(malformed_mir(
+                            "constructor phase cleanup requires an active own phase",
+                        ));
+                    }
+                    phase = Phase::Cleaned;
+                }
+                mir::Statement::CallVoid {
+                    function: callee,
+                    args,
+                    ..
+                } if is_parent_call(*callee, args) => {
+                    if phase != Phase::BeforeParent {
+                        return Err(malformed_mir(
+                            "constructor calls its parent outside the initial parent phase",
+                        ));
+                    }
+                    phase = Phase::Own;
+                }
+                mir::Statement::AssignProperty { object, .. }
+                    if *object == receiver && phase != Phase::Own =>
+                {
+                    return Err(malformed_mir(
+                        "constructor initializes storage outside its active own phase",
+                    ));
+                }
+                _ => {
+                    if phase == Phase::Cleaned
+                        && collect_statement_class_local_accesses(statement)
+                            .iter()
+                            .any(|access| {
+                                matches!(access,
+                                ClassLocalAccess::Borrow(local)
+                                | ClassLocalAccess::PropertyBorrow(local, _)
+                                | ClassLocalAccess::Transfer(local) if local == receiver)
+                            })
+                    {
+                        return Err(malformed_mir(
+                            "constructor uses its receiver after phase cleanup",
+                        ));
+                    }
+                }
+            }
+        }
+        match &block.terminator {
+            mir::Terminator::CheckedCall {
+                function: callee,
+                args,
+                success,
+                failure,
+                ..
+            } if is_parent_call(*callee, args) => {
+                if phase != Phase::BeforeParent {
+                    return Err(malformed_mir(
+                        "constructor calls its parent outside the initial parent phase",
+                    ));
+                }
+                pending.push_back((*success, Phase::Own));
+                pending.push_back((*failure, Phase::Cleaned));
+            }
+            mir::Terminator::PropagateError { .. } if phase == Phase::Own => {
+                return Err(malformed_mir(format!(
+                    "constructor {} propagates failure without constructor phase cleanup",
+                    function.name,
+                )));
+            }
+            mir::Terminator::Return(_) | mir::Terminator::ReturnVoid if phase != Phase::Own => {
+                return Err(malformed_mir(
+                    "constructor succeeds without an intact completed own phase",
+                ));
+            }
+            terminator => {
+                if phase == Phase::Cleaned
+                    && collect_terminator_class_local_accesses(terminator)
+                        .iter()
+                        .any(|access| {
+                            matches!(access,
+                            ClassLocalAccess::Borrow(local)
+                            | ClassLocalAccess::PropertyBorrow(local, _)
+                            | ClassLocalAccess::Transfer(local) if local == receiver)
+                        })
+                {
+                    return Err(malformed_mir(
+                        "constructor uses its receiver after phase cleanup",
+                    ));
+                }
+                pending.extend(
+                    analysis_terminator_targets(terminator, true)
+                        .into_iter()
+                        .map(|target| (target, phase)),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_borrowed_user_locals(
@@ -1778,9 +1926,11 @@ fn validate_statement(
                     "closure environment binding count does not match its layout",
                 ));
             }
+            let invocation_mode = function_type_in(program, closure.function_type)?.invocation_mode;
             for ((field, target), expected) in bindings.iter().zip(&layout.fields) {
                 let local = local_in(function, *target)?;
-                let expected_owned = match expected.storage {
+                let binding = expected.storage.invocation_binding(invocation_mode);
+                let expected_owned = match binding {
                     mir::ClosureEnvironmentStorage::Owned => expected.ty.has_move_ownership(),
                     mir::ClosureEnvironmentStorage::WritableBorrow => {
                         expected.ty.transfers_writable_capture_ownership()
@@ -1791,10 +1941,7 @@ fn validate_statement(
                     || local.ty != expected.ty
                     || local.owned != expected_owned
                     || local.writable
-                        != matches!(
-                            expected.storage,
-                            mir::ClosureEnvironmentStorage::WritableBorrow
-                        )
+                        != matches!(binding, mir::ClosureEnvironmentStorage::WritableBorrow)
                 {
                     return Err(malformed_mir(
                         "closure environment field binding has incompatible type or access",
@@ -1924,17 +2071,14 @@ fn validate_statement(
                     if expression.ty() == expected =>
                 {
                     validate_payload_enum_expression(program, function, expression)?;
-                    validate_payload_enum_assignment_ownership(local, expression.use_mode())
+                    validate_payload_enum_assignment_ownership(local, expression.owned_temporary())
                 }
                 (
                     mir::Type::NullablePayloadEnum(expected),
                     mir::Rvalue::NullablePayloadEnum(expression),
                 ) if expression.ty() == expected => {
                     validate_nullable_payload_enum_expression(program, function, expression)?;
-                    validate_payload_enum_assignment_ownership(
-                        local,
-                        nullable_payload_enum_use_mode(expression),
-                    )
+                    validate_payload_enum_assignment_ownership(local, expression.owned_temporary())
                 }
                 (mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_), _) => {
                     Err(malformed_mir(format!(
@@ -1987,6 +2131,14 @@ fn validate_statement(
                                 "borrowed nullable class local{} receives an owning value",
                                 target.0
                             )));
+                        }
+                        if local.writable {
+                            require_writable_nullable_class_expression(
+                                program,
+                                function,
+                                expression,
+                                &format!("borrowed nullable class local{}", target.0),
+                            )?;
                         }
                         return Ok(());
                     }
@@ -2122,6 +2274,14 @@ fn validate_statement(
                     if expression.class() == expected =>
                 {
                     if !local.owned {
+                        if local.writable {
+                            require_writable_class_expression(
+                                program,
+                                function,
+                                expression,
+                                &format!("borrowed class local{}", target.0),
+                            )?;
+                        }
                         if matches!(
                             expression,
                             mir::ClassExpression::CollectionIndex {
@@ -2476,7 +2636,8 @@ fn validate_statement(
                         | mir::Type::Mixed
                         | mir::Type::NullableMixed
                 )
-            ) || infer_function_return_borrow(program, callee)?.is_none()
+            ) || !function_return_borrow_contract(program, callee)?
+                .is_some_and(|borrow| borrow.kind == mir::ReturnBorrowKind::Value)
             {
                 return Err(malformed_mir(format!(
                     "borrowed call targets function {} without a borrowed move-value return",
@@ -2539,13 +2700,25 @@ fn validate_statement(
                     property.index, object.id.0
                 )));
             }
-            let constructor_receiver = class_in(program, class)?.constructor == Some(function.id)
-                && function.params.first() == Some(&object.id);
+            let constructor_receiver = is_direct_constructor_receiver(program, function, object)?;
             if matches!(kind, mir::PropertyWriteKind::Initialize) && !constructor_receiver {
                 return Err(malformed_mir(format!(
                     "property{} initialization does not target the direct constructor receiver",
                     property.index
                 )));
+            }
+            if matches!(kind, mir::PropertyWriteKind::InitializeOverride) {
+                let inherited = class_in(program, class)?
+                    .parent
+                    .map(|parent| class_in(program, parent))
+                    .transpose()?
+                    .is_some_and(|parent| property.index < parent.properties.len());
+                if !constructor_receiver || !inherited {
+                    return Err(malformed_mir(format!(
+                        "property{} override initialization must target inherited storage on the direct constructor receiver",
+                        property.index
+                    )));
+                }
             }
             if matches!(kind, mir::PropertyWriteKind::InitializeOrReplace)
                 && (!constructor_receiver || !property_definition.writable)
@@ -2633,6 +2806,18 @@ fn validate_statement(
                 )));
             }
             validate_rvalue(program, function, value)
+        }
+        mir::Statement::CleanupConstructorPhase { object, class } => {
+            let receiver = local_in(function, *object)?;
+            if receiver.ty != mir::Type::Class(*class)
+                || receiver.owned
+                || !is_direct_constructor_receiver(program, function, receiver)?
+            {
+                return Err(malformed_mir(
+                    "constructor phase cleanup must target its direct construction receiver",
+                ));
+            }
+            Ok(())
         }
         mir::Statement::DropClass { local, class } => {
             let definition = local_in(function, *local)?;
@@ -3308,6 +3493,45 @@ fn validate_terminator(
             }
             validate_rvalue(program, function, expression)?;
             if validate_return_ownership {
+                let absent = expression.is_null_value();
+                if matches!(
+                    return_type,
+                    mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                ) && !return_borrow_is_compatible(
+                    infer_function_return_borrow(program, function)?,
+                    function.return_borrow,
+                ) {
+                    return Err(malformed_mir(format!(
+                        "function-value return loses its declared borrow provenance in {}: inferred {:?}, declared {:?}",
+                        function.name,
+                        infer_function_return_borrow(program, function)?,
+                        function.return_borrow,
+                    )));
+                }
+                if (matches!(
+                    return_type,
+                    mir::Type::NullableCollection(_)
+                        | mir::Type::PayloadEnum(_)
+                        | mir::Type::NullablePayloadEnum(_)
+                        | mir::Type::NullableMixed
+                ) || crate::native_shared::Expression::from_rvalue(expression).is_some())
+                    && return_type.has_move_ownership()
+                {
+                    let expected = infer_function_return_borrow(program, function)?;
+                    if expected != function.return_borrow {
+                        return Err(malformed_mir(
+                            "move return loses its declared borrow provenance",
+                        ));
+                    }
+                    if !absent {
+                        let actual = infer_rvalue_return_borrow(program, function, expression)?;
+                        if !return_borrow_is_compatible(actual, expected)
+                            || (expected.is_none() && expression.borrows_move_value())
+                        {
+                            return Err(malformed_mir("move return has inconsistent ownership"));
+                        }
+                    }
+                }
                 if matches!(
                     return_type,
                     mir::Type::Interface(_) | mir::Type::NullableInterface(_)
@@ -3318,7 +3542,7 @@ fn validate_terminator(
                             "interface return loses its declared borrow provenance",
                         ));
                     }
-                    if inferred.is_none() && expression.borrows_move_value() {
+                    if !absent && inferred.is_none() && expression.borrows_move_value() {
                         return Err(malformed_mir(
                             "owning interface return receives a borrowed view",
                         ));
@@ -3345,13 +3569,13 @@ fn validate_terminator(
                 {
                     let expected = infer_function_return_borrow(program, function)?;
                     let actual = infer_nullable_expression_return_borrow(program, function, class)?;
-                    if !return_borrow_is_compatible(actual, expected) {
+                    if !absent && !return_borrow_is_compatible(actual, expected) {
                         return Err(malformed_mir(format!(
                             "return from {} has inconsistent nullable class ownership",
                             function.name
                         )));
                     }
-                    if expected.is_none() {
+                    if !absent && expected.is_none() {
                         require_owned_nullable_class_expression(
                             class,
                             &format!("return from {}", function.name),
@@ -3395,9 +3619,11 @@ fn validate_terminator(
                 } else if let (mir::Type::Function(_), mir::Rvalue::Function(value)) =
                     (return_type, expression)
                 {
-                    if function_expression_is_borrowed(value) {
+                    if function_expression_is_borrowed(value)
+                        != return_type.borrows_returned_value(function.return_borrow)
+                    {
                         return Err(malformed_mir(format!(
-                            "return from {} receives a borrowed function carrier",
+                            "return from {} has inconsistent function carrier ownership",
                             function.name
                         )));
                     }
@@ -3406,9 +3632,12 @@ fn validate_terminator(
                     mir::Rvalue::NullableFunction(value),
                 ) = (return_type, expression)
                 {
-                    if nullable_function_expression_is_borrowed(value) {
+                    if !absent
+                        && nullable_function_expression_is_borrowed(value)
+                            != return_type.borrows_returned_value(function.return_borrow)
+                    {
                         return Err(malformed_mir(format!(
-                            "return from {} receives a borrowed nullable function carrier",
+                            "return from {} has inconsistent nullable function carrier ownership",
                             function.name
                         )));
                     }
@@ -3909,11 +4138,7 @@ fn validate_indirect_arguments(
                 ));
             }
             let owned = expected.has_move_ownership()
-                && (definition.return_borrow.is_none()
-                    || matches!(
-                        expected,
-                        mir::Type::Function(_) | mir::Type::NullableFunction(_)
-                    ));
+                && !expected.borrows_returned_value(definition.return_borrow);
             if expected.has_move_ownership() && result.owned != owned {
                 return Err(malformed_mir(
                     "indirect call result ownership disagrees with its returned-borrow contract",
@@ -4422,7 +4647,7 @@ fn validate_function_expression(
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(mir::Type::Function(expected))
-                || *return_borrow != infer_function_return_borrow(program, callee)?
+                || *return_borrow != function_return_borrow_contract(program, callee)?
             {
                 return Err(malformed_mir(
                     "direct call function-value result disagrees with its callee",
@@ -4526,7 +4751,7 @@ fn validate_nullable_function_expression(
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(mir::Type::NullableFunction(expected))
-                || *return_borrow != infer_function_return_borrow(program, callee)?
+                || *return_borrow != function_return_borrow_contract(program, callee)?
             {
                 return Err(malformed_mir(
                     "direct call nullable-function result disagrees with its callee",
@@ -4750,7 +4975,7 @@ fn validate_interface_value(
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(expected)
-                || *return_borrow != infer_function_return_borrow(program, callee)?
+                || *return_borrow != function_return_borrow_contract(program, callee)?
             {
                 return Err(malformed_mir("Error call has an incompatible result"));
             }
@@ -4866,7 +5091,7 @@ fn validate_nullable_interface_value(
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(expected)
-                || *return_borrow != infer_function_return_borrow(program, callee)?
+                || *return_borrow != function_return_borrow_contract(program, callee)?
             {
                 return Err(malformed_mir(
                     "nullable Error call has an incompatible result",
@@ -4919,7 +5144,7 @@ fn validate_nullable_interface_value(
 
 fn validate_payload_enum_assignment_ownership(
     local: &mir::Local,
-    mode: Option<mir::PayloadEnumUseMode>,
+    owned: bool,
 ) -> Result<(), BackendError> {
     let ty = match local.ty {
         mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => ty,
@@ -4929,10 +5154,10 @@ fn validate_payload_enum_assignment_ownership(
             ))
         }
     };
-    if ty.capabilities.needs_drop && matches!(mode, Some(mir::PayloadEnumUseMode::Borrow)) {
-        if local.owned || !local.synthetic {
+    if ty.capabilities.needs_drop && !owned {
+        if local.owned {
             return Err(malformed_mir(format!(
-                "borrowed payload enum requires a non-owning synthetic local, got local{}",
+                "borrowed payload enum requires a non-owning local, got local{}",
                 local.id.0
             )));
         }
@@ -4943,19 +5168,6 @@ fn validate_payload_enum_assignment_ownership(
         )));
     }
     Ok(())
-}
-
-fn nullable_payload_enum_use_mode(
-    expression: &mir::NullablePayloadEnumExpression,
-) -> Option<mir::PayloadEnumUseMode> {
-    match expression {
-        mir::NullablePayloadEnumExpression::Use { mode, .. }
-        | mir::NullablePayloadEnumExpression::CollectionGet { mode, .. }
-        | mir::NullablePayloadEnumExpression::Coalesce { mode, .. } => Some(*mode),
-        mir::NullablePayloadEnumExpression::Null(_)
-        | mir::NullablePayloadEnumExpression::Value(_)
-        | mir::NullablePayloadEnumExpression::Call { .. } => None,
-    }
 }
 
 fn validate_payload_enum_expression(
@@ -5008,12 +5220,18 @@ fn validate_payload_enum_expression(
         mir::PayloadEnumExpression::Call {
             function: callee,
             args,
+            return_borrow,
             ..
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
                 return Err(malformed_mir(
                     "payload enum call targets a function with another return type",
+                ));
+            }
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
+                return Err(malformed_mir(
+                    "payload enum call has inconsistent return ownership",
                 ));
             }
             validate_call_args(program, function, callee, args)
@@ -5063,12 +5281,18 @@ fn validate_nullable_payload_enum_expression(
         mir::NullablePayloadEnumExpression::Call {
             function: callee,
             args,
+            return_borrow,
             ..
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
                 return Err(malformed_mir(
                     "nullable payload enum call targets a function with another return type",
+                ));
+            }
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
+                return Err(malformed_mir(
+                    "nullable payload enum call has inconsistent return ownership",
                 ));
             }
             validate_call_args(program, function, callee, args)
@@ -5211,7 +5435,9 @@ fn validate_payload_enum_place(
                     "payload enum collection element type mismatch",
                 ));
             }
-            if *remove == matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+            if (*remove && matches!(mode, mir::PayloadEnumUseMode::Borrow))
+                || (!*remove && matches!(mode, mir::PayloadEnumUseMode::Move))
+            {
                 return Err(malformed_mir(
                     "payload enum collection transfer mode disagrees with removal",
                 ));
@@ -5243,6 +5469,10 @@ fn validate_shared_reference_expression(
     function: &mir::Function,
     expression: &mir::SharedReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::Strong(expression),
+    )?;
     let class = expression.payload();
     validate_writable_shared_payload(program, class)?;
     match expression {
@@ -5362,6 +5592,7 @@ fn validate_weak_reference_expression(
     function: &mir::Function,
     expression: &mir::WeakReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(program, crate::native_shared::Expression::Weak(expression))?;
     let class = expression.payload();
     validate_writable_shared_payload(program, class)?;
     match expression {
@@ -5477,6 +5708,10 @@ fn validate_nullable_shared_reference_expression(
     function: &mir::Function,
     expression: &mir::NullableSharedReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::NullableStrong(expression),
+    )?;
     let class = expression.payload();
     validate_writable_shared_payload(program, class)?;
     match expression {
@@ -5621,6 +5856,10 @@ fn validate_nullable_weak_reference_expression(
     function: &mir::Function,
     expression: &mir::NullableWeakReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::NullableWeak(expression),
+    )?;
     let class = expression.payload();
     validate_writable_shared_payload(program, class)?;
     match expression {
@@ -5813,6 +6052,10 @@ fn validate_writable_shared_reference_expression(
     function: &mir::Function,
     expression: &mir::WritableSharedReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::WritableStrong(expression),
+    )?;
     let payload = expression.payload();
     validate_writable_shared_payload(program, payload)?;
     match expression {
@@ -5921,6 +6164,10 @@ fn validate_writable_weak_reference_expression(
     function: &mir::Function,
     expression: &mir::WritableWeakReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::WritableWeak(expression),
+    )?;
     let payload = expression.payload();
     validate_writable_shared_payload(program, payload)?;
     match expression {
@@ -6024,6 +6271,10 @@ fn validate_nullable_writable_shared_reference_expression(
     function: &mir::Function,
     expression: &mir::NullableWritableSharedReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::NullableWritableStrong(expression),
+    )?;
     let payload = expression.payload();
     validate_writable_shared_payload(program, payload)?;
     match expression {
@@ -6140,6 +6391,10 @@ fn validate_nullable_writable_weak_reference_expression(
     function: &mir::Function,
     expression: &mir::NullableWritableWeakReferenceExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::NullableWritableWeak(expression),
+    )?;
     let payload = expression.payload();
     validate_writable_shared_payload(program, payload)?;
     match expression {
@@ -6240,6 +6495,10 @@ fn validate_shared_reference_access_expression(
     function: &mir::Function,
     expression: &mir::SharedReferenceAccessExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::Access(expression),
+    )?;
     let payload = expression.payload();
     validate_writable_shared_payload(program, payload)?;
     let access_type = expression.ty();
@@ -6326,6 +6585,10 @@ fn validate_nullable_shared_reference_access_expression(
     function: &mir::Function,
     expression: &mir::NullableSharedReferenceAccessExpression,
 ) -> Result<(), BackendError> {
+    validate_shared_return_ownership(
+        program,
+        crate::native_shared::Expression::NullableAccess(expression),
+    )?;
     let payload = expression.payload();
     validate_writable_shared_payload(program, payload)?;
     let nullable_ty = expression.ty();
@@ -6449,7 +6712,7 @@ fn validate_mixed_expression(
             if callee.return_type != mir::ReturnType::Value(mir::Type::Mixed) {
                 return Err(malformed_mir("mixed call targets a non-mixed function"));
             }
-            if *return_borrow != infer_function_return_borrow(program, callee)? {
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
                 return Err(malformed_mir(format!(
                     "mixed call disagrees with function {} return ownership",
                     callee.name
@@ -6582,7 +6845,7 @@ fn validate_nullable_mixed_expression(
                     "nullable mixed call targets a non-nullable-mixed function",
                 ));
             }
-            if *return_borrow != infer_function_return_borrow(program, callee)? {
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
                 return Err(malformed_mir(format!(
                     "nullable mixed call disagrees with function {} return ownership",
                     callee.name
@@ -6918,7 +7181,7 @@ fn validate_collection_expression(
                     "collection call targets a function with another return type",
                 ));
             }
-            if *return_borrow != infer_function_return_borrow(program, callee)? {
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
                 return Err(malformed_mir(format!(
                     "collection call disagrees with function {} return ownership",
                     callee.name
@@ -6998,7 +7261,7 @@ fn validate_nullable_collection_expression(
                     "nullable collection call targets a function with another return type",
                 ));
             }
-            if *return_borrow != infer_function_return_borrow(program, callee)? {
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
                 return Err(malformed_mir(format!(
                     "nullable collection call disagrees with function {} return ownership",
                     callee.name
@@ -7551,7 +7814,12 @@ fn require_owned_class_expression(
         ))),
         mir::ClassExpression::Local { transfer: true, .. }
         | mir::ClassExpression::Call {
-            return_borrow: None,
+            return_borrow:
+                None
+                | Some(mir::ReturnBorrow {
+                    kind: mir::ReturnBorrowKind::Retained,
+                    ..
+                }),
             ..
         }
         | mir::ClassExpression::New { .. }
@@ -7569,7 +7837,11 @@ fn require_owned_class_expression(
             property.index
         ))),
         mir::ClassExpression::Call {
-            return_borrow: Some(_),
+            return_borrow:
+                Some(mir::ReturnBorrow {
+                    kind: mir::ReturnBorrowKind::Value,
+                    ..
+                }),
             ..
         } => Err(malformed_mir(format!(
             "{destination} receives a borrowed class call result"
@@ -7630,11 +7902,21 @@ fn require_owned_nullable_class_expression(
             "{destination} receives a borrowed nullable shared-reference payload"
         ))),
         mir::NullableClassExpression::Call {
-            return_borrow: None,
+            return_borrow:
+                None
+                | Some(mir::ReturnBorrow {
+                    kind: mir::ReturnBorrowKind::Retained,
+                    ..
+                }),
             ..
         }
         | mir::NullableClassExpression::NullSafeCall {
-            return_borrow: None,
+            return_borrow:
+                None
+                | Some(mir::ReturnBorrow {
+                    kind: mir::ReturnBorrowKind::Retained,
+                    ..
+                }),
             ..
         }
         | mir::NullableClassExpression::Local { transfer: true, .. } => Ok(()),
@@ -7654,11 +7936,19 @@ fn require_owned_nullable_class_expression(
             )))
         }
         mir::NullableClassExpression::Call {
-            return_borrow: Some(_),
+            return_borrow:
+                Some(mir::ReturnBorrow {
+                    kind: mir::ReturnBorrowKind::Value,
+                    ..
+                }),
             ..
         }
         | mir::NullableClassExpression::NullSafeCall {
-            return_borrow: Some(_),
+            return_borrow:
+                Some(mir::ReturnBorrow {
+                    kind: mir::ReturnBorrowKind::Value,
+                    ..
+                }),
             ..
         } => Err(malformed_mir(format!(
             "{destination} receives a borrowed nullable class call result"
@@ -7692,6 +7982,20 @@ fn require_owned_nullable_class_expression(
     }
 }
 
+fn function_return_borrow_contract(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    let actual = infer_function_return_borrow(program, function)?;
+    if !return_borrow_is_compatible(actual, function.return_borrow) {
+        return Err(malformed_mir(format!(
+            "function-value return loses its declared borrow provenance in {}: inferred {:?}, declared {:?}",
+            function.name, actual, function.return_borrow,
+        )));
+    }
+    Ok(function.return_borrow)
+}
+
 fn infer_function_return_borrow(
     program: &mir::Program,
     function: &mir::Function,
@@ -7699,6 +8003,11 @@ fn infer_function_return_borrow(
     let mut inferred: Option<Option<mir::ReturnBorrow>> = None;
     let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
     for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+        if let mir::Terminator::Return(value) = &block.terminator {
+            if value.is_null_value() {
+                continue;
+            }
+        }
         let candidate = match &block.terminator {
             mir::Terminator::Return(mir::Rvalue::Interface(expression)) => Some(
                 infer_interface_return_borrow(program, function, &expression.value)?,
@@ -7726,6 +8035,21 @@ fn infer_function_return_borrow(
             mir::Terminator::Return(mir::Rvalue::Collection(expression)) => Some(
                 infer_collection_expression_return_borrow(program, function, expression)?,
             ),
+            mir::Terminator::Return(mir::Rvalue::NullableCollection(
+                mir::NullableCollectionExpression::Null(_),
+            )) => None,
+            mir::Terminator::Return(mir::Rvalue::NullableCollection(expression)) => Some(
+                infer_nullable_collection_return_borrow(program, function, expression)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::PayloadEnum(expression)) => Some(
+                infer_payload_enum_return_borrow(program, function, expression)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::NullablePayloadEnum(
+                mir::NullablePayloadEnumExpression::Null(_),
+            )) => None,
+            mir::Terminator::Return(mir::Rvalue::NullablePayloadEnum(expression)) => Some(
+                infer_nullable_payload_enum_return_borrow(program, function, expression)?,
+            ),
             mir::Terminator::Return(mir::Rvalue::Mixed(expression)) => Some(
                 infer_mixed_expression_return_borrow(program, function, expression)?,
             ),
@@ -7744,6 +8068,15 @@ fn infer_function_return_borrow(
             mir::Terminator::Return(mir::Rvalue::NullableFunction(expression)) => Some(
                 infer_nullable_function_expression_return_borrow(program, function, expression)?,
             ),
+            mir::Terminator::Return(value)
+                if crate::native_shared::Expression::from_rvalue(value).is_some() =>
+            {
+                if value.is_null_value() {
+                    None
+                } else {
+                    Some(infer_rvalue_return_borrow(program, function, value)?)
+                }
+            }
             _ => continue,
         };
         let Some(candidate) = candidate else {
@@ -7751,8 +8084,18 @@ fn infer_function_return_borrow(
         };
         match (inferred.as_mut(), candidate) {
             (None, candidate) => inferred = Some(candidate),
-            (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
-                existing.writable &= candidate.writable;
+            (Some(Some(existing)), Some(candidate))
+                if existing.source == candidate.source && existing.kind == candidate.kind =>
+            {
+                existing.writable = existing
+                    .kind
+                    .join_writable(existing.writable, candidate.writable);
+            }
+            (Some(Some(existing)), None) if existing.kind == mir::ReturnBorrowKind::Retained => {}
+            (Some(existing @ None), Some(candidate))
+                if candidate.kind == mir::ReturnBorrowKind::Retained =>
+            {
+                *existing = Some(candidate);
             }
             (Some(None), None) => {}
             _ => {
@@ -7775,13 +8118,38 @@ fn infer_function_expression_return_borrow(
         mir::FunctionExpression::Create { captures, .. } => {
             let mut inferred = None;
             for capture in captures {
+                if let mir::ClosureCaptureOperand::MoveValue(value)
+                | mir::ClosureCaptureOperand::CopyValue(value) = capture
+                {
+                    if matches!(
+                        value.ty(),
+                        mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                    ) {
+                        if let Some(mut candidate) =
+                            infer_rvalue_return_borrow(program, function, value)?
+                        {
+                            candidate.kind = mir::ReturnBorrowKind::Retained;
+                            merge_function_value_borrow(
+                                &mut inferred,
+                                Some(candidate),
+                                "closure construction",
+                            )?;
+                        }
+                    }
+                    continue;
+                }
                 let mir::ClosureCaptureOperand::BorrowLocal { local, writable } = capture else {
                     continue;
                 };
                 let candidate =
                     infer_local_return_borrow(program, function, *local)?.map(|borrow| {
                         mir::ReturnBorrow {
-                            writable: borrow.writable && *writable,
+                            kind: mir::ReturnBorrowKind::Retained,
+                            writable: mir::ReturnBorrowKind::Retained.compose_writable(
+                                borrow.kind,
+                                borrow.writable,
+                                *writable,
+                            ),
                             ..borrow
                         }
                     });
@@ -7864,6 +8232,9 @@ fn infer_function_local_return_borrow(
         local: mir::LocalId,
         visiting: &mut HashSet<mir::LocalId>,
     ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+        if let Some(borrow) = borrow_from_parameter(function, local) {
+            return Ok(Some(borrow));
+        }
         if !visiting.insert(local) {
             return Err(malformed_mir(format!(
                 "function-value local{} has a recursive assignment",
@@ -7889,7 +8260,7 @@ fn infer_function_local_return_borrow(
                     }
                     mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Null {
                         ..
-                    }) => None,
+                    }) => continue,
                     mir::Rvalue::NullableFunction(expression) => {
                         infer_nullable_function_expression_return_borrow(
                             program, function, expression,
@@ -7897,6 +8268,15 @@ fn infer_function_local_return_borrow(
                     }
                     _ => continue,
                 };
+                merge_function_value_borrow(
+                    &mut inferred,
+                    candidate,
+                    &format!("function-value local{}", local.0),
+                )?;
+            }
+            if let Some(candidate) =
+                infer_terminator_result_borrow(program, function, &block.terminator, local)?
+            {
                 merge_function_value_borrow(
                     &mut inferred,
                     candidate,
@@ -7918,13 +8298,21 @@ fn merge_function_value_borrow(
 ) -> Result<(), BackendError> {
     match (*inferred, candidate) {
         (None, candidate) => *inferred = Some(candidate),
-        (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
+        (Some(Some(existing)), Some(candidate))
+            if existing.source == candidate.source && existing.kind == candidate.kind =>
+        {
             *inferred = Some(Some(mir::ReturnBorrow {
-                writable: existing.writable && candidate.writable,
+                writable: existing
+                    .kind
+                    .join_writable(existing.writable, candidate.writable),
                 ..existing
             }));
         }
         (Some(None), None) => {}
+        (Some(Some(existing)), None) if existing.kind == mir::ReturnBorrowKind::Retained => {}
+        (Some(None), Some(candidate)) if candidate.kind == mir::ReturnBorrowKind::Retained => {
+            *inferred = Some(Some(candidate));
+        }
         _ => {
             return Err(malformed_mir(format!(
                 "{source} mixes owned and borrow-bound function values"
@@ -7988,7 +8376,12 @@ fn infer_nullable_expression_return_borrow(
                     return infer_nullable_expression_return_borrow(program, function, object).map(
                         |borrow| {
                             borrow.map(|borrow| mir::ReturnBorrow {
-                                writable: borrow.writable && return_borrow.writable,
+                                kind: return_borrow.kind,
+                                writable: return_borrow.kind.compose_writable(
+                                    borrow.kind,
+                                    borrow.writable,
+                                    return_borrow.writable,
+                                ),
                                 ..borrow
                             })
                         },
@@ -8003,7 +8396,12 @@ fn infer_nullable_expression_return_borrow(
             };
             infer_rvalue_return_borrow(program, function, source).map(|borrow| {
                 borrow.map(|borrow| mir::ReturnBorrow {
-                    writable: borrow.writable && return_borrow.writable,
+                    kind: return_borrow.kind,
+                    writable: return_borrow.kind.compose_writable(
+                        borrow.kind,
+                        borrow.writable,
+                        return_borrow.writable,
+                    ),
                     ..borrow
                 })
             })
@@ -8066,7 +8464,12 @@ fn infer_borrowed_rvalue_source(
     })?;
     infer_rvalue_return_borrow(program, function, source).map(|borrow| {
         borrow.map(|borrow| mir::ReturnBorrow {
-            writable: borrow.writable && return_borrow.writable,
+            kind: return_borrow.kind,
+            writable: return_borrow.kind.compose_writable(
+                borrow.kind,
+                borrow.writable,
+                return_borrow.writable,
+            ),
             ..borrow
         })
     })
@@ -8077,6 +8480,9 @@ fn infer_rvalue_return_borrow(
     function: &mir::Function,
     source: &mir::Rvalue,
 ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    if let Some(shared) = crate::native_shared::Expression::from_rvalue(source) {
+        return infer_shared_return_borrow(program, function, shared);
+    }
     match source {
         mir::Rvalue::Interface(source) => {
             infer_interface_return_borrow(program, function, &source.value)
@@ -8091,13 +8497,104 @@ fn infer_rvalue_return_borrow(
         mir::Rvalue::Collection(source) => {
             infer_collection_expression_return_borrow(program, function, source)
         }
+        mir::Rvalue::NullableCollection(source) => {
+            infer_nullable_collection_return_borrow(program, function, source)
+        }
+        mir::Rvalue::PayloadEnum(source) => {
+            infer_payload_enum_return_borrow(program, function, source)
+        }
+        mir::Rvalue::NullablePayloadEnum(source) => {
+            infer_nullable_payload_enum_return_borrow(program, function, source)
+        }
         mir::Rvalue::Mixed(source) => {
             infer_mixed_expression_return_borrow(program, function, source)
         }
         mir::Rvalue::NullableMixed(source) => {
             infer_nullable_mixed_expression_return_borrow(program, function, source)
         }
+        mir::Rvalue::Function(source) => {
+            infer_function_expression_return_borrow(program, function, source)
+        }
+        mir::Rvalue::NullableFunction(source) => {
+            infer_nullable_function_expression_return_borrow(program, function, source)
+        }
         _ => Err(malformed_mir("borrowed call source is not a move value")),
+    }
+}
+
+fn validate_shared_return_ownership(
+    program: &mir::Program,
+    value: crate::native_shared::Expression<'_>,
+) -> Result<(), BackendError> {
+    use crate::native_shared::Operation;
+    if let Operation::Call {
+        function,
+        return_borrow,
+        ..
+    } = value.operation()
+    {
+        if return_borrow
+            != function_return_borrow_contract(program, function_in(program, function)?)?
+        {
+            return Err(malformed_mir(
+                "shared call has inconsistent return ownership",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn infer_shared_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: crate::native_shared::Expression<'_>,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    use crate::native_shared::Operation;
+    if value.owned() {
+        return Ok(None);
+    }
+    match value.operation() {
+        Operation::Local { local, .. } => infer_local_return_borrow(program, function, local),
+        Operation::Property { object: local, .. }
+        | Operation::Index {
+            collection: local, ..
+        }
+        | Operation::Get {
+            collection: local, ..
+        } => Ok(
+            infer_local_return_borrow(program, function, local)?.map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
+        Operation::Present(value) => infer_shared_return_borrow(program, function, value),
+        Operation::Call {
+            function: callee,
+            args,
+            return_borrow: Some(borrow),
+        } => infer_borrowed_rvalue_source(program, function, callee, args, borrow),
+        Operation::Coalesce { left, right, .. } => {
+            let left_null = matches!(left.operation(), Operation::Null);
+            let right_null = matches!(right.operation(), Operation::Null);
+            let left = infer_shared_return_borrow(program, function, left)?;
+            let right = infer_shared_return_borrow(program, function, right)?;
+            match (left, right, left_null, right_null) {
+                (Some(borrow), None, _, true) | (None, Some(borrow), true, _) => Ok(Some(borrow)),
+                (Some(mut left), Some(right), _, _) if left.source == right.source => {
+                    left.writable &= right.writable;
+                    Ok(Some(left))
+                }
+                (None, None, _, _) => Ok(None),
+                _ => Err(malformed_mir("shared coalesce mixes return ownership")),
+            }
+        }
+        Operation::New { .. }
+        | Operation::Null
+        | Operation::Runtime { .. }
+        | Operation::Call {
+            return_borrow: None,
+            ..
+        } => Ok(None),
     }
 }
 
@@ -8198,6 +8695,125 @@ fn infer_nullable_interface_return_borrow(
     }
 }
 
+fn infer_payload_enum_place_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    place: &mir::PayloadEnumPlace,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    use mir::PayloadEnumPlace as P;
+    match place {
+        P::Local(local)
+        | P::NullableLocalAssumeNonNull(local)
+        | P::MixedPayload { mixed: local } => infer_local_return_borrow(program, function, *local),
+        P::Property { object: local, .. }
+        | P::CollectionIndex {
+            collection: local, ..
+        } => Ok(
+            infer_local_return_borrow(program, function, *local)?.map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
+        P::Static(_) => Ok(None),
+    }
+}
+
+fn infer_payload_enum_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::PayloadEnumExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    use mir::PayloadEnumExpression as E;
+    match expression {
+        E::Use {
+            place,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => infer_payload_enum_place_return_borrow(program, function, place),
+        E::Call {
+            function: callee,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *borrow),
+        E::Coalesce {
+            left,
+            right,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => {
+            let right_borrow = infer_payload_enum_return_borrow(program, function, right)?;
+            if matches!(**left, mir::NullablePayloadEnumExpression::Null(_)) {
+                return Ok(right_borrow);
+            }
+            let left_borrow = infer_nullable_payload_enum_return_borrow(program, function, left)?;
+            if left_borrow != right_borrow {
+                return Err(malformed_mir(
+                    "payload enum coalesce has incompatible return borrows",
+                ));
+            }
+            Ok(left_borrow)
+        }
+        E::Construct { .. } | E::Use { .. } | E::Call { .. } | E::Coalesce { .. } => Ok(None),
+    }
+}
+
+fn infer_nullable_payload_enum_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullablePayloadEnumExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    use mir::NullablePayloadEnumExpression as E;
+    match expression {
+        E::Value(value) => infer_payload_enum_return_borrow(program, function, value),
+        E::Use {
+            place,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => infer_payload_enum_place_return_borrow(program, function, place),
+        E::Call {
+            function: callee,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *borrow),
+        E::CollectionGet {
+            collection,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => Ok(
+            infer_local_return_borrow(program, function, *collection)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: false,
+                    ..borrow
+                }
+            }),
+        ),
+        E::Coalesce {
+            left,
+            right,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => {
+            let left_borrow = infer_nullable_payload_enum_return_borrow(program, function, left)?;
+            let right_borrow = infer_nullable_payload_enum_return_borrow(program, function, right)?;
+            match (left_borrow, right_borrow) {
+                (left, right) if left == right => Ok(left),
+                (None, right) if matches!(**left, E::Null(_)) => Ok(right),
+                (left, None) if matches!(**right, E::Null(_)) => Ok(left),
+                _ => Err(malformed_mir(
+                    "nullable payload enum coalesce has incompatible return borrows",
+                )),
+            }
+        }
+        E::Null(_)
+        | E::Use { .. }
+        | E::Call { .. }
+        | E::CollectionGet { .. }
+        | E::Coalesce { .. } => Ok(None),
+    }
+}
+
 fn infer_collection_expression_return_borrow(
     program: &mir::Program,
     function: &mir::Function,
@@ -8271,6 +8887,51 @@ fn infer_collection_expression_return_borrow(
             return_borrow: None,
             ..
         } => Ok(None),
+    }
+}
+
+fn infer_nullable_collection_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableCollectionExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    use mir::NullableCollectionExpression as E;
+    match expression {
+        E::Null(_)
+        | E::Local { transfer: true, .. }
+        | E::Call {
+            return_borrow: None,
+            ..
+        } => Ok(None),
+        E::Collection(value) => infer_collection_expression_return_borrow(program, function, value),
+        E::Local {
+            local,
+            transfer: false,
+            ..
+        } => infer_local_return_borrow(program, function, *local),
+        E::Property { object, .. } => Ok(infer_local_return_borrow(program, function, *object)?
+            .map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            })),
+        E::Call {
+            function: callee,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *borrow),
+        E::Coalesce { left, right, .. } => {
+            let left_borrow = infer_nullable_collection_return_borrow(program, function, left)?;
+            let right_borrow = infer_nullable_collection_return_borrow(program, function, right)?;
+            match (left_borrow, right_borrow) {
+                (left, right) if left == right => Ok(left),
+                (None, right) if matches!(**left, E::Null(_)) => Ok(right),
+                (left, None) if matches!(**right, E::Null(_)) => Ok(left),
+                _ => Err(malformed_mir(
+                    "nullable collection coalesce mixes owned and borrowed results",
+                )),
+            }
+        }
     }
 }
 
@@ -8384,8 +9045,13 @@ fn return_borrow_is_compatible(
 ) -> bool {
     match (actual, expected) {
         (Some(actual), Some(expected)) => {
-            actual.source == expected.source && (!expected.writable || actual.writable)
+            actual.source == expected.source
+                && actual.kind == expected.kind
+                && expected
+                    .kind
+                    .accepts_writable(expected.writable, actual.writable)
         }
+        (None, Some(expected)) if expected.kind == mir::ReturnBorrowKind::Retained => true,
         (None, None) => true,
         _ => false,
     }
@@ -8456,17 +9122,7 @@ fn infer_expression_return_borrow(
             args,
             return_borrow: Some(return_borrow),
             ..
-        } => {
-            let source = borrowed_call_source(program, *callee, args, *return_borrow)?;
-            Ok(
-                infer_expression_return_borrow(program, function, source)?.map(|borrow| {
-                    mir::ReturnBorrow {
-                        writable: borrow.writable && return_borrow.writable,
-                        ..borrow
-                    }
-                }),
-            )
-        }
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
         mir::ClassExpression::Local { transfer: true, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { transfer: true, .. }
         | mir::ClassExpression::Call {
@@ -8501,7 +9157,25 @@ fn infer_synthetic_local_return_borrow(
                 continue;
             }
             let (borrow, recursive) = match value {
-                mir::Rvalue::Interface(_) | mir::Rvalue::NullableInterface(_) => {
+                value if crate::native_shared::Expression::from_rvalue(value).is_some() => {
+                    if value.is_null_value() {
+                        continue;
+                    }
+                    if escaping_class_local_borrows(program, value)?.contains(&local) {
+                        return Err(malformed_mir(
+                            "borrowed shared local has a recursive assignment",
+                        ));
+                    }
+                    (infer_rvalue_return_borrow(program, function, value)?, false)
+                }
+                value if value.is_null_value() => continue,
+                mir::Rvalue::Interface(_)
+                | mir::Rvalue::NullableInterface(_)
+                | mir::Rvalue::NullableCollection(_)
+                | mir::Rvalue::PayloadEnum(_)
+                | mir::Rvalue::NullablePayloadEnum(_)
+                | mir::Rvalue::Mixed(_)
+                | mir::Rvalue::NullableMixed(_) => {
                     if escaping_class_local_borrows(program, value)?.contains(&local) {
                         return Err(malformed_mir(format!(
                             "borrowed local{} has a recursive assignment",
@@ -8514,7 +9188,6 @@ fn infer_synthetic_local_return_borrow(
                     infer_expression_return_borrow(program, function, expression)?,
                     class_expression_accesses_local(expression, local),
                 ),
-                mir::Rvalue::NullableClass(mir::NullableClassExpression::Null(_)) => continue,
                 mir::Rvalue::NullableClass(expression) => (
                     infer_nullable_expression_return_borrow(program, function, expression)?,
                     nullable_class_expression_accesses_local(expression, local),
@@ -8542,64 +9215,10 @@ fn infer_synthetic_local_return_borrow(
             }
             merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
         }
-        if let mir::Terminator::CheckedCall {
-            function: callee,
-            args,
-            result: Some(target),
-            ..
-        } = &block.terminator
+        if let Some(borrow) =
+            infer_terminator_result_borrow(program, function, &block.terminator, local)?
         {
-            if *target == local {
-                let callee = function_in(program, *callee)?;
-                let borrow = match infer_function_return_borrow(program, callee)? {
-                    Some(return_borrow) => infer_borrowed_rvalue_source(
-                        program,
-                        function,
-                        callee.id,
-                        args,
-                        return_borrow,
-                    )?,
-                    None => None,
-                };
-                merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
-            }
-        }
-        if let mir::Terminator::IndirectCall {
-            function_type,
-            args,
-            result: Some(target),
-            ..
-        }
-        | mir::Terminator::CheckedIndirectCall {
-            function_type,
-            args,
-            result: Some(target),
-            ..
-        } = &block.terminator
-        {
-            if *target == local {
-                let contract = function_type_in(program, *function_type)?;
-                let borrow = match contract.return_borrow {
-                    Some(return_borrow) => {
-                        let mir::BorrowSource::Parameter(index) = return_borrow.source else {
-                            return Err(malformed_mir(
-                                "indirect returned borrow has no explicit parameter source",
-                            ));
-                        };
-                        let source = args.get(index).ok_or_else(|| {
-                            malformed_mir("indirect returned borrow source is missing")
-                        })?;
-                        infer_rvalue_return_borrow(program, function, source)?.map(|borrow| {
-                            mir::ReturnBorrow {
-                                writable: borrow.writable && return_borrow.writable,
-                                ..borrow
-                            }
-                        })
-                    }
-                    None => None,
-                };
-                merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
-            }
+            merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
         }
     }
     match inferred {
@@ -8612,6 +9231,70 @@ fn infer_synthetic_local_return_borrow(
     }
 }
 
+fn infer_terminator_result_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    terminator: &mir::Terminator,
+    local: mir::LocalId,
+) -> Result<Option<Option<mir::ReturnBorrow>>, BackendError> {
+    let borrow = match terminator {
+        mir::Terminator::CheckedCall {
+            function: callee,
+            args,
+            result: Some(target),
+            ..
+        } if *target == local => {
+            let callee = function_in(program, *callee)?;
+            match function_return_borrow_contract(program, callee)? {
+                Some(borrow) => {
+                    infer_borrowed_rvalue_source(program, function, callee.id, args, borrow)?
+                }
+                None => None,
+            }
+        }
+        mir::Terminator::IndirectCall {
+            function_type,
+            args,
+            result: Some(target),
+            ..
+        }
+        | mir::Terminator::CheckedIndirectCall {
+            function_type,
+            args,
+            result: Some(target),
+            ..
+        } if *target == local => {
+            let contract = function_type_in(program, *function_type)?;
+            match contract.return_borrow {
+                Some(return_borrow) => {
+                    let mir::BorrowSource::Parameter(index) = return_borrow.source else {
+                        return Err(malformed_mir(
+                            "indirect returned borrow has no explicit parameter source",
+                        ));
+                    };
+                    let source = args.get(index).ok_or_else(|| {
+                        malformed_mir("indirect returned borrow source is missing")
+                    })?;
+                    infer_rvalue_return_borrow(program, function, source)?.map(|borrow| {
+                        mir::ReturnBorrow {
+                            kind: return_borrow.kind,
+                            writable: return_borrow.kind.compose_writable(
+                                borrow.kind,
+                                borrow.writable,
+                                return_borrow.writable,
+                            ),
+                            ..borrow
+                        }
+                    })
+                }
+                None => None,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(borrow))
+}
+
 fn merge_synthetic_local_borrow(
     inferred: &mut Option<Option<mir::ReturnBorrow>>,
     candidate: Option<mir::ReturnBorrow>,
@@ -8619,9 +9302,13 @@ fn merge_synthetic_local_borrow(
 ) -> Result<(), BackendError> {
     match (*inferred, candidate) {
         (None, candidate) => *inferred = Some(candidate),
-        (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
+        (Some(Some(existing)), Some(candidate))
+            if existing.source == candidate.source && existing.kind == candidate.kind =>
+        {
             *inferred = Some(Some(mir::ReturnBorrow {
-                writable: existing.writable && candidate.writable,
+                writable: existing
+                    .kind
+                    .join_writable(existing.writable, candidate.writable),
                 ..existing
             }));
         }
@@ -8666,6 +9353,7 @@ fn borrow_from_parameter(
         mir::BorrowSource::Parameter(position - usize::from(has_receiver))
     };
     Some(mir::ReturnBorrow {
+        kind: mir::ReturnBorrowKind::Value,
         source,
         writable: definition.writable,
     })
@@ -8733,9 +9421,8 @@ fn require_writable_interface_value(
         mir::InterfaceValue::CollectionIndex { collection, .. } => {
             local_in(function, *collection)?.writable
         }
-        mir::InterfaceValue::Call { return_borrow, .. } => {
-            return_borrow.is_none_or(|borrow| borrow.writable)
-        }
+        mir::InterfaceValue::Call { return_borrow, .. } => return_borrow
+            .is_none_or(|borrow| borrow.kind == mir::ReturnBorrowKind::Retained || borrow.writable),
     };
     if writable {
         Ok(())
@@ -8781,9 +9468,8 @@ fn require_writable_nullable_interface_value(
             };
             object.writable && property_in(program, class, *property)?.writable
         }
-        mir::NullableInterfaceValue::Call { return_borrow, .. } => {
-            return_borrow.is_none_or(|borrow| borrow.writable)
-        }
+        mir::NullableInterfaceValue::Call { return_borrow, .. } => return_borrow
+            .is_none_or(|borrow| borrow.kind == mir::ReturnBorrowKind::Retained || borrow.writable),
         mir::NullableInterfaceValue::Null
         | mir::NullableInterfaceValue::DictionaryGet { .. }
         | mir::NullableInterfaceValue::CollectionIndex { .. } => false,
@@ -8795,6 +9481,29 @@ fn require_writable_nullable_interface_value(
             "nullable interface view requires a writable source path",
         ))
     }
+}
+
+fn is_direct_constructor_receiver(
+    program: &mir::Program,
+    function: &mir::Function,
+    object: &mir::Local,
+) -> Result<bool, BackendError> {
+    let mir::Type::Class(class) = object.ty else {
+        return Ok(false);
+    };
+    Ok(class_in(program, class)?.constructor == Some(function.id)
+        && function.params.first() == Some(&object.id))
+}
+
+fn property_receiver_allows_writable(
+    program: &mir::Program,
+    function: &mir::Function,
+    object: &mir::Local,
+) -> Result<bool, BackendError> {
+    // Constructor privilege derives access only through a writable child
+    // property; it never makes the receiver itself writable. Property reads
+    // still undergo the independent constructor definite-initialization pass.
+    Ok(object.writable || is_direct_constructor_receiver(program, function, object)?)
 }
 
 fn require_writable_class_expression(
@@ -8830,13 +9539,13 @@ fn require_writable_class_expression(
                     object.id.0
                 )));
             };
-            object.writable && property_in(program, class, *property)?.writable
+            property_receiver_allows_writable(program, function, object)?
+                && property_in(program, class, *property)?.writable
         }
         mir::ClassExpression::Local { transfer: true, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { transfer: true, .. } => false,
-        mir::ClassExpression::Call { return_borrow, .. } => {
-            return_borrow.is_none_or(|borrow| borrow.writable)
-        }
+        mir::ClassExpression::Call { return_borrow, .. } => return_borrow
+            .is_none_or(|borrow| borrow.kind == mir::ReturnBorrowKind::Retained || borrow.writable),
         mir::ClassExpression::New { .. } => true,
         mir::ClassExpression::Coalesce { left, right, .. } => {
             require_writable_nullable_class_expression(program, function, left, destination)
@@ -8889,12 +9598,12 @@ fn require_writable_nullable_class_expression(
                     object.id.0
                 )));
             };
-            object.writable && property_in(program, class, *property)?.writable
+            property_receiver_allows_writable(program, function, object)?
+                && property_in(program, class, *property)?.writable
         }
         mir::NullableClassExpression::Call { return_borrow, .. }
-        | mir::NullableClassExpression::NullSafeCall { return_borrow, .. } => {
-            return_borrow.is_none_or(|borrow| borrow.writable)
-        }
+        | mir::NullableClassExpression::NullSafeCall { return_borrow, .. } => return_borrow
+            .is_none_or(|borrow| borrow.kind == mir::ReturnBorrowKind::Retained || borrow.writable),
         mir::NullableClassExpression::Coalesce { left, right, .. } => {
             require_writable_nullable_class_expression(program, function, left, destination)
                 .and_then(|()| {
@@ -9566,7 +10275,7 @@ fn collect_shared_handle_local_accesses<'a>(
             }
         }
         O::Property { object, property } => accesses.borrow_property(object, property),
-        O::Call { function, args } => {
+        O::Call { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(function, args);
@@ -10657,6 +11366,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::CollectionClear { collection, .. } => {
             accesses.resource_reads.push(*collection)
         }
+        mir::Statement::CleanupConstructorPhase { object, .. } => accesses.borrow(*object),
         mir::Statement::EnsureErrorOrigin { error, .. } => accesses.borrow(*error),
         mir::Statement::ExtractErrorObject { error, .. } => accesses.transfer(*error),
         mir::Statement::WriteStreamBytes { contents, .. } => {
@@ -10852,7 +11562,8 @@ fn apply_class_local_state(
         mir::Statement::ExtractErrorObject { target, .. } => {
             moved.remove(target);
         }
-        mir::Statement::DropClass { local, .. }
+        mir::Statement::CleanupConstructorPhase { object: local, .. }
+        | mir::Statement::DropClass { local, .. }
         | mir::Statement::DropError { local }
         | mir::Statement::DropSharedReference { local, .. }
         | mir::Statement::DropWeakReference { local, .. }
@@ -13929,7 +14640,8 @@ fn apply_nullable_presence_statement(
                 }
             }
         }
-        mir::Statement::DropClass { local, .. }
+        mir::Statement::CleanupConstructorPhase { object: local, .. }
+        | mir::Statement::DropClass { local, .. }
         | mir::Statement::DropCollection { local, .. }
         | mir::Statement::DropError { local } => {
             present.remove(local);
@@ -14005,7 +14717,8 @@ fn apply_class_refinement_statement(
         mir::Statement::AssignLocalGroup { targets, .. } => {
             refinements.retain(|(local, _)| !targets.contains(local));
         }
-        mir::Statement::DropClass { local, .. }
+        mir::Statement::CleanupConstructorPhase { object: local, .. }
+        | mir::Statement::DropClass { local, .. }
         | mir::Statement::DropError { local }
         | mir::Statement::DropMixed { local } => {
             refinements.retain(|(source, _)| source != local);
@@ -14846,7 +15559,7 @@ fn validate_class_expression(
                     class.0, actual.0
                 )));
             }
-            let expected_return_borrow = infer_function_return_borrow(program, callee)?;
+            let expected_return_borrow = function_return_borrow_contract(program, callee)?;
             if *return_borrow != expected_return_borrow {
                 return Err(malformed_mir(format!(
                     "class#{} call disagrees with function {} return ownership",
@@ -15169,6 +15882,7 @@ fn validate_constructor_body_initializer(
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum State {
         Uninitialized,
+        ParentInitialized,
         Initialized,
         MaybeInitialized,
     }
@@ -15241,9 +15955,17 @@ fn validate_constructor_body_initializer(
         }
     }
     impl State {
+        fn is_initialized(self) -> bool {
+            matches!(self, Self::ParentInitialized | Self::Initialized)
+        }
+
         fn join(self, incoming: Self) -> Self {
             if self == incoming {
                 self
+            } else if self.is_initialized() && incoming.is_initialized() {
+                // A path which already replaced the inherited value cannot
+                // perform the declaration initializer again after the join.
+                Self::Initialized
             } else {
                 Self::MaybeInitialized
             }
@@ -15270,7 +15992,14 @@ fn validate_constructor_body_initializer(
                     "constructor {} initializes property{} more than once on one path",
                     constructor.name, property.index
                 ))),
-                (mir::PropertyWriteKind::Replace, Self::Initialized) if writable => {
+                (mir::PropertyWriteKind::InitializeOverride, Self::ParentInitialized) => {
+                    Ok(Self::Initialized)
+                }
+                (mir::PropertyWriteKind::InitializeOverride, _) => Err(malformed_mir(format!(
+                    "constructor {} override-initializes property{} without one completed parent phase or more than once",
+                    constructor.name, property.index
+                ))),
+                (mir::PropertyWriteKind::Replace, Self::Initialized | Self::ParentInitialized) if writable => {
                     Ok(Self::Initialized)
                 }
                 (mir::PropertyWriteKind::Replace, _) => Err(malformed_mir(format!(
@@ -15310,7 +16039,7 @@ fn validate_constructor_body_initializer(
             if statement_parent_constructor_call(program, constructor, statement) {
                 if inherited {
                     state = PropertyState {
-                        initialization: State::Initialized,
+                        initialization: State::ParentInitialized,
                         presence: Presence::Unknown,
                     };
                 }
@@ -15351,7 +16080,7 @@ fn validate_constructor_body_initializer(
                     successor,
                 ) {
                 PropertyState {
-                    initialization: State::Initialized,
+                    initialization: State::ParentInitialized,
                     presence: Presence::Unknown,
                 }
             } else {
@@ -15389,13 +16118,13 @@ fn validate_constructor_body_initializer(
             if statement_parent_constructor_call(program, constructor, statement) {
                 if inherited {
                     state = PropertyState {
-                        initialization: State::Initialized,
+                        initialization: State::ParentInitialized,
                         presence: Presence::Unknown,
                     };
                 }
                 continue;
             }
-            if state.initialization != State::Initialized
+            if !state.initialization.is_initialized()
                 && statement_observes_property(statement, receiver, property)
             {
                 return Err(malformed_mir(format!(
@@ -15439,7 +16168,7 @@ fn validate_constructor_body_initializer(
                 constructor.name, property.index
             )));
         }
-        if state.initialization != State::Initialized
+        if !state.initialization.is_initialized()
             && !parent_constructor_terminator
             && terminator_observes_property(&block.terminator, receiver, property)
         {
@@ -15448,7 +16177,7 @@ fn validate_constructor_body_initializer(
                 constructor.name, property.index
             )));
         }
-        if state.initialization != State::Initialized
+        if !state.initialization.is_initialized()
             && matches!(
                 block.terminator,
                 mir::Terminator::Return(_) | mir::Terminator::ReturnVoid
@@ -15773,6 +16502,9 @@ fn statement_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match statement {
+        // Failed-phase cleanup conditionally drops initialized slots; it does
+        // not expose an uninitialized field or run this phase's destructor.
+        mir::Statement::CleanupConstructorPhase { .. } => false,
         mir::Statement::CoreCollection { .. } => false,
         mir::Statement::AdvanceCollectionIterator { .. } => false,
         mir::Statement::AssignLocal { value, .. }
@@ -17610,10 +18342,104 @@ fn escaping_class_local_borrows(
         mir::Rvalue::NullableCollection(value) => {
             escaping_nullable_collection_local_borrows(program, value)
         }
+        mir::Rvalue::PayloadEnum(value) => escaping_payload_enum_local_borrows(program, value),
+        mir::Rvalue::NullablePayloadEnum(value) => {
+            escaping_nullable_payload_enum_local_borrows(program, value)
+        }
         _ => match crate::native_shared::Expression::from_rvalue(argument) {
             Some(value) => escaping_shared_local_borrows(program, value),
             None => Ok(Vec::new()),
         },
+    }
+}
+
+fn escaping_payload_enum_place_borrows(place: &mir::PayloadEnumPlace) -> Vec<mir::LocalId> {
+    use mir::PayloadEnumPlace as P;
+    match place {
+        P::Local(local)
+        | P::NullableLocalAssumeNonNull(local)
+        | P::MixedPayload { mixed: local }
+        | P::Property { object: local, .. }
+        | P::CollectionIndex {
+            collection: local, ..
+        } => vec![*local],
+        P::Static(_) => Vec::new(),
+    }
+}
+
+fn escaping_payload_enum_local_borrows(
+    program: &mir::Program,
+    value: &mir::PayloadEnumExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    use mir::PayloadEnumExpression as E;
+    match value {
+        E::Use {
+            place,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => Ok(escaping_payload_enum_place_borrows(place)),
+        E::Call {
+            function,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+        ),
+        E::Coalesce {
+            left,
+            right,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => {
+            let mut borrows = escaping_nullable_payload_enum_local_borrows(program, left)?;
+            borrows.extend(escaping_payload_enum_local_borrows(program, right)?);
+            Ok(borrows)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn escaping_nullable_payload_enum_local_borrows(
+    program: &mir::Program,
+    value: &mir::NullablePayloadEnumExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    use mir::NullablePayloadEnumExpression as E;
+    match value {
+        E::Value(value) => escaping_payload_enum_local_borrows(program, value),
+        E::Use {
+            place,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => Ok(escaping_payload_enum_place_borrows(place)),
+        E::Call {
+            function,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+        ),
+        E::CollectionGet {
+            collection,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => Ok(vec![*collection]),
+        E::Coalesce {
+            left,
+            right,
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        } => {
+            let mut borrows = escaping_nullable_payload_enum_local_borrows(program, left)?;
+            borrows.extend(escaping_nullable_payload_enum_local_borrows(
+                program, right,
+            )?);
+            Ok(borrows)
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -17711,7 +18537,11 @@ fn escaping_shared_local_borrows(
             collection: local, ..
         } => Ok(vec![local]),
         Operation::Present(value) => escaping_shared_local_borrows(program, value),
-        Operation::Call { function, args } => match function_in(program, function)?.return_borrow {
+        Operation::Call {
+            function,
+            args,
+            return_borrow,
+        } => match return_borrow {
             Some(borrow) => escaping_class_local_borrows(
                 program,
                 borrowed_call_rvalue_source(program, function, args, borrow)?,
@@ -17919,9 +18749,9 @@ fn escaping_class_expression_local_borrows(
             args,
             return_borrow: Some(return_borrow),
             ..
-        } => escaping_class_expression_local_borrows(
+        } => escaping_class_local_borrows(
             program,
-            borrowed_call_source(program, *function, args, *return_borrow)?,
+            borrowed_call_rvalue_source(program, *function, args, *return_borrow)?,
         ),
         mir::ClassExpression::Coalesce {
             left,
@@ -18034,23 +18864,6 @@ fn extend_unique_locals(target: &mut Vec<mir::LocalId>, incoming: Vec<mir::Local
     }
 }
 
-fn borrowed_call_source<'a>(
-    program: &mir::Program,
-    function: mir::FunctionId,
-    args: &'a [mir::Rvalue],
-    return_borrow: mir::ReturnBorrow,
-) -> Result<&'a mir::ClassExpression, BackendError> {
-    let source = borrowed_call_rvalue_source(program, function, args, return_borrow)?;
-    let mir::Rvalue::Class(source) = source else {
-        let callee = function_in(program, function)?;
-        return Err(malformed_mir(format!(
-            "borrowed class call to {} has no class source argument",
-            callee.name
-        )));
-    };
-    Ok(source)
-}
-
 fn borrowed_call_rvalue_source<'a>(
     program: &mir::Program,
     function: mir::FunctionId,
@@ -18064,7 +18877,7 @@ fn borrowed_call_rvalue_source<'a>(
     };
     args.get(index).ok_or_else(|| {
         malformed_mir(format!(
-            "borrowed class call to {} has no class source argument",
+            "borrowed call to {} has no source argument",
             callee.name
         ))
     })
@@ -19106,7 +19919,7 @@ fn validate_nullable_class_expression(
                     "nullable class call returns an unrelated class type",
                 ));
             }
-            if *return_borrow != infer_function_return_borrow(program, callee)? {
+            if *return_borrow != function_return_borrow_contract(program, callee)? {
                 return Err(malformed_mir(
                     "nullable class call has inconsistent ownership",
                 ));
@@ -19136,7 +19949,7 @@ fn validate_nullable_class_expression(
             ..
         } => {
             let callee_definition = function_in(program, *callee)?;
-            if *return_borrow != infer_function_return_borrow(program, callee_definition)? {
+            if *return_borrow != function_return_borrow_contract(program, callee_definition)? {
                 return Err(malformed_mir(
                     "null-safe class call has inconsistent ownership",
                 ));
@@ -19286,7 +20099,8 @@ fn validate_null_safe_statement_call(
     let discards_borrow = matches!(
         callee.return_type,
         mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
-    ) && infer_function_return_borrow(program, callee)?.is_some();
+    ) && function_return_borrow_contract(program, callee)?
+        .is_some_and(|borrow| borrow.kind == mir::ReturnBorrowKind::Value);
     if method.class != object.class()
         || (!matches!(callee.return_type, mir::ReturnType::Void) && !discards_borrow)
     {

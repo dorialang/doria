@@ -385,6 +385,84 @@ function invalid(int $left, int $right): function(): int
 }
 
 #[test]
+fn inline_owned_closure_arguments_acquire_move_captures_once() {
+    for invocation in [
+        "consume(fn() with (take $value) => $value->number);",
+        "let $store = new Store(fn() with (take $value) => $value->number);",
+        "Store::consume(fn() with (take $value) => $value->number);",
+        "let $receiver = new Receiver(); $receiver->consume(fn() with (take $value) => $value->number);",
+        "let $callee = fn(take function(): int $callback) => $callback(); $callee(fn() with (take $value) => $value->number);",
+    ] {
+        let source = format!(
+            "class Value {{ int $number = 42; }}
+             class Store {{
+                 function __construct(take function(): int $callback) {{}}
+                 static function consume(take function(): int $callback): void {{}}
+             }}
+             class Receiver {{ function consume(take function(): int $callback): void {{}} }}
+             function consume(take function(): int $callback): void {{}}
+             function main(): void {{ let $value = new Value(); {invocation} }}"
+        );
+        let analysis = analyze(&source);
+        assert!(
+            language_errors(&analysis.diagnostics).is_empty(),
+            "{invocation}: {:#?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
+fn returned_closures_follow_borrowed_child_roots_without_extending_owned_lifetimes() {
+    let declarations = r#"
+class Child {
+    int $value = 42;
+    function make(): function(): int { return fn() with ($this) => $this->value; }
+}
+class Holder {
+    Child $child = new Child();
+    function childRef(): Child { return $this->child; }
+}
+"#;
+    for expression in ["$holder->child", "$holder->childRef()"] {
+        for (parameters, setup, accepted) in [
+            ("Holder $holder", "", true),
+            ("take Holder $holder", "", false),
+            ("", "let $holder = new Holder();", false),
+        ] {
+            for via_alias in [false, true] {
+                let body = if via_alias {
+                    format!("let $view = {expression}; return $view->make();")
+                } else {
+                    format!("return {expression}->make();")
+                };
+                let source = format!(
+                    "{declarations}
+                     function capture({parameters}): function(): int {{ {setup} {body} }}"
+                );
+                let analysis = analyze(&source);
+                if via_alias && expression == "$holder->child" {
+                    diagnostic(&analysis.diagnostics, "E0472");
+                } else if accepted {
+                    assert!(
+                        language_errors(&analysis.diagnostics).is_empty(),
+                        "{source}\n{:#?}",
+                        analysis.diagnostics
+                    );
+                } else {
+                    diagnostic(&analysis.diagnostics, "E0658");
+                }
+            }
+        }
+    }
+    let temporary = analyze(&format!(
+        "{declarations}
+         function capture(): function(): int {{ return (new Holder())->child->make(); }}"
+    ));
+    diagnostic(&temporary.diagnostics, "E0658");
+}
+
+#[test]
 fn returned_closure_locals_preserve_borrow_provenance_through_move_chains() {
     let analysis = analyze(
         r#"

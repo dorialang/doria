@@ -1,0 +1,59 @@
+open class Reader
+{
+    function __construct(int $value) {}
+
+    open function make(): function(): int
+    {
+        return fn() with ($this) => $this->value;
+    }
+
+    function __destruct()
+    {
+        try { echo "drop{$this->value}\n"; } catch (Error) {}
+    }
+}
+
+class Source extends Reader
+{
+    function __construct(int $initial) { parent::__construct($initial); }
+
+    override function make(): function(): int
+    {
+        return fn() with ($this) => $this->value;
+    }
+}
+
+function maybeSource(bool $present): ?Source
+{
+    if ($present) { return new Source(41); }
+    return null;
+}
+
+function maybeReader(bool $present): ?Reader
+{
+    if ($present) { return new Source(42); }
+    return null;
+}
+
+function forward(?Reader $reader): ?function(): int
+{
+    return $reader?->make();
+}
+
+function main(): void
+{
+    let $source = maybeSource(true);
+    let $direct = $source?->make();
+    if ($direct != null) { echo "{$direct()} "; }
+    let $reader = maybeReader(true);
+    let $virtual = $reader?->make();
+    if ($virtual != null) { echo "{$virtual()} "; }
+    let $forwarded = forward($reader);
+    if ($forwarded != null) { echo "{$forwarded()}\n"; }
+    let $absentSource = maybeSource(false);
+    let $missingDirect = $absentSource?->make();
+    if ($missingDirect == null) { echo "no source;"; }
+    let $absentReader = maybeReader(false);
+    let $missingForwarded = forward($absentReader);
+    if ($missingForwarded == null) { echo "no reader;\n"; }
+}

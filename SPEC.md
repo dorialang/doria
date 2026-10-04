@@ -673,7 +673,25 @@ class ParserLimits
 
 Constants are immutable and evaluated before MIR. Declaration order does not affect meaning: forward references are resolved through a dependency graph, while cycles report the dependency chain. The bounded evaluator accepts supported primitive literals, other constants, grouping, typed arithmetic/bitwise/comparison/boolean/string operations, and accepted explicit numeric conversions. Overflow and invalid constant operations are compile-time errors. Function or method calls, constructors, runtime/static-property reads from constants, mutation, I/O, environment access, allocation with observable identity, loops, and arbitrary compile-time execution are rejected.
 
-Property hooks are planned later for validation and computed properties, but they are not part of the current implementation.
+Decision 0135 accepts property hooks with automatic backing storage, computed
+values, explicitly writable setters and getters, and interface/trait/override
+integration. Direct same-property `$this` access inside a hook uses its backing
+field; outside access invokes the accessor. Declaration initializers fill
+backing storage without calling the setter; purely computed hooks have no slot.
+An overriding backed hook reuses its inherited field. Parent-then-child
+declaration initializers each run once per object. The child replaces the
+inherited value after successfully evaluating its initializer, then destroys
+the old owned value; a failed initializer leaves the old value for ordinary
+failed-construction cleanup. An override without an initializer keeps the
+inherited value. A setter's explicitly
+declared input type must exactly match the property's resolved type.
+`borrowed get` declares a borrowed result; plain interface `get` requires an
+owned result for a Move type. Concrete bodies retain returned-borrow inference
+and must satisfy declared contracts. `writable borrowed get` combines writable
+receiver access with a borrowed result; these are separate permissions.
+A plain interface getter may return a newly owned callback borrowing `$this`;
+the callback owns its environment but cannot outlive the receiver. Returning an
+existing stored callback through `borrowed get` lends that environment instead.
 
 ### API surface naming
 
@@ -704,9 +722,9 @@ let $status = $message->status(); // avoid
 
 A noun method such as `body()` can be misread as an action, preparation step, mutation, or builder-style operation. If the member represents data, expose it as a property.
 
-Property hooks are the planned escape hatch when a property-shaped API needs validation, computed behavior, lazy decoding, caching, normalization, or guarded access. The public member should remain property-shaped when it is conceptually a value.
+Property hooks are the escape hatch when a property-shaped API needs validation, computed behavior, lazy decoding, caching, normalization, or guarded access. The public member should remain property-shaped when it is conceptually a value.
 
-Use methods for actions, commands, mutation, I/O, async work, fallible operations, and behavior with meaningful work:
+Use methods for actions, commands, mutation, I/O, async work, and behavior with meaningful work:
 
 ```doria
 await $message->acknowledge();
@@ -715,6 +733,13 @@ $report->renderPdf();
 ```
 
 If a data-returning operation must be a method because it performs I/O, expensive work, decoding, or another explicit operation, use an unmistakable verb such as `loadBody()`, `decodeBody()`, `findById()`, or `fetchProfile()`.
+
+Fallibility alone does not require a method. The accepted Stage 36 property-hook
+direction permits checked `throws` and side effects, but not blocking or async
+work in v1.0. Property-shaped access does not promise purity; complete accessor
+contracts remain owned by Stage 36.
+Potentially blocking output is included, and the restriction applies through
+helpers and callable dispatch as well as direct operations.
 
 See `docs/api-design-guidelines.md` for the detailed design notes.
 
@@ -1447,10 +1472,11 @@ transport.
 
 Checked propagation performs deterministic cleanup through the existing
 structured finalizer regions, but never rolls back completed side effects. A
-failed construction runs no class `__destruct`; initialized owned fields drop in
-reverse order, uninitialized fields are ignored, allocation is freed, and the
-error continues. Fatal panic remains separate, non-catchable, cleanup-free, and
-status 101.
+failed construction phase runs no `__destruct` for that incomplete class;
+initialized owned fields drop in reverse initialization order, followed by
+completed ancestor phases in reverse construction order. Uninitialized fields
+are ignored, the one allocation is freed once, and the error continues. Fatal
+panic remains separate, non-catchable, cleanup-free, and status 101.
 
 Stage 29 implements grammar, semantic checking, AST/HIR,
 ownership, the two-word erased carrier, hidden first-throw origin storage,
@@ -1589,10 +1615,12 @@ exact requirement compatibility, and two-word erased values. Requirements are
 external bodyless instance methods terminated by `;`; they may be generic, may
 use readonly or writable receivers, preserve parameter ownership and names, and
 declare checked Errors. Parameter defaults, `internal`, `open`, `override`,
-static members, constructors, destructors, constants, properties, and method
-bodies are not interface requirements. User interfaces remain method-only;
-`Error` retains its narrow compiler-known readonly stored `string $message`
-exception so Stage 35 does not decide Stage 36 property hooks.
+static members, constructors, destructors, constants, and method bodies are not
+interface requirements. Stored properties are not user-interface requirements.
+Decision 0135 extends the requirement graph with bodyless getter and setter
+contracts, preserving each accessor's receiver mode, result ownership, exact
+setter input type, and checked Errors. `Error` retains its narrow compiler-known
+readonly stored `string $message` exception.
 
 Classes conform only through authored or inherited `implements`. Interface
 values are `(data pointer, interface vtable pointer)` carriers over the original

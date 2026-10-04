@@ -85,6 +85,21 @@ Distinguish clearly between:
 Do not present a recommendation as though Andrew had already approved it.
 Do not broaden a narrow question into a redesign unless he asks for one.
 
+## Decision Requests Must Be Self-Contained
+
+Whenever Andrew's input is needed, restate each issue, the meaningful choices,
+their practical tradeoffs, and the recommendation in the current reply. Use a
+short numbered summary in plain language, with a small example where useful.
+Do not refer him to questions "above", earlier messages, another chat, or tool
+question cards as a substitute. He must be able to decide from that reply alone.
+This also applies to blocked-status reports and repeated decision requests.
+Keep the summary concise; do not bury the choices in a progress report.
+
+Keep a pending decision visible when reporting stalled work; unrelated monitor
+updates are not progress on the implementation. When Andrew answers, apply the
+ruling and resume. Do not re-request established workflow authorization unless
+the repository, destination, or action is outside its actual approved scope.
+
 ## Codex Prompt Delivery
 
 When Andrew asks for the next Codex prompt:
@@ -121,6 +136,8 @@ Before answering Andrew, verify:
 - Did I answer the literal question?
 - Did I infer a technical knowledge gap he did not state?
 - Did I add a corrective lesson or fundamentals he did not request?
+- If input is needed, does this reply contain the choices, tradeoffs, and
+  recommendations without requiring Andrew to search elsewhere?
 - For a status question, did I keep the answer to landed, missing, and owner?
 - Does any sentence imply that the answer was obvious or that he should already
   have known it?

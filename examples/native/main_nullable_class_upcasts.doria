@@ -1,0 +1,46 @@
+open class Shape
+{
+    open function name(): string { return "shape"; }
+}
+
+class Circle extends Shape
+{
+    override function name(): string { return "circle"; }
+}
+
+class Holder
+{
+    function __construct(take ?Circle $item) {}
+    function getItem(): ?Circle { return $this->item; }
+    function make(): ?Circle { return new Circle(); }
+    static function create(): ?Circle { return new Circle(); }
+}
+
+function make(bool $present): ?Circle
+{
+    if ($present) { return new Circle(); }
+    return null;
+}
+
+function relay(?Circle $item): ?Shape { return $item; }
+function name(?Shape $item): string { return $item?->name() ?? "none"; }
+function makeHolder(bool $present): ?Holder
+{
+    if ($present) { return new Holder(new Circle()); }
+    return null;
+}
+
+function main(): void
+{
+    let $holder = new Holder(new Circle());
+    let $maybeHolder = makeHolder(true);
+    let $absentHolder = makeHolder(false);
+    ?Circle $local = make(true);
+    ?Shape $owned = make(true);
+    let $callback = fn() => make(true);
+    echo name($local) . " " . name(relay($local)) . " " . name($owned) . "\n";
+    echo name($holder->item) . " " . name($holder->getItem()) . "\n";
+    echo name($holder->make()) . " " . name(Holder::create()) . " " . name($callback()) . "\n";
+    echo name($maybeHolder?->item) . " " . name($maybeHolder?->getItem()) . "\n";
+    echo name($absentHolder?->item) . " " . name($absentHolder?->getItem()) . " " . name(make(false)) . "\n";
+}

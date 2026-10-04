@@ -1,0 +1,60 @@
+class Item
+{
+    function __construct(int $number) {}
+}
+
+class Slots
+{
+    ?int $first = 7;
+    ?string $last = "tail";
+    ?Item $peek = new Item(8);
+    ?List<int> $peekFront = [9];
+    ?bool $peekBack = true;
+    int $count = 10;
+    int $length = 11;
+    bool $isEmpty = false;
+
+    function getFirst(): ?int { return $this->first; }
+    function getLast(): ?string { return $this->last; }
+    function getPeek(): ?Item { return $this->peek; }
+    function getFront(): ?List<int> { return $this->peekFront; }
+    function getBack(): ?bool { return $this->peekBack; }
+    function removeAt(int $index): string { return "removed"; }
+    function get(string $key): ?string { return "found"; }
+    function remove(string $key): ?int { return 12; }
+    function pop(): ?bool { return true; }
+    function popFront(): ?float { return 1.5; }
+    function popBack(): ?Item { return $this->peek; }
+    function indexOf(int $value): ?int { return 13; }
+    function contains(int $value): bool { return true; }
+    function clear(): void { echo "cleared\n"; }
+}
+
+function showItem(?Item $item): void
+{
+    if ($item != null) { echo "{$item->number} "; }
+}
+
+function showList(?List<int> $items): void
+{
+    if ($items != null) { echo "{$items[0]} "; }
+}
+
+function main(): void
+{
+    let $slots = new Slots();
+    echo ($slots->getFirst() ?? -1) . " " . ($slots->getLast() ?? "missing") . " ";
+    showItem($slots->getPeek());
+    showList($slots->getFront());
+    echo ($slots->getBack() ?? false) . " {$slots->count} {$slots->length} {$slots->isEmpty}\n";
+    echo $slots->removeAt(0) . " " . ($slots->get("key") ?? "missing") . " ";
+    echo ($slots->remove("key") ?? -1) . " " . ($slots->pop() ?? false) . " ";
+    echo ($slots->popFront() ?? 0.0) . " ";
+    showItem($slots->popBack());
+    echo ($slots->indexOf(0) ?? -1) . " {$slots->contains(0)}\n";
+    $slots->clear();
+
+    List<int> $actual = [14, 15];
+    echo ($actual->first ?? -1) . " " . ($actual->last ?? -1) . " ";
+    echo "{$actual->count} {$actual->isEmpty} {$actual->contains(15)}\n";
+}

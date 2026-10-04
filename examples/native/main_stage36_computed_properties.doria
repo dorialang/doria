@@ -1,0 +1,30 @@
+class Rectangle
+{
+    function __construct(float $width, float $height)
+    {
+    }
+
+    float $area {
+        get => $this->width * $this->height;
+    }
+
+    float $paintLitres {
+        get {
+            let $wallArea = $this->area;
+            let $coats = 2.0;
+            let $coveragePerLitre = 7.0;
+            return $wallArea * $coats / $coveragePerLitre;
+        }
+    }
+}
+
+function main(): void
+{
+    let $rectangle = new Rectangle(6.0, 7.0);
+
+    if ($rectangle->area == 42.0) {
+        echo "area: 42\n";
+    }
+
+    printf("paint: %.1f litres\n", $rectangle->paintLitres);
+}

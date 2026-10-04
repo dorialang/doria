@@ -1,0 +1,50 @@
+class Item
+{
+    function __construct(int $number) {}
+    function __destruct() { try { echo "drop {$this->number}\n"; } catch (Error) {} }
+}
+
+class Store
+{
+    List<Item> $list = [new Item(1)];
+    Item[] $array = [new Item(2)];
+    Dictionary<string, Item> $dictionary = ["key" => new Item(3)];
+
+    function getList(): List<Item> { return $this->list; }
+    function getArray(): Item[] { return $this->array; }
+    function getDictionary(): Dictionary<string, Item> { return $this->dictionary; }
+    function getMaybeList(bool $present): ?List<Item> {
+        let $scratch = new Item(4);
+        if ($present) { return $this->list; }
+        return null;
+    }
+    function getMaybeArray(): ?Item[] { return $this->array; }
+    function getMaybeDictionary(): ?Dictionary<string, Item> { return $this->dictionary; }
+    writable function finish(): void { echo "alive\n"; }
+    function __destruct() { try { echo "drop store\n"; } catch (Error) {} }
+}
+
+function forward(Store $store): List<Item> { return $store->getList(); }
+function identity<T>(T $value): T { return $value; }
+function firstItem(List<Item> $items): Item { return $items[0]; }
+function forwardItem(List<Item> $items): Item { return firstItem($items); }
+
+function main(): void
+{
+    let writable $store = new Store();
+    let $list = forward($store);
+    let $array = $store->getArray();
+    let $dictionary = $store->getDictionary();
+    echo "{$list[0]->number} {$array[0]->number} {$dictionary["key"]->number}\n";
+    echo identity(4) . "\n";
+    let $element = forwardItem($list);
+    echo "element {$element->number}\n";
+    let $maybeList = $store->getMaybeList(true);
+    let $maybeArray = $store->getMaybeArray();
+    let $maybeDictionary = $store->getMaybeDictionary();
+    if ($maybeList != null and $maybeArray != null and $maybeDictionary != null) {
+        echo "nullable {$maybeList[0]->number} {$maybeArray[0]->number} {$maybeDictionary["key"]->number}\n";
+    }
+    if ($store->getMaybeList(false) == null) { echo "no list\n"; }
+    $store->finish();
+}

@@ -6,6 +6,50 @@ use crate::source::{QualifiedNameRef, Span};
 
 pub use crate::numeric::{FloatType, IntegerType};
 
+/// Collection storage families share ingestion rules across effect and ownership analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectionFamily {
+    TypedArray,
+    List,
+    Dictionary,
+    Set,
+    PriorityQueue,
+    Deque,
+    Bytes,
+}
+
+impl CollectionFamily {
+    pub(crate) fn from_resolved(ty: &ResolvedType) -> Option<Self> {
+        match ty {
+            ResolvedType::TypedArray(_) => Some(Self::TypedArray),
+            ResolvedType::List(_) => Some(Self::List),
+            ResolvedType::Dictionary(_, _) | ResolvedType::SortedDictionary(_, _) => {
+                Some(Self::Dictionary)
+            }
+            ResolvedType::Set(_) | ResolvedType::SortedSet(_) => Some(Self::Set),
+            ResolvedType::PriorityQueue(_) => Some(Self::PriorityQueue),
+            ResolvedType::Deque(_) => Some(Self::Deque),
+            ResolvedType::Bytes => Some(Self::Bytes),
+            ResolvedType::Nullable(inner) | ResolvedType::SharedHandle(_, inner) => {
+                Self::from_resolved(inner)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn ingested_arguments(self, method: &str) -> &'static [usize] {
+        match (self, method) {
+            (Self::List, "add")
+            | (Self::Set, "add")
+            | (Self::PriorityQueue, "push")
+            | (Self::Deque, "pushFront" | "pushBack") => &[0],
+            (Self::List, "insertAt") => &[1],
+            (Self::Dictionary, "set") => &[0, 1],
+            _ => &[],
+        }
+    }
+}
+
 /// Preserve compiler-checked nominal kinds when substituting source type syntax.
 pub(crate) fn resolve_nominal_kinds<I>(
     ty: ResolvedType,
@@ -569,9 +613,78 @@ pub struct SemanticFunctionType<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReturnBorrowKind {
+    /// The returned value itself is lent by the source; callers do not own it.
+    Value,
+    /// The returned value is owned, but retains a borrow of the source.
+    Retained,
+}
+
+impl ReturnBorrowKind {
+    /// Branches promise their common value access, but retain every source loan
+    /// that either branch can require.
+    pub const fn join_writable(self, left: bool, right: bool) -> bool {
+        match self {
+            Self::Value => left && right,
+            Self::Retained => left || right,
+        }
+    }
+
+    /// An implementation may provide stronger value access, or require weaker
+    /// retained-source access, than its declared contract.
+    pub const fn accepts_writable(self, required: bool, actual: bool) -> bool {
+        match self {
+            Self::Value => !required || actual,
+            Self::Retained => !actual || required,
+        }
+    }
+
+    /// Compose a callee's returned contract with its source expression. Access
+    /// to a borrowed value may narrow; an already retained source loan cannot
+    /// be weakened by wrapping its owned carrier in another owned result.
+    pub const fn compose_writable(
+        self,
+        source_kind: Self,
+        source_writable: bool,
+        returned_writable: bool,
+    ) -> bool {
+        match (source_kind, self) {
+            (Self::Value, Self::Value) => source_writable && returned_writable,
+            (Self::Retained, Self::Retained) => source_writable || returned_writable,
+            _ => returned_writable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionReturnBorrow {
     pub source: FunctionBorrowSource,
     pub writable: bool,
+    pub kind: ReturnBorrowKind,
+}
+
+#[cfg(test)]
+mod return_borrow_tests {
+    use super::ReturnBorrowKind::{Retained, Value};
+
+    #[test]
+    fn returned_access_and_retained_loan_demand_compose_in_opposite_directions() {
+        for left in [false, true] {
+            for right in [false, true] {
+                assert_eq!(Value.join_writable(left, right), left && right);
+                assert_eq!(Retained.join_writable(left, right), left || right);
+                assert_eq!(Value.accepts_writable(left, right), !left || right);
+                assert_eq!(Retained.accepts_writable(left, right), !right || left);
+                assert_eq!(Value.compose_writable(Value, left, right), left && right);
+                assert_eq!(
+                    Retained.compose_writable(Retained, left, right),
+                    left || right
+                );
+                assert_eq!(Value.compose_writable(Retained, left, right), right);
+                assert_eq!(Retained.compose_writable(Value, left, right), right);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -657,6 +770,32 @@ impl SharedHandleKind {
                 | Self::ReadonlySharedReferenceAccess
                 | Self::WritableSharedReferenceAccess
         )
+    }
+
+    /// Compiler-owned operations take precedence over payload member lookup.
+    /// The result preserves the payload type; the flag denotes a nullable result.
+    pub(crate) fn method_result(self, method: &str) -> Option<(Self, bool)> {
+        use SharedHandleKind::*;
+        let result = match (self, method) {
+            (SharedReference, "share") => (SharedReference, false),
+            (SharedReference, "createWeakReference") => (WeakReference, false),
+            (WritableSharedReference, "share") => (WritableSharedReference, false),
+            (WritableSharedReference, "createWeakReference") => (WritableWeakReference, false),
+            (WritableSharedReference, "acquireReadonlyAccess") => {
+                (ReadonlySharedReferenceAccess, false)
+            }
+            (WritableSharedReference, "acquireWritableAccess") => {
+                (WritableSharedReferenceAccess, false)
+            }
+            (WeakReference, "acquire") => (SharedReference, true),
+            (WritableWeakReference, "acquire") => (WritableSharedReference, true),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    pub(crate) fn projects_payload_property(self, property: &str) -> bool {
+        self == Self::SharedReference && property == "referencedValue"
     }
 
     pub fn family(self) -> SharedFamily {

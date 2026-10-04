@@ -171,7 +171,27 @@ function llvm_commands(string $target): array
         command(['cargo', 'clippy', '-p', 'doriac', '--all-targets', '--features', 'llvm-backend', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '-p', 'doriac', '--lib', '--features', 'llvm-backend', '--locked'], $target),
     ];
-    foreach (['mir_validation_tests', 'llvm_mir_tests', 'cli_tests', 'stage17_io_tests', 'stage18_tests', 'stage35_runtime_tests', 'stage35a_optimizer_tests', 'performance_report_tests', 'native_testing_slice1_tests', 'native_mir_parity_tests'] as $suite) {
+    foreach ([
+        'mir_validation_tests',
+        'llvm_mir_tests',
+        'cli_tests',
+        'constructor_owned_property_tests',
+        'stage17_io_tests',
+        'stage18_tests',
+        'stage21_tests',
+        'stage22_tests',
+        'stage25a_tests',
+        'return_borrow_alias_tests',
+        'returned_closure_transport_tests',
+        'stage35_runtime_tests',
+        'stage35a_optimizer_tests',
+        'stage36_property_hook_tests',
+        'property_hook_initializer_tests',
+        'property_hook_cleanup_effect_tests',
+        'performance_report_tests',
+        'native_testing_slice1_tests',
+        'native_mir_parity_tests',
+    ] as $suite) {
         $commands[] = command(
             ['cargo', 'test', '-p', 'doriac', '--test', $suite, '--features', 'llvm-backend', '--locked'],
             $target,

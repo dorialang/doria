@@ -1,0 +1,28 @@
+packet 1
+drop 6
+drop 5
+nullable 1
+drop 6
+drop 5
+no packet
+shared 2
+closure 3
+mixed 4
+observe 7
+drop 7
+observe 8
+drop 8
+observe packet 9
+drop 9
+observe shared 10
+drop 10
+observe list 11
+observe list 12
+drop 12
+drop 11
+alive
+drop payload store
+drop 4
+drop 3
+drop 2
+drop 1

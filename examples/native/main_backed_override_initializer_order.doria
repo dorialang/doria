@@ -1,0 +1,23 @@
+class Events { static writable string $text = ""; }
+function note(string $event): void { Events::text = Events::text . $event; }
+function mark(string $event, int $value): int { note($event); return $value; }
+class Token {
+    function __construct(string $label) { note("new " . $this->label . ";"); }
+    function __destruct() { note("drop " . $this->label . ";"); }
+}
+
+open class Base {
+    open Token $item = new Token("parent") { borrowed get => $this->item; }
+    function __destruct() { note("base destructor;"); }
+}
+class Child extends Base {
+    override Token $item = new Token("child") { borrowed get => $this->item; }
+    function __destruct() { note("child destructor;"); }
+}
+function main(): void {
+    {
+        let $value = new Child();
+        note("live " . $value->item->label . ";");
+    }
+    echo Events::text . "\n";
+}

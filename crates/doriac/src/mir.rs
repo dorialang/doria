@@ -16,6 +16,7 @@ use crate::names::{PackageIdentity, SourceIdentity};
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::{SourceFile, SourceId, Span};
 use crate::symbols::{BindingId, ClosureId};
+pub use crate::types::ReturnBorrowKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
@@ -726,6 +727,19 @@ pub enum ClosureEnvironmentStorage {
     Owned,
 }
 
+impl ClosureEnvironmentStorage {
+    /// Environment ownership and invocation access are separate: a repeatable
+    /// call borrows an owned capture; only a consuming call transfers it.
+    pub fn invocation_binding(self, invocation_mode: FunctionInvocationMode) -> Self {
+        match (self, invocation_mode) {
+            (Self::Owned, FunctionInvocationMode::Readonly | FunctionInvocationMode::Writable) => {
+                Self::ReadonlyBorrow
+            }
+            _ => self,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClosureCaptureAcquisition {
     ReadonlyBorrow,
@@ -779,6 +793,7 @@ pub enum ReceiverMode {
 pub struct ReturnBorrow {
     pub source: BorrowSource,
     pub writable: bool,
+    pub kind: ReturnBorrowKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -991,6 +1006,18 @@ impl Type {
                 | Self::Function(_)
                 | Self::NullableFunction(_)
         )
+    }
+
+    /// Carrier ownership is independent of a returned value's retained sources.
+    pub const fn borrows_returned_value(self, return_borrow: Option<ReturnBorrow>) -> bool {
+        self.has_move_ownership()
+            && matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            )
     }
 
     /// Writable closure captures of these types temporarily move the source
@@ -1859,7 +1886,12 @@ impl Rvalue {
 
 pub(crate) fn function_expression_is_borrowed(value: &FunctionExpression) -> bool {
     match value {
-        FunctionExpression::Create { .. } | FunctionExpression::Call { .. } => false,
+        FunctionExpression::Create { .. } => false,
+        FunctionExpression::Call {
+            function_type,
+            return_borrow,
+            ..
+        } => Type::Function(*function_type).borrows_returned_value(*return_borrow),
         FunctionExpression::Local { transfer, .. } => !transfer,
         FunctionExpression::Property { .. } => true,
         FunctionExpression::CollectionIndex { remove, .. } => !remove,
@@ -1872,7 +1904,12 @@ pub(crate) fn function_expression_is_borrowed(value: &FunctionExpression) -> boo
 
 pub(crate) fn nullable_function_expression_is_borrowed(value: &NullableFunctionExpression) -> bool {
     match value {
-        NullableFunctionExpression::Null { .. } | NullableFunctionExpression::Call { .. } => false,
+        NullableFunctionExpression::Null { .. } => false,
+        NullableFunctionExpression::Call {
+            function_type,
+            return_borrow,
+            ..
+        } => Type::NullableFunction(*function_type).borrows_returned_value(*return_borrow),
         NullableFunctionExpression::Present(value) => function_expression_is_borrowed(value),
         NullableFunctionExpression::Local { transfer, .. } => !transfer,
         NullableFunctionExpression::Property { .. } => true,
@@ -2039,7 +2076,13 @@ impl InterfaceValue {
             | Self::NullableLocalAssumeNonNull { transfer, .. }
             | Self::Property { transfer, .. } => !transfer,
             Self::CollectionIndex { remove, .. } => !remove,
-            Self::Call { return_borrow, .. } => return_borrow.is_some(),
+            Self::Call { return_borrow, .. } => matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::FromClass { object, .. } => object.borrows_class_value(),
             Self::FromNullableClass { object, .. } => object.borrows_class_value(),
             Self::FromCollection { value, .. } => value.borrows_move_value(),
@@ -2068,7 +2111,13 @@ impl NullableInterfaceValue {
             Self::Null => true,
             Self::Present(value) => value.is_borrowed(),
             Self::Local { transfer, .. } | Self::Property { transfer, .. } => !transfer,
-            Self::Call { return_borrow, .. } => return_borrow.is_some(),
+            Self::Call { return_borrow, .. } => matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::DictionaryGet { access, .. } => !access.removes_element(),
             Self::CollectionIndex { remove, .. } => !remove,
         }
@@ -2119,6 +2168,7 @@ pub enum PayloadEnumExpression {
         ty: PayloadEnumType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
     },
     Coalesce {
         ty: PayloadEnumType,
@@ -2147,7 +2197,14 @@ impl PayloadEnumExpression {
 
     pub const fn owned_temporary(&self) -> bool {
         match self {
-            Self::Construct { .. } | Self::Call { .. } => true,
+            Self::Construct { .. } => true,
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::Use { mode, .. } | Self::Coalesce { mode, .. } => {
                 !matches!(mode, PayloadEnumUseMode::Borrow)
             }
@@ -2168,6 +2225,7 @@ pub enum NullablePayloadEnumExpression {
         ty: PayloadEnumType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
     },
     CollectionGet {
         ty: PayloadEnumType,
@@ -2201,7 +2259,13 @@ impl NullablePayloadEnumExpression {
         match self {
             Self::Null(_) => false,
             Self::Value(value) => value.owned_temporary(),
-            Self::Call { .. } => true,
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::Use { mode, .. }
             | Self::CollectionGet { mode, .. }
             | Self::Coalesce { mode, .. } => !matches!(mode, PayloadEnumUseMode::Borrow),
@@ -2288,7 +2352,13 @@ impl SharedReferenceExpression {
                 }
             }
             Self::Call { return_borrow, .. } => {
-                if return_borrow.is_none() {
+                if !matches!(
+                    return_borrow,
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    })
+                ) {
                     Some(OwnedSharedTemporary::Strong)
                 } else {
                     None
@@ -2380,7 +2450,13 @@ impl WeakReferenceExpression {
                 }
             }
             Self::Call { return_borrow, .. } => {
-                if return_borrow.is_none() {
+                if !matches!(
+                    return_borrow,
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    })
+                ) {
                     Some(OwnedSharedTemporary::Weak)
                 } else {
                     None
@@ -2481,7 +2557,13 @@ impl NullableSharedReferenceExpression {
                 }
             }
             Self::Call { return_borrow, .. } => {
-                if return_borrow.is_none() {
+                if !matches!(
+                    return_borrow,
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    })
+                ) {
                     Some(OwnedSharedTemporary::Strong)
                 } else {
                     None
@@ -2590,7 +2672,13 @@ impl NullableWeakReferenceExpression {
                 }
             }
             Self::Call { return_borrow, .. } => {
-                if return_borrow.is_none() {
+                if !matches!(
+                    return_borrow,
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    })
+                ) {
                     Some(OwnedSharedTemporary::Weak)
                 } else {
                     None
@@ -2690,7 +2778,13 @@ impl WritableSharedReferenceExpression {
             Self::Local { transfer, .. }
             | Self::NullableLocalAssumeNonNull { transfer, .. }
             | Self::Coalesce { transfer, .. } => *transfer,
-            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::CollectionIndex { remove, .. } => *remove,
             Self::Property { .. } => false,
         }
@@ -2759,7 +2853,13 @@ impl WritableWeakReferenceExpression {
             Self::Local { transfer, .. }
             | Self::NullableLocalAssumeNonNull { transfer, .. }
             | Self::Coalesce { transfer, .. } => *transfer,
-            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::CollectionIndex { remove, .. } => *remove,
             Self::Property { .. } => false,
         }
@@ -2833,7 +2933,13 @@ impl NullableWritableSharedReferenceExpression {
         match self {
             Self::Strong(value) => value.owned_temporary(),
             Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => *transfer,
-            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::Acquire { .. } | Self::NullSafeShare { .. } | Self::NullSafeAcquire { .. } => {
                 true
             }
@@ -2900,7 +3006,13 @@ impl NullableWritableWeakReferenceExpression {
         match self {
             Self::Weak(value) => value.owned_temporary(),
             Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => *transfer,
-            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::NullSafeCreate { .. } => true,
             Self::DictionaryGet { access, .. } => access.removes_element(),
             Self::Null(_) | Self::Property { .. } => false,
@@ -3040,7 +3152,13 @@ impl NullableSharedReferenceAccessExpression {
         match self {
             Self::Access(value) => value.owned_temporary(),
             Self::Local { transfer, .. } => *transfer,
-            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::NullSafeAcquire { .. } => true,
             Self::CollectionIndex { remove, .. } => *remove,
             Self::CollectionGet { access, .. } => access.removes_element(),
@@ -3086,7 +3204,13 @@ impl SharedReferenceAccessExpression {
             Self::Local { transfer, .. } | Self::NullableLocalAssumeNonNull { transfer, .. } => {
                 *transfer
             }
-            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Call { return_borrow, .. } => !matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
+                    ..
+                })
+            ),
             Self::CollectionIndex { remove, .. } => *remove,
             Self::Property { .. } => false,
         }
@@ -3233,7 +3357,12 @@ impl NullableCollectionExpression {
             }
             | Self::Call {
                 collection,
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             }
             | Self::Coalesce {
@@ -3329,7 +3458,12 @@ impl CollectionExpression {
             | Self::ReadStdinBytes { collection }
             | Self::Call {
                 collection,
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             } => Some(*collection),
             Self::StringIntrinsic(call) => match call.result {
@@ -3347,7 +3481,11 @@ impl CollectionExpression {
             | Self::Property { .. }
             | Self::SharedAccessPayload { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             } => None,
         }
@@ -3469,7 +3607,12 @@ impl MixedExpression {
                 MixedOwnership::Owned
             }
             Self::Call {
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             } => MixedOwnership::Owned,
             Self::BoxValue(_) => MixedOwnership::ShellOnly,
@@ -3489,7 +3632,11 @@ impl MixedExpression {
             }
             | Self::Property { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             }
             | Self::CollectionIndex {
@@ -3531,7 +3678,12 @@ impl NullableMixedExpression {
             Self::BoxNullablePayloadEnum(_) => MixedOwnership::Owned,
             Self::Local { transfer: true, .. } | Self::Coalesce { .. } => MixedOwnership::Owned,
             Self::Call {
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             } => MixedOwnership::Owned,
             Self::Null
@@ -3540,7 +3692,11 @@ impl NullableMixedExpression {
             }
             | Self::Property { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             } => MixedOwnership::None,
         }
@@ -3728,7 +3884,12 @@ impl ClassExpression {
             Self::New { class, .. }
             | Self::Call {
                 class,
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             } => Some(*class),
             Self::Local {
@@ -3756,7 +3917,11 @@ impl ClassExpression {
             | Self::SharedPayload { .. }
             | Self::SharedAccessPayload { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             } => None,
         }
@@ -3775,11 +3940,20 @@ impl ClassExpression {
             | Self::SharedPayload { .. }
             | Self::SharedAccessPayload { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             } => true,
             Self::Call {
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             }
             | Self::New { .. } => false,
@@ -4290,12 +4464,22 @@ impl NullableClassExpression {
             } => Some(*class),
             Self::Call {
                 class,
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             }
             | Self::NullSafeCall {
                 class,
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             } => Some(*class),
             Self::Null(_)
@@ -4305,14 +4489,22 @@ impl NullableClassExpression {
             }
             | Self::Property { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             }
             | Self::NullSafeProperty { .. }
             | Self::Coalesce { .. }
             | Self::DictionaryGet { .. }
             | Self::NullSafeCall {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             } => None,
         }
@@ -4326,21 +4518,39 @@ impl NullableClassExpression {
             | Self::SharedPayload { .. }
             | Self::NullSafeProperty { .. }
             | Self::Call {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             }
             | Self::NullSafeCall {
-                return_borrow: Some(_),
+                return_borrow:
+                    Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Value,
+                        ..
+                    }),
                 ..
             } => true,
             Self::DictionaryGet { access, .. } => !access.removes_element(),
             Self::Null(_)
             | Self::Call {
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             }
             | Self::NullSafeCall {
-                return_borrow: None,
+                return_borrow:
+                    None
+                    | Some(ReturnBorrow {
+                        kind: ReturnBorrowKind::Retained,
+                        ..
+                    }),
                 ..
             } => false,
         }
@@ -4580,6 +4790,13 @@ pub enum Statement {
         local: LocalId,
         class: ClassId,
     },
+    /// Cleans a failed constructor's own initialized fields, then its completed
+    /// parent phases. The incomplete phase has no destructor; the allocating
+    /// CheckedConstruct caller remains responsible for freeing storage.
+    CleanupConstructorPhase {
+        object: LocalId,
+        class: ClassId,
+    },
     DropSharedReference {
         local: LocalId,
         payload: SharedPayload,
@@ -4660,6 +4877,9 @@ pub enum Statement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyWriteKind {
     Initialize,
+    /// A declaration initializer replaces the parent phase's shared backing
+    /// value. Unlike an ordinary write, this also admits readonly backing.
+    InitializeOverride,
     Replace,
     InitializeOrReplace,
 }
@@ -5193,6 +5413,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::MatchResultPlan { .. }
         | Statement::ControlFlowPlan(_)
         | Statement::DropClass { .. }
+        | Statement::CleanupConstructorPhase { .. }
         | Statement::DropSharedReference { .. }
         | Statement::DropWeakReference { .. }
         | Statement::DropWritableSharedReference { .. }
@@ -5295,6 +5516,10 @@ fn io_contents_class_temporary_capacity(contents: &IoContents) -> usize {
 
 fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
     usize::from(value.owned_temporary_shared().is_some())
+        + usize::from(value.owned_temporary_payload_enum().is_some())
+        + usize::from(
+            value.mixed_ownership().has_shell() && value.transferred_owned_local().is_none(),
+        )
         + match value {
             Rvalue::Value(value) => value_class_temporary_capacity(value),
             Rvalue::String(value) => string_class_temporary_capacity(value),
@@ -8032,6 +8257,13 @@ impl fmt::Display for Statement {
             }
             Statement::DropClass { local, class } => {
                 write!(formatter, "drop class#{} local{}", class.0, local.0)
+            }
+            Statement::CleanupConstructorPhase { object, class } => {
+                write!(
+                    formatter,
+                    "cleanup constructor class#{} local{}",
+                    class.0, object.0
+                )
             }
             Statement::DropSharedReference {
                 local,

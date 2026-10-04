@@ -345,6 +345,7 @@ function main(): void
         Some(doriac::mir::ReturnBorrow {
             source: doriac::mir::BorrowSource::Parameter(0),
             writable: false,
+            kind: doriac::types::ReturnBorrowKind::Retained,
         })
     );
 }
