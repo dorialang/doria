@@ -81,7 +81,7 @@ $require($paths['decision'], $files['decision'], [
     '| TraitRef "::" Name "as" Name ";"',
     '| TraitRef "::" Name "as" "internal" Name? ";"',
     'Type parameters remain excluded from attribute targets under Decision 0125.',
-    'User interfaces remain method-only.',
+    'Stage 35 interface requirements are method-only.',
     'Stage 36 remains their sole owner.',
     'all six existing families',
     'Slice 1: Grammar, Graphs, And Conformance',
@@ -112,7 +112,8 @@ $require($paths['pipeline'], $files['pipeline'], [
 
 $require($paths['spec'], $files['spec'], [
     'Decision 0134 defines generic nominal interfaces',
-    'User interfaces remain method-only',
+    'Stored properties are not user-interface requirements.',
+    'Decision 0135 extends the requirement graph with bodyless getter and setter',
     'Traits cannot declare lifecycle methods',
     'There is no runtime trait object',
 ]);

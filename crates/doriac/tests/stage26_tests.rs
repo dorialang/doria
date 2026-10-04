@@ -1,3 +1,6 @@
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage26.doria", source).expect_err("source should be rejected")
 }
@@ -35,6 +38,116 @@ fn decision_0113_slice_three_example_executes_in_the_semantic_oracle() {
         b"index 0 1 -1\nremove true false red green blue\nnullable 0 1 -1\ndictionary true true false\nsorted true true false\nset 30 20\nset changed 10 20\nempty -1 -1\nsorted set 10 30\nsorted changed 20 20\n"
     );
     assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn collection_intrinsic_names_do_not_capture_user_class_members() {
+    let source = include_str!("../../../examples/native/main_collection_member_name_overlap.doria");
+    let expected =
+        include_bytes!("fixtures/native_io/main_collection_member_name_overlap/expected_stdout");
+    let output = interpret(source);
+    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn nullable_projection_names_dispatch_by_receiver_for_each_value_family() {
+    let values = [
+        ("int", "7", "$value", "7"),
+        ("float", "1.5", "$value", "1.5"),
+        ("bool", "true", "$value", "true"),
+        ("string", "\"text\"", "$value", "text"),
+        ("Item", "new Item(8)", "$value->number", "8"),
+        ("List<int>", "[9]", "$value[0]", "9"),
+    ];
+    for property in ["first", "last", "peek", "peekFront", "peekBack"] {
+        for (ty, initializer, display, expected) in values {
+            let source = format!(
+                r#"
+class Item {{ function __construct(int $number) {{}} }}
+class Slots {{
+    ?{ty} ${property} = {initializer};
+    function project(): ?{ty} {{ return $this->{property}; }}
+}}
+function show(?{ty} $value): void {{
+    if ($value != null) {{ echo {display}; }}
+}}
+function main(): void {{
+    let $slots = new Slots();
+    show($slots->{property});
+    show($slots->project());
+}}
+"#
+            );
+            let output = interpret(&source);
+            assert_eq!(
+                output.stdout,
+                expected.repeat(2).as_bytes(),
+                "{ty}::{property}"
+            );
+            assert_eq!(output.stderr, b"", "{ty}::{property}");
+            assert_eq!(output.exit_status, 0, "{ty}::{property}");
+        }
+    }
+}
+
+#[test]
+fn removed_values_can_initialize_nullable_destinations() {
+    for (ty, initializer, display, expected) in [
+        ("int", "7", "$value", "7"),
+        ("float", "1.5", "$value", "1.5"),
+        ("bool", "true", "$value", "true"),
+        ("string", "\"text\"", "$value", "text"),
+        ("Item", "new Item(8)", "$value->number", "8"),
+        ("List<int>", "[9]", "$value[0]", "9"),
+        ("function(): int", "fn() => 10", "$value()", "10"),
+        (
+            "SharedReference<Item>",
+            "shared new Item(11)",
+            "$value->number",
+            "11",
+        ),
+    ] {
+        let source = format!(
+            r#"
+class Item {{ function __construct(int $number) {{}} }}
+function main(): void {{
+    writable List<{ty}> $values = [{initializer}];
+    ?{ty} $value = $values->removeAt(0);
+    if ($value != null) {{ echo {display}; }}
+    echo " {{$values->count}}\n";
+}}
+"#
+        );
+        let output = interpret(&source);
+        assert_eq!(output.stdout, format!("{expected} 0\n").as_bytes(), "{ty}");
+        assert_eq!(output.stderr, b"", "{ty}");
+        assert_eq!(output.exit_status, 0, "{ty}");
+    }
+}
+
+#[test]
+fn durable_nullable_removal_retains_values_until_reverse_cleanup() {
+    let source = include_str!("../../../examples/native/main_nullable_collection_removal.doria");
+    let expected =
+        include_str!("fixtures/native_io/main_nullable_collection_removal/expected_stdout");
+    let program = doriac::lower_source_to_mir("nullable-removal.doria", source).unwrap();
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Fast,
+        expected,
+    );
+    #[cfg(feature = "llvm-backend")]
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Release,
+        expected,
+    );
 }
 
 #[test]

@@ -223,7 +223,8 @@ impl Proofs<'_> {
                     Self::set_result(facts, Some(*target), class, exact);
                 }
             }
-            mir::Statement::DropClass { local, .. }
+            mir::Statement::CleanupConstructorPhase { object: local, .. }
+            | mir::Statement::DropClass { local, .. }
             | mir::Statement::DropError { local }
             | mir::Statement::ExtractErrorObject { target: local, .. } => {
                 Self::set_result(facts, Some(*local), class, false)

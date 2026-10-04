@@ -147,13 +147,17 @@ function default_commands(string $root, string $target): array
     $native = $root . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'native';
 
     return [
+        command(['php', 'scripts/check_build_artifact_policy.php'], $target),
+        command(['php', 'scripts/check_docs_authority.php'], $target),
+        command(['php', 'scripts/check_diagnostic_style.php'], $target),
+        command(['php', 'scripts/check_panic_catalogue.php'], $target),
+        command(['php', 'scripts/check_runtime_diagnostic_architecture.php'], $target),
+        command(['php', 'scripts/check_indexed_foreach_and_scalar_display.php'], $target),
         command(['cargo', 'fmt', '--all', '--', '--check'], $target),
         command(['cargo', 'build', '-p', 'doria-rt', '--locked'], $target),
         command(['cargo', 'build', '-p', 'doriac', '--bin', 'doriac', '--locked'], $target),
         command(['cargo', 'clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '--workspace', '--all-targets', '--locked'], $target),
-        command(['php', 'scripts/check_indexed_foreach_and_scalar_display.php'], $target),
-        command(['php', 'scripts/check_stage35_authority.php'], $target),
         command([$executable, 'check', 'examples/php/person.doria'], $target),
         command([$executable, 'hir', 'examples/php/person.doria'], $target, true),
         command([$executable, 'compile', 'examples/native/main_return_zero.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_zero'], $target),
@@ -171,7 +175,27 @@ function llvm_commands(string $target): array
         command(['cargo', 'clippy', '-p', 'doriac', '--all-targets', '--features', 'llvm-backend', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '-p', 'doriac', '--lib', '--features', 'llvm-backend', '--locked'], $target),
     ];
-    foreach (['mir_validation_tests', 'llvm_mir_tests', 'cli_tests', 'stage17_io_tests', 'stage18_tests', 'stage35_runtime_tests', 'stage35a_optimizer_tests', 'performance_report_tests', 'native_testing_slice1_tests', 'native_mir_parity_tests'] as $suite) {
+    foreach ([
+        'mir_validation_tests',
+        'llvm_mir_tests',
+        'cli_tests',
+        'constructor_owned_property_tests',
+        'stage17_io_tests',
+        'stage18_tests',
+        'stage21_tests',
+        'stage22_tests',
+        'stage25a_tests',
+        'return_borrow_alias_tests',
+        'returned_closure_transport_tests',
+        'stage35_runtime_tests',
+        'stage35a_optimizer_tests',
+        'stage36_property_hook_tests',
+        'property_hook_initializer_tests',
+        'property_hook_cleanup_effect_tests',
+        'performance_report_tests',
+        'native_testing_slice1_tests',
+        'native_mir_parity_tests',
+    ] as $suite) {
         $commands[] = command(
             ['cargo', 'test', '-p', 'doriac', '--test', $suite, '--features', 'llvm-backend', '--locked'],
             $target,

@@ -1325,6 +1325,9 @@ impl<'a> Resolver<'a> {
                 for requirement in &mut declaration.requirements {
                     self.normalize_function(requirement);
                 }
+                for property in &mut declaration.properties {
+                    self.normalize_property(property);
+                }
                 self.type_parameter_scopes.pop();
             }
             Item::Trait(declaration) => {
@@ -1418,12 +1421,7 @@ impl<'a> Resolver<'a> {
 
     fn normalize_class_member(&mut self, member: &mut ClassMember) {
         match member {
-            ClassMember::Property(property) => {
-                self.normalize_type(&mut property.ty, property.span, GlobalReferenceRole::Type);
-                if let Some(initializer) = &mut property.initializer {
-                    self.normalize_expression(initializer);
-                }
-            }
+            ClassMember::Property(property) => self.normalize_property(property),
             ClassMember::Method(method) => self.normalize_function(method),
             ClassMember::Constant(constant) => self.normalize_const(constant),
             ClassMember::Uses(composition) => {
@@ -1451,6 +1449,37 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn normalize_property(&mut self, property: &mut PropertyDecl) {
+        self.normalize_type(&mut property.ty, property.span, GlobalReferenceRole::Type);
+        if let Some(initializer) = &mut property.initializer {
+            self.normalize_expression(initializer);
+        }
+        for hook in &mut property.hooks {
+            if let Some(parameter) = &mut hook.parameter {
+                self.normalize_parameter(parameter);
+            }
+            self.normalize_throws(&mut hook.throws);
+            if let Some(body) = hook.body.as_block_mut() {
+                self.normalize_block(body);
+            }
+        }
+    }
+
+    fn normalize_parameter(&mut self, parameter: &mut Param) {
+        self.normalize_type(&mut parameter.ty, parameter.span, GlobalReferenceRole::Type);
+        if let Some(default) = &mut parameter.default {
+            self.normalize_expression(default);
+        }
+    }
+
+    fn normalize_throws(&mut self, throws: &mut Option<ThrowsClause>) {
+        if let Some(throws) = throws {
+            for entry in &mut throws.entries {
+                self.normalize_type(&mut entry.ty, entry.span, GlobalReferenceRole::Throws);
+            }
+        }
+    }
+
     fn normalize_const(&mut self, constant: &mut ConstDecl) {
         if let Some(ty) = &mut constant.ty {
             self.normalize_type(ty, constant.span, GlobalReferenceRole::Type);
@@ -1468,19 +1497,12 @@ impl<'a> Resolver<'a> {
         );
         self.normalize_type_params(&mut function.type_params);
         for param in &mut function.params {
-            self.normalize_type(&mut param.ty, param.span, GlobalReferenceRole::Type);
-            if let Some(default) = &mut param.default {
-                self.normalize_expression(default);
-            }
+            self.normalize_parameter(param);
         }
         if let Some(return_type) = &mut function.return_type {
             self.normalize_type(return_type, function.span, GlobalReferenceRole::Type);
         }
-        if let Some(throws) = &mut function.throws {
-            for entry in &mut throws.entries {
-                self.normalize_type(&mut entry.ty, entry.span, GlobalReferenceRole::Throws);
-            }
-        }
+        self.normalize_throws(&mut function.throws);
         if let Some(body) = function.body.as_block_mut() {
             self.normalize_block(body);
         }

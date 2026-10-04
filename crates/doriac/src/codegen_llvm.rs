@@ -1163,6 +1163,10 @@ fn define_function<'ctx>(
         .index_of(native_closure_abi::NativeCallableHiddenInput::ErrorOut)
         .and_then(|index| llvm_function.get_nth_param(index as u32))
         .map(BasicValueEnum::into_pointer_value);
+    let result_borrow_home_address = signature_plan
+        .index_of(native_closure_abi::NativeCallableHiddenInput::ResultBorrowHomeOut)
+        .and_then(|index| llvm_function.get_nth_param(index as u32))
+        .map(BasicValueEnum::into_pointer_value);
     let mut writable_parameter_addresses = HashMap::new();
     for (index, parameter) in function.params.iter().enumerate() {
         let value = llvm_function
@@ -1353,17 +1357,32 @@ fn define_function<'ctx>(
         stack_collection_iterators: HashMap::new(),
         stack_classes: HashMap::new(),
         borrow_home_addresses,
+        evaluated_borrow_homes: HashMap::new(),
         writable_parameter_addresses,
         blocks,
         current_frame,
         return_address,
         checked_error_address,
+        result_borrow_home_address,
         next_data_id: 0,
         defer_class_temporary_drops: false,
         deferred_class_temporary_slots,
         deferred_class_temporary_slot_cursor: 0,
         deferred_class_temporary_drops: Vec::new(),
     };
+    for local in &function.locals {
+        if native_closure_abi::local_needs_borrow_home(function, local) {
+            // The descriptor slot is fixed for the whole function. Assignments
+            // update its contents at runtime, so branches and loop backedges
+            // retain the origin of the value actually stored in the local.
+            let home = BorrowHome {
+                address: local_slot(&lowerer.local_slots, local.id)?,
+                source_type: lowerer.borrow_home_type_key(local.ty),
+            };
+            let descriptor = lowerer.borrow_home_argument(home)?;
+            lowerer.borrow_home_addresses.insert(local.id, descriptor);
+        }
+    }
     lowerer.retain_string_parameters()?;
     for local in &function.locals {
         if let Some(class) = optimization.stack_classes.get(&local.id) {
@@ -1450,11 +1469,13 @@ fn define_class_drop_functions<'ctx>(
             stack_collection_iterators: HashMap::new(),
             stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            evaluated_borrow_homes: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame,
             return_address: None,
             checked_error_address: None,
+            result_borrow_home_address: None,
             next_data_id: 0,
             defer_class_temporary_drops: false,
             deferred_class_temporary_slots: Vec::new(),
@@ -1509,11 +1530,13 @@ fn define_collection_drop_functions<'ctx>(
             stack_collection_iterators: HashMap::new(),
             stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            evaluated_borrow_homes: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame: context.ptr_type(AddressSpace::default()).const_null(),
             return_address: None,
             checked_error_address: None,
+            result_borrow_home_address: None,
             next_data_id: 0,
             defer_class_temporary_drops: false,
             deferred_class_temporary_slots: Vec::new(),
@@ -1572,11 +1595,13 @@ fn define_closure_drop_functions<'ctx>(
             stack_collection_iterators: HashMap::new(),
             stack_classes: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            evaluated_borrow_homes: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame,
             return_address: None,
             checked_error_address: None,
+            result_borrow_home_address: None,
             next_data_id: 0,
             defer_class_temporary_drops: false,
             deferred_class_temporary_slots: Vec::new(),
@@ -2069,11 +2094,13 @@ struct FunctionLowerer<'ctx, 'program> {
     stack_collection_iterators: HashMap<mir::LocalId, (mir::LocalId, PointerValue<'ctx>)>,
     stack_classes: HashMap<mir::LocalId, PointerValue<'ctx>>,
     borrow_home_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
+    evaluated_borrow_homes: HashMap<BasicValueEnum<'ctx>, BorrowHome<'ctx>>,
     writable_parameter_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     blocks: Vec<BasicBlock<'ctx>>,
     current_frame: PointerValue<'ctx>,
     return_address: Option<PointerValue<'ctx>>,
     checked_error_address: Option<PointerValue<'ctx>>,
+    result_borrow_home_address: Option<PointerValue<'ctx>>,
     next_data_id: usize,
     defer_class_temporary_drops: bool,
     deferred_class_temporary_slots: Vec<PointerValue<'ctx>>,
@@ -2084,15 +2111,21 @@ struct FunctionLowerer<'ctx, 'program> {
 #[derive(Clone, Copy)]
 struct BoundClosureField<'ctx> {
     address: PointerValue<'ctx>,
+    source_type: IntValue<'ctx>,
     storage: mir::ClosureEnvironmentStorage,
     ty: mir::Type,
+}
+
+#[derive(Clone, Copy)]
+struct BorrowHome<'ctx> {
+    address: PointerValue<'ctx>,
+    source_type: IntValue<'ctx>,
 }
 
 struct LoweredCallArguments<'ctx> {
     values: Vec<BasicMetadataValueEnum<'ctx>>,
     lowered: Vec<BasicValueEnum<'ctx>>,
     owned_strings: Vec<PointerValue<'ctx>>,
-    temporary_mixed: Vec<(usize, PointerValue<'ctx>, mir::MixedOwnership)>,
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
@@ -2219,6 +2252,11 @@ enum DeferredOwnedTemporary<'ctx> {
     Collection {
         slot: PointerValue<'ctx>,
         collection: mir::CollectionTypeId,
+    },
+    PayloadEnum {
+        slot: PointerValue<'ctx>,
+        ty: mir::PayloadEnumType,
+        nullable: bool,
     },
     Mixed {
         slot: PointerValue<'ctx>,
@@ -2761,6 +2799,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .iter()
                 .find(|field| field.id == *field_id)
                 .ok_or_else(|| malformed_mir("closure binding field does not exist"))?;
+            let binding_storage = field.storage.invocation_binding(descriptor.invocation_mode);
             let layout = native
                 .fields
                 .iter()
@@ -2768,18 +2807,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir("native closure binding field does not exist"))?;
             let field_address =
                 self.byte_offset(environment, layout.offset, "closure.binding.field")?;
-            let place = match field.storage {
+            let home = match field.storage {
                 mir::ClosureEnvironmentStorage::ReadonlyBorrow
-                | mir::ClosureEnvironmentStorage::WritableBorrow => build(
-                    self.builder
-                        .build_load(pointer, field_address, "closure.binding.place"),
-                )?
-                .into_pointer_value(),
-                mir::ClosureEnvironmentStorage::Owned => field_address,
+                | mir::ClosureEnvironmentStorage::WritableBorrow => {
+                    self.load_borrow_home(field_address)?
+                }
+                mir::ClosureEnvironmentStorage::Owned => BorrowHome {
+                    address: field_address,
+                    source_type: self.borrow_home_type_key(field.ty),
+                },
             };
+            let place = home.address;
             let target_slot = local_slot(&self.local_slots, *target)?;
-            if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
-                field.ty
+            let projected_borrow = binding_storage != mir::ClosureEnvironmentStorage::Owned;
+            if projected_borrow {
+                self.bind_borrow_home(
+                    home,
+                    target_slot,
+                    field.ty,
+                    binding_storage == mir::ClosureEnvironmentStorage::WritableBorrow,
+                )?;
+            } else if let mir::Type::PayloadEnum(payload)
+            | mir::Type::NullablePayloadEnum(payload) = field.ty
             {
                 self.copy_payload_bytes(
                     target_slot,
@@ -2817,8 +2866,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     build(self.builder.build_store(target_slot, retained))?;
                 }
             }
-            if field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+            if binding_storage == mir::ClosureEnvironmentStorage::WritableBorrow
                 && field.ty.transfers_writable_capture_ownership()
+                && !projected_borrow
             {
                 match field.ty {
                     mir::Type::PayloadEnum(payload) => {
@@ -2838,7 +2888,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     }
                 }
             }
-            let address = if field.storage == mir::ClosureEnvironmentStorage::Owned {
+            let address = if binding_storage == mir::ClosureEnvironmentStorage::Owned {
                 target_slot
             } else {
                 place
@@ -2847,11 +2897,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 *target,
                 BoundClosureField {
                     address,
-                    storage: field.storage,
+                    source_type: home.source_type,
+                    storage: binding_storage,
                     ty: field.ty,
                 },
             );
-            if field.storage == mir::ClosureEnvironmentStorage::Owned
+            if binding_storage == mir::ClosureEnvironmentStorage::Owned
                 && field.ty.has_move_ownership()
             {
                 let zero = self.context.i8_type().const_zero();
@@ -2871,33 +2922,638 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    fn borrow_home_type_key(&self, ty: mir::Type) -> IntValue<'ctx> {
+        self.context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(native_closure_abi::borrow_home_type_key(ty), false)
+    }
+
+    fn load_borrow_home(
+        &self,
+        address: PointerValue<'ctx>,
+    ) -> Result<BorrowHome<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let source = build(
+            self.builder
+                .build_load(pointer, address, "borrow.home.address"),
+        )?
+        .into_pointer_value();
+        let type_address = self.byte_offset(
+            address,
+            self.target_data.get_pointer_byte_size(None),
+            "borrow.home.type.address",
+        )?;
+        let source_type = build(self.builder.build_load(
+            self.context.ptr_sized_int_type(self.target_data, None),
+            type_address,
+            "borrow.home.type",
+        ))?
+        .into_int_value();
+        Ok(BorrowHome {
+            address: source,
+            source_type,
+        })
+    }
+
+    fn store_borrow_home(
+        &self,
+        address: PointerValue<'ctx>,
+        home: BorrowHome<'ctx>,
+    ) -> Result<(), BackendError> {
+        build(self.builder.build_store(address, home.address))?;
+        let type_address = self.byte_offset(
+            address,
+            self.target_data.get_pointer_byte_size(None),
+            "borrow.home.type.address",
+        )?;
+        build(self.builder.build_store(type_address, home.source_type))?;
+        Ok(())
+    }
+
+    fn borrow_home_argument(
+        &self,
+        home: BorrowHome<'ctx>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let ty = self.context.struct_type(
+            &[
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context
+                    .ptr_sized_int_type(self.target_data, None)
+                    .into(),
+            ],
+            false,
+        );
+        let address = self.entry_alloca(ty, "borrow.home")?;
+        self.store_borrow_home(address, home)?;
+        Ok(address)
+    }
+
+    fn closure_source_home(&self, local: mir::LocalId) -> Result<BorrowHome<'ctx>, BackendError> {
+        if let Some(field) = self.closure_bound_fields.get(&local) {
+            return Ok(BorrowHome {
+                address: field.address,
+                source_type: field.source_type,
+            });
+        }
+        if let Some(address) = self.borrow_home_addresses.get(&local) {
+            return self.load_borrow_home(*address);
+        }
+        let address = match self.writable_parameter_addresses.get(&local) {
+            Some(address) => *address,
+            None => local_slot(&self.local_slots, local)?,
+        };
+        Ok(BorrowHome {
+            address,
+            source_type: self.borrow_home_type_key(local_in(self.function, local)?.ty),
+        })
+    }
+
     fn closure_source_address(
         &self,
         local: mir::LocalId,
     ) -> Result<PointerValue<'ctx>, BackendError> {
-        if let Some(field) = self.closure_bound_fields.get(&local) {
-            return Ok(field.address);
+        Ok(self.closure_source_home(local)?.address)
+    }
+
+    fn assignment_borrow_home(
+        &self,
+        target: mir::LocalId,
+        value: &mir::Rvalue,
+        evaluated: BasicValueEnum<'ctx>,
+    ) -> Result<Option<(PointerValue<'ctx>, BorrowHome<'ctx>)>, BackendError> {
+        let local = local_in(self.function, target)?;
+        if !native_closure_abi::local_needs_borrow_home(self.function, local) {
+            return Ok(None);
         }
-        if let Some(address) = self.writable_parameter_addresses.get(&local) {
-            return Ok(*address);
+        let descriptor = self
+            .borrow_home_addresses
+            .get(&target)
+            .copied()
+            .ok_or_else(|| malformed_mir("borrowed local has no stable home descriptor"))?;
+        let home = if let Some(home) = self.evaluated_borrow_homes.get(&evaluated) {
+            *home
+        } else if value.borrows_move_value()
+            && native_closure_abi::has_addressable_borrow_home(value, self.function)
+        {
+            // Read the exact source descriptor before replacing target storage.
+            // A call's lifetime root alone is not an exact returned place.
+            self.load_borrow_home(self.rvalue_borrow_home(value)?)?
+        } else {
+            BorrowHome {
+                address: local_slot(&self.local_slots, target)?,
+                source_type: self.borrow_home_type_key(local.ty),
+            }
+        };
+        Ok(Some((descriptor, home)))
+    }
+
+    fn evaluated_borrow_home(
+        &self,
+        source: &mir::Rvalue,
+        evaluated: BasicValueEnum<'ctx>,
+    ) -> Result<BorrowHome<'ctx>, BackendError> {
+        if let Some(home) = self.evaluated_borrow_homes.get(&evaluated) {
+            return Ok(*home);
         }
-        if let Some(address) = self.borrow_home_addresses.get(&local) {
-            return Ok(*address);
+        if native_closure_abi::needs_owned_borrow_home(source, self.function) {
+            return self.materialize_owned_borrow_home(source.ty(), evaluated);
         }
-        local_slot(&self.local_slots, local)
+        self.load_borrow_home(self.rvalue_borrow_home(source)?)
+    }
+
+    fn materialize_owned_borrow_home(
+        &self,
+        ty: mir::Type,
+        evaluated: BasicValueEnum<'ctx>,
+    ) -> Result<BorrowHome<'ctx>, BackendError> {
+        // The existing temporary cleanup remains the sole owner. This home is
+        // only an addressable view of the already-evaluated carrier. Inline
+        // enums already have caller storage; other carriers use a fixed entry
+        // slot so repeated loop execution never grows the stack.
+        let address = if matches!(
+            ty,
+            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+        ) {
+            evaluated.into_pointer_value()
+        } else {
+            let address = self.entry_alloca(
+                llvm_type(self.context, self.target_data, self.program, ty),
+                "borrow.owned.home",
+            )?;
+            self.store_value_at_address(address, evaluated, ty)?;
+            address
+        };
+        Ok(BorrowHome {
+            address,
+            source_type: self.borrow_home_type_key(ty),
+        })
+    }
+
+    fn remember_explicit_borrow_home(
+        &mut self,
+        source: &mir::Rvalue,
+        evaluated: BasicValueEnum<'ctx>,
+    ) -> Result<(), BackendError> {
+        if source.is_null_value() && source.ty().has_move_ownership() {
+            self.evaluated_borrow_homes
+                .insert(evaluated, self.absent_borrow_home());
+            return Ok(());
+        }
+        if source.borrows_move_value()
+            && native_closure_abi::has_addressable_borrow_home(source, self.function)
+        {
+            let home = self.load_borrow_home(self.rvalue_borrow_home(source)?)?;
+            self.evaluated_borrow_homes.insert(evaluated, home);
+        } else if native_closure_abi::needs_owned_borrow_home(source, self.function)
+            && !self.evaluated_borrow_homes.contains_key(&evaluated)
+        {
+            let home = self.materialize_owned_borrow_home(source.ty(), evaluated)?;
+            self.evaluated_borrow_homes.insert(evaluated, home);
+        }
+        Ok(())
+    }
+
+    fn forward_evaluated_borrow_home(
+        &mut self,
+        source: BasicValueEnum<'ctx>,
+        projected: BasicValueEnum<'ctx>,
+    ) {
+        if let Some(home) = self.evaluated_borrow_homes.get(&source).copied() {
+            self.evaluated_borrow_homes.insert(projected, home);
+        }
+    }
+
+    fn merge_evaluated_borrow_homes(
+        &mut self,
+        result: BasicValueEnum<'ctx>,
+        branches: &[(BasicValueEnum<'ctx>, BasicBlock<'ctx>)],
+    ) -> Result<(), BackendError> {
+        let homes = branches
+            .iter()
+            .map(|(value, _)| self.evaluated_borrow_homes.get(value).copied())
+            .collect::<Option<Vec<_>>>();
+        let Some(homes) = homes else {
+            return Ok(());
+        };
+        let address = build(self.builder.build_phi(
+            self.context.ptr_type(AddressSpace::default()),
+            "borrow.result.address",
+        ))?;
+        let key = build(self.builder.build_phi(
+            self.context.ptr_sized_int_type(self.target_data, None),
+            "borrow.result.type",
+        ))?;
+        for (home, (_, block)) in homes.iter().zip(branches) {
+            address.add_incoming(&[(&home.address, *block)]);
+            key.add_incoming(&[(&home.source_type, *block)]);
+        }
+        self.evaluated_borrow_homes.insert(
+            result,
+            BorrowHome {
+                address: address.as_basic_value().into_pointer_value(),
+                source_type: key.as_basic_value().into_int_value(),
+            },
+        );
+        Ok(())
+    }
+
+    fn absent_borrow_home(&self) -> BorrowHome<'ctx> {
+        BorrowHome {
+            address: self.context.ptr_type(AddressSpace::default()).const_null(),
+            source_type: self
+                .context
+                .ptr_sized_int_type(self.target_data, None)
+                .const_zero(),
+        }
+    }
+
+    fn result_borrow_home_out(
+        &self,
+        return_type: mir::ReturnType,
+        return_borrow: Option<mir::ReturnBorrow>,
+        result: Option<mir::LocalId>,
+    ) -> Result<Option<PointerValue<'ctx>>, BackendError> {
+        if !native_closure_abi::returns_borrowed_value(return_type, return_borrow) {
+            return Ok(None);
+        }
+        if let Some(result) = result {
+            return self
+                .borrow_home_addresses
+                .get(&result)
+                .copied()
+                .map(Some)
+                .ok_or_else(|| {
+                    malformed_mir("borrowed call result has no stable descriptor slot")
+                });
+        }
+        self.borrow_home_argument(self.absent_borrow_home())
+            .map(Some)
+    }
+
+    /// Dispatch on the original storage representation, not the narrowed view
+    /// in the current frame. Nullable nominal types share their payload layout.
+    fn with_borrow_home_type(
+        &self,
+        home: BorrowHome<'ctx>,
+        target: mir::Type,
+        mut operation: impl FnMut(mir::Type) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let sources = native_closure_abi::borrow_home_projection_types(self.program, target);
+        if sources.is_empty() {
+            return operation(target);
+        }
+        let function = current_function(&self.builder)?;
+        let done = self
+            .context
+            .append_basic_block(function, "borrow.home.done");
+        let invalid = self
+            .context
+            .append_basic_block(function, "borrow.home.invalid");
+        let cases = sources
+            .iter()
+            .map(|source| {
+                (
+                    self.borrow_home_type_key(*source),
+                    self.context
+                        .append_basic_block(function, "borrow.home.source"),
+                )
+            })
+            .collect::<Vec<_>>();
+        build(self.builder.build_switch(home.source_type, invalid, &cases))?;
+        self.builder.position_at_end(invalid);
+        // Keys are private compiler-generated ABI data. No source-level
+        // recovery or alternative ownership rule exists for an invalid key.
+        build(self.builder.build_unreachable())?;
+        for (source, (_, block)) in sources.into_iter().zip(cases) {
+            self.builder.position_at_end(block);
+            operation(source)?;
+            build(self.builder.build_unconditional_branch(done))?;
+        }
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
+    fn project_borrow_home_value(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        source: mir::Type,
+        target: mir::Type,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        if native_closure_abi::borrow_home_type_key(source)
+            == native_closure_abi::borrow_home_type_key(target)
+        {
+            return Ok(value);
+        }
+        match (source, target) {
+            (mir::Type::PayloadEnum(payload), mir::Type::NullablePayloadEnum(expected))
+                if payload == expected =>
+            {
+                // The view has an extra presence byte, but the descriptor must
+                // continue to identify the original non-nullable enum slot.
+                let view = self.entry_payload_alloca(payload, true, "borrow.enum.optional")?;
+                self.zero_payload_bytes(view, payload, true)?;
+                build(
+                    self.builder
+                        .build_store(view, self.context.i8_type().const_int(1, false)),
+                )?;
+                let destination = self.byte_offset(
+                    view,
+                    payload.nullable_payload_offset,
+                    "borrow.enum.optional.payload",
+                )?;
+                build(self.builder.build_store(destination, value))?;
+                return build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, self.program, target),
+                    view,
+                    "borrow.enum.optional.value",
+                ));
+            }
+            (mir::Type::NullablePayloadEnum(payload), mir::Type::PayloadEnum(expected))
+                if payload == expected =>
+            {
+                let view = self.entry_payload_alloca(payload, true, "borrow.enum.present")?;
+                build(self.builder.build_store(view, value))?;
+                let present = build(self.builder.build_load(
+                    self.context.i8_type(),
+                    view,
+                    "borrow.enum.presence",
+                ))?
+                .into_int_value();
+                let present = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    present,
+                    self.context.i8_type().const_zero(),
+                    "borrow.enum.has-value",
+                ))?;
+                let function = current_function(&self.builder)?;
+                let valid = self
+                    .context
+                    .append_basic_block(function, "borrow.enum.valid");
+                let invalid = self
+                    .context
+                    .append_basic_block(function, "borrow.enum.invalid");
+                build(
+                    self.builder
+                        .build_conditional_branch(present, valid, invalid),
+                )?;
+                self.builder.position_at_end(invalid);
+                self.trap_invalid_borrow_transport()?;
+                self.builder.position_at_end(valid);
+                let payload_address = self.byte_offset(
+                    view,
+                    payload.nullable_payload_offset,
+                    "borrow.enum.present.payload",
+                )?;
+                return build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, self.program, target),
+                    payload_address,
+                    "borrow.enum.present.value",
+                ));
+            }
+            _ => {}
+        }
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let (object, dynamic, interface_view) = match source {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                let (object, descriptor) = self.class_parts(value, class)?;
+                (
+                    object,
+                    Some(
+                        descriptor
+                            .map(Ok)
+                            .unwrap_or_else(|| self.class_descriptor_address(class))?,
+                    ),
+                    None,
+                )
+            }
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
+                let (object, vtable) = self.error_parts(value.into_struct_value())?;
+                (object, None, Some(vtable))
+            }
+            mir::Type::Collection(_) | mir::Type::NullableCollection(_) => {
+                (value.into_pointer_value(), None, None)
+            }
+            _ => {
+                return Err(malformed_mir(
+                    "nominal borrow home has a non-nominal source",
+                ))
+            }
+        };
+        // Pointer-only views need no descriptor and preserve the same object.
+        match target {
+            mir::Type::Class(class) | mir::Type::NullableClass(class)
+                if !class_uses_open_carrier(self.program, class) =>
+            {
+                return Ok(object.into())
+            }
+            mir::Type::Collection(_) | mir::Type::NullableCollection(_) => return Ok(object.into()),
+            _ => {}
+        }
+        // A nullable interface may have neither payload nor vtable. Guard all
+        // descriptor loads, even when the receiving view is non-null in MIR.
+        let function = current_function(&self.builder)?;
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| malformed_mir("borrow projection has no block"))?;
+        let present_block = self
+            .context
+            .append_basic_block(function, "borrow.home.present");
+        let done = self
+            .context
+            .append_basic_block(function, "borrow.home.projected");
+        let present = build(
+            self.builder
+                .build_is_not_null(object, "borrow.home.has-value"),
+        )?;
+        build(
+            self.builder
+                .build_conditional_branch(present, present_block, done),
+        )?;
+        self.builder.position_at_end(present_block);
+        let descriptor = match interface_view {
+            Some(vtable) => {
+                let field = build(self.builder.build_struct_gep(
+                    interface_vtable_header_type(self.context, self.target_data),
+                    vtable,
+                    crate::native_abi::INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD,
+                    "borrow.home.descriptor.field",
+                ))?;
+                Some(
+                    build(
+                        self.builder
+                            .build_load(pointer, field, "borrow.home.descriptor"),
+                    )?
+                    .into_pointer_value(),
+                )
+            }
+            None => dynamic,
+        };
+        let projected: BasicValueEnum<'ctx> = match target {
+            mir::Type::Class(_) | mir::Type::NullableClass(_) => self
+                .open_class_value(
+                    object,
+                    descriptor.ok_or_else(|| {
+                        malformed_mir("class borrow projection has no descriptor")
+                    })?,
+                )?
+                .into(),
+            mir::Type::Interface(interface) | mir::Type::NullableInterface(interface) => {
+                let vtable = match source {
+                    mir::Type::Collection(collection)
+                    | mir::Type::NullableCollection(collection) => {
+                        let vtable = self
+                            .program
+                            .interface_vtable(
+                                mir::ImplementingType::Collection(collection),
+                                interface,
+                            )
+                            .ok_or_else(|| {
+                                malformed_mir("collection borrow projection has no interface view")
+                            })?;
+                        self.interface_vtable_address(vtable)?
+                    }
+                    _ => self.lower_interface_view(
+                        descriptor.ok_or_else(|| {
+                            malformed_mir("interface borrow projection has no descriptor")
+                        })?,
+                        interface,
+                    )?,
+                };
+                self.error_value(object, vtable)?.into()
+            }
+            _ => {
+                return Err(malformed_mir(
+                    "nominal borrow home has a non-nominal target",
+                ))
+            }
+        };
+        let present_end = self
+            .builder
+            .get_insert_block()
+            .expect("borrow projection block");
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        let ty = llvm_type(self.context, self.target_data, self.program, target);
+        let phi = build(self.builder.build_phi(ty, "borrow.home.value"))?;
+        phi.add_incoming(&[(&ty.const_zero(), entry), (&projected, present_end)]);
+        Ok(phi.as_basic_value())
+    }
+
+    fn trap_invalid_borrow_transport(&self) -> Result<(), BackendError> {
+        let trap = self.module.get_function("llvm.trap").unwrap_or_else(|| {
+            self.module.add_function(
+                "llvm.trap",
+                self.context.void_type().fn_type(&[], false),
+                None,
+            )
+        });
+        build(self.builder.build_call(trap, &[], ""))?;
+        build(self.builder.build_unreachable())?;
+        Ok(())
+    }
+
+    fn bind_borrow_home(
+        &self,
+        home: BorrowHome<'ctx>,
+        target: PointerValue<'ctx>,
+        ty: mir::Type,
+        writable: bool,
+    ) -> Result<(), BackendError> {
+        let absent_done = {
+            let function = current_function(&self.builder)?;
+            let present = self
+                .context
+                .append_basic_block(function, "borrow.capture.present");
+            let absent = self
+                .context
+                .append_basic_block(function, "borrow.capture.absent");
+            let done = self
+                .context
+                .append_basic_block(function, "borrow.capture.bound");
+            let has_place = build(
+                self.builder
+                    .build_is_not_null(home.address, "borrow.capture.has-place"),
+            )?;
+            build(
+                self.builder
+                    .build_conditional_branch(has_place, present, absent),
+            )?;
+            self.builder.position_at_end(absent);
+            if writable {
+                // An absent returned borrow has no writable storage. Preserve
+                // this explicit implementation boundary rather than inventing
+                // a writeback destination or dereferencing a null home.
+                self.trap_invalid_borrow_transport()?;
+            } else {
+                build(self.builder.build_store(
+                    target,
+                    llvm_type(self.context, self.target_data, self.program, ty).const_zero(),
+                ))?;
+                build(self.builder.build_unconditional_branch(done))?;
+            }
+            self.builder.position_at_end(present);
+            Some(done)
+        };
+        self.with_borrow_home_type(home, ty, |source| {
+            let source_ty = llvm_type(self.context, self.target_data, self.program, source);
+            let value = build(self.builder.build_load(
+                source_ty,
+                home.address,
+                "borrow.home.original",
+            ))?;
+            let value = self.project_borrow_home_value(value, source, ty)?;
+            build(self.builder.build_store(target, value))?;
+            if writable && ty.transfers_writable_capture_ownership() {
+                build(
+                    self.builder
+                        .build_store(home.address, source_ty.const_zero()),
+                )?;
+            }
+            Ok(())
+        })?;
+        if let Some(done) = absent_done {
+            build(self.builder.build_unconditional_branch(done))?;
+            self.builder.position_at_end(done);
+        }
+        Ok(())
+    }
+
+    fn sync_nominal_borrow_home(
+        &self,
+        home: BorrowHome<'ctx>,
+        source: PointerValue<'ctx>,
+        ty: mir::Type,
+    ) -> Result<(), BackendError> {
+        let source_ty = llvm_type(self.context, self.target_data, self.program, ty);
+        let value = build(
+            self.builder
+                .build_load(source_ty, source, "borrow.home.updated"),
+        )?;
+        self.with_borrow_home_type(home, ty, |target| {
+            let projected = self.project_borrow_home_value(value, ty, target)?;
+            build(self.builder.build_store(home.address, projected))?;
+            Ok(())
+        })?;
+        build(self.builder.build_store(source, source_ty.const_zero()))?;
+        Ok(())
     }
 
     fn direct_call_borrow_home(
         &self,
         callee: &mir::Function,
         args: &[mir::Rvalue],
+        evaluated: &[BasicValueEnum<'ctx>],
         receiver_present: bool,
         receiver_home: Option<PointerValue<'ctx>>,
     ) -> Result<Option<PointerValue<'ctx>>, BackendError> {
-        let Some(return_borrow) = callee
-            .return_borrow
-            .filter(|_| native_closure_abi::returns_function_value(callee.return_type))
-        else {
+        let Some(return_borrow) = callee.return_borrow.filter(|_| {
+            native_closure_abi::returns_function_value(callee.return_type)
+                || native_closure_abi::returns_borrowed_value(
+                    callee.return_type,
+                    callee.return_borrow,
+                )
+        }) else {
             return Ok(None);
         };
         if return_borrow.source == mir::BorrowSource::Receiver && receiver_present {
@@ -2905,45 +3561,107 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 malformed_mir("borrow-returning null-safe method call has no stable receiver place")
             });
         }
-        let source = match return_borrow.source {
-            mir::BorrowSource::Parameter(index) if receiver_present => args.get(index),
-            _ => args.get(native_closure_abi::return_borrow_argument_index(
+        let index = match return_borrow.source {
+            mir::BorrowSource::Parameter(index) if receiver_present => index,
+            _ => native_closure_abi::return_borrow_argument_index(
                 return_borrow,
                 callee.receiver_mode.is_some(),
-            )),
-        }
-        .ok_or_else(|| {
+            ),
+        };
+        let source = args.get(index).ok_or_else(|| {
             malformed_mir(format!(
                 "borrow-returning call to {} has no source argument",
                 callee.name
             ))
         })?;
-        self.rvalue_borrow_home(source).map(Some)
+        let value = evaluated
+            .get(index)
+            .copied()
+            .ok_or_else(|| malformed_mir("borrow-returning argument has no evaluated value"))?;
+        self.borrow_home_argument(self.evaluated_borrow_home(source, value)?)
+            .map(Some)
     }
 
     fn indirect_call_borrow_home(
         &self,
         function_type: &mir::FunctionType,
         args: &[mir::Rvalue],
+        evaluated: &[BasicValueEnum<'ctx>],
     ) -> Result<Option<PointerValue<'ctx>>, BackendError> {
-        let Some(return_borrow) = function_type
-            .return_borrow
-            .filter(|_| native_closure_abi::returns_function_value(function_type.return_type))
-        else {
+        let Some(return_borrow) = function_type.return_borrow.filter(|_| {
+            native_closure_abi::returns_function_value(function_type.return_type)
+                || native_closure_abi::returns_borrowed_value(
+                    function_type.return_type,
+                    function_type.return_borrow,
+                )
+        }) else {
             return Ok(None);
         };
-        let source = args
-            .get(native_closure_abi::return_borrow_argument_index(
-                return_borrow,
-                false,
-            ))
-            .ok_or_else(|| {
-                malformed_mir("borrow-returning indirect call has no source argument")
-            })?;
-        self.rvalue_borrow_home(source).map(Some)
+        let index = native_closure_abi::return_borrow_argument_index(return_borrow, false);
+        let source = args.get(index).ok_or_else(|| {
+            malformed_mir("borrow-returning indirect call has no source argument")
+        })?;
+        let value = evaluated
+            .get(index)
+            .copied()
+            .ok_or_else(|| malformed_mir("borrow-returning argument has no evaluated value"))?;
+        self.borrow_home_argument(self.evaluated_borrow_home(source, value)?)
+            .map(Some)
     }
 
     fn rvalue_borrow_home(&self, source: &mir::Rvalue) -> Result<PointerValue<'ctx>, BackendError> {
+        if source.is_null_value() && source.ty().has_move_ownership() {
+            return self.borrow_home_argument(self.absent_borrow_home());
+        }
+        if let Some(place) = native_closure_abi::direct_borrow_home_place(source) {
+            return match place {
+                native_closure_abi::BorrowHomePlace::Local { local, projection } => {
+                    let mut home = self.closure_source_home(local)?;
+                    let offset = match projection {
+                        native_closure_abi::BorrowHomeProjection::Direct => 0,
+                        native_closure_abi::BorrowHomeProjection::NullableWordPayload => {
+                            self.target_data.get_pointer_byte_size(None)
+                        }
+                    };
+                    if offset != 0 {
+                        home.address =
+                            self.byte_offset(home.address, offset, "borrow.home.payload")?;
+                    }
+                    self.borrow_home_argument(home)
+                }
+                native_closure_abi::BorrowHomePlace::Property { object, property } => {
+                    self.property_borrow_home(object, property)
+                }
+            };
+        }
+        match source {
+            mir::Rvalue::Interface(value) => return self.interface_borrow_home(&value.value),
+            mir::Rvalue::NullableInterface(value) => {
+                return self.nullable_interface_borrow_home(&value.value)
+            }
+            mir::Rvalue::NullableClass(mir::NullableClassExpression::Class(value)) => {
+                return self.rvalue_borrow_home(&mir::Rvalue::Class(value.clone()));
+            }
+            mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(
+                value,
+            )) => {
+                return self.rvalue_borrow_home(&mir::Rvalue::Collection(value.clone()));
+            }
+            mir::Rvalue::Class(mir::ClassExpression::InterfaceReceiver { receiver, .. })
+            | mir::Rvalue::Collection(mir::CollectionExpression::InterfaceReceiver {
+                receiver,
+                ..
+            }) => {
+                return self.borrow_home_argument(self.closure_source_home(*receiver)?);
+            }
+            mir::Rvalue::Class(mir::ClassExpression::InterfacePayload { local, .. }) => {
+                return self.nominal_local_borrow_home(*local);
+            }
+            mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local)) => {
+                return self.borrow_home_argument(self.nullable_payload_borrow_home(*local)?);
+            }
+            _ => {}
+        }
         let place = match source {
             mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
                 operand,
@@ -2961,7 +3679,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ..
             })) => return self.operand_borrow_home(operand),
             mir::Rvalue::String(mir::StringExpression::Local(local))
-            | mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local))
             | mir::Rvalue::Class(mir::ClassExpression::Local { local, .. })
             | mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
                 local, ..
@@ -3031,6 +3748,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 property,
                 ..
             })
+            | mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Property {
+                object,
+                property,
+                ..
+            })
             | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Property {
                 object,
                 property,
@@ -3039,10 +3761,112 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             _ => None,
         };
         match place {
-            Some((local, None)) => self.closure_source_address(local),
-            Some((object, Some(property))) => self.lower_property_address(object, property),
+            Some((local, None)) => self.borrow_home_argument(self.closure_source_home(local)?),
+            Some((object, Some(property))) => self.property_borrow_home(object, property),
             None => Err(malformed_mir(
                 "borrow-returning call source is not an addressable Doria place",
+            )),
+        }
+    }
+
+    fn nominal_local_borrow_home(
+        &self,
+        local: mir::LocalId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        if !matches!(
+            local_in(self.function, local)?.ty,
+            mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Interface(_)
+                | mir::Type::NullableInterface(_)
+        ) {
+            return Err(malformed_mir(
+                "borrow-returning nominal projection has no nominal source place",
+            ));
+        }
+        self.borrow_home_argument(self.closure_source_home(local)?)
+    }
+
+    fn property_borrow_home(
+        &self,
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        self.borrow_home_argument(BorrowHome {
+            address: self.lower_property_address(object, property)?,
+            source_type: self.borrow_home_type_key(property_definition(self.program, property)?.ty),
+        })
+    }
+
+    fn nullable_payload_borrow_home(
+        &self,
+        local: mir::LocalId,
+    ) -> Result<BorrowHome<'ctx>, BackendError> {
+        let home = self.closure_source_home(local)?;
+        let ty = llvm_type(
+            self.context,
+            self.target_data,
+            self.program,
+            local_in(self.function, local)?.ty,
+        )
+        .into_struct_type();
+        Ok(BorrowHome {
+            address: build(self.builder.build_struct_gep(
+                ty,
+                home.address,
+                1,
+                "borrow.home.nullable-payload",
+            ))?,
+            source_type: self.borrow_home_type_key(mir::Type::String),
+        })
+    }
+
+    fn interface_borrow_home(
+        &self,
+        source: &mir::InterfaceValue,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        match source {
+            mir::InterfaceValue::Local { local, .. }
+            | mir::InterfaceValue::NullableLocalAssumeNonNull { local, .. } => {
+                self.borrow_home_argument(self.closure_source_home(*local)?)
+            }
+            mir::InterfaceValue::NarrowedLocal { local, .. } => {
+                self.nominal_local_borrow_home(*local)
+            }
+            mir::InterfaceValue::Property {
+                object, property, ..
+            } => self.property_borrow_home(*object, *property),
+            mir::InterfaceValue::Upcast { source, .. } => self.interface_borrow_home(&source.value),
+            mir::InterfaceValue::FromClass { object, .. } => {
+                self.rvalue_borrow_home(&mir::Rvalue::Class((**object).clone()))
+            }
+            mir::InterfaceValue::FromNullableClass { object, .. } => {
+                self.rvalue_borrow_home(&mir::Rvalue::NullableClass((**object).clone()))
+            }
+            mir::InterfaceValue::FromCollection { value, .. } => self.rvalue_borrow_home(value),
+            _ => Err(malformed_mir(
+                "borrow-returning interface source is not an addressable Doria place",
+            )),
+        }
+    }
+
+    fn nullable_interface_borrow_home(
+        &self,
+        source: &mir::NullableInterfaceValue,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        match source {
+            mir::NullableInterfaceValue::Local { local, .. } => {
+                self.borrow_home_argument(self.closure_source_home(*local)?)
+            }
+            mir::NullableInterfaceValue::Property {
+                object, property, ..
+            } => self.property_borrow_home(*object, *property),
+            mir::NullableInterfaceValue::Upcast { source, .. } => {
+                self.nullable_interface_borrow_home(&source.value)
+            }
+            mir::NullableInterfaceValue::Present(source) => self.interface_borrow_home(source),
+            _ => Err(malformed_mir(
+                "borrow-returning nullable interface source is not an addressable Doria place",
             )),
         }
     }
@@ -3052,11 +3876,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         operand: &mir::Operand,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         match operand {
-            mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => {
-                self.closure_source_address(*local)
+            mir::Operand::Local(local) => {
+                self.borrow_home_argument(self.closure_source_home(*local)?)
+            }
+            mir::Operand::NullablePayload(local) => {
+                self.borrow_home_argument(self.nullable_payload_borrow_home(*local)?)
             }
             mir::Operand::Property { object, property } => {
-                self.lower_property_address(*object, *property)
+                self.property_borrow_home(*object, *property)
             }
             _ => Err(malformed_mir(
                 "borrow-returning call source is not an addressable scalar place",
@@ -3075,6 +3902,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .collect::<Vec<_>>();
         for (local, field) in bindings {
             let slot = local_slot(&self.local_slots, local)?;
+            if native_closure_abi::borrow_home_type_key(field.ty) != 0 {
+                self.sync_nominal_borrow_home(
+                    BorrowHome {
+                        address: field.address,
+                        source_type: field.source_type,
+                    },
+                    slot,
+                    field.ty,
+                )?;
+                continue;
+            }
             match field.ty {
                 ty if ty.shared_interface().is_some() => {
                     let ty = llvm_type(self.context, self.target_data, self.program, ty);
@@ -3201,6 +4039,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         span: crate::source::Span,
     ) -> Result<(), BackendError> {
         self.set_active_panic_site(span)?;
+        debug_assert!(self.deferred_class_temporary_drops.is_empty());
+        self.defer_class_temporary_drops = true;
         let function_type = function_type_in(self.program, function_type_id)?.clone();
         if function_type.has_checked_transport() {
             return Err(malformed_mir(
@@ -3222,7 +4062,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 result.ok_or_else(|| malformed_mir("indirect payload call has no result"))?;
             values.push(local_slot(&self.local_slots, result)?.into());
         }
-        if let Some(home) = self.indirect_call_borrow_home(&function_type, args)? {
+        if let Some(home) =
+            self.indirect_call_borrow_home(&function_type, args, &lowered.lowered)?
+        {
+            values.push(home.into());
+        }
+        if let Some(home) = self.result_borrow_home_out(
+            function_type.return_type,
+            function_type.return_borrow,
+            result,
+        )? {
             values.push(home.into());
         }
         if let Some(environment) = environment {
@@ -3260,6 +4109,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 })?,
             )?;
         }
+        self.defer_class_temporary_drops = false;
+        self.flush_deferred_class_temporary_drops()?;
         build(
             self.builder
                 .build_unconditional_branch(block_for(&self.blocks, continuation)?),
@@ -3281,6 +4132,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         span: crate::source::Span,
     ) -> Result<(), BackendError> {
         self.set_active_panic_site(span)?;
+        debug_assert!(self.deferred_class_temporary_drops.is_empty());
+        self.defer_class_temporary_drops = true;
         let function_type = function_type_in(self.program, function_type_id)?.clone();
         if !function_type.has_checked_transport() {
             return Err(malformed_mir(
@@ -3297,7 +4150,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             values.push(local_slot(&self.local_slots, result)?.into());
         }
         values.push(local_slot(&self.local_slots, error)?.into());
-        if let Some(home) = self.indirect_call_borrow_home(&function_type, args)? {
+        if let Some(home) =
+            self.indirect_call_borrow_home(&function_type, args, &lowered.lowered)?
+        {
+            values.push(home.into());
+        }
+        if let Some(home) = self.result_borrow_home_out(
+            function_type.return_type,
+            function_type.return_borrow,
+            result,
+        )? {
             values.push(home.into());
         }
         if let Some(environment) = environment {
@@ -3329,6 +4191,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 })?,
             )?;
         }
+        self.defer_class_temporary_drops = false;
+        self.flush_deferred_class_temporary_drops()?;
         let current = current_function(&self.builder)?;
         let failed_status = self
             .context
@@ -3457,7 +4321,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.defer_or_drop_owned_shared_temporary(value, shared)?;
                 } else if let Some((payload, nullable)) = args[index].owned_temporary_payload_enum()
                 {
-                    self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
+                    self.defer_or_drop_payload_enum_temporary(
+                        value.into_pointer_value(),
+                        payload,
+                        nullable,
+                    )?;
+                } else if args[index].mixed_ownership().has_shell() {
+                    self.defer_or_cleanup_mixed_temporary(
+                        value.into_pointer_value(),
+                        args[index].mixed_ownership(),
+                    )?;
                 }
             }
         }
@@ -3625,7 +4498,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .first()
                     .ok_or_else(|| malformed_mir("grouped local assignment has no targets"))?;
                 let ty = local_in(self.function, first)?.ty;
-                let value = self.lower_rvalue(value)?;
+                let evaluated = self.lower_rvalue(value)?;
+                let homes = targets
+                    .iter()
+                    .map(|target| self.assignment_borrow_home(*target, value, evaluated))
+                    .collect::<Result<Vec<_>, BackendError>>()?;
+                let value = evaluated;
                 for (index, target) in targets.iter().enumerate() {
                     let value = if index == 0 {
                         value
@@ -3644,6 +4522,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         }
                     };
                     let destination = local_slot(&self.local_slots, *target)?;
+                    if let Some((descriptor, home)) = homes[index] {
+                        self.store_borrow_home(descriptor, home)?;
+                    }
                     if let mir::Type::PayloadEnum(payload)
                     | mir::Type::NullablePayloadEnum(payload) = ty
                     {
@@ -3791,12 +4672,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         }
                         _ => None,
                     };
-                let value = match (value, self.stack_classes.get(target).copied()) {
+                let evaluated = match (value, self.stack_classes.get(target).copied()) {
                     (mir::Rvalue::Class(expression), Some(storage)) => {
                         self.lower_class_expression_with_storage(expression, Some(storage))?
                     }
                     _ => self.lower_rvalue(value)?,
                 };
+                let home = self.assignment_borrow_home(*target, value, evaluated)?;
+                let value = evaluated;
+                if let Some((descriptor, home)) = home {
+                    self.store_borrow_home(descriptor, home)?;
+                }
                 if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
                     local.ty
                 {
@@ -4217,6 +5103,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.drop_function_carrier(old_function)?;
                 }
             }
+            mir::Statement::CleanupConstructorPhase { object, class } => {
+                let value = build(self.builder.build_load(
+                    llvm_type(
+                        self.context,
+                        self.target_data,
+                        self.program,
+                        mir::Type::Class(*class),
+                    ),
+                    local_slot(&self.local_slots, *object)?,
+                    "constructor.cleanup.receiver",
+                ))?;
+                let (object, _) = self.class_parts(value, *class)?;
+                self.drop_class_value_impl(object, *class, false, false)?;
+            }
             mir::Statement::DropClass { local, .. } => {
                 let (mir::Type::Class(class) | mir::Type::NullableClass(class)) =
                     local_in(self.function, *local)?.ty
@@ -4516,6 +5416,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 debug_assert!(self.deferred_class_temporary_drops.is_empty());
                 self.defer_class_temporary_drops = true;
                 let value = self.lower_rvalue(expression)?;
+                if let Some(destination) = self.result_borrow_home_address {
+                    let home = self.evaluated_borrow_home(expression, value)?;
+                    self.store_borrow_home(destination, home)?;
+                }
                 self.defer_class_temporary_drops = false;
                 self.flush_deferred_class_temporary_drops()?;
                 if let Some(destination) = self
@@ -4675,6 +5579,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 span,
             } => {
                 self.set_active_panic_site(*span)?;
+                debug_assert!(self.deferred_class_temporary_drops.is_empty());
+                self.defer_class_temporary_drops = true;
                 let callee_definition = function_in(self.program, *function)?;
                 let lowered = self.lower_call_arguments(args)?;
                 let mut values = Vec::with_capacity(lowered.values.len() + 3);
@@ -4683,9 +5589,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     values.push(local_slot(&self.local_slots, *result)?.into());
                 }
                 values.push(local_slot(&self.local_slots, *error)?.into());
-                if let Some(home) =
-                    self.direct_call_borrow_home(callee_definition, args, false, None)?
-                {
+                if let Some(home) = self.direct_call_borrow_home(
+                    callee_definition,
+                    args,
+                    &lowered.lowered,
+                    false,
+                    None,
+                )? {
+                    values.push(home.into());
+                }
+                if let Some(home) = self.result_borrow_home_out(
+                    callee_definition.return_type,
+                    callee_definition.return_borrow,
+                    *result,
+                )? {
                     values.push(home.into());
                 }
                 if callee_definition.uses_virtual_receiver_abi() {
@@ -4772,6 +5689,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| malformed_mir("checked call produced no status"))?
                     .into_int_value();
                 self.cleanup_call_arguments(*function, args, false, &lowered)?;
+                self.defer_class_temporary_drops = false;
+                self.flush_deferred_class_temporary_drops()?;
 
                 let current = current_function(&self.builder)?;
                 let failure_status = self
@@ -4818,6 +5737,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 span,
             } => {
                 self.set_active_panic_site(*span)?;
+                debug_assert!(self.deferred_class_temporary_drops.is_empty());
+                self.defer_class_temporary_drops = true;
                 let (object, lowered) =
                     self.lower_class_allocation(*class, properties, args, None)?;
                 let callee = *self.functions.get(constructor.0).ok_or_else(|| {
@@ -4867,6 +5788,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| malformed_mir("checked constructor produced no status"))?
                     .into_int_value();
                 self.cleanup_constructor_arguments(*constructor, properties, args, &lowered)?;
+                self.defer_class_temporary_drops = false;
+                let drops = std::mem::take(&mut self.deferred_class_temporary_drops);
 
                 let current = current_function(&self.builder)?;
                 let success_store = self
@@ -4905,6 +5828,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.builder
                         .build_store(local_slot(&self.local_slots, *result)?, result_value),
                 )?;
+                self.emit_deferred_class_temporary_drops(&drops)?;
                 build(
                     self.builder
                         .build_unconditional_branch(block_for(&self.blocks, *success)?),
@@ -4924,7 +5848,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
 
                 self.builder.position_at_end(failed_cleanup);
-                self.drop_failed_class_value(object, *class)?;
+                // The constructor owns phase cleanup; the allocating caller
+                // frees the complete payload exactly once on failure.
+                self.call_runtime(
+                    CLASS_FREE,
+                    &[object.get_type().into()],
+                    None,
+                    &[object.into()],
+                )?;
+                self.emit_deferred_class_temporary_drops(&drops)?;
                 build(
                     self.builder
                         .build_unconditional_branch(block_for(&self.blocks, *failure)?),
@@ -5688,6 +6620,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::PayloadEnumExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        let value = self.lower_payload_enum_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(
+            &mir::Rvalue::PayloadEnum(expression.clone()),
+            value.into(),
+        )?;
+        Ok(value)
+    }
+
+    fn lower_payload_enum_expression_inner(
+        &mut self,
+        expression: &mir::PayloadEnumExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
         let ty = expression.ty();
         match expression {
             mir::PayloadEnumExpression::Construct { case, fields, .. } => {
@@ -5764,6 +6708,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.builder.position_at_end(use_left);
                 let left_payload =
                     self.byte_offset(left, ty.nullable_payload_offset, "payload.coalesce.value")?;
+                if let Some(home) = self.evaluated_borrow_homes.get(&left.into()).copied() {
+                    self.evaluated_borrow_homes
+                        .insert(left_payload.into(), home);
+                }
                 build(self.builder.build_unconditional_branch(done))?;
                 let left_end = self.builder.get_insert_block().expect("payload left block");
                 self.builder.position_at_end(use_right);
@@ -5779,6 +6727,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 phi.add_incoming(&[(&left_payload, left_end), (&right, right_end)]);
                 let result = phi.as_basic_value().into_pointer_value();
                 if matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+                    self.merge_evaluated_borrow_homes(
+                        result.into(),
+                        &[(left_payload.into(), left_end), (right.into(), right_end)],
+                    )?;
                     Ok(result)
                 } else {
                     let owned = self.entry_payload_alloca(ty, false, "payload.coalesce.owned")?;
@@ -5793,6 +6745,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     fn lower_nullable_payload_enum_expression(
+        &mut self,
+        expression: &mir::NullablePayloadEnumExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let value = self.lower_nullable_payload_enum_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(
+            &mir::Rvalue::NullablePayloadEnum(expression.clone()),
+            value.into(),
+        )?;
+        Ok(value)
+    }
+
+    fn lower_nullable_payload_enum_expression_inner(
         &mut self,
         expression: &mir::NullablePayloadEnumExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
@@ -5824,6 +6788,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.builder
                         .build_memcpy(destination, ty.align, payload, ty.align, size),
                 )?;
+                if let Some(home) = self.evaluated_borrow_homes.get(&payload.into()).copied() {
+                    self.evaluated_borrow_homes.insert(address.into(), home);
+                }
                 Ok(address)
             }
             mir::NullablePayloadEnumExpression::Use { place, mode, .. } => {
@@ -5900,6 +6867,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 phi.add_incoming(&[(&left, left_end), (&right, right_end)]);
                 let result = phi.as_basic_value().into_pointer_value();
                 if matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+                    self.merge_evaluated_borrow_homes(
+                        result.into(),
+                        &[(left.into(), left_end), (right.into(), right_end)],
+                    )?;
                     Ok(result)
                 } else {
                     let owned = self.entry_payload_alloca(ty, true, "nullable.payload.owned")?;
@@ -5944,6 +6915,55 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
+        if matches!(mode, mir::PayloadEnumUseMode::Borrow) && !access.removes_element() {
+            let address =
+                self.collection_borrow_slot(collection, key_word, key_type, access, false)?;
+            let result = self.entry_payload_alloca(ty, true, "aggregate.nullable.borrow")?;
+            self.zero_payload_bytes(result, ty, true)?;
+            let function = current_function(&self.builder)?;
+            let present_block = self
+                .context
+                .append_basic_block(function, "aggregate.borrow.present");
+            let done = self
+                .context
+                .append_basic_block(function, "aggregate.borrow.loaded");
+            let found = build(
+                self.builder
+                    .build_is_not_null(address, "aggregate.borrow.found"),
+            )?;
+            build(
+                self.builder
+                    .build_conditional_branch(found, present_block, done),
+            )?;
+            self.builder.position_at_end(present_block);
+            if stored_nullable {
+                self.copy_payload_bytes(result, address, ty, true)?;
+            } else {
+                build(
+                    self.builder
+                        .build_store(result, self.context.i8_type().const_int(1, false)),
+                )?;
+                let destination = self.byte_offset(
+                    result,
+                    ty.nullable_payload_offset,
+                    "aggregate.borrow.payload",
+                )?;
+                self.copy_payload_bytes(destination, address, ty, false)?;
+            }
+            build(self.builder.build_unconditional_branch(done))?;
+            self.builder.position_at_end(done);
+            self.evaluated_borrow_homes.insert(
+                result.into(),
+                BorrowHome {
+                    address,
+                    source_type: self.borrow_home_type_key(definition.value),
+                },
+            );
+            if key_type == mir::Type::String {
+                self.release_string(key_value.into_pointer_value())?;
+            }
+            return Ok(result);
+        }
         let raw = self.entry_payload_alloca(ty, stored_nullable, "aggregate.nullable.raw")?;
         self.zero_payload_bytes(raw, ty, stored_nullable)?;
         let found = self.entry_alloca(self.context.i8_type(), "aggregate.nullable.found")?;
@@ -6123,7 +7143,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 };
                 let index_word = self.value_to_collection_word(index_value, index_type)?;
                 let pointer = self.context.ptr_type(AddressSpace::default());
-                let byte = self.context.i8_type();
                 if *remove {
                     let destination =
                         self.entry_payload_alloca(ty, nullable, "aggregate.collection.remove")?;
@@ -6160,29 +7179,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         "payload enum collection move requires a removing operation",
                     ));
                 }
-                (
-                    self.call_runtime(
-                        COLLECTION_AGGREGATE_VALUE_AT,
-                        &[
-                            pointer.into(),
-                            pointer.into(),
-                            self.context.i64_type().into(),
-                            byte.into(),
-                            byte.into(),
-                        ],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            collection_value.into(),
-                            index_word.into(),
-                            byte.const_int(u64::from(*positional), false).into(),
-                            self.collection_compare_kind(index_type)?.into(),
-                        ],
-                    )?
-                    .ok_or_else(|| backend_failure("aggregate collection read produced no slot"))?
-                    .into_pointer_value(),
-                    None,
-                )
+                let address = self.collection_borrow_slot(
+                    collection_value,
+                    index_word,
+                    index_type,
+                    mir::NullableCollectionAccess::Index,
+                    *positional,
+                )?;
+                if index_type == mir::Type::String {
+                    self.release_string(index_value.into_pointer_value())?;
+                }
+                if matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+                    self.evaluated_borrow_homes.insert(
+                        address.into(),
+                        BorrowHome {
+                            address,
+                            source_type: self.borrow_home_type_key(definition.value),
+                        },
+                    );
+                }
+                (address, None)
             }
             mir::PayloadEnumPlace::MixedPayload { .. } => unreachable!(),
         };
@@ -7109,8 +8125,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             "borrow capture storage disagrees with environment layout",
                         ));
                     }
-                    let source = self.closure_source_address(*local)?;
-                    build(self.builder.build_store(address, source))?;
+                    let source = self.closure_source_home(*local)?;
+                    self.store_borrow_home(address, source)?;
                 }
                 mir::ClosureCaptureOperand::CopyValue(value)
                 | mir::ClosureCaptureOperand::MoveValue(value) => {
@@ -7188,7 +8204,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::Rvalue,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
-        match expression {
+        let value = match expression {
             mir::Rvalue::Function(value) => Ok(self.lower_function_expression(value)?.into()),
             mir::Rvalue::NullableFunction(value) => {
                 Ok(self.lower_nullable_function_expression(value)?.into())
@@ -7249,7 +8265,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullablePayloadEnum(value) => {
                 Ok(self.lower_nullable_payload_enum_expression(value)?.into())
             }
-        }
+        }?;
+        self.remember_explicit_borrow_home(expression, value)?;
+        Ok(value)
     }
 
     fn lower_interface_upcast(
@@ -7308,7 +8326,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             phi.add_incoming(&[(&pointer.const_null(), entry), (&view, some)]);
             view = phi.as_basic_value().into_pointer_value();
         }
-        self.error_value(object, view)
+        let result = self.error_value(object, view)?;
+        self.forward_evaluated_borrow_home(value.into(), result.into());
+        Ok(result)
     }
 
     fn lower_interface_view(
@@ -7503,7 +8523,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "collection.view",
                 ))?
                 .into_pointer_value();
-                self.error_value(object, table)
+                let result = self.error_value(object, table)?;
+                self.forward_evaluated_borrow_home(object.into(), result.into());
+                Ok(result)
             }
             mir::InterfaceValue::NewCollectionIterator { source, vtable } => {
                 let source_value = self.collection_pointer(*source)?;
@@ -7530,7 +8552,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let class = object.class();
                 let value = self.lower_class_expression(object)?;
                 let (object, dynamic) = self.class_parts(value, class)?;
-                self.error_value(object, self.class_interface_vtable(dynamic, *vtable)?)
+                let result =
+                    self.error_value(object, self.class_interface_vtable(dynamic, *vtable)?)?;
+                self.forward_evaluated_borrow_home(value, result.into());
+                Ok(result)
             }
             mir::InterfaceValue::FromNullableClass { object, vtable } => {
                 let class = object.class();
@@ -7545,7 +8570,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "error.nullable.descriptor",
                 ))?
                 .into_pointer_value();
-                self.error_value(object, descriptor)
+                let result = self.error_value(object, descriptor)?;
+                self.forward_evaluated_borrow_home(value, result.into());
+                Ok(result)
             }
             mir::InterfaceValue::Property {
                 object,
@@ -7680,39 +8707,32 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             slot
         } else {
-            self.call_runtime(
-                COLLECTION_AGGREGATE_VALUE_AT,
-                &[
-                    pointer.into(),
-                    pointer.into(),
-                    self.context.i64_type().into(),
-                    self.context.i8_type().into(),
-                    self.context.i8_type().into(),
-                ],
-                Some(pointer.into()),
-                &[
-                    self.current_frame.into(),
-                    collection_value.into(),
-                    index_word.into(),
-                    self.context
-                        .i8_type()
-                        .const_int(u64::from(positional), false)
-                        .into(),
-                    self.collection_compare_kind(index_type)?.into(),
-                ],
+            self.collection_borrow_slot(
+                collection_value,
+                index_word,
+                index_type,
+                mir::NullableCollectionAccess::Index,
+                positional,
             )?
-            .ok_or_else(|| backend_failure("Error collection read produced no slot"))?
-            .into_pointer_value()
         };
         if index_type == mir::Type::String {
             self.release_string(index_value.into_pointer_value())?;
         }
-        Ok(build(self.builder.build_load(
+        let value = build(self.builder.build_load(
             error_carrier_type(self.context),
             address,
             "error.collection.value",
-        ))?
-        .into_struct_value())
+        ))?;
+        if !remove {
+            self.evaluated_borrow_homes.insert(
+                value,
+                BorrowHome {
+                    address,
+                    source_type: self.borrow_home_type_key(definition.value),
+                },
+            );
+        }
+        Ok(value.into_struct_value())
     }
 
     fn lower_function_collection_index(
@@ -7770,39 +8790,32 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             slot
         } else {
-            self.call_runtime(
-                COLLECTION_AGGREGATE_VALUE_AT,
-                &[
-                    pointer.into(),
-                    pointer.into(),
-                    self.context.i64_type().into(),
-                    self.context.i8_type().into(),
-                    self.context.i8_type().into(),
-                ],
-                Some(pointer.into()),
-                &[
-                    self.current_frame.into(),
-                    collection_value.into(),
-                    index_word.into(),
-                    self.context
-                        .i8_type()
-                        .const_int(u64::from(positional), false)
-                        .into(),
-                    self.collection_compare_kind(index_type)?.into(),
-                ],
+            self.collection_borrow_slot(
+                collection_value,
+                index_word,
+                index_type,
+                mir::NullableCollectionAccess::Index,
+                positional,
             )?
-            .ok_or_else(|| backend_failure("function collection read produced no slot"))?
-            .into_pointer_value()
         };
         if index_type == mir::Type::String {
             self.release_string(index_value.into_pointer_value())?;
         }
-        Ok(build(self.builder.build_load(
+        let value = build(self.builder.build_load(
             closure_carrier_type(self.context),
             address,
             "function.collection.value",
-        ))?
-        .into_struct_value())
+        ))?;
+        if !remove {
+            self.evaluated_borrow_homes.insert(
+                value,
+                BorrowHome {
+                    address,
+                    source_type: self.borrow_home_type_key(definition.value),
+                },
+            );
+        }
+        Ok(value.into_struct_value())
     }
 
     fn lower_nullable_error_collection_get(
@@ -7833,6 +8846,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection_value = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
+        if !access.removes_element() {
+            let address =
+                self.collection_borrow_slot(collection_value, key_word, key_type, access, false)?;
+            let value =
+                self.load_borrowed_collection_slot(address, definition.value, definition.value)?;
+            if key_type == mir::Type::String {
+                self.release_string(key_value.into_pointer_value())?;
+            }
+            return Ok(value.into_struct_value());
+        }
         let result = self.entry_alloca(
             error_carrier_type(self.context),
             "error.collection.optional",
@@ -7928,6 +8951,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection_value = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
+        if !access.removes_element() {
+            let address =
+                self.collection_borrow_slot(collection_value, key_word, key_type, access, false)?;
+            let value =
+                self.load_borrowed_collection_slot(address, definition.value, definition.value)?;
+            if key_type == mir::Type::String {
+                self.release_string(key_value.into_pointer_value())?;
+            }
+            return Ok(value.into_struct_value());
+        }
         let result = self.entry_alloca(
             closure_carrier_type(self.context),
             "function.collection.optional",
@@ -8882,6 +9915,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::CollectionExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        let value = self.lower_collection_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(
+            &mir::Rvalue::Collection(expression.clone()),
+            value.into(),
+        )?;
+        Ok(value)
+    }
+
+    fn lower_collection_expression_inner(
+        &mut self,
+        expression: &mir::CollectionExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         match expression {
@@ -9421,6 +10466,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::NullableCollectionExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        let value = self.lower_nullable_collection_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(
+            &mir::Rvalue::NullableCollection(expression.clone()),
+            value.into(),
+        )?;
+        Ok(value)
+    }
+
+    fn lower_nullable_collection_expression_inner(
+        &mut self,
+        expression: &mir::NullableCollectionExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
             mir::NullableCollectionExpression::Null(_) => Ok(pointer.const_null()),
@@ -9497,6 +10554,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .build_phi(pointer, "nullable-collection.coalesce"),
                 )?;
                 result.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                self.merge_evaluated_borrow_homes(
+                    result.as_basic_value(),
+                    &[(left.into(), some_end), (right.into(), none_end)],
+                )?;
                 if !transfer && (left_owned || right_owned) {
                     let temporary = build(
                         self.builder
@@ -9515,6 +10576,92 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 Ok(result.as_basic_value().into_pointer_value())
             }
         }
+    }
+
+    fn collection_borrow_slot(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        key: IntValue<'ctx>,
+        key_type: mir::Type,
+        access: mir::NullableCollectionAccess,
+        positional: bool,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let byte = self.context.i8_type();
+        let access = crate::native_abi::collection_borrow_access_code(access).ok_or_else(|| {
+            malformed_mir("removing collection access cannot return a borrowed slot")
+        })?;
+        self.call_runtime(
+            crate::native_abi::COLLECTION_BORROW_SLOT,
+            &[
+                pointer.into(),
+                pointer.into(),
+                self.context.i64_type().into(),
+                byte.into(),
+                byte.into(),
+                byte.into(),
+            ],
+            Some(pointer.into()),
+            &[
+                self.current_frame.into(),
+                collection.into(),
+                key.into(),
+                self.collection_compare_kind(key_type)?.into(),
+                byte.const_int(u64::from(access), false).into(),
+                byte.const_int(u64::from(positional), false).into(),
+            ],
+        )?
+        .ok_or_else(|| backend_failure("collection borrow access produced no slot"))
+        .map(BasicValueEnum::into_pointer_value)
+    }
+
+    fn load_borrowed_collection_slot(
+        &mut self,
+        address: PointerValue<'ctx>,
+        stored: mir::Type,
+        expected: mir::Type,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let function = current_function(&self.builder)?;
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| malformed_mir("collection borrow has no block"))?;
+        let some = self
+            .context
+            .append_basic_block(function, "collection.borrow.present");
+        let done = self
+            .context
+            .append_basic_block(function, "collection.borrow.loaded");
+        let present = build(
+            self.builder
+                .build_is_not_null(address, "collection.borrow.found"),
+        )?;
+        build(self.builder.build_conditional_branch(present, some, done))?;
+        self.builder.position_at_end(some);
+        let value = build(self.builder.build_load(
+            llvm_type(self.context, self.target_data, self.program, stored),
+            address,
+            "collection.borrow.value",
+        ))?;
+        let value = self.project_borrow_home_value(value, stored, expected)?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("collection borrow present block");
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        let ty = llvm_type(self.context, self.target_data, self.program, expected);
+        let value_phi = build(self.builder.build_phi(ty, "collection.borrow.result"))?;
+        value_phi.add_incoming(&[(&ty.const_zero(), entry), (&value, some_end)]);
+        let result = value_phi.as_basic_value();
+        self.evaluated_borrow_homes.insert(
+            result,
+            BorrowHome {
+                address,
+                source_type: self.borrow_home_type_key(stored),
+            },
+        );
+        Ok(result)
     }
 
     fn lower_collection_index(
@@ -9550,12 +10697,27 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?
                 .ok_or_else(|| backend_failure("byte index produced no result"));
         }
-        let index_type = definition
-            .key
-            .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
-                IntegerType::Int64,
-            )));
+        let index_type = match (positional, definition.key) {
+            (false, Some(key)) => key,
+            _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        };
         let index_value = self.lower_rvalue(index)?;
+        if !remove && definition.value.has_move_ownership() {
+            let key = self.value_to_collection_word(index_value, index_type)?;
+            let address = self.collection_borrow_slot(
+                collection_value,
+                key,
+                index_type,
+                mir::NullableCollectionAccess::Index,
+                positional,
+            )?;
+            let value =
+                self.load_borrowed_collection_slot(address, definition.value, definition.value)?;
+            if index_type == mir::Type::String {
+                self.release_string(index_value.into_pointer_value())?;
+            }
+            return Ok(value);
+        }
         let word = if definition.key.is_some() && !positional {
             if remove {
                 return Err(malformed_mir(
@@ -9710,34 +10872,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             slot
         } else {
-            self.call_runtime(
-                COLLECTION_AGGREGATE_VALUE_AT,
-                &[
-                    pointer.into(),
-                    pointer.into(),
-                    self.context.i64_type().into(),
-                    self.context.i8_type().into(),
-                    self.context.i8_type().into(),
-                ],
-                Some(pointer.into()),
-                &[
-                    self.current_frame.into(),
-                    collection_value.into(),
-                    index_word.into(),
-                    self.context
-                        .i8_type()
-                        .const_int(u64::from(positional), false)
-                        .into(),
-                    self.collection_compare_kind(index_type)?.into(),
-                ],
+            self.collection_borrow_slot(
+                collection_value,
+                index_word,
+                index_type,
+                mir::NullableCollectionAccess::Index,
+                positional,
             )?
-            .ok_or_else(|| backend_failure("aggregate collection read produced no slot"))?
-            .into_pointer_value()
         };
         if index_type == mir::Type::String {
             self.release_string(index_value.into_pointer_value())?;
         }
-        build(self.builder.build_load(
+        let value = build(self.builder.build_load(
             llvm_type(
                 self.context,
                 self.target_data,
@@ -9746,7 +10892,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ),
             address,
             "aggregate.collection.value",
-        ))
+        ))?;
+        if !remove {
+            self.evaluated_borrow_homes.insert(
+                value,
+                BorrowHome {
+                    address,
+                    source_type: self.borrow_home_type_key(definition.value),
+                },
+            );
+        }
+        Ok(value)
     }
 
     fn lower_nullable_two_word_collection_get(
@@ -9775,6 +10931,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection_value = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
+        if !access.removes_element() {
+            let address =
+                self.collection_borrow_slot(collection_value, key_word, key_type, access, false)?;
+            let value = self.load_borrowed_collection_slot(address, definition.value, result_ty)?;
+            if key_type == mir::Type::String {
+                self.release_string(key_value.into_pointer_value())?;
+            }
+            return Ok(value);
+        }
         let result_type = llvm_type(self.context, self.target_data, self.program, result_ty);
         let result = self.entry_alloca(result_type, "class.collection.optional")?;
         build(self.builder.build_store(result, result_type.const_zero()))?;
@@ -9915,6 +11080,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
+        if expected.has_move_ownership() && !access.removes_element() {
+            let address =
+                self.collection_borrow_slot(collection, key_word, key_type, access, false)?;
+            let value = self.load_borrowed_collection_slot(address, definition.value, expected)?;
+            let present = build(
+                self.builder
+                    .build_is_not_null(value.into_pointer_value(), "collection.borrow.has-value"),
+            )?;
+            let present = build(self.builder.build_int_z_extend(
+                present,
+                self.context.ptr_sized_int_type(self.target_data, None),
+                "collection.borrow.present-word",
+            ))?;
+            if key_type == mir::Type::String {
+                self.release_string(key_value.into_pointer_value())?;
+            }
+            return Ok((present, value));
+        }
         let found = self.entry_alloca(self.context.i8_type(), "dictionary.get.found")?;
         let removed_key = self.entry_alloca(self.context.i64_type(), "dictionary.removed.key")?;
         if access == mir::NullableCollectionAccess::Index && !definition.kind.is_dictionary() {
@@ -12043,7 +13226,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::ClassExpression,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
-        self.lower_class_expression_with_storage(expression, None)
+        let value = self.lower_class_expression_with_storage(expression, None)?;
+        self.remember_explicit_borrow_home(&mir::Rvalue::Class(expression.clone()), value)?;
+        Ok(value)
     }
 
     fn lower_class_expression_with_storage(
@@ -12236,7 +13421,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     _ => return Err(malformed_mir("class call has another return type")),
                 };
                 let (object, descriptor) = self.class_parts(value, actual)?;
-                self.class_value_for_static_type(object, descriptor, *class, actual)
+                let result =
+                    self.class_value_for_static_type(object, descriptor, *class, actual)?;
+                self.forward_evaluated_borrow_home(value, result);
+                Ok(result)
             }
             mir::ClassExpression::New {
                 class,
@@ -12327,6 +13515,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let phi = build(self.builder.build_phi(ty, "class.coalesce"))?;
                 phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
                 let result = phi.as_basic_value();
+                self.merge_evaluated_borrow_homes(result, &[(left, some_end), (right, none_end)])?;
                 if !transfer && (left_owned || right_owned) {
                     let temporary = build(self.builder.build_phi(ty, "class.coalesce.temporary"))?;
                     let null = ty.const_zero();
@@ -12548,24 +13737,41 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_pointer_value();
                 self.shared_value(control, view)
             }
-            O::Null => Ok(result_type.const_zero()),
+            O::Null => {
+                let value = result_type.const_zero();
+                self.evaluated_borrow_homes
+                    .insert(value, self.absent_borrow_home());
+                Ok(value)
+            }
             O::Present(value) => self.lower_shared_expression(value),
             O::Local { local, transfer } => {
                 let slot = local_slot(&self.local_slots, local)?;
                 let value = build(self.builder.build_load(result_type, slot, "shared.local"))?;
                 if transfer {
                     build(self.builder.build_store(slot, result_type.const_zero()))?;
+                } else {
+                    self.evaluated_borrow_homes
+                        .insert(value, self.closure_source_home(local)?);
                 }
                 Ok(value)
             }
             O::Property { object, property } => {
                 let address = self.lower_property_address(object, property)?;
-                build(
-                    self.builder
-                        .build_load(result_type, address, "shared.property"),
-                )
+                let value = build(self.builder.build_load(
+                    result_type,
+                    address,
+                    "shared.property",
+                ))?;
+                self.evaluated_borrow_homes.insert(
+                    value,
+                    BorrowHome {
+                        address,
+                        source_type: self.borrow_home_type_key(expression.ty()),
+                    },
+                );
+                Ok(value)
             }
-            O::Call { function, args } => self
+            O::Call { function, args, .. } => self
                 .lower_call(function, args, true)?
                 .ok_or_else(|| malformed_mir("shared call produced no result")),
             O::Runtime {
@@ -12639,6 +13845,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.builder.position_at_end(done);
                 let phi = build(self.builder.build_phi(result_type, "shared.coalesce"))?;
                 phi.add_incoming(&[(&left_value, some), (&right_value, right_end)]);
+                if !expression.owned() {
+                    self.merge_evaluated_borrow_homes(
+                        phi.as_basic_value(),
+                        &[(left_value, some), (right_value, right_end)],
+                    )?;
+                }
                 if !transfer && (left.owned() || right.owned()) {
                     let cleanup = build(self.builder.build_phi(pointer, "shared.temporary"))?;
                     let left_drop = if left.owned() {
@@ -12861,6 +14073,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::NullableClassExpression,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let value = self.lower_nullable_class_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(&mir::Rvalue::NullableClass(expression.clone()), value)?;
+        Ok(value)
+    }
+
+    fn lower_nullable_class_expression_inner(
+        &mut self,
+        expression: &mir::NullableClassExpression,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         match expression {
             mir::NullableClassExpression::Null(class) => Ok(self.null_class_value(*class)),
             mir::NullableClassExpression::Class(value) => self.lower_class_expression(value),
@@ -12951,7 +14172,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     _ => return Err(malformed_mir("nullable class call has another return type")),
                 };
                 let (object, descriptor) = self.class_parts(value, actual)?;
-                self.class_value_for_static_type(object, descriptor, *class, actual)
+                let result =
+                    self.class_value_for_static_type(object, descriptor, *class, actual)?;
+                self.forward_evaluated_borrow_home(value, result);
+                Ok(result)
             }
             mir::NullableClassExpression::NullSafeProperty {
                 class,
@@ -12968,6 +14192,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     *class,
                     |lowerer, receiver| {
                         let property_ty = property_definition(lowerer.program, *property)?.ty;
+                        let address =
+                            lowerer.lower_property_address_from_value(receiver, *property)?;
                         let value = build(lowerer.builder.build_load(
                             llvm_type(
                                 lowerer.context,
@@ -12975,7 +14201,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 lowerer.program,
                                 property_ty,
                             ),
-                            lowerer.lower_property_address_from_value(receiver, *property)?,
+                            address,
                             "null-safe.class.property",
                         ))?;
                         let actual = match property_ty {
@@ -12987,7 +14213,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             }
                         };
                         let (object, descriptor) = lowerer.class_parts(value, actual)?;
-                        lowerer.class_value_for_static_type(object, descriptor, *class, actual)
+                        let result = lowerer
+                            .class_value_for_static_type(object, descriptor, *class, actual)?;
+                        lowerer.evaluated_borrow_homes.insert(
+                            result,
+                            BorrowHome {
+                                address,
+                                source_type: lowerer.borrow_home_type_key(property_ty),
+                            },
+                        );
+                        Ok(result)
                     },
                 )
             }
@@ -13006,13 +14241,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     receiver_class,
                     owned_receiver,
                     *class,
-                    |lowerer, receiver| {
-                        let receiver = lowerer.class_value_for_static_type(
-                            receiver,
-                            None,
-                            receiver_class,
-                            receiver_class,
-                        )?;
+                    |lowerer, _| {
+                        // Nullable and non-null class carriers share a layout.
+                        // Reuse the evaluated carrier so its dynamic descriptor
+                        // and exact borrow home survive null-safe dispatch.
                         lowerer
                             .lower_method_call(receiver, *function, args, true)?
                             .ok_or_else(|| malformed_mir("null-safe class call produced no result"))
@@ -13065,6 +14297,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 );
                 let result = build(self.builder.build_phi(ty, "nullable-class.coalesce"))?;
                 result.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                self.merge_evaluated_borrow_homes(
+                    result.as_basic_value(),
+                    &[(left, some_end), (right, none_end)],
+                )?;
                 if !transfer && (left_owned || right_owned) {
                     let temporary = build(
                         self.builder
@@ -13113,6 +14349,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ) -> Result<BasicValueEnum<'ctx>, BackendError>,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         let object = self.class_object(receiver, receiver_class)?;
+        self.forward_evaluated_borrow_home(receiver, object.into());
         if let Some(class) = owned_receiver {
             self.defer_or_drop_class_temporary(receiver, class)?;
         }
@@ -13140,6 +14377,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .expect("null-safe class some block");
         self.builder.position_at_end(none);
         let absent = self.null_class_value(result_class);
+        self.evaluated_borrow_homes
+            .insert(absent, self.absent_borrow_home());
         build(self.builder.build_unconditional_branch(done))?;
         let none_end = self
             .builder
@@ -13156,6 +14395,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             "null-safe.class.value",
         ))?;
         phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
+        self.merge_evaluated_borrow_homes(
+            phi.as_basic_value(),
+            &[(value, some_end), (absent, none_end)],
+        )?;
         Ok(phi.as_basic_value())
     }
 
@@ -14558,6 +15801,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::MixedExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        let value = self.lower_mixed_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(&mir::Rvalue::Mixed(expression.clone()), value.into())?;
+        Ok(value)
+    }
+
+    fn lower_mixed_expression_inner(
+        &mut self,
+        expression: &mir::MixedExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
             mir::MixedExpression::Null => Ok(pointer.const_null()),
@@ -14843,6 +16095,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         expression: &mir::NullableMixedExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        let value = self.lower_nullable_mixed_expression_inner(expression)?;
+        self.remember_explicit_borrow_home(
+            &mir::Rvalue::NullableMixed(expression.clone()),
+            value.into(),
+        )?;
+        Ok(value)
+    }
+
+    fn lower_nullable_mixed_expression_inner(
+        &mut self,
+        expression: &mir::NullableMixedExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
             mir::NullableMixedExpression::Null => Ok(pointer.const_null()),
@@ -15017,6 +16281,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.builder.position_at_end(done);
         let phi = build(self.builder.build_phi(pointer, "nullable-mixed.coalesce"))?;
         phi.add_incoming(&[(&left, some_end), (&fallback, none_end)]);
+        if !normalize_ownership {
+            self.merge_evaluated_borrow_homes(
+                phi.as_basic_value(),
+                &[(left.into(), some_end), (fallback.into(), none_end)],
+            )?;
+        }
         Ok(phi.as_basic_value().into_pointer_value())
     }
 
@@ -15851,6 +17121,31 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     build(self.builder.build_store(*slot, pointer.const_null()))?;
                     self.drop_collection_value(value, *collection)?;
                 }
+                DeferredOwnedTemporary::PayloadEnum { slot, ty, nullable } => {
+                    let value = build(self.builder.build_load(
+                        pointer,
+                        *slot,
+                        "payload.temporary.drop",
+                    ))?
+                    .into_pointer_value();
+                    build(self.builder.build_store(*slot, pointer.const_null()))?;
+                    let function = current_function(&self.builder)?;
+                    let drop = self
+                        .context
+                        .append_basic_block(function, "payload.temporary.present");
+                    let done = self
+                        .context
+                        .append_basic_block(function, "payload.temporary.done");
+                    let present = build(
+                        self.builder
+                            .build_is_not_null(value, "payload.temporary.is-present"),
+                    )?;
+                    build(self.builder.build_conditional_branch(present, drop, done))?;
+                    self.builder.position_at_end(drop);
+                    self.drop_payload_enum_at(value, *ty, *nullable)?;
+                    build(self.builder.build_unconditional_branch(done))?;
+                    self.builder.position_at_end(done);
+                }
                 DeferredOwnedTemporary::Mixed { slot, ownership } => {
                     let value = build(self.builder.build_load(
                         pointer,
@@ -15915,6 +17210,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_store(slot, value))?;
         self.deferred_class_temporary_drops
             .push(DeferredOwnedTemporary::Collection { slot, collection });
+        Ok(())
+    }
+
+    fn defer_or_drop_payload_enum_temporary(
+        &mut self,
+        value: PointerValue<'ctx>,
+        ty: mir::PayloadEnumType,
+        nullable: bool,
+    ) -> Result<(), BackendError> {
+        if !self.defer_class_temporary_drops {
+            return self.drop_payload_enum_at(value, ty, nullable);
+        }
+        let slot = *self
+            .deferred_class_temporary_slots
+            .get(self.deferred_class_temporary_slot_cursor)
+            .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
+        self.deferred_class_temporary_slot_cursor += 1;
+        build(self.builder.build_store(slot, value))?;
+        self.deferred_class_temporary_drops
+            .push(DeferredOwnedTemporary::PayloadEnum { slot, ty, nullable });
         Ok(())
     }
 
@@ -16118,19 +17433,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.drop_class_value_impl(object, class, true, true)
     }
 
-    fn drop_failed_class_value(
-        &mut self,
-        object: PointerValue<'ctx>,
-        class: crate::class_layout::ClassId,
-    ) -> Result<(), BackendError> {
-        self.drop_class_value_impl(object, class, false, true)
-    }
-
     fn drop_class_value_impl(
         &mut self,
         object: PointerValue<'ctx>,
         class: crate::class_layout::ClassId,
-        run_destructor: bool,
+        mut run_destructor: bool,
         free_storage: bool,
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
@@ -16270,6 +17577,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
             }
             phase = phase_definition.parent;
+            // Completed ancestor phases retain their ordinary destructor.
+            run_destructor = true;
         }
         if free_storage {
             let _ = self.call_runtime(CLASS_FREE, &[pointer.into()], None, &[object.into()])?;
@@ -17714,13 +19023,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let (receiver, args) = args
                 .split_first()
                 .ok_or_else(|| malformed_mir("instance call has no receiver argument"))?;
+            let source = receiver;
+            let receiver = self.lower_rvalue(source)?;
             let receiver_home = callee
                 .return_borrow
                 .filter(|borrow| borrow.source == mir::BorrowSource::Receiver)
-                .filter(|_| native_closure_abi::returns_function_value(callee.return_type))
-                .map(|_| self.rvalue_borrow_home(receiver))
+                .filter(|_| {
+                    native_closure_abi::returns_function_value(callee.return_type)
+                        || native_closure_abi::returns_borrowed_value(
+                            callee.return_type,
+                            callee.return_borrow,
+                        )
+                })
+                .map(|_| self.borrow_home_argument(self.evaluated_borrow_home(source, receiver)?))
                 .transpose()?;
-            let receiver = self.lower_rvalue(receiver)?;
             return self.lower_call_with_receiver(
                 function,
                 args,
@@ -17747,7 +19063,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let mut values = Vec::with_capacity(args.len());
         let mut lowered = Vec::with_capacity(args.len());
         let mut owned_strings = Vec::new();
-        let mut temporary_mixed = Vec::new();
         for (index, argument) in args.iter().enumerate() {
             if parameters
                 .and_then(|parameters| parameters.get(index))
@@ -17756,7 +19071,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let local = argument.direct_place_local().ok_or_else(|| {
                     malformed_mir("writable indirect-call argument is not a direct local place")
                 })?;
-                let address = self.closure_source_address(local)?;
+                let address = if self.closure_bound_fields.contains_key(&local)
+                    || (self.borrow_home_addresses.contains_key(&local)
+                        && native_closure_abi::borrow_home_type_key(argument.ty()) != 0)
+                {
+                    // Writable capture binding owns its current value until
+                    // writeback; its original home may already be cleared and
+                    // may use a different erased representation.
+                    local_slot(&self.local_slots, local)?
+                } else {
+                    self.closure_source_address(local)?
+                };
                 let value = if matches!(
                     argument.ty(),
                     mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
@@ -17783,10 +19108,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ),
                 _ => {}
             }
-            let ownership = argument.mixed_ownership();
-            if ownership.has_shell() {
-                temporary_mixed.push((index, value.into_pointer_value(), ownership));
-            }
             values.push(value.into());
             lowered.push(value);
         }
@@ -17794,7 +19115,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             values,
             lowered,
             owned_strings,
-            temporary_mixed,
         })
     }
 
@@ -17808,21 +19128,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let callee = function_in(self.program, function)?;
         for string in &lowered.owned_strings {
             self.release_string(*string)?;
-        }
-        for (index, value, ownership) in &lowered.temporary_mixed {
-            if args[*index].transferred_owned_local().is_some() {
-                continue;
-            }
-            let parameter_index = *index + usize::from(receiver_present);
-            let parameter = *callee.params.get(parameter_index).ok_or_else(|| {
-                malformed_mir(format!(
-                    "function{} is missing parameter {parameter_index}",
-                    function.0
-                ))
-            })?;
-            if !local_in(callee, parameter)?.owned {
-                self.cleanup_mixed_temporary(*value, *ownership)?;
-            }
         }
         for index in ordered_owned_argument_indices(args) {
             let argument = &args[index];
@@ -17845,7 +19150,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 } else if let Some(shared) = argument.owned_temporary_shared() {
                     self.defer_or_drop_owned_shared_temporary(value, shared)?;
                 } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
-                    self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
+                    self.defer_or_drop_payload_enum_temporary(
+                        value.into_pointer_value(),
+                        payload,
+                        nullable,
+                    )?;
                 } else if argument.mixed_ownership().has_shell() {
                     self.defer_or_cleanup_mixed_temporary(
                         value.into_pointer_value(),
@@ -17874,20 +19183,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )
             })
         };
-        for (index, value, ownership) in &lowered.temporary_mixed {
-            if args[*index].transferred_owned_local().is_some() || promoted(*index) {
-                continue;
-            }
-            let parameter = *definition.params.get(index + 1).ok_or_else(|| {
-                malformed_mir(format!(
-                    "constructor function{} is missing parameter {index}",
-                    constructor.0
-                ))
-            })?;
-            if !local_in(definition, parameter)?.owned {
-                self.cleanup_mixed_temporary(*value, *ownership)?;
-            }
-        }
         for index in ordered_owned_argument_indices(args) {
             if promoted(index) {
                 continue;
@@ -17911,7 +19206,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 } else if let Some(shared) = argument.owned_temporary_shared() {
                     self.defer_or_drop_owned_shared_temporary(value, shared)?;
                 } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
-                    self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
+                    self.defer_or_drop_payload_enum_temporary(
+                        value.into_pointer_value(),
+                        payload,
+                        nullable,
+                    )?;
                 } else if argument.mixed_ownership().has_shell() {
                     self.defer_or_cleanup_mixed_temporary(
                         value.into_pointer_value(),
@@ -18006,7 +19305,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         args: &[mir::Rvalue],
         expects_result: bool,
     ) -> Result<Option<BasicValueEnum<'ctx>>, BackendError> {
-        self.lower_call_with_receiver(function, args, expects_result, Some(receiver), None)
+        let receiver_home = self
+            .evaluated_borrow_homes
+            .get(&receiver)
+            .copied()
+            .map(|home| self.borrow_home_argument(home))
+            .transpose()?;
+        self.lower_call_with_receiver(
+            function,
+            args,
+            expects_result,
+            Some(receiver),
+            receiver_home,
+        )
     }
 
     fn lower_call_with_receiver(
@@ -18033,6 +19344,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::ReturnType::Value(_) | mir::ReturnType::Void => None,
         };
         let mut values = Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(args.len() + 2);
+        let lowered = self.lower_call_arguments(args)?;
         values.push(self.current_frame.into());
         if let Some((result, _, _)) = aggregate_result {
             values.push(result.into());
@@ -18040,9 +19352,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if let Some(home) = self.direct_call_borrow_home(
             callee_definition,
             args,
+            &lowered.lowered,
             receiver.is_some(),
             receiver_home,
         )? {
+            values.push(home.into());
+        }
+        let result_home = self.result_borrow_home_out(
+            callee_definition.return_type,
+            callee_definition.return_borrow,
+            None,
+        )?;
+        if let Some(home) = result_home {
             values.push(home.into());
         }
         if let Some(receiver) = receiver {
@@ -18055,7 +19376,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             };
             values.push(receiver.into());
         }
-        let lowered = self.lower_call_arguments(args)?;
         values.extend(lowered.values.iter().copied());
         let call = if let (Some(slot), Some(receiver), Some(class)) =
             (callee_definition.virtual_slot, receiver, receiver_class)
@@ -18125,6 +19445,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         } else {
             None
         };
+        if let (Some(value), Some(home)) = (result, result_home) {
+            let home = self.load_borrow_home(home)?;
+            self.evaluated_borrow_homes.insert(value, home);
+        }
         self.cleanup_call_arguments(function, args, receiver.is_some(), &lowered)?;
         Ok(result)
     }
@@ -18139,8 +19463,7 @@ fn ordered_owned_argument_indices(args: &[mir::Rvalue]) -> Vec<usize> {
                 || argument.owned_temporary_collection().is_some()
                 || argument.owned_temporary_shared().is_some()
                 || argument.owned_temporary_payload_enum().is_some()
-                || (argument.mixed_ownership().has_shell()
-                    && argument.transferred_owned_local().is_some()))
+                || argument.mixed_ownership().has_shell())
             .then_some(index)
         })
         .collect::<Vec<_>>();

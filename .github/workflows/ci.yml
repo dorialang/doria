@@ -196,9 +196,19 @@ jobs:
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
 
-      - name: Leak-check interface and optimizer ownership with Cranelift
+      - name: Leak-check interface, optimizer, hook, and returned-borrow ownership with Cranelift
         run: |
-          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria examples/native/main_stage35a_*.doria; do
+          for source in \
+            examples/native/main_stage35_interface_*.doria \
+            examples/native/main_stage35_trait_*.doria \
+            examples/native/main_stage35a_*.doria \
+            examples/native/main_stage36_*.doria \
+            examples/native/main_backed_override_initializer_*.doria \
+            examples/native/main_returned_collection_borrows.doria \
+            examples/native/main_returned_move_borrows.doria \
+            examples/native/main_nullable_returned_closures.doria \
+            examples/native/main_repeatable_closure_captures.doria \
+            examples/native/main_temporary_returned_borrows.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
@@ -252,15 +262,7 @@ jobs:
           php scripts/check_build_artifact_policy.php
 
       - name: Check documentation authority
-        run: |
-          php scripts/check_docs_authority.php
-          php scripts/check_stage25a_completion.php
-          php scripts/check_checked_error_foundation.php
-          php scripts/check_stage29_completion.php
-          php scripts/check_stage30f_php_closure_compatibility.php
-          php scripts/check_stage30g_list_algorithms.php
-          php scripts/check_stage30h_closure_completion.php
-          php scripts/check_stage34_inheritance.php
+        run: php scripts/check_docs_authority.php
 
       # Reachability needs the network and, for private repositories, an
       # explicitly scoped credential. Structural checks always run. A configured
@@ -446,10 +448,19 @@ jobs:
           cargo test -p doriac --test mir_validation_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test llvm_mir_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test cli_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test constructor_owned_property_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage17_io_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage18_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage21_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage22_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage25a_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test return_borrow_alias_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test returned_closure_transport_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage35_runtime_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage35a_optimizer_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage36_property_hook_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test property_hook_initializer_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test property_hook_cleanup_effect_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test performance_report_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test native_testing_slice1_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --lib --features llvm-backend --locked
@@ -539,11 +550,21 @@ jobs:
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage26a_grouped_locals.doria --release --out build/native/main_stage26a_grouped_locals_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage26a_grouped_locals_release
 
-      - name: Leak-check interface and optimizer ownership with LLVM
+      - name: Leak-check interface, optimizer, hook, and returned-borrow ownership with LLVM
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria examples/native/main_stage35a_*.doria; do
+          for source in \
+            examples/native/main_stage35_interface_*.doria \
+            examples/native/main_stage35_trait_*.doria \
+            examples/native/main_stage35a_*.doria \
+            examples/native/main_stage36_*.doria \
+            examples/native/main_backed_override_initializer_*.doria \
+            examples/native/main_returned_collection_borrows.doria \
+            examples/native/main_returned_move_borrows.doria \
+            examples/native/main_nullable_returned_closures.doria \
+            examples/native/main_repeatable_closure_captures.doria \
+            examples/native/main_temporary_returned_borrows.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi

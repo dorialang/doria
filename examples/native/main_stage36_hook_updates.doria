@@ -1,0 +1,39 @@
+class Trace { static writable string $events = ""; }
+function trace(string $event): void { Trace::events = Trace::events . $event; }
+interface Reading { writable float $value { get; set (float $next); } }
+open class Base implements Reading {
+    writable float $raw = 1.0;
+    open writable float $value {
+        get { trace("get\n"); return $this->raw; }
+        set (float $next) { trace("set\n"); $this->raw = $next; }
+    }
+}
+class Derived extends Base {
+    override writable float $value {
+        get { trace("derived get\n"); return $this->raw; }
+        set (float $next) { trace("derived set\n"); $this->raw = $next; }
+    }
+}
+class Backed {
+    writable string $name = "initial" {
+        get => $this->name;
+        set (string $next) => $this->name = $next;
+    }
+    function __doriaAccessor0(): string { return "authored"; }
+}
+function make(): Derived { trace("receiver\n"); return new Derived(); }
+function rhs(): float { trace("rhs\n"); return 2.0; }
+function update(writable Reading $reading): void { $reading->value += rhs(); }
+function generic<T implements Reading>(writable T $reading): void { $reading->value /= 3.0; }
+function main(): void {
+    let writable $value = new Derived();
+    update($value);
+    generic($value);
+    trace(($value->value == 1.0) . "\n");
+    make()->value *= rhs();
+    let writable $backed = new Backed();
+    trace($backed->name . "\n");
+    $backed->name = "changed";
+    trace($backed->name . " " . $backed->__doriaAccessor0() . "\n");
+    echo Trace::events;
+}

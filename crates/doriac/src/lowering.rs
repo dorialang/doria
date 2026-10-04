@@ -91,6 +91,21 @@ pub fn lower_program_with_semantics(
         let hir::Item::Class(class) = item else {
             continue;
         };
+        for member in &mut class.members {
+            if let hir::ClassMember::Property(property) = member {
+                if let Some(hooks) = &mut property.hooks {
+                    hooks.backing_field = semantic_info
+                        .property_backing_fields
+                        .get(&property.span)
+                        .cloned();
+                }
+            }
+        }
+    }
+    for item in &mut items {
+        let hir::Item::Class(class) = item else {
+            continue;
+        };
         if let Some(checked) = semantic_info
             .classes
             .iter()
@@ -230,7 +245,7 @@ fn apply_checked_error_semantics(
             }
             hir::Item::Class(class) => {
                 for member in &mut class.members {
-                    if let hir::ClassMember::Method(method) = member {
+                    for method in member.callables_mut() {
                         apply_function_checked_error_semantics(method, semantic_info);
                     }
                 }
@@ -497,19 +512,17 @@ fn apply_expr_checked_error_semantics(
                 callback_span: plan.callback_span,
                 span,
             }));
-        } else if semantic_info
+        } else if let Some(call) = semantic_info
             .callable_value_calls
             .get(&span)
-            .is_some_and(|call| {
-                call.target_kind == crate::semantics::CallableValueTargetKind::Property
-            })
+            .filter(|call| call.target_kind == crate::semantics::CallableValueTargetKind::Property)
         {
             *expression = hir::Expr::CallableCall(Box::new(hir::CallableCall {
                 callee: Box::new(hir::Expr::PropertyAccess {
                     object,
                     property: method,
                     null_safe,
-                    span,
+                    span: call.callee_span,
                 }),
                 args,
                 span,
@@ -744,7 +757,7 @@ fn lower_class_member(
 ) -> Result<hir::ClassMember, Diagnostic> {
     Ok(match member {
         ast::ClassMember::Property(property) => {
-            hir::ClassMember::Property(lower_property(property, Some(class_name)))
+            hir::ClassMember::Property(lower_property(property, Some(class_name))?)
         }
         ast::ClassMember::Method(method) => {
             hir::ClassMember::Method(lower_function(method, Some(class_name))?)
@@ -765,8 +778,32 @@ fn lower_class_member(
 fn lower_property(
     property: &ast::PropertyDecl,
     class_name: Option<ClassContext<'_>>,
-) -> hir::PropertyDecl {
-    hir::PropertyDecl {
+) -> Result<hir::PropertyDecl, Diagnostic> {
+    let hooks = crate::property_hooks::declaration_facts(
+        property,
+        crate::property_hooks::PropertyHookContext::Class,
+    )
+    .map(|facts| {
+        let accessors = facts
+            .accessors()
+            .zip(facts.callables())
+            .map(|(accessor, function)| {
+                Ok(hir::PropertyAccessor {
+                    identity: accessor.identity,
+                    function: lower_function(&function, class_name)?,
+                })
+            })
+            .collect::<Result<_, Diagnostic>>()?;
+        Ok::<_, Diagnostic>(hir::PropertyHooks {
+            storage: facts
+                .storage
+                .expect("concrete property has storage classification"),
+            backing_field: None,
+            accessors,
+        })
+    })
+    .transpose()?;
+    Ok(hir::PropertyDecl {
         access: property.access,
         is_static: property.is_static,
         writable: property.writable,
@@ -776,8 +813,9 @@ fn lower_property(
             .initializer
             .as_ref()
             .map(|expr| lower_expr(expr, class_name)),
+        hooks,
         span: property.span,
-    }
+    })
 }
 
 fn lower_constant(

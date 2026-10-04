@@ -50,7 +50,20 @@ fn checked_method_receivers_have_statement_owners() {
     use doriac::mir::{ClassExpression, Rvalue, Statement, Terminator};
     let program = doriac::lower_source_to_mir(
         "receivers.doria",
-        include_str!("../../../examples/native/main_stage35_trait_generic.doria"),
+        r#"
+class Failure implements Error { function __construct(string $message) {} }
+trait Work {
+    function value<T>(take T $value): T throws Failure { return $value; }
+}
+class Worker { uses Work; }
+class Plain {
+    function value(): int throws Failure { return 3; }
+}
+function main(): void throws Failure {
+    echo (new Worker())->value(1);
+    echo (new Plain())->value();
+}
+"#,
     )
     .unwrap();
     let main = program

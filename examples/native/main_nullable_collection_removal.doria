@@ -1,0 +1,44 @@
+class Item
+{
+    function __construct(int $number) {}
+    function __destruct() { try { echo "drop{$this->number}\n"; } catch (Error) {} }
+}
+
+enum CopyPacket { case Value(int $number); }
+enum MovePacket { case Value(Item $item); }
+
+function main(): void
+{
+    writable List<int> $integers = [7];
+    ?int $integer = $integers->removeAt(0);
+    writable List<string> $texts = ["text"];
+    ?string $text = $texts->removeAt(0);
+    writable List<Item> $items = [new Item(11)];
+    ?Item $item = $items->removeAt(0);
+    writable List<List<int>> $lists = [[12]];
+    ?List<int> $list = $lists->removeAt(0);
+    writable List<CopyPacket> $copies = [CopyPacket::Value(13)];
+    ?CopyPacket $copy = $copies->removeAt(0);
+    writable List<MovePacket> $moves = [MovePacket::Value(new Item(14))];
+    ?MovePacket $move = $moves->removeAt(0);
+    writable List<function(): int> $callbacks = [fn() => 15];
+    ?function(): int $callback = $callbacks->removeAt(0);
+    writable List<SharedReference<Item>> $handles = [shared new Item(16)];
+    ?SharedReference<Item> $handle = $handles->removeAt(0);
+
+    if ($integer != null) { echo "{$integer} "; }
+    if ($text != null) { echo "{$text} "; }
+    if ($item != null) { echo "{$item->number} "; }
+    if ($list != null) { echo "{$list[0]} "; }
+    if ($copy != null) {
+        echo match ($copy) { CopyPacket::Value($number) => "{$number} " };
+    }
+    if ($move != null) {
+        echo match ($move) { MovePacket::Value($payload) => "{$payload->number} " };
+    }
+    if ($callback != null) { echo "{$callback()} "; }
+    if ($handle != null) { echo "{$handle->number}\n"; }
+    echo "{$integers->count} {$texts->count} {$items->count} {$lists->count} ";
+    echo "{$copies->count} {$moves->count} {$callbacks->count} {$handles->count}\n";
+    echo "alive\n";
+}

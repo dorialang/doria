@@ -112,8 +112,12 @@ pub(super) fn collection_operation(
         Op::ValueAt { position, target } => {
             check(*position, integer, None)?;
             check(*target, definition.value, Some(false))?;
-            if local_in(function, *target)?.writable {
-                return Err(malformed_mir("core collection read is exposed writable"));
+            if local_in(function, *target)?.writable
+                && !(local.writable && definition.kind.supports_writable_element_iteration())
+            {
+                return Err(malformed_mir(
+                    "core collection writable value view lacks a writable source or eligible collection family",
+                ));
             }
         }
         Op::Exchange {

@@ -188,6 +188,26 @@ impl Builtin {
         )
     }
 
+    /// Whether invoking this intrinsic may wait for an external device.
+    /// Catching its checked errors does not change this execution property.
+    pub const fn may_block(self) -> bool {
+        match self {
+            Self::Panic | Self::Sprintf => false,
+            Self::ReadLine
+            | Self::Printf
+            | Self::ReadFile
+            | Self::WriteFile
+            | Self::AppendFile
+            | Self::WriteStderr
+            | Self::ReadFileBytes
+            | Self::WriteFileBytes
+            | Self::AppendFileBytes
+            | Self::ReadStdinBytes
+            | Self::WriteStdoutBytes
+            | Self::WriteStderrBytes => true,
+        }
+    }
+
     /// Canonical checked Error identities contributed by this builtin.
     ///
     /// Semantic checking and compiler-known type activation both consume this

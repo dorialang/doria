@@ -40,6 +40,38 @@ fn apply_fix(source: &str, fix: &DiagnosticFix) -> String {
 }
 
 #[test]
+fn method_overrides_preserve_resolved_closure_capture_provenance() {
+    for (base, child, compatible) in [
+        ("fn() => 42", "fn() with ($this) => $this->value", false),
+        // An owned callback with no retained source satisfies a receiver-bound
+        // owned result without changing who destroys its environment.
+        ("fn() with ($this) => $this->value", "fn() => 42", true),
+        (
+            "fn() with ($this) => $this->value",
+            "fn() with ($this) => $this->value + 1",
+            true,
+        ),
+        ("fn() => 42", "fn() => 43", true),
+    ] {
+        let source = format!(
+            "open class Base {{
+                 int $value = 42;
+                 open function callback(): function(): int {{ return {base}; }}
+             }}
+             class Child extends Base {{
+                 override function callback(): function(): int {{ return {child}; }}
+             }}
+             function main(): void {{}}"
+        );
+        if compatible {
+            doriac::check_source("stage34.doria", &source).unwrap();
+        } else {
+            assert_diagnostic(&source, "E0729");
+        }
+    }
+}
+
+#[test]
 fn parameter_is_a_keyword_without_reserving_param_or_text_occurrences() {
     let tokens = doriac::lex_source(
         "constructor-roles.doria",
@@ -676,6 +708,25 @@ function main(): void
         "open class Box<T> {} class IntBox extends Box<int> {} function f(): void { Box<string> $value = new IntBox(); }",
         "E0403",
     );
+}
+
+#[test]
+fn nullable_class_upcasts_preserve_call_and_property_result_identity() {
+    let program = lower(include_str!(
+        "../../../examples/native/main_nullable_class_upcasts.doria"
+    ));
+    doriac::mir_validation::validate_program(&program).unwrap();
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program).unwrap().stdout,
+        include_bytes!("fixtures/native_io/main_nullable_class_upcasts/expected_stdout")
+    );
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .unwrap()
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

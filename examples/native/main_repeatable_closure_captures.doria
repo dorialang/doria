@@ -1,0 +1,88 @@
+class Child
+{
+    function __construct(int $value) {}
+    function __destruct() { try { echo "drop{$this->value};"; } catch (Error) {} }
+}
+
+class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+enum Packet { case Value(Child $child); }
+
+function make(): function(): int
+{
+    let $child = new Child(55);
+    return fn() with (take $child) => $child->value;
+}
+
+function ordinary(): void
+{
+    {
+        let $child = new Child(11);
+        List<Child> $children = [new Child(22)];
+        let $packet = Packet::Value(new Child(33));
+        let $innerChild = new Child(44);
+        let $inner = fn() with (take $innerChild) => $innerChild->value;
+        let $read = function (): int with (take $child, take $children, take $packet, take $inner) {
+            let $packetValue = match ($packet) { Packet::Value($item) => $item->value };
+            return $child->value + $children[0]->value + $packetValue + $inner();
+        };
+        let $escaped = make();
+        let $label = "owned{$escaped()}";
+        let $readLabel = fn() with (take $label) => $label;
+        echo "{$read()} {$read()} {$escaped()} {$escaped()} {$readLabel()} {$readLabel()}\n";
+        echo "alive\n";
+    }
+    echo "after\n";
+}
+
+function checked(): void
+{
+    {
+        let $child = new Child(42);
+        let $read = function (bool $fail): int with (take $child) {
+            let $temporary = new Child(9);
+            if ($fail) { throw new Failure("failed"); }
+            return $child->value;
+        };
+        try { echo "{$read(false)}\n"; } catch (Failure) { echo "unexpected;"; }
+        try { $read(true); } catch (Failure) { echo "caught;"; }
+        try { echo "{$read(false)}\n"; } catch (Failure) { echo "unexpected;"; }
+        echo "alive\n";
+    }
+    echo "after\n";
+}
+
+function writableCapture(): void
+{
+    let writable $count = 0;
+    {
+        let $child = new Child(40);
+        let writable $next = function (): int with (take $child, writable $count) {
+            $count += 1;
+            return $child->value + $count;
+        };
+        echo "{$next()} {$next()}\n";
+        echo "alive\n";
+    }
+    echo "count{$count}\n";
+}
+
+function main(): void
+{
+    ordinary();
+    checked();
+    writableCapture();
+    {
+        let $first = new Child(60);
+        let $arrow = fn() with (take $first) => $first;
+        let $second = new Child(70);
+        let $block = function (): Child with (take $second) { return $second; };
+        let $fromArrow = $arrow();
+        let $fromBlock = $block();
+        echo "{$fromArrow->value} {$fromBlock->value}\n";
+    }
+    echo "returned\n";
+}

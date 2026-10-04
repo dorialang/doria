@@ -1,0 +1,38 @@
+class SalesReport
+{
+    internal writable ?int $cachedTotal = null;
+    internal writable int $calculationCount = 0;
+
+    function __construct(internal take List<int> $amounts)
+    {
+    }
+
+    int $calculations {
+        get => $this->calculationCount;
+    }
+
+    int $total {
+        writable get {
+            let $cached = $this->cachedTotal;
+            if ($cached != null) {
+                return $cached;
+            }
+
+            let writable $sum = 0;
+            foreach ($this->amounts as int $amount) {
+                $sum += $amount;
+            }
+            $this->cachedTotal = $sum;
+            $this->calculationCount++;
+            return $sum;
+        }
+    }
+}
+
+function main(): void
+{
+    let writable $report = new SalesReport([12, 18, 9]);
+    echo "first: {$report->total}\n";
+    echo "again: {$report->total}\n";
+    echo "calculations: {$report->calculations}\n";
+}

@@ -642,7 +642,7 @@ fn mixed_owner_moves_into_properties_consume_the_source() {
 #[test]
 fn mixed_properties_are_move_values() {
     for source in [
-        "class Box { mixed $payload = 1; function release(): mixed { return $this->payload; } }",
+        "class Box { mixed $payload = 1; function release(): void { let $owned = $this->payload; } }",
         "function sink(take mixed $value): void {} class Box { mixed $payload = 1; function release(): void { sink($this->payload); } }",
     ] {
         let diagnostics = doriac::check_source("mixed-property-move.doria", source)
@@ -650,6 +650,28 @@ fn mixed_properties_are_move_values() {
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "E0472" && diagnostic.message.contains("moves out")
         }));
+    }
+}
+
+#[test]
+fn mixed_property_returns_lend_the_box_without_transferring_it() {
+    let declarations = "class Box { writable mixed $payload = 1; function getPayload(): mixed { return $this->payload; } writable function reset(): void {} }";
+    doriac::check_source("mixed-property-borrow.doria", declarations)
+        .expect("a returned property borrow leaves ownership with the receiver");
+    for body in [
+        "sink($box->getPayload());",
+        "let $view = $box->getPayload(); $box->reset(); inspect($view);",
+    ] {
+        let diagnostics = doriac::check_source(
+            "mixed-property-borrow.doria",
+            format!("{declarations} function sink(take mixed $value): void {{}} function inspect(mixed $value): void {{}} function route(writable Box $box): void {{ {body} }}"),
+        ).expect_err("a returned borrow cannot be consumed or invalidated while live");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code, "E0474" | "E0477")),
+            "{diagnostics:?}"
+        );
     }
 }
 

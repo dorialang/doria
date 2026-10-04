@@ -1,0 +1,34 @@
+class Trace { static writable string $events = ""; }
+function trace(string $event): void { Trace::events = Trace::events . $event; }
+class Fault implements Error { function __construct(string $message) {} }
+class Reading {
+    function __construct(bool $failGet, bool $failSet) {}
+    writable float $value {
+        get throws Fault {
+            trace("get\n");
+            if ($this->failGet) { throw new Fault("get"); }
+            return 1.0;
+        }
+        set (float $next) throws Fault {
+            trace("set\n");
+            if ($this->failSet) { throw new Fault("set"); }
+        }
+    }
+    function __destruct() { trace("drop\n"); }
+}
+function make(bool $failGet, bool $failSet): Reading {
+    trace("receiver\n");
+    return new Reading($failGet, $failSet);
+}
+function rhs(bool $fail): float throws Fault {
+    trace("rhs\n");
+    if ($fail) { throw new Fault("rhs"); }
+    return 2.0;
+}
+function main(): void {
+    try { make(false, false)->value += rhs(false); } catch (Fault) { trace("unexpected\n"); }
+    try { make(true, false)->value += rhs(false); } catch (Fault $fault) { trace("caught {$fault->message}\n"); }
+    try { make(false, false)->value += rhs(true); } catch (Fault $fault) { trace("caught {$fault->message}\n"); }
+    try { make(false, true)->value += rhs(false); } catch (Fault $fault) { trace("caught {$fault->message}\n"); }
+    echo Trace::events;
+}

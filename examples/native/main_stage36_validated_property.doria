@@ -1,0 +1,55 @@
+class InvalidQuantity implements Error
+{
+    string $message = "quantity must be positive";
+}
+
+class MissingPrice implements Error
+{
+    string $message = "choose a price before reading the total";
+}
+
+class OrderLine
+{
+    writable ?int $unitPrice = null;
+
+    writable int $quantity = 1 {
+        get => $this->quantity;
+        set (int $value) throws InvalidQuantity {
+            if ($value < 1) {
+                throw new InvalidQuantity();
+            }
+            $this->quantity = $value;
+        }
+    }
+
+    int $total {
+        get throws MissingPrice {
+            let $price = $this->unitPrice;
+            if ($price == null) {
+                throw new MissingPrice();
+            }
+            return $price * $this->quantity;
+        }
+    }
+}
+
+function main(): void
+{
+    let writable $line = new OrderLine();
+    try {
+        echo $line->total;
+    } catch (MissingPrice $error) {
+        echo "price: {$error->message}\n";
+    }
+
+    $line->unitPrice = 12;
+    $line->quantity = 3;
+    echo "total: {$line->total}\n";
+
+    try {
+        $line->quantity = 0;
+    } catch (InvalidQuantity $error) {
+        echo "quantity: {$error->message}\n";
+    }
+    echo "kept: {$line->quantity}; total: {$line->total}\n";
+}

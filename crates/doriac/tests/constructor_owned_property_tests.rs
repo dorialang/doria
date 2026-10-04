@@ -1,5 +1,8 @@
 use doriac::mir;
 
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("constructor-owned-property.doria", source)
         .expect_err("source should be rejected")
@@ -77,6 +80,122 @@ function main(): void throws Doria\Std\Io\IoError
     assert_eq!(output.stdout, b"41:42");
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn constructor_root_derives_nullable_child_access_without_becoming_writable() {
+    let source = r#"
+class Counter
+{
+    writable int $value = 0;
+    writable function add(int $amount): void
+    {
+        $this->value += $amount;
+        echo "{$this->value};";
+    }
+}
+function maybe(bool $present): ?Counter
+{
+    if ($present) { return new Counter(); }
+    return null;
+}
+class Application
+{
+    writable ?Counter $counter;
+    function __construct(parameter bool $present)
+    {
+        $this->counter = maybe($present);
+        $this->counter?->add(4);
+        $this->counter?->add(4);
+    }
+}
+function main(): void
+{
+    let $present = new Application(true);
+    let $absent = new Application(false);
+    echo "done;";
+}
+"#;
+    let program = lower(source);
+    doriac::mir_validation::validate_program(&program).expect("constructor MIR should validate");
+    let constructor = program
+        .functions
+        .iter()
+        .find(|function| function.name == "Application::__construct")
+        .expect("Application constructor should lower");
+    assert!(!constructor.locals[constructor.params[0].0].writable);
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, b"4;8;done;");
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
+    assert!(output.runtime_diagnostic.is_none());
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Fast,
+        "4;8;done;",
+    );
+    #[cfg(feature = "llvm-backend")]
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Release,
+        "4;8;done;",
+    );
+}
+
+#[test]
+fn constructor_child_access_keeps_nullable_readonly_and_scope_boundaries() {
+    let declarations = r#"
+class Counter { writable function add(int $amount): void {} }
+function maybe(bool $present): ?Counter
+{
+    if ($present) { return new Counter(); }
+    return null;
+}
+"#;
+    for body in [
+        r#"
+class Application
+{
+    ?Counter $counter = maybe(true);
+    function __construct() { $this->counter?->add(1); }
+}
+"#,
+        r#"
+class Application
+{
+    writable Counter $counter = new Counter();
+    function __construct()
+    {
+        let $mutate = function (): void with ($this) { $this->counter->add(1); };
+    }
+}
+"#,
+        r#"
+class Application
+{
+    writable Counter $counter = new Counter();
+    function __destruct() { $this->counter->add(1); }
+}
+"#,
+    ] {
+        assert_diagnostic(&format!("{declarations}{body}"), "E0203");
+    }
+    assert_diagnostic(
+        &format!(
+            r#"{declarations}
+class Application
+{{
+    writable ?Counter $counter;
+    function __construct()
+    {{
+        $this->counter?->add(1);
+        $this->counter = null;
+    }}
+}}
+"#,
+        ),
+        "E0501",
+    );
 }
 
 #[test]

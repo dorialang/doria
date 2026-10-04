@@ -3,8 +3,13 @@ use std::collections::{HashMap, HashSet};
 pub mod composition;
 pub mod composition_rename;
 pub mod contracts;
+mod nonblocking;
+mod property_hooks;
+
+use contracts::ContractMismatch;
 
 pub use crate::checked_effects::CatchCoverage;
+pub use crate::constructor_init::ConstructorPartialCleanup;
 
 use crate::ast::*;
 use crate::attributes::{
@@ -37,8 +42,8 @@ use crate::symbols::{
 use crate::types::{
     resolved_type_complexity, ClassType, FunctionBorrowSource, FunctionInvocationMode,
     FunctionReturnBorrow, FunctionTypeParameterMode, FunctionTypeRef, ResolvedType,
-    SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeId, TypeKind, TypeRef,
-    TypeRegistry,
+    ReturnBorrowKind, SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeId,
+    TypeKind, TypeRef, TypeRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +118,8 @@ pub enum ForeachValueAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeachSemanticInfo {
+    pub iterable_span: Span,
+    pub binding_ids: Vec<BindingId>,
     pub iterable_type: ResolvedType,
     pub iterable_family: ForeachIterableFamily,
     pub iteration_kind: ForeachIterationKind,
@@ -235,6 +242,10 @@ pub struct SemanticInfo {
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
     pub retained_callables: HashMap<Span, crate::ownership::RetainedCallableInfo>,
+    /// Source ownership transfers and releases shared by semantic consumers.
+    pub cleanup: crate::ownership::cleanup::Analysis,
+    /// Canonical initialized fields released when construction fails.
+    pub constructor_partial_cleanups: Vec<ConstructorPartialCleanup>,
     /// Compiler-owned hierarchy identity for every checked method declaration.
     ///
     /// Tooling uses this table to relate override families without rebuilding
@@ -252,6 +263,8 @@ pub struct SemanticInfo {
     /// physical root property; override parameters are related declarations,
     /// never additional fields.
     pub property_families: HashMap<Span, PropertyFamilySemanticInfo>,
+    /// Canonical field identity for backed hooks, including inherited reuse.
+    pub property_backing_fields: HashMap<Span, crate::property_hooks::PropertyBackingField>,
     /// Exact declaration and virtual-family identity selected at each method call.
     pub method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
     /// Declaring class selected for inherited static-property and class-constant access.
@@ -329,8 +342,11 @@ pub struct SemanticInfo {
     pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
     /// Backend-independent classification of each checked instance-property write.
     pub property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
+    pub property_accessor_calls: HashMap<Span, PropertyAccessorCalls>,
     /// Object-path expressions proven to carry ordinary writable access.
     pub(crate) writable_object_paths: HashSet<Span>,
+    /// Receiver capabilities at checked member uses, including readonly and construction access.
+    member_receiver_access: HashMap<Span, ObjectPathAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +410,27 @@ pub struct PropertyWriteSemanticInfo {
     pub constructor_context: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PropertyAccessorCalls {
+    pub getter: Option<PropertyAccessorCallSemanticInfo>,
+    pub setter: Option<PropertyAccessorCallSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyAccessorCallSemanticInfo {
+    /// Member selection is semantic; native lowering only specializes it.
+    /// The target name is the source property, not a synthetic method name.
+    pub target: CallableTarget,
+    pub declaring_type: ResolvedType,
+    pub declaration: Span,
+    pub virtual_root: Option<Span>,
+    pub receiver_mode: ReceiverMode,
+    pub return_type: ResolvedType,
+    pub return_borrow: Option<ReturnBorrow>,
+    pub checked_effects: Vec<ResolvedType>,
+    pub parameter: Option<CallableParameterSemanticInfo>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionTypeSemanticInfo {
     pub ty: ResolvedType,
@@ -449,6 +486,7 @@ pub enum CallableValueTargetKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallableValueCallInfo {
+    pub callee_span: Span,
     pub function_type: ResolvedType,
     pub invocation_mode: FunctionInvocationMode,
     pub return_type: ResolvedType,
@@ -904,6 +942,10 @@ impl SemanticInfo {
         self.expression_types.get(&span)
     }
 
+    pub fn member_receiver_access(&self, span: Span) -> Option<ObjectPathAccess> {
+        self.member_receiver_access.get(&span).copied()
+    }
+
     pub fn type_test_type(&self, span: Span) -> Option<&ResolvedType> {
         self.type_test_types.get(&span)
     }
@@ -1008,6 +1050,29 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let authored_program = program;
     let mut composition = crate::trait_composition::CompositionPlan::default();
     let mut composition_diagnostics = Vec::new();
+    // Validate authored accessor declarations before trait composition.
+    for item in &program.items {
+        use crate::property_hooks::PropertyHookContext;
+        let (members, properties, context): (&[ClassMember], &[PropertyDecl], _) = match item {
+            Item::Class(class) => (&class.members, &[], PropertyHookContext::Class),
+            Item::Trait(trait_decl) => (&trait_decl.members, &[], PropertyHookContext::Trait),
+            Item::Interface(interface) => {
+                (&[], &interface.properties, PropertyHookContext::Interface)
+            }
+            _ => continue,
+        };
+        for property in properties
+            .iter()
+            .chain(members.iter().filter_map(|member| match member {
+                ClassMember::Property(property) if !property.hooks.is_empty() => Some(property),
+                _ => None,
+            }))
+        {
+            if let Some(facts) = crate::property_hooks::declaration_facts(property, context) {
+                facts.validate_declaration(&mut composition_diagnostics);
+            }
+        }
+    }
     let mut composition_facts = contracts::ContractFacts::default();
     if program.items.iter().any(|item| {
         matches!(item, Item::Class(class)
@@ -1076,6 +1141,10 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     configure_composition(&mut discovery);
     discovery.check();
     let mut ambient_effect_seed = discovery.inferred_ambient_effects();
+    let discovery_backing_fields = discovery.property_backing_fields();
+    let discovery_provenance = discovery.prepare_call_provenance(&discovery_backing_fields);
+    let mut callback_ambient_effect_seed = discovery
+        .callback_ambient_effects(&discovery.known_callback_targets(&discovery_provenance));
     let generated_test_effect_seed = discovery
         .callable_effective_checked_effects
         .iter()
@@ -1100,15 +1169,24 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             test_semantics.clone(),
         );
         refinement.ambient_effect_seed = ambient_effect_seed.clone();
+        refinement.callback_ambient_effect_seed = callback_ambient_effect_seed.clone();
         configure_composition(&mut refinement);
         refinement.generated_test_effect_seed = generated_test_effect_seed.clone();
         refinement.check();
         let refined = refinement.escaping_ambient_effects();
-        if ambient_effect_maps_equal(&ambient_effect_seed, &refined) {
+        let backing_fields = refinement.property_backing_fields();
+        let provenance = refinement.prepare_call_provenance(&backing_fields);
+        let refined_callbacks =
+            refinement.callback_ambient_effects(&refinement.known_callback_targets(&provenance));
+        if ambient_effect_maps_equal(&ambient_effect_seed, &refined)
+            && ambient_effect_maps_equal(&callback_ambient_effect_seed, &refined_callbacks)
+        {
             ambient_effect_seed = refined;
+            callback_ambient_effect_seed = refined_callbacks;
             break;
         }
         ambient_effect_seed = refined;
+        callback_ambient_effect_seed = refined_callbacks;
     }
 
     let mut checker = Checker::new(
@@ -1122,6 +1200,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
         test_semantics,
     );
     checker.ambient_effect_seed = ambient_effect_seed;
+    checker.callback_ambient_effect_seed = callback_ambient_effect_seed;
     configure_composition(&mut checker);
     checker.generated_test_effect_seed = generated_test_effect_seed;
     checker.diagnostics.extend(const_diagnostics);
@@ -1136,12 +1215,63 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             &checker.attributes,
             &checker.global_symbols,
         ));
-    let constructor_analysis = crate::constructor_init::check_program(
+    let property_backing_fields = checker.property_backing_fields();
+    let mut call_provenance = checker.prepare_call_provenance(&property_backing_fields);
+    let constructor_cleanup_contexts = checker
+        .classes
+        .values()
+        .map(|class| {
+            let parent = class
+                .parent
+                .as_ref()
+                .and_then(|parent| checker.classes.get(&parent.name));
+            let mut inherited_stored_properties = HashSet::new();
+            let mut ancestor = parent;
+            let mut visited = HashSet::new();
+            while let Some(info) = ancestor {
+                if !visited.insert(info.declaration) {
+                    break;
+                }
+                for property in info.properties.values() {
+                    if property.hooks.as_ref().is_some_and(|hooks| {
+                        hooks.storage == Some(crate::property_hooks::PropertyHookStorage::Computed)
+                    }) {
+                        continue;
+                    }
+                    inherited_stored_properties.insert(
+                        property_backing_fields
+                            .get(&property.declaration_span)
+                            .map_or(property.declaration_span, |field| field.declaration),
+                    );
+                }
+                ancestor = info
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| checker.classes.get(&parent.name));
+            }
+            let mut inherited_stored_properties =
+                inherited_stored_properties.into_iter().collect::<Vec<_>>();
+            inherited_stored_properties.sort();
+            (
+                class.declaration,
+                crate::constructor_init::ConstructorCleanupContext {
+                    parent_class: parent.map(|parent| parent.declaration),
+                    parent_constructor: parent
+                        .and_then(|parent| parent.methods.get("__construct"))
+                        .map(|method| method.declaration),
+                    inherited_stored_properties,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let constructor_analysis = crate::constructor_init::check_program_with_cleanup_context(
         program,
+        &property_backing_fields,
         &checker.given_preludes,
         &checker.checked_effect_sites,
         &checker.catch_error_types,
         &checker.catch_coverage,
+        &constructor_cleanup_contexts,
     );
     for (span, kind) in constructor_analysis.property_writes {
         if let Some(write) = checker.property_writes.get_mut(&span) {
@@ -1161,7 +1291,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let return_borrows = checker
         .function_signatures
         .iter()
-        .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
+        .map(|(span, signature)| (*span, signature.return_borrow))
         .collect();
     let move_enum_names = checker
         .enums
@@ -1169,9 +1299,10 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
         .filter(|definition| !definition.capabilities.copy)
         .map(|definition| definition.name.clone())
         .collect();
-    let classes = collect_ordered_class_semantics(program, &mut checker);
+    let classes = collect_ordered_class_semantics(program, &mut checker, &property_backing_fields);
     checker.specialize_conformance_facts(&classes);
     checker.publish_interface_specializations();
+    checker.publish_constrained_member_surfaces();
     let interface_conversion_types = checker
         .contextual_expression_types
         .iter()
@@ -1185,6 +1316,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             matches!(inner, ResolvedType::Interface(_)).then_some((*span, resolved))
         })
         .collect();
+    let enums = collect_ordered_enum_semantics(&checker);
     let ownership_analysis = crate::ownership::check_program_with_inferred_move_returns(
         program,
         &crate::ownership::OwnershipAnalysisContext {
@@ -1203,18 +1335,56 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             assertion_callable_invocations: &checker.assertion_callable_invocations,
             list_algorithm_calls: &checker.list_algorithm_calls,
             call_targets: &checker.call_targets,
+            property_accessor_calls: &checker.property_accessor_calls,
+            property_writes: &checker.property_writes,
+            matches: &checker.matches,
+            enum_semantics: &enums,
+            enum_case_constructions: &checker.enum_case_constructions,
             contracts: &checker.contracts,
             classes: &classes,
         },
     );
+    let cleanup = ownership_analysis.cleanup;
+    let constructor_partial_cleanups = constructor_analysis.partial_cleanups;
     let closure_ownership = ownership_analysis.closures;
     let retained_callables = ownership_analysis.retained_callables;
     let return_borrows = ownership_analysis.return_borrows;
+    // Return-loan inference determines local carrier ownership. Publish those
+    // canonical facts so every consumer agrees with the ownership checker.
+    for (binding, ownership) in ownership_analysis.binding_ownership {
+        if let Some(declaration) = checker
+            .binding_resolution
+            .declarations_by_id
+            .get_mut(&binding)
+        {
+            declaration.ownership = ownership;
+        }
+    }
+    let mut accessor_calls = std::mem::take(&mut checker.property_accessor_calls);
+    for calls in accessor_calls.values_mut() {
+        if let Some(getter) = &mut calls.getter {
+            let result = checker.types.intern_resolved(&getter.return_type);
+            if !checker.type_is_move_type(result) {
+                getter.return_borrow = None;
+            } else if !matches!(
+                getter.declaring_type,
+                ResolvedType::Interface(_) | ResolvedType::TypeParameter(_)
+            ) {
+                getter.return_borrow = return_borrows.get(&getter.declaration).copied();
+            }
+        }
+    }
+    checker.property_accessor_calls = accessor_calls;
+    checker.check_nonblocking_property_hooks(
+        &mut call_provenance,
+        &cleanup,
+        &constructor_partial_cleanups,
+    );
     checker.diagnostics.extend(ownership_analysis.diagnostics);
+    checker.check_property_hook_return_contracts(&return_borrows);
     checker.invalidate_erroneous_compositions();
     let class_hierarchy = collect_class_hierarchy_semantics(&checker);
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
-    let enums = collect_ordered_enum_semantics(&checker);
     let property_families = collect_property_family_semantics(&checker);
     let retained_parameters = program
         .items
@@ -1323,10 +1493,13 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             retained_callables,
+            cleanup,
+            constructor_partial_cleanups,
             method_hierarchy,
             constructor_parameters: checker.constructor_parameters,
             foreach_loops: checker.foreach_loops,
             property_families,
+            property_backing_fields,
             method_call_targets: checker.method_call_targets,
             static_member_targets: checker.static_member_targets,
             static_receiver_types: checker.static_receiver_types,
@@ -1356,7 +1529,9 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             list_algorithm_calls: checker.list_algorithm_calls,
             closure_ownership,
             property_writes: checker.property_writes,
+            property_accessor_calls: checker.property_accessor_calls,
             writable_object_paths: checker.writable_object_paths,
+            member_receiver_access: checker.member_receiver_access,
         },
         diagnostics: checker.diagnostics,
     };
@@ -1539,6 +1714,7 @@ fn collect_class_hierarchy_semantics(
 fn collect_ordered_class_semantics(
     program: &Program,
     checker: &mut Checker<'_>,
+    backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
 ) -> Vec<ClassSemanticInfo> {
     let mut expanded_classes = HashSet::new();
     loop {
@@ -1682,6 +1858,14 @@ fn collect_ordered_class_semantics(
                     let Some(property) = hierarchy_info.properties.get(&name) else {
                         continue;
                     };
+                    if property.hooks.as_ref().is_some_and(|hooks| {
+                        hooks.storage == Some(crate::property_hooks::PropertyHookStorage::Computed)
+                    }) || backing_fields
+                        .get(&property.declaration_span)
+                        .is_some_and(|field| field.declaration != property.declaration_span)
+                    {
+                        continue;
+                    }
                     let ty = checker.substitute_type_id(property.ty, &substitutions);
                     properties.push((
                         declaring_class,
@@ -1803,11 +1987,14 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
     for item in &program.items {
         match item {
             Item::Function(function) => {
-                declarations.insert(function.span, (function, None));
+                declarations.insert(function.span, (std::borrow::Cow::Borrowed(function), None));
             }
             Item::Class(class) => {
                 for member in &class.members {
-                    if let ClassMember::Method(method) = member {
+                    for method in crate::property_hooks::member_callables(
+                        member,
+                        crate::property_hooks::PropertyHookContext::Class,
+                    ) {
                         declarations.insert(method.span, (method, Some(class)));
                     }
                 }
@@ -1928,6 +2115,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
         for span in constrained_calls {
             checker.specialize_constrained_method(span, &substitutions);
         }
+        checker.specialize_constrained_property_accessors(function.span, &substitutions);
 
         if let Some(templates) = checker
             .callable_class_instantiation_templates
@@ -2251,6 +2439,7 @@ struct Checker<'program> {
     interface_definitions: HashMap<String, contracts::InterfaceDefinition>,
     interface_requirements:
         HashMap<crate::types::InterfaceType<TypeId>, contracts::InterfaceRequirements>,
+    constrained_receivers: HashMap<Span, contracts::ConstrainedReceiver>,
     enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
     function_signatures: HashMap<Span, FunctionInfo>,
@@ -2307,6 +2496,10 @@ struct Checker<'program> {
     callable_declared_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     callable_dependencies: HashMap<Span, Vec<Span>>,
     ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
+    /// An entry, including an empty one, proves the complete set of ambient
+    /// effects for this invocation through the shared call-provenance solver.
+    /// Missing entries retain the ambient-capable unknown-call contract.
+    callback_ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
     generated_test_effect_seed: HashMap<Span, Vec<ResolvedType>>,
     callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     checked_effect_sites: crate::checked_effects::EffectSiteMap,
@@ -2325,7 +2518,9 @@ struct Checker<'program> {
     assertion_callable_invocations: HashMap<Span, FunctionInvocationMode>,
     list_algorithm_calls: HashMap<Span, ListAlgorithmCallInfo>,
     property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
+    property_accessor_calls: HashMap<Span, PropertyAccessorCalls>,
     writable_object_paths: HashSet<Span>,
+    member_receiver_access: HashMap<Span, ObjectPathAccess>,
     allow_terminal_assertion: bool,
     attributes: AttributeSemanticInfo,
     active_closures: Vec<ActiveClosure>,
@@ -2734,7 +2929,7 @@ enum ReceiverAccess {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObjectPathAccess {
+pub enum ObjectPathAccess {
     Readonly,
     Writable,
     ConstructionRoot,
@@ -2990,6 +3185,7 @@ impl<'program> Checker<'program> {
             composition: crate::trait_composition::CompositionPlan::default(),
             interface_definitions: HashMap::new(),
             interface_requirements: HashMap::new(),
+            constrained_receivers: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -3045,6 +3241,7 @@ impl<'program> Checker<'program> {
             callable_declared_checked_effects: HashMap::new(),
             callable_dependencies: HashMap::new(),
             ambient_effect_seed: HashMap::new(),
+            callback_ambient_effect_seed: HashMap::new(),
             generated_test_effect_seed: HashMap::new(),
             callable_effective_checked_effects: HashMap::new(),
             checked_effect_sites: HashMap::new(),
@@ -3063,7 +3260,9 @@ impl<'program> Checker<'program> {
             assertion_callable_invocations: HashMap::new(),
             list_algorithm_calls: HashMap::new(),
             property_writes: HashMap::new(),
+            property_accessor_calls: HashMap::new(),
             writable_object_paths: HashSet::new(),
+            member_receiver_access: HashMap::new(),
             allow_terminal_assertion: false,
             attributes: AttributeSemanticInfo::default(),
             active_closures: Vec::new(),
@@ -3082,7 +3281,7 @@ impl<'program> Checker<'program> {
         self.collect_functions();
         self.apply_ambient_effect_seed();
         self.check_instance_property_initializers();
-        self.infer_return_borrow_signatures();
+        self.infer_return_borrow_signatures(false);
         self.infer_unannotated_move_return_signatures();
 
         // A clause-free selected entrypoint infers its public checked-effect
@@ -3122,6 +3321,11 @@ impl<'program> Checker<'program> {
                 Item::Trait(declaration) => self.check_trait_bodies(declaration),
             }
         }
+        // Closure capture identities are available only after checking bodies.
+        // Publish their returned loans before comparing callable contracts.
+        self.infer_return_borrow_signatures(true);
+        self.validate_override_return_provenance();
+        self.validate_property_hook_hierarchies();
         self.materialize_override_parameter_defaults();
         self.invalidate_erroneous_compositions();
         self.check_nominal_conformances();
@@ -3972,6 +4176,36 @@ impl<'program> Checker<'program> {
         ambient
     }
 
+    fn callback_ambient_effects(
+        &self,
+        targets: &HashMap<Span, Vec<Span>>,
+    ) -> HashMap<Span, Vec<ResolvedType>> {
+        targets
+            .iter()
+            .filter_map(|(site, targets)| {
+                if targets.is_empty() {
+                    return None;
+                }
+                let mut ambient = Vec::new();
+                for target in targets {
+                    let effects = self
+                        .closures
+                        .get(&ClosureId::from_span(*target))
+                        .map(|closure| &closure.inferred_checked_effects)
+                        .or_else(|| self.callable_effective_checked_effects.get(target))?;
+                    for effect in effects {
+                        if crate::checked_effects::is_automatic_effect(effect)
+                            && !ambient.contains(effect)
+                        {
+                            ambient.push(effect.clone());
+                        }
+                    }
+                }
+                Some((*site, ambient))
+            })
+            .collect()
+    }
+
     fn close_virtual_ambient_effects(&self, ambient: &mut HashMap<Span, Vec<ResolvedType>>) {
         loop {
             let mut changed = false;
@@ -4175,6 +4409,11 @@ impl<'program> Checker<'program> {
                 match member {
                     ClassMember::Uses(_) => {}
                     ClassMember::Property(property) => {
+                        self.collect_property_hook_signatures(
+                            property,
+                            &class_decl.name,
+                            crate::property_hooks::PropertyHookContext::Class,
+                        );
                         if property.is_static {
                             self.declare_static_property(&mut info, &class_decl.name, property);
                         } else {
@@ -4436,6 +4675,19 @@ impl<'program> Checker<'program> {
                     continue;
                 };
                 let Some(method) = class_info.methods.get(name) else {
+                    if class_info
+                        .properties
+                        .get(name)
+                        .is_some_and(|property| property.hooks.is_some())
+                        && self
+                            .classes
+                            .get(&declaring_class.name)
+                            .and_then(|class| class.properties.get(name))
+                            .is_some_and(|property| property.hooks.is_some())
+                    {
+                        // Accessor overrides are checked after return provenance is inferred.
+                        continue;
+                    }
                     let compatible_promoted_property = if member.kind
                         == MemberKind::PromotedProperty
                         && matches!(
@@ -4864,14 +5116,12 @@ impl<'program> Checker<'program> {
                 });
 
             let mut constructor_calls = Vec::new();
-            for member in declaration
-                .members
-                .iter()
-                .filter_map(|member| match member {
-                    ClassMember::Method(method) => Some(method),
-                    _ => None,
-                })
-            {
+            for member in declaration.members.iter().flat_map(|member| {
+                crate::property_hooks::member_callables(
+                    member,
+                    crate::property_hooks::PropertyHookContext::Class,
+                )
+            }) {
                 let mut calls = self
                     .call_targets
                     .iter()
@@ -5863,23 +6113,17 @@ impl<'program> Checker<'program> {
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
         let return_borrow = self
-            .type_can_return_borrow(return_ty)
+            .type_is_move_type(return_ty)
             .then(|| {
-                let enclosing_type_params = declaring_class
-                    .and_then(|class_name| {
-                        self.program.items.iter().find_map(|item| match item {
-                            Item::Class(class) if class.name == class_name => {
-                                Some(&class.type_params)
-                            }
-                            _ => None,
-                        })
-                    })
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                crate::ownership::function_return_borrow_in_context(
+                crate::ownership::function_return_borrow_with_calls(
                     function,
-                    enclosing_type_params,
-                    &mut |_| None,
+                    crate::ownership::return_borrow_parameters(params.iter().map(|param| {
+                        (
+                            !param.take && self.type_is_move_type(param.ty),
+                            self.type_is_symbolic(param.ty),
+                        )
+                    })),
+                    &mut |_| crate::ownership::ReturnBorrowLookup::Unresolved,
                 )
             })
             .flatten();
@@ -6231,40 +6475,71 @@ impl<'program> Checker<'program> {
         )
     }
 
-    fn infer_return_borrow_signatures(&mut self) {
+    fn infer_return_borrow_signatures(&mut self, checked_bodies: bool) {
         let callables = self
             .program
             .items
             .iter()
             .flat_map(|item| match item {
-                Item::Function(function) => vec![(function.clone(), None)],
+                Item::Function(function) => vec![(function.clone(), None, HashMap::new())],
                 Item::Class(class) => class
                     .members
                     .iter()
-                    .filter_map(|member| match member {
-                        ClassMember::Method(method) => {
-                            Some((method.clone(), Some(class.name.clone())))
-                        }
-                        ClassMember::Property(_)
-                        | ClassMember::Constant(_)
-                        | ClassMember::Uses(_) => None,
+                    .flat_map(|member| {
+                        crate::property_hooks::member_callables(
+                            member,
+                            crate::property_hooks::PropertyHookContext::Class,
+                        )
+                        .map(|callable| {
+                            (
+                                callable.into_owned(),
+                                Some(class.name.clone()),
+                                type_parameter_scope(&class.type_params),
+                            )
+                        })
                     })
                     .collect(),
-                Item::Enum(_)
-                | Item::Interface(_)
-                | Item::Trait(_)
-                | Item::Constant(_)
-                | Item::Statement(_) => Vec::new(),
+                Item::Trait(declaration) => declaration
+                    .members
+                    .iter()
+                    .flat_map(|member| {
+                        crate::property_hooks::member_callables(
+                            member,
+                            crate::property_hooks::PropertyHookContext::Trait,
+                        )
+                        .map(|callable| {
+                            (
+                                callable.into_owned(),
+                                Some(declaration.name.clone()),
+                                type_parameter_scope(&declaration.type_params),
+                            )
+                        })
+                    })
+                    .collect(),
+                Item::Enum(_) | Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {
+                    Vec::new()
+                }
             })
             .collect::<Vec<_>>();
+        let graphs = if checked_bodies {
+            callables
+                .iter()
+                .filter_map(|(function, _, _)| {
+                    self.return_borrow_graph(function)
+                        .map(|graph| (function.span, graph))
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
 
         for _ in 0..callables.len().max(1) {
             let mut changed = false;
-            for (function, declaring_class) in &callables {
+            for (function, declaring_class, owner_type_parameters) in &callables {
                 let Some(signature) = self.function_signatures.get(&function.span).cloned() else {
                     continue;
                 };
-                if !self.type_can_return_borrow(signature.return_ty) {
+                if !self.type_is_move_type(signature.return_ty) {
                     continue;
                 }
                 let mut scopes = ScopeStack::new();
@@ -6286,23 +6561,67 @@ impl<'program> Checker<'program> {
                         ReceiverAccess::Readonly
                     },
                 });
-                let enclosing_type_params = declaring_class
-                    .as_ref()
-                    .and_then(|class_name| {
-                        self.program.items.iter().find_map(|item| match item {
-                            Item::Class(class) if &class.name == class_name => {
-                                Some(class.type_params.clone())
-                            }
-                            _ => None,
-                        })
-                    })
-                    .unwrap_or_default();
-                let inferred = crate::ownership::function_return_borrow_in_context(
-                    function,
-                    &enclosing_type_params,
-                    &mut |call| self.call_return_borrow(call, &scopes, method_context.as_ref()),
+                let borrowed_parameters = crate::ownership::return_borrow_parameters(
+                    signature.params.iter().map(|param| {
+                        (
+                            !param.take && self.type_is_move_type(param.ty),
+                            self.type_is_symbolic(param.ty),
+                        )
+                    }),
                 );
-                if inferred.is_some() && inferred != signature.return_borrow {
+                let previous_owner = std::mem::replace(
+                    &mut self.current_lexical_owner,
+                    LexicalOwner::Callable(function.span),
+                );
+                let type_scope_depth = self.type_parameter_scopes.len();
+                self.type_parameter_scopes
+                    .push(owner_type_parameters.clone());
+                self.type_parameter_scopes
+                    .push(type_parameter_scope(&function.type_params));
+                let calls = if checked_bodies {
+                    self.checked_return_borrow_calls(function, &scopes, method_context.as_ref())
+                } else {
+                    HashMap::new()
+                };
+                let inferred = if let Some(graph) = graphs.get(&function.span) {
+                    crate::ownership::function_return_borrow_with_bindings(
+                        function,
+                        borrowed_parameters,
+                        &mut |call| {
+                            calls
+                                .get(&call.span())
+                                .copied()
+                                .unwrap_or(crate::ownership::ReturnBorrowLookup::Unresolved)
+                        },
+                        &self.binding_resolution,
+                        graph,
+                    )
+                } else {
+                    crate::ownership::function_return_borrow_with_calls(
+                        function,
+                        borrowed_parameters,
+                        &mut |call| self.call_return_borrow(call, &scopes, method_context.as_ref()),
+                    )
+                };
+                let inferred = match crate::ownership::returned_closure_provenance(
+                    function,
+                    &self.closures,
+                    &self.binding_resolution,
+                    &mut |call| {
+                        calls
+                            .get(&call.span())
+                            .copied()
+                            .unwrap_or(crate::ownership::ReturnBorrowLookup::Unresolved)
+                    },
+                ) {
+                    Some(crate::ownership::ReturnedClosureProvenance::Retained(borrow)) => {
+                        Some(borrow)
+                    }
+                    _ => inferred,
+                };
+                self.type_parameter_scopes.truncate(type_scope_depth);
+                self.current_lexical_owner = previous_owner;
+                if inferred != signature.return_borrow {
                     self.set_return_borrow(function, declaring_class.as_deref(), inferred);
                     changed = true;
                 }
@@ -6313,32 +6632,202 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn return_borrow_graph(
+        &self,
+        function: &FunctionDecl,
+    ) -> Option<crate::control_flow::ControlFlowGraph> {
+        Some(
+            crate::control_flow::build_function_cfg_with_checked_effects(
+                function.body.as_block()?,
+                function.span,
+                &self.given_preludes,
+                &self.checked_effect_sites,
+                &self.catch_error_types,
+                &self.catch_coverage,
+                &self.terminal_assertion_spans(),
+            ),
+        )
+    }
+
+    fn checked_return_borrow_calls(
+        &mut self,
+        function: &FunctionDecl,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> HashMap<Span, crate::ownership::ReturnBorrowLookup> {
+        let mut calls = HashMap::new();
+        if let Some(body) = function.body.as_block() {
+            crate::ast::visit::block(body, &mut |expression| {
+                // A checked property with no accessor plan is a stored-field
+                // projection (including an accessor's own backing field).
+                // Resolving it again without its body scope could overwrite
+                // the checked receiver type with an unknown parameter lookup.
+                if matches!(expression, Expr::PropertyAccess { .. })
+                    && !self
+                        .property_accessor_calls
+                        .get(&expression.span())
+                        .is_some_and(|calls| calls.getter.is_some())
+                {
+                    return;
+                }
+                let borrow = self.call_return_borrow(expression, scopes, method_context);
+                if !matches!(borrow, crate::ownership::ReturnBorrowLookup::Unresolved) {
+                    calls.insert(expression.span(), borrow);
+                }
+            });
+        }
+        calls
+    }
+
     fn call_return_borrow(
         &mut self,
         call: &Expr,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) -> Option<ReturnBorrow> {
+    ) -> crate::ownership::ReturnBorrowLookup {
+        use crate::ownership::ReturnBorrowLookup;
+        if let Some(call) = self.callable_value_calls.get(&call.span()) {
+            let ResolvedType::Function(function) = &call.function_type else {
+                return ReturnBorrowLookup::Unresolved;
+            };
+            return function
+                .return_borrow
+                .map_or(ReturnBorrowLookup::Resolved(None), |returned| {
+                    let FunctionBorrowSource::Parameter(argument_index) = returned.source;
+                    // Checked structural function calls are positional-only.
+                    // Their source index belongs to that checked contract, not
+                    // to the enclosing declaration's parameter names.
+                    ReturnBorrowLookup::ResolvedArgument {
+                        borrow: ReturnBorrow {
+                            source: BorrowSource::Parameter(argument_index),
+                            writable: returned.writable,
+                            kind: returned.kind,
+                        },
+                        argument_index,
+                    }
+                });
+        }
+        // Interface and constrained getters carry their specialized contract.
+        // The template declaration may still return T and cannot replace the
+        // checked callable/Copy ownership fact. Getters have no arguments, so
+        // any retained source is already relative to their receiver.
+        if let Some(getter) = self
+            .property_accessor_calls
+            .get(&call.span())
+            .and_then(|accessors| accessors.getter.as_ref())
+            .filter(|getter| {
+                matches!(
+                    getter.target,
+                    CallableTarget::InterfaceMethod { .. }
+                        | CallableTarget::ConstrainedMethod { .. }
+                )
+            })
+        {
+            return ReturnBorrowLookup::Resolved(getter.return_borrow);
+        }
+        // Body checking has already selected these declarations using the real
+        // lexical scopes. Reuse that identity rather than resolving a local
+        // receiver again from the parameter-only signature-inference scope.
+        // Read the live signature: return loans converge across this pass, so a
+        // return_borrow copied into a call plan may still describe an earlier
+        // iteration. Abstract method contracts are resolved with substitutions
+        // below instead of consulting their unspecialized declaration.
+        let declaration = self
+            .property_accessor_calls
+            .get(&call.span())
+            .and_then(|accessors| accessors.getter.as_ref())
+            .map(|getter| getter.declaration)
+            .or_else(|| {
+                self.method_call_targets
+                    .get(&call.span())
+                    .filter(|_| {
+                        !matches!(
+                            self.call_targets.get(&call.span()),
+                            Some(
+                                CallableTarget::InterfaceMethod { .. }
+                                    | CallableTarget::ConstrainedMethod { .. }
+                            )
+                        )
+                    })
+                    .map(|target| target.declaration)
+            });
+        if let Some(signature) =
+            declaration.and_then(|declaration| self.function_signatures.get(&declaration))
+        {
+            return Self::bind_call_return_borrow(call, signature.return_borrow, &signature.params);
+        }
         match call {
-            Expr::FunctionCall { name, .. } => {
-                self.functions.get(name).and_then(|info| info.return_borrow)
+            Expr::PropertyAccess { .. } => {
+                let Some(method) = self.property_getter(call, scopes, method_context) else {
+                    return ReturnBorrowLookup::Unresolved;
+                };
+                Self::bind_call_return_borrow(call, method.return_borrow, &method.params)
             }
-            Expr::MethodCall { object, method, .. } => {
-                let object_ty = self.infer_expr_type(object, scopes, method_context);
+            Expr::FunctionCall { name, .. } => self
+                .functions
+                .get(name)
+                .map_or(ReturnBorrowLookup::Resolved(None), |info| {
+                    Self::bind_call_return_borrow(call, info.return_borrow, &info.params)
+                }),
+            Expr::MethodCall {
+                object,
+                method,
+                span,
+                ..
+            } => {
+                let object_ty = self
+                    .expression_types
+                    .get(&object.span())
+                    .filter(|ty| !matches!(ty, ResolvedType::Unsupported))
+                    .cloned()
+                    .map(|ty| self.types.intern_resolved(&ty))
+                    .unwrap_or_else(|| self.infer_expr_type(object, scopes, method_context));
                 let object_ty = self.forwarded_access_payload_type(object_ty);
+                if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty) {
+                    return self.trait_method(owner, method).map_or(
+                        ReturnBorrowLookup::Resolved(None),
+                        |info| {
+                            Self::bind_call_return_borrow(call, info.return_borrow, &info.params)
+                        },
+                    );
+                }
                 if matches!(
                     (self.types.kind(object_ty), method.as_str()),
                     (TypeKind::Dictionary(_, _), "get")
                 ) {
-                    return Some(ReturnBorrow {
+                    return ReturnBorrowLookup::Resolved(Some(ReturnBorrow {
                         source: BorrowSource::Receiver,
                         writable: false,
-                    });
+                        kind: ReturnBorrowKind::Value,
+                    }));
                 }
-                self.expr_class_name(object, scopes, method_context)
-                    .and_then(|class_name| self.classes.get(&class_name))
-                    .and_then(|class| class.methods.get(method))
-                    .and_then(|info| info.return_borrow)
+                if let Some(interface) = self.interface_receiver(object_ty) {
+                    return self.interface_method(&interface, method).map_or(
+                        ReturnBorrowLookup::Resolved(None),
+                        |info| {
+                            Self::bind_call_return_borrow(call, info.return_borrow, &info.params)
+                        },
+                    );
+                }
+                if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty).clone() {
+                    return self
+                        .constrained_requirement(&parameter, method, *span)
+                        .ok()
+                        .flatten()
+                        .map_or(ReturnBorrowLookup::Resolved(None), |requirement| {
+                            Self::bind_call_return_borrow(
+                                call,
+                                requirement.method.return_borrow,
+                                &requirement.method.params,
+                            )
+                        });
+                }
+                self.member_class_type(object_ty)
+                    .and_then(|class| self.lookup_instance_method(&class, method))
+                    .map(|(_, method)| method)
+                    .map_or(ReturnBorrowLookup::Resolved(None), |info| {
+                        Self::bind_call_return_borrow(call, info.return_borrow, &info.params)
+                    })
             }
             Expr::StaticCall {
                 qualifier, method, ..
@@ -6346,9 +6835,38 @@ impl<'program> Checker<'program> {
                 .static_qualifier_class_name(qualifier, method_context)
                 .and_then(|class_name| self.classes.get(&class_name))
                 .and_then(|class| class.methods.get(method))
-                .and_then(|info| info.return_borrow),
-            _ => None,
+                .map_or(ReturnBorrowLookup::Resolved(None), |info| {
+                    Self::bind_call_return_borrow(call, info.return_borrow, &info.params)
+                }),
+            _ => ReturnBorrowLookup::Unresolved,
         }
+    }
+
+    fn bind_call_return_borrow(
+        call: &Expr,
+        borrow: Option<ReturnBorrow>,
+        params: &[ParamInfo],
+    ) -> crate::ownership::ReturnBorrowLookup {
+        use crate::ownership::ReturnBorrowLookup;
+        let Some(borrow) = borrow else {
+            return ReturnBorrowLookup::Resolved(None);
+        };
+        let BorrowSource::Parameter(parameter_index) = borrow.source else {
+            return ReturnBorrowLookup::Resolved(Some(borrow));
+        };
+        let args = match call {
+            Expr::FunctionCall { args, .. }
+            | Expr::MethodCall { args, .. }
+            | Expr::StaticCall { args, .. } => args,
+            _ => return ReturnBorrowLookup::Resolved(None),
+        };
+        Self::argument_index_bound_to_parameter(params, args, parameter_index).map_or(
+            ReturnBorrowLookup::Resolved(None),
+            |argument_index| ReturnBorrowLookup::ResolvedArgument {
+                borrow,
+                argument_index,
+            },
+        )
     }
 
     fn set_return_borrow(
@@ -7223,6 +7741,11 @@ impl<'program> Checker<'program> {
         for member in &class_decl.members {
             match member {
                 ClassMember::Property(property) => {
+                    self.check_property_hook_bodies(
+                        property,
+                        &class_decl.name,
+                        crate::property_hooks::PropertyHookContext::Class,
+                    );
                     if property.is_static {
                         if let Some(initializer) = &property.initializer {
                             self.check_nonthrowing_initializer(
@@ -7434,6 +7957,11 @@ impl<'program> Checker<'program> {
                     PropertyInitState::Uninitialized
                 },
                 declaration_span: property.span,
+                hooks: crate::property_hooks::declaration_facts(
+                    property,
+                    crate::property_hooks::PropertyHookContext::Class,
+                )
+                .map(|facts| facts.symbols()),
             },
         );
     }
@@ -7538,6 +8066,7 @@ impl<'program> Checker<'program> {
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
                 declaration_span: param.span,
+                hooks: None,
             },
         );
     }
@@ -8128,6 +8657,24 @@ impl<'program> Checker<'program> {
             crate::compiler_known_io::INVALID_UTF8_ERROR,
         ] {
             let effect = self.resolve_type_ref(&TypeRef::named(name), span);
+            if !complete.contains(&effect) {
+                complete.push(effect);
+            }
+        }
+        complete
+    }
+
+    fn complete_callback_invocation_effects(
+        &mut self,
+        required: &[TypeId],
+        span: Span,
+    ) -> Vec<TypeId> {
+        let Some(ambient) = self.callback_ambient_effect_seed.get(&span).cloned() else {
+            return self.complete_function_value_effects(required, span);
+        };
+        let mut complete = required.to_vec();
+        for effect in ambient {
+            let effect = self.types.intern_resolved(&effect);
             if !complete.contains(&effect) {
                 complete.push(effect);
             }
@@ -8917,6 +9464,19 @@ impl<'program> Checker<'program> {
                 self.foreach_loops.insert(
                     foreach.span,
                     ForeachSemanticInfo {
+                        iterable_span: foreach.iterable.span(),
+                        binding_ids: foreach
+                            .first_binding
+                            .iter()
+                            .map(|binding| binding.name_span)
+                            .chain(std::iter::once(foreach.value_binding.name_span))
+                            .filter_map(|span| {
+                                self.binding_resolution
+                                    .declaration_by_span
+                                    .get(&span)
+                                    .copied()
+                            })
+                            .collect(),
                         iterable_type: self.types.resolved(plan.iterable_type),
                         iterable_family: plan.family,
                         iteration_kind: plan.iteration_kind,
@@ -9456,6 +10016,12 @@ impl<'program> Checker<'program> {
     ) {
         match assignment.op {
             AssignOp::Assign => {
+                self.check_setter_argument(
+                    &assignment.target,
+                    &assignment.value,
+                    scopes,
+                    method_context,
+                );
                 let target_ty = target.ty;
                 let destination = target.destination.clone();
                 let assignment_ok = self.check_expr_assignable(
@@ -11247,7 +11813,7 @@ impl<'program> Checker<'program> {
                 .with_title("Error Inspector Must Return Void"),
             );
         }
-        let complete = self.complete_function_value_effects(&function.checked_effects, span);
+        let complete = self.complete_callback_invocation_effects(&function.checked_effects, span);
         self.record_checked_effects(complete, span);
         let inspector_requirement = match function.invocation_mode {
             FunctionInvocationMode::Readonly => CaptureRequirement::Readonly,
@@ -11490,6 +12056,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.record_member_receiver_access(object, scopes, method_context);
                 self.check_mixed_operation(object, "property access", scopes, method_context);
                 self.check_nullable_member_access(
                     object,
@@ -11542,7 +12109,14 @@ impl<'program> Checker<'program> {
                             method_context,
                         );
                     } else {
-                        self.lookup_property(object, property, *span, scopes, method_context);
+                        self.check_property_read(
+                            object,
+                            property,
+                            *member_span,
+                            *span,
+                            scopes,
+                            method_context,
+                        );
                     }
                 }
             }
@@ -11556,6 +12130,7 @@ impl<'program> Checker<'program> {
                 null_safe,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.record_member_receiver_access(object, scopes, method_context);
                 self.record_method_argument_types(
                     object,
                     method,
@@ -11912,20 +12487,30 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
-            return false;
+        let receiver = self.infer_expr_type(object, scopes, method_context);
+        let property_type = if let Some(receiver) = self.property_contract_receiver(receiver) {
+            let Ok(Some(required)) = self.property_contract_requirement(
+                receiver,
+                member,
+                crate::ast::PropertyHookKind::Get,
+                span,
+            ) else {
+                return false;
+            };
+            required.method.return_ty
+        } else {
+            let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
+                return false;
+            };
+            if self.lookup_instance_method(&class_type, member).is_some() {
+                return false;
+            }
+            let Some((_, property)) = self.lookup_instance_property(&class_type, member) else {
+                return false;
+            };
+            property.ty
         };
-        let Some(class) = self.classes.get(&class_type.name) else {
-            return false;
-        };
-        if class.methods.contains_key(member) {
-            return false;
-        }
-        let Some(property) = class.properties.get(member).cloned() else {
-            return false;
-        };
-        let property = self.specialize_property_for_class(&property, &class_type);
-        if self.non_null_function_type(property.ty).is_none() {
+        if self.non_null_function_type(property_type).is_none() {
             return false;
         }
         let property_expr = Expr::PropertyAccess {
@@ -11947,10 +12532,17 @@ impl<'program> Checker<'program> {
             );
             return true;
         }
-        self.lookup_property(object, member, span, scopes, method_context);
+        self.check_property_read(
+            object,
+            member,
+            member_span,
+            property_expr.span(),
+            scopes,
+            method_context,
+        );
         self.check_callable_signature(
             &property_expr,
-            property.ty,
+            property_type,
             args,
             span,
             CallableValueTargetKind::Property,
@@ -12141,7 +12733,7 @@ impl<'program> Checker<'program> {
         }
 
         let complete_effects =
-            self.complete_function_value_effects(&function.checked_effects, span);
+            self.complete_callback_invocation_effects(&function.checked_effects, span);
         self.record_checked_effects(complete_effects.iter().copied(), span);
         let resolved_function = self.types.resolved(callee_ty);
         let resolved_effects = complete_effects
@@ -12153,6 +12745,7 @@ impl<'program> Checker<'program> {
         self.callable_value_calls.insert(
             span,
             CallableValueCallInfo {
+                callee_span: callee.span(),
                 function_type: resolved_function,
                 invocation_mode: function.invocation_mode,
                 return_type: self.types.resolved(function.return_type),
@@ -12172,7 +12765,16 @@ impl<'program> Checker<'program> {
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .is_some_and(|binding| binding.ownership == BindingOwnership::Owned),
-            Expr::This { .. } | Expr::PropertyAccess { .. } | Expr::Index { .. } => false,
+            Expr::PropertyAccess { span, .. } => self
+                .property_accessor_calls
+                .get(span)
+                .and_then(|calls| calls.getter.as_ref())
+                .is_some_and(|getter| {
+                    getter
+                        .return_borrow
+                        .is_none_or(|borrow| borrow.kind == ReturnBorrowKind::Retained)
+                }),
+            Expr::This { .. } | Expr::Index { .. } => false,
             _ => true,
         }
     }
@@ -12499,9 +13101,12 @@ impl<'program> Checker<'program> {
                     ) && !self.is_assignable(expected, inferred)
                     {
                         self.report_closure_return_mismatch(expected, inferred, expression.span());
+                    } else {
+                        self.check_closure_return_capture(expression, expected, &closure_scopes);
                     }
                     expected
                 } else {
+                    self.check_closure_return_capture(expression, inferred, &closure_scopes);
                     inferred
                 }
             }
@@ -12585,7 +13190,7 @@ impl<'program> Checker<'program> {
         normalized_effects.sort_by_key(|effect| self.types.display(*effect));
         normalized_effects.dedup();
         let return_borrow = self
-            .type_can_return_borrow(inferred_return)
+            .type_is_move_type(inferred_return)
             .then(|| {
                 self.infer_closure_return_borrow(closure, &closure_scopes, closure_method_context)
             })
@@ -12676,7 +13281,10 @@ impl<'program> Checker<'program> {
                 name_span: parameter.name_span,
                 default: None,
                 default_span: None,
-                span: parameter.span,
+                // Closure parameters use their name span as the canonical
+                // declaration key. Preserve it in this inference-only adapter
+                // so the shared dataflow seeds the actual checked binding.
+                span: parameter.name_span,
             })
             .collect();
         let mut seen_type_parameters = HashSet::new();
@@ -12717,14 +13325,51 @@ impl<'program> Checker<'program> {
             modifier_prefix_span: closure.span,
             span: closure.span,
         };
-        let borrow =
-            crate::ownership::function_return_borrow_in_context(&function, &[], &mut |call| {
-                self.call_return_borrow(call, scopes, method_context)
-            })?;
+        let borrowed_parameters = crate::ownership::return_borrow_parameters(
+            closure.parameters.iter().map(|parameter| {
+                scopes
+                    .lookup(&parameter.name)
+                    .map_or((false, false), |binding| {
+                        (
+                            !parameter.take && self.type_is_move_type(binding.ty),
+                            self.type_is_symbolic(binding.ty),
+                        )
+                    })
+            }),
+        );
+        let calls = self.checked_return_borrow_calls(&function, scopes, method_context);
+        let graph = self.return_borrow_graph(&function)?;
+        let inferred = crate::ownership::function_return_borrow_with_bindings(
+            &function,
+            borrowed_parameters,
+            &mut |call| {
+                calls
+                    .get(&call.span())
+                    .copied()
+                    .unwrap_or(crate::ownership::ReturnBorrowLookup::Unresolved)
+            },
+            &self.binding_resolution,
+            &graph,
+        );
+        let borrow = match crate::ownership::returned_closure_provenance(
+            &function,
+            &self.closures,
+            &self.binding_resolution,
+            &mut |call| {
+                calls
+                    .get(&call.span())
+                    .copied()
+                    .unwrap_or(crate::ownership::ReturnBorrowLookup::Unresolved)
+            },
+        ) {
+            Some(crate::ownership::ReturnedClosureProvenance::Retained(borrow)) => Some(borrow),
+            _ => inferred,
+        }?;
         match borrow.source {
             BorrowSource::Parameter(index) => Some(FunctionReturnBorrow {
                 source: FunctionBorrowSource::Parameter(index),
                 writable: borrow.writable,
+                kind: borrow.kind,
             }),
             BorrowSource::Receiver => None,
         }
@@ -13059,6 +13704,7 @@ impl<'program> Checker<'program> {
             [(index, mode)] => Some(FunctionReturnBorrow {
                 source: FunctionBorrowSource::Parameter(*index),
                 writable: *mode == FunctionTypeParameterMode::Writable,
+                kind: ReturnBorrowKind::Value,
             }),
             _ => None,
         };
@@ -15420,17 +16066,6 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn type_can_return_borrow(&self, ty: TypeId) -> bool {
-        match self.types.kind(ty) {
-            TypeKind::Nullable(inner) => self.type_can_return_borrow(*inner),
-            TypeKind::Class(_)
-            | TypeKind::Interface(_)
-            | TypeKind::TraitSelf(_)
-            | TypeKind::TypeParameter(_) => true,
-            _ => false,
-        }
-    }
-
     fn type_is_symbolic(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::TypeParameter(_) | TypeKind::TraitSelf(_) | TypeKind::InterfaceSelf(_) => {
@@ -15622,10 +16257,59 @@ impl<'program> Checker<'program> {
         inherited: &MethodInfo,
     ) -> bool {
         let defaults_omitted = method.params.iter().all(|parameter| !parameter.has_default);
-        if defaults_omitted && self.method_contract_failures(method, inherited).is_empty() {
+        let mut failures = self.method_contract_failures(method, inherited);
+        // Receiver/parameter capture provenance is finalized after body checking.
+        failures.retain(|failure| *failure != ContractMismatch::ReturnProvenance);
+        if defaults_omitted && failures.is_empty() {
             return true;
         }
 
+        self.report_override_contract_mismatch(class_name, method, inherited_class, inherited);
+        false
+    }
+
+    fn validate_override_return_provenance(&mut self) {
+        let mut classes = self.classes.keys().cloned().collect::<Vec<_>>();
+        classes.sort();
+        for class_name in classes {
+            let class = self.classes[&class_name].clone();
+            let Some(parent) = &class.parent else {
+                continue;
+            };
+            let mut methods = class.methods.iter().collect::<Vec<_>>();
+            methods.sort_by_key(|(_, method)| method.declaration);
+            for (name, method) in methods {
+                if !method.is_override
+                    || !self
+                        .overridden_declarations
+                        .contains_key(&method.declaration)
+                {
+                    continue;
+                }
+                let Some((owner, _)) = self.lookup_inherited_member(parent, name) else {
+                    continue;
+                };
+                let Some(inherited) = self.classes[&owner.name].methods.get(name).cloned() else {
+                    continue;
+                };
+                let inherited = self.specialize_method_for_class(&inherited, &owner);
+                if self
+                    .method_contract_failures(method, &inherited)
+                    .contains(&ContractMismatch::ReturnProvenance)
+                {
+                    self.report_override_contract_mismatch(&class_name, method, &owner, &inherited);
+                }
+            }
+        }
+    }
+
+    fn report_override_contract_mismatch(
+        &mut self,
+        class_name: &str,
+        method: &MethodInfo,
+        inherited_class: &ClassType<TypeId>,
+        inherited: &MethodInfo,
+    ) {
         self.diagnostics.push(
             Diagnostic::new(
                 "E0729",
@@ -15639,7 +16323,6 @@ impl<'program> Checker<'program> {
             .with_related(inherited.declaration, "the inherited open contract is declared here")
             .with_help("match parameter names, types, ownership, generic arity, receiver access, defaults, return, and checked effects"),
         );
-        false
     }
 
     fn substitute_type_id(
@@ -16091,8 +16774,8 @@ impl<'program> Checker<'program> {
                 object,
                 property,
                 null_safe,
+                member_span,
                 span,
-                ..
             } => {
                 if *null_safe {
                     self.diagnostics.push(
@@ -16108,6 +16791,7 @@ impl<'program> Checker<'program> {
                     return None;
                 }
                 self.check_expr(object, scopes, method_context);
+                self.record_member_receiver_access(object, scopes, method_context);
                 self.check_nullable_member_access(
                     object,
                     false,
@@ -16139,22 +16823,86 @@ impl<'program> Checker<'program> {
                     );
                     return None;
                 }
-                if !Self::is_property_write_object_path(object) {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0204",
-                            "property assignment requires a stable object path",
-                            object.span(),
+                if let Some(receiver) = self.property_contract_receiver(object_ty) {
+                    use crate::ast::PropertyHookKind;
+                    let getter = if matches!(op, AssignOp::Assign) {
+                        None
+                    } else {
+                        self.check_contract_property_accessor(
+                            receiver,
+                            object,
+                            property,
+                            PropertyHookKind::Get,
+                            *member_span,
+                            *span,
+                            scopes,
+                            method_context,
                         )
-                        .with_help(
-                            "bind the object to a writable local before assigning its property",
-                        ),
-                    );
-                    return None;
+                    };
+                    let setter = self.check_contract_property_accessor(
+                        receiver,
+                        object,
+                        property,
+                        PropertyHookKind::Set,
+                        *member_span,
+                        *span,
+                        scopes,
+                        method_context,
+                    )?;
+                    return Some(AssignmentTarget {
+                        ty: getter
+                            .map(|getter| getter.return_ty)
+                            .or_else(|| setter.params.first().map(|parameter| parameter.ty))
+                            .unwrap_or_else(|| self.types.unknown()),
+                        destination: AssignmentDestination::Type,
+                    });
                 }
-                if let Some((class_name, property_info)) =
+                if let Some((class_name, declaring_class, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
+                    if property_info.hooks.is_some()
+                        && !self.accesses_hook_backing(object, &property_info)
+                    {
+                        if !matches!(op, AssignOp::Assign) {
+                            self.check_property_accessor_call(
+                                object,
+                                property,
+                                &property_info,
+                                &declaring_class,
+                                crate::ast::PropertyHookKind::Get,
+                                *span,
+                                scopes,
+                                method_context,
+                            );
+                        }
+                        self.check_property_accessor_call(
+                            object,
+                            property,
+                            &property_info,
+                            &declaring_class,
+                            crate::ast::PropertyHookKind::Set,
+                            *span,
+                            scopes,
+                            method_context,
+                        );
+                        return Some(AssignmentTarget {
+                            ty: property_info.ty,
+                            destination: AssignmentDestination::Type,
+                        });
+                    }
+                    if !Self::is_property_write_object_path(object) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0204",
+                                "property assignment requires a stable object path",
+                                object.span(),
+                            )
+                            .with_help(
+                                "bind the object to a writable local before assigning its property",
+                            ),
+                        );
+                        return None;
+                    }
                     let constructor_context = Self::is_direct_this(object)
                         && constructor_init_context
                             .as_deref()
@@ -18951,6 +19699,18 @@ impl<'program> Checker<'program> {
         writable
     }
 
+    fn record_member_receiver_access(
+        &mut self,
+        object: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let access = self.object_path_access(object, scopes, method_context);
+        self.member_receiver_access.insert(object.span(), access);
+        let receiver = self.infer_expr_type(object, scopes, method_context);
+        self.record_constrained_receiver(receiver, object.span());
+    }
+
     fn object_path_access(
         &mut self,
         expr: &Expr,
@@ -18990,6 +19750,27 @@ impl<'program> Checker<'program> {
             Expr::PropertyAccess {
                 object, property, ..
             } => {
+                if let Some(method) = self.property_getter(expr, scopes, method_context) {
+                    let writable = self.call_result_is_writable(
+                        CallSite {
+                            return_ty: method.return_ty,
+                            return_borrow: method.return_borrow,
+                            params: &method.params,
+                            args: &[],
+                        },
+                        Some(object),
+                        scopes,
+                        method_context,
+                    );
+                    if writable {
+                        self.writable_object_paths.insert(expr.span());
+                    }
+                    return if writable {
+                        ObjectPathAccess::Writable
+                    } else {
+                        ObjectPathAccess::Readonly
+                    };
+                }
                 if !Self::is_property_write_object_path(object) {
                     return ObjectPathAccess::Readonly;
                 }
@@ -19206,6 +19987,15 @@ impl<'program> Checker<'program> {
         args: &'a [Argument],
         param_index: usize,
     ) -> Option<&'a Expr> {
+        Self::argument_index_bound_to_parameter(params, args, param_index)
+            .map(|arg_index| &args[arg_index].value)
+    }
+
+    fn argument_index_bound_to_parameter(
+        params: &[ParamInfo],
+        args: &[Argument],
+        param_index: usize,
+    ) -> Option<usize> {
         let param_names: Vec<&str> = params.iter().map(|param| param.name.as_str()).collect();
         let param_has_default: Vec<bool> = params.iter().map(|param| param.has_default).collect();
         let arg_names: Vec<Option<&str>> = args
@@ -19214,12 +20004,7 @@ impl<'program> Checker<'program> {
             .collect();
         let bound =
             crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
-        bound
-            .param_to_arg
-            .get(param_index)
-            .copied()
-            .flatten()
-            .map(|arg_index| &args[arg_index].value)
+        bound.param_to_arg.get(param_index).copied().flatten()
     }
 
     fn is_direct_this(expr: &Expr) -> bool {
@@ -19237,39 +20022,12 @@ impl<'program> Checker<'program> {
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) -> Option<(String, PropertyInfo)> {
+    ) -> Option<(String, ClassType<TypeId>, PropertyInfo)> {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
         if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
             return self
                 .trait_property(&owner, property)
-                .map(|property| (owner, property));
-        }
-        if let Some(interface) = self.interface_receiver(object_ty) {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0303",
-                    format!(
-                        "interface `{}` has no property `{property}`",
-                        interface.name
-                    ),
-                    span,
-                )
-                .with_title("Unknown Interface Property"),
-            );
-            return None;
-        }
-        if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0537",
-                    format!(
-                        "property `{property}` is not guaranteed by the constraints on type parameter `{parameter}`"
-                    ),
-                    span,
-                )
-                .with_help("type-parameter bodies may use only members guaranteed by their constraints"),
-            );
-            return None;
+                .map(|property| (owner.clone(), ClassType::new(owner, Vec::new()), property));
         }
         let class_type = self.expr_class_type(object, scopes, method_context)?;
         let class_name = class_type.name.clone();
@@ -19305,7 +20063,7 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        Some((class_name, property_info))
+        Some((class_name, declaring_class, property_info))
     }
 
     fn lookup_instance_property(
@@ -21445,6 +22203,20 @@ impl<'program> Checker<'program> {
                 ) {
                     return result;
                 }
+                if let Some(receiver) = self.property_contract_receiver(object_ty) {
+                    let result = self
+                        .property_contract_requirement(
+                            receiver,
+                            property,
+                            crate::ast::PropertyHookKind::Get,
+                            *span,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|required| required.method.return_ty)
+                        .unwrap_or_else(|| self.types.unknown());
+                    return self.null_safe_result_type(result, *null_safe);
+                }
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
@@ -22052,43 +22824,15 @@ impl<'program> Checker<'program> {
         payload: TypeId,
         method: &str,
     ) -> Option<TypeId> {
-        use SharedHandleKind::*;
-        let result = match (kind, method) {
-            (SharedReference, "share") => self
-                .types
-                .intern(TypeKind::SharedHandle(SharedReference, payload)),
-            (SharedReference, "createWeakReference") => self
-                .types
-                .intern(TypeKind::SharedHandle(WeakReference, payload)),
-            (WritableSharedReference, "share") => self
-                .types
-                .intern(TypeKind::SharedHandle(WritableSharedReference, payload)),
-            (WritableSharedReference, "createWeakReference") => self
-                .types
-                .intern(TypeKind::SharedHandle(WritableWeakReference, payload)),
-            (WritableSharedReference, "acquireReadonlyAccess") => self.types.intern(
-                TypeKind::SharedHandle(ReadonlySharedReferenceAccess, payload),
-            ),
-            (WritableSharedReference, "acquireWritableAccess") => self.types.intern(
-                TypeKind::SharedHandle(WritableSharedReferenceAccess, payload),
-            ),
-            // A weak reference acquires only within its own family, and the result
-            // is nullable because the payload may already be gone.
-            (WeakReference, "acquire") => {
-                let strong = self
-                    .types
-                    .intern(TypeKind::SharedHandle(SharedReference, payload));
-                self.types.intern(TypeKind::Nullable(strong))
-            }
-            (WritableWeakReference, "acquire") => {
-                let strong = self
-                    .types
-                    .intern(TypeKind::SharedHandle(WritableSharedReference, payload));
-                self.types.intern(TypeKind::Nullable(strong))
-            }
-            _ => return None,
-        };
-        Some(result)
+        let (result_kind, nullable) = kind.method_result(method)?;
+        let result = self
+            .types
+            .intern(TypeKind::SharedHandle(result_kind, payload));
+        Some(if nullable {
+            self.types.intern(TypeKind::Nullable(result))
+        } else {
+            result
+        })
     }
 
     /// `referencedValue` is the compiler-known readonly projection to the payload,
@@ -22103,7 +22847,7 @@ impl<'program> Checker<'program> {
     ) -> Option<TypeId> {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
         let (kind, payload) = self.shared_handle_type(object_ty, null_safe)?;
-        if kind != SharedHandleKind::SharedReference || property != "referencedValue" {
+        if !kind.projects_payload_property(property) {
             return None;
         }
         Some(self.null_safe_result_type(payload, null_safe))
@@ -23472,7 +24216,7 @@ impl<'program> Checker<'program> {
         };
 
         let complete_effects =
-            self.complete_function_value_effects(&function.checked_effects, span);
+            self.complete_callback_invocation_effects(&function.checked_effects, span);
         self.record_checked_effects(complete_effects.iter().copied(), span);
         let checked_effects = complete_effects
             .iter()
@@ -24038,6 +24782,10 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<ClassType<TypeId>> {
         let ty = self.infer_expr_type(expr, scopes, method_context);
+        self.member_class_type(ty)
+    }
+
+    fn member_class_type(&self, ty: TypeId) -> Option<ClassType<TypeId>> {
         // Compiler-known place behavior (record 0106): a forwarding handle resolves
         // member access against its payload class. Deliberately closed to these
         // types — this is not a general proxy or dynamic-lookup mechanism.

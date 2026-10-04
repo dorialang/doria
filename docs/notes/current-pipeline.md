@@ -22,7 +22,16 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   fallbacks. Opt-in reports cover multi-file builds and native code size; pinned
   benchmark workloads separate specialization growth from erased dispatch.
   Tooling describes source dispatch without promising a machine-code shape.
-  Stage 35a is complete; Stage 36 is next and has not begun. Controlled timing
+  Stage 35a is complete; Stage 36 grammar, hook-body checks, concrete/interface/
+  constrained call analysis, and override contract checks are implemented under
+  Decision 0135. HIR storage and accessor bodies, MIR dispatch, and PHP accessor
+  calls are enabled through the public compiler pipeline. Andrew approved
+  exact setter input types, inherited backing-field reuse, separate callback
+  ownership and receiver-bound lifetimes, and transitive blocking-I/O rejection.
+  These rules have regression coverage. Backed override initializers run parent
+  then child, replacing the inherited value after successful evaluation.
+  Durable linked-backend parity and coordinated closure validation are in progress.
+  Controlled timing
   remains **Measurement Status: Pending Available Runner**, never a pass.
 - Stage 35 Slice 3 implements canonical value equality/hash/order/clone,
   Copy-or-Cloneable preserving collections, and public iteration. Promoted
@@ -278,7 +287,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   - Stage 35 Slice 5 Cross-Repository Closure — Complete.
   - Stage 35 — Complete.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Complete.
-- Stage 36 Property Hooks — Scheduled. Next language work; not begun.
+- Stage 36 Property Hooks — In Progress. Grammar, concrete/interface/constrained
+  call analysis, and override contract checks under Decision 0135, including
+  `borrowed get`. Accessor execution components have interpreter, linked-native,
+  and PHP tests, including transitive blocking/async checks. The blanket E0764
+  rejection is removed, and tests exercise the public compiler pipeline.
+  Backed override initializers run parent then child, replacing the inherited
+  value. Initializer regressions cover replacement ownership and failed
+  construction phases; durable parity and coordinated validation are in progress.
+  This is not Stage 36 completion.
 - Pre-Stage-45 Doria-Native Baton Transition — Scheduled, Mandatory Before Unsuffixed `2026.03.1`.
 - Stage 36a — Scheduled, Not Implemented.
 

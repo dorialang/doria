@@ -62,6 +62,7 @@ leaves!(
     String,
     bool,
     MemberAccess,
+    PropertyHookKind,
     AssignOp,
     IncrementOp,
     IncrementPosition,
@@ -163,14 +164,49 @@ structure!(GroupedTypeRef {
 });
 
 enumeration!(ClassMember { Property(value), Method(value), Constant(value), Uses(value) });
+structure!(InterfaceDecl {
+    access,
+    access_span,
+    name,
+    name_span,
+    type_params,
+    parents,
+    requirements,
+    properties,
+    syntax,
+    span
+});
+structure!(TypeDeclarationSyntax {
+    keyword_span,
+    type_parameters,
+    inheritance_keyword_span,
+    inheritance_type_spans,
+    inheritance_comma_spans,
+    open_brace_span,
+    close_brace_span
+});
 structure!(PropertyDecl {
     access,
+    open_span,
+    override_span,
     is_static,
     writable,
     ty,
     name,
     name_span,
     initializer,
+    hooks,
+    span
+});
+structure!(PropertyHook {
+    kind,
+    keyword_span,
+    writable_span,
+    borrowed_span,
+    parameter,
+    throws,
+    arrow_span,
+    body,
     span
 });
 structure!(ConstDecl {

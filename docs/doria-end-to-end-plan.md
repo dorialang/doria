@@ -474,21 +474,21 @@ class Article
 
 ### 6.4 Property hooks
 
-The planned escape hatch from SPEC §6, landing after classes are fully native:
+Decision 0135 records the accepted Stage 36 hook foundations:
 
 ```doria
 class Temperature
 {
     internal writable float $celsius = 0.0;
 
-    float $fahrenheit {
+    writable float $fahrenheit {
         get => $this->celsius * 9.0 / 5.0 + 32.0;
         set (float $value) => $this->celsius = ($value - 32.0) * 5.0 / 9.0;
     }
 }
 ```
 
-PHP 8.4 hook spelling, adjusted to Doria's always-typed parameter rule; `get`-only hooks make computed readonly properties; `set` hooks require the property (or hook) to be writable-consistent.
+PHP-shaped hook spelling with explicitly typed setter parameters. Automatic backing storage is accepted alongside computed hooks. Direct same-property `$this` access inside its hook refers to backing storage; outside access invokes the hook. Initializers fill backing storage without calling the setter; purely computed hooks have no slot. A setter requires a `writable` property; ordinary `get` is readonly, while `writable get` requires writable receiver access. Getter-only properties remain unassignable. `borrowed get` declares a borrowed result, independently of receiver access; plain interface `get` requires an owned Move result. Interfaces, traits, and deliberate `open`/`override` hook dispatch land together under Decision 0135.
 
 ### 6.5 Statics and constants
 
@@ -840,7 +840,7 @@ Subjects awaiting decision records are deliberately unnumbered:
 - Collections runtime and API surface (§9).
 - Compiler-internal iteration machinery.
 - Interfaces, traits, `Cloneable`, and public `Iterable` conformance.
-- Property hooks. The demanding design case is **ORM-shaped lazy-loaded relations**. PHP/TypeScript ORMs in the AssegaiPHP/TypeORM lineage use proxies to intercept property access; Doria has no reflection and no proxies, so hooks are the only mechanism a property-shaped lazy relation could use. Accepted direction (audit finding F6): a hook **may `throws`** — so a lazy relation can surface a load failure through the checked-error path — but **may not block or perform async work** in v1.0, and a hooked property is therefore **not guaranteed side-effect-free**; the §6 "looks like data" contract is a readability convention, not a purity guarantee, and the record documents that honestly. Design against the ORM lazy-relation case, not only simple validation and computed properties.
+- Decision 0135: property hooks, automatic backing storage, writable accessors, and interface/trait/override integration. Hooks may `throws` and have side effects but may not block or perform async work in v1.0. The ORM-shaped lazy-relation case is required alongside computed and validation cases; property-shaped access is not a purity guarantee.
 - Unsafe/FFI, including zero-copy numerical exchange (D12).
 - The `php-lib` bridge: transport-neutral contract, export analysis, thread-affinity invariant, and interop handoff questions (D13c/d).
 - Async and `Shareable` (D11).
@@ -1051,7 +1051,7 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   - **Post-Stage-34 Corrective Beat:** Explicit Foreach Binding Types — Complete under Decision 0133.
   - **Stage 35:** Interfaces And Traits — Complete under Decision 0134; all five slices complete.
   - **Stage 35a:** Optimizer Contracts, Dispatch, And Escape Audit — Complete.
-  - **Next:** Stage 36 Property Hooks — Scheduled.
+  - **Current:** Stage 36 Property Hooks — In Progress.
   - **Scheduled:** Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
   - **Non-blocking evidence:** Stage 26b controlled timing remains `Measurement Status: Pending Available Runner`; this is not a performance pass.
   - **Release gate:** the unsuffixed `2026.03.1` release remains blocked on the Doria-native Baton cutover.
@@ -1171,8 +1171,8 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   traits, deterministic flattening/layout, and `insteadof`/`as`. Concrete
   constrained calls remain static; deliberate interface erasure uses one
   constant-slot indirect call without a wrapper allocation or object header.
-  User interfaces are method-only and `Error` keeps its narrow stored-message
-  exception, leaving all property-hook syntax to Stage 36.
+  Stage 35 delivered method requirements and `Error`'s narrow stored-message
+  exception. Stage 36 extends interfaces with accessor contracts under Decision 0135.
   - **Slice 1 — Complete: Grammar, Graphs, And Conformance.** Complete source-
     preserving grammar/AST, declaration and specialization graphs, interface
     inheritance, nominal class conformance, method compatibility, diagnostics,
@@ -1221,7 +1221,11 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   - **Acceptance:** dispatch-shape IR checks, metadata soundness negatives, code-size
     evidence, separate specialized/erased measurements, and one proven allocation
     promotion across the native backends.
-- **Stage 36 — Property hooks — Next.** §6.4 hooks. AC: `Temperature` example. (`when` moved to Stage 28a — it is basic control flow, not OOP completion.)
+- **Stage 36 — Property Hooks — In Progress.** Decision 0135 and §6.4. Accepted foundations include automatic backing storage, explicit writable accessors, and full interface/trait/override integration.
+  - **Authority And Grammar:** preserve accessor bodies, typed setter parameters, effects, and source spans; apply Decision 0135's accepted backing-access rules.
+  - **Analysis:** concrete, interface, and constrained accessor calls reuse ownership and checked-effect rules. Exact setter input types, inherited backing-field reuse, transitive rejection of blocking I/O, and separate callback ownership and receiver-bound lifetimes are implemented with regression coverage.
+  - **Execution And Ownership:** HIR storage and accessor bodies, MIR dispatch, and PHP accessor calls implement backed/computed access, exactly-once read-modify-write, ownership, and cleanup. Backed override initializers run parent then child in one shared field, preserving replacement ownership and failed-construction cleanup. Public execution is enabled; durable linked-backend parity and closure validation remain in progress.
+  - **Closure:** interpreter/Cranelift/LLVM parity for Temperature, validation, caching, failures, composition, ownership, and negative contracts; PHP preserves the same hooks within its existing numeric compatibility boundaries. Coordinate tooling, website, and installed refresh. Stage 36 is not complete.
 - **Stage 36a — Stream, readiness, and standard I/O foundation.** **Scheduled, not implemented.** Decision 0110 accepts both the semantic architecture and its binding performance/memory contract: small byte-stream capabilities; owned handles with consuming explicit close/finish and nonthrowing best-effort destruction; first-class non-owning standard streams over the intrinsic device substrate; data/would-block/EOF/timed-out reads; partial-progress writes; capability-gated blocking modes; one multi-stream readiness, duration/deadline, cancellation, and backpressure model; typed buffering and incremental UTF-8 text adapters; typed file requests and locking; bounded streaming copy; and owned child processes with concurrently drained pipes. The steady-state data plane has no mandatory allocation per operation or loop iteration, exposes reusable caller/adapter buffers and safe readable/writable byte regions, avoids hidden whole-chunk and unread-suffix copies, keeps common outcomes and standard-stream views allocation-free, reuses readiness registrations/event storage, forbids ordinary busy polling and one-thread-per-stream designs, and initializes no executor/task/scheduler infrastructure in synchronous programs. Concrete adapters remain eligible for static specialization and inlining; deliberate interface erasure may dispatch dynamically without a heap object per call or layer. Exact public interface, member, result-case, readiness, byte-region, reusable-buffer, standard-stream, file, adapter, and process spellings are deferred to a decision-0110 appendix before implementation begins; this is a naming deferral, not a semantic or performance review gate. Prerequisites: Stage 29 checked errors, Stage 31 namespaces/multi-file support, Stage 35 interfaces/capability contracts, existing ownership/RAII, the existing standard-device runtime substrate, and decision 0109's unified diagnostics/runtime outcomes. Property hooks are not intrinsically required, but Stage 36a remains after Stage 36 to preserve the accepted linear sequence. Non-goals: async state-machine lowering, a multithreaded executor, TCP/UDP product APIs, HTTP, TLS implementation, terminal raw mode/key/resize/cursor/screen/color/styling, PHP-compatible dynamic wrapper or string-filter registries, global stream contexts, and mixed metadata bags. Stage 36a owns the initial Linux/macOS/Windows stream benchmark and memory-regression gate: cold startup; throughput and latency; wall/user/system time; peak RSS; allocation count where available; syscall count where available; development/release/stripped binary size; and correctness hashes or exact output. Its required cases are large streaming file copy, repeated small writes, non-blocking pipe transfer, child stdout/stderr drainage, incremental UTF-8 line processing, first-class versus intrinsic standard-output writes, many stable readiness registrations, synchronous startup, a concrete adapter chain, and an erased interface stream. Equivalent direct OS/C/Rust implementations are comparison baselines, never unsupported superiority claims. Structural allocation/copy/readiness assertions run in ordinary CI; curated timing regressions run on controlled runners. Stage 43 continues and broadens this suite instead of postponing the initial gate. AC: the semantic fixtures above agree across interpreter/Cranelift/LLVM; the benchmark cases produce identical correctness hashes; reusable-buffer loops show no mandatory steady-state allocation or hidden whole-chunk copy; standard-stream/common-outcome and readiness-reuse structural checks pass; synchronous startup initializes no async infrastructure; all three native OS backends meet the accepted regression thresholds recorded with the benchmark harness. No speculative source spelling is accepted syntax here.
 
 ### Phase H — Concurrency (Stages 37–39)

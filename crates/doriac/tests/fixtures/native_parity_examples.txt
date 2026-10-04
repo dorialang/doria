@@ -1,4 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
+examples/native/main_nullable_collection_removal.doria
 examples/native/main_add_overflow_panic.doria
 examples/native/main_ambient_io_callbacks.doria
 examples/native/main_ambient_io_fallible_finalizers.doria
@@ -367,3 +368,23 @@ examples/native/main_stage35_trait_inheritance_core.doria
 examples/native/main_stage35_trait_iteration.doria
 examples/native/main_stage35a_stack_classes.doria
 examples/native/main_stage35a_transferred_closure.doria
+examples/native/main_returned_collection_borrows.doria
+examples/native/main_returned_move_borrows.doria
+examples/native/main_nullable_class_upcasts.doria
+examples/native/main_nullable_returned_closures.doria
+examples/native/main_collection_member_name_overlap.doria
+examples/native/main_collection_callback_mutation.doria
+examples/native/main_repeatable_closure_captures.doria
+examples/native/main_temporary_returned_borrows.doria
+examples/native/main_backed_override_initializer_order.doria
+examples/native/main_backed_override_initializer_failure.doria
+examples/native/main_stage36_computed_properties.doria
+examples/native/main_stage36_hook_updates.doria
+examples/native/main_stage36_hook_failures.doria
+examples/native/main_stage36_hook_results.doria
+examples/native/main_stage36_hook_ownership.doria
+examples/native/main_stage36_writable_getters.doria
+examples/native/main_stage36_hook_composition.doria
+examples/native/main_stage36_cached_property.doria
+examples/native/main_stage36_temperature.doria
+examples/native/main_stage36_validated_property.doria

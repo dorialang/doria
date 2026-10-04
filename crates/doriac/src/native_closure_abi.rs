@@ -7,12 +7,280 @@ use crate::mir;
 pub const CARRIER_WORDS: u32 = 2;
 pub const DESCRIPTOR_WORDS: u32 = 2;
 
+/// A borrow home retains the original storage address, not an intermediate
+/// receiver's stack slot. Representation projections also retain the storage's type:
+/// an interface vtable is not an open-class descriptor, even though both
+/// carriers have two words. Call arguments point to a transient descriptor;
+/// borrowed environment fields copy its words rather than retaining that pointer.
+pub const BORROW_HOME_WORDS: u32 = 2;
+
+pub fn borrow_home_type_key(ty: mir::Type) -> u64 {
+    match ty {
+        mir::Type::Class(id) | mir::Type::NullableClass(id) => ((id.0 as u64) << 2) | 1,
+        mir::Type::Interface(id) | mir::Type::NullableInterface(id) => ((id.0 as u64) << 2) | 2,
+        mir::Type::Collection(id) | mir::Type::NullableCollection(id) => ((id.0 as u64) << 2) | 3,
+        // Nonzero multiples of four are disjoint from nominal keys. Unlike
+        // pointer-based nullable carriers, a nullable enum has a presence
+        // prefix, so its physical nullability must remain part of the key.
+        mir::Type::PayloadEnum(ty) => (ty.id.0 as u64 + 1) << 3,
+        mir::Type::NullablePayloadEnum(ty) => ((ty.id.0 as u64 + 1) << 3) | 4,
+        _ => 0,
+    }
+}
+
+pub fn local_needs_borrow_home(function: &mir::Function, local: &mir::Local) -> bool {
+    !local.owned
+        && local.ty.has_move_ownership()
+        && !function.params.contains(&local.id)
+        && !function.closure.as_ref().is_some_and(|closure| {
+            closure
+                .capture_locals
+                .iter()
+                .any(|(_, capture)| *capture == local.id)
+        })
+}
+
+/// An independently owned temporary has no preexisting source place. Native
+/// consumers may give its evaluated carrier stable statement-scoped storage;
+/// the existing temporary cleanup remains its only ownership obligation.
+/// Never manufacture a replacement home for missing borrowed provenance.
+pub fn needs_owned_borrow_home(value: &mir::Rvalue, function: &mir::Function) -> bool {
+    value.ty().has_move_ownership()
+        && !value.is_null_value()
+        && !value.borrows_move_value()
+        && !has_addressable_borrow_home(value, function)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowHomeProjection {
+    Direct,
+    NullableWordPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowHomePlace {
+    Local {
+        local: mir::LocalId,
+        projection: BorrowHomeProjection,
+    },
+    Property {
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    },
+}
+
+/// Exact places shared by every native value family. Runtime projections such
+/// as mixed unboxing and call results are deliberately not guessed here.
+pub fn direct_borrow_home_place(value: &mir::Rvalue) -> Option<BorrowHomePlace> {
+    use BorrowHomePlace as P;
+    use BorrowHomeProjection as Q;
+    let projected_local = match value {
+        mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local)) => {
+            Some((*local, Q::NullableWordPayload))
+        }
+        mir::Rvalue::Value(
+            mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                operand: mir::Operand::NullablePayload(local),
+                ..
+            })
+            | mir::ValueExpression::Float(mir::FloatExpression::Use {
+                operand: mir::Operand::NullablePayload(local),
+                ..
+            })
+            | mir::ValueExpression::Bool(mir::BoolExpression::Use {
+                operand: mir::Operand::NullablePayload(local),
+            })
+            | mir::ValueExpression::Enum(mir::EnumExpression::Use {
+                operand: mir::Operand::NullablePayload(local),
+                ..
+            }),
+        ) => Some((*local, Q::NullableWordPayload)),
+        mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+            ..
+        }) => Some((*local, Q::Direct)),
+        _ => None,
+    };
+    if let Some((local, projection)) = projected_local {
+        return Some(P::Local { local, projection });
+    }
+    if let Some(local) = value.direct_place_local() {
+        return Some(P::Local {
+            local,
+            projection: Q::Direct,
+        });
+    }
+    fn shared(value: crate::native_shared::Expression<'_>) -> Option<BorrowHomePlace> {
+        use crate::native_shared::Operation as O;
+        match value.operation() {
+            O::Local { local, .. } => Some(P::Local {
+                local,
+                projection: Q::Direct,
+            }),
+            O::Property { object, property } => Some(P::Property { object, property }),
+            O::Present(value) => shared(value),
+            _ => None,
+        }
+    }
+    if let Some(value) = crate::native_shared::Expression::from_rvalue(value) {
+        return shared(value);
+    }
+    match value {
+        mir::Rvalue::Mixed(mir::MixedExpression::Property { object, property })
+        | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Property { object, property })
+        | mir::Rvalue::Function(mir::FunctionExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Property {
+            object,
+            property,
+            ..
+        })
+        | mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            place: mir::PayloadEnumPlace::Property { object, property },
+            ..
+        })
+        | mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+            place: mir::PayloadEnumPlace::Property { object, property },
+            ..
+        }) => Some(P::Property {
+            object: *object,
+            property: *property,
+        }),
+        mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Mixed(value)) => {
+            direct_borrow_home_place(&mir::Rvalue::Mixed(value.clone()))
+        }
+        mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Present(value)) => {
+            direct_borrow_home_place(&mir::Rvalue::Function(value.clone()))
+        }
+        mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(value)) => {
+            direct_borrow_home_place(&mir::Rvalue::PayloadEnum(value.clone()))
+        }
+        mir::Rvalue::Function(mir::FunctionExpression::AssumePresent { value, .. }) => {
+            direct_borrow_home_place(&mir::Rvalue::NullableFunction((**value).clone()))
+        }
+        _ => None,
+    }
+}
+
+/// A lifetime root on a call result is not an exact place: a method borrowing
+/// `$this` may return one of its fields. Only explicit MIR places can forward
+/// their home without additional return-place provenance.
+pub fn has_addressable_borrow_home(value: &mir::Rvalue, function: &mir::Function) -> bool {
+    if direct_borrow_home_place(value).is_some() {
+        return true;
+    }
+    fn nominal_local(function: &mir::Function, local: mir::LocalId) -> bool {
+        function.locals.get(local.0).is_some_and(|local| {
+            matches!(
+                local.ty,
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Interface(_)
+                    | mir::Type::NullableInterface(_)
+            )
+        })
+    }
+    fn class(value: &mir::ClassExpression, function: &mir::Function) -> bool {
+        match value {
+            mir::ClassExpression::Local { .. }
+            | mir::ClassExpression::NullableLocalAssumeNonNull { .. }
+            | mir::ClassExpression::Property { .. }
+            | mir::ClassExpression::InterfaceReceiver { .. } => true,
+            mir::ClassExpression::InterfacePayload { local, .. } => nominal_local(function, *local),
+            _ => false,
+        }
+    }
+    fn nullable_class(value: &mir::NullableClassExpression, function: &mir::Function) -> bool {
+        match value {
+            mir::NullableClassExpression::Class(value) => class(value, function),
+            mir::NullableClassExpression::Local { .. }
+            | mir::NullableClassExpression::Property { .. } => true,
+            _ => false,
+        }
+    }
+    fn interface(value: &mir::InterfaceValue, function: &mir::Function) -> bool {
+        match value {
+            mir::InterfaceValue::Local { .. }
+            | mir::InterfaceValue::NullableLocalAssumeNonNull { .. }
+            | mir::InterfaceValue::Property { .. } => true,
+            mir::InterfaceValue::NarrowedLocal { local, .. } => nominal_local(function, *local),
+            mir::InterfaceValue::Upcast { source, .. } => interface(&source.value, function),
+            mir::InterfaceValue::FromClass { object, .. } => class(object, function),
+            mir::InterfaceValue::FromNullableClass { object, .. } => {
+                nullable_class(object, function)
+            }
+            mir::InterfaceValue::FromCollection { value, .. } => {
+                has_addressable_borrow_home(value, function)
+            }
+            _ => false,
+        }
+    }
+    fn nullable_interface(value: &mir::NullableInterfaceValue, function: &mir::Function) -> bool {
+        match value {
+            mir::NullableInterfaceValue::Local { .. }
+            | mir::NullableInterfaceValue::Property { .. } => true,
+            mir::NullableInterfaceValue::Present(value) => interface(value, function),
+            mir::NullableInterfaceValue::Upcast { source, .. } => {
+                nullable_interface(&source.value, function)
+            }
+            _ => false,
+        }
+    }
+    match value {
+        mir::Rvalue::Class(value) => class(value, function),
+        mir::Rvalue::NullableClass(value) => nullable_class(value, function),
+        mir::Rvalue::Interface(value) => interface(&value.value, function),
+        mir::Rvalue::NullableInterface(value) => nullable_interface(&value.value, function),
+        mir::Rvalue::Collection(
+            mir::CollectionExpression::Local { .. }
+            | mir::CollectionExpression::Property { .. }
+            | mir::CollectionExpression::InterfaceReceiver { .. },
+        )
+        | mir::Rvalue::NullableCollection(
+            mir::NullableCollectionExpression::Local { .. }
+            | mir::NullableCollectionExpression::Property { .. },
+        ) => true,
+        mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(value)) => {
+            has_addressable_borrow_home(&mir::Rvalue::Collection(value.clone()), function)
+        }
+        _ => false,
+    }
+}
+
+/// Nominal views and nullable enum views can change representation. Other
+/// homes point directly at the checked value, including narrowed Copy words.
+pub fn borrow_home_projection_types(program: &mir::Program, target: mir::Type) -> Vec<mir::Type> {
+    if let mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) = target {
+        return vec![
+            mir::Type::PayloadEnum(ty),
+            mir::Type::NullablePayloadEnum(ty),
+        ];
+    }
+    if borrow_home_type_key(target) == 0 {
+        return Vec::new();
+    }
+    program.classes.iter().map(|class| mir::Type::Class(class.id))
+        .chain(program.interface_types.iter().map(|interface| mir::Type::Interface(interface.id)))
+        .chain(program.collection_types.iter().map(|collection| mir::Type::Collection(collection.id)))
+        .filter(|source| match (*source, target) {
+            (mir::Type::Collection(source), mir::Type::Interface(target) | mir::Type::NullableInterface(target)) => program.interface_vtable(mir::ImplementingType::Collection(source), target).is_some(),
+            (mir::Type::Interface(source), mir::Type::Collection(target) | mir::Type::NullableCollection(target)) => program.interface_vtable(mir::ImplementingType::Collection(target), source).is_some(),
+            (mir::Type::Collection(source), mir::Type::Collection(target) | mir::Type::NullableCollection(target)) => source == target,
+            (mir::Type::Collection(_), mir::Type::Class(_) | mir::Type::NullableClass(_))
+            | (mir::Type::Class(_), mir::Type::Collection(_) | mir::Type::NullableCollection(_)) => false,
+            _ => true,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeCallableHiddenInput {
     CurrentFrame,
     ResultOut,
     ErrorOut,
     BorrowHome,
+    ResultBorrowHomeOut,
     Environment,
 }
 
@@ -68,8 +336,14 @@ impl NativeCallableSignaturePlan {
         ) {
             hidden_inputs.push(NativeCallableHiddenInput::ResultOut);
         }
-        if return_borrow.is_some() && returns_function_value(return_type) {
+        if return_borrow.is_some()
+            && (returns_function_value(return_type)
+                || returns_borrowed_value(return_type, return_borrow))
+        {
             hidden_inputs.push(NativeCallableHiddenInput::BorrowHome);
+        }
+        if returns_borrowed_value(return_type, return_borrow) {
+            hidden_inputs.push(NativeCallableHiddenInput::ResultBorrowHomeOut);
         }
         if environment {
             hidden_inputs.push(NativeCallableHiddenInput::Environment);
@@ -98,13 +372,28 @@ pub const fn returns_function_value(return_type: mir::ReturnType) -> bool {
     )
 }
 
+/// A returned Move borrow transports its exact runtime place independently of
+/// the lifetime root. Borrowed stored closure carriers use this output as well;
+/// an owned closure retaining capture borrows does not.
+pub const fn returns_borrowed_value(
+    return_type: mir::ReturnType,
+    return_borrow: Option<mir::ReturnBorrow>,
+) -> bool {
+    match return_type {
+        mir::ReturnType::Value(ty) => ty.borrows_returned_value(return_borrow),
+        mir::ReturnType::Void => false,
+    }
+}
+
 pub fn return_borrow_source_parameter(
     function: &mir::Function,
 ) -> Result<Option<mir::LocalId>, BackendError> {
     let Some(return_borrow) = function.return_borrow else {
         return Ok(None);
     };
-    if !returns_function_value(function.return_type) {
+    if !returns_function_value(function.return_type)
+        && !returns_borrowed_value(function.return_type, function.return_borrow)
+    {
         return Ok(None);
     }
     let index = match return_borrow.source {
@@ -226,7 +515,7 @@ pub fn environment_layout(
         let field_layout = match field.storage {
             mir::ClosureEnvironmentStorage::ReadonlyBorrow
             | mir::ClosureEnvironmentStorage::WritableBorrow => NativeLayout {
-                size: pointer_size,
+                size: pointer_size * BORROW_HOME_WORDS,
                 align: pointer_size,
             },
             mir::ClosureEnvironmentStorage::Owned => value_layout(program, field.ty, pointer_size),
@@ -421,6 +710,174 @@ mod tests {
     }
 
     #[test]
+    fn borrow_home_keys_preserve_storage_identity_across_nullable_views() {
+        use super::borrow_home_type_key as key;
+        let class = crate::class_layout::ClassId(3);
+        let interface = mir::InterfaceTypeId(3);
+        let collection = mir::CollectionTypeId(3);
+        assert_eq!(
+            key(mir::Type::Class(class)),
+            key(mir::Type::NullableClass(class))
+        );
+        assert_eq!(
+            key(mir::Type::Interface(interface)),
+            key(mir::Type::NullableInterface(interface))
+        );
+        assert_eq!(
+            key(mir::Type::Collection(collection)),
+            key(mir::Type::NullableCollection(collection))
+        );
+        let payload_enum = mir::PayloadEnumType {
+            id: crate::enums::EnumId(3),
+            capabilities: crate::enums::EnumCapabilities {
+                copy: false,
+                trivial_copy: false,
+                needs_drop: true,
+                equality: false,
+            },
+            size: 16,
+            align: 8,
+            nullable_size: 24,
+            nullable_payload_offset: 8,
+        };
+        let keys = [
+            key(mir::Type::Class(class)),
+            key(mir::Type::Interface(interface)),
+            key(mir::Type::Collection(collection)),
+            key(mir::Type::Class(crate::class_layout::ClassId(4))),
+            key(mir::Type::PayloadEnum(payload_enum)),
+            key(mir::Type::NullablePayloadEnum(payload_enum)),
+            key(mir::Type::String),
+        ];
+        for (index, key) in keys.iter().enumerate() {
+            assert!(!keys[index + 1..].contains(key));
+        }
+    }
+
+    #[test]
+    fn every_nonowned_move_family_preserves_explicit_alias_homes() {
+        let program =
+            crate::lower_source_to_mir("borrow-home-types.doria", "function main(): void {}")
+                .expect("empty entry should lower");
+        let mut function = program.functions[program.entry.0].clone();
+        let payload = mir::SharedPayload::Class(crate::class_layout::ClassId(0));
+        let enum_ty = mir::PayloadEnumType {
+            id: crate::enums::EnumId(0),
+            capabilities: crate::enums::EnumCapabilities {
+                copy: false,
+                trivial_copy: false,
+                needs_drop: true,
+                equality: false,
+            },
+            size: 16,
+            align: 8,
+            nullable_size: 24,
+            nullable_payload_offset: 8,
+        };
+        let types = [
+            mir::Type::Mixed,
+            mir::Type::NullableMixed,
+            mir::Type::Function(mir::FunctionTypeId(0)),
+            mir::Type::NullableFunction(mir::FunctionTypeId(0)),
+            mir::Type::SharedReference(payload),
+            mir::Type::WeakReference(payload),
+            mir::Type::NullableSharedReference(payload),
+            mir::Type::NullableWeakReference(payload),
+            mir::Type::WritableSharedReference(payload),
+            mir::Type::WritableWeakReference(payload),
+            mir::Type::NullableWritableSharedReference(payload),
+            mir::Type::NullableWritableWeakReference(payload),
+            mir::Type::ReadonlySharedReferenceAccess(payload),
+            mir::Type::WritableSharedReferenceAccess(payload),
+            mir::Type::NullableReadonlySharedReferenceAccess(payload),
+            mir::Type::NullableWritableSharedReferenceAccess(payload),
+            mir::Type::PayloadEnum(enum_ty),
+            mir::Type::NullablePayloadEnum(enum_ty),
+        ];
+        for ty in types {
+            let mut local = mir::Local {
+                id: mir::LocalId(0),
+                name: "alias".into(),
+                ty,
+                writable: false,
+                owned: false,
+                synthetic: false,
+            };
+            assert!(super::local_needs_borrow_home(&function, &local), "{ty}");
+            local.owned = true;
+            assert!(!super::local_needs_borrow_home(&function, &local), "{ty}");
+        }
+        function.params.push(mir::LocalId(0));
+        let parameter = mir::Local {
+            id: mir::LocalId(0),
+            name: "parameter".into(),
+            ty: mir::Type::Mixed,
+            writable: false,
+            owned: false,
+            synthetic: false,
+        };
+        assert!(!super::local_needs_borrow_home(&function, &parameter));
+
+        let narrowed = mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            ty: enum_ty,
+            place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(mir::LocalId(0)),
+            mode: mir::PayloadEnumUseMode::Borrow,
+        });
+        assert_eq!(
+            super::direct_borrow_home_place(&narrowed),
+            Some(super::BorrowHomePlace::Local {
+                local: mir::LocalId(0),
+                projection: super::BorrowHomeProjection::Direct,
+            })
+        );
+        let property = crate::class_layout::PropertyId {
+            class: crate::class_layout::ClassId(0),
+            index: 0,
+        };
+        let shared =
+            mir::Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Shared(
+                mir::SharedReferenceExpression::Property {
+                    payload,
+                    object: mir::LocalId(0),
+                    property,
+                },
+            ));
+        assert_eq!(
+            super::direct_borrow_home_place(&shared),
+            Some(super::BorrowHomePlace::Property {
+                object: mir::LocalId(0),
+                property
+            })
+        );
+        let borrowed_call = mir::Rvalue::Mixed(mir::MixedExpression::Call {
+            function: mir::FunctionId(0),
+            args: vec![],
+            return_borrow: Some(mir::ReturnBorrow {
+                kind: crate::types::ReturnBorrowKind::Value,
+                source: mir::BorrowSource::Parameter(0),
+                writable: false,
+            }),
+        });
+        assert!(borrowed_call.borrows_move_value());
+        assert!(!super::has_addressable_borrow_home(
+            &borrowed_call,
+            &function
+        ));
+        assert!(!super::needs_owned_borrow_home(&borrowed_call, &function));
+        let owned_call = mir::Rvalue::Mixed(mir::MixedExpression::Call {
+            function: mir::FunctionId(0),
+            args: vec![],
+            return_borrow: None,
+        });
+        assert!(super::needs_owned_borrow_home(&owned_call, &function));
+        assert!(!super::needs_owned_borrow_home(
+            &mir::Rvalue::Mixed(mir::MixedExpression::Null),
+            &function
+        ));
+        assert!(!super::needs_owned_borrow_home(&narrowed, &function));
+    }
+
+    #[test]
     fn callable_signature_plans_keep_hidden_inputs_in_one_order() {
         let function = mir::FunctionType {
             id: mir::FunctionTypeId(0),
@@ -431,6 +888,7 @@ mod tests {
             ambient_checked_effects: vec![],
             test_assertion_checked_effects: vec![],
             return_borrow: Some(mir::ReturnBorrow {
+                kind: crate::types::ReturnBorrowKind::Retained,
                 source: mir::BorrowSource::Parameter(0),
                 writable: false,
             }),
@@ -447,6 +905,52 @@ mod tests {
             ]
         );
         assert_eq!(plan.source_parameter_offset(), 5);
+
+        // Every borrowed Move carrier returns an exact place, including a
+        // stored closure. This differs from the owned closure above whose
+        // captures retain a source. Keep all call plans aligned.
+        for ty in [
+            mir::Type::Class(crate::class_layout::ClassId(0)),
+            mir::Type::NullableClass(crate::class_layout::ClassId(0)),
+            mir::Type::Interface(mir::InterfaceTypeId(0)),
+            mir::Type::Mixed,
+            mir::Type::Collection(mir::CollectionTypeId(0)),
+            mir::Type::Function(mir::FunctionTypeId(1)),
+            mir::Type::NullableFunction(mir::FunctionTypeId(1)),
+        ] {
+            let borrowed = mir::FunctionType {
+                return_type: mir::ReturnType::Value(ty),
+                return_borrow: Some(mir::ReturnBorrow {
+                    kind: crate::types::ReturnBorrowKind::Value,
+                    source: mir::BorrowSource::Parameter(0),
+                    writable: false,
+                }),
+                ..function.clone()
+            };
+            let plan = NativeCallableSignaturePlan::indirect(&borrowed);
+            assert_eq!(
+                plan.hidden_inputs,
+                vec![
+                    NativeCallableHiddenInput::CurrentFrame,
+                    NativeCallableHiddenInput::ResultOut,
+                    NativeCallableHiddenInput::ErrorOut,
+                    NativeCallableHiddenInput::BorrowHome,
+                    NativeCallableHiddenInput::ResultBorrowHomeOut,
+                    NativeCallableHiddenInput::Environment,
+                ]
+            );
+            let entry = NativeCallableSignaturePlan::interface_entry(&borrowed);
+            assert_eq!(entry.hidden_inputs, plan.hidden_inputs[..5]);
+            let owning = mir::FunctionType {
+                return_borrow: None,
+                ..borrowed
+            };
+            assert_eq!(
+                NativeCallableSignaturePlan::indirect(&owning)
+                    .index_of(NativeCallableHiddenInput::ResultBorrowHomeOut),
+                None
+            );
+        }
 
         let nested = mir::FunctionType {
             id: mir::FunctionTypeId(1),
@@ -470,6 +974,57 @@ mod tests {
             ]
         );
         assert_eq!(nested_plan.source_parameter_offset(), 2);
+    }
+
+    #[test]
+    fn closure_return_plans_separate_carrier_borrows_from_retained_sources() {
+        use crate::types::ReturnBorrowKind;
+
+        for ty in [
+            mir::Type::Function(mir::FunctionTypeId(0)),
+            mir::Type::NullableFunction(mir::FunctionTypeId(0)),
+        ] {
+            for checked in [false, true] {
+                for kind in [ReturnBorrowKind::Value, ReturnBorrowKind::Retained] {
+                    let return_borrow = Some(mir::ReturnBorrow {
+                        kind,
+                        source: mir::BorrowSource::Parameter(0),
+                        writable: false,
+                    });
+                    let return_type = mir::ReturnType::Value(ty);
+                    assert_eq!(
+                        super::returns_borrowed_value(return_type, return_borrow),
+                        kind == ReturnBorrowKind::Value
+                    );
+                    for environment in [false, true] {
+                        let plan = NativeCallableSignaturePlan::new(
+                            return_type,
+                            checked,
+                            return_borrow,
+                            environment,
+                        );
+                        assert!(plan
+                            .index_of(NativeCallableHiddenInput::BorrowHome)
+                            .is_some());
+                        assert_eq!(
+                            plan.index_of(NativeCallableHiddenInput::ResultBorrowHomeOut)
+                                .is_some(),
+                            kind == ReturnBorrowKind::Value
+                        );
+                        assert_eq!(
+                            plan.index_of(NativeCallableHiddenInput::ResultOut)
+                                .is_some(),
+                            checked
+                        );
+                        assert_eq!(
+                            plan.index_of(NativeCallableHiddenInput::Environment)
+                                .is_some(),
+                            environment
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -519,6 +1074,13 @@ function main(): void
                 program.closure_environment_layouts[logical.0].fields.len()
             );
             let logical = &program.closure_environment_layouts[logical.0];
+            for (field, native_field) in logical.fields.iter().zip(&native.fields) {
+                if field.storage != mir::ClosureEnvironmentStorage::Owned {
+                    assert_eq!(native_field.layout.size, 8 * super::BORROW_HOME_WORDS);
+                    assert_eq!(native_field.layout.align, 8);
+                    assert_eq!(native_field.live_bit, None);
+                }
+            }
             for pair in native.fields.windows(2) {
                 assert!(pair[0].offset + pair[0].layout.size <= pair[1].offset);
             }

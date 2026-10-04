@@ -1,3 +1,6 @@
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 fn assert_diagnostic(source: &str, code: &str) {
     let diagnostics =
         doriac::check_source("stage21.doria", source).expect_err("source should be rejected");
@@ -16,6 +19,436 @@ fn assert_valid_mir(source: &str) {
     let object = doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("validated MIR should lower through the fast native backend");
     assert!(!object.is_empty());
+}
+
+fn assert_linked_native_execution(program: &doriac::mir::Program, stdout: &str) {
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(program)
+        .expect("validated MIR should lower through LLVM")
+        .is_empty());
+    native_execution::assert_native_execution(
+        program,
+        doriac::backend::NativeProfile::Fast,
+        stdout,
+    );
+    #[cfg(feature = "llvm-backend")]
+    native_execution::assert_native_execution(
+        program,
+        doriac::backend::NativeProfile::Release,
+        stdout,
+    );
+}
+
+#[test]
+fn temporary_returned_borrow_homes_preserve_statement_cleanup_across_native_profiles() {
+    let source = include_str!("../../../examples/native/main_temporary_returned_borrows.doria");
+    let stdout = include_str!("fixtures/native_io/main_temporary_returned_borrows/expected_stdout");
+    let program = doriac::lower_source_to_mir("temporary-returned-borrows.doria", source)
+        .expect("temporary returned borrows should lower to MIR");
+    doriac::mir_validation::validate_program(&program).expect("MIR should validate");
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, stdout.as_bytes());
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    assert!(output.runtime_diagnostic.is_none());
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("temporary returned borrows should lower through Cranelift")
+        .is_empty());
+    assert_linked_native_execution(&program, stdout);
+}
+
+#[test]
+fn materialized_call_results_preserve_owned_and_borrowed_writable_capabilities() {
+    let source = r#"
+class Counter
+{
+    writable int $value = 0;
+    function __construct(parameter int $initial) { $this->value = $initial; }
+    writable function touch(): self { return $this; }
+    writable function bump(): void
+    {
+        $this->value++;
+        echo "{$this->value};";
+    }
+}
+class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+function maybe(bool $present, bool $fail, int $initial = 10): ?Counter throws Failure
+{
+    if ($fail) { throw new Failure("factory"); }
+    if ($present) { return new Counter($initial); }
+    return null;
+}
+function direct(writable Counter $counter): Counter { return $counter; }
+function checked(writable Counter $counter, bool $fail): Counter throws Failure
+{
+    if ($fail) { throw new Failure("borrow"); }
+    return $counter;
+}
+function readonlyResult(Counter $counter): Counter { return $counter; }
+function observe(Counter $counter): void { echo "read{$counter->value};"; }
+function main(): void throws Error
+{
+    maybe(true, false)?->bump();
+    maybe(false, false)?->bump();
+    echo "afterNullable;";
+
+    let writable $owner = new Counter(0);
+    direct($owner)->bump();
+    checked($owner, false)->bump();
+
+    writable ?Counter $nullable = maybe(true, false, 20);
+    $nullable?->touch()?->bump();
+
+    let $indirect = function (writable Counter $counter): Counter { return $counter; };
+    observe($indirect($owner));
+    let $checkedIndirect = function (writable Counter $counter, bool $fail): Counter {
+        if ($fail) { throw new Failure("indirect borrow"); }
+        return $counter;
+    };
+    observe($checkedIndirect($owner, false));
+    echo "owner{$owner->value};";
+}
+"#;
+    let program = doriac::lower_source_to_mir("call-result-capabilities.doria", source)
+        .expect("materialized call results should retain their checked capabilities");
+    doriac::mir_validation::validate_program(&program).expect("MIR should validate");
+    // Source-level borrowed locals remain readonly. Inspect the intermediate
+    // call results directly instead of granting a writable source alias.
+    // Decision 0123 gives every structural function value ambient checked
+    // transport, including the body with no required effects. Exercise both
+    // ambient-only and required-Failure profiles, not an infallible ABI.
+    let mut indirect_profiles = [0; 2];
+    for function in &program.functions {
+        for block in &function.blocks {
+            let (function_type, result) = match &block.terminator {
+                doriac::mir::Terminator::CheckedIndirectCall {
+                    function_type,
+                    result: Some(result),
+                    ..
+                } => (*function_type, *result),
+                _ => continue,
+            };
+            let definition = &program.function_types[function_type.0];
+            if definition
+                .return_borrow
+                .is_some_and(|borrow| borrow.writable)
+            {
+                assert!(!definition.ambient_checked_effects.is_empty());
+                assert!(function.locals[result.0].writable);
+                assert!(!function.locals[result.0].owned);
+                indirect_profiles[usize::from(!definition.checked_effects.is_empty())] += 1;
+            }
+        }
+    }
+    assert_eq!(indirect_profiles, [1, 1]);
+    let stdout = "11;afterNullable;1;2;21;read2;read2;owner2;";
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, stdout.as_bytes());
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    assert!(output.runtime_diagnostic.is_none());
+    assert_linked_native_execution(&program, stdout);
+
+    assert_diagnostic(
+        &source.replace("direct($owner)->bump();", "readonlyResult($owner)->bump();"),
+        "E0203",
+    );
+}
+
+#[test]
+fn borrowed_collections_remain_owned_by_the_source() {
+    let source = include_str!("../../../examples/native/main_returned_collection_borrows.doria");
+    let program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let result = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(
+        result.stdout,
+        include_bytes!("fixtures/native_io/main_returned_collection_borrows/expected_stdout")
+    );
+}
+
+#[test]
+fn returned_collection_borrows_use_the_same_provenance_as_object_results() {
+    for ty in ["List<int>", "int[]", "Dictionary<string, int>"] {
+        let initializer = if ty.starts_with("Dictionary") {
+            "[\"x\" => 1]"
+        } else {
+            "[1]"
+        };
+        let key = if ty.starts_with("Dictionary") {
+            "\"x\""
+        } else {
+            "0"
+        };
+        let declarations = format!(
+            r#"
+class Store {{
+    {ty} $values = {initializer};
+    function getValues(): {ty} {{ return $this->values; }}
+    writable function change(): void {{}}
+}}
+function forward(Store $store): {ty} {{ return $store->getValues(); }}
+"#
+        );
+        assert_valid_mir(&format!(
+            r#"{declarations}
+function main(): void {{
+    let writable $store = new Store();
+    let $values = forward($store);
+    echo $values[{key}];
+    $store->change();
+}}
+"#
+        ));
+        assert_diagnostic(
+            &format!(
+                r#"{declarations}
+function main(): void {{
+    let writable $store = new Store();
+    let $values = forward($store);
+    $store->change();
+    echo $values[{key}];
+}}
+"#
+            ),
+            "E0477",
+        );
+    }
+}
+
+#[test]
+fn returned_move_borrows_do_not_own_their_payloads() {
+    let source = include_str!("../../../examples/native/main_returned_move_borrows.doria");
+    let program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let result = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(
+        result.stdout,
+        include_bytes!("fixtures/native_io/main_returned_move_borrows/expected_stdout")
+    );
+    assert_eq!(result.stderr, b"");
+    assert_eq!(result.exit_status, 0);
+    assert!(result.runtime_diagnostic.is_none());
+    assert_linked_native_execution(
+        &program,
+        include_str!("fixtures/native_io/main_returned_move_borrows/expected_stdout"),
+    );
+}
+
+#[test]
+fn returned_borrow_elision_counts_resolved_move_parameters() {
+    for ty in ["List<int>", "SharedReference<Item>", "Packet"] {
+        let declarations =
+            "class Item {} enum Packet { case Value(Item $item); } enum Flag { case On; }";
+        doriac::check_source(
+            "borrows.doria",
+            format!(
+            "{declarations} function select({ty} $value, Flag $flag): {ty} {{ return $value; }}"
+        ),
+        )
+        .expect("Copy enums must not count as borrowed sources");
+        assert_diagnostic(
+            &format!(
+                "{declarations} function select({ty} $left, {ty} $right): {ty} {{ return $left; }}"
+            ),
+            "E0474",
+        );
+    }
+}
+
+#[test]
+fn null_return_paths_preserve_the_other_paths_borrow() {
+    for ty in [
+        "Item",
+        "Readable",
+        "List<Item>",
+        "Packet",
+        "SharedReference<Item>",
+        "mixed",
+    ] {
+        for body in [
+            "if ($present) { return $value; } return (null);",
+            "if (!$present) { return null; } return $value;",
+        ] {
+            for body in [
+                body.to_owned(),
+                format!("let $scratch = new Item(); {body}"),
+                format!(
+                    "if (true) {{ {body} }} finally {{ let $scratch = new Item(); }} return null;"
+                ),
+            ] {
+                assert_valid_mir(&format!(
+                    "interface Readable {{ function read(): int; }} class Item implements Readable {{ function read(): int {{ return 1; }} }} enum Packet {{ case Value(Item $item); }} function select({ty} $value, bool $present): ?{ty} {{ {body} }} function main(): void {{}}"
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn nullable_return_temporary_cannot_hide_an_owned_value() {
+    use doriac::mir::{ClassExpression, NullableClassExpression, Rvalue, Statement, Type};
+    let source = r#"
+class Item {}
+function select(Item $value, bool $present): ?Item {
+    let $scratch = new Item();
+    if ($present) { return $value; }
+    return null;
+}
+function main(): void {}
+"#;
+    let mut program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let function = program
+        .functions
+        .iter_mut()
+        .find(|f| f.name == "select")
+        .unwrap();
+    let scratch = function
+        .locals
+        .iter()
+        .find(|local| local.name == "scratch")
+        .unwrap();
+    let Type::Class(class) = scratch.ty else {
+        panic!("expected class temporary")
+    };
+    let replacement =
+        Rvalue::NullableClass(NullableClassExpression::Class(ClassExpression::Local {
+            local: scratch.id,
+            class,
+            transfer: false,
+        }));
+    let (target, block) = function
+        .blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    Statement::AssignLocal { target, value }
+                        if value.ty() == Type::NullableClass(class) =>
+                    {
+                        Some(*target)
+                    }
+                    _ => None,
+                })
+                .map(|target| (target, block))
+        })
+        .expect("saved borrowed return");
+    block.statements.push(Statement::AssignLocal {
+        target,
+        value: replacement,
+    });
+    let error = doriac::mir_validation::validate_program(&program).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("mixes owned and borrowed assignments"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn null_return_has_no_saved_payload_through_cleanup_and_finalizers() {
+    use doriac::mir::{Statement, Terminator};
+    let source = r#"
+class Item {}
+function select(Item $value, bool $present): ?Item {
+    let $scratch = new Item();
+    if ($present) { return $value; } else { return null; }
+    finally { let $finalizer = new Item(); }
+}
+function main(): void {}
+"#;
+    let program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "select")
+        .unwrap();
+    assert!(function.blocks.iter().any(|block| {
+        matches!(&block.terminator, Terminator::Return(value) if value.is_null_value())
+    }));
+    assert!(!function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .any(|statement| {
+            matches!(statement, Statement::AssignLocal { value, .. } if value.is_null_value())
+        }));
+    doriac::mir_validation::validate_program(&program).unwrap();
+}
+
+#[test]
+fn move_calls_cannot_erase_returned_borrow() {
+    use doriac::mir::{PayloadEnumExpression, Rvalue, SharedReferenceExpression, Statement};
+    for shared in [false, true] {
+        let source = if shared {
+            "class Item {} function lend(SharedReference<Item> $item): SharedReference<Item> { return $item; } function main(): void { let $owner = shared new Item(); let $view = lend($owner); }"
+        } else {
+            "class Item {} enum Packet { case Value(Item $item); } function lend(Packet $item): Packet { return $item; } function main(): void { let $owner = Packet::Value(new Item()); let $view = lend($owner); }"
+        };
+        let mut program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+        let borrow = program
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.statements)
+            .find_map(|statement| match statement {
+                Statement::AssignLocal {
+                    value: Rvalue::PayloadEnum(PayloadEnumExpression::Call { return_borrow, .. }),
+                    ..
+                }
+                | Statement::AssignLocal {
+                    value:
+                        Rvalue::SharedReference(SharedReferenceExpression::Call {
+                            return_borrow, ..
+                        }),
+                    ..
+                } => Some(return_borrow),
+                _ => None,
+            })
+            .expect("borrowing call");
+        assert!(borrow.take().is_some());
+        let error = doriac::mir_validation::validate_program(&program).unwrap_err();
+        assert!(error.message.contains("return ownership"), "{error:?}");
+    }
+}
+
+#[test]
+fn nullable_collection_call_cannot_erase_returned_borrow() {
+    use doriac::mir::{NullableCollectionExpression, Rvalue, Statement};
+    let source = r#"
+function borrowList(?List<int> $items): ?List<int> { return $items; }
+function main(): void {
+    ?List<int> $items = [1];
+    let $alias = borrowList($items);
+    if ($alias != null) { echo $alias[0]; }
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let value = program
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value:
+                    Rvalue::NullableCollection(NullableCollectionExpression::Call {
+                        return_borrow, ..
+                    }),
+                ..
+            } => Some(return_borrow),
+            _ => None,
+        })
+        .expect("nullable borrowing call");
+    assert!(value.take().is_some());
+    let error = doriac::mir_validation::validate_program(&program).unwrap_err();
+    assert!(error.message.contains("return ownership"), "{error:?}");
 }
 
 fn constructor_diagnostic_snapshot(source: &str, code: &str) -> String {
@@ -522,9 +955,13 @@ function main(): void throws Doria\Std\Io\IoError
     doriac::mir_validation::validate_program(&program).expect("MIR should validate");
     let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
     assert_eq!(output.stdout, b"observe\ndrop\nafter\n");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    assert!(output.runtime_diagnostic.is_none());
     assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("a borrowed temporary source should lower through Cranelift")
         .is_empty());
+    assert_linked_native_execution(&program, "observe\ndrop\nafter\n");
 }
 
 #[test]
@@ -663,8 +1100,7 @@ function main(): void
 
 #[test]
 fn unreachable_returns_do_not_change_returned_borrow_inference() {
-    assert_valid_mir(
-        r#"
+    let source = r#"
 class Guard
 {
     function direct(): self
@@ -695,8 +1131,19 @@ function main(): void
     observe($guard->conditional());
     observe($guard->looping());
 }
-"#,
-    );
+"#;
+    let program = doriac::lower_source_to_mir("stage21-unreachable-borrow-return.doria", source)
+        .expect("source should lower to MIR");
+    doriac::mir_validation::validate_program(&program).expect("MIR should validate");
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, b"");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    assert!(output.runtime_diagnostic.is_none());
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("validated MIR should lower through the fast native backend")
+        .is_empty());
+    assert_linked_native_execution(&program, "");
 }
 
 #[test]

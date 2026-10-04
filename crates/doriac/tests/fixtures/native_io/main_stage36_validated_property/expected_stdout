@@ -1,0 +1,4 @@
+price: choose a price before reading the total
+total: 36
+quantity: quantity must be positive
+kept: 3; total: 36

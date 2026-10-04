@@ -29,6 +29,7 @@ pub(super) struct Plan {
     functions: HashMap<String, Span>,
     methods: HashMap<(ClassId, String), Span>,
     generic_methods: HashMap<(String, Vec<GenericArgument>), String>,
+    accessor_symbols: HashMap<String, String>,
     call_targets: HashMap<Span, CallableTarget>,
     call_arguments: HashMap<Span, Vec<GenericArgument>>,
     semantic: Rc<SemanticInfo>,
@@ -181,6 +182,38 @@ impl Plan {
             .iter()
             .map(|declaration| declaration.function.name.to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        for requirement in program
+            .semantic_info
+            .contracts
+            .interfaces
+            .iter()
+            .flat_map(|interface| &interface.requirements)
+        {
+            if let Some(kind) = requirement.accessor {
+                let name = crate::property_hooks::accessor_name(&requirement.name, kind);
+                plan.accessor_symbols
+                    .entry(name)
+                    .or_insert_with(|| allocate_symbol("__doriaAccessor", &mut names));
+            }
+        }
+        for property in program
+            .items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Class(class) => class.members.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|member| match member {
+                ClassMember::Property(property) => property.hooks.as_ref(),
+                _ => None,
+            })
+        {
+            for accessor in &property.accessors {
+                plan.accessor_symbols
+                    .entry(accessor.function.name.clone())
+                    .or_insert_with(|| allocate_symbol("__doriaAccessor", &mut names));
+            }
+        }
         for (index, instance) in instances.iter().enumerate() {
             let declaration = declarations[instance.declaration];
             let function = declaration.function;
@@ -191,7 +224,9 @@ impl Plan {
                 plan.functions.insert(function.name.clone(), function.span);
             }
             let symbol = if declaration.class.is_some() {
-                if instance.arguments.is_empty() {
+                if let Some(symbol) = plan.accessor_symbols.get(&function.name) {
+                    symbol.clone()
+                } else if instance.arguments.is_empty() {
                     function.name.clone()
                 } else {
                     plan.generic_methods
@@ -218,16 +253,16 @@ impl Plan {
             .items
             .iter()
             .filter_map(|item| match item {
-                Item::Class(class) => Some(php_symbol_name(&class.name).to_ascii_lowercase()),
+                Item::Class(class) => Some(php_type_symbol(&class.name).to_ascii_lowercase()),
                 Item::Enum(enumeration) => {
-                    Some(php_symbol_name(&enumeration.name).to_ascii_lowercase())
+                    Some(php_type_symbol(&enumeration.name).to_ascii_lowercase())
                 }
                 _ => None,
             })
             .collect();
         for class in &program.semantic_info.classes {
             let symbol = if class.arguments.is_empty() {
-                php_symbol_name(&class.declaration_name)
+                php_type_symbol(&class.declaration_name)
             } else {
                 allocate_symbol("__DoriaClassSpecialization", &mut names)
             };
@@ -271,7 +306,9 @@ impl Plan {
                         })
                         .collect();
                     let callable = PhpCallablePlan {
-                        returns_borrow: requirement.return_borrow.is_some(),
+                        returns_borrow: requirement.return_borrow.is_some_and(|borrow| {
+                            borrow.kind == crate::types::ReturnBorrowKind::Value
+                        }),
                         parameters: requirement
                             .signature
                             .parameters
@@ -369,6 +406,54 @@ impl Plan {
 
     pub fn callable(&self, id: mir::FunctionId) -> &Callable {
         &self.callables[id.0]
+    }
+
+    pub(super) fn accessor(
+        &self,
+        span: Span,
+        kind: crate::ast::PropertyHookKind,
+        substitutions: &HashMap<String, ResolvedType>,
+    ) -> Option<(&str, &PhpCallablePlan)> {
+        let calls = self.semantic.property_accessor_calls.get(&span)?;
+        let call = match kind {
+            crate::ast::PropertyHookKind::Get => calls.getter.as_ref(),
+            crate::ast::PropertyHookKind::Set => calls.setter.as_ref(),
+        }?;
+        let target = call
+            .target
+            .specialize(|ty| substitute_resolved_type(ty, substitutions))
+            .expect("checked accessor has a concrete target");
+        let (property, callable) = match target {
+            CallableTarget::Method {
+                class_type,
+                method_name,
+                ..
+            } => {
+                let class = self.classes[&class_type];
+                let name = crate::property_hooks::accessor_name(&method_name, kind);
+                let declaration = self.methods[&(class, name)];
+                let callable = self
+                    .callables
+                    .iter()
+                    .find(|callable| {
+                        callable.declaration == declaration && callable.class == Some(class)
+                    })
+                    .expect("checked accessor has a callable instance");
+                (method_name, &self.callable_plans[&callable.id])
+            }
+            CallableTarget::InterfaceMethod {
+                interface,
+                requirement,
+                method_name,
+                ..
+            } => (
+                method_name,
+                &self.requirements[&(interface, requirement, Vec::new())],
+            ),
+            _ => unreachable!("checked accessor specializes to an instance callable"),
+        };
+        let name = crate::property_hooks::accessor_name(&property, kind);
+        Some((&self.accessor_symbols[&name], callable))
     }
 
     pub fn class_symbol(&self, id: ClassId) -> &str {

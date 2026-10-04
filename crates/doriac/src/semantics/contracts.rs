@@ -7,6 +7,8 @@ use crate::types::InterfaceType;
 pub struct ContractFacts {
     pub interfaces: Vec<InterfaceFacts>,
     pub interface_specializations: Vec<InterfaceSpecializationFacts>,
+    /// Scope-resolved member contracts for each constrained receiver expression.
+    pub constrained_member_surfaces: HashMap<Span, ConstrainedMemberSurface>,
     pub traits: Vec<TraitFacts>,
     pub conformances: Vec<ConformanceFacts>,
     pub member_references: Vec<ContractMemberReference>,
@@ -57,6 +59,18 @@ pub struct InterfaceSpecializationFacts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstrainedMemberSurface {
+    pub requirements: Vec<RequirementFacts>,
+    pub has_error_message: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ConstrainedReceiver {
+    parameter: String,
+    interfaces: Vec<InterfaceType<TypeId>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequirementOrigin {
     pub interface: InterfaceType<ResolvedType>,
     pub declaration: Span,
@@ -65,6 +79,8 @@ pub struct RequirementOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequirementFacts {
     pub name: String,
+    /// Accessors share callable compatibility, but not method-name identity.
+    pub accessor: Option<crate::ast::PropertyHookKind>,
     pub origins: Vec<RequirementOrigin>,
     pub signature: CallableSignatureSemanticInfo,
     pub generic_parameters: Vec<TypeParamDecl>,
@@ -110,15 +126,16 @@ pub struct ConformanceFacts {
 pub(super) struct InterfaceDefinition {
     declaration: InterfaceDecl,
     parents: Vec<(InterfaceType<TypeId>, Span)>,
-    local_requirements: Vec<(String, MethodInfo)>,
+    local_requirements: Vec<(String, Option<crate::ast::PropertyHookKind>, MethodInfo)>,
     valid: bool,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct CanonicalRequirement {
     name: String,
-    origins: Vec<(InterfaceType<TypeId>, Span)>,
-    method: MethodInfo,
+    accessor: Option<crate::ast::PropertyHookKind>,
+    pub(super) origins: Vec<(InterfaceType<TypeId>, Span)>,
+    pub(super) method: MethodInfo,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,6 +203,72 @@ impl ContractMismatch {
 }
 
 impl Checker<'_> {
+    pub(super) fn record_constrained_receiver(&mut self, receiver: TypeId, span: Span) {
+        let Some(receiver) = self.property_contract_receiver(receiver) else {
+            return;
+        };
+        let TypeKind::TypeParameter(parameter) = self.types.kind(receiver).clone() else {
+            return;
+        };
+        let interfaces = self.constrained_interfaces(&parameter, span);
+        self.constrained_receivers.insert(
+            span,
+            ConstrainedReceiver {
+                parameter,
+                interfaces,
+            },
+        );
+    }
+
+    pub(super) fn publish_constrained_member_surfaces(&mut self) {
+        // Resolve bounds while their lexical scope is active, then publish the
+        // final inferred contracts rather than an early copy of their effects.
+        for (span, receiver) in std::mem::take(&mut self.constrained_receivers) {
+            let mut names = Vec::new();
+            let mut has_error_message = false;
+            for interface in &receiver.interfaces {
+                let graph = self.canonical_interface_requirements(interface, &mut Vec::new());
+                if !graph.valid {
+                    continue;
+                }
+                has_error_message |= interface.name == "Error"
+                    || graph
+                        .ancestors
+                        .iter()
+                        .any(|ancestor| ancestor.name == "Error");
+                names.extend(
+                    graph
+                        .requirements
+                        .iter()
+                        .map(|r| (r.name.clone(), r.accessor)),
+                );
+            }
+            names.sort_by_key(|(name, accessor)| (name.clone(), accessor.map(|kind| kind as u8)));
+            names.dedup();
+            let requirements = names
+                .into_iter()
+                .filter_map(|(name, accessor)| {
+                    self.constrained_requirement_from_interfaces(
+                        &receiver.parameter,
+                        &receiver.interfaces,
+                        &name,
+                        accessor,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|requirement| self.requirement_facts(&requirement))
+                })
+                .collect();
+            self.contracts.constrained_member_surfaces.insert(
+                span,
+                ConstrainedMemberSurface {
+                    requirements,
+                    has_error_message,
+                },
+            );
+        }
+    }
+
     pub(super) fn publish_interface_specializations(&mut self) {
         let conformances = self
             .contracts
@@ -259,14 +342,23 @@ impl Checker<'_> {
         interface: &InterfaceType<TypeId>,
         name: &str,
     ) -> Option<MethodInfo> {
-        let mut method = self
+        self.interface_requirement(interface, name, None)
+            .map(|requirement| requirement.method)
+    }
+
+    pub(super) fn interface_requirement(
+        &mut self,
+        interface: &InterfaceType<TypeId>,
+        name: &str,
+        accessor: Option<crate::ast::PropertyHookKind>,
+    ) -> Option<CanonicalRequirement> {
+        let mut requirement = self
             .canonical_interface_requirements(interface, &mut Vec::new())
             .requirements
             .into_iter()
-            .find(|requirement| requirement.name == name)
-            .map(|requirement| requirement.method)?;
-        self.resolve_interface_self_result(&mut method, interface);
-        Some(method)
+            .find(|requirement| requirement.name == name && requirement.accessor == accessor)?;
+        self.resolve_interface_self_result(&mut requirement.method, interface);
+        Some(requirement)
     }
 
     fn resolve_interface_self_result(
@@ -288,6 +380,25 @@ impl Checker<'_> {
         name: &str,
         span: Span,
     ) -> Result<Option<CanonicalRequirement>, Vec<Span>> {
+        self.constrained_member_requirement(parameter, name, None, span)
+    }
+
+    pub(super) fn constrained_member_requirement(
+        &mut self,
+        parameter: &str,
+        name: &str,
+        accessor: Option<crate::ast::PropertyHookKind>,
+        span: Span,
+    ) -> Result<Option<CanonicalRequirement>, Vec<Span>> {
+        let interfaces = self.constrained_interfaces(parameter, span);
+        self.constrained_requirement_from_interfaces(parameter, &interfaces, name, accessor)
+    }
+
+    fn constrained_interfaces(
+        &mut self,
+        parameter: &str,
+        span: Span,
+    ) -> Vec<InterfaceType<TypeId>> {
         let constraints = self
             .type_parameter_scopes
             .iter()
@@ -295,7 +406,7 @@ impl Checker<'_> {
             .find_map(|scope| scope.get(parameter))
             .cloned()
             .unwrap_or_default();
-        let mut candidates = Vec::new();
+        let mut interfaces = Vec::new();
         for mut constraint in constraints {
             if self.is_core_interface(&constraint.name)
                 && matches!(constraint.name.as_str(), "Comparable" | "Equatable")
@@ -310,14 +421,27 @@ impl Checker<'_> {
             if self.interface_declaration(&constraint.name).is_none() {
                 continue;
             }
-            let Some(interface) = self.resolve_interface_edge(&constraint, span) else {
-                continue;
-            };
+            if let Some(interface) = self.resolve_interface_edge(&constraint, span) {
+                interfaces.push(interface);
+            }
+        }
+        interfaces
+    }
+
+    fn constrained_requirement_from_interfaces(
+        &mut self,
+        parameter: &str,
+        interfaces: &[InterfaceType<TypeId>],
+        name: &str,
+        accessor: Option<crate::ast::PropertyHookKind>,
+    ) -> Result<Option<CanonicalRequirement>, Vec<Span>> {
+        let mut candidates = Vec::new();
+        for interface in interfaces {
             if let Some(requirement) = self
-                .canonical_interface_requirements(&interface, &mut Vec::new())
+                .canonical_interface_requirements(interface, &mut Vec::new())
                 .requirements
                 .into_iter()
-                .find(|requirement| requirement.name == name)
+                .find(|requirement| requirement.name == name && requirement.accessor == accessor)
             {
                 candidates.push(requirement);
             }
@@ -388,7 +512,7 @@ impl Checker<'_> {
             .canonical_interface_requirements(interface, &mut Vec::new())
             .requirements
             .into_iter()
-            .find(|requirement| requirement.name == method)
+            .find(|requirement| requirement.name == method && requirement.accessor.is_none())
         else {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -790,7 +914,7 @@ impl Checker<'_> {
                     .canonical_interface_requirements(&interface, &mut Vec::new())
                     .requirements
                     .into_iter()
-                    .find(|required| required.name == method_name)?;
+                    .find(|required| required.name == method_name && required.accessor.is_none())?;
                 let interface = self.resolved_interface(&interface);
                 let target = CallableTarget::InterfaceMethod {
                     interface,
@@ -809,15 +933,24 @@ impl Checker<'_> {
         method: &MethodInfo,
         span: Span,
     ) {
-        let effects = if matches!(
+        let effects = self.selected_contract_effects(target, method, span);
+        self.record_checked_effects(effects, span);
+    }
+
+    pub(super) fn selected_contract_effects(
+        &mut self,
+        target: &CallableTarget,
+        method: &MethodInfo,
+        span: Span,
+    ) -> Vec<TypeId> {
+        if matches!(
             target,
             CallableTarget::InterfaceMethod { .. } | CallableTarget::ConstrainedMethod { .. }
         ) {
             self.complete_function_value_effects(&method.checked_effects, span)
         } else {
             method.checked_effects.clone()
-        };
-        self.record_checked_effects(effects, span);
+        }
     }
 
     pub(super) fn select_public_iteration(&mut self, ty: TypeId, span: Span) {
@@ -987,6 +1120,69 @@ impl Checker<'_> {
             }
             let mut requirements = Vec::new();
             let mut names = HashMap::new();
+            for property in &declaration.properties {
+                self.collect_property_hook_signatures(
+                    property,
+                    &declaration.name,
+                    crate::property_hooks::PropertyHookContext::Interface,
+                );
+                if let Some(previous) = names.insert(property.name.clone(), property.name_span) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0753",
+                            format!("requirement `{}` is declared more than once", property.name),
+                            property.name_span,
+                        )
+                        .with_title("Duplicate Interface Requirement")
+                        .with_related(previous, "the previous requirement is here"),
+                    );
+                }
+                let invalid = property.access != MemberAccess::External
+                    || property.is_static
+                    || property.open_span.is_some()
+                    || property.override_span.is_some()
+                    || property.initializer.is_some()
+                    || property
+                        .hooks
+                        .iter()
+                        .any(|hook| hook.body.as_block().is_some());
+                if invalid {
+                    self.diagnostics.push(
+                        Diagnostic::new("E0749", "an interface property requires external instance accessor signatures without implementations or an initializer", property.span)
+                            .with_title("Invalid Interface Requirement"),
+                    );
+                }
+                for hook in &property.hooks {
+                    let signature = &self.function_signatures[&hook.span];
+                    requirements.push((
+                        property.name.clone(),
+                        Some(hook.kind),
+                        MethodInfo {
+                            declaration: hook.span,
+                            is_open: false,
+                            is_override: false,
+                            virtual_root: None,
+                            access: property.access,
+                            receiver_mode: Some(
+                                if hook.kind == crate::ast::PropertyHookKind::Set
+                                    || hook.writable_span.is_some()
+                                {
+                                    ReceiverMode::Writable
+                                } else {
+                                    ReceiverMode::Readonly
+                                },
+                            ),
+                            return_borrow: signature.return_borrow,
+                            is_static: false,
+                            enclosing_type_bindings: HashMap::new(),
+                            type_params: Vec::new(),
+                            params: signature.params.clone(),
+                            return_ty: signature.return_ty,
+                            checked_effects: signature.checked_effects.clone(),
+                        },
+                    ));
+                }
+            }
             for requirement in &declaration.requirements {
                 if let Some(previous) =
                     names.insert(requirement.name.clone(), requirement.name_span)
@@ -1043,6 +1239,7 @@ impl Checker<'_> {
                     .insert(requirement.span, signature.clone());
                 requirements.push((
                     requirement.name.clone(),
+                    None,
                     MethodInfo {
                         declaration: requirement.span,
                         is_open: false,
@@ -1403,25 +1600,57 @@ impl Checker<'_> {
         let mut locals = definition
             .local_requirements
             .iter()
-            .map(|(name, method)| CanonicalRequirement {
+            .map(|(name, accessor, method)| CanonicalRequirement {
                 name: name.clone(),
+                accessor: *accessor,
                 origins: vec![(interface.clone(), method.declaration)],
                 method: self.substitute_contract_method(method, &substitutions),
             })
             .collect::<Vec<_>>();
+        let mut member_kinds = HashMap::new();
+        let mut conflicts = HashSet::new();
+        for requirement in inherited.iter().chain(&locals) {
+            if let Some(previous) = member_kinds.insert(&requirement.name, requirement) {
+                if previous.accessor.is_some() != requirement.accessor.is_some()
+                    && conflicts.insert(&requirement.name)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0753",
+                            format!(
+                                "`{}` is required as both a method and a property",
+                                requirement.name
+                            ),
+                            definition.declaration.name_span,
+                        )
+                        .with_title("Conflicting Interface Requirements")
+                        .with_related(
+                            previous.method.declaration,
+                            "one member contract is declared here",
+                        )
+                        .with_related(
+                            requirement.method.declaration,
+                            "the conflicting member contract is declared here",
+                        ),
+                    );
+                    result.valid = false;
+                }
+            }
+        }
         let mut names = HashSet::new();
         for requirement in &inherited {
-            if !names.insert(requirement.name.clone()) {
+            if !names.insert((requirement.name.clone(), requirement.accessor)) {
                 continue;
             }
             let same_name = inherited
                 .iter()
-                .filter(|other| other.name == requirement.name)
+                .filter(|other| {
+                    other.name == requirement.name && other.accessor == requirement.accessor
+                })
                 .collect::<Vec<_>>();
-            if let Some(local) = locals
-                .iter_mut()
-                .find(|local| local.name == requirement.name)
-            {
+            if let Some(local) = locals.iter_mut().find(|local| {
+                local.name == requirement.name && local.accessor == requirement.accessor
+            }) {
                 for parent in &same_name {
                     let failures = self.method_contract_failures(&local.method, &parent.method);
                     if !failures.is_empty() {
@@ -1482,6 +1711,31 @@ impl Checker<'_> {
             parameter.ty = self.substitute_type_id(parameter.ty, substitutions);
         }
         method.return_ty = self.substitute_type_id(method.return_ty, substitutions);
+        // A generic borrowed result specialised to Copy has no loan to retain.
+        if !self.type_is_move_type(method.return_ty) {
+            method.return_borrow = None;
+        }
+        // A generic ordinary getter can become callable only after substitution.
+        // Its interface contract must retain the same receiver bound as an
+        // explicitly spelled callable getter, without borrowing the new carrier.
+        if method.return_borrow.is_none()
+            && self.non_null_function_type(method.return_ty).is_some()
+            && self.interface_definitions.values().any(|definition| {
+                definition
+                    .local_requirements
+                    .iter()
+                    .any(|(_, accessor, requirement)| {
+                        *accessor == Some(crate::ast::PropertyHookKind::Get)
+                            && requirement.declaration == method.declaration
+                    })
+            })
+        {
+            method.return_borrow = Some(ReturnBorrow {
+                source: BorrowSource::Receiver,
+                writable: method.receiver_mode == Some(ReceiverMode::Writable),
+                kind: ReturnBorrowKind::Retained,
+            });
+        }
         if method.declaration.source == crate::compiler_known_contracts::SOURCE_ID
             && crate::compiler_known_contracts::interfaces().any(|interface| {
                 interface.name == "Iterator"
@@ -1495,6 +1749,7 @@ impl Checker<'_> {
                     .then_some(ReturnBorrow {
                         source: BorrowSource::Receiver,
                         writable: false,
+                        kind: ReturnBorrowKind::Value,
                     });
         }
         method.checked_effects = method
@@ -1541,6 +1796,7 @@ impl Checker<'_> {
             .unwrap_or_default();
         RequirementFacts {
             name: requirement.name.clone(),
+            accessor: requirement.accessor,
             origins: self.requirement_origins(requirement),
             generic_parameters,
             signature: CallableSignatureSemanticInfo {
@@ -1583,7 +1839,14 @@ impl Checker<'_> {
             .join(", ");
         let mut diagnostic = Diagnostic::new(
             "E0755",
-            format!("method `{name}` does not preserve the required {detail}"),
+            format!(
+                "{} `{name}` does not preserve the required {detail}",
+                match required.accessor {
+                    Some(crate::ast::PropertyHookKind::Get) => "getter",
+                    Some(crate::ast::PropertyHookKind::Set) => "setter",
+                    None => "method",
+                }
+            ),
             method.declaration,
         )
         .with_title("Interface Contract Does Not Match");
@@ -1677,7 +1940,14 @@ impl Checker<'_> {
                     if requires_exact_return {
                         requirement.method.return_ty = implementing_type;
                     }
-                    let method = self.find_concrete_contract_method(&class, &requirement.name);
+                    let method = if let Some(kind) = requirement.accessor {
+                        self.lookup_instance_property(&class, &requirement.name)
+                            .and_then(|(owner, property)| {
+                                self.property_accessor_method(&property, &owner, kind)
+                            })
+                    } else {
+                        self.find_concrete_contract_method(&class, &requirement.name)
+                    };
                     let mut implementation = RequirementImplementation {
                         requirement_origins: self.requirement_origins(&requirement),
                         implementation: None,
@@ -1722,8 +1992,14 @@ impl Checker<'_> {
                             let mut diagnostic = Diagnostic::new(
                                 "E0754",
                                 format!(
-                                    "class `{}` does not implement required method `{}`",
-                                    class.name, requirement.name
+                                    "class `{}` does not implement required {} `{}`",
+                                    class.name,
+                                    match requirement.accessor {
+                                        Some(crate::ast::PropertyHookKind::Get) => "getter",
+                                        Some(crate::ast::PropertyHookKind::Set) => "setter",
+                                        None => "method",
+                                    },
+                                    requirement.name
                                 ),
                                 declaration.name_span,
                             )
@@ -2313,22 +2589,15 @@ impl Checker<'_> {
                         let signature =
                             self.resolve_function_signature(method, Some(&declaration.name));
                         self.function_signatures.insert(method.span, signature);
-                        for parameter in &method.params {
-                            if let Some(default) = &parameter.default {
-                                self.check_trait_expression(default);
-                            }
-                        }
-                        if let Some(body) = method.body.as_block() {
-                            let mut forbidden = Vec::new();
-                            crate::ast::visit::block(body, &mut |expression| {
-                                collect_trait_parent_uses(expression, &mut forbidden)
-                            });
-                            self.report_trait_parent_uses(forbidden);
-                        }
                         Some((&method.name, method.name_span))
                     }
                     ClassMember::Property(property) => {
                         self.check_trait_type(&property.ty, property.span, &declaration.name);
+                        self.collect_property_hook_signatures(
+                            property,
+                            &declaration.name,
+                            crate::property_hooks::PropertyHookContext::Trait,
+                        );
                         if let Some(initializer) = &property.initializer {
                             self.check_trait_expression(initializer);
                         }
@@ -2342,6 +2611,23 @@ impl Checker<'_> {
                         Some((&constant.name, constant.span))
                     }
                 };
+                for callable in crate::property_hooks::member_callables(
+                    member,
+                    crate::property_hooks::PropertyHookContext::Trait,
+                ) {
+                    for parameter in &callable.params {
+                        if let Some(default) = &parameter.default {
+                            self.check_trait_expression(default);
+                        }
+                    }
+                    if let Some(body) = callable.body.as_block() {
+                        let mut forbidden = Vec::new();
+                        crate::ast::visit::block(body, &mut |expression| {
+                            collect_trait_parent_uses(expression, &mut forbidden)
+                        });
+                        self.report_trait_parent_uses(forbidden);
+                    }
+                }
                 if let Some((name, span)) = identity {
                     if let Some(previous) = members.insert(name.clone(), span) {
                         self.diagnostics.push(
@@ -2436,6 +2722,11 @@ impl Checker<'_> {
         for member in &declaration.members {
             if let ClassMember::Property(property) = member {
                 self.check_property_initializer(&declaration.name, property);
+                self.check_property_hook_bodies(
+                    property,
+                    &declaration.name,
+                    crate::property_hooks::PropertyHookContext::Trait,
+                );
             }
             if let ClassMember::Method(method) = member {
                 self.check_function(
@@ -2492,6 +2783,11 @@ impl Checker<'_> {
                 PropertyInitState::Uninitialized
             },
             declaration_span: property.span,
+            hooks: crate::property_hooks::declaration_facts(
+                &property,
+                crate::property_hooks::PropertyHookContext::Trait,
+            )
+            .map(|facts| facts.symbols()),
         })
     }
 
@@ -2817,8 +3113,13 @@ impl Checker<'_> {
         }
         if !match (required.return_borrow, method.return_borrow) {
             (None, None) => true,
+            (Some(expected), None) => expected.kind == ReturnBorrowKind::Retained,
             (Some(expected), Some(actual)) => {
-                expected.source == actual.source && (!expected.writable || actual.writable)
+                expected.kind == actual.kind
+                    && expected.source == actual.source
+                    && expected
+                        .kind
+                        .accepts_writable(expected.writable, actual.writable)
             }
             _ => false,
         } {

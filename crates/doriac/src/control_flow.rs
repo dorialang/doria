@@ -148,6 +148,11 @@ struct ExceptionHandler {
     catch_finalizer_depth: usize,
 }
 
+struct ValueRegion {
+    finalizer_depth: usize,
+    yields: Vec<NodeId>,
+}
+
 struct Builder<'a> {
     graph: ControlFlowGraph,
     loops: Vec<LoopContext>,
@@ -158,6 +163,7 @@ struct Builder<'a> {
     catch_coverage: &'a CatchCoverageMap,
     terminal_expression_spans: &'a HashSet<Span>,
     exception_handlers: Vec<ExceptionHandler>,
+    value_regions: Vec<ValueRegion>,
 }
 
 pub fn build_function_cfg(body: &Block, function_span: Span) -> ControlFlowGraph {
@@ -223,6 +229,7 @@ pub(crate) fn build_function_cfg_with_checked_effects(
         catch_coverage,
         terminal_expression_spans,
         exception_handlers: Vec::new(),
+        value_regions: Vec::new(),
     };
     let outgoing = builder.build_statements(&body.statements, vec![entry]);
     let fallthrough = builder.graph.add_node(
@@ -259,6 +266,26 @@ impl Builder<'_> {
         match statement {
             Stmt::Block(block) => self.build_statements(&block.statements, incoming),
             Stmt::Return { span, .. } => {
+                if let Some(finalizer_depth) = self
+                    .value_regions
+                    .last()
+                    .map(|region| region.finalizer_depth)
+                {
+                    let action = match statement {
+                        Stmt::Return {
+                            expr: Some(expr), ..
+                        } => NodeAction::Expression(expr.clone()),
+                        _ => NodeAction::None,
+                    };
+                    let value = self.normal(NodeKind::Statement, *span, action, incoming);
+                    let routed = self.route_finalizers(vec![value], finalizer_depth);
+                    self.value_regions
+                        .last_mut()
+                        .expect("active value region")
+                        .yields
+                        .extend(routed);
+                    return Vec::new();
+                }
                 let value = self.normal(
                     NodeKind::Statement,
                     *span,
@@ -270,6 +297,9 @@ impl Builder<'_> {
                 Vec::new()
             }
             Stmt::Throw(statement) => {
+                let action = NodeAction::Expression(statement.expr.clone());
+                let exclusions = action_evaluation_exclusions(&action);
+                let incoming = self.prepare_action_evaluation(&action, incoming);
                 let value = self.normal_without_checked_effects(
                     NodeKind::Statement,
                     statement.span,
@@ -281,7 +311,12 @@ impl Builder<'_> {
                     .iter()
                     .any(|(span, effects)| statement.span.contains(*span) && !effects.is_empty());
                 if has_checked_effect {
-                    self.connect_checked_effects(statement.span, &incoming, Some(value));
+                    self.connect_checked_effects_except(
+                        statement.span,
+                        &incoming,
+                        Some(value),
+                        &exclusions,
+                    );
                 } else {
                     let routed = self.route_finalizers(vec![value], 0);
                     self.terminal(
@@ -397,11 +432,16 @@ impl Builder<'_> {
                 let header = self.graph.add_node(
                     NodeKind::LoopHeader,
                     while_stmt.condition.span(),
-                    NodeAction::Expression(while_stmt.condition.clone()),
+                    NodeAction::None,
                     true,
                 );
                 self.graph.connect_all(&gate.passed, header);
-                self.connect_checked_effects(while_stmt.condition.span(), &[header], None);
+                let predicate = self.normal(
+                    NodeKind::Branch,
+                    while_stmt.condition.span(),
+                    NodeAction::Expression(while_stmt.condition.clone()),
+                    vec![header],
+                );
                 let condition = constant_condition(&while_stmt.condition);
                 self.loops.push(LoopContext {
                     continue_target: gate.entry.unwrap_or(header),
@@ -411,7 +451,7 @@ impl Builder<'_> {
                 let body_incoming = if condition == ConstantCondition::AlwaysFalse {
                     Vec::new()
                 } else {
-                    vec![self.assumption(&while_stmt.condition, true, header)]
+                    vec![self.assumption(&while_stmt.condition, true, predicate)]
                 };
                 let body_outgoing =
                     self.build_statements(&while_stmt.body.statements, body_incoming);
@@ -421,7 +461,7 @@ impl Builder<'_> {
                 let mut outgoing = loop_context.breaks;
                 outgoing.extend(gate.failed);
                 if condition != ConstantCondition::AlwaysTrue {
-                    outgoing.push(self.assumption(&while_stmt.condition, false, header));
+                    outgoing.push(self.assumption(&while_stmt.condition, false, predicate));
                 }
                 let outgoing = deduplicate(outgoing);
                 if let Some(finally) = &while_stmt.finally {
@@ -445,7 +485,7 @@ impl Builder<'_> {
                 let condition_node = self.graph.add_node(
                     NodeKind::LoopHeader,
                     do_while.condition.span(),
-                    NodeAction::Expression(do_while.condition.clone()),
+                    NodeAction::None,
                     true,
                 );
                 self.loops.push(LoopContext {
@@ -456,15 +496,20 @@ impl Builder<'_> {
                 let body_outgoing =
                     self.build_statements(&do_while.body.statements, vec![body_entry]);
                 self.graph.connect_all(&body_outgoing, condition_node);
-                self.connect_checked_effects(do_while.condition.span(), &[condition_node], None);
+                let predicate = self.normal(
+                    NodeKind::Branch,
+                    do_while.condition.span(),
+                    NodeAction::Expression(do_while.condition.clone()),
+                    vec![condition_node],
+                );
                 let condition = constant_condition(&do_while.condition);
                 if condition != ConstantCondition::AlwaysFalse {
-                    let repeat = self.assumption(&do_while.condition, true, condition_node);
+                    let repeat = self.assumption(&do_while.condition, true, predicate);
                     self.graph.add_edge(repeat, body_entry);
                 }
                 let mut outgoing = self.loops.pop().expect("do-while loop context").breaks;
                 if condition != ConstantCondition::AlwaysTrue {
-                    outgoing.push(self.assumption(&do_while.condition, false, condition_node));
+                    outgoing.push(self.assumption(&do_while.condition, false, predicate));
                 }
                 let outgoing = deduplicate(outgoing);
                 if let Some(finally) = &do_while.finally {
@@ -476,14 +521,19 @@ impl Builder<'_> {
             }
             Stmt::For(for_stmt) => self.build_for(for_stmt, incoming),
             Stmt::Foreach(foreach) => {
+                let iterable = self.normal(
+                    NodeKind::Statement,
+                    foreach.iterable.span(),
+                    NodeAction::Expression(foreach.iterable.clone()),
+                    incoming,
+                );
                 let header = self.graph.add_node(
                     NodeKind::LoopHeader,
                     foreach.iterable.span(),
-                    NodeAction::Expression(foreach.iterable.clone()),
+                    NodeAction::None,
                     true,
                 );
-                self.graph.connect_all(&incoming, header);
-                self.connect_checked_effects(foreach.iterable.span(), &incoming, None);
+                self.graph.add_edge(iterable, header);
                 self.loops.push(LoopContext {
                     continue_target: header,
                     finalizer_depth: self.finalizers.len(),
@@ -569,15 +619,21 @@ impl Builder<'_> {
         let mut failed = Vec::new();
         let mut entry = None;
         for predicate in predicates {
-            let branch = self.graph.add_node(
+            let start = self.graph.add_node(
+                NodeKind::Branch,
+                predicate.span(),
+                NodeAction::None,
+                repeatable,
+            );
+            self.graph.connect_all(&passed, start);
+            let branch = self.normal(
                 NodeKind::Branch,
                 predicate.span(),
                 NodeAction::Expression(predicate.clone()),
-                repeatable,
+                vec![start],
             );
-            self.graph.connect_all(&passed, branch);
-            self.connect_checked_effects(predicate.span(), &[branch], None);
-            entry.get_or_insert(branch);
+            self.graph.nodes[branch.0].repeatable = repeatable;
+            entry.get_or_insert(start);
             let condition = constant_condition(&predicate);
             passed = if condition == ConstantCondition::AlwaysFalse {
                 Vec::new()
@@ -659,31 +715,26 @@ impl Builder<'_> {
             .as_ref()
             .map(Expr::span)
             .unwrap_or(for_stmt.span);
-        let header = self.graph.add_node(
-            NodeKind::LoopHeader,
-            header_span,
-            for_stmt
-                .condition
-                .clone()
-                .map(NodeAction::Expression)
-                .unwrap_or(NodeAction::None),
-            true,
-        );
+        let header = self
+            .graph
+            .add_node(NodeKind::LoopHeader, header_span, NodeAction::None, true);
         self.graph.connect_all(&incoming, header);
-        if let Some(condition) = &for_stmt.condition {
-            self.connect_checked_effects(condition.span(), &[header], None);
-        }
+        let predicate = for_stmt.condition.as_ref().map_or(header, |condition| {
+            self.normal(
+                NodeKind::Branch,
+                condition.span(),
+                NodeAction::Expression(condition.clone()),
+                vec![header],
+            )
+        });
         let increment = for_stmt.increment.as_ref().map(|increment| {
             self.graph.add_node(
                 NodeKind::Statement,
                 for_increment_span(increment),
-                NodeAction::ForIncrement(increment.clone()),
+                NodeAction::None,
                 true,
             )
         });
-        if let Some(increment) = increment {
-            self.graph.add_edge(increment, header);
-        }
         let continue_target = increment.unwrap_or(header);
         self.loops.push(LoopContext {
             continue_target,
@@ -700,13 +751,19 @@ impl Builder<'_> {
             Vec::new()
         } else {
             match &for_stmt.condition {
-                Some(condition) => vec![self.assumption(condition, true, header)],
+                Some(condition) => vec![self.assumption(condition, true, predicate)],
                 None => vec![header],
             }
         };
         let body_outgoing = self.build_statements(&for_stmt.body.statements, body_incoming);
-        if let Some(increment) = &for_stmt.increment {
-            self.connect_checked_effects(for_increment_span(increment), &body_outgoing, None);
+        if let (Some(action), Some(entry)) = (&for_stmt.increment, increment) {
+            let completed = self.normal(
+                NodeKind::Statement,
+                for_increment_span(action),
+                NodeAction::ForIncrement(action.clone()),
+                vec![entry],
+            );
+            self.graph.add_edge(completed, header);
         }
         self.graph
             .connect_all(&body_outgoing, increment.unwrap_or(header));
@@ -714,7 +771,7 @@ impl Builder<'_> {
         let mut outgoing = self.loops.pop().expect("for loop context").breaks;
         if condition != ConstantCondition::AlwaysTrue {
             if let Some(condition) = &for_stmt.condition {
-                outgoing.push(self.assumption(condition, false, header));
+                outgoing.push(self.assumption(condition, false, predicate));
             } else {
                 outgoing.push(header);
             }
@@ -726,10 +783,203 @@ impl Builder<'_> {
         let active = self.finalizers.clone();
         for index in (target_depth..active.len()).rev() {
             self.finalizers.truncate(index);
+            // An outer callable's finalizer is outside any inner value region.
+            // A return there overrides propagation; it is not a when yield.
+            let retained = self
+                .value_regions
+                .partition_point(|region| region.finalizer_depth <= index);
+            let suspended = self.value_regions.split_off(retained);
             incoming = self.build_statements(&active[index].statements, incoming);
+            self.value_regions.extend(suspended);
         }
         self.finalizers = active;
         incoming
+    }
+
+    /// Most expressions cannot write source bindings and remain one action.
+    /// Value-producing control flow contains real statements, so its evaluation
+    /// must be represented before the enclosing action commits its result.
+    fn prepare_action_evaluation(
+        &mut self,
+        action: &NodeAction,
+        incoming: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let expressions = action_expressions(action);
+        if !expressions.iter().any(|expr| contains_value_region(expr)) {
+            return incoming;
+        }
+        if let Some(assignment) = action_assignment(action) {
+            let incoming = expression_children(&assignment.target)
+                .into_iter()
+                .fold(incoming, |incoming, child| {
+                    self.build_expression_evaluation(child, incoming)
+                });
+            let incoming = self.build_expression_evaluation(&assignment.value, incoming);
+            self.connect_expression_effects(&assignment.target, &incoming);
+            return incoming;
+        }
+        expressions
+            .into_iter()
+            .fold(incoming, |incoming, expression| {
+                self.build_expression_evaluation(expression, incoming)
+            })
+    }
+
+    fn build_expression_evaluation(
+        &mut self,
+        expression: &Expr,
+        incoming: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let outgoing = match expression {
+            Expr::When(when) => self.build_when(when, incoming),
+            Expr::Binary {
+                left, op, right, ..
+            } if matches!(op, crate::ast::BinaryOp::And | crate::ast::BinaryOp::Or) => {
+                let outgoing = self.build_expression_evaluation(left, incoming);
+                let branch = self.normal_without_checked_effects(
+                    NodeKind::Branch,
+                    left.span(),
+                    NodeAction::None,
+                    &outgoing,
+                );
+                let condition = constant_condition(left);
+                let right_truth = matches!(op, crate::ast::BinaryOp::And);
+                let mut outgoing = Vec::new();
+                if condition == ConstantCondition::Unknown
+                    || (condition == ConstantCondition::AlwaysTrue) == right_truth
+                {
+                    let right_incoming = self.assumption(left, right_truth, branch);
+                    outgoing.extend(self.build_expression_evaluation(right, vec![right_incoming]));
+                }
+                if condition == ConstantCondition::Unknown
+                    || (condition == ConstantCondition::AlwaysTrue) != right_truth
+                {
+                    outgoing.push(self.assumption(left, !right_truth, branch));
+                }
+                outgoing
+            }
+            Expr::Binary {
+                left,
+                op: crate::ast::BinaryOp::Coalesce,
+                right,
+                ..
+            } => {
+                let outgoing = self.build_expression_evaluation(left, incoming);
+                // A present left value bypasses the right evaluation entirely.
+                let mut joined = if matches!(left.as_ref(), Expr::Null { .. }) {
+                    Vec::new()
+                } else {
+                    outgoing.clone()
+                };
+                joined.extend(self.build_expression_evaluation(right, outgoing));
+                deduplicate(joined)
+            }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                let incoming = self.build_expression_evaluation(scrutinee, incoming);
+                let mut outgoing = Vec::new();
+                for arm in arms {
+                    let mut incoming = incoming.clone();
+                    if let Some(guard) = &arm.guard {
+                        incoming = self.build_expression_evaluation(&guard.condition, incoming);
+                        if constant_condition(&guard.condition) == ConstantCondition::AlwaysFalse {
+                            continue;
+                        }
+                    }
+                    outgoing.extend(self.build_expression_evaluation(&arm.value, incoming));
+                }
+                deduplicate(outgoing)
+            }
+            _ => expression_children(expression)
+                .into_iter()
+                .fold(incoming, |incoming, child| {
+                    self.build_expression_evaluation(child, incoming)
+                }),
+        };
+        // Checked effects belong to the evaluation point, not to the enclosing
+        // assignment's predecessor. Never execute a closure body at creation.
+        if is_panic_call(expression) || self.terminal_expression_spans.contains(&expression.span())
+        {
+            return Vec::new();
+        }
+        self.connect_expression_effects(expression, &outgoing);
+        outgoing
+    }
+
+    fn connect_expression_effects(&mut self, expression: &Expr, incoming: &[NodeId]) {
+        let effects = self.checked_effect_sites.get(&expression.span()).cloned();
+        if let Some(effects) = effects {
+            for effect in effects {
+                self.connect_checked_effect(&effect, expression.span(), incoming);
+            }
+        }
+    }
+
+    fn build_when(
+        &mut self,
+        when: &crate::ast::WhenExpression,
+        incoming: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let finalizer_depth = self.finalizers.len();
+        self.value_regions.push(ValueRegion {
+            finalizer_depth,
+            yields: Vec::new(),
+        });
+        if let Some(finally) = &when.finally {
+            self.finalizers.push(finally.block.clone());
+        }
+        let gate = if let Some(given) = &when.given {
+            let given = self.build_given(given, incoming);
+            self.build_gate(
+                given.predicates,
+                given.setup_outgoing,
+                !self.loops.is_empty(),
+            )
+        } else {
+            GateFlow {
+                entry: None,
+                passed: incoming,
+                failed: Vec::new(),
+            }
+        };
+        let mut remaining = gate.passed;
+        let mut gate_failed = gate.failed;
+        let mut fallthrough = Vec::new();
+        for branch in &when.branches {
+            let entered = if let Some(condition) = &branch.condition {
+                let node = self.normal(
+                    NodeKind::Branch,
+                    condition.span(),
+                    NodeAction::Expression(condition.clone()),
+                    remaining,
+                );
+                let value = constant_condition(condition);
+                remaining = if value == ConstantCondition::AlwaysTrue {
+                    Vec::new()
+                } else {
+                    vec![self.assumption(condition, false, node)]
+                };
+                if value == ConstantCondition::AlwaysFalse {
+                    Vec::new()
+                } else {
+                    vec![self.assumption(condition, true, node)]
+                }
+            } else {
+                remaining.append(&mut gate_failed);
+                std::mem::take(&mut remaining)
+            };
+            fallthrough.extend(self.build_statements(&branch.block.statements, entered));
+        }
+        fallthrough.extend(remaining);
+        fallthrough.extend(gate_failed);
+        if let Some(finally) = &when.finally {
+            self.finalizers.pop().expect("when finalizer context");
+            fallthrough = self.build_statements(&finally.block.statements, fallthrough);
+        }
+        let region = self.value_regions.pop().expect("when value region");
+        fallthrough.extend(region.yields);
+        deduplicate(fallthrough)
     }
 
     fn normal(
@@ -739,8 +989,10 @@ impl Builder<'_> {
         action: NodeAction,
         incoming: Vec<NodeId>,
     ) -> NodeId {
+        let exclusions = action_evaluation_exclusions(&action);
+        let incoming = self.prepare_action_evaluation(&action, incoming);
         let node = self.normal_without_checked_effects(kind, span, action, &incoming);
-        self.connect_checked_effects(span, &incoming, None);
+        self.connect_checked_effects_except(span, &incoming, None, &exclusions);
         node
     }
 
@@ -758,16 +1010,18 @@ impl Builder<'_> {
         node
     }
 
-    fn connect_checked_effects(
+    fn connect_checked_effects_except(
         &mut self,
         action_span: Span,
         before_action: &[NodeId],
         completed_action: Option<NodeId>,
+        exclusions: &[Span],
     ) {
         let sites = self
             .checked_effect_sites
             .iter()
             .filter(|(span, _)| action_span.contains(**span))
+            .filter(|(span, _)| !exclusions.iter().any(|excluded| excluded.contains(**span)))
             .map(|(span, effects)| (*span, effects.clone()))
             .collect::<Vec<_>>();
         for (site_span, effects) in sites {
@@ -847,6 +1101,124 @@ fn constant_condition(expr: &Expr) -> ConstantCondition {
 
 fn is_panic_call(expr: &Expr) -> bool {
     matches!(expr, Expr::FunctionCall { name, .. } if name == "panic")
+}
+
+fn action_assignment(action: &NodeAction) -> Option<&crate::ast::Assignment> {
+    match action {
+        NodeAction::Statement(Stmt::Assignment(assignment))
+        | NodeAction::ForInitializer(ForInitializer::Assignment(assignment)) => Some(assignment),
+        NodeAction::ForIncrement(ForIncrement::Assignment(assignment)) => Some(assignment),
+        _ => None,
+    }
+}
+
+fn action_expressions(action: &NodeAction) -> Vec<&Expr> {
+    if let Some(assignment) = action_assignment(action) {
+        return vec![&assignment.target, &assignment.value];
+    }
+    match action {
+        NodeAction::Expression(expression) => vec![expression],
+        NodeAction::Statement(Stmt::VarDecl(declaration))
+        | NodeAction::ForInitializer(ForInitializer::VarDecl(declaration)) => {
+            vec![&declaration.initializer]
+        }
+        NodeAction::Statement(Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. }) => vec![expr],
+        NodeAction::Statement(Stmt::Return { expr, .. }) => expr.iter().collect(),
+        NodeAction::Statement(Stmt::Throw(statement)) => vec![&statement.expr],
+        NodeAction::Statement(Stmt::Increment(increment)) => vec![&increment.target],
+        NodeAction::ForIncrement(ForIncrement::Increment(increment)) => vec![&increment.target],
+        _ => Vec::new(),
+    }
+}
+
+fn action_evaluation_exclusions(action: &NodeAction) -> Vec<Span> {
+    let expressions = action_expressions(action);
+    if expressions.iter().any(|expr| contains_value_region(expr)) {
+        expressions.into_iter().map(Expr::span).collect()
+    } else {
+        let mut closures = Vec::new();
+        for expression in expressions {
+            collect_closure_exclusions(expression, &mut closures);
+        }
+        closures
+    }
+}
+
+fn collect_closure_exclusions(expression: &Expr, spans: &mut Vec<Span>) {
+    if matches!(expression, Expr::Closure(_)) {
+        spans.push(expression.span());
+    } else {
+        for child in expression_children(expression) {
+            collect_closure_exclusions(child, spans);
+        }
+    }
+}
+
+fn contains_value_region(expression: &Expr) -> bool {
+    matches!(expression, Expr::When(_))
+        || expression_children(expression)
+            .into_iter()
+            .any(contains_value_region)
+}
+
+/// Executed child expressions in source evaluation order. Closure bodies are
+/// separate callable graphs; constructing their environment does not run them.
+fn expression_children(expression: &Expr) -> Vec<&Expr> {
+    match expression {
+        Expr::Grouped { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::PropertyAccess { object: expr, .. } => vec![expr],
+        Expr::Binary { left, right, .. }
+        | Expr::Range {
+            start: left,
+            end: right,
+            ..
+        }
+        | Expr::ArrayRepeat {
+            value: left,
+            count: right,
+            ..
+        }
+        | Expr::Index {
+            collection: left,
+            index: right,
+            ..
+        } => vec![left, right],
+        Expr::FunctionCall { args, .. }
+        | Expr::StaticCall { args, .. }
+        | Expr::New { args, .. } => args.iter().map(|argument| &argument.value).collect(),
+        Expr::MethodCall { object, args, .. }
+        | Expr::CallableCall {
+            callee: object,
+            args,
+            ..
+        } => std::iter::once(object.as_ref())
+            .chain(args.iter().map(|argument| &argument.value))
+            .collect(),
+        Expr::Array { elements, .. } => elements
+            .iter()
+            .flat_map(|element| element.key.iter().chain(std::iter::once(&element.value)))
+            .collect(),
+        Expr::InterpolatedString { parts, .. } => parts
+            .iter()
+            .filter_map(|part| match part {
+                crate::ast::InterpolatedStringPart::Expr(expression) => Some(expression),
+                _ => None,
+            })
+            .collect(),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => std::iter::once(scrutinee.as_ref())
+            .chain(arms.iter().flat_map(|arm| {
+                arm.guard
+                    .iter()
+                    .map(|guard| &guard.condition)
+                    .chain(std::iter::once(&arm.value))
+            }))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn statement_span(statement: &Stmt) -> Span {

@@ -1,0 +1,1 @@
+new parent;new child;drop parent;live child;child destructor;base destructor;drop child;

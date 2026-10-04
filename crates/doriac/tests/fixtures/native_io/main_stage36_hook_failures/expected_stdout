@@ -1,0 +1,20 @@
+receiver
+get
+rhs
+set
+drop
+receiver
+get
+drop
+caught get
+receiver
+get
+rhs
+drop
+caught rhs
+receiver
+get
+rhs
+set
+drop
+caught set

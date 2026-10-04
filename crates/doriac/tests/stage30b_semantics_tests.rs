@@ -502,6 +502,53 @@ function main(): void
 }
 
 #[test]
+fn capture_return_ownership_agrees_for_arrows_and_blocks() {
+    for (body, return_type, moves_capture) in [
+        ("$payload", "Payload", true),
+        ("$payload->value", "int", false),
+    ] {
+        for take in [false, true] {
+            let capture = if take { "take $payload" } else { "$payload" };
+            for declaration in [
+                format!("let $callback = fn() with ({capture}) => {body};"),
+                format!(
+                    "let $callback = function (): {return_type} with ({capture}) {{ return {body}; }};"
+                ),
+                format!(
+                    "function once(): {return_type} $callback = fn() with ({capture}) => {body};"
+                ),
+                format!(
+                    "function once(): {return_type} $callback = function (): {return_type} with ({capture}) {{ return {body}; }};"
+                ),
+            ] {
+                let source = format!(
+                    "class Payload {{ int $value = 42; }}\nfunction main(): void {{\n\
+                     let $payload = new Payload();\n{declaration}\n}}"
+                );
+                let analysis = analyze(&source);
+                if moves_capture && !take {
+                    diagnostic(&analysis.diagnostics, "E0653");
+                    continue;
+                }
+                assert!(
+                    analysis.diagnostics.is_empty(),
+                    "{declaration}: {:#?}",
+                    analysis.diagnostics
+                );
+                let closure = analysis.info.closures.values().next().unwrap();
+                let (mode, capability) = if moves_capture {
+                    (FunctionInvocationMode::Once, CaptureRequirement::Take)
+                } else {
+                    (FunctionInvocationMode::Readonly, CaptureRequirement::Readonly)
+                };
+                assert_eq!(closure.inferred_invocation_mode, mode, "{declaration}");
+                assert_eq!(closure.captures[0].required_capability, capability, "{declaration}");
+            }
+        }
+    }
+}
+
+#[test]
 fn effect_sets_grouping_and_return_borrows_have_semantic_identity() {
     let source = r#"
 class FirstError implements Error { function __construct(string $message) {} }

@@ -9,6 +9,7 @@ use crate::control_flow::{
 };
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 use crate::diagnostics::Diagnostic;
+use crate::property_hooks::{declaration_facts, PropertyHookContext, PropertyHookStorage};
 use crate::semantics::PropertyWriteKind;
 use crate::source::Span;
 
@@ -16,6 +17,28 @@ use crate::source::Span;
 pub(crate) struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
     pub property_writes: HashMap<Span, PropertyWriteKind>,
+    pub partial_cleanups: Vec<ConstructorPartialCleanup>,
+}
+
+/// Resolved inheritance/storage facts, supplied by member selection rather than
+/// reconstructed from source names by constructor dataflow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConstructorCleanupContext {
+    pub parent_class: Option<Span>,
+    pub parent_constructor: Option<Span>,
+    pub inherited_stored_properties: Vec<Span>,
+}
+
+/// Fields which may have been initialized when construction exits through a
+/// checked error. These are canonical backing declarations, not accessor views.
+/// Consumers use checked property ownership/type facts to select owned payloads;
+/// failure never invokes the incomplete object's own destructor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorPartialCleanup {
+    pub class: Span,
+    pub constructor: Option<Span>,
+    pub site: Span,
+    pub initialized_properties: Vec<Span>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +61,7 @@ impl InitState {
 #[derive(Debug, Clone)]
 struct Property {
     name: String,
+    declaration: Span,
     writable: bool,
     preinitialized: bool,
     same_named_constructor_only_parameter: bool,
@@ -115,12 +139,35 @@ impl ForwardAnalysis for ConstructorAnalysis<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn check_program(
     program: &Program,
+    backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &crate::checked_effects::EffectSiteMap,
     catch_error_types: &crate::checked_effects::CatchTypeMap,
     catch_coverage: &crate::checked_effects::CatchCoverageMap,
+) -> Analysis {
+    check_program_with_cleanup_context(
+        program,
+        backing_fields,
+        given_preludes,
+        checked_effect_sites,
+        catch_error_types,
+        catch_coverage,
+        &HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_program_with_cleanup_context(
+    program: &Program,
+    backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
+    given_preludes: &GivenSemanticInfoMap,
+    checked_effect_sites: &crate::checked_effects::EffectSiteMap,
+    catch_error_types: &crate::checked_effects::CatchTypeMap,
+    catch_coverage: &crate::checked_effects::CatchCoverageMap,
+    cleanup_contexts: &HashMap<Span, ConstructorCleanupContext>,
 ) -> Analysis {
     let mut analysis = Analysis::default();
     for class in program.items.iter().filter_map(|item| match item {
@@ -129,22 +176,28 @@ pub(crate) fn check_program(
     }) {
         check_class(
             class,
+            backing_fields,
             given_preludes,
             checked_effect_sites,
             catch_error_types,
             catch_coverage,
+            cleanup_contexts.get(&class.span),
             &mut analysis,
         );
     }
+    inherit_parent_partial_cleanups(program, cleanup_contexts, &mut analysis.partial_cleanups);
     analysis
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_class(
     class: &ClassDecl,
+    backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &crate::checked_effects::EffectSiteMap,
     catch_error_types: &crate::checked_effects::CatchTypeMap,
     catch_coverage: &crate::checked_effects::CatchCoverageMap,
+    cleanup_context: Option<&ConstructorCleanupContext>,
     analysis: &mut Analysis,
 ) {
     let constructor = class.members.iter().find_map(|member| match member {
@@ -161,13 +214,24 @@ fn check_class(
         .members
         .iter()
         .filter_map(|member| match member {
-            ClassMember::Property(property) if !property.is_static => Some(Property {
-                name: property.name.clone(),
-                writable: property.writable,
-                preinitialized: property.initializer.is_some(),
-                same_named_constructor_only_parameter: constructor_only_names
-                    .contains(property.name.as_str()),
-            }),
+            ClassMember::Property(property)
+                if !property.is_static
+                    && !backing_fields
+                        .get(&property.span)
+                        .is_some_and(|field| field.declaration != property.span)
+                    && !declaration_facts(property, PropertyHookContext::Class).is_some_and(
+                        |facts| facts.storage == Some(PropertyHookStorage::Computed),
+                    ) =>
+            {
+                Some(Property {
+                    name: property.name.clone(),
+                    declaration: property.span,
+                    writable: property.writable,
+                    preinitialized: property.initializer.is_some(),
+                    same_named_constructor_only_parameter: constructor_only_names
+                        .contains(property.name.as_str()),
+                })
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -179,12 +243,23 @@ fn check_class(
                 .filter(|parameter| parameter.constructor_role.is_promoted())
                 .map(|parameter| Property {
                     name: parameter.name.clone(),
+                    declaration: parameter.span,
                     writable: parameter.writable,
                     preinitialized: true,
                     same_named_constructor_only_parameter: false,
                 }),
         );
     }
+    project_partial_cleanups(
+        class,
+        &properties,
+        cleanup_context,
+        given_preludes,
+        checked_effect_sites,
+        catch_error_types,
+        catch_coverage,
+        &mut analysis.partial_cleanups,
+    );
     if properties.is_empty() {
         return;
     }
@@ -259,6 +334,211 @@ fn check_class(
             _ => {}
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_partial_cleanups(
+    class: &ClassDecl,
+    properties: &[Property],
+    cleanup_context: Option<&ConstructorCleanupContext>,
+    given_preludes: &GivenSemanticInfoMap,
+    checked_effect_sites: &crate::checked_effects::EffectSiteMap,
+    catch_error_types: &crate::checked_effects::CatchTypeMap,
+    catch_coverage: &crate::checked_effects::CatchCoverageMap,
+    cleanups: &mut Vec<ConstructorPartialCleanup>,
+) {
+    let constructor = class.members.iter().find_map(|member| match member {
+        ClassMember::Method(method) if method.name == "__construct" => Some(method),
+        _ => None,
+    });
+    let mut statements = Vec::new();
+    // Construction phases follow declarations, not the physical field list:
+    // backed overrides have no new field but their initializer still executes.
+    let explicit = class.members.iter().filter_map(|member| match member {
+        ClassMember::Property(property)
+            if !property.is_static
+                && !declaration_facts(property, PropertyHookContext::Class)
+                    .is_some_and(|facts| facts.storage == Some(PropertyHookStorage::Computed)) =>
+        {
+            property
+                .initializer
+                .clone()
+                .map(|value| (property.name.clone(), property.span, value))
+        }
+        _ => None,
+    });
+    let promoted = constructor.into_iter().flat_map(|constructor| {
+        constructor
+            .params
+            .iter()
+            .filter(|parameter| parameter.constructor_role.is_promoted())
+            .map(|parameter| {
+                (
+                    parameter.name.clone(),
+                    parameter.span,
+                    Expr::Variable {
+                        name: parameter.name.clone(),
+                        span: parameter.span,
+                    },
+                )
+            })
+    });
+    for (name, declaration, value) in explicit.chain(promoted) {
+        // These assignments model the existing construction phase, using
+        // authored initializer spans so checked effects precede the store.
+        statements.push(Stmt::Assignment(crate::ast::Assignment {
+            target: Expr::PropertyAccess {
+                object: Box::new(Expr::This { span: declaration }),
+                property: name,
+                member_span: declaration,
+                null_safe: false,
+                span: declaration,
+            },
+            op: AssignOp::Assign,
+            value,
+            span: declaration,
+        }));
+    }
+    if let Some(body) = constructor.and_then(|constructor| constructor.body.as_block()) {
+        let mut remaining = body.statements.as_slice();
+        if cleanup_context.is_some_and(|context| context.parent_class.is_some())
+            && remaining
+                .first()
+                .is_some_and(is_parent_constructor_statement)
+        {
+            // Parent failure is projected from the parent's own dataflow below.
+            // Its successful path precedes this class's initialization phase.
+            remaining = &remaining[1..];
+        }
+        statements.extend_from_slice(remaining);
+    }
+    let owner = constructor.map_or(class.span, |constructor| constructor.span);
+    let body = crate::ast::Block {
+        statements,
+        span: owner,
+    };
+    let graph = build_function_cfg_with_checked_effects(
+        &body,
+        owner,
+        given_preludes,
+        checked_effect_sites,
+        catch_error_types,
+        catch_coverage,
+        &HashSet::new(),
+    );
+    let result = solve_forward(
+        &graph,
+        &ConstructorAnalysis {
+            properties,
+            entry: State {
+                reachable: true,
+                properties: vec![InitState::Uninitialized; properties.len()],
+            },
+        },
+    );
+    for node in &graph.nodes {
+        let input = &result.inputs[node.id.0];
+        if !input.reachable
+            || node.kind != NodeKind::DivergeExit
+            || !matches!(node.action, NodeAction::None)
+            || !checked_effect_sites
+                .get(&node.span)
+                .is_some_and(|effects| !effects.is_empty())
+        {
+            continue;
+        }
+        let mut initialized_properties = cleanup_context
+            .map(|context| context.inherited_stored_properties.clone())
+            .unwrap_or_default();
+        initialized_properties.extend(properties.iter().zip(&input.properties).filter_map(
+            |(property, state)| {
+                (*state != InitState::Uninitialized).then_some(property.declaration)
+            },
+        ));
+        insert_partial_cleanup(
+            cleanups,
+            ConstructorPartialCleanup {
+                class: class.span,
+                constructor: constructor.map(|constructor| constructor.span),
+                site: node.span,
+                initialized_properties,
+            },
+        );
+    }
+}
+
+fn is_parent_constructor_statement(statement: &Stmt) -> bool {
+    matches!(statement, Stmt::Expr {
+        expr: Expr::StaticCall {
+            qualifier: crate::ast::StaticQualifier::Parent,
+            method,
+            ..
+        },
+        ..
+    } if method == "__construct")
+}
+
+fn insert_partial_cleanup(
+    cleanups: &mut Vec<ConstructorPartialCleanup>,
+    mut incoming: ConstructorPartialCleanup,
+) -> bool {
+    if let Some(existing) = cleanups.iter_mut().find(|existing| {
+        existing.class == incoming.class
+            && existing.constructor == incoming.constructor
+            && existing.site == incoming.site
+    }) {
+        let before = existing.initialized_properties.len();
+        for property in incoming.initialized_properties {
+            if !existing.initialized_properties.contains(&property) {
+                existing.initialized_properties.push(property);
+            }
+        }
+        return existing.initialized_properties.len() != before;
+    }
+    incoming.initialized_properties.dedup();
+    cleanups.push(incoming);
+    true
+}
+
+fn inherit_parent_partial_cleanups(
+    program: &Program,
+    contexts: &HashMap<Span, ConstructorCleanupContext>,
+    cleanups: &mut Vec<ConstructorPartialCleanup>,
+) {
+    loop {
+        let mut changed = false;
+        let previous = cleanups.clone();
+        for class in program.items.iter().filter_map(|item| match item {
+            Item::Class(class) => Some(class),
+            _ => None,
+        }) {
+            let Some(context) = contexts.get(&class.span) else {
+                continue;
+            };
+            let constructor = class.members.iter().find_map(|member| match member {
+                ClassMember::Method(method) if method.name == "__construct" => Some(method.span),
+                _ => None,
+            });
+            for parent in previous.iter().filter(|cleanup| {
+                Some(cleanup.class) == context.parent_class
+                    && cleanup.constructor == context.parent_constructor
+            }) {
+                changed |= insert_partial_cleanup(
+                    cleanups,
+                    ConstructorPartialCleanup {
+                        class: class.span,
+                        constructor,
+                        site: parent.site,
+                        initialized_properties: parent.initialized_properties.clone(),
+                    },
+                );
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    cleanups.sort_by_key(|cleanup| (cleanup.class, cleanup.constructor, cleanup.site));
 }
 
 fn transfer_action(properties: &[Property], action: &NodeAction, state: &mut State) {
@@ -618,43 +898,8 @@ fn inspect_expr(
             inspect_expr(class, properties, state, left, analysis);
             inspect_expr(class, properties, state, right, analysis);
         }
-        Expr::When(when) => {
-            let mut nested = state.clone();
-            if let Some(given) = &when.given {
-                for statement in &given.block.statements {
-                    inspect_statement(class, properties, &mut nested, statement, false, analysis);
-                }
-            }
-            for branch in &when.branches {
-                if let Some(condition) = &branch.condition {
-                    inspect_expr(class, properties, &nested, condition, analysis);
-                }
-                let mut branch_state = nested.clone();
-                for statement in &branch.block.statements {
-                    inspect_statement(
-                        class,
-                        properties,
-                        &mut branch_state,
-                        statement,
-                        false,
-                        analysis,
-                    );
-                }
-            }
-            if let Some(finally) = &when.finally {
-                let mut final_state = nested;
-                for statement in &finally.block.statements {
-                    inspect_statement(
-                        class,
-                        properties,
-                        &mut final_state,
-                        statement,
-                        false,
-                        analysis,
-                    );
-                }
-            }
-        }
+        // Its statements now have their own CFG nodes and incoming states.
+        Expr::When(_) => {}
         Expr::Closure(closure) => {
             if let Some(capture) = closure.captures.as_ref().and_then(|clause| {
                 clause
@@ -836,4 +1081,281 @@ fn constant_bool(expression: &Expr) -> Option<bool> {
 
 fn property_index(properties: &[Property], name: &str) -> Option<usize> {
     properties.iter().position(|property| property.name == name)
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use crate::checked_effects::{CatchCoverage, CatchCoverageMap, CatchTypeMap, EffectSiteMap};
+    use crate::types::ResolvedType;
+
+    fn source_span(source: &str, text: &str) -> Span {
+        let start = source.find(text).expect("fixture text exists");
+        Span::new(start, start + text.len())
+    }
+
+    fn class<'a>(program: &'a Program, name: &str) -> &'a ClassDecl {
+        program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Class(class) if class.name == name => Some(class),
+                _ => None,
+            })
+            .expect("fixture class exists")
+    }
+
+    fn property(class: &ClassDecl, name: &str) -> Span {
+        class
+            .members
+            .iter()
+            .find_map(|member| match member {
+                ClassMember::Property(property) if property.name == name => Some(property.span),
+                _ => None,
+            })
+            .expect("fixture property exists")
+    }
+
+    fn analyze(source: &str, calls: &[&str]) -> (Program, Analysis) {
+        let program = crate::parse_source("constructor-cleanup.doria", source).unwrap();
+        let effects = calls
+            .iter()
+            .map(|call| (source_span(source, call), vec![ResolvedType::Error]))
+            .collect();
+        let analysis = check_program(
+            &program,
+            &HashMap::new(),
+            &GivenSemanticInfoMap::new(),
+            &effects,
+            &CatchTypeMap::new(),
+            &CatchCoverageMap::new(),
+        );
+        (program, analysis)
+    }
+
+    #[test]
+    fn initializer_failure_releases_only_completed_stores_before_promotion() {
+        let source = r#"
+class Example {
+    Token $first = new Token();
+    Token $second = fail();
+    function __construct(Token $promoted) {}
+}
+"#;
+        let (program, analysis) = analyze(source, &["fail()"]);
+        assert_eq!(analysis.partial_cleanups.len(), 1);
+        assert_eq!(
+            analysis.partial_cleanups[0].initialized_properties,
+            vec![property(class(&program, "Example"), "first")]
+        );
+    }
+
+    #[test]
+    fn body_failure_joins_maybe_initialized_fields_without_committing_throwing_store() {
+        let source = r#"
+class Example {
+    Token $first;
+    Token $second;
+    function __construct() {
+        if (choose()) { $this->first = new Token(); }
+        $this->second = fail();
+    }
+}
+"#;
+        let (program, analysis) = analyze(source, &["fail()"]);
+        assert_eq!(analysis.partial_cleanups.len(), 1);
+        assert_eq!(
+            analysis.partial_cleanups[0].initialized_properties,
+            vec![property(class(&program, "Example"), "first")]
+        );
+    }
+
+    #[test]
+    fn when_failure_observes_prior_inner_stores_but_not_the_enclosing_store() {
+        let source = r#"
+class Example {
+    Token $before;
+    Token $result;
+    function __construct() {
+        $this->result = when (true): Token {
+            $this->before = new Token();
+            fail();
+            return new Token();
+        } else { return new Token(); };
+    }
+}
+"#;
+        let (program, analysis) = analyze(source, &["fail()"]);
+        assert_eq!(analysis.partial_cleanups.len(), 1);
+        assert_eq!(
+            analysis.partial_cleanups[0].initialized_properties,
+            vec![property(class(&program, "Example"), "before")]
+        );
+        assert!(!analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0412"));
+    }
+
+    #[test]
+    fn later_argument_failure_observes_completed_when_and_its_finalizer() {
+        let source = r#"
+class Example {
+    Token $before;
+    Token $finalized;
+    Token $result;
+    function __construct() {
+        $this->result = combine(when (true): int {
+            $this->before = new Token();
+            return 1;
+        } else { return 0; } finally {
+            $this->finalized = new Token();
+        }, fail());
+    }
+}
+"#;
+        let (program, analysis) = analyze(source, &["fail()"]);
+        let owner = class(&program, "Example");
+        assert_eq!(analysis.partial_cleanups.len(), 1);
+        assert_eq!(
+            analysis.partial_cleanups[0].initialized_properties,
+            vec![property(owner, "before"), property(owner, "finalized")]
+        );
+    }
+
+    #[test]
+    fn caught_failures_do_not_release_fields_and_escaping_finalizers_are_included() {
+        let source = r#"
+class Example {
+    Token $caught;
+    Token $finalized;
+    function __construct() {
+        try { caughtFailure(); }
+        catch (Error $error) { $this->caught = new Token(); }
+        try { escapingFailure(); }
+        finally { $this->finalized = new Token(); }
+    }
+}
+"#;
+        let program = crate::parse_source("constructor-cleanup.doria", source).unwrap();
+        let owner = class(&program, "Example");
+        let catch = owner
+            .members
+            .iter()
+            .find_map(|member| match member {
+                ClassMember::Method(method) => method.body.as_block().and_then(|body| {
+                    body.statements
+                        .iter()
+                        .find_map(|statement| match statement {
+                            Stmt::Try(statement) => {
+                                statement.catches.first().map(|catch| catch.span)
+                            }
+                            _ => None,
+                        })
+                }),
+                _ => None,
+            })
+            .unwrap();
+        let effects = EffectSiteMap::from([
+            (
+                source_span(source, "caughtFailure()"),
+                vec![ResolvedType::Error],
+            ),
+            (
+                source_span(source, "escapingFailure()"),
+                vec![ResolvedType::Error],
+            ),
+        ]);
+        let analysis = check_program(
+            &program,
+            &HashMap::new(),
+            &GivenSemanticInfoMap::new(),
+            &effects,
+            &CatchTypeMap::from([(catch, ResolvedType::Error)]),
+            &CatchCoverageMap::from([(
+                catch,
+                HashMap::from([(ResolvedType::Error, CatchCoverage::Complete)]),
+            )]),
+        );
+        assert_eq!(analysis.partial_cleanups.len(), 1);
+        assert_eq!(
+            analysis.partial_cleanups[0].site,
+            source_span(source, "escapingFailure()")
+        );
+        assert_eq!(
+            analysis.partial_cleanups[0].initialized_properties,
+            vec![property(owner, "caught"), property(owner, "finalized")]
+        );
+    }
+
+    #[test]
+    fn callback_creation_does_not_execute_its_latent_checked_effects() {
+        let source = r#"
+class Example {
+    Token $first = new Token();
+    function(): int throws Error $callback = function(): int {
+        fail();
+        return 1;
+    };
+}
+"#;
+        let (_, analysis) = analyze(source, &["fail()"]);
+        assert!(analysis.partial_cleanups.is_empty());
+    }
+
+    #[test]
+    fn parent_failure_preserves_parent_partial_state_before_derived_initializers() {
+        let source = r#"
+class Parent {
+    Token $first = new Token();
+    Token $second = failBase();
+}
+class Child extends Parent {
+    Token $third = failChild();
+}
+"#;
+        let program = crate::parse_source("constructor-cleanup.doria", source).unwrap();
+        let parent = class(&program, "Parent");
+        let child = class(&program, "Child");
+        let effects = EffectSiteMap::from([
+            (source_span(source, "failBase()"), vec![ResolvedType::Error]),
+            (
+                source_span(source, "failChild()"),
+                vec![ResolvedType::Error],
+            ),
+        ]);
+        let analysis = check_program_with_cleanup_context(
+            &program,
+            &HashMap::new(),
+            &GivenSemanticInfoMap::new(),
+            &effects,
+            &CatchTypeMap::new(),
+            &CatchCoverageMap::new(),
+            &HashMap::from([(
+                child.span,
+                ConstructorCleanupContext {
+                    parent_class: Some(parent.span),
+                    parent_constructor: None,
+                    inherited_stored_properties: vec![
+                        property(parent, "first"),
+                        property(parent, "second"),
+                    ],
+                },
+            )]),
+        );
+        let child_failures = analysis
+            .partial_cleanups
+            .iter()
+            .filter(|cleanup| cleanup.class == child.span)
+            .collect::<Vec<_>>();
+        assert_eq!(child_failures.len(), 2);
+        assert_eq!(
+            child_failures[0].initialized_properties,
+            vec![property(parent, "first")]
+        );
+        assert_eq!(
+            child_failures[1].initialized_properties,
+            vec![property(parent, "first"), property(parent, "second")]
+        );
+    }
 }

@@ -148,6 +148,44 @@ function main(): void {{
 }
 
 #[test]
+fn writable_method_receivers_conflict_with_retained_iterator_and_closure_loans() {
+    for (acquire, use_result, expected) in [
+        (
+            "$source->getCursor()",
+            "echo $result->getCurrent();",
+            "E0763",
+        ),
+        ("$source->getCallback()", "echo $result();", "E0654"),
+    ] {
+        let source = format!(
+            r#"{BORROWING_CURSOR}
+class Source {{
+    List<int> $items = [1];
+    function getCursor(): Cursor {{ return new Cursor($this->items); }}
+    function getCallback(): function(): int {{ return fn() with ($this) => $this->items->count; }}
+    writable function change(): void {{}}
+}}
+function main(): void {{
+    let writable $source = new Source();
+    let $result = {acquire};
+    $source->change();
+    {use_result}
+}}
+"#
+        );
+        let analysis = analyze(&source);
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == expected),
+            "{acquire}: {:?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
 fn retained_iterator_source_loans_reject_mutation_escape_and_reassignment_leaks() {
     for (body, expected) in [
         ("let writable $source = [1]; let $cursor = new Cursor($source); $source->add(2); echo $cursor->getCurrent();", "E0763"),

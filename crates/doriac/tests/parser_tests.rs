@@ -5,6 +5,412 @@ use doriac::ast::{
 use doriac::types::TypeArgumentRef;
 
 #[test]
+fn parses_stage36_property_hook_bodies_modes_effects_and_spans() {
+    use doriac::ast::{ConstructorParameterRole, FunctionBody, PropertyHookKind};
+
+    let source = r#"
+open class Temperature
+{
+    internal writable float $celsius = 0.0;
+    open writable float $fahrenheit = 32.0 {
+        get throws ReadError => $this->celsius * 9.0 / 5.0 + 32.0;
+        set (float $value) throws WriteError, OtherError => $this->celsius = ($value - 32.0) * 5.0 / 9.0;
+    }
+    override float $cached {
+        writable get { $this->celsius = 1.0; return $this->celsius; }
+    }
+    writable Value $owned {
+        get;
+        set (take Value $value) { $this->owned = $value; }
+    }
+    writable Value $borrowed {
+        set (writable Value $value) => update($value);
+    }
+}
+"#;
+    let program = doriac::parse_source("hooks.doria", source).expect("hooks should parse");
+    let Item::Class(class) = &program.items[0] else {
+        panic!("expected class");
+    };
+    let property = |index| match &class.members[index] {
+        ClassMember::Property(property) => property,
+        _ => panic!("expected property"),
+    };
+    assert!(property(0).hooks.is_empty());
+    let fahrenheit = property(1);
+    let authored = |span: doriac::source::Span| &source[span.start..span.end];
+    assert_eq!(authored(fahrenheit.open_span.unwrap()), "open");
+    assert!(fahrenheit.writable);
+    assert!(fahrenheit.initializer.is_some());
+    assert_eq!(fahrenheit.hooks.len(), 2);
+    let get = &fahrenheit.hooks[0];
+    assert_eq!(get.kind, PropertyHookKind::Get);
+    assert_eq!(authored(get.keyword_span), "get");
+    assert_eq!(authored(get.arrow_span.unwrap()), "=>");
+    assert!(get.parameter.is_none());
+    assert!(get.writable_span.is_none());
+    assert!(get.borrowed_span.is_none());
+    assert!(matches!(get.body.statements(), [Stmt::Return { .. }]));
+    let throws = get.throws.as_ref().unwrap();
+    assert_eq!(authored(throws.keyword_span), "throws");
+    assert_eq!(authored(throws.entries[0].span), "ReadError");
+    assert!(authored(get.body.span()).starts_with("=>"));
+    assert!(authored(get.span).ends_with(';'));
+    let set = &fahrenheit.hooks[1];
+    assert_eq!(set.kind, PropertyHookKind::Set);
+    assert!(set.borrowed_span.is_none());
+    assert!(matches!(set.body.statements(), [Stmt::Assignment(_)]));
+    assert_eq!(set.throws.as_ref().unwrap().entries.len(), 2);
+    let parameter = set.parameter.as_ref().unwrap();
+    assert_eq!(
+        parameter.constructor_role,
+        ConstructorParameterRole::Ordinary
+    );
+    assert_eq!(parameter.ty.name, "float");
+    assert_eq!(authored(parameter.name_span), "$value");
+    assert_eq!(authored(property(2).override_span.unwrap()), "override");
+    let cached = &property(2).hooks[0];
+    assert_eq!(authored(cached.writable_span.unwrap()), "writable");
+    assert!(cached.arrow_span.is_none());
+    assert_eq!(cached.body.statements().len(), 2);
+    assert!(matches!(
+        property(3).hooks[0].body,
+        FunctionBody::Requirement { .. }
+    ));
+    assert!(property(3).hooks[1].parameter.as_ref().unwrap().take);
+    assert!(property(4).hooks[0].parameter.as_ref().unwrap().writable);
+    assert!(matches!(
+        property(4).hooks[0].body.statements(),
+        [Stmt::Expr { .. }]
+    ));
+}
+
+#[test]
+fn parses_stage36_interface_and_trait_hooks_without_reserving_get_or_set() {
+    use doriac::ast::FunctionBody;
+
+    let program = doriac::parse_source(
+        "hooks.doria",
+        r#"
+interface ValueSource<T> {
+    T $value { get throws ReadError; }
+    writable T $editable { writable get; set (take T $value) throws WriteError; }
+    function get(): T;
+    writable function set(take T $value): void;
+}
+trait HasValue<T> {
+    writable T $value { get; set (take T $value); }
+    function get(): T { return $this->value; }
+    writable function set(take T $value): void { $this->value = $value; }
+}
+function main(): void {
+    let $value = $dictionary->get("key");
+    $dictionary->set("key", $value);
+}
+"#,
+    )
+    .expect("hook names should remain contextual");
+    let Item::Interface(interface) = &program.items[0] else {
+        panic!("expected interface");
+    };
+    assert_eq!(interface.properties.len(), 2);
+    assert_eq!(interface.requirements.len(), 2);
+    assert_eq!(interface.requirements[0].name, "get");
+    assert_eq!(interface.requirements[1].name, "set");
+    for property in &interface.properties {
+        for hook in &property.hooks {
+            assert!(matches!(hook.body, FunctionBody::Requirement { .. }));
+            assert!(hook.arrow_span.is_none());
+        }
+    }
+    let Item::Trait(declaration) = &program.items[1] else {
+        panic!("expected trait");
+    };
+    let ClassMember::Property(property) = &declaration.members[0] else {
+        panic!("expected trait property");
+    };
+    assert_eq!(property.hooks.len(), 2);
+}
+
+#[test]
+fn parses_stage36_borrowed_getters_in_all_declaration_and_body_forms() {
+    use doriac::ast::{FunctionBody, PropertyHookKind};
+
+    for owner in ["class", "trait", "interface"] {
+        for head in ["borrowed get", "writable borrowed get"] {
+            for effects in ["", " throws ReadError<T>"] {
+                for body in [";", " => $this->value;", " { return $this->value; }"] {
+                    let accessor = format!("{head}{effects}{body}");
+                    let source = format!("{owner} Source<T> {{ T $value {{ {accessor} }} }}");
+                    let program = doriac::parse_source("borrowed-hooks.doria", &source)
+                        .unwrap_or_else(|errors| panic!("{source}: {errors:?}"));
+                    let property = match &program.items[0] {
+                        Item::Interface(interface) => &interface.properties[0],
+                        Item::Class(class) => match &class.members[0] {
+                            ClassMember::Property(property) => property,
+                            _ => panic!("expected class property"),
+                        },
+                        Item::Trait(declaration) => match &declaration.members[0] {
+                            ClassMember::Property(property) => property,
+                            _ => panic!("expected trait property"),
+                        },
+                        _ => panic!("expected declaration"),
+                    };
+                    assert_eq!(property.hooks.len(), 1);
+                    let hook = &property.hooks[0];
+                    let authored = |span: doriac::source::Span| &source[span.start..span.end];
+                    assert_eq!(hook.kind, PropertyHookKind::Get);
+                    assert_eq!(authored(hook.borrowed_span.unwrap()), "borrowed");
+                    assert_eq!(authored(hook.keyword_span), "get");
+                    assert_eq!(authored(hook.span), accessor);
+                    assert_eq!(hook.writable_span.is_some(), head.starts_with("writable"));
+                    if let Some(span) = hook.writable_span {
+                        assert_eq!(authored(span), "writable");
+                    }
+                    assert!(hook.parameter.is_none());
+                    assert_eq!(hook.throws.is_some(), !effects.is_empty());
+                    if let Some(throws) = &hook.throws {
+                        assert_eq!(authored(throws.keyword_span), "throws");
+                        assert_eq!(authored(throws.entries[0].span), "ReadError<T>");
+                    }
+                    assert_eq!(hook.arrow_span.is_some(), body.starts_with(" =>"));
+                    if body == ";" {
+                        let FunctionBody::Requirement { semicolon_span } = hook.body else {
+                            panic!("expected requirement");
+                        };
+                        assert_eq!(authored(semicolon_span), ";");
+                    } else {
+                        assert!(matches!(hook.body.statements(), [Stmt::Return { .. }]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stage36_borrowed_remains_an_identifier_outside_accessor_heads() {
+    let program = doriac::parse_source(
+        "borrowed-identifiers.doria",
+        r#"
+function borrowed(int $value): int { return $value; }
+class Example {
+    int $borrowed = 1;
+    function borrowed(): int { return borrowed($this->borrowed); }
+}
+function main(): void {
+    let $borrowed = new Example();
+    echo $borrowed->borrowed();
+}
+"#,
+    )
+    .expect("borrowed must remain contextual");
+    let Item::Function(function) = &program.items[0] else {
+        panic!("expected function");
+    };
+    assert_eq!(function.name, "borrowed");
+    let Item::Class(class) = &program.items[1] else {
+        panic!("expected class");
+    };
+    let ClassMember::Method(method) = &class.members[1] else {
+        panic!("expected method");
+    };
+    assert_eq!(method.name, "borrowed");
+}
+
+#[test]
+fn rejects_stage36_malformed_hook_signatures() {
+    for hooks in [
+        "",
+        "get();",
+        "set;",
+        "set ();",
+        "set ($value);",
+        "set (int $first, int $second);",
+        "set (int $value = 1);",
+        "get throws => 1;",
+        "get => ;",
+        "get => 1; get => 2;",
+        "set (int $value); set (int $value);",
+        "set (writable writable int $value);",
+        "borrowed;",
+        "borrowed get();",
+        "borrowed set (int $value);",
+        "writable borrowed set (int $value);",
+        "borrowed borrowed get;",
+        "borrowed writable get;",
+        "get; borrowed get;",
+        "borrowed get; writable get;",
+        "borrow get;",
+        "writable borrow get;",
+        "borrowable get;",
+        "lendable get;",
+    ] {
+        let source = format!("class Value {{ writable int $value {{ {hooks} }} }}");
+        let diagnostics = doriac::parse_source("hooks.doria", &source)
+            .expect_err("malformed hook syntax must be diagnosed");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "P0001"),
+            "missing parser diagnostic for {hooks}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn stage36_hook_recovery_preserves_following_hooks_and_class_members() {
+    let source = r#"
+class Value {
+    writable int $value {
+        set ($value) { if (true) { echo "nested"; } }
+        get => 1;
+        get => 2;
+    }
+    open int $stored;
+}
+"#;
+    let diagnostics = doriac::parse_source("hooks.doria", source)
+        .expect_err("untyped setter, duplicate getter, and open stored field are invalid");
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| { diagnostic.message == "a property cannot repeat the same hook" }));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| { diagnostic.title == "Property Cannot Have A Method Modifier" }));
+}
+
+#[test]
+fn stage36_borrowed_hook_recovery_preserves_modifiers_and_following_members() {
+    let source = r#"
+class Value {
+    writable int $value {
+        get() { if (true) { echo "nested"; } }
+        borrowed set (int $value) { $this->value = $value; }
+        borrowed get => 1;
+        writable borrowed get => 2;
+    }
+    open int $stored;
+}
+"#;
+    let diagnostics = doriac::parse_source("borrowed-recovery.doria", source)
+        .expect_err("malformed getter, borrowed setter, duplicate getter and stored modifier");
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+    for message in [
+        "a getter has no parameter list",
+        "`borrowed` is only allowed on a getter",
+        "a property cannot repeat the same hook",
+        "`open` and `override` require a method or a hooked property",
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == message),
+            "missing {message}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn stage36_hook_transform_preserves_all_types_and_source_locations() {
+    use doriac::ast::transform::{Transform, Transformable};
+    use doriac::source::{SourceId, Span};
+    use doriac::types::TypeRef;
+
+    struct Substitute;
+    impl Transform for Substitute {
+        fn type_ref(&mut self, ty: &mut TypeRef) {
+            ty.walk(self);
+            if ty.name == "T" {
+                ty.name = "Value".into();
+            }
+        }
+        fn span(&mut self, span: &mut Span) {
+            span.source = SourceId(7);
+            span.start += 100;
+            span.end += 100;
+        }
+    }
+    let mut program = doriac::parse_source(
+        "hooks.doria",
+        "interface Source<T> { writable T $value { writable borrowed get throws Failure<T> => new T(); set (take T $value) throws Failure<T>; } }",
+    )
+    .expect("source shapes parse before interface body checking");
+    let Item::Interface(interface) = &mut program.items[0] else {
+        panic!("expected interface");
+    };
+    let old_property = interface.properties[0].clone();
+    interface.transform(&mut Substitute);
+    let property = &interface.properties[0];
+    assert_eq!(property.ty.name, "Value");
+    assert_eq!(property.name_span.source, SourceId(7));
+    assert_eq!(property.name_span.start, old_property.name_span.start + 100);
+    let get = &property.hooks[0];
+    assert_eq!(get.arrow_span.unwrap().source, SourceId(7));
+    assert_eq!(get.borrowed_span.unwrap().source, SourceId(7));
+    assert_eq!(
+        get.borrowed_span.unwrap().start,
+        old_property.hooks[0].borrowed_span.unwrap().start + 100
+    );
+    assert_eq!(
+        get.borrowed_span.unwrap().end,
+        old_property.hooks[0].borrowed_span.unwrap().end + 100
+    );
+    assert_eq!(get.writable_span.unwrap().source, SourceId(7));
+    assert_eq!(
+        get.keyword_span.start,
+        old_property.hooks[0].keyword_span.start + 100
+    );
+    let effect = &get.throws.as_ref().unwrap().entries[0];
+    assert_eq!(effect.span.source, SourceId(7));
+    let TypeArgumentRef::Type(argument) = &effect.ty.arguments[0] else {
+        panic!("expected type argument");
+    };
+    assert_eq!(argument.name, "Value");
+    let Stmt::Return {
+        expr: Some(Expr::New {
+            class_type, span, ..
+        }),
+        ..
+    } = &get.body.statements()[0]
+    else {
+        panic!("expected normalized getter return");
+    };
+    assert_eq!(class_type.name, "Value");
+    assert_eq!(span.source, SourceId(7));
+    let set = &property.hooks[1];
+    assert_eq!(set.parameter.as_ref().unwrap().ty.name, "Value");
+    assert_eq!(
+        set.parameter.as_ref().unwrap().type_span.source,
+        SourceId(7)
+    );
+    assert_eq!(set.body.span().source, SourceId(7));
+}
+
+#[test]
+fn stage36_property_expression_visitor_includes_hook_bodies_in_source_order() {
+    let program = doriac::parse_source(
+        "hooks.doria",
+        "class Value { writable int $value = 1 { get => 2; set (int $value) => $this->value = 3; } }",
+    )
+    .expect("initialized hook property should parse");
+    let Item::Class(class) = &program.items[0] else {
+        panic!("expected class");
+    };
+    let ClassMember::Property(property) = &class.members[0] else {
+        panic!("expected property");
+    };
+    let mut values = Vec::new();
+    doriac::ast::visit::property(property, &mut |expr| {
+        if let Expr::Int { value, .. } = expr {
+            values.push(value.clone());
+        }
+    });
+    assert_eq!(values, ["1", "2", "3"]);
+}
+
+#[test]
 fn parses_stage29_checked_error_declarations_and_control_flow() {
     let program = doriac::parse_source(
         "test.doria",

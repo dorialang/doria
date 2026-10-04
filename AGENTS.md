@@ -299,8 +299,8 @@ These are identity, not scope deferral. They do not become available later, and 
 - Decision 0134 owns interfaces, traits, core value contracts, and public
   iteration. Conformance is nominal and declaration-site only; concrete objects
   remain headerless; erased interface values are two words; generic constraints
-  dispatch statically; traits flatten before MIR. User interfaces are method-only
-  until property hooks are separately accepted. `Error` retains its narrow
+  dispatch statically; traits flatten before MIR. Decision 0135 extends user
+  interfaces with distinct getter and setter contracts. `Error` retains its narrow
   compiler-known readonly stored `string $message` exception. Do not infer
   structural conformance, box primitives, add runtime trait objects, or let a
   backend reconstruct conformance or flattening.
@@ -329,8 +329,10 @@ These are identity, not scope deferral. They do not become available later, and 
   callable return type, concrete catches cover the named class and descendants
   (Decision 0130), `catch (Error)` is the
   catch-all, and callers catch or declare every effect. Catch bindings are
-  optional, checked cleanup does not roll back side effects, and failed
-  construction runs no class destructor. Stage 29 Slice 1 checking and AST/HIR
+  optional, and checked cleanup does not roll back side effects. A failed
+  construction phase runs no destructor for that incomplete class; initialized
+  fields and completed ancestor phases clean in reverse construction order.
+  Stage 29 Slice 1 checking and AST/HIR
   are complete; keep descriptors, carrier/ABI, executable MIR, propagation,
   backend transport, I/O migration, and R1000 in their bound Slices 2 and 3.
   Never use panic, `Result<T, E>`, host exceptions, or a second cleanup model as

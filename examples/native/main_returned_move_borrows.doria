@@ -1,0 +1,72 @@
+class Item
+{
+    function __construct(int $number) {}
+    function __destruct() { try { echo "drop {$this->number}\n"; } catch (Error) {} }
+}
+
+enum Packet
+{
+    case Value(Item $item);
+}
+
+function borrowPacket(Packet $packet): Packet { return $packet; }
+function maybePacket(Packet $packet, bool $present): ?Packet {
+    let $scratch = new Item(5);
+    if ($present) { return $packet; } else { return null; }
+    finally { let $finalizer = new Item(6); }
+}
+function borrowHandle(SharedReference<Item> $handle): SharedReference<Item> { return $handle; }
+function borrowItem(Item $item): Item { return $item; }
+function makeItem(int $number): Item { return new Item($number); }
+function borrowItems(List<Item> $items): List<Item> { return $items; }
+
+function observeItem(Item $item): void { echo "observe {$item->number}\n"; }
+function observePacket(Packet $packet): void {
+    echo match ($packet) { Packet::Value($item) => "observe packet {$item->number}\n" };
+}
+function observeHandle(SharedReference<Item> $handle): void {
+    echo "observe shared {$handle->number}\n";
+}
+function observeItems(List<Item> $items): void {
+    foreach ($items as Item $item) { echo "observe list {$item->number}\n"; }
+}
+
+class PayloadStore
+{
+    mixed $payload = new Item(4);
+    function getPayload(): mixed { return $this->payload; }
+    function __destruct() { try { echo "drop payload store\n"; } catch (Error) {} }
+}
+
+function makeReader(Item $item): function(): int
+{
+    let $read = fn() with ($item) => $item->number;
+    return $read;
+}
+
+function main(): void
+{
+    let $packet = Packet::Value(new Item(1));
+    let $view = borrowPacket($packet);
+    echo match ($view) { Packet::Value($item) => "packet {$item->number}\n" };
+    let $maybe = maybePacket($packet, true);
+    if ($maybe != null) {
+        echo match ($maybe) { Packet::Value($item) => "nullable {$item->number}\n" };
+    }
+    if (maybePacket($packet, false) == null) { echo "no packet\n"; }
+    let $handle = shared new Item(2);
+    let $handleView = borrowHandle($handle);
+    echo "shared {$handleView->number}\n";
+    let $item = new Item(3);
+    let $read = makeReader($item);
+    echo "closure {$read()}\n";
+    let $store = new PayloadStore();
+    let $payload = $store->getPayload();
+    if ($payload is Item) { echo "mixed {$payload->number}\n"; }
+    observeItem(borrowItem(new Item(7)));
+    observeItem(borrowItem(makeItem(8)));
+    observePacket(borrowPacket(Packet::Value(new Item(9))));
+    observeHandle(borrowHandle(shared new Item(10)));
+    observeItems(borrowItems([new Item(11), new Item(12)]));
+    echo "alive\n";
+}

@@ -1156,6 +1156,48 @@ pub unsafe fn aggregate_value_at(
     value_address(collection, index)
 }
 
+/// Resolve an exact read-only element place for either word or aggregate
+/// storage. Missing optional entries have no place; a stored null still owns
+/// its real slot. The caller's checked source loan keeps the backing storage
+/// stable for the lifetime of the returned address.
+pub unsafe fn borrow_slot(
+    frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    access: u8,
+    positional: bool,
+) -> *mut u8 {
+    if collection.is_null() {
+        collection_panic_with_frame(frame, b"P1001");
+    }
+    let length = (*collection).length;
+    let index = match access {
+        0 if (*collection).keyed != 0 && !positional => find(collection, key, key_kind),
+        2 => (length != 0).then_some(0),
+        3 => length.checked_sub(1),
+        7 => usize::try_from(key).ok().filter(|index| *index < length),
+        9 => {
+            if (*collection).keyed != 0 && !positional {
+                Some(
+                    find(collection, key, key_kind)
+                        .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1312")),
+                )
+            } else {
+                let index = usize::try_from(key)
+                    .unwrap_or_else(|_| collection_bounds_panic(frame, key as usize, length));
+                if index >= length {
+                    collection_bounds_panic(frame, index, length);
+                }
+                Some(index)
+            }
+        }
+        // Mutating accesses would invalidate the address being returned.
+        _ => collection_panic_with_frame(frame, b"P1001"),
+    };
+    index.map_or(ptr::null_mut(), |index| value_address(collection, index))
+}
+
 pub unsafe fn aggregate_push_slot(collection: *mut DrCollectionV1) -> *mut u8 {
     require_aggregate(collection);
     if (*collection).length == (*collection).capacity {
@@ -2372,6 +2414,109 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+
+    #[test]
+    fn borrow_slots_preserve_sequence_and_wrapped_deque_storage() {
+        unsafe {
+            let frame = ptr::null();
+            let array = new(2, false, true, 8);
+            write_value(array, 0, 11);
+            write_value(array, 1, 22);
+            assert_eq!(
+                borrow_slot(frame, array, 1, COMPARE_UNSIGNED_64, 9, true),
+                value_address(array, 1)
+            );
+            assert_eq!(
+                borrow_slot(frame, array, 0, COMPARE_UNSIGNED_64, 2, true),
+                value_address(array, 0)
+            );
+            assert_eq!(
+                borrow_slot(frame, array, 0, COMPARE_UNSIGNED_64, 3, true),
+                value_address(array, 1)
+            );
+            assert!(borrow_slot(frame, array, 2, COMPARE_UNSIGNED_64, 7, true).is_null());
+            free(array);
+
+            let deque = new_stage26(0, false, 8, KIND_DEQUE, COMPARE_UNSIGNED_64);
+            for value in [11, 22, 33, 44] {
+                push(deque, value);
+            }
+            let mut found = 0;
+            assert_eq!(pop_front(deque, &mut found), 11);
+            push(deque, 55);
+            assert_eq!((*deque).head, 1);
+            let first = borrow_slot(frame, deque, 0, COMPARE_UNSIGNED_64, 2, true);
+            let last = borrow_slot(frame, deque, 0, COMPARE_UNSIGNED_64, 3, true);
+            assert_eq!(first, value_address(deque, 0));
+            assert_eq!(last, value_address(deque, 3));
+            assert_eq!(*first.cast::<u64>(), 22);
+            assert_eq!(*last.cast::<u64>(), 55);
+            assert_eq!((*deque).length, 4);
+            free(deque);
+        }
+    }
+
+    #[test]
+    fn borrow_slots_distinguish_stored_null_from_missing_key_and_keep_aggregate_identity() {
+        unsafe {
+            let frame = ptr::null();
+            let dictionary = new(0, true, false, 8);
+            let mut replaced = 0;
+            let mut previous_present = 0;
+            keyed_set_nullable(
+                dictionary,
+                10,
+                11,
+                true,
+                COMPARE_UNSIGNED_64,
+                &mut replaced,
+                &mut previous_present,
+            );
+            keyed_set_nullable(
+                dictionary,
+                20,
+                0,
+                false,
+                COMPARE_UNSIGNED_64,
+                &mut replaced,
+                &mut previous_present,
+            );
+            let present = borrow_slot(frame, dictionary, 10, COMPARE_UNSIGNED_64, 0, false);
+            let stored_null = borrow_slot(frame, dictionary, 20, COMPARE_UNSIGNED_64, 0, false);
+            assert_eq!(present, value_address(dictionary, 0));
+            assert_eq!(stored_null, value_address(dictionary, 1));
+            assert_eq!(*present.cast::<u64>(), 11);
+            assert_eq!(*stored_null.cast::<u64>(), 0);
+            assert!(borrow_slot(frame, dictionary, 30, COMPARE_UNSIGNED_64, 0, false).is_null());
+            assert_eq!(
+                borrow_slot(frame, dictionary, 20, COMPARE_UNSIGNED_64, 9, false),
+                stored_null
+            );
+            assert_eq!((*dictionary).length, 2);
+            free(dictionary);
+
+            let aggregate = new_aggregate(
+                frame,
+                0,
+                false,
+                false,
+                16,
+                8,
+                KIND_LEGACY,
+                COMPARE_UNSIGNED_64,
+            );
+            let slot = aggregate_push_slot(aggregate);
+            *slot.cast::<u64>() = 33;
+            *slot.add(8).cast::<u64>() = 44;
+            assert_eq!(
+                borrow_slot(frame, aggregate, 0, COMPARE_UNSIGNED_64, 9, true),
+                slot
+            );
+            assert_eq!(*slot.cast::<u64>(), 33);
+            assert_eq!(*slot.add(8).cast::<u64>(), 44);
+            free(aggregate);
+        }
+    }
 
     #[test]
     fn detached_cleanup_isolates_destructor_refills() {

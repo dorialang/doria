@@ -1,0 +1,5 @@
+drop 1
+2 hello true
+empty
+drop store
+drop 2

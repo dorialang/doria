@@ -143,7 +143,8 @@ fn invoke(
                         signature.return_borrow,
                     );
                     let owned = user_local_type_owns_value(ty) && !value.borrows_move_value();
-                    let local = context.declare_checked_call_slot(ty, owned);
+                    let local =
+                        context.declare_call_result_slot(ty, owned, signature.return_borrow);
                     context.push_statement(mir::Statement::AssignLocal {
                         target: local,
                         value,

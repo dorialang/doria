@@ -21,7 +21,7 @@ its compiler implementation is complete and coordinated tooling is pending.
 - **F3 — named arguments:** RESOLVED → scheduled **Stage 23a** (after collections, before generic functions); **decision 0098** authored with the full binding/ordering/evaluation ruleset; variadics stay deferred.
 - **F4 — integer literals:** RESOLVED direction → add `0x`/`0o`/`0b` literals and `_` digit separators (`1_000_000`); **no** typed suffixes. SPEC records this as future direction, not current syntax. A dedicated numeric-literals slice must settle separator placement and malformed-form diagnostics before promoting the forms into the accepted grammar.
 - **F5 — `uint8[]`↔`Bytes`:** RESOLVED → **explicit, non-implicit** conversion, copy in v1.0; method surface finalized with the collections decision (Stage 23).
-- **F6 — property-hook I/O policy:** RESOLVED → a hook **may `throws`**, **may not block/async** in v1.0, and is **not guaranteed side-effect-free** ("looks like data" is a readability convention, not a purity guarantee). Recorded on the §12 property-hooks subject for the future record.
+- **F6 — property-hook I/O policy:** RESOLVED → a hook **may `throws`**, **may not block/async** in v1.0, and is **not guaranteed side-effect-free** ("looks like data" is a readability convention, not a purity guarantee). Decision 0135 formalizes the contract; Andrew's 2026-10-03 ruling includes output and transitive calls even when their checked errors are caught.
 - **F7 — `Baton.lock` encoding:** RESOLVED → **deterministic JSON**, now
   formalized by Decision 0118 together with the complete source-neutral lock,
   resolver, workspace, cache, and offline contract.
@@ -77,7 +77,7 @@ above; their accepted decisions and scheduled work are the authority.
 
 ## Recommended deferrals (reason · reopen trigger)
 - **F5** (`uint8[]`↔`Bytes`) → decide with the **collections decision (Stage 23)**; the recommendation above is the direction.
-- **F6** (hook I/O policy) → decide with the **property-hooks decision (Stage 36)**; needs a real ruling, not a default.
+- **F6** (hook I/O policy) → resolved by **Decision 0135**; no longer deferred.
 - **F7** (lock encoding) → resolved by **Decision 0118**; no longer deferred.
 - **F8** (ScreenBuffer) → decide with the **terminal decision (Stage 46)**.
 - Genuinely blocked / correctly parked (not audited): async/concurrency (Phase H), FFI zero-copy (Stage 40), generics value-parameters (kept-room extension point), `sscanf` (post-1.0), registry server (post-1.0), labeled break/continue, `goto`, `declare` keys.

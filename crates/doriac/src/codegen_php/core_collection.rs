@@ -78,9 +78,10 @@ fn create(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
         "null"
     };
     let compare = if mode >= 2 {
-        "static function ($left, $right): int { $order = $left->compare($right); return $order === Ordering::Less ? -1 : ($order === Ordering::Greater ? 1 : 0); }"
+        let ordering = php_type_symbol("Ordering");
+        format!("static function ($left, $right): int {{ $order = $left->compare($right); return $order === {ordering}::Less ? -1 : ($order === {ordering}::Greater ? 1 : 0); }}")
     } else {
-        "null"
+        "null".to_string()
     };
     format!(
         "new __DoriaCoreCollection({mode}, {hash}, {equals}, {compare}, {}, {})",

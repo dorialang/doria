@@ -538,8 +538,13 @@ function main(): void
         .expect("map should be explicit in HIR");
     assert_eq!(map.kind, hir::ListAlgorithmKind::Map);
     assert_eq!(map.callback_access, hir::ListCallbackAccess::Readonly);
-    assert_eq!(map.required_checked_effects.len(), 1);
-    assert_eq!(map.ambient_checked_effects.len(), 2);
+    assert_eq!(
+        map.required_checked_effects,
+        vec![doriac::types::ResolvedType::Class(
+            doriac::types::ClassType::new("Failure", Vec::new())
+        )]
+    );
+    assert!(map.ambient_checked_effects.is_empty());
     let mut complete_effects = map.required_checked_effects.clone();
     complete_effects.extend(map.ambient_checked_effects.iter().cloned());
     assert_eq!(map.checked_effects, complete_effects);

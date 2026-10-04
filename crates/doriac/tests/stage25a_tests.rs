@@ -1,6 +1,9 @@
 //! Stage 25a — shared-ownership grammar, type model, and readonly runtime family
 //! (record 0106).
 
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 use doriac::diagnostics::{
     ColorChoice, Diagnostic, DiagnosticFormat, RenderOptions, RuntimeFactValue,
 };
@@ -558,26 +561,141 @@ fn writes_through_a_shared_reference_are_rejected() {
 }
 
 #[test]
+fn shared_construction_flow_facts_do_not_use_payload_method_declarations() {
+    for payload_method in [
+        "",
+        "function share(): string { return \"payload\"; }",
+        "function share(): ?string { return null; }",
+    ] {
+        let source = format!(
+            r#"
+class Node
+{{
+    string $referencedValue = "payload property";
+    {payload_method}
+    function label(): string {{ return "node"; }}
+    function createWeakReference(): string {{ return "payload weak"; }}
+    function acquire(): string {{ return "payload acquire"; }}
+    function acquireReadonlyAccess(): string {{ return "payload read"; }}
+    function acquireWritableAccess(): string {{ return "payload write"; }}
+}}
+
+class Holder
+{{
+    function __construct(take SharedReference<Node> $value) {{}}
+    function owner(): SharedReference<Node> {{ return $this->value->share(); }}
+}}
+
+function owner(): SharedReference<Node> {{ return shared new Node(); }}
+function inspect(Node $value): void {{}}
+
+function main(): void throws Doria\Std\Io\IoError
+{{
+    let $root = shared new Node();
+    ?string $payloadLabel = $root->label();
+    string $knownPayloadLabel = $payloadLabel;
+    ?SharedReference<Node> $present = $root->share();
+    ?SharedReference<Node> $temporary = (shared new Node())->share();
+    SharedReference<Node> $typed = shared new Node();
+    ?SharedReference<Node> $typedPresent = $typed->share();
+    ?SharedReference<Node> $coalesced = ($present ?? $root)->share();
+    inspect(($present ?? $root)->referencedValue);
+    ?SharedReference<Node> $chained = $root->share()->share();
+    let $weak = $root->share()->createWeakReference();
+    ?SharedReference<Node> $acquired = $weak->acquire();
+    ?SharedReference<Node> $fromFactory = owner()->share();
+    let $holder = new Holder($root->share());
+    ?SharedReference<Node> $fromProperty = $holder->value->share();
+    ?SharedReference<Node> $fromMethod = $holder->owner()->share();
+    ?string $projectedLabel = $root->referencedValue->label();
+    string $knownProjectedLabel = $projectedLabel;
+    let $writable = new WritableSharedReference(new Node());
+    ?WritableSharedReference<Node> $writablePresent = $writable->share()->share();
+    let $writableWeak = $writable->share()->createWeakReference();
+    ?WritableSharedReference<Node> $writableAcquired = $writableWeak->acquire();
+    {{
+        let $read = $writable->acquireReadonlyAccess();
+        ?string $label = $read->label();
+        string $known = $label;
+        ?string $payloadAcquire = $read->acquire();
+        string $knownPayloadAcquire = $payloadAcquire;
+    }}
+    {{
+        let $write = $writable->acquireWritableAccess();
+        ?string $label = $write->label();
+        string $known = $label;
+        ?string $payloadAcquire = $write->acquire();
+        string $knownPayloadAcquire = $payloadAcquire;
+    }}
+    echo $present?->label() ?? "absent";
+    echo $temporary?->label() ?? "absent";
+    echo $typedPresent?->label() ?? "absent";
+    echo $coalesced?->label() ?? "absent";
+    echo $chained?->label() ?? "absent";
+    echo $acquired?->label() ?? "absent";
+    echo $fromFactory?->label() ?? "absent";
+    echo $fromProperty?->label() ?? "absent";
+    echo $fromMethod?->label() ?? "absent";
+    $writablePresent?->share();
+    $writableAcquired?->share();
+}}
+"#
+        );
+        doriac::check_source("stage25a-shared-construction-flow-owner.doria", &source)
+            .expect("payload declarations must not establish facts for shared-handle methods");
+    }
+}
+
+#[test]
 fn nullable_shared_members_are_lazy_and_preserve_handle_families() {
     let source = r#"
 class Node
 {
+    writable int $count = 0;
     function __construct(string $name) {}
     function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
     function label(): string { return $this->name; }
+    function tagged(int $tag): string { return $this->name . " " . $tag; }
+    function share(): string { return "payload share " . $this->name; }
+    function acquire(): string { return "payload acquire " . $this->name; }
+    writable function increment(int $amount): void { $this->count += $amount; }
+}
+
+function marker(string $label): int throws Doria\Std\Io\IoError
+{
+    echo $label . "\n";
+    return 7;
+}
+
+function maybeReadonly(bool $present, SharedReference<Node> $value): ?SharedReference<Node>
+{
+    if ($present) { return $value->share(); }
+    return null;
+}
+
+function maybeWritable(bool $present, WritableSharedReference<Node> $value): ?WritableSharedReference<Node>
+{
+    if ($present) { return $value->share(); }
+    return null;
 }
 
 function main(): void throws Doria\Std\Io\IoError
 {
     let $root = shared new Node("root");
-    ?SharedReference<Node> $present = $root->share();
-    ?SharedReference<Node> $missing = null;
+    ?SharedReference<Node> $present = maybeReadonly(true, $root);
+    ?SharedReference<Node> $missing = maybeReadonly(false, $root);
     ?WeakReference<Node> $presentWeak = $present?->createWeakReference();
     ?WeakReference<Node> $missingWeak = $missing?->createWeakReference();
     ?SharedReference<Node> $sharedAgain = $present?->share();
     ?SharedReference<Node> $absentShare = $missing?->share();
     ?SharedReference<Node> $acquired = $presentWeak?->acquire();
     ?SharedReference<Node> $absentAcquire = $missingWeak?->acquire();
+    $present?->share();
+    $missing?->share();
+    $present?->createWeakReference();
+    $missing?->createWeakReference();
+    $presentWeak?->acquire();
+    $missingWeak?->acquire();
     echo ($present?->name ?? "missing") . "\n";
     echo ($missing?->name ?? "missing") . "\n";
     echo ($present?->label() ?? "missing") . "\n";
@@ -588,21 +706,92 @@ function main(): void throws Doria\Std\Io\IoError
     if ($absentShare == null) { echo "no share\n"; }
     if ($acquired != null) { echo $acquired->name . "\n"; }
     if ($absentAcquire == null) { echo "no acquire\n"; }
+    echo ($present?->tagged(marker("strong argument")) ?? "missing") . "\n";
+    echo ($missing?->tagged(marker("unexpected strong argument")) ?? "missing") . "\n";
+    echo ($present?->referencedValue?->share() ?? "missing") . "\n";
+    echo ($missing?->referencedValue?->share() ?? "missing") . "\n";
+
+    let $writableRoot = new WritableSharedReference(new Node("writable"));
+    ?WritableSharedReference<Node> $writablePresent = maybeWritable(true, $writableRoot);
+    ?WritableSharedReference<Node> $writableMissing = maybeWritable(false, $writableRoot);
+    ?WritableWeakReference<Node> $writableWeak = $writablePresent?->createWeakReference();
+    ?WritableWeakReference<Node> $missingWritableWeak = $writableMissing?->createWeakReference();
+    ?WritableSharedReference<Node> $writableAgain = $writablePresent?->share();
+    ?WritableSharedReference<Node> $absentWritableShare = $writableMissing?->share();
+    ?WritableSharedReference<Node> $writableAcquired = $writableWeak?->acquire();
+    ?WritableSharedReference<Node> $absentWritableAcquire = $missingWritableWeak?->acquire();
+    if ($writableAgain != null) { echo "writable share\n"; }
+    if ($absentWritableShare == null) { echo "no writable share\n"; }
+    if ($writableAcquired != null) { echo "writable acquire\n"; }
+    if ($absentWritableAcquire == null) { echo "no writable acquire\n"; }
+    $writablePresent?->share();
+    $writableMissing?->share();
+    $writablePresent?->createWeakReference();
+    $writableMissing?->createWeakReference();
+    $writableWeak?->acquire();
+    $missingWritableWeak?->acquire();
+    {
+        ?ReadonlySharedReferenceAccess<Node> $read = $writablePresent?->acquireReadonlyAccess();
+        ?ReadonlySharedReferenceAccess<Node> $absentRead = $writableMissing?->acquireReadonlyAccess();
+        echo ($read?->share() ?? "missing") . "\n";
+        echo ($absentRead?->share() ?? "missing") . "\n";
+        echo ($read?->tagged(marker("readonly argument")) ?? "missing") . "\n";
+        echo ($absentRead?->tagged(marker("unexpected readonly argument")) ?? "missing") . "\n";
+        $writableMissing?->acquireWritableAccess();
+    }
+    {
+        writable ?WritableSharedReferenceAccess<Node> $write = $writablePresent?->acquireWritableAccess();
+        writable ?WritableSharedReferenceAccess<Node> $absentWrite = $writableMissing?->acquireWritableAccess();
+        $write?->increment(marker("writable argument"));
+        $absentWrite?->increment(marker("unexpected writable argument"));
+        echo ($write?->acquire() ?? "missing") . "\n";
+        echo ($absentWrite?->acquire() ?? "missing") . "\n";
+        $writableMissing?->acquireReadonlyAccess();
+    }
+    $writablePresent?->acquireReadonlyAccess();
+    $writablePresent?->acquireWritableAccess();
+    echo ($writablePresent?->acquireReadonlyAccess()?->tagged(marker("temporary access argument")) ?? "missing") . "\n";
+    echo ($writableMissing?->acquireReadonlyAccess()?->tagged(marker("unexpected temporary access argument")) ?? "missing") . "\n";
+    $writablePresent?->acquireWritableAccess();
+    {
+        ?ReadonlySharedReferenceAccess<Node> $read = $writableAcquired?->acquireReadonlyAccess();
+        echo ($read?->count ?? -1) . "\n";
+    }
 }
 "#;
     let program = doriac::lower_source_to_mir("stage25a-null-safe-shared.doria", source)
         .expect("nullable shared members should lower lazily");
     let output = doriac::mir_interpreter::interpret(&program)
         .expect("nullable shared members should interpret");
-    assert_eq!(
-        output.stdout,
-        b"root\nmissing\nroot\nmissing\nroot\nmissing\nroot\nno share\nroot\nno acquire\ndrop root\n"
+    let expected = concat!(
+        "root\nmissing\nroot\nmissing\nroot\nmissing\nroot\nno share\nroot\nno acquire\n",
+        "strong argument\nroot 7\nmissing\npayload share root\nmissing\n",
+        "writable share\nno writable share\nwritable acquire\nno writable acquire\n",
+        "payload share writable\nmissing\nreadonly argument\nwritable 7\nmissing\n",
+        "writable argument\npayload acquire writable\nmissing\n",
+        "temporary access argument\nwritable 7\nmissing\n7\ndrop writable\ndrop root\n",
     );
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    assert!(output.runtime_diagnostic.is_none());
     doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("nullable shared members should lower through Cranelift");
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Fast,
+        expected,
+    );
     #[cfg(feature = "llvm-backend")]
-    doriac::codegen_llvm::lower_mir_to_object(&program)
-        .expect("nullable shared members should lower through LLVM");
+    {
+        doriac::codegen_llvm::lower_mir_to_object(&program)
+            .expect("nullable shared members should lower through LLVM");
+        native_execution::assert_native_execution(
+            &program,
+            doriac::backend::NativeProfile::Release,
+            expected,
+        );
+    }
 }
 
 // --- Family disjointness -------------------------------------------------
@@ -686,23 +875,58 @@ fn sharing_is_explicit_rather_than_implicit_retention() {
 }
 
 #[test]
-fn shared_handle_returns_transfer_instead_of_extending_a_borrow() {
+fn shared_handle_returns_preserve_borrow_or_transfer_contracts() {
     let source = r#"
 class Node {}
 
-function invalid(SharedReference<Node> $value): SharedReference<Node>
+function borrowed(SharedReference<Node> $value): SharedReference<Node>
 {
     return $value;
 }
+
+function transferred(take SharedReference<Node> $value): SharedReference<Node>
+{
+    return $value;
+}
+
+function consume(take SharedReference<Node> $value): void {}
+function main(): void {}
 "#;
-    let diagnostics = doriac::check_source("stage25a-return.doria", source)
-        .expect_err("a borrowed handle cannot become an owning return");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0474"),
-        "expected an ownership-return diagnostic, got {diagnostics:?}"
+    let program = doriac::lower_source_to_mir("stage25a-return.doria", source)
+        .expect("handle returns must distinguish elided borrows from ownership transfers");
+    let borrowed = program
+        .functions
+        .iter()
+        .find(|function| function.name == "borrowed")
+        .unwrap();
+    assert_eq!(
+        borrowed.return_borrow,
+        Some(doriac::mir::ReturnBorrow {
+            source: doriac::mir::BorrowSource::Parameter(0),
+            writable: false,
+            kind: doriac::types::ReturnBorrowKind::Value,
+        })
     );
+    let transferred = program
+        .functions
+        .iter()
+        .find(|function| function.name == "transferred")
+        .unwrap();
+    assert_eq!(transferred.return_borrow, None);
+
+    for expression in ["$value", "borrowed($value)"] {
+        let invalid = format!(
+            "{source}\nfunction invalid(SharedReference<Node> $value): void {{ consume({expression}); }}"
+        );
+        let diagnostics = doriac::check_source("stage25a-return-owner.doria", &invalid)
+            .expect_err("neither a direct nor returned borrow may become an owning argument");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0474"),
+            "expected an ownership diagnostic, got {diagnostics:?}"
+        );
+    }
 }
 
 // --- Readonly runtime family ---------------------------------------------

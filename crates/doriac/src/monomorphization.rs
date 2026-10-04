@@ -131,7 +131,7 @@ pub(crate) fn callable_declarations<'a>(
                     .filter(|info| info.declaration_name == class_decl.name)
                 {
                     for member in &class_decl.members {
-                        if let hir::ClassMember::Method(method) = member {
+                        for method in member.callables() {
                             declarations.push(CallableDecl {
                                 function: method,
                                 class: Some(class_info.id),

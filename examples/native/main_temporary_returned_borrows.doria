@@ -1,0 +1,209 @@
+class Guard
+{
+    function __construct(int $value) { echo "new{$value};"; }
+
+    function __destruct()
+    {
+        try { echo "drop{$this->value};"; } catch (Error) {}
+    }
+
+    function inspect(): self { return $this; }
+
+    function direct(): self
+    {
+        return $this;
+        return new Guard(90);
+    }
+
+    function conditional(): self
+    {
+        if (false) { return new Guard(91); }
+        return $this;
+    }
+
+    function looping(): self
+    {
+        while (true) { return $this; }
+        return new Guard(92);
+    }
+}
+
+function make(int $value): Guard { return new Guard($value); }
+function maybe(bool $present, int $value): ?Guard
+{
+    if ($present) { return new Guard($value); }
+    return null;
+}
+function identity(Guard $guard): Guard { return $guard; }
+function forward(Guard $guard): Guard { return identity($guard); }
+function observe(Guard $guard): void { echo "see{$guard->value};"; }
+function observeNullable(?Guard $guard): void
+{
+    if ($guard == null) { echo "absent;"; }
+    else { echo "see{$guard->value};"; }
+}
+
+class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+function checkedObserve(Guard $guard, bool $fail): void throws Failure
+{
+    echo "checked{$guard->value};";
+    if ($fail) { throw new Failure("observe"); }
+}
+
+function checkedIdentity(Guard $guard, bool $fail): Guard throws Failure
+{
+    echo "checkedId{$guard->value};";
+    if ($fail) { throw new Failure("identity"); }
+    return $guard;
+}
+
+function makeCallback(int $value): function(): int
+{
+    let $guard = new Guard($value);
+    return fn() with (take $guard) => $guard->value;
+}
+
+function relayCallback(function(): int $callback): (function(): int) throws Failure
+{
+    return fn() with ($callback) => $callback();
+}
+
+function invoke(function(): int $callback): void { echo "callback{$callback()};"; }
+function mark(int $value): int { echo "mark{$value};"; return $value; }
+function ordered(int $marker, mixed $first, Guard $second): void
+{
+    if ($first is Guard) { echo "order{$marker}:{$first->value}:{$second->value};"; }
+}
+
+function observeSnapshot(int $before, Guard $item): void
+{
+    echo "snapshot{$before}:{$item->value};";
+}
+
+function observeNamedSnapshot(Guard $item, int $before): void
+{
+    echo "namedSnapshot{$before}:{$item->value};";
+}
+
+function makeIncrementedCopy(writable int $number): Guard
+{
+    $number += 1;
+    return new Guard($number);
+}
+
+class Probe
+{
+    int $value;
+
+    function __construct(parameter Guard $guard, parameter bool $fail) throws Failure
+    {
+        $this->value = $guard->value;
+        echo "construct{$guard->value};";
+        if ($fail) { throw new Failure("construct"); }
+    }
+}
+
+function main(): void
+{
+    for (let writable $round = 0; $round < 3; $round++) {
+        echo "round{$round}\n";
+        observe(forward(new Guard(1)));
+        echo "after1\n";
+        observe(forward(make(2)));
+        echo "after2\n";
+        observe(make(3)->inspect());
+        echo "after3\n";
+        observeNullable(maybe(true, 4)?->inspect());
+        echo "after4\n";
+        observeNullable(maybe(false, 5)?->inspect());
+        echo "after5\n";
+        observe(make(6)->direct()->conditional()->looping());
+        echo "after6\n";
+    }
+
+    try { checkedObserve(forward(new Guard(7)), false); }
+    catch (Failure) { echo "unexpected;"; }
+    echo "after7\n";
+    try { checkedObserve(forward(new Guard(8)), true); }
+    catch (Failure) { echo "caught8;"; }
+    echo "after8\n";
+
+    try {
+        let $probe = new Probe(forward(new Guard(9)), false);
+        echo "probe{$probe->value};";
+    } catch (Failure) { echo "unexpected;"; }
+    echo "after9\n";
+    try { let $probe = new Probe(forward(new Guard(10)), true); }
+    catch (Failure) { echo "caught10;"; }
+    echo "after10\n";
+
+    let $read = fn(Guard $guard) => $guard->value;
+    let $number = $read(forward(new Guard(11)));
+    echo "read{$number};after11\n";
+
+    let $checkedRead = function (Guard $guard, bool $fail): int {
+        echo "indirect{$guard->value};";
+        if ($fail) { throw new Failure("indirect"); }
+        return $guard->value;
+    };
+    try {
+        let $number = $checkedRead(forward(new Guard(12)), false);
+        echo "read{$number};";
+    } catch (Failure) { echo "unexpected;"; }
+    echo "after12\n";
+    try { $checkedRead(forward(new Guard(13)), true); }
+    catch (Failure) { echo "caught13;"; }
+    echo "after13\n";
+
+    try { observe(checkedIdentity(new Guard(14), false)); }
+    catch (Failure) { echo "unexpected;"; }
+    echo "after14\n";
+    try { observe(checkedIdentity(new Guard(15), true)); }
+    catch (Failure) { echo "caught15;"; }
+    echo "after15\n";
+
+    let $indirectIdentity = function (Guard $guard): Guard { return $guard; };
+    observe($indirectIdentity(new Guard(16)));
+    echo "after16\n";
+    let $checkedIdentity = function (Guard $guard, bool $fail): Guard {
+        echo "indirectId{$guard->value};";
+        if ($fail) { throw new Failure("indirect identity"); }
+        return $guard;
+    };
+    try { observe($checkedIdentity(new Guard(17), false)); }
+    catch (Failure) { echo "unexpected;"; }
+    echo "after17\n";
+    try { observe($checkedIdentity(new Guard(18), true)); }
+    catch (Failure) { echo "caught18;"; }
+    echo "after18\n";
+
+    try { invoke(relayCallback(makeCallback(19))); }
+    catch (Failure) { echo "unexpected;"; }
+    echo "after19\n";
+    let $callbackGuard = new Guard(20);
+    try { invoke(relayCallback(fn() with (take $callbackGuard) => $callbackGuard->value)); }
+    catch (Failure) { echo "unexpected;"; }
+    echo "after20\n";
+
+    ordered(mark(21), new Guard(22), new Guard(23));
+    echo "afterOrder\n";
+
+    writable int $snapshot = 30;
+    observeSnapshot($snapshot, makeIncrementedCopy($snapshot));
+    echo "afterSnapshot{$snapshot}\n";
+
+    $snapshot = 40;
+    observeNamedSnapshot(before: $snapshot, item: makeIncrementedCopy($snapshot));
+    echo "afterNamedSnapshot{$snapshot}\n";
+
+    let $observeSnapshot = function (int $before, Guard $item): void {
+        echo "indirectSnapshot{$before}:{$item->value};";
+    };
+    $snapshot = 50;
+    $observeSnapshot($snapshot, makeIncrementedCopy($snapshot));
+    echo "afterIndirectSnapshot{$snapshot}\n";
+}

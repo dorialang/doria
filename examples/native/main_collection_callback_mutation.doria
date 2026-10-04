@@ -1,0 +1,55 @@
+function fail(): void
+{
+    read_file("missing-stage36-callback-input.txt");
+}
+
+function appendCallback(writable List<function(): void> $callbacks): void
+{
+    $callbacks->add(fn() => fail());
+}
+
+function main(): void
+{
+    writable string $caught = "";
+    writable List<function(): void> $direct = [function(): void {}];
+    $direct->add(fn() => fail());
+    foreach ($direct as function(): void $callback) {
+        try { $callback(); } catch (Error) { $caught = $caught . "direct;"; }
+    }
+
+    writable List<function(): void> $indirect = [function(): void {}];
+    appendCallback($indirect);
+    foreach ($indirect as function(): void $callback) {
+        try { $callback(); } catch (Error) { $caught = $caught . "helper;"; }
+    }
+
+    writable List<function(): void> $captured = [function(): void {}];
+    {
+        let writable $update = function(): void with (writable $captured) {
+            $captured->insertAt(0, fn() => fail());
+        };
+        $update();
+    }
+    foreach ($captured as function(): void $callback) {
+        try { $callback(); } catch (Error) { $caught = $caught . "capture;"; }
+    }
+
+    writable (function(): void)[] $array = [function(): void {}];
+    $array[0] = fn() => fail();
+    foreach ($array as function(): void $callback) {
+        try { $callback(); } catch (Error) { $caught = $caught . "array;"; }
+    }
+
+    writable Dictionary<string, function(): void> $dictionary = ["pure" => function(): void {}];
+    $dictionary->set("failure", fn() => fail());
+    foreach ($dictionary->values as function(): void $callback) {
+        try { $callback(); } catch (Error) { $caught = $caught . "dictionary;"; }
+    }
+
+    writable Deque<function(): void> $queue = Deque::from([]);
+    $queue->pushBack(fn() => fail());
+    foreach ($queue as function(): void $callback) {
+        try { $callback(); } catch (Error) { $caught = $caught . "deque;"; }
+    }
+    echo "caught: {$caught}\n";
+}

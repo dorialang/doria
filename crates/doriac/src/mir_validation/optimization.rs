@@ -407,16 +407,24 @@ fn root_effects(
     let mut result = Effects::default();
     for block in &function.blocks {
         for statement in &block.statements {
-            if let mir::Statement::DropClass { local, class } = statement {
-                if roots.contains(local) {
+            let destruction = match statement {
+                mir::Statement::DropClass { local, class } => Some((*local, *class, true)),
+                mir::Statement::CleanupConstructorPhase { object, class } => {
+                    Some((*object, *class, false))
+                }
+                _ => None,
+            };
+            if let Some((local, class, mut run_destructor)) = destruction {
+                if roots.contains(&local) {
                     result.writes = true;
-                    let mut phase = Some(*class);
+                    let mut phase = Some(class);
                     while let Some(class) = phase {
                         let definition = &program.classes[class.0];
-                        if let Some(destructor) = definition.destructor {
+                        if let Some(destructor) = definition.destructor.filter(|_| run_destructor) {
                             result.include(summaries[destructor.0][0]);
                         }
                         phase = definition.parent;
+                        run_destructor = true;
                     }
                 }
                 continue;

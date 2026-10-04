@@ -186,6 +186,22 @@ pub struct PropertyInfo {
     pub ty: TypeId,
     pub init_state: PropertyInitState,
     pub declaration_span: Span,
+    pub hooks: Option<PropertyHooksInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertyHooksInfo {
+    pub storage: Option<crate::property_hooks::PropertyHookStorage>,
+    pub is_open: bool,
+    pub is_override: bool,
+    pub getter: Option<PropertyAccessorInfo>,
+    pub setter: Option<PropertyAccessorInfo>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyAccessorInfo {
+    pub declaration: Span,
+    pub receiver_mode: ReceiverMode,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +264,7 @@ pub struct MethodInfo {
 pub struct ReturnBorrow {
     pub source: BorrowSource,
     pub writable: bool,
+    pub kind: crate::types::ReturnBorrowKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
