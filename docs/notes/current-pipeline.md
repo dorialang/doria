@@ -30,7 +30,8 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   ownership and receiver-bound lifetimes, and transitive blocking-I/O rejection.
   These rules have regression coverage. Backed override initializers run parent
   then child, replacing the inherited value after successful evaluation.
-  Durable linked-backend parity and coordinated closure validation are in progress.
+  Stage 36 is complete: durable native parity, PHP coverage, ownership leak
+  checks, tooling, website acceptance, and installed-tool verification pass.
   Controlled timing
   remains **Measurement Status: Pending Available Runner**, never a pass.
 - Stage 35 Slice 3 implements canonical value equality/hash/order/clone,
@@ -287,15 +288,19 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   - Stage 35 Slice 5 Cross-Repository Closure — Complete.
   - Stage 35 — Complete.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Complete.
-- Stage 36 Property Hooks — In Progress. Grammar, concrete/interface/constrained
+- Stage 36 Property Hooks — Complete. Grammar, concrete/interface/constrained
   call analysis, and override contract checks under Decision 0135, including
   `borrowed get`. Accessor execution components have interpreter, linked-native,
   and PHP tests, including transitive blocking/async checks. The blanket E0764
   rejection is removed, and tests exercise the public compiler pipeline.
   Backed override initializers run parent then child, replacing the inherited
   value. Initializer regressions cover replacement ownership and failed
-  construction phases; durable parity and coordinated validation are in progress.
-  This is not Stage 36 completion.
+  construction phases. The 389-example native parity manifest, PHP coverage,
+  Linux/macOS/Windows CI, and native ownership leak checks pass. Compiler-owned
+  accessor facts drive coordinated editor support; all eleven website hook
+  examples pass Check and Run using the managed installed compiler. The compiler
+  and language server are refreshed together and verified after installation-cache
+  reclamation. Stage 36a is next; its public spellings remain deferred.
 - Pre-Stage-45 Doria-Native Baton Transition — Scheduled, Mandatory Before Unsuffixed `2026.03.1`.
 - Stage 36a — Scheduled, Not Implemented.
 

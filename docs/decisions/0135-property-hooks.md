@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-10-02
-- **Implementation Status:** Compiler Implemented; Stage 36 Closure Validation In Progress
+- **Implementation Status:** Stage 36 Complete
 - **Extends:** Decisions 0089, 0119, 0122, 0130, 0131, and 0134
 
 ## Context
@@ -186,9 +186,12 @@ blocking/async checks have regression coverage. The blanket E0764 execution
 rejection is removed; hook execution tests use the public checked compiler
 pipeline. Parent-then-child initializer regressions cover independent instances,
 generic and multilevel overrides, replacement ownership, and failed construction
-phases. Durable linked-backend parity and coordinated closure validation remain
-part of the in-progress delivery.
-Public activation alone is not Stage 36 completion.
+phases. Canonical workspace and LLVM validation, the 389-example durable native
+parity matrix, and Linux/macOS/Windows CI pass. Native ownership leak checks pass.
+Coordinated tooling preserves accessor contracts, source navigation, and receiver
+facts; the website's eleven hook examples pass Check and Run through its managed
+installed compiler. Both installed tools report the same compiler revision, and
+native execution succeeds after reclaiming the installation build cache.
 
 Closure requires the computed Temperature case, backed validation, writable
 caching, checked failures, ownership/cleanup, interface and override dispatch,

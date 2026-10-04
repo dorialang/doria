@@ -100,6 +100,11 @@ updates are not progress on the implementation. When Andrew answers, apply the
 ruling and resume. Do not re-request established workflow authorization unless
 the repository, destination, or action is outside its actual approved scope.
 
+Interpret short cancellations in their conversational context. "Never mind"
+after a question cancels that question, not unrelated implementation work.
+Read the original exchange before repeating another agent's claim that work
+was stopped; do not broaden the cancellation beyond its actual referent.
+
 ## Codex Prompt Delivery
 
 When Andrew asks for the next Codex prompt:
