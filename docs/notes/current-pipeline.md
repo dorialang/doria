@@ -2,6 +2,10 @@
 
 Documentation role: working note. This file prevents duplicated in-flight work. It is not a roadmap; `docs/doria-end-to-end-plan.md` owns the roadmap.
 
+## Scheduled application direction
+
+The master plan adds Stage 40a network/data foundations and the separate post-40a OSINT prototype checkpoint 40b. `Doria\Tui` design starts against Stage 36a; executable acceptance follows Stage 46. Native UI checkpoints UI-1/UI-2 cover Doria components/styles and the reviewed PHP host path after Stage 40/41. These are scheduled product checkpoints, not implemented compiler surfaces. The [supporting package design](../application-package-design.md) records proposals and open decisions.
+
 ## Recently merged
 
 - PR #75: Stage 17 integration, parity, examples, editor, docs, and CI closure.
