@@ -379,7 +379,8 @@ function check_stream_io_completeness(string $root): array
         'Typed composition replaces PHP wrappers, filters, contexts, registries, string options, and mixed bags',
         'Sync and async I/O, networking, processes, and terminals share one ownership, read, write, readiness, time, cancellation, and backpressure model',
         'Stage 37 consumes it in the async design',
-        'Stage 44 owns network-specific',
+        'Stage 40a owns the first network-specific',
+        'Stage 44 owns network-specific maturation',
         'Stage 46 owns terminal raw mode',
     ];
     foreach ($decisionSemantics as $semantic) {
@@ -414,7 +415,7 @@ function check_stream_io_completeness(string $root): array
         'Reopen in `Doria\\Std\\Fs` design',
         'no later than Stage 36a surface finalization',
         'after the Stage 36a foundation and before their v1 implementation',
-        'Reopen in the Stage 44 `Doria\\Std\\Net` design',
+        'Reopen in the Stage 40a `Doria\\Std\\Net` design',
         'first operation or adapter that requires it',
     ];
     foreach ($deferralRules as $rule) {
