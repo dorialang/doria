@@ -1,0 +1,40 @@
+use Doria\Std\Io\{PendingReadableStream, PendingWritableStream, ReadRequest,
+    WriteRequest, WritableByteRegion, ByteRegion, ReadOutcome, WriteOutcome,
+    ReadinessSource, ReadableFile, IoError};
+
+interface Both extends PendingReadableStream, PendingWritableStream {}
+
+class Closed implements Both {
+    internal ReadableFile $file;
+    function __construct(parameter take ReadableFile $file) { $this->file = $file; }
+    ReadinessSource $readinessSource { borrowed get => $this->file->readinessSource; }
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError {
+        return ReadOutcome::Data(0);
+    }
+    writable function write(ByteRegion $source): WriteOutcome throws IoError {
+        return WriteOutcome::Accepted(0);
+    }
+    writable function prepareRead(writable ReadRequest $request, writable WritableByteRegion $destination): void throws IoError {}
+    writable function prepareWrite(writable WriteRequest $request, ByteRegion $source): void throws IoError {}
+    writable function completeRead(ReadRequest $request, writable WritableByteRegion $destination): ?ReadOutcome throws IoError { return null; }
+    writable function completeWrite(WriteRequest $request, ByteRegion $source): ?WriteOutcome throws IoError { return null; }
+}
+
+open class Open implements Both {
+    internal ReadableFile $file;
+    function __construct(parameter take ReadableFile $file) { $this->file = $file; }
+    ReadinessSource $readinessSource { borrowed get => $this->file->readinessSource; }
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError {
+        return ReadOutcome::WouldBlock;
+    }
+    writable function write(ByteRegion $source): WriteOutcome throws IoError {
+        return WriteOutcome::WouldBlock;
+    }
+    writable function prepareRead(writable ReadRequest $request, writable WritableByteRegion $destination): void throws IoError {}
+    writable function prepareWrite(writable WriteRequest $request, ByteRegion $source): void throws IoError {}
+    writable function completeRead(ReadRequest $request, writable WritableByteRegion $destination): ?ReadOutcome throws IoError { return ReadOutcome::EndOfStream; }
+    writable function completeWrite(WriteRequest $request, ByteRegion $source): ?WriteOutcome throws IoError { return WriteOutcome::Accepted(0); }
+}
+
+function observe(Both $stream): void {}
+function main(): void {}

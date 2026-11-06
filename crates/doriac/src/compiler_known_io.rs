@@ -17,35 +17,18 @@ pub const INVALID_UTF8_ERROR: &str = "Doria\\Std\\Io\\InvalidUtf8Error";
 pub const SYNTHETIC_SOURCE_ID: crate::source::SourceId = crate::source::SourceId(0x7fff_ffff);
 pub const SYNTHETIC_SOURCE_IDENTITY: &str = "<compiler-known:stdio>";
 
-pub const CANONICAL_TYPES: [&str; 6] = [
+pub const CANONICAL_TYPES: [&str; 8] = [
     IO_OPERATION,
     IO_TARGET,
     IO_ERROR_REASON,
     UTF8_INPUT_SOURCE,
     IO_ERROR,
     INVALID_UTF8_ERROR,
+    crate::types::ByteRegionKind::Readonly.source_name(),
+    crate::types::ByteRegionKind::Writable.source_name(),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IoOperation {
-    Open,
-    Read,
-    Write,
-    Append,
-    Flush,
-}
-
-impl IoOperation {
-    pub(crate) const fn case_name(self) -> &'static str {
-        match self {
-            Self::Open => "Open",
-            Self::Read => "Read",
-            Self::Write => "Write",
-            Self::Append => "Append",
-            Self::Flush => "Flush",
-        }
-    }
-}
+pub(crate) use doria_diagnostic_catalogue::IoMessageOperation as IoOperation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IoTarget {
@@ -53,15 +36,29 @@ pub(crate) enum IoTarget {
     StandardInput,
     StandardOutput,
     StandardError,
+    ReadinessSet,
+    TransferPlan,
+    TransferGroup,
+    Process(String),
+    ProcessInput(String),
+    ProcessOutput(String),
+    ProcessErrors(String),
 }
 
 impl IoTarget {
     pub(crate) const fn case_name(&self) -> &'static str {
         match self {
             Self::File(_) => "File",
+            Self::Process(_) => "Process",
+            Self::ProcessInput(_) => "ProcessInput",
+            Self::ProcessOutput(_) => "ProcessOutput",
+            Self::ProcessErrors(_) => "ProcessErrors",
             Self::StandardInput => "StandardInput",
             Self::StandardOutput => "StandardOutput",
             Self::StandardError => "StandardError",
+            Self::ReadinessSet => "ReadinessSet",
+            Self::TransferPlan => "TransferPlan",
+            Self::TransferGroup => "TransferGroup",
         }
     }
 }
@@ -114,21 +111,21 @@ pub(crate) fn io_error_message(
     reason: IoErrorReason,
 ) -> String {
     use doria_diagnostic_catalogue::{
-        visit_io_error_message_parts, IoMessageOperation, IoMessageReason, IoMessageTarget,
+        visit_io_error_message_parts, IoMessageReason, IoMessageTarget,
     };
 
-    let operation = match operation {
-        IoOperation::Open => IoMessageOperation::Open,
-        IoOperation::Read => IoMessageOperation::Read,
-        IoOperation::Write => IoMessageOperation::Write,
-        IoOperation::Append => IoMessageOperation::Append,
-        IoOperation::Flush => IoMessageOperation::Flush,
-    };
     let target = match target {
         IoTarget::File(path) => IoMessageTarget::File(path.as_bytes()),
         IoTarget::StandardInput => IoMessageTarget::StandardInput,
         IoTarget::StandardOutput => IoMessageTarget::StandardOutput,
         IoTarget::StandardError => IoMessageTarget::StandardError,
+        IoTarget::ReadinessSet => IoMessageTarget::ReadinessSet,
+        IoTarget::TransferPlan => IoMessageTarget::TransferPlan,
+        IoTarget::TransferGroup => IoMessageTarget::TransferGroup,
+        IoTarget::Process(program) => IoMessageTarget::Process(program.as_bytes()),
+        IoTarget::ProcessInput(program) => IoMessageTarget::ProcessInput(program.as_bytes()),
+        IoTarget::ProcessOutput(program) => IoMessageTarget::ProcessOutput(program.as_bytes()),
+        IoTarget::ProcessErrors(program) => IoMessageTarget::ProcessErrors(program.as_bytes()),
     };
     let reason = match reason {
         IoErrorReason::NotFound => IoMessageReason::NotFound,
@@ -164,7 +161,7 @@ pub(crate) fn invalid_utf8_message(
 }
 
 pub fn is_canonical_type(name: &str) -> bool {
-    CANONICAL_TYPES.contains(&name)
+    CANONICAL_TYPES.contains(&name) || crate::compiler_known_stream::CANONICAL_TYPES.contains(&name)
 }
 
 pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
@@ -184,7 +181,7 @@ pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
         let canonical = namespace
             .as_ref()
             .map_or_else(|| name.clone(), |namespace| format!("{namespace}\\{name}"));
-        if is_canonical_type(&canonical) {
+        if crate::names::standard_type_identity(&canonical).is_some() {
             diagnostics.push(
                 Diagnostic::new(
                     "E0640",
@@ -244,10 +241,12 @@ fn starts_structural_function_type(tokens: &[crate::lexer::Token], index: usize)
         .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
 }
 
-pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
-    // Interface slots share the automatic-effect transport of structural calls,
-    // even when no implementation in this program performs I/O.
-    facts.declarations.iter().any(|declaration| declaration.kind == crate::names::GlobalSymbolKind::Interface)
+pub fn resolved_program_uses_canonical_io(facts: &GlobalSymbolFacts, program: &Program) -> bool {
+    // Interface slots and the trait requirements a composer satisfies share the
+    // automatic-effect transport of structural calls, even when no
+    // implementation in this program performs I/O.
+    program.items.iter().any(declares_trait_requirement)
+    || facts.declarations.iter().any(|declaration| declaration.kind == crate::names::GlobalSymbolKind::Interface)
     || facts.references.iter().any(|reference| {
         matches!(
             &reference.symbol_id.owner,
@@ -256,6 +255,16 @@ pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
         || matches!(&reference.symbol_id.owner,
             GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::Prelude(name))
                 if crate::compiler_known_contracts::interfaces().any(|interface| interface.name == *name))
+    })
+}
+
+fn declares_trait_requirement(item: &Item) -> bool {
+    let Item::Trait(declaration) = item else {
+        return false;
+    };
+    declaration.members.iter().any(|member| {
+        matches!(member, ClassMember::Method(method)
+            if matches!(method.body, crate::ast::FunctionBody::Requirement { .. }))
     })
 }
 
@@ -269,16 +278,23 @@ pub fn augment_program(program: &Program) -> Program {
     augmented.items.extend([
         unit_enum(
             IO_OPERATION,
-            &["Open", "Read", "Write", "Append", "Flush"],
+            &IoOperation::ALL.map(IoOperation::case_name),
             synthetic(0),
         ),
         payload_enum(
             IO_TARGET,
             &[
                 ("File", Some(("string", "path"))),
-                ("StandardInput", None),
-                ("StandardOutput", None),
-                ("StandardError", None),
+                (IoTarget::StandardInput.case_name(), None),
+                (IoTarget::StandardOutput.case_name(), None),
+                (IoTarget::StandardError.case_name(), None),
+                (IoTarget::ReadinessSet.case_name(), None),
+                (IoTarget::TransferPlan.case_name(), None),
+                (IoTarget::TransferGroup.case_name(), None),
+                ("Process", Some(("string", "program"))),
+                ("ProcessInput", Some(("string", "program"))),
+                ("ProcessOutput", Some(("string", "program"))),
+                ("ProcessErrors", Some(("string", "program"))),
             ],
             synthetic(1),
         ),
@@ -298,7 +314,11 @@ pub fn augment_program(program: &Program) -> Program {
         ),
         payload_enum(
             UTF8_INPUT_SOURCE,
-            &[("File", Some(("string", "path"))), ("StandardInput", None)],
+            &[
+                ("File", Some(("string", "path"))),
+                ("StandardInput", None),
+                ("Stream", None),
+            ],
             synthetic(3),
         ),
         error_class(
@@ -309,6 +329,7 @@ pub fn augment_program(program: &Program) -> Program {
                 (IO_TARGET, "target", false),
                 (IO_ERROR_REASON, "reason", false),
                 ("int", "systemCode", true),
+                ("int", "transferredByteCount", true),
             ],
             synthetic(4),
         ),
@@ -403,8 +424,10 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
         extends_span: None,
         parent_span: None,
         modifier_prefix_span: span,
-        implements: vec![TypeRef::named("Error")],
-        syntax: crate::ast::TypeDeclarationSyntax::synthetic(span),
+        implements: vec![crate::ast::InterfaceConformance::unconditional(
+            TypeRef::named("Error"),
+        )],
+        syntax: crate::ast::TypeDeclarationSyntax::synthetic(span, vec![span]),
         members: vec![ClassMember::Method(FunctionDecl {
             access: MemberAccess::External,
             access_span: None,
@@ -414,6 +437,8 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
             override_span: None,
             writable_this: false,
             writable_span: None,
+            consuming_this: false,
+            consuming_span: None,
             is_static: false,
             static_span: None,
             name: "__construct".to_string(),
@@ -422,6 +447,7 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
             params,
             return_type: None,
             throws: None,
+            availability: None,
             body: crate::ast::FunctionBody::Block(Block {
                 statements: Vec::new(),
                 span,

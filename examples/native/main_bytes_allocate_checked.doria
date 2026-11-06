@@ -1,0 +1,33 @@
+class Events { static writable string $text = ""; }
+function note(string $event): void { Events::text = Events::text . $event . ";"; }
+class Failure implements Error {
+    function __construct(string $message) {}
+    function __destruct() { note("drop error"); }
+}
+class Holder {
+    function __construct(take Bytes $bytes, string $label) { note("new " . $this->label); }
+    function __destruct() { note("drop " . $this->label . " " . $this->bytes->length); }
+}
+function length(bool $fail): int throws Failure {
+    note("length");
+    if ($fail) { throw new Failure("length"); }
+    return 3;
+}
+function allocate(bool $fail): Bytes throws Failure { return Bytes::allocate(length($fail)); }
+function failWithOwnedBytes(): void throws Failure {
+    let $bytes = Bytes::allocate(2);
+    let $holder = new Holder($bytes, "unwind");
+    throw new Failure("body");
+}
+function main(): void {
+    try {
+        let $holder = new Holder(allocate(false), "normal");
+        note("live " . $holder->bytes->length);
+    } catch (Failure) { note("unexpected failure"); }
+    try {
+        let $never = new Holder(allocate(true), "never");
+    } catch (Failure $error) { note("caught " . $error->message); }
+    try { failWithOwnedBytes(); }
+    catch (Failure $error) { note("caught " . $error->message); }
+    echo Events::text . "\n";
+}

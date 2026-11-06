@@ -1,0 +1,11 @@
+interface Read<T> { function value(): T; }
+class Reader implements Read<int> { function value(): int { return 7; } }
+open class Root<T> {
+    open function create<U>(U $tag): Read<int> { return new Reader(); }
+}
+open class Child<V> extends Root<List<V>> {
+    override function create<W>(W $tag): Reader { return new Reader(); }
+}
+class Leaf extends Child<int> {}
+function produce(Child<int> $source): Reader { return $source->create(true); }
+function main(): void { let $value = produce(new Leaf()); echo $value->value(); }

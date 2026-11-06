@@ -111,8 +111,24 @@ pub enum CompilerSymbolIdentity {
     Prelude(String),
     Intrinsic(String),
     StandardIo(String),
+    StandardTime(String),
+    StandardConcurrency(String),
     StandardTest(String),
     Attribute(String),
+}
+
+pub(crate) fn standard_type_identity(canonical: &str) -> Option<CompilerSymbolIdentity> {
+    if crate::compiler_known_concurrency::CANONICAL_TYPES.contains(&canonical) {
+        Some(CompilerSymbolIdentity::StandardConcurrency(
+            canonical.to_string(),
+        ))
+    } else if crate::compiler_known_time::CANONICAL_TYPES.contains(&canonical) {
+        Some(CompilerSymbolIdentity::StandardTime(canonical.to_string()))
+    } else if crate::compiler_known_io::is_canonical_type(canonical) {
+        Some(CompilerSymbolIdentity::StandardIo(canonical.to_string()))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -208,6 +224,8 @@ pub enum CompilerKnownProvenance {
     EditionPrelude(Edition),
     Intrinsic,
     StandardIo,
+    StandardTime,
+    StandardConcurrency,
     StandardTest,
     Attribute,
 }
@@ -780,11 +798,10 @@ impl<'a> Resolver<'a> {
                 continue;
             };
             let canonical = self.canonical_declaration_name(source_name);
-            let compiler_known = crate::compiler_known_io::is_canonical_type(&canonical);
-            let owner = if compiler_known {
-                GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(
-                    canonical.clone(),
-                ))
+            let identity = standard_type_identity(&canonical);
+            let compiler_known = identity.is_some();
+            let owner = if let Some(identity) = identity {
+                GlobalSymbolOwner::CompilerKnown(identity)
             } else {
                 GlobalSymbolOwner::Package(self.context.package.clone())
             };
@@ -911,7 +928,7 @@ impl<'a> Resolver<'a> {
                 }
                 imported_targets.insert(target.clone(), entry.target.span);
                 if !self.has_symbol(&target)
-                    && !crate::compiler_known_io::is_canonical_type(&target)
+                    && standard_type_identity(&target).is_none()
                     && !crate::compiler_known_test::is_canonical_member(&target)
                 {
                     self.imports.insert(
@@ -1062,11 +1079,9 @@ impl<'a> Resolver<'a> {
         {
             return Some(declaration.id.clone());
         }
-        if crate::compiler_known_io::is_canonical_type(canonical) {
+        if let Some(identity) = standard_type_identity(canonical) {
             return Some(GlobalSymbolId {
-                owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(
-                    canonical.to_string(),
-                )),
+                owner: GlobalSymbolOwner::CompilerKnown(identity),
                 qualified_name: canonical.to_string(),
             });
         }
@@ -1375,7 +1390,7 @@ impl<'a> Resolver<'a> {
         }
         for (index, interface) in class.implements.iter_mut().enumerate() {
             self.normalize_type(
-                interface,
+                &mut interface.ty,
                 class
                     .syntax
                     .inheritance_type_spans
@@ -1384,6 +1399,7 @@ impl<'a> Resolver<'a> {
                     .unwrap_or(class.span),
                 GlobalReferenceRole::Implements,
             );
+            self.normalize_nominal_condition(&mut interface.condition);
         }
         self.normalize_type_params(&mut class.type_params);
         for member in &mut class.members {
@@ -1393,6 +1409,13 @@ impl<'a> Resolver<'a> {
     }
 
     fn normalize_enum(&mut self, definition: &mut EnumDecl) {
+        self.type_parameter_scopes.push(
+            definition
+                .type_params
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+        );
         definition.name = self.canonical_declaration_name(&definition.name);
         self.normalize_type_params(&mut definition.type_params);
         if let Some(ty) = &mut definition.backing_type {
@@ -1406,6 +1429,7 @@ impl<'a> Resolver<'a> {
                 self.normalize_expression(value);
             }
         }
+        self.type_parameter_scopes.pop();
     }
 
     fn normalize_type_params(&mut self, params: &mut [TypeParamDecl]) {
@@ -1451,6 +1475,7 @@ impl<'a> Resolver<'a> {
 
     fn normalize_property(&mut self, property: &mut PropertyDecl) {
         self.normalize_type(&mut property.ty, property.span, GlobalReferenceRole::Type);
+        self.normalize_nominal_condition(&mut property.availability);
         if let Some(initializer) = &mut property.initializer {
             self.normalize_expression(initializer);
         }
@@ -1480,6 +1505,16 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn normalize_nominal_condition(&mut self, condition: &mut Option<NominalCondition>) {
+        if let Some(condition) = condition {
+            for bound in &mut condition.bounds {
+                for (ty, span) in bound.interfaces.iter_mut().zip(&bound.type_spans) {
+                    self.normalize_type(ty, *span, GlobalReferenceRole::Type);
+                }
+            }
+        }
+    }
+
     fn normalize_const(&mut self, constant: &mut ConstDecl) {
         if let Some(ty) = &mut constant.ty {
             self.normalize_type(ty, constant.span, GlobalReferenceRole::Type);
@@ -1503,6 +1538,7 @@ impl<'a> Resolver<'a> {
             self.normalize_type(return_type, function.span, GlobalReferenceRole::Type);
         }
         self.normalize_throws(&mut function.throws);
+        self.normalize_nominal_condition(&mut function.availability);
         if let Some(body) = function.body.as_block_mut() {
             self.normalize_block(body);
         }
@@ -2004,19 +2040,50 @@ pub fn compiler_known_symbol_facts(edition: Edition) -> Vec<CompilerKnownSymbolF
             provenance: CompilerKnownProvenance::Intrinsic,
         }
     }));
-    facts.extend(crate::compiler_known_io::CANONICAL_TYPES.map(|canonical| {
-        CompilerKnownSymbolFact {
+    facts.extend(
+        crate::compiler_known_io::CANONICAL_TYPES
+            .into_iter()
+            .chain(crate::compiler_known_stream::CANONICAL_TYPES)
+            .map(|canonical| CompilerKnownSymbolFact {
+                id: GlobalSymbolId {
+                    owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(
+                        canonical.to_string(),
+                    )),
+                    qualified_name: canonical.to_string(),
+                },
+                kind: GlobalSymbolKind::CompilerKnownType,
+                source_name: canonical.to_string(),
+                provenance: CompilerKnownProvenance::StandardIo,
+            }),
+    );
+    facts.extend(
+        crate::compiler_known_time::CANONICAL_TYPES.map(|canonical| CompilerKnownSymbolFact {
             id: GlobalSymbolId {
-                owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(
+                owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardTime(
                     canonical.to_string(),
                 )),
                 qualified_name: canonical.to_string(),
             },
             kind: GlobalSymbolKind::CompilerKnownType,
             source_name: canonical.to_string(),
-            provenance: CompilerKnownProvenance::StandardIo,
-        }
-    }));
+            provenance: CompilerKnownProvenance::StandardTime,
+        }),
+    );
+    facts.extend(
+        crate::compiler_known_concurrency::CANONICAL_TYPES.map(|canonical| {
+            CompilerKnownSymbolFact {
+                id: GlobalSymbolId {
+                    owner: GlobalSymbolOwner::CompilerKnown(
+                        CompilerSymbolIdentity::StandardConcurrency(canonical.to_string()),
+                    ),
+                    qualified_name: canonical.to_string(),
+                },
+                kind: GlobalSymbolKind::CompilerKnownType,
+                source_name: canonical.to_string(),
+                provenance: CompilerKnownProvenance::StandardConcurrency,
+            }
+        }),
+    );
     facts.extend(
         crate::compiler_known_test::DECLARATIONS
             .into_iter()

@@ -1,0 +1,50 @@
+use Doria\Std\Io\{File, ReadableStream, WritableByteRegion, ReadOutcome, IoError, IoOperation, IoErrorReason, IoTarget};
+
+function readErased(writable ReadableStream $stream, writable WritableByteRegion $destination): ReadOutcome throws IoError
+{
+    return $stream->read($destination);
+}
+
+function describe(ReadOutcome $outcome): string
+{
+    return match ($outcome) {
+        ReadOutcome::Data($byteCount) => "data {$byteCount}",
+        ReadOutcome::WouldBlock => "would block",
+        ReadOutcome::EndOfStream => "end",
+        ReadOutcome::TimedOut => "timed out",
+    };
+}
+
+function main(): void
+{
+    write_file("stream-read.txt", "ABC\n");
+    let writable $file = File::openRead("stream-read.txt");
+    writable Bytes $buffer = Bytes::allocate(3);
+    {
+        let writable $destination = $buffer->getWritableRegion(1, 2);
+        echo describe($file->read($destination)) . "\n";
+        echo describe(readErased($file, $destination)) . "\n";
+        echo describe($file->read($destination)) . "\n";
+    }
+    echo "bytes {$buffer[0]} {$buffer[1]} {$buffer[2]}\n";
+    {
+        let writable $empty = $buffer->getWritableRegion(3, 0);
+        echo describe($file->read($empty)) . "\n";
+    }
+    $file->close();
+    let writable $second = File::openRead("stream-read.txt");
+    {
+        let writable $firstByte = $buffer->getWritableRegion(0, 1);
+        echo describe($second->read($firstByte)) . "\n";
+    }
+    echo "independent {$buffer[0]}\n";
+    try { File::openRead("missing-stream.txt"); }
+    catch (IoError $error) {
+        if ($error->operation == IoOperation::Open && $error->reason == IoErrorReason::NotFound) {
+            echo match ($error->target) {
+                IoTarget::File($path) => "missing {$path}\n",
+                default => "wrong target\n",
+            };
+        }
+    }
+}

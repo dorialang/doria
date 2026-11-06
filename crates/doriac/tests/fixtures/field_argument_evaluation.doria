@@ -1,0 +1,63 @@
+enum Packet { case Number(int $value); }
+class Events { static writable string $text = ""; }
+function note(string $value): void { Events::text = Events::text . $value . ";"; }
+function make(int $value): Packet { note("make " . $value); return Packet::Number($value); }
+function number(Packet $value): int { return match ($value) { Packet::Number($number) => $number, }; }
+function scalar(int $value): int { note("scalar " . $value); return $value; }
+function consume(Packet $first, int $middle, Packet $last): int {
+    note("consume");
+    return number($first) + $middle + number($last);
+}
+class Token {
+    function __construct(string $name) { note("new " . $this->name); }
+    function __destruct() { note("drop " . $this->name); }
+}
+class Failure implements Error { function __construct(string $message) {} }
+function fail(): Packet throws Failure { note("fail"); throw new Failure("argument"); }
+function consumeTaking(Packet $first, take Token $token, Packet $last): int {
+    note("consume taking");
+    return number($first) + number($last);
+}
+class Reader {
+    int $bias = 0;
+    function __construct() { note("new reader"); }
+    function __destruct() { note("drop reader"); }
+    function read(Packet $first, int $middle, Packet $last): int {
+        let $read = fn() with ($this) => $this->bias;
+        return consume($first, $middle, $last) + $read();
+    }
+}
+function reader(bool $present): ?Reader {
+    note("receiver");
+    if ($present) { return new Reader(); }
+    return null;
+}
+function callback(): function(Packet, int, Packet): int {
+    note("callback");
+    return fn(Packet $first, int $middle, Packet $last) => consume($first, $middle, $last);
+}
+class Consumer {
+    function __construct(string $name) { note("new " . $this->name); }
+    function __destruct() { note("drop " . $this->name); }
+    consuming function finish(Packet $first, take Token $token, Packet $last): int {
+        note("finish " . $this->name);
+        return number($first) + number($last);
+    }
+}
+function main(): void {
+    let $sum = consume(last: make(3), middle: scalar(2), first: make(1));
+    note("sum " . $sum);
+    let $present = reader(true)?->read(make(4), scalar(5), make(6));
+    if ($present != null) { note("present " . $present); }
+    reader(false)?->read(make(7), scalar(8), make(9));
+    note("absent");
+    let $answer = callback()(make(10), scalar(11), make(12));
+    note("answer " . $answer);
+    try { consumeTaking(make(13), new Token("argument"), fail()); }
+    catch (Failure) { note("caught free"); }
+    try { (new Consumer("receiver"))->finish(make(14), new Token("argument"), fail()); }
+    catch (Failure) { note("caught receiver"); }
+    let $finished = (new Consumer("success"))->finish(make(15), new Token("argument"), make(16));
+    note("finished " . $finished);
+    echo Events::text;
+}

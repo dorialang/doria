@@ -1,0 +1,31 @@
+data 1
+would block
+end
+byte 42
+data 0
+accepted 1
+flushed 1
+timed out
+would block
+concrete failure 1
+erased failure 1
+partial byte 7
+optional read absent
+optional read data 0
+optional read data 3
+optional read would block
+optional read end
+optional read timed out
+optional write absent
+optional write accepted 0
+optional write accepted 3
+optional write would block
+flushed byte 10
+flush pending:1
+flush pending:1
+flushed byte 20
+flush failed 1:2
+flushed byte 30
+flush complete:3
+flush complete:3
+retained 10:20:30

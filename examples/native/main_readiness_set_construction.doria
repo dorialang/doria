@@ -1,0 +1,32 @@
+use Doria\Std\Io\{ReadinessSet, IoError, IoOperation, IoTarget, IoErrorReason};
+
+class SetHolder {
+    internal ReadinessSet $set;
+    function __construct(parameter take ReadinessSet $set) {
+        $this->set = $set;
+    }
+    function __destruct() {
+        try { echo "holder released\n"; }
+        catch (IoError $error) {}
+    }
+}
+
+function create(): ReadinessSet { return new ReadinessSet(); }
+
+function failAfterTaking(take ReadinessSet $set): void {
+    throw new IoError("checked exit", IoOperation::Register,
+        IoTarget::ReadinessSet, IoErrorReason::Other);
+}
+
+function main(): void {
+    {
+        let $holder = new SetHolder(create());
+        List<ReadinessSet> $sets = [create(), new ReadinessSet()];
+        foreach ($sets as ReadinessSet $set) { echo "stored set\n"; }
+        ?ReadinessSet $optional = create();
+        if ($optional != null) { echo "optional set\n"; }
+        try { failAfterTaking(new ReadinessSet()); }
+        catch (IoError $error) { echo $error->message . "\n"; }
+    }
+    echo "construction complete\n";
+}

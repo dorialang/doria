@@ -1,0 +1,68 @@
+use Doria\Std\Io\{ReadableStream, WritableByteRegion, ReadOutcome, IoError};
+
+class FixtureReader implements ReadableStream
+{
+    function __construct(uint8 $value) {}
+
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError
+    {
+        if ($destination->length == 0) { return ReadOutcome::Data(0); }
+        $destination[0] = $this->value;
+        return ReadOutcome::Data(1);
+    }
+
+    function __destruct(): void
+    {
+        try { echo "drop {$this->value}\n"; } catch (IoError) {}
+    }
+}
+
+class FixtureRegistry
+{
+    internal writable List<ReadableStream> $streams = [];
+
+    writable function register(take ReadableStream $stream): void
+    {
+        $this->streams->add($stream);
+    }
+
+    writable function read(int $index, writable WritableByteRegion $destination): ReadOutcome throws IoError
+    {
+        return $this->streams[$index]->read($destination);
+    }
+
+    writable function remove(int $index): ReadableStream
+    {
+        return $this->streams->removeAt($index);
+    }
+
+    function __destruct(): void
+    {
+        try { echo "drop registry\n"; } catch (IoError) {}
+    }
+}
+
+function main(): void
+{
+    writable Bytes $buffer = Bytes::allocate(1);
+    {
+        let writable $registry = new FixtureRegistry();
+        let $first = new FixtureReader(10);
+        $registry->register($first);
+        $registry->register(new FixtureReader(20));
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            $registry->read(0, $destination);
+        }
+        echo "registered {$buffer[0]}\n";
+        {
+            let writable $returned = $registry->remove(1);
+            {
+                let writable $destination = $buffer->getWritableRegion(0, 1);
+                $returned->read($destination);
+            }
+            echo "returned {$buffer[0]}\n";
+        }
+        echo "leave registry\n";
+    }
+}

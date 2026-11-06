@@ -4,6 +4,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/cargo_artifacts.php';
+require_once __DIR__ . '/cargo_artifact_cleanup.php';
 
 const CACHE_POLICY_VERSION = 1;
 const UNTRACKED_CACHE_BYTES = 256 * 1024 * 1024;
@@ -13,6 +14,9 @@ $root = dirname(__DIR__);
 $withLlvm = false;
 $plan = false;
 $reclaim = false;
+$reclaimObsolete = false;
+$reclaimInterrupted = false;
+$approvedPlan = null;
 $target = getenv('DORIA_VALIDATION_TARGET_DIR') ?: getenv('CARGO_TARGET_DIR') ?: $root . '/target';
 
 for ($index = 1; $index < count($argv); $index++) {
@@ -26,6 +30,18 @@ for ($index = 1; $index < count($argv); $index++) {
         case '--reclaim':
             $reclaim = true;
             break;
+        case '--reclaim-obsolete':
+            $reclaimObsolete = true;
+            break;
+        case '--reclaim-interrupted':
+            $reclaimInterrupted = true;
+            break;
+        case '--approve-plan':
+            if (!isset($argv[++$index])) {
+                fail('--approve-plan requires a selective cleanup plan identity');
+            }
+            $approvedPlan = $argv[$index];
+            break;
         case '--target-dir':
             if (!isset($argv[++$index])) {
                 fail('--target-dir requires a path');
@@ -35,6 +51,31 @@ for ($index = 1; $index < count($argv); $index++) {
         default:
             fail("unknown option `{$argv[$index]}`");
     }
+}
+
+if ($reclaimObsolete || $reclaimInterrupted) {
+    if ($reclaim || $withLlvm || ($reclaimObsolete && $reclaimInterrupted) || ($plan && $approvedPlan !== null)) {
+        fail('selective cleanup cannot be combined with validation, whole-target cleanup, or plan application');
+    }
+    try {
+        $metadata = json_decode(
+            capture(['cargo', 'metadata', '--no-deps', '--format-version', '1', '--offline', '--locked'], $root),
+            true,
+            512,
+            JSON_THROW_ON_ERROR | JSON_BIGINT_AS_STRING,
+        );
+        $selection = $reclaimInterrupted ? DoriaTestCleanupMode::Interrupted : DoriaTestCleanupMode::Obsolete;
+        $cleanup = $approvedPlan === null
+            ? doria_obsolete_test_plan($target, $root, $metadata, $selection)
+            : doria_reclaim_obsolete_tests($target, $root, $metadata, $approvedPlan, $selection);
+        fwrite(STDOUT, json_encode($cleanup, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
+        exit(0);
+    } catch (Throwable $error) {
+        fail($error->getMessage());
+    }
+}
+if ($approvedPlan !== null) {
+    fail('--approve-plan requires --reclaim-obsolete or --reclaim-interrupted');
 }
 
 try {
@@ -158,6 +199,8 @@ function default_commands(string $root, string $target): array
         command(['cargo', 'build', '-p', 'doriac', '--bin', 'doriac', '--locked'], $target),
         command(['cargo', 'clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '--workspace', '--all-targets', '--locked'], $target),
+        command(['cargo', 'clippy', '-p', 'doria-rt', '--all-targets', '--no-default-features', '--features', 'hosted-shared-runtime', '--locked', '--', '-D', 'warnings'], $target),
+        command(['cargo', 'test', '-p', 'doria-rt', '--all-targets', '--no-default-features', '--features', 'hosted-shared-runtime', '--locked'], $target),
         command([$executable, 'check', 'examples/php/person.doria'], $target),
         command([$executable, 'hir', 'examples/php/person.doria'], $target, true),
         command([$executable, 'compile', 'examples/native/main_return_zero.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_zero'], $target),
@@ -185,13 +228,33 @@ function llvm_commands(string $target): array
         'stage21_tests',
         'stage22_tests',
         'stage25a_tests',
+        'stage27_tests',
         'return_borrow_alias_tests',
+        'writable_borrow_writeback_tests',
         'returned_closure_transport_tests',
         'stage35_runtime_tests',
         'stage35a_optimizer_tests',
         'stage36_property_hook_tests',
         'property_hook_initializer_tests',
         'property_hook_cleanup_effect_tests',
+        'php_integer_execution_tests',
+        'bytes_allocate_tests',
+        'byte_region_execution_tests',
+        'byte_region_mir_validation_tests',
+        'byte_region_transport_tests',
+        'byte_region_native_structure_tests',
+        'consuming_receiver_tests',
+        'stream_capability_tests',
+        'time_contract_tests',
+        'nullable_default_tests',
+        'registration_key_tests',
+        'readiness_set_contract_tests',
+        'transfer_plan_tests',
+        'pending_stream_contract_tests',
+        'pending_selected_storage_tests',
+        'pending_selected_storage_mir_tests',
+        'io_progress_native_structure_tests',
+        'indexed_access_span_tests',
         'performance_report_tests',
         'native_testing_slice1_tests',
         'native_mir_parity_tests',
@@ -214,11 +277,7 @@ function command(array $arguments, string $target, bool $discardOutput = false):
 /** @return array<string, string> */
 function environment_for(string $target): array
 {
-    $environment = getenv();
-    $environment = is_array($environment) ? $environment : [];
-    $environment['CARGO_TARGET_DIR'] = $target;
-
-    return $environment;
+    return doria_build_environment($target);
 }
 
 /** @param list<string> $command @param array<string, string> $environment */
@@ -263,6 +322,7 @@ function reclaim_target(string $root, string $target, string $reason): void
     fwrite(STDOUT, "Reclaiming managed Cargo target because {$reason}.\n");
     run(['cargo', 'clean', '--target-dir', $target], $root, environment_for($target));
     doria_write_artifact_owner($target, $root);
+    write_stamp($target . DIRECTORY_SEPARATOR . '.doria-artifact-cache.json', cache_identity($root));
 }
 
 function cache_identity(string $root): string

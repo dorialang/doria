@@ -1,0 +1,69 @@
+use Doria\Std\Io\{File, ReadableFile, ReadableStream, ReadinessSource, ReadinessStream,
+    ReadOutcome, WritableByteRegion, IoError};
+
+class MeteredFile implements ReadableStream, ReadinessStream
+{
+    writable int $reads = 0;
+    internal writable ReadableFile $file;
+
+    function __construct(parameter take ReadableFile $file)
+    {
+        $this->file = $file;
+    }
+
+    ReadinessSource $readinessSource { borrowed get => $this->file->readinessSource; }
+
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError
+    {
+        $this->reads = 1;
+        return $this->file->read($destination);
+    }
+}
+
+function getSource(ReadinessStream $stream): ReadinessSource
+{
+    return $stream->readinessSource;
+}
+
+function maybeSource(ReadinessSource $source): ?ReadinessSource
+{
+    return $source;
+}
+
+function inspectSource(ReadinessSource $source): void
+{
+    let $isSource = fn() with ($source) => $source is ReadinessSource;
+    if ($isSource()) {
+        echo "source\n";
+    }
+}
+
+function readErased(writable ReadableStream $stream, writable WritableByteRegion $destination): void
+{
+    echo match ($stream->read($destination)) {
+        ReadOutcome::Data($count) => "read {$count}\n",
+        default => "wrong outcome\n",
+    };
+}
+
+function main(): void
+{
+    write_file("ready.txt", "abc\n");
+    let writable $file = File::openRead("ready.txt");
+    let $direct = $file->readinessSource;
+    let $alias = $direct;
+    let $maybe = maybeSource($alias);
+    if ($maybe != null) {
+        inspectSource($maybe);
+    }
+    writable Bytes $bytes = Bytes::allocate(3);
+    let writable $region = $bytes->getWritableRegion(0, 3);
+    readErased($file, $region);
+    $file->close();
+
+    let writable $adapter = new MeteredFile(File::openRead("ready.txt"));
+    let $forwarded = getSource($adapter);
+    inspectSource($forwarded);
+    readErased($adapter, $region);
+    echo "adapter {$adapter->reads}\n";
+}

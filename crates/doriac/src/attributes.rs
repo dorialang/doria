@@ -944,9 +944,12 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
         ResolvedType::Enum(ty) => ty.name.clone(),
         ResolvedType::Nullable(inner) => format!("?{}", metadata_type_name(inner)),
         ResolvedType::Bytes => "Bytes".to_string(),
+        ResolvedType::ByteRegion(kind) => kind.source_name().to_string(),
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
-        ResolvedType::TypeParameter(name) => name.clone(),
+        ResolvedType::TypeParameter(name) => {
+            crate::trait_composition::authored_type_parameter_name(name).to_owned()
+        }
         ResolvedType::Function(function) => {
             let invocation = match function.invocation_mode {
                 crate::types::FunctionInvocationMode::Readonly => "",
@@ -1040,21 +1043,18 @@ pub fn attribute_value_from_const(
         ConstValue::Bool(value) => AttributeValueKind::Bool(value),
         ConstValue::Null => AttributeValueKind::Null,
         ConstValue::Enum(value) => {
-            let (_, case) = evaluation.enum_case_name(value)?;
+            let (_, case) = evaluation.enum_case_name(&value)?;
             AttributeValueKind::Enum {
                 case: case.to_string(),
             }
         }
         ConstValue::PayloadEnum(value) => {
-            let (_, case) = evaluation.payload_case_name(value.enum_id, value.case_id)?;
+            let (_, case) = evaluation.payload_case_name(&value.value)?;
             let fields = value
                 .fields
                 .into_iter()
                 .zip(value.field_types)
-                .map(|(field, ty)| {
-                    let resolved = resolved_const_type(&ty, evaluation)?;
-                    attribute_value_from_const(resolved, field, evaluation)
-                })
+                .map(|(field, ty)| attribute_value_from_const(ty, field, evaluation))
                 .collect::<Option<Vec<_>>>()?;
             AttributeValueKind::PayloadEnum {
                 case: case.to_string(),
@@ -1065,31 +1065,6 @@ pub fn attribute_value_from_const(
     Some(AttributeValue {
         semantic_type,
         value,
-    })
-}
-
-fn resolved_const_type(
-    ty: &crate::types::TypeRef,
-    evaluation: &crate::const_eval::Evaluation,
-) -> Option<ResolvedType> {
-    let base = match ty.name.as_str() {
-        "string" => ResolvedType::String,
-        "bool" => ResolvedType::Bool,
-        name if crate::numeric::IntegerType::from_source_name(name).is_some() => {
-            ResolvedType::Integer(crate::numeric::IntegerType::from_source_name(name)?)
-        }
-        name if crate::numeric::FloatType::from_source_name(name).is_some() => {
-            ResolvedType::Float(crate::numeric::FloatType::from_source_name(name)?)
-        }
-        name => ResolvedType::Enum(crate::enums::EnumType {
-            id: *evaluation.enum_names.get(name)?,
-            name: name.to_string(),
-        }),
-    };
-    Some(if ty.nullable {
-        ResolvedType::Nullable(Box::new(base))
-    } else {
-        base
     })
 }
 

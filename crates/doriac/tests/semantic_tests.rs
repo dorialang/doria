@@ -187,7 +187,7 @@ fn preserves_nested_mixed_collection_shape_after_clear_heterogeneous_elements() 
     doriac::check_source(
         "test.doria",
         r#"
-function rows(take mixed $payload)
+function rows(take mixed $payload): List<List<mixed>>
 {
     return [[1], ["two"], [$payload]];
 }
@@ -274,7 +274,7 @@ string $name = $payload;
         ),
         (
             r#"
-function leak(mixed $payload)
+function leak(mixed $payload): mixed
 {
     return $payload;
 }
@@ -285,7 +285,7 @@ string $name = leak(1);
         ),
         (
             r#"
-function leak(mixed $payload)
+function leak(mixed $payload): mixed
 {
     if (true) {
         return $payload;
@@ -302,7 +302,7 @@ class Box
 {
     mixed $payload = "x";
 
-    function leak()
+    function leak(): mixed
     {
         return $this->payload;
     }
@@ -315,12 +315,12 @@ string $name = $box->leak();
         ),
         (
             r#"
-function forward(mixed $payload)
+function forward(mixed $payload): mixed
 {
     return identity($payload);
 }
 
-function identity(mixed $payload)
+function identity(mixed $payload): mixed
 {
     return $payload;
 }
@@ -331,7 +331,7 @@ string $name = forward(1);
         ),
         (
             r#"
-function leak(mixed $payload)
+function leak(mixed $payload): List<mixed>
 {
     return [$payload, 1];
 }
@@ -347,7 +347,7 @@ class Box
     mixed $payload = "x";
 }
 
-function leak(Box $box)
+function leak(Box $box): mixed
 {
     Box $same = $box;
     return $same->payload;
@@ -397,7 +397,7 @@ $payload += 1;
         ),
         (
             r#"
-function leak(mixed $payload, bool $usePayload)
+function leak(mixed $payload, bool $usePayload): mixed
 {
     writable mixed $value = "";
     if ($usePayload) {
@@ -415,7 +415,7 @@ string $value = leak(1, true);
         ),
         (
             r#"
-function leak(mixed $payload)
+function leak(mixed $payload): mixed[]
 {
     mixed[] $items = [$payload];
     return $items;
@@ -445,7 +445,7 @@ foreach ($items as string $item) {
         ),
         (
             r#"
-function first(mixed[] $items)
+function first(mixed[] $items): mixed
 {
     foreach ($items as mixed $item) {
         return $item;
@@ -468,7 +468,7 @@ class Box
         $this->items = [$payload];
     }
 
-    function leak()
+    function leak(): mixed
     {
         foreach ($this->items as mixed $item) {
             return $item;
@@ -490,14 +490,14 @@ echo [[$payload], [1]];
         ),
         (
             r#"
-function first(mixed[] $items)
+function first(mixed[] $items): mixed
 {
     foreach ($items as mixed $item) {
         return $item;
     }
 }
 
-function forward(mixed[] $items)
+function forward(mixed[] $items): mixed
 {
     return first($items);
 }
@@ -518,7 +518,7 @@ class Box
         $this->items = $items;
     }
 
-    function leak()
+    function leak(): mixed
     {
         foreach ($this->items as mixed $item) {
             return $item;
@@ -544,7 +544,7 @@ class Box
         $this->items = $items;
     }
 
-    function leak()
+    function leak(): mixed
     {
         foreach ($this->items as mixed $item) {
             return $item;
@@ -569,7 +569,7 @@ class Box
 {
     mixed[] $items = [sourceMixed()];
 
-    function leak()
+    function leak(): mixed
     {
         foreach ($this->items as mixed $item) {
             return $item;
@@ -589,7 +589,7 @@ class Box
     writable mixed[] $items;
 }
 
-function first(Box $box)
+function first(Box $box): mixed
 {
     foreach ($box->items as mixed $item) {
         return $item;
@@ -618,12 +618,12 @@ fn propagates_mixed_return_through_long_method_chains() {
     let mut source = String::from("class Chain\n{\n");
     for index in 0..16 {
         source.push_str(&format!(
-            "    function m{index}(mixed $value)\n    {{\n        return $this->m{}($value);\n    }}\n\n",
+            "    function m{index}(mixed $value): mixed\n    {{\n        return $this->m{}($value);\n    }}\n\n",
             index + 1
         ));
     }
     source.push_str(
-        r#"    function m16(mixed $value)
+        r#"    function m16(mixed $value): mixed
     {
         return $value;
     }
@@ -686,16 +686,16 @@ null $value = null;
 }
 
 #[test]
-fn isolates_branch_scopes_during_mixed_return_inference() {
+fn isolates_branch_scopes_with_a_written_return_contract() {
     let err = doriac::check_source(
         "test.doria",
         r#"
-function safeValue()
+function safeValue(): string
 {
     return "safe";
 }
 
-function maybeString(mixed $payload, bool $usePayload)
+function maybeString(mixed $payload, bool $usePayload): string
 {
     let writable $value = safeValue();
 
@@ -724,7 +724,7 @@ string $value = maybeString(1, false);
     );
     assert!(assignment_errors[0]
         .message
-        .contains("cannot assign value of type `mixed` to `Unknown`"));
+        .contains("cannot assign value of type `mixed` to `string`"));
 }
 
 #[test]
@@ -732,12 +732,12 @@ fn still_tracks_mixed_branch_assignments_that_can_reach_later_returns() {
     let err = doriac::check_source(
         "test.doria",
         r#"
-function safeValue()
+function safeValue(): string
 {
     return "safe";
 }
 
-function leak(mixed $payload, bool $usePayload)
+function leak(mixed $payload, bool $usePayload): string
 {
     let writable $value = safeValue();
 
@@ -762,10 +762,10 @@ string $value = leak(1, true);
     );
 }
 #[test]
-fn merges_mixed_return_shapes_before_updating_unannotated_signatures() {
-    assert_type_mismatch(
+fn rejects_incompatible_shapes_at_a_written_mixed_list_return() {
+    assert_diagnostic_code(
         r#"
-function leak(mixed $payload, bool $asList)
+function leak(mixed $payload, bool $asList): List<mixed>
 {
     if ($asList) {
         return [$payload];
@@ -776,6 +776,7 @@ function leak(mixed $payload, bool $asList)
 
 List<mixed> $payloads = leak(1, false);
 "#,
+        "E0404",
     );
 }
 
@@ -783,12 +784,12 @@ List<mixed> $payloads = leak(1, false);
 fn tracks_mixed_assignments_in_for_increments() {
     assert_type_mismatch(
         r#"
-function unknownValue()
+function unknownValue(): int
 {
     return 0;
 }
 
-function leak(mixed $payload)
+function leak(mixed $payload): int
 {
     let writable $keepGoing = true;
     let writable $value = unknownValue();
@@ -2043,8 +2044,8 @@ function chained(bool $left, bool $right): int throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn keeps_unannotated_returns_unchecked() {
-    doriac::check_source(
+fn rejects_unannotated_named_returns() {
+    let diagnostics = doriac::check_source(
         "test.doria",
         r#"
 function value()
@@ -2058,7 +2059,14 @@ function empty()
 }
 "#,
     )
-    .expect("semantic check should succeed");
+    .expect_err("D20 requires a written return type for each named function");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|finding| finding.code == "E0617")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -4061,7 +4069,7 @@ Invoice $value = new Invoice();
 fn tracks_mixed_return_through_grouped_assignment_targets() {
     assert_type_mismatch(
         r#"
-function leak(mixed $payload)
+function leak(mixed $payload): List<mixed>
 {
     let writable $items = [];
     ($items) = [$payload];
@@ -4074,10 +4082,10 @@ List<int> $items = leak("x");
 }
 
 #[test]
-fn preserves_mixed_with_empty_collection_literals_in_return_inference() {
+fn preserves_mixed_with_empty_collection_literals_at_a_written_return() {
     assert_type_mismatch(
         r#"
-function leak(mixed $payload)
+function leak(mixed $payload): List<mixed>
 {
     return [$payload, []];
 }
@@ -4088,10 +4096,10 @@ List<int> $items = leak("x");
 }
 
 #[test]
-fn allows_body_locals_to_shadow_params_during_mixed_return_inference() {
+fn allows_body_locals_to_shadow_params_with_a_written_return() {
     assert_type_mismatch(
         r#"
-function leak(int $value, mixed $payload)
+function leak(int $value, mixed $payload): mixed
 {
     let $value = $payload;
     return $value;

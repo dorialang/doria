@@ -608,13 +608,27 @@ fn assert_behavioral_panic_on_every_enabled_backend(source: &str) {
             .arg(&path)
             .output()
             .expect("run PHP panic dispatcher");
-        let _ = fs::remove_file(path);
+        let payload = fs::read(&outcome).expect("PHP panic outcome");
         let _ = fs::remove_file(outcome);
         assert_eq!(output.status.code(), Some(101));
+        assert!(payload.starts_with(b"DORIAO2\0\x02\0"), "{payload:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+
+        let human = Command::new("php")
+            .env_remove("DORIA_RUNTIME_OUTCOME_V2")
+            .env_remove("DORIA_RUNTIME_OUTCOME_V3")
+            .env_remove("DORIA_RUNTIME_OUTCOME_V4")
+            .arg(&path)
+            .output()
+            .expect("run human PHP panic dispatcher");
+        let _ = fs::remove_file(path);
+        assert_eq!(human.status.code(), Some(101));
+        assert!(human.stdout.is_empty(), "{human:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("Program Panicked"),
+            String::from_utf8_lossy(&human.stderr).contains("Program Panicked"),
             "{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&human.stderr)
         );
     }
 }
@@ -1171,6 +1185,43 @@ describe("suite", function (): void { it("case", function (): void {}); });
     assert!(diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "E0711"));
+}
+
+#[test]
+fn compiler_generated_error_edges_preserve_exact_nominal_facts() {
+    let source = r#"
+use Doria\Std\Io\{IoError, InvalidUtf8Error};
+use Doria\Std\Test\AssertionError;
+function io(take IoError $error): void throws IoError { throw $error; }
+function utf8(take InvalidUtf8Error $error): void throws InvalidUtf8Error { throw $error; }
+function assertion(take AssertionError $error): void throws AssertionError { throw $error; }
+function main(): void {}
+"#;
+    let graph = graph(source, SourceScope::Development, None);
+    let analysis = analyze_compilation_graph_for_ide(&graph);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for name in [
+        doriac::compiler_known_io::IO_ERROR,
+        doriac::compiler_known_io::INVALID_UTF8_ERROR,
+        doriac::compiler_known_test::ASSERTION_ERROR,
+    ] {
+        let class = analysis
+            .semantic_info
+            .classes
+            .iter()
+            .find(|class| class.name == name)
+            .unwrap();
+        assert!(
+            class.implements(doriac::symbols::BuiltinInterface::Error),
+            "{name}"
+        );
+    }
+    doriac::lower_compilation_graph_to_mir(&graph)
+        .expect("compiler-generated Error edges must retain reporting metadata");
 }
 
 #[test]

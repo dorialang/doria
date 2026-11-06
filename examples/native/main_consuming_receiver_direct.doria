@@ -1,0 +1,46 @@
+class Events { static writable string $text = ""; }
+function note(string $event): void { Events::text = Events::text . $event . ";"; }
+class Token {
+    function __construct(string $label) { note("new token " . $this->label); }
+    function __destruct() { note("drop token " . $this->label); }
+}
+class Product {
+    function __construct(string $label) { note("new product " . $this->label); }
+    function __destruct() { note("drop product " . $this->label); }
+}
+class Resource {
+    writable int $value = 0;
+    function __construct(string $label) { note("new resource " . $this->label); }
+    function __destruct() { note("drop resource " . $this->label); }
+    consuming function inspect(Token $argument): int {
+        note("inspect " . $this->label . " " . $argument->label);
+        return 42;
+    }
+    consuming function finish(): Product { return new Product($this->label); }
+    consuming function pass(): self { note("pass " . $this->label); return $this; }
+    consuming function setValue(int $value): self {
+        let writable $owned = $this;
+        $owned->value = $value;
+        note("set " . $owned->value);
+        return $owned;
+    }
+    consuming function close(): void { note("close " . $this->label); }
+}
+function main(): void {
+    {
+        let $argument = new Token("argument");
+        {
+            let $readonly = new Resource("readonly");
+            let $answer = $readonly->inspect($argument);
+            note("answer " . $answer);
+            let $product = (new Resource("temporary"))->finish();
+            note("product " . $product->label);
+            let $chain = (new Resource("chain"))->pass()->setValue(7)->pass();
+            note("chain live " . $chain->value);
+            $chain->close();
+            note("closed");
+        }
+        note("argument live " . $argument->label);
+    }
+    echo Events::text . "\n";
+}

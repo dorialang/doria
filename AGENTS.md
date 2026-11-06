@@ -123,7 +123,9 @@ before reporting the compiler beat complete.
 - The validator keeps reusable caches, isolates the LLVM feature graph under `target/llvm-backend`, and reclaims through `cargo clean --target-dir` only when cache identity changes, free space is critically low, or the managed target exceeds 15 GiB. Do not replace this with disposable per-run targets: repeated cold builds increase SSD writes.
 - Use `DORIA_VALIDATION_TARGET_DIR` or `--target-dir` to place the managed cache on another volume. A custom target must be dedicated to this checkout: the validator records ownership and rejects roots, repository ancestors, and nonempty unowned shared caches before cleanup. Repository layout and platform-specific absolute paths must never be assumed.
 - `php scripts/check_cargo_target_size.php` remains the non-destructive size probe. Use `php scripts/validate_work_unit.php --reclaim` for an intentional manual reclamation; do not remove `target/` recursively.
+- For selective reclamation, inspect `php scripts/validate_work_unit.php --reclaim-obsolete --plan`, then apply the exact reviewed `planId` with `--reclaim-obsolete --approve-plan <planId>`. It reclaims superseded stale workspace test executables and stale completed-link test objects from checked Cargo dependency records. It preserves libraries, incremental data, retained executables, installed tools and unrecognized files; coordinate with build owners first. An aggregate storage ceiling never authorizes clearing healthy caches, and insufficient reclaimable space leaves builds on hold.
 - Keep dev and test debug information at line-table level, dependency debug information disabled, and test incremental compilation disabled unless Andrew explicitly accepts the storage tradeoff.
+- For verified interrupted test compilations, inspect `--reclaim-interrupted --plan` and apply with `--reclaim-interrupted --approve-plan <planId>`. This separate mode requires checked workspace metadata, a retained executable, an empty completion marker and a matching invocation record. It preserves older or unrecognized objects and rejects changed proofs, held build locks and active consumers.
 
 ## Decision triage
 
@@ -304,6 +306,11 @@ These are identity, not scope deferral. They do not become available later, and 
   compiler-known readonly stored `string $message` exception. Do not infer
   structural conformance, box primitives, add runtime trait objects, or let a
   backend reconstruct conformance or flattening.
+  Decision 0139 extends explicit nominal conformance and class/trait methods
+  and computed properties with local positive `where (...)` conditions. Stored
+  state and lifecycle declarations remain unconditional. Preserve authored
+  predicates and canonical member identities; only shared checked capability
+  proofs may establish availability or a conformance witness.
 - `Displayable` requires explicit `implements Displayable` and exactly
   `function toString(): string`. It is one of Decision 0134's compiler-known
   nominal core contracts, not structural conformance or implicit string

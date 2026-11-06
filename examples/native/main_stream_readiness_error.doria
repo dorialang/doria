@@ -1,0 +1,34 @@
+use Doria\Std\Io\{IoError, IoErrorReason, IoOperation, IoTarget};
+
+function failReadiness(IoOperation $operation): void throws IoError
+{
+    throw new IoError("readiness failure", $operation, IoTarget::ReadinessSet,
+        IoErrorReason::Unsupported, 95);
+}
+
+function inspectFailure(IoOperation $operation): void
+{
+    try {
+        failReadiness($operation);
+    } catch (IoError $error) {
+        let $name = match ($error->operation) {
+            IoOperation::Register => "register",
+            IoOperation::Unregister => "unregister",
+            IoOperation::Wait => "wait",
+            default => "unexpected"
+        };
+        let $target = match ($error->target) {
+            IoTarget::ReadinessSet => "readiness set",
+            default => "unexpected"
+        };
+        echo "{$name}: {$target}; {$error->message}; {$error->systemCode ?? -1}; " .
+            ($error->transferredByteCount == null) . "\n";
+    }
+}
+
+function main(): void
+{
+    inspectFailure(IoOperation::Register);
+    inspectFailure(IoOperation::Unregister);
+    inspectFailure(IoOperation::Wait);
+}

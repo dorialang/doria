@@ -1,0 +1,345 @@
+enum Packet { case Number(int $value); case Empty; }
+function make(int $value): Packet { return Packet::Number($value); }
+function copyThroughTake(take Packet $value): Packet { return $value; }
+function number(Packet $value): int {
+    return match ($value) { Packet::Number($number) => $number, Packet::Empty => -1, };
+}
+function optionalNumber(?Packet $value): int {
+    if ($value == null) { return -1; }
+    return number($value);
+}
+class Plain {
+    static int $__doriaPropertyStorage0 = 41;
+    int $__doriaPropertyCell0 = 42;
+    writable Packet $value = Packet::Empty;
+}
+class Promoted { function __construct(writable Packet $value) {} }
+class Box<T> {
+    writable T $value;
+    function __construct(parameter take T $input) { $this->value = $input; }
+}
+class Optional { writable ?Packet $value = null; }
+class Hidden {
+    internal writable Packet $value = Packet::Empty;
+    writable function exercise(int $iterations): int {
+        let writable $index = 0;
+        let writable $sum = 0;
+        while ($index < $iterations) {
+            $this->value = make($index);
+            $sum += number($this->value);
+            $index++;
+        }
+        return $sum;
+    }
+}
+interface PacketStore { writable Packet $value { get; set (Packet $next); } }
+class Hooked implements PacketStore {
+    writable Packet $value = Packet::Empty {
+        get => $this->value;
+        set (Packet $next) => $this->value = $next;
+    }
+}
+class GenericHooked<T> {
+    writable ?T $value = null {
+        get => $this->value;
+        set (take ?T $next) => $this->value = $next;
+    }
+}
+open class BaseHooked {
+    open writable Packet $value = Packet::Empty {
+        get => $this->value;
+        set (Packet $next) => $this->value = $next;
+    }
+}
+class DerivedHooked extends BaseHooked {
+    override writable Packet $value {
+        get => make(number($this->value) + 1);
+        set (Packet $next) => $this->value = $next;
+    }
+}
+function hookedStorage(int $iterations): int {
+    let writable $holder = new Hooked();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = copyThroughTake(make($index));
+        $sum += number($holder->value);
+        $index++;
+    }
+    return $sum;
+}
+function genericHookedStorage(int $iterations): int {
+    let writable $holder = new GenericHooked<Packet>();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        let $value = $holder->value;
+        if ($value == null) { panic("hooked value absent"); }
+        $sum += number($value);
+        $index++;
+    }
+    return $sum;
+}
+function virtualHookedStorage(int $iterations): int {
+    writable BaseHooked $holder = new DerivedHooked();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += number($holder->value) - 1;
+        $index++;
+    }
+    return $sum;
+}
+function erasedHookedStorage(int $iterations): int {
+    writable PacketStore $holder = new Hooked();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += number($holder->value);
+        $index++;
+    }
+    return $sum;
+}
+function physicalStorage(int $iterations): int {
+    let writable $holder = new Plain();
+    if (Plain::__doriaPropertyStorage0 != 41 || $holder->__doriaPropertyCell0 != 42) {
+        panic("generated property helpers collided with source members");
+    }
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += number($holder->value);
+        $index++;
+    }
+    return $sum;
+}
+function promotedStorage(int $iterations): int {
+    let writable $holder = new Promoted(Packet::Empty);
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += number($holder->value);
+        $index++;
+    }
+    return $sum;
+}
+function genericStorage(int $iterations): int {
+    let writable $holder = new Box<Packet>(Packet::Empty);
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += number($holder->value);
+        $index++;
+    }
+    return $sum;
+}
+function nullableStorage(int $iterations): int {
+    let writable $holder = new Optional();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        let $snapshot = $holder->value;
+        if (null == $snapshot || $snapshot == null || null == $holder->value || $holder->value == null) {
+            panic("present field became absent");
+        }
+        $holder->value = null;
+        if (null != $holder->value || $holder->value != null) { panic("absent field stayed present"); }
+        $sum += optionalNumber($snapshot);
+        $index++;
+    }
+    if (optionalNumber($holder->value) != -1) { panic("nullable field stayed present"); }
+    return $sum;
+}
+function callbackPropertyStorage(int $iterations): int {
+    let writable $holder = new Plain();
+    let $replace = function(writable Packet $value, int $number): int {
+        $value = make($number);
+        return number($value);
+    };
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        let $snapshot = $holder->value;
+        $sum += $replace($holder->value, $index);
+        if (number($snapshot) != $index - 1 || number($holder->value) != $index) {
+            panic("property callback lost its home or Copy snapshot");
+        }
+        $index++;
+    }
+    return $sum;
+}
+function internalStorage(int $iterations): int {
+    let writable $holder = new Hidden();
+    return $holder->exercise($iterations);
+}
+open class SecretParent {
+    internal writable Packet $value = make(2);
+    function readParent(): Packet { return $this->value; }
+    writable function writeParent(Packet $next): void { $this->value = $next; }
+}
+class SecretChild extends SecretParent { writable Packet $value = make(3); }
+function shadowedStorage(int $iterations): int {
+    let writable $holder = new SecretChild();
+    if (number($holder->value) != 3 || number($holder->readParent()) != 2) {
+        panic("parent and child initializers shared storage");
+    }
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $holder->writeParent(make(0 - $index));
+        $sum += number($holder->value);
+        $index++;
+    }
+    if ($iterations > 0 && number($holder->readParent()) != 1 - $iterations) {
+        panic("parent and child updates shared storage");
+    }
+    return $sum;
+}
+function nullSafeValue(?Plain $holder): ?Packet { return $holder?->value; }
+function nullableNullSafeValue(?Optional $holder): ?Packet { return $holder?->value; }
+function genericNullSafeValue<T>(?Box<T> $holder): ?T { return $holder?->value; }
+function nullSafeStorage(int $iterations): int {
+    let writable $holder = new Plain();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += optionalNumber(nullSafeValue($holder));
+        $index++;
+    }
+    return $sum;
+}
+function nullableNullSafeStorage(int $iterations): int {
+    let writable $holder = new Optional();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += optionalNumber(nullableNullSafeValue($holder));
+        $index++;
+    }
+    return $sum;
+}
+function genericNullSafeStorage(int $iterations): int {
+    let writable $holder = new Box<Packet>(Packet::Empty);
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += optionalNumber(genericNullSafeValue($holder));
+        $index++;
+    }
+    return $sum;
+}
+class Events { static writable string $text = ""; }
+function note(string $text): void { Events::text = Events::text . $text . ";"; }
+function marked(string $text, int $value): Packet { note($text); return make($value); }
+open class Parent {
+    open writable Packet $value = marked("parent", 2) {
+        get => $this->value;
+        set (Packet $next) => $this->value = $next;
+    }
+}
+class Child extends Parent {
+    override writable Packet $value = marked("child", 3) {
+        get => $this->value;
+        set (Packet $next) { note("setter"); $this->value = $next; }
+    }
+}
+function inheritedStorage(): int {
+    let writable $holder = new Child();
+    let $snapshot = $holder->value;
+    $holder->value = make(9);
+    if (Events::text != "parent;child;setter;") { panic("backing initialization invoked a setter"); }
+    return number($snapshot) * 10 + number($holder->value);
+}
+class Failure implements Error { function __construct(string $message) {} }
+class ValidatingHooked {
+    writable Packet $value = make(7) {
+        get => $this->value;
+        set (Packet $next) throws Failure {
+            if (number($next) < 0) { throw new Failure("setter"); }
+            $this->value = $next;
+        }
+    }
+}
+function failedSetterReplacement(): int {
+    let writable $holder = new ValidatingHooked();
+    try { $holder->value = make(-1); } catch (Failure) {}
+    return number($holder->value);
+}
+function fail(): Packet throws Failure { throw new Failure("replacement"); }
+function failedReplacement(): int {
+    let writable $holder = new Plain();
+    $holder->value = make(7);
+    try { $holder->value = fail(); } catch (Failure) {}
+    return number($holder->value);
+}
+class Traced {
+    writable Packet $value = Packet::Empty {
+        get => $this->value;
+        set (Packet $next) => $this->value = $next;
+    }
+    function __destruct() { note("drop"); }
+}
+class Receiver {
+    Traced $child { get { note("receiver"); return new Traced(); } }
+}
+function rhs(): Packet { note("rhs"); return make(5); }
+function failingRhs(): Packet throws Failure { note("fail"); throw new Failure("rhs"); }
+function receiverOrder(): string {
+    Events::text = "";
+    let $receiver = new Receiver();
+    $receiver->child->value = rhs();
+    try { $receiver->child->value = failingRhs(); } catch (Failure) { note("caught"); }
+    return Events::text;
+}
+class PlainTraced {
+    Packet $value = make(7);
+    function __destruct() { note("plain drop"); number(make(99)); }
+}
+function plainReceiver(bool $present): ?PlainTraced {
+    note("plain receiver");
+    if (!$present) { return null; }
+    return new PlainTraced();
+}
+function plainRhs(): int { note("plain rhs"); return 0; }
+function failedPlainReceiver(): ?PlainTraced throws Failure {
+    note("plain fail");
+    throw new Failure("plain receiver");
+}
+function combinePlain(?Packet $value, int $other): int { return optionalNumber($value) + $other; }
+function nullableReceiverOrder(): string {
+    Events::text = "";
+    let $present = combinePlain(plainReceiver(true)?->value, plainRhs());
+    let $absent = combinePlain(plainReceiver(false)?->value, plainRhs());
+    if ($present != 7 || $absent != -1) { panic("nullable receiver lost its value"); }
+    try {
+        combinePlain(failedPlainReceiver()?->value, plainRhs());
+    } catch (Failure) { note("plain caught"); }
+    return Events::text;
+}
+function nullableFallback(): int {
+    Events::text = "";
+    let $present = number(plainReceiver(true)?->value ?? marked("fallback", 4));
+    let $absent = number(plainReceiver(false)?->value ?? marked("fallback", 4));
+    if (Events::text != "plain receiver;plain drop;plain receiver;fallback;") {
+        panic("nullable fallback evaluation changed");
+    }
+    return $present * 10 + $absent;
+}
+function main(): void {
+    echo physicalStorage(4) . ";" . promotedStorage(4) . ";" . genericStorage(4) . ";" . nullableStorage(4) . ";" . callbackPropertyStorage(4) . ";" . internalStorage(4) . ";" . shadowedStorage(4) . ";" . hookedStorage(4) . ";" . genericHookedStorage(4) . ";" . virtualHookedStorage(4) . ";" . erasedHookedStorage(4) . ";" . inheritedStorage() . ";" . failedReplacement() . ";" . failedSetterReplacement() . ";" . receiverOrder();
+    echo nullSafeStorage(4) . ";" . nullableNullSafeStorage(4) . ";" . genericNullSafeStorage(4) . ";";
+    echo optionalNumber(nullSafeValue(null)) . ";" . optionalNumber(nullableNullSafeValue(null)) . ";";
+    echo nullableReceiverOrder();
+    echo nullableFallback() . ";";
+}

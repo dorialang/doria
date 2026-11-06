@@ -1,0 +1,56 @@
+use Doria\Std\Io\{FinishOutcome, BorrowedFinishOutcome};
+
+class Drops {
+    static writable int $sources = 0;
+    static writable int $writers = 0;
+}
+
+class Source {
+    function __construct(int $id) {}
+    function __destruct(): void { Drops::sources++; }
+}
+
+class Writer {
+    function __construct(int $retained) {}
+    function __destruct(): void { Drops::writers++; }
+}
+
+function finish(take Writer $writer): FinishOutcome<Source, Writer> {
+    if ($writer->retained == 0) {
+        return FinishOutcome::Complete(new Source(1));
+    }
+    return FinishOutcome::Pending($writer);
+}
+
+function finishBorrowed(take Writer $writer): BorrowedFinishOutcome<Writer> {
+    if ($writer->retained == 0) {
+        return BorrowedFinishOutcome::Complete;
+    }
+    return BorrowedFinishOutcome::Pending($writer);
+}
+
+function counts(int $left, int $right): FinishOutcome<int, int> {
+    return $left > $right ? FinishOutcome::Complete($left) : FinishOutcome::Pending($right);
+}
+
+function main(): void {
+    echo match (finish(new Writer(0))) {
+        FinishOutcome::Complete($source) => "complete" . $source->id . ";",
+        FinishOutcome::Pending($writer) => "pending" . $writer->retained . ";",
+    };
+    echo match (finish(new Writer(2))) {
+        FinishOutcome::Complete($source) => "complete" . $source->id . ";",
+        FinishOutcome::Pending($writer) => "pending" . $writer->retained . ";",
+    };
+    echo match (finishBorrowed(new Writer(3))) {
+        BorrowedFinishOutcome::Complete => "done;",
+        BorrowedFinishOutcome::Pending($writer) => "retry" . $writer->retained . ";",
+    };
+    let $copy = counts(4, 1);
+    let $again = $copy;
+    echo match ($again) {
+        FinishOutcome::Complete($value) => "copy" . $value,
+        FinishOutcome::Pending($value) => "wait" . $value,
+    };
+    echo ";" . Drops::sources . ":" . Drops::writers . "\n";
+}

@@ -17,6 +17,7 @@ llvm-backend = ["dep:inkwell"]
 
 [dependencies]
 doria-diagnostic-catalogue = { path = "../doria-diagnostic-catalogue" }
+doria-time = { path = "../doria-time" }
 cranelift-codegen = "0.134.2"
 cranelift-frontend = "0.134.2"
 cranelift-module = "0.134.2"

@@ -27,7 +27,7 @@ impl From<Source> for Value {
 
 impl Checker<'_> {
     pub(super) fn blocking_cleanups(
-        &self,
+        &mut self,
         graph: &mut Graph,
         cleanup: &Analysis,
         partial_cleanups: &[crate::constructor_init::ConstructorPartialCleanup],
@@ -46,7 +46,7 @@ impl Checker<'_> {
                     graph.unpacked_fields.insert((
                         Value::Expression(*scrutinee),
                         (*source).into(),
-                        PayloadField {
+                        StoredField::Payload {
                             case: *case,
                             index: *field,
                         },
@@ -65,7 +65,7 @@ impl Checker<'_> {
                 graph.unpacked_fields.insert((
                     Value::Expression(scrutinee),
                     value.source.into(),
-                    PayloadField { case, index: field },
+                    StoredField::Payload { case, index: field },
                 ));
             }
         }
@@ -78,15 +78,34 @@ impl Checker<'_> {
             self.connect_cleanup(graph, release.owner, release.site, effects);
         }
         for release in partial_cleanups {
+            let Some(name) = self.classes.iter().find_map(|(name, class)| {
+                (class.declaration == release.class).then_some(name.clone())
+            }) else {
+                continue;
+            };
+            let ty = self.symbolic_class_type(&name);
+            let Some(class) = self.class_type(ty) else {
+                continue;
+            };
+            let mut owners = vec![class.clone()];
+            owners.extend(self.specialized_ancestor_types(&class));
             let mut effects = Effects::default();
             for declaration in &release.initialized_properties {
-                if let Some(property) = self
-                    .classes
-                    .values()
-                    .flat_map(|class| class.properties.values())
-                    .find(|property| property.declaration_span == *declaration)
-                {
-                    if !property.borrowed_source {
+                // Physical declaration identity selects storage; the releasing
+                // class's ancestor view supplies its lexical type bindings.
+                let property = owners.iter().find_map(|owner| {
+                    self.classes.get(&owner.name).and_then(|class| {
+                        class
+                            .properties
+                            .values()
+                            .find(|property| property.declaration_span == *declaration)
+                            .cloned()
+                            .map(|property| (owner.clone(), property))
+                    })
+                });
+                if let Some((owner, property)) = property {
+                    let property = self.specialize_property_for_class(&property, &owner);
+                    if property.borrowed_source.is_none() {
                         self.drop_effects(
                             &self.types.resolved(property.ty),
                             Value::Property(*declaration),
@@ -234,6 +253,7 @@ impl Checker<'_> {
             {
                 generic_owner = true;
                 let method_bindings = pending
+                    .inference
                     .bindings
                     .iter()
                     .map(|(name, ty)| (name.clone(), self.types.resolved(*ty)))
@@ -270,10 +290,6 @@ impl Checker<'_> {
         visited: &mut HashSet<ResolvedType>,
         effects: &mut Effects,
     ) {
-        if crate::types::resolved_type_is_symbolic(ty) {
-            effects.generic.push((ty.clone(), source));
-            return;
-        }
         if !visited.insert(ty.clone()) {
             return;
         }
@@ -305,6 +321,13 @@ impl Checker<'_> {
                     effects.unknown = true;
                     return;
                 };
+                if class.declaration.source == crate::compiler_known_stream::SOURCE_ID
+                    && crate::compiler_known_stream::cleanup_may_block(&class_type.name)
+                {
+                    effects
+                        .targets
+                        .insert((class.declaration, class_type.clone()));
+                }
                 if let Some(destructor) = class.methods.get("__destruct") {
                     effects
                         .targets
@@ -317,7 +340,7 @@ impl Checker<'_> {
                     .zip(class_type.arguments.iter().cloned())
                     .collect::<HashMap<_, _>>();
                 for property in class.properties.values() {
-                    if property.borrowed_source
+                    if property.borrowed_source.is_some()
                         || property.hooks.as_ref().is_some_and(|hooks| {
                             hooks.storage
                                 == Some(crate::property_hooks::PropertyHookStorage::Computed)
@@ -354,6 +377,10 @@ impl Checker<'_> {
                 }
             }
             ResolvedType::Interface(interface) => {
+                if crate::types::resolved_type_is_symbolic(ty) {
+                    effects.generic.push((ty.clone(), source));
+                    return;
+                }
                 let implementations = self
                     .contracts
                     .conformances
@@ -381,17 +408,18 @@ impl Checker<'_> {
                     }
                 }
             }
-            ResolvedType::Mixed
-            | ResolvedType::Error
-            | ResolvedType::TypeParameter(_)
+            ResolvedType::TypeParameter(_)
             | ResolvedType::InterfaceSelf(_)
-            | ResolvedType::TraitSelf(_)
-            | ResolvedType::Unsupported => effects.unknown = true,
+            | ResolvedType::TraitSelf(_) => effects.generic.push((ty.clone(), source)),
+            ResolvedType::Mixed | ResolvedType::Error | ResolvedType::Unsupported => {
+                effects.unknown = true
+            }
             ResolvedType::Void
             | ResolvedType::Integer(_)
             | ResolvedType::Float(_)
             | ResolvedType::String
             | ResolvedType::Bytes
+            | ResolvedType::ByteRegion(_)
             | ResolvedType::Bool
             | ResolvedType::Null => {}
         }

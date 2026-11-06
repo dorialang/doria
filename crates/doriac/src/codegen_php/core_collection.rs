@@ -50,12 +50,71 @@ pub(super) fn receiver(expr: &Expr, null_safe: bool, scopes: &PhpNameScopes) -> 
     }
 }
 
+pub(super) fn borrowed_cell(expr: &Expr, scopes: &PhpNameScopes) -> Option<String> {
+    let (object, member, key, null_safe) = match expr {
+        Expr::PropertyAccess {
+            object,
+            property,
+            null_safe,
+            ..
+        } => (object.as_ref(), property.as_str(), None, *null_safe),
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe,
+            ..
+        } if args.len() == 1 => (
+            object.as_ref(),
+            method.as_str(),
+            Some(&args[0].value),
+            *null_safe,
+        ),
+        _ => return None,
+    };
+    let ty = scopes.expression_types.get(&object.span())?;
+    if !crate::types::CollectionFamily::from_resolved(ty)?.borrows_element(member) {
+        return None;
+    }
+    let ty = receiver_type(ty);
+    let value = if uses(ty)
+        || !matches!(
+            ty,
+            ResolvedType::List(_) | ResolvedType::Set(_) | ResolvedType::Dictionary(_, _)
+        ) {
+        let source = receiver(object, null_safe, scopes);
+        let operator = if null_safe { "?->" } else { "->" };
+        if let Some(key) = key {
+            format!(
+                "{source}{operator}__doriaBorrowCell({}, 0, 0, '', true)",
+                emit_expr(key, scopes)
+            )
+        } else {
+            format!("{source}{operator}__doriaBorrowElementCell('{}')", member)
+        }
+    } else {
+        let home = emit_receiver_borrow_home(object, null_safe, scopes);
+        let key = key.map_or_else(|| "null".into(), |key| emit_expr(key, scopes));
+        format!(
+            "__doria_collection_optional_cell({home}, '{}', {key})",
+            member
+        )
+    };
+    Some(if null_safe {
+        format!("({value} ?? new __DoriaCell(null))")
+    } else {
+        value
+    })
+}
+
 fn duplicate(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
-    if scopes
+    if owns_copy_claim(ty, scopes) {
+        emit_php_string_literal("__doria_copy_value")
+    } else if scopes
         .specialization
         .core_capability(ty, CoreValueOperation::Clone)
     {
-        "static fn($value) => $value === null ? null : $value->clone()".into()
+        emit_php_string_literal(&core_value::helper(ty, CoreValueOperation::Clone, scopes))
     } else {
         "null".into()
     }
@@ -68,18 +127,29 @@ fn create(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
         .specialization
         .core_capability(compared, CoreValueOperation::Equal)
     {
-        "static fn($left, $right) => $left->equals($right)"
+        emit_php_string_literal(&core_value::helper(
+            compared,
+            CoreValueOperation::Equal,
+            scopes,
+        ))
     } else {
-        "static fn($left, $right) => $left === $right"
+        emit_php_string_literal("__doria_core_identical")
     };
     let hash = if mode < 2 {
-        "static fn($value) => $value->hash()"
+        emit_php_string_literal(&core_value::helper(
+            compared,
+            CoreValueOperation::Hash,
+            scopes,
+        ))
     } else {
-        "null"
+        "null".into()
     };
     let compare = if mode >= 2 {
-        let ordering = php_type_symbol("Ordering");
-        format!("static function ($left, $right): int {{ $order = $left->compare($right); return $order === {ordering}::Less ? -1 : ($order === {ordering}::Greater ? 1 : 0); }}")
+        emit_php_string_literal(&core_value::helper(
+            compared,
+            CoreValueOperation::Compare,
+            scopes,
+        ))
     } else {
         "null".to_string()
     };
@@ -90,16 +160,14 @@ fn create(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
     )
 }
 
-fn temporary_cell(value: String, span: Span, role: &str, scopes: &PhpNameScopes) -> String {
+pub(super) fn temporary_cell(
+    value: String,
+    span: Span,
+    role: &str,
+    scopes: &PhpNameScopes,
+) -> String {
     let name = scopes.expression_temp(role, span);
-    let mut temporaries = scopes
-        .expression_temporaries
-        .as_ref()
-        .expect("expression cleanup scope")
-        .borrow_mut();
-    if !temporaries.contains(&name) {
-        temporaries.push(name.clone());
-    }
+    scopes.track_expression_temporary(PhpExpressionTemporary::Owned(name.clone()));
     format!("(${name} = new __DoriaCell({value}))")
 }
 
@@ -129,13 +197,32 @@ pub(super) fn expression(expr: &Expr, scopes: &PhpNameScopes) -> Option<String> 
                     .map_or("null".into(), |key| owned_cell(key, scopes));
                 let value = owned_cell(&element.value, scopes);
                 output = format!("__doria_core_insert({output}, {key}, {value})");
+                if let Some(key) = &element.key {
+                    // MIR owns literal insertion callbacks at the authored key.
+                    // Nested key/value calls must restore that insertion site.
+                    output = diagnostic_sites::operation(output, key.span(), scopes);
+                }
             }
             Some(format!("__doria_take_cell({output})"))
         }
         Expr::StaticCall {
-            method, args, span, ..
-        } if method == "from" && args.len() == 1 => {
+            class_name,
+            method,
+            args,
+            span,
+            ..
+        } if matches!(
+            class_name.as_str(),
+            "Set" | "SortedDictionary" | "SortedSet" | "PriorityQueue"
+        ) && method == "from"
+            && args.len() == 1 =>
+        {
             let ty = scopes.expression_types.get(span).filter(|ty| uses(ty))?;
+            let source = expression_region::ungrouped(&args[0].value);
+            // An empty constructor input has no independent collection or callbacks.
+            if matches!(source, Expr::Array { elements, .. } if elements.is_empty()) {
+                return Some(create(ty, scopes));
+            }
             Some(format!(
                 "({})->fromSource({})",
                 create(ty, scopes),
@@ -222,8 +309,8 @@ pub(super) fn expression(expr: &Expr, scopes: &PhpNameScopes) -> Option<String> 
                 "{}->required({}, {}, {}, {})",
                 receiver(collection, false, scopes),
                 emit_expr(index, scopes),
-                php_source_location(*span, span.start),
-                php_source_location(*span, span.end),
+                scopes.source_location(*span, span.start),
+                scopes.source_location(*span, span.end),
                 scopes.callable_identity()
             ))
         }
@@ -336,6 +423,19 @@ final class __DoriaCoreCollection extends __DoriaOrderedCollection implements It
         if ($index < 0) { __doria_panic('P1312', $start, $end, null, $callable); }
         return $this->entries[$index][1];
     }
+    public function __doriaBorrowCell(mixed $key, int $start, int $end, string $callable, bool $optional = false): __DoriaCell
+    {
+        [$index] = $this->locate($key);
+        if ($index < 0 && $optional) { return new __DoriaCell(null); }
+        if ($index < 0) { __doria_panic('P1312', $start, $end, null, $callable); }
+        return __DoriaCell::borrowed($this->entries[$index][1]);
+    }
+    public function __doriaBorrowElementCell(string $member): __DoriaCell
+    {
+        if (!$this->entries) { return new __DoriaCell(null); }
+        $index = $member === 'last' ? array_key_last($this->entries) : array_key_first($this->entries);
+        return __DoriaCell::borrowed($this->entries[$index][1]);
+    }
     public function containsKey(mixed $key): bool { return $this->locate($key)[0] >= 0; }
     public function contains(mixed $key): bool
     {
@@ -436,7 +536,7 @@ final class __DoriaCoreCollection extends __DoriaOrderedCollection implements It
             $key = $this->duplicateKey === null ? $entry[0] : ($this->duplicateKey)($entry[0]);
             $value = $this->duplicateValue === null ? $entry[1] : ($this->duplicateValue)($entry[1]);
             return [$key, $value];
-        } catch (__DoriaCheckedError $error) { __doria_drop_value($key); throw $error; }
+        } catch (__DoriaCheckedError $error) { __doria_drop_value($key); __doria_rethrow_checked_error($error); }
     }
     public function fromSource(mixed $source): self
     {
@@ -467,7 +567,7 @@ final class __DoriaCoreCollection extends __DoriaOrderedCollection implements It
                 }
             }
             return $this;
-        } catch (__DoriaCheckedError $error) { $this->clear(); throw $error; }
+        } catch (__DoriaCheckedError $error) { $this->clear(); __doria_rethrow_checked_error($error); }
     }
 
     private function appendDuplicate(array $entry): void
@@ -481,7 +581,7 @@ final class __DoriaCoreCollection extends __DoriaOrderedCollection implements It
         } catch (__DoriaCheckedError $error) {
             __doria_drop_value($entry[1]);
             __doria_drop_value($entry[0]);
-            throw $error;
+            __doria_rethrow_checked_error($error);
         }
     }
     private function algebra(self $other, string $operation): self
@@ -502,7 +602,7 @@ final class __DoriaCoreCollection extends __DoriaOrderedCollection implements It
                 self::sort(count($result->entries), fn($left, $right) => $result->comparePositions($left, $right), fn($left, $right) => $result->swap($left, $right));
             }
             return $result;
-        } catch (__DoriaCheckedError $error) { $result->clear(); throw $error; }
+        } catch (__DoriaCheckedError $error) { $result->clear(); __doria_rethrow_checked_error($error); }
     }
     public function union(self $other): self { return $this->algebra($other, 'union'); }
     public function intersect(self $other): self { return $this->algebra($other, 'intersect'); }

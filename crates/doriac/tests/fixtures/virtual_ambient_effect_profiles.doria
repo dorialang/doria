@@ -1,0 +1,45 @@
+open class Root
+{
+    int $seed = 3;
+    function __construct() { $this->value(); }
+    function __destruct() { $this->value(); }
+    open function value(): int { return $this->seed; }
+}
+
+open class Middle extends Root
+{
+    override function value(): int { echo "m"; return 7; }
+    function exact(): int { return parent::value(); }
+    int $number { get { return parent::value(); } }
+}
+
+class Leaf extends Middle
+{
+    override function value(): int { return $this->seed + 6; }
+}
+
+class Sibling extends Root
+{
+    override function value(): int { return $this->seed + 2; }
+}
+
+function catches(Root $source): int
+{
+    try { $source->value(); } catch (Error) {}
+    return 4;
+}
+
+function main(): void
+{
+    Root $source = new Middle();
+    echo $source->value();
+    Middle $middle = new Leaf();
+    echo $middle->value();
+    echo $middle->exact();
+    let $leaf = new Leaf();
+    echo $leaf->value();
+    let $sibling = new Sibling();
+    echo $sibling->value();
+    echo $middle->number;
+    echo catches($source);
+}

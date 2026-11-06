@@ -1,0 +1,45 @@
+interface Read { function value(): int; }
+
+class Reader implements Read {
+    function value(): int { return 7; }
+    function __destruct() { try { echo "c"; } catch (Error) {} }
+}
+open class OpenReader implements Read {
+    open function value(): int { return 7; }
+    function __destruct() { try { echo "o"; } catch (Error) {} }
+}
+class LeafReader extends OpenReader { override function value(): int { return 9; } }
+
+open class Root
+{
+    open function closed(): Read { return new Reader(); }
+    open function openView(): Read { return new OpenReader(); }
+}
+
+open class Child extends Root
+{
+    override function closed(): Reader { return new Reader(); }
+    override function openView(): OpenReader { return new LeafReader(); }
+}
+
+function throughRoot(Root $source): void
+{
+    let $closed = $source->closed();
+    echo $closed->value();
+    let $open = $source->openView();
+    echo $open->value();
+}
+
+function throughChild(Child $source): void
+{
+    let $closed = $source->closed();
+    echo $closed->value();
+    let $open = $source->openView();
+    echo $open->value();
+}
+
+function main(): void
+{
+    throughRoot(new Child());
+    throughChild(new Child());
+}

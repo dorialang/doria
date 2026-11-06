@@ -1,0 +1,18 @@
+enum Packet { case Number(int $count); case Empty; }
+class State { static writable int $finalizations = 0; }
+function loopExits(): int {
+    State::finalizations = 0;
+    let writable $index = 0;
+    let writable $total = 0;
+    while ($index < 4) {
+        $index++;
+        let $value = when ($index == 1): Packet { continue; }
+            else when ($index == 3) { break; }
+            else { return Packet::Number($index); }
+            finally { State::finalizations++; };
+        let $count = match ($value) { Packet::Number($number) => $number, default => -100, };
+        $total += $count;
+    }
+    return $total + State::finalizations * 10 + $index;
+}
+function main(): void { echo loopExits() . "\n"; }

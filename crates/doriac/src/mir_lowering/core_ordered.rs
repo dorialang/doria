@@ -63,12 +63,13 @@ fn element(
     collection: mir::LocalId,
     definition: &mir::CollectionType,
     position: mir::LocalId,
+    span: Span,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<Value> {
     let value = if let Some(key) = definition.key {
         core_collection::key_at(collection, position, key, context)
     } else {
-        core_collection::value_at(collection, position, definition.value, context)?
+        core_collection::value_at(collection, position, definition.value, span, context)?
     };
     Ok(core_value::materialize_value(value, context))
 }
@@ -157,7 +158,7 @@ pub(super) fn lookup(
         ),
         context,
     );
-    let value = element(collection, definition, middle, context)?;
+    let value = element(collection, definition, middle, span, context)?;
     let compared = ordering(value, needle, span, context)?;
     context.terminate_current(mir::Terminator::Branch {
         condition: is_ordering(compared, "Less", context),
@@ -181,7 +182,7 @@ pub(super) fn lookup(
         else_block: exit,
     });
     context.current_block = Some(candidate);
-    let value = element(collection, definition, low, context)?;
+    let value = element(collection, definition, low, span, context)?;
     let compared = ordering(value, needle, span, context)?;
     context.terminate_current(mir::Terminator::Branch {
         condition: is_ordering(compared, "Equal", context),
@@ -398,7 +399,7 @@ pub(super) fn push(
         ),
         context,
     );
-    let stored = element(collection, definition, parent, context)?;
+    let stored = element(collection, definition, parent, span, context)?;
     let compared = ordering(value, stored, span, context)?;
     context.terminate_current(mir::Terminator::Branch {
         condition: is_ordering(compared, "Less", context),
@@ -416,6 +417,7 @@ pub(super) fn push(
             key: None,
             value: value.0,
             hash: None,
+            storage_origin: Some(span),
         },
         context,
     );
@@ -478,8 +480,8 @@ pub(super) fn pop(
         false,
         span,
         &mut |left, right, context| {
-            let left = element(collection, definition, left, context)?;
-            let right = element(collection, definition, right, context)?;
+            let left = element(collection, definition, left, span, context)?;
+            let right = element(collection, definition, right, span, context)?;
             ordering(left, right, span, context)
         },
         context,
@@ -535,13 +537,14 @@ fn append_duplicate(
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<()> {
     let key = if let Some(ty) = definition.key {
-        let key = collection_key_at_rvalue(source, collection_offset_rvalue(index), ty, context)?;
+        let key =
+            collection_key_at_rvalue(source, collection_offset_rvalue(index), ty, span, context)?;
         let key = core_value::duplicate(key, span, context)?;
         Some(core_value::materialize_value(key, context).0)
     } else {
         None
     };
-    let value = core_collection::value_at(source, index, definition.value, context)?;
+    let value = core_collection::value_at(source, index, definition.value, span, context)?;
     let value = core_value::duplicate(value, span, context)?;
     let value = core_value::materialize_value(value, context).0;
     let position = slot(length(output), context);
@@ -552,6 +555,7 @@ fn append_duplicate(
             key,
             value,
             hash: None,
+            storage_origin: None,
         },
         context,
     );
@@ -577,8 +581,8 @@ pub(super) fn preserving_from(
             false,
             span,
             &mut |left, right, context| {
-                let left = element(output, &definition, left, context)?;
-                let right = element(output, &definition, right, context)?;
+                let left = element(output, &definition, left, span, context)?;
+                let right = element(output, &definition, right, span, context)?;
                 ordering(left, right, span, context)
             },
             &mut |left, right, context| raw_swap(output, left, right, context),
@@ -591,6 +595,7 @@ pub(super) fn preserving_from(
         let indices = empty(scratch_id, context);
         core_collection::walk(source, span, context, |index, context| {
             context.push_statement(mir::Statement::CollectionAdd {
+                span,
                 collection: indices,
                 value: collection_offset_rvalue(index),
                 index: None,
@@ -600,26 +605,28 @@ pub(super) fn preserving_from(
         })?;
         let read_index =
             |index, context: &mut LoweringContext<'_>| -> DiagnosticResult<mir::LocalId> {
-                let value = core_collection::value_at(indices, index, int_ty, context)?;
+                let value = core_collection::value_at(indices, index, int_ty, span, context)?;
                 Ok(core_value::materialize_value(value, context).0)
             };
         let mut compare = |left, right, context: &mut LoweringContext<'_>| {
             let left = read_index(left, context)?;
             let right = read_index(right, context)?;
-            let left = element(source, &definition, left, context)?;
-            let right = element(source, &definition, right, context)?;
+            let left = element(source, &definition, left, span, context)?;
+            let right = element(source, &definition, right, span, context)?;
             ordering(left, right, span, context)
         };
         let mut swap = |left, right, context: &mut LoweringContext<'_>| {
             let a = read_index(left, context)?;
             let b = read_index(right, context)?;
             context.push_statement(mir::Statement::AssignCollectionIndex {
+                index_span: span,
                 positional: true,
                 collection: indices,
                 index: collection_offset_rvalue(left),
                 value: collection_offset_rvalue(b),
             });
             context.push_statement(mir::Statement::AssignCollectionIndex {
+                index_span: span,
                 positional: true,
                 collection: indices,
                 index: collection_offset_rvalue(right),
@@ -667,8 +674,8 @@ pub(super) fn preserving_from(
                     else_block: append,
                 });
                 context.current_block = Some(compare);
-                let left = element(source, &definition, previous, context)?;
-                let right = element(source, &definition, index, context)?;
+                let left = element(source, &definition, previous, span, context)?;
+                let right = element(source, &definition, index, span, context)?;
                 let compared = ordering(left, right, span, context)?;
                 context.terminate_current(mir::Terminator::Branch {
                     condition: is_ordering(compared, "Equal", context),
@@ -702,8 +709,8 @@ pub(super) fn sort(
 ) -> DiagnosticResult<()> {
     let count = slot(length(collection), context);
     let mut compare = |left, right, context: &mut LoweringContext<'_>| {
-        let left = element(collection, definition, left, context)?;
-        let right = element(collection, definition, right, context)?;
+        let left = element(collection, definition, left, span, context)?;
+        let right = element(collection, definition, right, span, context)?;
         ordering(left, right, span, context)
     };
     let mut swap =

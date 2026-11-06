@@ -1,0 +1,16 @@
+interface Ready { function ready(): int; }
+interface Pending extends Ready { function prepare(): int; }
+class Adapter<T> implements Ready where (T implements Ready), Pending where (T implements Pending) {
+    T $source;
+    function __construct(parameter take T $source) { $this->source = $source; }
+    function ready(): int where (T implements Ready) { return $this->source->ready(); }
+    function prepare(): int where (T implements Pending) { return $this->source->prepare(); }
+    int $state where (T implements Ready) { get { return 1; } }
+    static function inspect<U>(U $source): int where (U implements Ready) { return $source->ready(); }
+}
+trait Inspection<T> {
+    function inspect(T $source): int where (T implements Ready) { return $source->ready(); }
+    int $state where (T implements Ready) { get { return 1; } }
+}
+function where(int $value): int { return $value; }
+function main(): void {}

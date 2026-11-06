@@ -44,6 +44,9 @@ pub enum FieldType {
     Collection,
     Function,
     NullableFunction,
+    ByteRegion(crate::types::ByteRegionKind),
+    NullableByteRegion(crate::types::ByteRegionKind),
+    RetainedPlace,
     Aggregate { size: u32, align: u32 },
 }
 
@@ -137,10 +140,13 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableError
         | FieldType::Function
         | FieldType::NullableFunction
+        | FieldType::ByteRegion(_)
         | FieldType::SharedInterface
         | FieldType::OpenClass(_)
         | FieldType::NullableOpenClass(_) => (pointer_size * 2, pointer_size),
-        FieldType::String
+        FieldType::NullableByteRegion(_) => (pointer_size * 3, pointer_size),
+        FieldType::RetainedPlace
+        | FieldType::String
         | FieldType::Mixed
         | FieldType::NullableMixed
         | FieldType::Class(_)

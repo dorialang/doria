@@ -1,5 +1,52 @@
 use doriac::backend::BackendTarget;
 
+#[test]
+fn owned_copy_enum_captures_acquire_payload_ownership() {
+    use doriac::mir::{
+        ClosureCaptureOperand, FunctionExpression, PayloadEnumUseMode, Rvalue, Statement,
+    };
+    let hir = doriac::lower_source(
+        "copy-capture.doria",
+        r#"
+enum Message { case Text(string $text); }
+function main(): void {
+    let $message = Message::Text("a" . "b");
+    let $read = function(): Message with (take $message) { return $message; };
+}
+"#,
+    )
+    .unwrap();
+    let mut program = doriac::mir_lowering::lower_program(&hir).unwrap();
+    let capture = program
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value: Rvalue::Function(FunctionExpression::Create { captures, .. }),
+                ..
+            } => captures.first_mut(),
+            _ => None,
+        })
+        .unwrap();
+    let ClosureCaptureOperand::CopyValue(Rvalue::PayloadEnum(
+        doriac::mir::PayloadEnumExpression::Use { mode, .. },
+    )) = capture
+    else {
+        panic!("expected an owned Copy enum capture");
+    };
+    assert_eq!(*mode, PayloadEnumUseMode::Copy);
+    *mode = PayloadEnumUseMode::Borrow;
+    let error = doriac::mir_validation::validate_program(&program).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("owned capture uses a borrowed value"),
+        "{error:?}"
+    );
+}
+
 fn debug(source: &str) -> String {
     doriac::compile_source_to_debug("stage30d.doria", source)
         .unwrap_or_else(|diagnostics| panic!("Stage 30d source should execute: {diagnostics:#?}"))
@@ -346,6 +393,7 @@ function main(): void
             source: doriac::mir::BorrowSource::Parameter(0),
             writable: false,
             kind: doriac::types::ReturnBorrowKind::Retained,
+            lifetime: doriac::types::RetainedLifetime::LastUse,
         })
     );
 }

@@ -359,7 +359,7 @@ fn arm_results_share_one_strict_type_with_nullable_unification() {
         "E0403",
     );
     assert_code(
-        "function f(bool $v) { return match ($v) { true => null, false => null, }; }",
+        "function f(bool $v): void { let $empty = match ($v) { true => null, false => null, }; }",
         "E0592",
     );
     assert_code(

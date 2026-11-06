@@ -1,4 +1,6 @@
 use super::*;
+pub(super) use crate::mir::return_adaptation::convert_value;
+pub(super) use crate::mir::value_factory::direct_call_result;
 use crate::semantics::contracts::{ConformanceStatus, RequirementFacts};
 use crate::types::{
     FunctionBorrowSource, FunctionInvocationMode, FunctionReturnBorrow, FunctionTypeParameterMode,
@@ -35,90 +37,6 @@ pub(super) fn collection_vtable(
                 "collection has no checked implementation of this interface",
             )]
         })
-}
-
-pub(super) fn convert_value(
-    value: mir::Rvalue,
-    target: mir::Type,
-    span: Span,
-    context: &LoweringContext<'_>,
-) -> DiagnosticResult<mir::Rvalue> {
-    let (target_type, nullable) = non_null_match_type(target);
-    let mir::Type::Interface(interface) = target_type else {
-        unreachable!("interface result conversion")
-    };
-    let upcast = |source: mir::InterfaceTypeId| {
-        source == interface
-            || context.collection_registry.interface_types[source.0]
-                .ancestors
-                .contains(&interface)
-    };
-    let value = match value {
-        value @ (mir::Rvalue::Collection(_) | mir::Rvalue::NullableCollection(_)) => {
-            let (mir::Type::Collection(collection), source_nullable) =
-                non_null_match_type(value.ty())
-            else {
-                unreachable!()
-            };
-            if source_nullable && !nullable {
-                return Err(vec![unsupported(
-                    span,
-                    "nullable collection requires a presence proof before interface conversion",
-                )]);
-            }
-            mir::InterfaceValue::FromCollection {
-                vtable: collection_vtable(collection, interface, span, context)?,
-                value: Box::new(value),
-            }
-        }
-        mir::Rvalue::Class(object) => mir::InterfaceValue::FromClass {
-            vtable: context.class_interface_vtable(object.class(), interface, span)?,
-            object: Box::new(object),
-        },
-        mir::Rvalue::NullableClass(object) if nullable => {
-            return Ok(mir::Rvalue::nullable_interface(
-                interface,
-                mir::NullableInterfaceValue::Present(mir::InterfaceValue::FromNullableClass {
-                    vtable: context.class_interface_vtable(object.class(), interface, span)?,
-                    object: Box::new(object),
-                }),
-            ));
-        }
-        mir::Rvalue::Interface(source) if upcast(source.interface) => {
-            if source.interface == interface {
-                source.value
-            } else {
-                mir::InterfaceValue::Upcast {
-                    source: Box::new(source),
-                    interface,
-                }
-            }
-        }
-        mir::Rvalue::NullableInterface(source) if nullable && upcast(source.interface) => {
-            return Ok(if source.interface == interface {
-                mir::Rvalue::NullableInterface(source)
-            } else {
-                mir::Rvalue::nullable_interface(
-                    interface,
-                    mir::NullableInterfaceValue::Upcast {
-                        source: Box::new(source),
-                        interface,
-                    },
-                )
-            });
-        }
-        _ => {
-            return Err(vec![unsupported(
-                span,
-                "call result has no checked conversion to the required interface",
-            )])
-        }
-    };
-    Ok(if nullable {
-        mir::Rvalue::nullable_interface(interface, mir::NullableInterfaceValue::Present(value))
-    } else {
-        mir::Rvalue::interface(interface, value)
-    })
 }
 
 pub(super) fn call_plan(
@@ -207,7 +125,11 @@ pub(super) fn materialize_lowered_call(
         .clone();
     let writable = definition.parameters[0].mode == mir::FunctionParameterMode::Writable;
     let local = materialize_call_receiver(receiver, writable, context);
-    let mut lowered = vec![local_rvalue(local, mir::Type::Interface(interface), false)];
+    let mut lowered = vec![local_rvalue(
+        local,
+        mir::Type::Interface(interface),
+        definition.parameters[0].mode == mir::FunctionParameterMode::Take,
+    )];
     lowered.extend(args);
     emit_indirect_call(
         mir::IndirectCallee::InterfaceMethod {
@@ -260,10 +182,11 @@ pub(super) fn materialize_call(
         .0]
         .clone();
     materialize_nested_collection_places(object, false, context)?;
+    let consuming = definition.parameters[0].mode == mir::FunctionParameterMode::Take;
     if *null_safe {
         let receiver = mir::Rvalue::nullable_interface(
             interface,
-            lower_nullable_interface_expression(object, interface, false, context)?,
+            lower_nullable_interface_expression(object, interface, consuming, context)?,
         );
         let writable = definition.parameters[0].mode == mir::FunctionParameterMode::Writable;
         let result = match definition.return_type {
@@ -281,7 +204,7 @@ pub(super) fn materialize_call(
                 materialize_receiver_call(
                     mir::InterfaceValue::NullableLocalAssumeNonNull {
                         local: receiver,
-                        transfer: false,
+                        transfer: consuming,
                     },
                     interface,
                     plan,
@@ -296,7 +219,7 @@ pub(super) fn materialize_call(
             context,
         );
     }
-    let value = lower_interface_expression(object, interface, false, context)?;
+    let value = lower_interface_expression(object, interface, consuming, context)?;
     materialize_receiver_call(
         value,
         interface,
@@ -328,7 +251,7 @@ fn materialize_receiver_call(
     let mut lowered = vec![local_rvalue(
         receiver,
         mir::Type::Interface(interface),
-        false,
+        definition.parameters[0].mode == mir::FunctionParameterMode::Take,
     )];
     lowered.extend(lower_call_args_with_ownership(
         method,
@@ -498,14 +421,22 @@ pub(super) fn register_methods(
                 registry.interface_types[interface.0]
                     .methods
                     .push(mir::InterfaceMethod {
-                        requirement: requirement.origins[0].declaration,
+                        requirement_origins: requirement
+                            .origins
+                            .iter()
+                            .map(|origin| origin.declaration)
+                            .collect(),
                         name: requirement.accessor.map_or_else(
                             || requirement.name.clone(),
                             |kind| crate::property_hooks::accessor_name(&requirement.name, kind),
                         ),
                         arguments: mir_arguments,
                         signature,
-                        writable_receiver: requirement.writable_receiver,
+                        receiver_mode: match requirement.receiver_mode {
+                            crate::symbols::ReceiverMode::Readonly => mir::ReceiverMode::Readonly,
+                            crate::symbols::ReceiverMode::Writable => mir::ReceiverMode::Writable,
+                            crate::symbols::ReceiverMode::Consuming => mir::ReceiverMode::Consuming,
+                        },
                         exact_dynamic_return: matches!(
                             requirement.signature.return_type,
                             ResolvedType::InterfaceSelf(_)
@@ -522,7 +453,8 @@ pub(super) fn register_methods(
                     .collect::<Vec<_>>();
                 let binding = FunctionSignature {
                     id: mir::FunctionId(usize::MAX),
-                    direct_id: None,
+                    source_declaration: None,
+                    direct: None,
                     return_type: definition.return_type,
                     return_borrow: definition.return_borrow,
                     parameter_names: requirement
@@ -536,7 +468,7 @@ pub(super) fn register_methods(
                         .iter()
                         .zip(&parameter_modes)
                         .map(|(ty, mode)| {
-                            ty.has_move_ownership() && *mode == mir::FunctionParameterMode::Take
+                            ty.requires_owned_cleanup() && *mode == mir::FunctionParameterMode::Take
                         })
                         .collect(),
                     parameter_types,
@@ -583,7 +515,9 @@ fn requirement_signature(
         .expect("registered interface");
     let mut parameters = vec![SemanticFunctionParameter {
         ty: ResolvedType::Interface(receiver.clone()),
-        ownership_mode: if requirement.writable_receiver {
+        ownership_mode: if requirement.receiver_mode.is_consuming() {
+            FunctionTypeParameterMode::Take
+        } else if requirement.receiver_mode.is_writable() {
             FunctionTypeParameterMode::Writable
         } else {
             FunctionTypeParameterMode::Readonly
@@ -608,22 +542,25 @@ fn requirement_signature(
         result
     };
     let function = ResolvedType::Function(Box::new(SemanticFunctionType {
-        invocation_mode: if requirement.writable_receiver {
+        invocation_mode: if requirement.receiver_mode.is_writable() {
             FunctionInvocationMode::Writable
         } else {
             FunctionInvocationMode::Readonly
         },
         parameters,
         return_type: result,
-        checked_effects: requirement
-            .checked_effects
-            .iter()
-            .map(|effect| substitute_resolved_type(effect, substitutions))
-            .collect(),
+        checked_effects: crate::checked_effects::CheckedEffectProfile::classify(
+            requirement
+                .checked_effects
+                .iter()
+                .map(|effect| substitute_resolved_type(effect, substitutions)),
+        )
+        .required,
         return_borrow: requirement
             .return_borrow
             .map(|borrow| FunctionReturnBorrow {
                 kind: borrow.kind,
+                lifetime: borrow.lifetime,
                 source: FunctionBorrowSource::Parameter(match borrow.source {
                     crate::symbols::BorrowSource::Receiver => 0,
                     crate::symbols::BorrowSource::Parameter(index) => index + 1,
@@ -643,7 +580,8 @@ fn requirement_signature(
 pub(super) fn build_entries(
     semantic: &SemanticInfo,
     classes: &ClassIds,
-    methods: &HashMap<MethodInstanceKey, FunctionSignature>,
+    instances: &HashMap<crate::semantics::CallableInstanceKey, mir::FunctionId>,
+    direct_methods: &HashMap<mir::FunctionId, mir::FunctionId>,
     registry: &mut NativeTypeRegistry,
     functions: &mut Vec<mir::Function>,
 ) -> DiagnosticResult<()> {
@@ -661,70 +599,58 @@ pub(super) fn build_entries(
             fact.status == ConformanceStatus::Checked
                 && registry.interface_ids.get(&fact.interface) == Some(&table.interface)
                 && matches!(&fact.implementing_type, ResolvedType::Class(ty) if classes.get(ty) == Some(&class))
-        }).expect("registered vtable has checked conformance");
+        }).ok_or_else(|| vec![Diagnostic::new("I2401", "registered vtable has no checked conformance", Span::default())])?;
+        let witnesses = semantic.interface_witnesses.conformance(conformance)?;
         for method in registry.interface_types[table.interface.0].methods.clone() {
-            let implementation = conformance
-                .implementations
+            let witness = witnesses
                 .iter()
                 .find(|item| {
-                    item.requirement_origins
+                    item.origins
                         .iter()
-                        .any(|origin| origin.declaration == method.requirement)
+                        .any(|origin| method.requirement_origins.contains(&origin.declaration))
                 })
-                .expect("checked conformance selects an implementation");
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I2401",
+                        "checked interface slot has no canonical witness",
+                        method.requirement_origins[0],
+                    )]
+                })?;
             if method.exact_dynamic_return
-                && implementation.exact_dynamic_return.as_ref()
-                    != Some(&conformance.implementing_type)
+                && witness.exact_dynamic_return.as_ref() != Some(&conformance.implementing_type)
             {
                 return Err(vec![Diagnostic::new(
                     "I2401",
                     "interface self result lacks checked exact dynamic return proof",
-                    method.requirement,
+                    method.requirement_origins[0],
                 )]);
             }
-            let implementation = implementation
-                .implementation
-                .expect("checked implementation declaration");
             let key = registry
                 .interface_methods
                 .keys()
                 .find(|key| {
                     key.interface == table.interface
-                        && key.requirement == method.requirement
+                        && method.requirement_origins.contains(&key.requirement)
                         && registry.interface_methods[*key].slot
                             == registry.interface_vtables[index].methods.len()
                 })
                 .expect("registered slot has call plan");
-            let signature = std::iter::once(class)
-                .chain(
-                    semantic.classes[class.0]
-                        .ancestors
-                        .iter()
-                        .filter_map(|ty| classes.get(ty).copied()),
-                )
-                .find_map(|class| {
-                    methods.get(&MethodInstanceKey {
-                        class,
-                        name: method.name.clone(),
-                        arguments: key.arguments.clone(),
-                    })
-                })
-                .filter(|signature| functions[signature.id.0].source_span == implementation)
-                .ok_or_else(|| {
-                    vec![Diagnostic::new(
-                        "I2401",
-                        "checked interface slot has no concrete method specialization",
-                        implementation,
-                    )]
-                })?;
+            let instance = witness.instance(&key.arguments, method.requirement_origins[0])?;
+            let function = instances.get(&instance).ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2401",
+                    "checked interface slot has no concrete method specialization",
+                    witness.declaration,
+                )]
+            })?;
             let id = mir::FunctionId(functions.len());
             let definition = &registry.function_types[method.signature.0];
             let entry = build_entry(
                 id,
                 &table,
                 definition,
-                signature,
-                &functions[signature.id.0],
+                direct_methods.get(function).copied().unwrap_or(*function),
+                &functions[function.0],
                 registry,
             )?;
             functions.push(entry);
@@ -741,7 +667,11 @@ fn build_collection_entry(
     registry: &NativeTypeRegistry,
 ) -> DiagnosticResult<mir::Function> {
     use crate::compiler_known_contracts::IterationOperation as Op;
-    let operation = Op::from_requirement(method.requirement).expect("canonical collection adapter");
+    let operation = method
+        .requirement_origins
+        .iter()
+        .find_map(|origin| Op::from_requirement(*origin))
+        .expect("canonical collection adapter");
     let contract = &registry.function_types[method.signature.0];
     let (mir::ImplementingType::Collection(collection)
     | mir::ImplementingType::CollectionIterator(collection)) = table.implementing_type
@@ -805,10 +735,14 @@ fn build_collection_entry(
                         returns: vec![mir::RetainedSource {
                             local: receiver,
                             inherited: false,
+                            writable: false,
+                            lifetime: mir::RetainedLifetime::Cleanup,
+                            owned_path: Vec::new(),
                         }],
                         constructs: Vec::new(),
                         independent_parameters: Vec::new(),
                         promotions: Vec::new(),
+                        ..Default::default()
                     },
                 )),
             );
@@ -861,9 +795,42 @@ fn build_collection_entry(
                     collection: source,
                     operation: mir::CoreCollectionOperation::ValueAt { position, target },
                 });
-                local_rvalue(target, definition.value, false)
+                read_local_as_rvalue(
+                    target,
+                    definition.value,
+                    !definition.value.has_move_ownership(),
+                )
             } else {
-                collection_value_rvalue(source, index.clone(), index, definition.value, true)?
+                let value = collection_value_rvalue(
+                    source,
+                    index.clone(),
+                    index,
+                    definition.value,
+                    true,
+                    method.requirement_origins[0],
+                )?;
+                if !definition.value.has_move_ownership()
+                    && (definition.value.requires_owned_cleanup()
+                        || matches!(
+                            definition.value,
+                            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+                        ))
+                {
+                    // The collection owns the element; the Copy return owns a new claim.
+                    let target = mir::LocalId(locals.len());
+                    locals.push(mir::Local {
+                        id: target,
+                        name: "__element".into(),
+                        ty: definition.value,
+                        writable: false,
+                        owned: false,
+                        synthetic: true,
+                    });
+                    statements.push(mir::Statement::AssignLocal { target, value });
+                    read_local_as_rvalue(target, definition.value, true)
+                } else {
+                    value
+                }
             };
             mir::Terminator::Return(value)
         }
@@ -878,7 +845,8 @@ fn build_collection_entry(
     Ok(mir::Function {
         id,
         name: format!("<collection#{}>::{}", collection.0, method.name),
-        source_span: method.requirement,
+        source_span: method.requirement_origins[0],
+        diagnostic_frame: mir::DiagnosticFrame::Caller,
         method: None,
         virtual_slot: None,
         receiver_mode: None,
@@ -909,7 +877,7 @@ fn build_entry(
     id: mir::FunctionId,
     table: &mir::InterfaceVtable,
     contract: &mir::FunctionType,
-    signature: &FunctionSignature,
+    direct: mir::FunctionId,
     implementation: &mir::Function,
     registry: &NativeTypeRegistry,
 ) -> DiagnosticResult<mir::Function> {
@@ -927,7 +895,7 @@ fn build_entry(
             ty: parameter.ty,
             writable: parameter.mode == mir::FunctionParameterMode::Writable,
             owned: parameter.mode == mir::FunctionParameterMode::Take
-                && parameter.ty.has_move_ownership(),
+                && parameter.ty.requires_owned_cleanup(),
             synthetic: true,
         })
         .collect::<Vec<_>>();
@@ -958,6 +926,9 @@ fn build_entry(
                     .map(|source| mir::RetainedSource {
                         local: remap(source.local),
                         inherited: source.inherited,
+                        writable: source.writable,
+                        lifetime: source.lifetime,
+                        owned_path: source.owned_path.clone(),
                     })
                     .collect(),
                 constructs: Vec::new(),
@@ -967,16 +938,128 @@ fn build_entry(
                     .map(|local| remap(*local))
                     .collect(),
                 promotions: Vec::new(),
+                stores: plan
+                    .stores
+                    .iter()
+                    .map(|store| mir::RetainedStore {
+                        destination: remap(store.destination),
+                        path: store.path.clone(),
+                        identity: store.identity.clone(),
+                        sources: store
+                            .sources
+                            .iter()
+                            .map(|source| mir::RetainedSource {
+                                local: remap(source.local),
+                                ..source.clone()
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                exceptional_stores: plan
+                    .exceptional_stores
+                    .iter()
+                    .map(|store| mir::RetainedStore {
+                        destination: remap(store.destination),
+                        path: store.path.clone(),
+                        identity: store.identity.clone(),
+                        sources: store
+                            .sources
+                            .iter()
+                            .map(|source| mir::RetainedSource {
+                                local: remap(source.local),
+                                ..source.clone()
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                returned_selectors: plan
+                    .returned_selectors
+                    .iter()
+                    .map(|selector| match selector {
+                        mir::RetainedStorageSelector::Member(identity) => {
+                            mir::RetainedStorageSelector::Member(identity.clone())
+                        }
+                        mir::RetainedStorageSelector::Input(local) => {
+                            mir::RetainedStorageSelector::Input(remap(*local))
+                        }
+                        mir::RetainedStorageSelector::Unknown => {
+                            mir::RetainedStorageSelector::Unknown
+                        }
+                        mir::RetainedStorageSelector::All => mir::RetainedStorageSelector::All,
+                    })
+                    .collect(),
+                returned_storage: plan.returned_storage.as_ref().map(|storage| {
+                    mir::RetainedReturnedStorage {
+                        inputs: storage.inputs.iter().map(|local| remap(*local)).collect(),
+                        selections: storage
+                            .selections
+                            .iter()
+                            .map(|selection| remap_storage_selection(selection, &remap))
+                            .collect(),
+                        direct: storage
+                            .direct
+                            .iter()
+                            .map(|source| mir::RetainedSource {
+                                local: remap(source.local),
+                                ..source.clone()
+                            })
+                            .collect(),
+                        members: storage
+                            .members
+                            .iter()
+                            .map(|member| mir::RetainedReturnedMember {
+                                sources: member
+                                    .sources
+                                    .iter()
+                                    .map(|source| mir::RetainedSource {
+                                        local: remap(source.local),
+                                        ..source.clone()
+                                    })
+                                    .collect(),
+                                ..member.clone()
+                            })
+                            .collect(),
+                    }
+                }),
+                removals: plan
+                    .removals
+                    .iter()
+                    .map(|selection| remap_storage_selection(selection, &remap))
+                    .collect(),
+                exceptional_removals: plan
+                    .exceptional_removals
+                    .iter()
+                    .map(|selection| remap_storage_selection(selection, &remap))
+                    .collect(),
             }),
         ));
     }
-    let mut args = vec![mir::Rvalue::Class(
-        mir::ClassExpression::InterfaceReceiver {
+    let receiver = if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) =
+        implementation.locals[implementation.params[0].0].ty
+    {
+        if ty.storage_bytes() > 8 {
+            return Err(vec![unsupported(
+                span,
+                "inline interface payloads wider than one carrier word require aggregate transport",
+            )]);
+        }
+        mir::Rvalue::Value(mir::ValueExpression::Inline(
+            mir::InlineValueExpression::InterfaceReceiver {
+                ty,
+                receiver: params[0],
+                vtable: table.id,
+                transfer: contract.parameters[0].mode == mir::FunctionParameterMode::Take,
+            },
+        ))
+    } else {
+        mir::Rvalue::Class(mir::ClassExpression::InterfaceReceiver {
             class,
             receiver: params[0],
             vtable: table.id,
-        },
-    )];
+            transfer: contract.parameters[0].mode == mir::FunctionParameterMode::Take,
+        })
+    };
+    let mut args = vec![receiver];
     if let Some(parent) = implementation
         .method
         .as_ref()
@@ -992,7 +1075,7 @@ fn build_entry(
             name: "__interface_payload".into(),
             ty: mir::Type::Class(class),
             writable: locals[0].writable,
-            owned: false,
+            owned: locals[0].owned,
             synthetic: true,
         });
         statements.push(mir::Statement::AssignLocal {
@@ -1002,23 +1085,27 @@ fn build_entry(
         args.push(mir::Rvalue::Class(mir::ClassExpression::Local {
             class: parent,
             local: target,
-            transfer: false,
+            transfer: locals[0].owned,
         }));
     }
     args.extend(params.iter().skip(1).map(|id| {
         let local = &locals[id.0];
-        local_rvalue(*id, local.ty, local.owned)
+        if local.owned {
+            pending_owned_rvalue(*id, local.ty, true)
+        } else {
+            local_rvalue(*id, local.ty, false)
+        }
     }));
-    let direct = signature.direct_id.unwrap_or(signature.id);
     let mut blocks = Vec::new();
-    let result = if let mir::ReturnType::Value(ty) = signature.return_type {
+    let result = if let mir::ReturnType::Value(ty) = implementation.return_type {
         let local = mir::LocalId(locals.len());
-        let owned = ty.has_move_ownership() && !ty.borrows_returned_value(signature.return_borrow);
+        let owned =
+            ty.requires_owned_cleanup() && !ty.borrows_returned_value(implementation.return_borrow);
         locals.push(mir::Local {
             id: local,
             name: "__interface_result".into(),
             ty,
-            writable: call_result_is_writable(owned, signature.return_borrow),
+            writable: call_result_is_writable(owned, implementation.return_borrow),
             owned,
             synthetic: true,
         });
@@ -1029,56 +1116,26 @@ fn build_entry(
     let return_value = match (result, contract.return_type) {
         (None, mir::ReturnType::Void) => mir::Terminator::ReturnVoid,
         (Some((local, actual)), mir::ReturnType::Value(target)) => {
-            let value = local_rvalue(
-                local,
-                actual,
-                !actual.borrows_returned_value(signature.return_borrow),
-            );
-            let value = if target == actual {
-                value
-            } else if let (mir::Type::Interface(interface), mir::Rvalue::Class(object)) =
-                (target, value.clone())
-            {
-                let vtable = registry
-                    .interface_vtable_ids
-                    .get(&(mir::ImplementingType::Class(object.class()), interface))
-                    .copied()
-                    .ok_or_else(|| {
-                        vec![unsupported(
-                            span,
-                            "interface return adaptation lacks checked conformance",
-                        )]
-                    })?;
-                mir::Rvalue::Interface(mir::InterfaceExpression {
-                    interface,
-                    value: mir::InterfaceValue::FromClass {
-                        object: Box::new(object),
-                        vtable,
-                    },
-                })
+            let value = if locals[local.0].owned {
+                pending_owned_rvalue(local, actual, true)
             } else {
-                virtual_adapter_local_result(
-                    local,
-                    target,
-                    actual,
-                    !actual.borrows_returned_value(signature.return_borrow),
-                    span,
-                )?
+                local_rvalue(local, actual, false)
             };
+            let value = adapt_return_value(value, target, span, registry)?;
             mir::Terminator::Return(value)
         }
         _ => {
             return Err(vec![unsupported(
                 span,
                 "interface entry return contract disagrees with its implementation",
-            )])
+            )]);
         }
     };
-    if signature.checked_effects.is_empty() {
+    if implementation.checked_effects.is_empty() {
         let statement = match result {
             Some((target, ty)) => mir::Statement::AssignLocal {
                 target,
-                value: direct_call_result(ty, direct, args, signature.return_borrow),
+                value: direct_call_result(ty, direct, args, implementation.return_borrow, span),
             },
             None => mir::Statement::CallVoid {
                 function: direct,
@@ -1130,6 +1187,7 @@ fn build_entry(
         id,
         name: format!("{}::<interface-entry#{}>", implementation.name, table.id.0),
         source_span: span,
+        diagnostic_frame: mir::DiagnosticFrame::Forwarded(direct),
         method: None,
         virtual_slot: None,
         receiver_mode: None,
@@ -1152,213 +1210,25 @@ fn build_entry(
     })
 }
 
-pub(super) fn direct_call_result(
-    ty: mir::Type,
-    function: mir::FunctionId,
-    args: Vec<mir::Rvalue>,
-    return_borrow: Option<mir::ReturnBorrow>,
-) -> mir::Rvalue {
-    use mir::*;
-    match ty {
-        Type::ClosureEnvironment(_) => {
-            unreachable!("closure environments are not source return types")
-        }
-        Type::Scalar(ScalarType::Integer(ty)) => {
-            Rvalue::Value(ValueExpression::Integer(IntegerExpression::Call {
-                ty,
-                function,
-                args,
-            }))
-        }
-        Type::Scalar(ScalarType::Float(ty)) => {
-            Rvalue::Value(ValueExpression::Float(FloatExpression::Call {
-                ty,
-                function,
-                args,
-            }))
-        }
-        Type::Scalar(ScalarType::Bool) => {
-            Rvalue::Value(ValueExpression::Bool(BoolExpression::Call {
-                function,
-                args,
-            }))
-        }
-        Type::Scalar(ScalarType::Enum(enum_id)) => {
-            Rvalue::Value(ValueExpression::Enum(EnumExpression::Call {
-                enum_id,
-                function,
-                args,
-            }))
-        }
-        Type::NullableScalar(ty) => {
-            Rvalue::NullableScalar(NullableScalarExpression::Call { ty, function, args })
-        }
-        Type::String => Rvalue::String(StringExpression::Call { function, args }),
-        Type::NullableString => {
-            Rvalue::NullableString(NullableStringExpression::Call { function, args })
-        }
-        Type::Class(class) => Rvalue::Class(ClassExpression::Call {
-            class,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::NullableClass(class) => Rvalue::NullableClass(NullableClassExpression::Call {
-            class,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::Interface(interface) => Rvalue::Interface(InterfaceExpression {
-            interface,
-            value: InterfaceValue::Call {
-                function,
-                args,
-                return_borrow,
-            },
-        }),
-        Type::NullableInterface(interface) => {
-            Rvalue::NullableInterface(NullableInterfaceExpression {
-                interface,
-                value: NullableInterfaceValue::Call {
-                    function,
-                    args,
-                    return_borrow,
-                },
-            })
-        }
-        Type::Collection(collection) => Rvalue::Collection(CollectionExpression::Call {
-            collection,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::NullableCollection(collection) => {
-            Rvalue::NullableCollection(NullableCollectionExpression::Call {
-                collection,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::Function(function_type) => Rvalue::Function(FunctionExpression::Call {
-            function_type,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::NullableFunction(function_type) => {
-            Rvalue::NullableFunction(NullableFunctionExpression::Call {
-                function_type,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::Mixed => Rvalue::Mixed(MixedExpression::Call {
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::NullableMixed => Rvalue::NullableMixed(NullableMixedExpression::Call {
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::PayloadEnum(ty) => Rvalue::PayloadEnum(PayloadEnumExpression::Call {
-            ty,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::NullablePayloadEnum(ty) => {
-            Rvalue::NullablePayloadEnum(NullablePayloadEnumExpression::Call {
-                ty,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::SharedReference(class) => Rvalue::SharedReference(SharedReferenceExpression::Call {
-            payload: class,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::WeakReference(class) => Rvalue::WeakReference(WeakReferenceExpression::Call {
-            payload: class,
-            function,
-            args,
-            return_borrow,
-        }),
-        Type::NullableSharedReference(class) => {
-            Rvalue::NullableSharedReference(NullableSharedReferenceExpression::Call {
-                payload: class,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::NullableWeakReference(class) => {
-            Rvalue::NullableWeakReference(NullableWeakReferenceExpression::Call {
-                payload: class,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::WritableSharedReference(payload) => {
-            Rvalue::WritableSharedReference(WritableSharedReferenceExpression::Call {
-                payload,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::WritableWeakReference(payload) => {
-            Rvalue::WritableWeakReference(WritableWeakReferenceExpression::Call {
-                payload,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::NullableWritableSharedReference(payload) => Rvalue::NullableWritableSharedReference(
-            NullableWritableSharedReferenceExpression::Call {
-                payload,
-                function,
-                args,
-                return_borrow,
-            },
-        ),
-        Type::NullableWritableWeakReference(payload) => {
-            Rvalue::NullableWritableWeakReference(NullableWritableWeakReferenceExpression::Call {
-                payload,
-                function,
-                args,
-                return_borrow,
-            })
-        }
-        Type::ReadonlySharedReferenceAccess(payload)
-        | Type::WritableSharedReferenceAccess(payload) => {
-            Rvalue::SharedReferenceAccess(SharedReferenceAccessExpression::Call {
-                payload,
-                function,
-                args,
-                return_borrow,
-                writable: matches!(ty, Type::WritableSharedReferenceAccess(_)),
-            })
-        }
-        Type::NullableReadonlySharedReferenceAccess(payload)
-        | Type::NullableWritableSharedReferenceAccess(payload) => {
-            Rvalue::NullableSharedReferenceAccess(NullableSharedReferenceAccessExpression::Call {
-                payload,
-                function,
-                args,
-                return_borrow,
-                writable: matches!(ty, Type::NullableWritableSharedReferenceAccess(_)),
-            })
-        }
+fn remap_storage_selection(
+    selection: &mir::RetainedStorageSelection,
+    remap: &impl Fn(mir::LocalId) -> mir::LocalId,
+) -> mir::RetainedStorageSelection {
+    let mut selectors = selection
+        .selectors
+        .iter()
+        .map(|selector| match selector {
+            mir::RetainedStorageSelector::Input(local) => {
+                mir::RetainedStorageSelector::Input(remap(*local))
+            }
+            other => other.clone(),
+        })
+        .collect::<Vec<_>>();
+    selectors.sort();
+    mir::RetainedStorageSelection {
+        destination: remap(selection.destination),
+        path: selection.path.clone(),
+        selectors,
     }
 }
 
@@ -1542,7 +1412,9 @@ function main(): void {
             "../../../../examples/native/main_stage35_interface_argument_cleanup.doria"
         );
         let program = lower_checked_source(source);
-        let expected = include_bytes!("../../tests/fixtures/native_io/main_stage35_interface_argument_cleanup/expected_stdout");
+        let expected = include_bytes!(
+            "../../tests/fixtures/native_io/main_stage35_interface_argument_cleanup/expected_stdout"
+        );
         let output = crate::mir_interpreter::interpret(&program).unwrap();
         assert_eq!(output.stdout, expected);
         assert_eq!(output.exit_status, 0);
@@ -1679,7 +1551,7 @@ function main(): void {
         let text = include_str!(
             "../../../../examples/native/main_stage35_interface_constructor_failure.doria"
         );
-        let expected = b"drop input;drop explicit;caught;constructed;drop second;drop implicit;";
+        let expected = b"drop explicit;drop input;caught;constructed;drop second;drop implicit;";
         let program = lower_checked_source(text);
         assert_eq!(
             crate::mir_interpreter::interpret(&program).unwrap().stdout,
@@ -1994,6 +1866,32 @@ function main(): void { Base $first = new Child(); Base $second = new Inherited(
     }
 
     #[test]
+    fn php_checked_wrappers_keep_closure_inputs_and_generated_names_distinct() {
+        let source = r#"
+class Failure implements Error { function __construct(string $message) {} }
+function checked(string $text, bool $fail): string throws Failure {
+    if ($fail) { throw new Failure("expected"); }
+    return $text;
+}
+function main(): void {
+    string $label = "capture:";
+    let $callback = function(string $__doriaEnvironment__doria1, bool $fail): string with ($label) {
+        string $__doriaEnvironment__doria2 = ":local";
+        return checked($label . $__doriaEnvironment__doria1 . $__doriaEnvironment__doria2, $fail);
+    };
+    echo $callback("argument", false);
+    try { $callback("argument", true); }
+    catch (Failure) { echo ":caught"; }
+}
+"#;
+        let program = lower_checked_source(source);
+        let output = crate::mir_interpreter::interpret(&program).unwrap();
+        assert_eq!(output.stdout, b"capture:argument:local:caught");
+        assert_eq!(output.exit_status, 0);
+        assert_php_output(source, &output.stdout);
+    }
+
+    #[test]
     fn php_generic_properties_keep_interface_and_callable_specializations() {
         let source = include_str!(
             "../../../../examples/native/main_stage35_interface_generic_properties.doria"
@@ -2066,16 +1964,25 @@ function inspect(bool $flag): void {
 function main(): void { inspect(true); inspect(false); }
 "#;
         for (expression, expected) in [
-            ("show(match ($flag) { true => new Item(1), false => new Item(2) })", "1drop1;done;2drop2;done;"),
-            ("show(when ($flag): Item { return new Item(1); } else { return new Item(2); })", "1drop1;done;2drop2;done;"),
-            ("show(when ($flag): Value { return new Item(1); } else { return new Item(2); } finally { try { echo \"finally;\"; } catch (Error) {} })", "finally;1drop1;done;finally;2drop2;done;"),
+            (
+                "show(match ($flag) { true => new Item(1), false => new Item(2) })",
+                "1drop1;done;2drop2;done;",
+            ),
+            (
+                "show(when ($flag): Item { return new Item(1); } else { return new Item(2); })",
+                "1drop1;done;2drop2;done;",
+            ),
+            (
+                "show(when ($flag): Value { return new Item(1); } else { return new Item(2); } finally { try { echo \"finally;\"; } catch (Error) {} })",
+                "finally;1drop1;done;finally;2drop2;done;",
+            ),
         ] {
-        let source = source.replace("EXPRESSION", expression);
-        let program = lower_checked_source(&source);
-        let output = crate::mir_interpreter::interpret(&program).unwrap();
-        assert_eq!(output.stdout, expected.as_bytes());
-        assert_native_output(&program, &output.stdout);
-        assert_php_output(&source, &output.stdout);
+            let source = source.replace("EXPRESSION", expression);
+            let program = lower_checked_source(&source);
+            let output = crate::mir_interpreter::interpret(&program).unwrap();
+            assert_eq!(output.stdout, expected.as_bytes());
+            assert_native_output(&program, &output.stdout);
+            assert_php_output(&source, &output.stdout);
         }
     }
 
@@ -2107,7 +2014,9 @@ function values(): Dictionary<string, Value> { return ["a" => new Item(1), "b" =
                 } else {
                     body
                 };
-                let source = format!("{prefix}\nfunction inspect(): void {{ {body} }}\nfunction main(): void {{ inspect(); echo \"done;\"; }}");
+                let source = format!(
+                    "{prefix}\nfunction inspect(): void {{ {body} }}\nfunction main(): void {{ inspect(); echo \"done;\"; }}"
+                );
                 let program = lower_checked_source(&source);
                 let output = crate::mir_interpreter::interpret(&program).unwrap();
                 assert_eq!(output.stdout, expected.as_bytes(), "{source}");
@@ -2211,6 +2120,7 @@ function main(): void {{}}
                             unreachable!()
                         };
                         mir::IntegerExpression::Call {
+                            span: function.source_span,
                             ty: IntegerType::Int64,
                             function: read_value,
                             args: vec![mir::Rvalue::Interface(mir::InterfaceExpression {
@@ -2223,6 +2133,7 @@ function main(): void {{}}
                         }
                     }
                     _ => mir::IntegerExpression::Call {
+                        span: function.source_span,
                         ty: IntegerType::Int64,
                         function: read,
                         args: vec![mir::Rvalue::Class(mir::ClassExpression::InterfacePayload {
@@ -2233,6 +2144,7 @@ function main(): void {{}}
                     },
                 };
                 let call = mir::IntegerExpression::Call {
+                    span: function.source_span,
                     ty: IntegerType::Int64,
                     function: touch,
                     args: vec![local_rvalue(local.id, local.ty, false)],
@@ -2516,11 +2428,9 @@ function main(): void {
             }
             let error = crate::mir_validation::validate_program(&changed).unwrap_err();
             assert!(
-                error.message.contains(if end_owner {
-                    "ownership ended"
-                } else {
-                    "overlapping writable borrows"
-                }),
+                error
+                    .message
+                    .contains("source access conflicts with a live borrowed view"),
                 "{error:?}"
             );
         }
@@ -2574,7 +2484,12 @@ function main(): void {
             .unwrap();
         block.statements.push(release);
         let error = crate::mir_validation::validate_program(&program).unwrap_err();
-        assert!(error.message.contains("ownership ended"), "{error:?}");
+        assert!(
+            error
+                .message
+                .contains("source access conflicts with a live borrowed view"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -2703,7 +2618,12 @@ function main(): void { inspect(true); inspect(false); }
             "inserted={inserted}, replaced={replaced}\n{program}"
         );
         let error = crate::mir_validation::validate_program(&program).unwrap_err();
-        assert!(error.message.contains("ownership ended"), "{error:?}");
+        assert!(
+            error
+                .message
+                .contains("source access conflicts with a live borrowed view"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -2876,10 +2796,12 @@ function main(): void {
             &output.stdout,
             crate::build_plan::SourceScope::Development,
         );
-        assert!(program.functions.iter().any(|function| function
-            .required_checked_effects
-            .iter()
-            .any(|effect| matches!(effect, mir::CheckedEffect::Interface(_)))));
+        assert!(program.functions.iter().any(|function| {
+            function
+                .required_checked_effects
+                .iter()
+                .any(|effect| matches!(effect, mir::CheckedEffect::Interface(_)))
+        }));
     }
 
     #[test]
@@ -2890,15 +2812,30 @@ function main(): void {
             "let $root = new WritableSharedReference<I>(new Item()); let $result = $root->share();",
             "let $owner = new WritableSharedReference<I>(new Item()); let $root = $owner->createWeakReference(); let $result = $root->acquire();",
         ] {
-            let source = format!("interface I {{}} class Item implements I {{}} function main(): void {{ {body} }}");
+            let source = format!(
+                "interface I {{}} class Item implements I {{}} function main(): void {{ {body} }}"
+            );
             let mut program = lower_checked_source(&source);
             let main = &mut program.functions[program.entry.0];
-            let root = main.locals.iter().find(|local| local.name == "root").unwrap().id;
-            let drop = main.blocks.iter().flat_map(|block| &block.statements).find(|statement| matches!(statement,
+            let root = main
+                .locals
+                .iter()
+                .find(|local| local.name == "root")
+                .unwrap()
+                .id;
+            let drop = main
+                .blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .find(|statement| {
+                    matches!(statement,
                 mir::Statement::DropSharedReference { local, .. }
                 | mir::Statement::DropWeakReference { local, .. }
                 | mir::Statement::DropWritableSharedReference { local, .. }
-                | mir::Statement::DropWritableWeakReference { local, .. } if *local == root)).unwrap().clone();
+                | mir::Statement::DropWritableWeakReference { local, .. } if *local == root)
+                })
+                .unwrap()
+                .clone();
             let mut inserted = false;
             for block in &mut main.blocks {
                 if let Some(index) = block.statements.iter().position(|statement| {
@@ -2914,7 +2851,10 @@ function main(): void {
             }
             assert!(inserted, "{program}");
             let error = crate::mir_validation::validate_program(&program).unwrap_err();
-            assert!(error.message.contains("ownership ended"), "{body}: {error:?}");
+            assert!(
+                error.message.contains("ownership ended"),
+                "{body}: {error:?}"
+            );
         }
     }
 
@@ -2950,7 +2890,9 @@ function main(): void {
         let output = crate::mir_interpreter::interpret(&program).unwrap();
         assert_eq!(
             output.stdout,
-            include_bytes!("../../tests/fixtures/native_io/main_stage35_interface_shared_storage/expected_stdout"),
+            include_bytes!(
+                "../../tests/fixtures/native_io/main_stage35_interface_shared_storage/expected_stdout"
+            ),
             "{program}"
         );
         assert_eq!(output.exit_status, 0);

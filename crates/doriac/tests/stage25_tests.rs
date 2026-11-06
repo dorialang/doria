@@ -546,27 +546,32 @@ function main(): int
 
 #[test]
 fn substituted_nested_class_instantiations_recheck_constraints() {
-    let errors = diagnostics(
-        r#"
-class Sorted<T implements Comparable<T>> {}
-class Outer<T>
-{
-    function create(): void
-    {
-        let $sorted = new Sorted<T>();
+    for (parameter, argument, rejected) in [
+        ("T", "float", Some("T")),
+        ("T", "int", Some("T")),
+        ("T implements Comparable<T>", "float", Some("float")),
+        ("T implements Comparable<T>", "int", None),
+    ] {
+        let source = format!(
+            "class Sorted<T implements Comparable<T>> {{}} class Outer<{parameter}> {{ function create(): void {{ let $sorted = new Sorted<T>(); }} }} function main(): void {{ let $outer = new Outer<{argument}>(); }}"
+        );
+        let checked = doriac::check_source("stage25-nested-bounds.doria", &source);
+        if let Some(argument) = rejected {
+            let errors =
+                checked.expect_err("nested class bounds require authored and concrete proof");
+            let argument = format!("`{argument}`");
+            assert!(
+                errors.iter().any(|diagnostic| {
+                    diagnostic.code == "E0535"
+                        && diagnostic.message.contains(argument.as_str())
+                        && diagnostic.message.contains("Comparable")
+                }),
+                "{source}\n{errors:#?}"
+            );
+        } else {
+            checked.unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        }
     }
-}
-function main(): void
-{
-    let $outer = new Outer<float>();
-}
-"#,
-    );
-    assert!(errors.iter().any(|diagnostic| {
-        diagnostic.code == "E0535"
-            && diagnostic.message.contains("float")
-            && diagnostic.message.contains("Comparable")
-    }));
 }
 
 #[test]
@@ -580,9 +585,11 @@ function main(): void { let $integer = new Box<int>(42); let $boolean = new Box<
     )
     .expect("checked generic classes should lower to PHP");
     assert_eq!(php.matches("class __DoriaClassSpecialization").count(), 2);
-    assert!(php.contains("(public int $value)"));
-    assert!(php.contains("(public bool $value)"));
-    assert!(!php.contains("(public T $value)"));
+    assert!(php.contains("public int $value;"));
+    assert!(php.contains("public bool $value;"));
+    assert!(php.contains("function __construct(int $value)"));
+    assert!(php.contains("function __construct(bool $value)"));
+    assert!(!php.contains("public T $value"));
 }
 
 #[test]

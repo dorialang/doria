@@ -37,7 +37,7 @@ pub(crate) fn expressions<'a>(program: &'a Program, visitor: &mut impl FnMut(&'a
     }
 }
 
-fn block<'a>(body: &'a Block, visitor: &mut impl FnMut(&'a Expr)) {
+pub(crate) fn block<'a>(body: &'a Block, visitor: &mut impl FnMut(&'a Expr)) {
     for stmt in &body.statements {
         statement(stmt, visitor);
     }
@@ -132,7 +132,7 @@ fn statement<'a>(value: &'a Stmt, visitor: &mut impl FnMut(&'a Expr)) {
     }
 }
 
-fn expression<'a>(value: &'a Expr, visitor: &mut impl FnMut(&'a Expr)) {
+pub(crate) fn expression<'a>(value: &'a Expr, visitor: &mut impl FnMut(&'a Expr)) {
     visitor(value);
     match value {
         Expr::Assertion(value) => {

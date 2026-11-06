@@ -1,0 +1,22 @@
+function input(): Doria\Std\Io\StandardInput
+{
+    echo "i";
+    return Doria\Std\Io\StandardStreams::input;
+}
+
+function optionalInput(bool $present): ?Doria\Std\Io\StandardInput
+{
+    echo "o";
+    if ($present) { return Doria\Std\Io\StandardStreams::input; }
+    return null;
+}
+
+function main(): void
+{
+    let $input = Doria\Std\Io\StandardStreams::input;
+    echo $input is Doria\Std\Io\ReadableStream;
+    echo $input is Doria\Std\Io\WritableStream;
+    echo input() is Doria\Std\Io\ReadableStream;
+    echo optionalInput(true) is Doria\Std\Io\ReadableStream;
+    echo optionalInput(false) is Doria\Std\Io\ReadableStream;
+}

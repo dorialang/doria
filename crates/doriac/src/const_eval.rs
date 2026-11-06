@@ -4,10 +4,10 @@ use std::fmt;
 
 use crate::ast::{self, Argument, BinaryOp, Expr, Item, MemberAccess, StaticQualifier, UnaryOp};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::enums::{EnumCaseId, EnumId, EnumValue};
+use crate::enums::{EnumCaseSource, EnumId, EnumType};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
-use crate::types::TypeRef;
+use crate::types::{ResolvedType, TypeRef, TypeRegistry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstValue {
@@ -16,16 +16,21 @@ pub enum ConstValue {
     String(String),
     Bool(bool),
     Null,
-    Enum(EnumValue),
+    Enum(ConstEnumValue),
     PayloadEnum(ConstPayloadEnumValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstEnumValue {
+    pub enum_type: EnumType,
+    pub case: EnumCaseSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstPayloadEnumValue {
-    pub enum_id: EnumId,
-    pub case_id: EnumCaseId,
+    pub value: ConstEnumValue,
     pub fields: Vec<ConstValue>,
-    pub field_types: Vec<TypeRef>,
+    pub field_types: Vec<ResolvedType>,
 }
 
 impl ConstValue {
@@ -42,19 +47,20 @@ impl ConstValue {
 }
 
 impl Evaluation {
-    pub fn enum_case_name(&self, value: EnumValue) -> Option<(&str, &str)> {
+    pub fn enum_case_name(&self, value: &ConstEnumValue) -> Option<(&str, &str)> {
         self.enum_cases
             .iter()
             .find_map(|((enum_name, case_name), candidate)| {
-                (*candidate == value).then_some((enum_name.as_str(), case_name.as_str()))
+                (candidate.case == value.case && enum_name == &value.enum_type.name)
+                    .then_some((enum_name.as_str(), case_name.as_str()))
             })
     }
 
-    pub fn payload_case_name(&self, enum_id: EnumId, case_id: EnumCaseId) -> Option<(&str, &str)> {
+    pub fn payload_case_name(&self, value: &ConstEnumValue) -> Option<(&str, &str)> {
         self.payload_cases
             .iter()
             .find_map(|((enum_name, case_name), schema)| {
-                (schema.enum_id == enum_id && schema.case_id == case_id)
+                (schema.value.case == value.case && enum_name == &value.enum_type.name)
                     .then_some((enum_name.as_str(), case_name.as_str()))
             })
     }
@@ -103,16 +109,16 @@ impl TypedValue {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Evaluation {
     pub values: HashMap<ConstKey, EvaluatedDecl>,
-    pub enum_cases: HashMap<(String, String), EnumValue>,
-    pub enum_names: HashMap<String, EnumId>,
+    pub enum_cases: HashMap<(String, String), ConstEnumValue>,
+    enum_names: HashMap<String, (EnumId, usize)>,
     payload_cases: HashMap<(String, String), PayloadCaseSchema>,
     class_parents: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PayloadCaseSchema {
-    enum_id: EnumId,
-    case_id: EnumCaseId,
+    value: ConstEnumValue,
+    parameters: Vec<String>,
     fields: Vec<(String, TypeRef)>,
 }
 
@@ -135,7 +141,7 @@ pub fn evaluate_parameter_default(
         states: evaluation
             .values
             .iter()
-            .map(|(key, value)| (key.clone(), State::Done(value.clone())))
+            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
             .collect(),
         stack: Vec::new(),
         diagnostics: Vec::new(),
@@ -144,8 +150,8 @@ pub fn evaluate_parameter_default(
         payload_cases: evaluation.payload_cases.clone(),
         class_parents: evaluation.class_parents.clone(),
     };
-    let value = evaluator.evaluate_expr(expr, Some(expected), &requester)?;
-    evaluator.diagnostics.is_empty().then_some(value.value)
+    let value = evaluator.evaluate_expr(expr, Some(expected.clone()), &requester)?;
+    (evaluator.diagnostics.is_empty() && expected.accepts(&value.ty)).then_some(value.value)
 }
 
 pub fn evaluate_string_expression(evaluation: &Evaluation, expr: &Expr) -> Option<String> {
@@ -155,7 +161,7 @@ pub fn evaluate_string_expression(evaluation: &Evaluation, expr: &Expr) -> Optio
         states: evaluation
             .values
             .iter()
-            .map(|(key, value)| (key.clone(), State::Done(value.clone())))
+            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
             .collect(),
         stack: Vec::new(),
         diagnostics: Vec::new(),
@@ -191,7 +197,7 @@ pub fn evaluate_attribute_value(
         states: evaluation
             .values
             .iter()
-            .map(|(key, value)| (key.clone(), State::Done(value.clone())))
+            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
             .collect(),
         stack: Vec::new(),
         diagnostics: Vec::new(),
@@ -200,7 +206,18 @@ pub fn evaluate_attribute_value(
         payload_cases: evaluation.payload_cases.clone(),
         class_parents: evaluation.class_parents.clone(),
     };
-    let value = evaluator.evaluate_expr(expr, Some(expected), &requester);
+    let value = evaluator.evaluate_expr(expr, Some(expected.clone()), &requester);
+    if let Some(value) = &value {
+        if !expected.accepts(&value.ty) {
+            evaluator.invalid(
+                expr.span(),
+                format!(
+                    "attribute constant expects `{expected}`, found `{}`",
+                    value.ty
+                ),
+            );
+        }
+    }
     if let Some(value) = value.filter(|_| evaluator.diagnostics.is_empty()) {
         Ok(value.value)
     } else {
@@ -237,7 +254,7 @@ struct Node {
 #[derive(Clone)]
 enum State {
     Visiting(usize),
-    Done(EvaluatedDecl),
+    Done(Box<EvaluatedDecl>),
     Failed,
 }
 
@@ -288,7 +305,7 @@ pub(crate) fn evaluate_program_with_diagnostics(
                 .states
                 .into_iter()
                 .filter_map(|(key, state)| match state {
-                    State::Done(value) => Some((key, value)),
+                    State::Done(value) => Some((key, *value)),
                     State::Visiting(_) | State::Failed => None,
                 })
                 .collect(),
@@ -306,8 +323,8 @@ struct Evaluator {
     states: HashMap<ConstKey, State>,
     stack: Vec<ConstKey>,
     diagnostics: Vec<Diagnostic>,
-    enum_cases: HashMap<(String, String), EnumValue>,
-    enum_names: HashMap<String, EnumId>,
+    enum_cases: HashMap<(String, String), ConstEnumValue>,
+    enum_names: HashMap<String, (EnumId, usize)>,
     payload_cases: HashMap<(String, String), PayloadCaseSchema>,
     class_parents: HashMap<String, String>,
 }
@@ -336,22 +353,32 @@ impl Evaluator {
         for item in &program.items {
             if let Item::Enum(declaration) = item {
                 let next = evaluator.enum_names.len();
-                let enum_id = *evaluator
+                let (enum_id, _) = *evaluator
                     .enum_names
                     .entry(declaration.name.clone())
-                    .or_insert(EnumId(next));
+                    .or_insert((EnumId(next), declaration.type_params.len()));
                 let payload_enum = declaration
                     .cases
                     .iter()
                     .any(|case| !case.payload.is_empty());
                 for (index, case) in declaration.cases.iter().enumerate() {
-                    let case_id = EnumCaseId { enum_id, index };
+                    let value = ConstEnumValue {
+                        enum_type: EnumType::new(enum_id, declaration.name.clone()),
+                        case: EnumCaseSource {
+                            declaration: enum_id,
+                            index,
+                        },
+                    };
                     if payload_enum {
                         evaluator.payload_cases.insert(
                             (declaration.name.clone(), case.name.clone()),
                             PayloadCaseSchema {
-                                enum_id,
-                                case_id,
+                                value,
+                                parameters: declaration
+                                    .type_params
+                                    .iter()
+                                    .map(|parameter| parameter.name.clone())
+                                    .collect(),
                                 fields: case
                                     .payload
                                     .iter()
@@ -360,10 +387,9 @@ impl Evaluator {
                             },
                         );
                     } else {
-                        evaluator.enum_cases.insert(
-                            (declaration.name.clone(), case.name.clone()),
-                            EnumValue { enum_id, case_id },
-                        );
+                        evaluator
+                            .enum_cases
+                            .insert((declaration.name.clone(), case.name.clone()), value);
                     }
                 }
             }
@@ -392,7 +418,12 @@ impl Evaluator {
                                 writable: false,
                                 span: decl.span,
                             }),
-                            ast::ClassMember::Property(property) if property.is_static => {
+                            ast::ClassMember::Property(property)
+                                if property.is_static
+                                    && crate::property_hooks::declaration_facts(
+                                        property,
+                                        crate::property_hooks::PropertyHookContext::Class,
+                                    ).is_none_or(|facts| facts.storage != Some(crate::property_hooks::PropertyHookStorage::Computed)) => {
                                 let Some(initializer) = &property.initializer else {
                                     evaluator.diagnostics.push(Diagnostic::new(
                                         "E0480",
@@ -480,7 +511,7 @@ impl Evaluator {
 
     fn evaluate_key(&mut self, key: &ConstKey) -> Option<EvaluatedDecl> {
         match self.states.get(key) {
-            Some(State::Done(value)) => return Some(value.clone()),
+            Some(State::Done(value)) => return Some(value.as_ref().clone()),
             Some(State::Failed) => return None,
             Some(State::Visiting(index)) => {
                 let mut chain = self.stack[*index..]
@@ -523,12 +554,15 @@ impl Evaluator {
         let evaluated = if node.annotation.is_some() && expected.is_none() {
             None
         } else {
-            self.evaluate_expr(&node.initializer, expected, &requester)
+            self.evaluate_expr(&node.initializer, expected.clone(), &requester)
         };
         self.stack.pop();
 
         let result = evaluated.and_then(|evaluated| {
-            if expected.is_some_and(|expected| !expected.accepts(evaluated.ty)) {
+            if expected
+                .as_ref()
+                .is_some_and(|expected| !expected.accepts(&evaluated.ty))
+            {
                 self.diagnostics.push(Diagnostic::new(
                     "E0484",
                     format!(
@@ -553,7 +587,9 @@ impl Evaluator {
         });
         self.states.insert(
             key.clone(),
-            result.clone().map_or(State::Failed, State::Done),
+            result
+                .clone()
+                .map_or(State::Failed, |value| State::Done(Box::new(value))),
         );
         result
     }
@@ -568,6 +604,7 @@ impl Evaluator {
             Expr::Int { value, span } => self.integer_literal(value, false, expected, *span),
             Expr::Float { value, span } => {
                 let ty = expected
+                    .as_ref()
                     .and_then(ConstType::float)
                     .unwrap_or(FloatType::Float64);
                 FloatValue::parse_decimal(ty, value)
@@ -596,20 +633,22 @@ impl Evaluator {
                     .payload_cases
                     .get(&(class_name.clone(), member.clone()))
                     .filter(|schema| schema.fields.is_empty())
+                    .cloned()
                 {
-                    return Some(TypedValue::new(ConstValue::PayloadEnum(
-                        ConstPayloadEnumValue {
-                            enum_id: schema.enum_id,
-                            case_id: schema.case_id,
-                            fields: Vec::new(),
-                            field_types: Vec::new(),
-                        },
-                    )));
+                    return self.payload_enum(
+                        &class_name,
+                        member,
+                        &[],
+                        schema,
+                        *span,
+                        requester,
+                        expected.as_ref(),
+                    );
                 }
                 if let Some(value) = self
                     .enum_cases
                     .get(&(class_name.clone(), member.clone()))
-                    .copied()
+                    .cloned()
                 {
                     return Some(TypedValue::new(ConstValue::Enum(value)));
                 }
@@ -652,10 +691,10 @@ impl Evaluator {
             } => {
                 if *op != BinaryOp::Coalesce && Self::is_contextual_numeric_literal(left) {
                     let right = self.evaluate_expr(right, expected, requester)?;
-                    let left = self.evaluate_expr(left, Some(right.ty), requester)?;
+                    let left = self.evaluate_expr(left, Some(right.ty.clone()), requester)?;
                     return self.binary(op, left, right, *span).map(TypedValue::new);
                 }
-                let left = self.evaluate_expr(left, expected, requester)?;
+                let left = self.evaluate_expr(left, expected.clone(), requester)?;
                 match (op, &left.value) {
                     (BinaryOp::And, ConstValue::Bool(false)) => {
                         return Some(TypedValue::new(ConstValue::Bool(false)));
@@ -667,7 +706,7 @@ impl Evaluator {
                         let expected = left
                             .ty
                             .nullable_payload()
-                            .or_else(|| expected.and_then(ConstType::nullable_payload))
+                            .or_else(|| expected.as_ref().and_then(ConstType::nullable_payload))
                             .or(expected);
                         return self.evaluate_expr(right, expected, requester);
                     }
@@ -679,7 +718,7 @@ impl Evaluator {
                     }
                     _ => {}
                 }
-                let right = self.evaluate_expr(right, Some(left.ty), requester)?;
+                let right = self.evaluate_expr(right, Some(left.ty.clone()), requester)?;
                 self.binary(op, left, right, *span).map(TypedValue::new)
             }
             Expr::StaticCall {
@@ -695,7 +734,15 @@ impl Evaluator {
                     .get(&(class_name.clone(), method.clone()))
                     .cloned()
                 {
-                    return self.payload_enum(&class_name, method, args, schema, *span, requester);
+                    return self.payload_enum(
+                        &class_name,
+                        method,
+                        args,
+                        schema,
+                        *span,
+                        requester,
+                        expected.as_ref(),
+                    );
                 }
                 self.convert(&class_name, method, args, *span, requester)
             }
@@ -714,6 +761,7 @@ impl Evaluator {
         span: Span,
     ) -> Option<TypedValue> {
         let ty = expected
+            .as_ref()
             .and_then(ConstType::integer)
             .unwrap_or(IntegerType::Int64);
         let value = parse_decimal_magnitude(text)
@@ -861,6 +909,7 @@ impl Evaluator {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn payload_enum(
         &mut self,
         enum_name: &str,
@@ -869,6 +918,7 @@ impl Evaluator {
         schema: PayloadCaseSchema,
         span: Span,
         requester: &EvaluationRequester,
+        expected_result: Option<&ConstType>,
     ) -> Option<TypedValue> {
         let parameter_names = schema
             .fields
@@ -896,36 +946,140 @@ impl Evaluator {
             return None;
         }
 
+        let patterns = schema
+            .parameters
+            .iter()
+            .map(|name| (name.clone(), ResolvedType::TypeParameter(name.clone())))
+            .collect::<HashMap<_, _>>();
+        let field_patterns = schema
+            .fields
+            .iter()
+            .map(|(_, ty)| resolve_const_type(ty, &self.enum_names, &patterns))
+            .collect::<Option<Vec<_>>>()?;
+        let mut value = schema.value;
+        let mut types = TypeRegistry::new();
+        let mut bindings: HashMap<String, crate::types::TypeId> = HashMap::new();
+        let mut context = HashMap::new();
+        let callee = format!("enum case `{enum_name}::{case_name}`");
+        let mut inference_diagnostics = Vec::new();
+        let contextual_application = match expected_result {
+            Some(ConstType::Enum(ty) | ConstType::NullableEnum(ty))
+                if ty.id == value.enum_type.id && ty.arguments.len() == schema.parameters.len() =>
+            {
+                Some(ty)
+            }
+            _ => None,
+        };
+        if let Some(ty) = contextual_application {
+            context.extend(
+                schema
+                    .parameters
+                    .iter()
+                    .cloned()
+                    .zip(ty.arguments.iter().cloned()),
+            );
+        }
         let mut fields = vec![None; schema.fields.len()];
         for (argument_index, argument) in args.iter().enumerate() {
             let parameter_index = bound.arg_to_param[argument_index]
                 .expect("validated payload enum argument has a parameter");
-            let expected =
-                const_type_with_enums(&schema.fields[parameter_index].1, &self.enum_names)
-                    .or_else(|| {
-                        self.invalid(
-                            argument.span,
-                            format!(
-                                "payload field `${}` is not available in the Copy constant tier",
-                                schema.fields[parameter_index].0
-                            ),
-                        );
-                        None
-                    })?;
-            fields[parameter_index] = Some(
-                self.evaluate_expr(&argument.value, Some(expected), requester)?
-                    .value,
+            let pattern = &field_patterns[parameter_index];
+            let mut contextual = context.clone();
+            contextual.extend(
+                bindings
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), types.resolved(*ty))),
             );
+            let hint = ConstType::from_resolved(crate::types::substitute_resolved_type(
+                pattern,
+                &contextual,
+            ))
+            .or_else(|| {
+                schema
+                    .parameters
+                    .is_empty()
+                    .then(|| const_type(&schema.fields[parameter_index].1))
+                    .flatten()
+            });
+            let field = self.evaluate_expr(&argument.value, hint, requester)?;
+            if !schema.parameters.is_empty() {
+                let pattern = types.intern_resolved(pattern);
+                let actual = types.intern_resolved(&field.ty.resolved()?);
+                crate::generic_inference::infer_type_parameter_bindings(
+                    &mut types,
+                    &mut inference_diagnostics,
+                    &callee,
+                    pattern,
+                    actual,
+                    argument.value.span(),
+                    &mut bindings,
+                    false,
+                );
+            }
+            fields[parameter_index] = Some((field, argument.value.span()));
+        }
+        if !inference_diagnostics.is_empty() {
+            self.diagnostics.extend(inference_diagnostics);
+            return None;
+        }
+        for (name, ty) in bindings {
+            context.insert(name, types.resolved(ty));
+        }
+        let Some(arguments) = schema
+            .parameters
+            .iter()
+            .map(|name| context.get(name).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            self.invalid(
+                span,
+                format!("cannot infer all type arguments for {callee}"),
+            );
+            return None;
+        };
+        value.enum_type.arguments = arguments;
+        let field_types = field_patterns
+            .iter()
+            .map(|pattern| crate::types::substitute_resolved_type(pattern, &context))
+            .collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(fields.len());
+        for (index, field) in fields.into_iter().enumerate() {
+            let (field, field_span) = field.expect("validated payload field is bound");
+            let Some(expected) =
+                ConstType::from_resolved(field_types[index].clone()).or_else(|| {
+                    schema
+                        .parameters
+                        .is_empty()
+                        .then(|| const_type(&schema.fields[index].1))
+                        .flatten()
+                })
+            else {
+                self.invalid(
+                    field_span,
+                    format!(
+                        "payload field `${}` is not available in the Copy constant tier",
+                        schema.fields[index].0
+                    ),
+                );
+                return None;
+            };
+            if !expected.accepts(&field.ty) {
+                self.invalid(
+                    field_span,
+                    format!(
+                        "payload field `${}` expects `{expected}`, found `{}`",
+                        schema.fields[index].0, field.ty
+                    ),
+                );
+                return None;
+            }
+            values.push(field.value);
         }
         Some(TypedValue::new(ConstValue::PayloadEnum(
             ConstPayloadEnumValue {
-                enum_id: schema.enum_id,
-                case_id: schema.case_id,
-                fields: fields
-                    .into_iter()
-                    .map(|field| field.expect("validated payload field is bound"))
-                    .collect(),
-                field_types: schema.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+                value,
+                fields: values,
+                field_types,
             },
         )))
     }
@@ -961,7 +1115,7 @@ impl Evaluator {
     ) -> Option<ConstValue> {
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
             && (left.ty.is_nullable() || right.ty.is_nullable())
-            && (left.ty.accepts(right.ty) || right.ty.accepts(left.ty))
+            && (left.ty.accepts(&right.ty) || right.ty.accepts(&left.ty))
             && (matches!(left.value, ConstValue::Null) || matches!(right.value, ConstValue::Null))
         {
             let equal = matches!(
@@ -1024,22 +1178,24 @@ impl Evaluator {
                 BinaryOp::GreaterEqual => Ok(ConstValue::Bool(left >= right)),
                 _ => Err("invalid string operation in constant expression"),
             },
-            (ConstValue::Enum(left), ConstValue::Enum(right)) if left.enum_id == right.enum_id => {
+            (ConstValue::Enum(left), ConstValue::Enum(right))
+                if left.enum_type == right.enum_type =>
+            {
                 match op {
-                    BinaryOp::Equal => Ok(ConstValue::Bool(left.case_id == right.case_id)),
-                    BinaryOp::NotEqual => Ok(ConstValue::Bool(left.case_id != right.case_id)),
+                    BinaryOp::Equal => Ok(ConstValue::Bool(left.case == right.case)),
+                    BinaryOp::NotEqual => Ok(ConstValue::Bool(left.case != right.case)),
                     _ => Err("only equality is defined for enum constants"),
                 }
             }
             (ConstValue::PayloadEnum(left), ConstValue::PayloadEnum(right))
-                if left.enum_id == right.enum_id =>
+                if left.value.enum_type == right.value.enum_type =>
             {
                 match op {
                     BinaryOp::Equal => Ok(ConstValue::Bool(
-                        left.case_id == right.case_id && left.fields == right.fields,
+                        left.value.case == right.value.case && left.fields == right.fields,
                     )),
                     BinaryOp::NotEqual => Ok(ConstValue::Bool(
-                        left.case_id != right.case_id || left.fields != right.fields,
+                        left.value.case != right.value.case || left.fields != right.fields,
                     )),
                     _ => Err("only equality is defined for enum constants"),
                 }
@@ -1226,7 +1382,7 @@ impl Evaluator {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstType {
     Integer(IntegerType),
     NullableInteger(IntegerType),
@@ -1237,11 +1393,46 @@ pub enum ConstType {
     NullableBool,
     Null,
     NullableString,
-    Enum(EnumId),
-    NullableEnum(EnumId),
+    Enum(EnumType),
+    NullableEnum(EnumType),
+    Inline(crate::inline_value::InlineValueType),
+    NullableInline(crate::inline_value::InlineValueType),
+    NullableInlineNominal(Box<TypeRef>),
 }
 
 impl ConstType {
+    fn from_resolved(ty: ResolvedType) -> Option<Self> {
+        Some(match ty {
+            ResolvedType::Integer(ty) => Self::Integer(ty),
+            ResolvedType::Float(ty) => Self::Float(ty),
+            ResolvedType::String => Self::String,
+            ResolvedType::Bool => Self::Bool,
+            ResolvedType::Null => Self::Null,
+            ResolvedType::Enum(ty) => Self::Enum(ty),
+            ResolvedType::Nullable(inner) => match Self::from_resolved(*inner)? {
+                Self::Integer(ty) => Self::NullableInteger(ty),
+                Self::Float(ty) => Self::NullableFloat(ty),
+                Self::String => Self::NullableString,
+                Self::Bool => Self::NullableBool,
+                Self::Enum(ty) => Self::NullableEnum(ty),
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+
+    fn resolved(&self) -> Option<ResolvedType> {
+        Some(match self {
+            Self::Integer(ty) => ResolvedType::Integer(*ty),
+            Self::Float(ty) => ResolvedType::Float(*ty),
+            Self::String => ResolvedType::String,
+            Self::Bool => ResolvedType::Bool,
+            Self::Null => ResolvedType::Null,
+            Self::Enum(ty) => ResolvedType::Enum(ty.clone()),
+            ty => crate::types::nullable_of(ty.nullable_payload()?.resolved()?),
+        })
+    }
+
     fn of(value: &ConstValue) -> Self {
         match value {
             ConstValue::Integer(value) => Self::Integer(value.ty),
@@ -1249,27 +1440,41 @@ impl ConstType {
             ConstValue::String(_) => Self::String,
             ConstValue::Bool(_) => Self::Bool,
             ConstValue::Null => Self::Null,
-            ConstValue::Enum(value) => Self::Enum(value.enum_id),
-            ConstValue::PayloadEnum(value) => Self::Enum(value.enum_id),
+            ConstValue::Enum(value) => Self::Enum(value.enum_type.clone()),
+            ConstValue::PayloadEnum(value) => Self::Enum(value.value.enum_type.clone()),
         }
     }
 
-    fn accepts(self, actual: Self) -> bool {
+    fn accepts(&self, actual: &Self) -> bool {
         self == actual
             || match (self, actual) {
+                (Self::NullableInlineNominal(expected), Self::NullableInlineNominal(actual)) => {
+                    let substitutions = HashMap::new();
+                    crate::types::resolved_type_ref_with_substitutions(expected, &substitutions)
+                        .is_some_and(|expected| {
+                            crate::types::resolved_type_ref_with_substitutions(
+                                actual,
+                                &substitutions,
+                            )
+                            .is_some_and(|actual| expected == actual)
+                        })
+                }
                 (Self::NullableString, Self::String | Self::Null)
                 | (Self::NullableInteger(_), Self::Null)
                 | (Self::NullableFloat(_), Self::Null)
                 | (Self::NullableBool, Self::Bool | Self::Null) => true,
                 (Self::NullableEnum(expected), Self::Enum(actual)) => expected == actual,
                 (Self::NullableEnum(_), Self::Null) => true,
+                (Self::NullableInline(_), Self::Null) => true,
+                (Self::NullableInlineNominal(_), Self::Null) => true,
+                (Self::NullableInline(expected), Self::Inline(actual)) => expected == actual,
                 (Self::NullableInteger(expected), Self::Integer(actual)) => expected == actual,
                 (Self::NullableFloat(expected), Self::Float(actual)) => expected == actual,
                 _ => false,
             }
     }
 
-    const fn is_nullable(self) -> bool {
+    const fn is_nullable(&self) -> bool {
         matches!(
             self,
             Self::NullableInteger(_)
@@ -1277,30 +1482,33 @@ impl ConstType {
                 | Self::NullableBool
                 | Self::NullableString
                 | Self::NullableEnum(_)
+                | Self::NullableInline(_)
+                | Self::NullableInlineNominal(_)
         )
     }
 
-    const fn nullable_payload(self) -> Option<Self> {
+    fn nullable_payload(&self) -> Option<Self> {
         match self {
-            Self::NullableInteger(ty) => Some(Self::Integer(ty)),
-            Self::NullableFloat(ty) => Some(Self::Float(ty)),
+            Self::NullableInteger(ty) => Some(Self::Integer(*ty)),
+            Self::NullableFloat(ty) => Some(Self::Float(*ty)),
             Self::NullableBool => Some(Self::Bool),
             Self::NullableString => Some(Self::String),
-            Self::NullableEnum(enum_id) => Some(Self::Enum(enum_id)),
+            Self::NullableEnum(ty) => Some(Self::Enum(ty.clone())),
+            Self::NullableInline(ty) => Some(Self::Inline(*ty)),
             _ => None,
         }
     }
 
-    fn integer(self) -> Option<IntegerType> {
+    fn integer(&self) -> Option<IntegerType> {
         match self {
-            Self::Integer(ty) | Self::NullableInteger(ty) => Some(ty),
+            Self::Integer(ty) | Self::NullableInteger(ty) => Some(*ty),
             _ => None,
         }
     }
 
-    fn float(self) -> Option<FloatType> {
+    fn float(&self) -> Option<FloatType> {
         match self {
-            Self::Float(ty) | Self::NullableFloat(ty) => Some(ty),
+            Self::Float(ty) | Self::NullableFloat(ty) => Some(*ty),
             _ => None,
         }
     }
@@ -1318,14 +1526,46 @@ impl fmt::Display for ConstType {
             Self::NullableBool => formatter.write_str("?bool"),
             Self::Null => formatter.write_str("null"),
             Self::NullableString => formatter.write_str("?string"),
-            Self::Enum(enum_id) => write!(formatter, "enum#{}", enum_id.0),
-            Self::NullableEnum(enum_id) => write!(formatter, "?enum#{}", enum_id.0),
+            Self::Enum(ty) | Self::NullableEnum(ty) => {
+                let mut types = crate::types::TypeRegistry::new();
+                let id = types.intern_resolved(&crate::types::ResolvedType::Enum(ty.clone()));
+                if matches!(self, Self::NullableEnum(_)) {
+                    formatter.write_str("?")?;
+                }
+                formatter.write_str(&types.display(id))
+            }
+            Self::Inline(ty) => formatter.write_str(ty.name()),
+            Self::NullableInline(ty) => write!(formatter, "?{}", ty.name()),
+            Self::NullableInlineNominal(ty) => write!(formatter, "{ty}"),
         }
     }
 }
 
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
+    if ty.nullable
+        && matches!(
+            crate::inline_value::InlineValueKind::for_nominal(&ty.name, ty.arguments.len()),
+            Some(
+                crate::inline_value::InlineValueKind::RegistrationKey
+                    | crate::inline_value::InlineValueKind::ReadTransferKey
+                    | crate::inline_value::InlineValueKind::WriteTransferKey
+                    | crate::inline_value::InlineValueKind::CancellationToken
+                    | crate::inline_value::InlineValueKind::StandardInput
+                    | crate::inline_value::InlineValueKind::StandardOutput
+                    | crate::inline_value::InlineValueKind::StandardError
+            )
+        )
+    {
+        return Some(ConstType::NullableInlineNominal(Box::new(ty.clone())));
+    }
     if ty.arguments.is_empty() {
+        if let Some(value) = crate::inline_value::InlineValueType::for_name(&ty.name) {
+            return Some(if ty.nullable {
+                ConstType::NullableInline(value)
+            } else {
+                ConstType::Inline(value)
+            });
+        }
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
             return Some(if ty.nullable {
                 ConstType::NullableInteger(integer)
@@ -1350,19 +1590,32 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
     }
 }
 
-fn const_type_with_enums(ty: &TypeRef, enum_names: &HashMap<String, EnumId>) -> Option<ConstType> {
-    const_type(ty).or_else(|| {
-        (ty.arguments.is_empty())
-            .then(|| enum_names.get(&ty.name).copied())
-            .flatten()
-            .map(|enum_id| {
-                if ty.nullable {
-                    ConstType::NullableEnum(enum_id)
-                } else {
-                    ConstType::Enum(enum_id)
-                }
-            })
-    })
+fn const_type_with_enums(
+    ty: &TypeRef,
+    enum_names: &HashMap<String, (EnumId, usize)>,
+) -> Option<ConstType> {
+    const_type(ty)
+        .or_else(|| ConstType::from_resolved(resolve_const_type(ty, enum_names, &HashMap::new())?))
+}
+
+fn resolve_const_type(
+    ty: &TypeRef,
+    enum_names: &HashMap<String, (EnumId, usize)>,
+    substitutions: &HashMap<String, ResolvedType>,
+) -> Option<ResolvedType> {
+    let ty = crate::types::resolved_type_ref_with_substitutions(ty, substitutions)?;
+    Some(crate::types::resolve_nominal_kinds_with(ty, &|class| {
+        if let Some(&(id, arity)) = enum_names.get(&class.name) {
+            if class.arguments.len() == arity {
+                return ResolvedType::Enum(EnumType::with_arguments(
+                    id,
+                    class.name,
+                    class.arguments,
+                ));
+            }
+        }
+        ResolvedType::Class(class)
+    }))
 }
 
 fn is_screaming_snake_case(name: &str) -> bool {
@@ -1370,4 +1623,130 @@ fn is_screaming_snake_case(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+#[cfg(test)]
+mod enum_constant_tests {
+    use super::*;
+    use crate::types::ResolvedType;
+
+    #[test]
+    fn enum_constants_infer_nested_applications_and_fill_empty_cases_from_context() {
+        let program = crate::parse_source(
+            "generic-constant.doria",
+            r#"
+enum Item<T> { case Value(T $value); case Empty; }
+enum Outer<T> { case Wrap(Item<T> $item); }
+const Outer<bool> PRESENT = Outer::Wrap(Item::Value(true));
+const Outer<bool> EMPTY = Outer::Wrap(Item::Empty);
+const Item<bool> WRONG = Item::Value("text");
+"#,
+        )
+        .unwrap();
+        let (evaluation, diagnostics) = evaluate_program_with_diagnostics(&program);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(!evaluation
+            .values
+            .contains_key(&ConstKey::TopLevel("WRONG".into())));
+        for name in ["PRESENT", "EMPTY"] {
+            let ConstValue::PayloadEnum(outer) =
+                &evaluation.values[&ConstKey::TopLevel(name.into())].value
+            else {
+                panic!("expected outer payload");
+            };
+            let ConstValue::PayloadEnum(inner) = &outer.fields[0] else {
+                panic!("expected inner payload");
+            };
+            assert_eq!(outer.value.enum_type.arguments, vec![ResolvedType::Bool]);
+            assert_eq!(inner.value.enum_type.arguments, vec![ResolvedType::Bool]);
+            assert_eq!(
+                outer.field_types,
+                vec![ResolvedType::Enum(inner.value.enum_type.clone())]
+            );
+        }
+    }
+
+    #[test]
+    fn enum_constants_validate_nested_field_types_after_argument_binding() {
+        let program = crate::parse_source(
+            "enum-payload-types.doria",
+            r#"
+enum State { case Ready; }
+enum Other { case Ready; }
+enum Packet { case Value(?State $state, bool $flag); }
+const Packet GOOD = Packet::Value(flag: true, state: null);
+const Packet BAD = Packet::Value(flag: true, state: Other::Ready);
+"#,
+        )
+        .unwrap();
+        let (evaluation, diagnostics) = evaluate_program_with_diagnostics(&program);
+        assert!(evaluation
+            .values
+            .contains_key(&ConstKey::TopLevel("GOOD".into())));
+        assert!(!evaluation
+            .values
+            .contains_key(&ConstKey::TopLevel("BAD".into())));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0]
+            .message
+            .contains("expects `?State`, found `Other`"));
+    }
+
+    #[test]
+    fn enum_constant_types_and_equality_preserve_the_complete_application() {
+        let application = |argument| ConstEnumValue {
+            enum_type: EnumType::with_arguments(EnumId(17), "Packet", vec![argument]),
+            case: EnumCaseSource {
+                declaration: EnumId(17),
+                index: 0,
+            },
+        };
+        let first = application(ResolvedType::Bool);
+        let second = application(ResolvedType::String);
+        let expected = ConstType::Enum(first.enum_type.clone());
+        let nullable = ConstType::NullableEnum(first.enum_type.clone());
+        assert_eq!(expected.to_string(), "Packet<bool>");
+        assert_eq!(nullable.to_string(), "?Packet<bool>");
+        assert!(nullable.accepts(&expected));
+        assert!(nullable.accepts(&ConstType::Null));
+        assert!(!nullable.accepts(&ConstType::Enum(second.enum_type.clone())));
+        assert_eq!(nullable.nullable_payload(), Some(expected.clone()));
+
+        let program =
+            crate::parse_source("enum-constant.doria", "function main(): void {}").unwrap();
+        for payload in [false, true] {
+            let value = |identity: ConstEnumValue| {
+                if payload {
+                    ConstValue::PayloadEnum(ConstPayloadEnumValue {
+                        value: identity,
+                        fields: vec![ConstValue::Bool(true)],
+                        field_types: vec![ResolvedType::Bool],
+                    })
+                } else {
+                    ConstValue::Enum(identity)
+                }
+            };
+            assert_eq!(ConstType::of(&value(first.clone())), expected);
+            let mut evaluator = Evaluator::collect(&program);
+            assert_eq!(
+                evaluator.binary(
+                    &BinaryOp::Equal,
+                    TypedValue::new(value(first.clone())),
+                    TypedValue::new(value(first.clone())),
+                    Span::default()
+                ),
+                Some(ConstValue::Bool(true))
+            );
+            assert_eq!(
+                evaluator.binary(
+                    &BinaryOp::Equal,
+                    TypedValue::new(value(first.clone())),
+                    TypedValue::new(value(second.clone())),
+                    Span::default()
+                ),
+                None
+            );
+            assert_eq!(evaluator.diagnostics.len(), 1);
+        }
+    }
 }

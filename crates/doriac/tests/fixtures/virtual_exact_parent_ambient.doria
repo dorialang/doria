@@ -1,0 +1,16 @@
+open class Root
+{
+    open function value(): int { return 3; }
+}
+
+class Child extends Root
+{
+    override function value(): int { echo "child"; return 7; }
+    function exact(): int { return parent::value(); }
+}
+
+function main(): void
+{
+    let $source = new Child();
+    echo $source->exact();
+}

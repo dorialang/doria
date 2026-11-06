@@ -15,6 +15,7 @@ pub(crate) enum Reason {
 pub(crate) struct Failure {
     pub(crate) reason: Reason,
     pub(crate) system_code: Option<i64>,
+    pub(crate) transferred_byte_count: Option<usize>,
 }
 
 impl Failure {
@@ -22,6 +23,7 @@ impl Failure {
         Self {
             reason: classify(code),
             system_code: Some(code),
+            transferred_byte_count: None,
         }
     }
 
@@ -29,14 +31,15 @@ impl Failure {
         Self {
             reason: Reason::InvalidInput,
             system_code: None,
+            transferred_byte_count: None,
         }
     }
 
-    #[cfg(not(any(unix, windows)))]
     pub(crate) const fn unsupported() -> Self {
         Self {
             reason: Reason::Unsupported,
             system_code: None,
+            transferred_byte_count: None,
         }
     }
 
@@ -44,8 +47,54 @@ impl Failure {
         Self {
             reason: Reason::Other,
             system_code: None,
+            transferred_byte_count: None,
         }
     }
+
+    /// Sets progress only when the operation owning the transfer knows it.
+    pub(crate) const fn with_transferred_byte_count(mut self, count: Option<usize>) -> Self {
+        self.transferred_byte_count = count;
+        self
+    }
+
+    /// Adds an already transferred prefix without turning unknown progress into zero.
+    pub(crate) fn after_transferred(self, prefix: usize) -> Self {
+        self.with_transferred_byte_count(
+            self.transferred_byte_count
+                .and_then(|count| prefix.checked_add(count)),
+        )
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn last_failure() -> Failure {
+    Failure::from_system_code(last_system_code())
+}
+
+#[cfg(unix)]
+pub(crate) fn last_system_code() -> i64 {
+    unsafe extern "C" {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn __errno_location() -> *mut i32;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        fn __error() -> *mut i32;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        i64::from(*__errno_location())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    unsafe {
+        i64::from(*__error())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn last_system_code() -> i64 {
+    unsafe extern "system" {
+        fn GetLastError() -> u32;
+    }
+    unsafe { i64::from(GetLastError()) }
 }
 
 #[cfg(unix)]
@@ -141,6 +190,28 @@ mod tests {
     #[test]
     fn validation_failures_have_no_host_code() {
         assert_eq!(Failure::invalid_input().system_code, None);
+    }
+
+    #[test]
+    fn progress_preserves_absent_zero_positive_and_overflow() {
+        let failure = Failure::from_system_code(13);
+        assert_eq!(failure.transferred_byte_count, None);
+        assert_eq!(failure.after_transferred(9), failure);
+        for (raw, prefix, expected) in [
+            (0, 0, Some(0)),
+            (0, 9, Some(9)),
+            (3, 9, Some(12)),
+            (1, usize::MAX, None),
+        ] {
+            let accumulated = failure
+                .with_transferred_byte_count(Some(raw))
+                .after_transferred(prefix);
+            assert_eq!(accumulated.transferred_byte_count, expected);
+            assert_eq!(accumulated.reason, failure.reason);
+            assert_eq!(accumulated.system_code, failure.system_code);
+        }
+        assert_eq!(Failure::invalid_input().transferred_byte_count, None);
+        assert_eq!(Failure::other().transferred_byte_count, None);
     }
 
     #[cfg(not(any(unix, windows)))]

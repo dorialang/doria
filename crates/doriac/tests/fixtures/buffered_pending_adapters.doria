@@ -1,0 +1,151 @@
+use Doria\Std\Io\{File, ReadableFile, WritableFile, FileCreation, FileWriteMode, BufferedReader,
+    BorrowedBufferedReader, BufferedWriter, BorrowedBufferedWriter, ReadinessSet, ReadinessSource,
+    TransferPlan, TransferWaitResult, TransferCompletion, Wait, ReadOutcome, WriteOutcome, IoError,
+    IoOperation, IoErrorReason, FinishOutcome, BorrowedFinishOutcome};
+
+// Decision log entry 44: buffered bytes complete a pending read immediately;
+// an empty buffer passes the transfer through to the source, in plan order.
+function ownedReader(): void throws IoError {
+    write_file("buffered-input", "hello world");
+    let writable $reader = new BufferedReader<ReadableFile>(File::openRead("buffered-input"), 4);
+    $reader->fill();
+    {
+        let $source = $reader->readinessSource;
+        if (!($source is ReadinessSource)) { panic("readiness source lost"); }
+    }
+    writable ReadinessSet $set = new ReadinessSet();
+    let $registration = $set->register($reader);
+    writable Bytes $a = Bytes::allocate(3);
+    writable Bytes $b = Bytes::allocate(3);
+    {
+        let $plan = TransferPlan::read($registration, $a->getWritableRegion(0, 3))
+            ->andReadFrom($registration, $b->getWritableRegion(0, 3));
+        let $first = $plan->getReadKey(0);
+        let $second = $plan->getReadKey(1);
+        let writable $group = $set->begin($plan);
+        if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Read($first, ReadOutcome::Data(3)))) { panic("buffered bytes not served first"); }
+        if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Read($second, ReadOutcome::Data(1)))) { panic("remaining buffered byte lost"); }
+        {
+            let $region = $group->getReadRegion($first);
+            if ($region == null || $region[0] != 104 || $region[2] != 108) { panic("buffered bytes changed"); }
+        }
+        $group->resubmitRead($first, 0, 3);
+        if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Read($first, ReadOutcome::Data(3)))) { panic("pass-through lost"); }
+        {
+            let $region = $group->getReadRegion($first);
+            if ($region == null || $region[0] != 111 || $region[1] != 32 || $region[2] != 119) { panic("pass-through bytes changed"); }
+        }
+        if ($group->getNextCompletion(Wait::Immediate) != TransferWaitResult::Exhausted) { panic("completion repeated"); }
+    }
+    let writable $returned = $set->unregister($registration);
+    writable Bytes $rest = Bytes::allocate(8);
+    if ($returned->read($rest->getWritableRegion(0, 8)) != ReadOutcome::Data(4)) { panic("position changed"); }
+    echo "reader;";
+}
+
+function borrowedReader(): void throws IoError {
+    write_file("borrowed-input", "abcdef");
+    let writable $file = File::openRead("borrowed-input");
+    {
+        let writable $reader = new BorrowedBufferedReader<ReadableFile>($file, 4);
+        $reader->fill();
+        writable ReadinessSet $set = new ReadinessSet();
+        let $registration = $set->register($reader);
+        writable Bytes $a = Bytes::allocate(8);
+        {
+            let $plan = TransferPlan::read($registration, $a->getWritableRegion(0, 8));
+            let $key = $plan->getReadKey(0);
+            let writable $group = $set->begin($plan);
+            if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Read($key, ReadOutcome::Data(4)))) { panic("borrowed buffered bytes lost"); }
+            $group->resubmitRead($key, 0, 8);
+            if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Read($key, ReadOutcome::Data(2)))) { panic("borrowed pass-through lost"); }
+        }
+        let $returned = $set->unregister($registration);
+    }
+    writable Bytes $rest = Bytes::allocate(2);
+    if ($file->read($rest->getWritableRegion(0, 2)) != ReadOutcome::EndOfStream) { panic("borrowed file moved"); }
+    echo "borrowed reader;";
+}
+
+function close(take WritableFile $file): bool throws IoError { $file->close(); return true; }
+
+// A pending write fills free buffer space immediately, drains a full buffer
+// through one transfer, and passes a large write through an empty buffer.
+function ownedWriter(): void throws IoError {
+    writable Bytes $data = Bytes::fromArray([97, 98, 99, 100, 101, 102, 103, 104, 105, 106]);
+    let writable $writer = new BufferedWriter<WritableFile>(File::openWrite("buffered-output", FileCreation::CreateOrTruncate, FileWriteMode::Positioned), 4);
+    $writer->write($data->getRegion(0, 2));
+    writable ReadinessSet $set = new ReadinessSet();
+    let $registration = $set->register($writer);
+    {
+        let $plan = TransferPlan::writeTo($registration, $data->getRegion(2, 4));
+        let $key = $plan->getWriteKey(0);
+        let writable $group = $set->begin($plan);
+        if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(2)))) { panic("free space not filled immediately"); }
+        $group->resubmitWrite($key, 2, 2);
+        if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(2)))) { panic("full buffer did not drain"); }
+        if ($group->getNextCompletion(Wait::Immediate) != TransferWaitResult::Exhausted) { panic("completion repeated"); }
+    }
+    if (read_file("buffered-output") != "abcd") { panic("drain wrote the wrong bytes"); }
+    {
+        let $plan = TransferPlan::writeTo($registration, $data->getRegion(6, 1))->andWriteTo($registration, $data->getRegion(7, 1));
+        try {
+            let $group = $set->begin($plan);
+            panic("a second concurrent write was accepted");
+        } catch (IoError $error) {
+            if ($error->operation != IoOperation::Configure || $error->reason != IoErrorReason::InvalidInput) { panic("wrong rejection"); }
+            echo $error->message . ";";
+        }
+    }
+    let $returned = $set->unregister($registration);
+    let $closed = match (take $returned->finish()) {
+        FinishOutcome::Complete($file) => close($file),
+        FinishOutcome::Pending($pending) => false,
+    };
+    if (!$closed) { panic("finish pending"); }
+    // The rejected plan's first write was accepted into the buffer during
+    // preparation; Decision 0110 keeps an immediate outcome after setup fails.
+    if (read_file("buffered-output") != "abcdefg") { panic("finish lost the buffered tail"); }
+    let writable $through = new BufferedWriter<WritableFile>(File::openWrite("through-output", FileCreation::CreateOrTruncate, FileWriteMode::Positioned), 4);
+    let $second = $set->register($through);
+    {
+        let $plan = TransferPlan::writeTo($second, $data->getRegion(0, 10));
+        let $key = $plan->getWriteKey(0);
+        let writable $group = $set->begin($plan);
+        if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(10)))) { panic("large write did not pass through"); }
+    }
+    if (read_file("through-output") != "abcdefghij") { panic("pass-through wrote the wrong bytes"); }
+    echo "writer;";
+}
+
+function borrowedWriter(): void throws IoError {
+    writable Bytes $data = Bytes::fromArray([120, 121]);
+    let writable $file = File::openWrite("borrowed-output", FileCreation::CreateOrTruncate, FileWriteMode::Positioned);
+    {
+        let writable $writer = new BorrowedBufferedWriter<WritableFile>($file, 4);
+        writable ReadinessSet $set = new ReadinessSet();
+        let $registration = $set->register($writer);
+        {
+            let $plan = TransferPlan::writeTo($registration, $data->getRegion(0, 2));
+            let $key = $plan->getWriteKey(0);
+            let writable $group = $set->begin($plan);
+            if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(2)))) { panic("borrowed write not buffered"); }
+        }
+        if (read_file("borrowed-output") != "") { panic("buffered bytes reached the file early"); }
+        let $returned = $set->unregister($registration);
+        let $finished = match (take $returned->finish()) {
+            BorrowedFinishOutcome::Complete => true,
+            BorrowedFinishOutcome::Pending($pending) => false,
+        };
+        if (!$finished) { panic("borrowed finish pending"); }
+    }
+    if (read_file("borrowed-output") != "xy") { panic("borrowed finish lost bytes"); }
+    echo "borrowed writer\n";
+}
+
+function main(): void {
+    ownedReader();
+    borrowedReader();
+    ownedWriter();
+    borrowedWriter();
+}

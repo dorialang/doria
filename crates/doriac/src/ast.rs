@@ -251,12 +251,12 @@ pub struct DelimitedListSpans {
 }
 
 impl TypeDeclarationSyntax {
-    pub fn synthetic(span: Span) -> Self {
+    pub fn synthetic(span: Span, inheritance_type_spans: Vec<Span>) -> Self {
         Self {
             keyword_span: span,
             type_parameters: None,
-            inheritance_keyword_span: None,
-            inheritance_type_spans: Vec::new(),
+            inheritance_keyword_span: (!inheritance_type_spans.is_empty()).then_some(span),
+            inheritance_type_spans,
             inheritance_comma_spans: Vec::new(),
             open_brace_span: span,
             close_brace_span: span,
@@ -277,9 +277,41 @@ pub struct ClassDecl {
     pub extends_span: Option<Span>,
     pub parent_span: Option<Span>,
     pub modifier_prefix_span: Span,
-    pub implements: Vec<TypeRef>,
+    pub implements: Vec<InterfaceConformance>,
     pub syntax: TypeDeclarationSyntax,
     pub members: Vec<ClassMember>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceConformance {
+    pub ty: TypeRef,
+    pub condition: Option<NominalCondition>,
+}
+
+impl InterfaceConformance {
+    pub fn unconditional(ty: TypeRef) -> Self {
+        Self {
+            ty,
+            condition: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NominalCondition {
+    pub keyword_span: Span,
+    pub bounds: Vec<NominalBound>,
+    pub delimiters: DelimitedListSpans,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NominalBound {
+    pub subject: NameRef,
+    pub implements_span: Span,
+    pub interfaces: Vec<TypeRef>,
+    pub type_spans: Vec<Span>,
     pub span: Span,
 }
 
@@ -346,6 +378,7 @@ pub struct PropertyDecl {
     pub ty: TypeRef,
     pub name: String,
     pub name_span: Span,
+    pub availability: Option<NominalCondition>,
     pub initializer: Option<Expr>,
     pub hooks: Vec<PropertyHook>,
     pub span: Span,
@@ -394,6 +427,8 @@ pub struct FunctionDecl {
     pub override_span: Option<Span>,
     pub writable_this: bool,
     pub writable_span: Option<Span>,
+    pub consuming_this: bool,
+    pub consuming_span: Option<Span>,
     pub is_static: bool,
     pub static_span: Option<Span>,
     pub name: String,
@@ -402,30 +437,47 @@ pub struct FunctionDecl {
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
     pub throws: Option<ThrowsClause>,
+    pub availability: Option<NominalCondition>,
     pub body: FunctionBody,
     pub syntax: Box<FunctionSyntax>,
     pub modifier_prefix_span: Span,
     pub span: Span,
 }
 
+impl FunctionDecl {
+    /// Whether the method's `$this` is writable. Decision 0080, amended by the
+    /// Stage 36a decision log entry 42: a destructor has exclusive writable
+    /// access to the dying object, which nothing else can observe, without
+    /// declaring `writable` (E0466 still rejects the modifier).
+    pub fn has_writable_receiver(&self) -> bool {
+        self.writable_this || (self.name == "__destruct" && !self.is_static)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionBody {
     Block(Block),
-    Requirement { semicolon_span: Span },
+    Requirement {
+        semicolon_span: Span,
+    },
+    Intrinsic {
+        implementation: CompilerIntrinsic,
+        span: Span,
+    },
 }
 
 impl FunctionBody {
     pub fn as_block(&self) -> Option<&Block> {
         match self {
             Self::Block(block) => Some(block),
-            Self::Requirement { .. } => None,
+            Self::Requirement { .. } | Self::Intrinsic { .. } => None,
         }
     }
 
     pub fn as_block_mut(&mut self) -> Option<&mut Block> {
         match self {
             Self::Block(block) => Some(block),
-            Self::Requirement { .. } => None,
+            Self::Requirement { .. } | Self::Intrinsic { .. } => None,
         }
     }
 
@@ -433,11 +485,70 @@ impl FunctionBody {
         match self {
             Self::Block(block) => block.span,
             Self::Requirement { semicolon_span } => *semicolon_span,
+            Self::Intrinsic { span, .. } => *span,
         }
     }
 
     pub fn statements(&self) -> &[Stmt] {
         self.as_block().map_or(&[], |block| &block.statements)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilerIntrinsic {
+    File(crate::compiler_known_stream::FileFunction),
+    Readiness(crate::compiler_known_stream::ReadinessFunction),
+    TransferPlan(crate::compiler_known_stream::TransferPlanFunction),
+    TransferGroup(crate::compiler_known_stream::TransferGroupFunction),
+    Time(crate::compiler_known_time::TimeFunction),
+    Concurrency(crate::compiler_known_concurrency::ConcurrencyFunction),
+    Process(crate::compiler_known_stream::ProcessFunction),
+}
+
+impl CompilerIntrinsic {
+    pub const fn source_id(self) -> crate::source::SourceId {
+        match self {
+            Self::File(_)
+            | Self::Readiness(_)
+            | Self::TransferPlan(_)
+            | Self::TransferGroup(_)
+            | Self::Process(_) => crate::compiler_known_stream::SOURCE_ID,
+            Self::Time(_) => crate::compiler_known_time::SOURCE_ID,
+            Self::Concurrency(_) => crate::compiler_known_concurrency::SOURCE_ID,
+        }
+    }
+
+    pub fn may_block(self) -> bool {
+        match self {
+            Self::File(function) => function.may_block(),
+            Self::Readiness(function) => function.may_block(),
+            Self::TransferGroup(implementation) => {
+                implementation
+                    == crate::compiler_known_stream::TransferGroupFunction::NextCompletion
+            }
+            Self::Process(function) => function.may_block(),
+            Self::Time(_) | Self::TransferPlan(_) | Self::Concurrency(_) => false,
+        }
+    }
+
+    pub fn return_borrow(self) -> Option<crate::symbols::ReturnBorrow> {
+        match self {
+            Self::File(function) => function.return_borrow(),
+            Self::Readiness(function) => function.return_borrow(),
+            Self::TransferPlan(implementation) => implementation.return_borrow(),
+            Self::TransferGroup(implementation) => implementation.return_borrow(),
+            Self::Process(function) => function.return_borrow(),
+            Self::Time(_) | Self::Concurrency(_) => None,
+        }
+    }
+
+    pub(crate) fn retained_sources(self) -> Vec<crate::ownership::RetainedSource> {
+        match self {
+            Self::TransferPlan(function) => function.retained_sources(),
+            Self::Readiness(function) => function.retained_sources(),
+            Self::TransferGroup(function) => function.retained_sources(),
+            Self::File(_) | Self::Time(_) | Self::Concurrency(_) | Self::Process(_) => Vec::new(),
+        }
     }
 }
 
@@ -915,6 +1026,8 @@ pub enum Expr {
         property: String,
         member_span: Span,
         null_safe: bool,
+        /// `take $this->field` moves a stored field out of a consumed receiver.
+        take_span: Option<Span>,
         span: Span,
     },
     MethodCall {

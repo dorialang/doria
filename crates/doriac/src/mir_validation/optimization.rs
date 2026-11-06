@@ -112,9 +112,11 @@ pub(crate) fn optimization_facts_with_metrics(
                         return ParameterFacts::default();
                     };
                     let class = &program.classes[class.0];
-                    // Open classes and erased values use aggregate carriers, not one
-                    // pointer parameter. Their payload facts must not annotate a carrier.
+                    // Opaque runtime owners do not have the source property layout
+                    // or ordinary-class alias guarantees. Aggregate carriers also
+                    // cannot receive facts about a single payload pointer.
                     if class.is_open
+                        || class.runtime_payload.is_some()
                         || function.closure.is_some()
                         || (index == 0 && function.uses_virtual_receiver_abi())
                     {
@@ -172,6 +174,7 @@ pub(crate) fn optimization_facts_with_metrics(
                     };
                     if class != concrete_class
                         || program.classes[class.0].is_open
+                        || program.classes[class.0].runtime_payload.is_some()
                         || !function.locals[target.0].owned
                         || assignment_count(function, *target) != 1
                         || root_effects(program, function, *target, &effects).captures
@@ -266,14 +269,17 @@ fn assignment_count(function: &mir::Function, local: mir::LocalId) -> usize {
                     mir::Statement::CoreCollection { operation, .. } => {
                         operation.outputs().contains(&local)
                     }
-                    mir::Statement::ExtractErrorObject { target, .. } => *target == local,
+                    mir::Statement::ExtractErrorObject { target, .. }
+                    | mir::Statement::TakeProperty { target, .. } => *target == local,
                     _ => false,
                 })
                 .count();
             let result = match &block.terminator {
                 mir::Terminator::CheckedCall { result, error, .. }
                 | mir::Terminator::CheckedIndirectCall { result, error, .. }
-                | mir::Terminator::CheckedIo { result, error, .. } => {
+                | mir::Terminator::CheckedIo { result, error, .. }
+                | mir::Terminator::CheckedDeadlineFromNow { result, error, .. }
+                | mir::Terminator::CheckedCancellationRequest { result, error, .. } => {
                     *result == Some(local) || *error == local
                 }
                 mir::Terminator::IndirectCall { result, .. } => *result == Some(local),
@@ -330,7 +336,7 @@ fn call_effects(
     summaries: &[Vec<Effects>],
 ) -> Effects {
     let mut result = Effects::default();
-    for (callee, receiver) in &accesses.method_receivers {
+    for (_, callee, receiver) in &accesses.method_receivers {
         let mut receiver_accesses = ClassLocalAccesses::default();
         collect_nullable_class_local_accesses(receiver, &mut receiver_accesses);
         if touches(&receiver_accesses, roots) {
@@ -408,7 +414,11 @@ fn root_effects(
     for block in &function.blocks {
         for statement in &block.statements {
             let destruction = match statement {
-                mir::Statement::DropClass { local, class } => Some((*local, *class, true)),
+                mir::Statement::DropClass {
+                    local,
+                    class,
+                    runs_destructor,
+                } => Some((*local, *class, *runs_destructor)),
                 mir::Statement::CleanupConstructorPhase { object, class } => {
                     Some((*object, *class, false))
                 }
@@ -463,11 +473,15 @@ fn root_effects(
         }
         result.include(call_effects(program, &accesses, &roots, summaries));
         match &block.terminator {
+            mir::Terminator::CheckedCancellationRequest { source, .. } => {
+                result.writes |= roots.contains(source);
+            }
             mir::Terminator::Return(value) if copied_result(value) => {}
             mir::Terminator::Branch { .. }
             | mir::Terminator::Panic { .. }
             | mir::Terminator::CheckedCall { .. }
-            | mir::Terminator::CheckedIo { .. } => {}
+            | mir::Terminator::CheckedIo { .. }
+            | mir::Terminator::CheckedDeadlineFromNow { .. } => {}
             _ => result.include(Effects::UNKNOWN),
         }
     }

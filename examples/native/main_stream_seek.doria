@@ -1,0 +1,58 @@
+use Doria\Std\Io\{File, FileCreation, FileWriteMode, ReadableFile, SeekableStream, SeekOrigin, IoError, IoOperation, IoTarget};
+
+function inspect(ReadableFile $file): int throws IoError {
+    return $file->getPosition() + $file->getLength();
+}
+
+function view(ReadableFile $file): ReadableFile {
+    return $file;
+}
+
+function reposition(writable SeekableStream $stream, int $offset, SeekOrigin $origin): int throws IoError {
+    return $stream->seek($offset, $origin);
+}
+
+function genericSeek<T implements SeekableStream>(writable T $stream, int $offset, SeekOrigin $origin): int throws IoError {
+    return $stream->seek($offset, $origin);
+}
+
+function main(): void {
+    write_file("seek.bin", "abcdef");
+    let writable $reader = File::openRead("seek.bin");
+    echo inspect($reader) . " ";
+    echo reposition($reader, 2, SeekOrigin::Start) . " ";
+    echo genericSeek($reader, -1, SeekOrigin::Current) . " ";
+    echo $reader->seek(-2, SeekOrigin::End) . " ";
+    let $view = view($reader);
+    echo $view->getPosition() . " " . $view->getLength() . " ";
+    try {
+        $reader->seek(-1, SeekOrigin::Start);
+        panic("negative absolute seek succeeded");
+    } catch (IoError $error) {
+        if ($error->operation != IoOperation::Seek || $error->target != IoTarget::File("seek.bin")
+            || $error->transferredByteCount != null) { panic("seek error lost its facts"); }
+        echo "seek-error ";
+    }
+    writable Bytes $buffer = Bytes::allocate(2);
+    $reader->read($buffer->getWritableRegion(0, 2));
+    echo $buffer[0] . " " . $buffer[1] . " " . $reader->getPosition() . "\n";
+    $reader->close();
+
+    let writable $duplex = File::openReadWrite("seek.bin", FileCreation::OpenExisting, FileWriteMode::Positioned);
+    echo $duplex->seek(8, SeekOrigin::Start) . " ";
+    writable Bytes $marker = Bytes::allocate(1);
+    $marker[0] = 90;
+    $duplex->write($marker->getRegion(0, 1));
+    echo $duplex->getPosition() . " " . $duplex->getLength() . " ";
+    $duplex->seek(6, SeekOrigin::Start);
+    $duplex->read($buffer->getWritableRegion(0, 2));
+    echo $buffer[0] . " " . $buffer[1] . "\n";
+    $duplex->close();
+
+    let writable $writer = File::openWrite("seek.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+    echo $writer->seek(0, SeekOrigin::Start) . " ";
+    $marker[0] = 33;
+    $writer->write($marker->getRegion(0, 1));
+    echo $writer->getPosition() . " " . $writer->getLength() . "\n";
+    $writer->close();
+}

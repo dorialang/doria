@@ -15,6 +15,18 @@ use doriac::diagnostics::{
 };
 use doriac::source::{SourceFile, SourceId, Span};
 
+#[cfg(test)]
+#[path = "../tests/common/execution_directory.rs"]
+mod execution_directory;
+
+#[cfg(test)]
+#[path = "../tests/common/native_execution_runner.rs"]
+mod panic_native_execution;
+
+#[cfg(test)]
+#[path = "../tests/common/php_execution.rs"]
+mod php_execution;
+
 #[derive(Debug)]
 enum CliError {
     Message(String),
@@ -118,6 +130,15 @@ fn main() -> ExitCode {
         include_bytes!(env!("DORIA_RT_BUILT_RELEASE_PATH")),
         include_str!(concat!(
             env!("DORIA_RT_BUILT_RELEASE_PATH"),
+            ".doria-runtime.json"
+        )),
+    );
+
+    #[cfg(feature = "bundled-runtime")]
+    doriac::runtime_artifact::register_embedded_shared_runtime(
+        include_bytes!(env!("DORIA_RT_BUILT_SHARED_PATH")),
+        include_str!(concat!(
+            env!("DORIA_RT_BUILT_SHARED_PATH"),
             ".doria-runtime.json"
         )),
     );
@@ -401,7 +422,13 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
             })?;
             (output, None)
         };
-        write_backend_output(&out_path, output)?;
+        write_backend_output(&out_path, output).map_err(|error| {
+            CliError::graph_diagnostics(
+                graph.source_map.clone(),
+                publication_diagnostics(error),
+                diagnostic_options,
+            )
+        })?;
         if let (Some(report_path), Some(mut report)) = (performance_report, report) {
             report["totalDurationNs"] = serde_json::Value::from(
                 u64::try_from(source_load_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -458,7 +485,14 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         (output, None)
     };
 
-    write_backend_output(&out_path, output)?;
+    write_backend_output(&out_path, output).map_err(|error| {
+        CliError::diagnostics(
+            path.clone(),
+            text.clone(),
+            publication_diagnostics(error),
+            diagnostic_options,
+        )
+    })?;
     if let Some(report) = report.as_mut() {
         report["totalDurationNs"] = serde_json::Value::from(
             u64::try_from(source_load_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -598,6 +632,8 @@ fn graph_load_error(
     mut failure: doriac::compilation_graph::GraphLoadFailure,
     options: RenderOptions,
 ) -> CliError {
+    // Plan diagnostics locate the plan text, which is not a graph source.
+    // Give their spans the plan's identity; preparation names the source.
     let plan_source_id = SourceId(u32::MAX);
     for diagnostic in &mut failure.diagnostics {
         let primary_is_plan = diagnostic.labels.iter().any(|label| {
@@ -605,14 +641,12 @@ fn graph_load_error(
         });
         for label in &mut diagnostic.labels {
             if label.source == DiagnosticSource::Current {
-                label.source = DiagnosticSource::Path(path.to_string());
                 label.span.source = plan_source_id;
             }
         }
         for fix in &mut diagnostic.fixes {
             for edit in &mut fix.edits {
                 if edit.source == DiagnosticSource::Current {
-                    edit.source = DiagnosticSource::Path(path.to_string());
                     edit.span.source = plan_source_id;
                 }
             }
@@ -835,30 +869,17 @@ fn mir_command(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn write_backend_output(out_path: &Path, output: BackendOutput) -> Result<(), String> {
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("failed to create output directory: {error}"))?;
-        }
-    }
+fn write_backend_output(
+    out_path: &Path,
+    output: BackendOutput,
+) -> Result<(), doriac::backend::BackendError> {
+    doriac::backend::publish_output(out_path, output)
+}
 
-    match output {
-        BackendOutput::Text { contents, .. } => fs::write(out_path, contents)
-            .map_err(|error| format!("failed to write output file: {error}")),
-        BackendOutput::Binary { bytes, .. } => fs::write(out_path, bytes)
-            .map_err(|error| format!("failed to write output file: {error}")),
-        BackendOutput::Executable { bytes, .. } => {
-            fs::write(out_path, bytes)
-                .map_err(|error| format!("failed to write output file: {error}"))?;
-            make_executable(out_path)
-        }
-        BackendOutput::Artifact { path } => {
-            fs::copy(&path, out_path)
-                .map_err(|error| format!("failed to copy backend artifact: {error}"))?;
-            Ok(())
-        }
-    }
+fn publication_diagnostics(error: doriac::backend::BackendError) -> Vec<Diagnostic> {
+    error
+        .diagnostics
+        .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
 }
 
 fn default_output_path(input: &str, target: BackendTarget) -> Result<PathBuf, String> {
@@ -1160,7 +1181,11 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
                 .and_then(|entry| graph.sources.get(&entry.0))
                 .map(|source| source.display_path.as_str())
                 .unwrap_or(plan_path);
-            let diagnostic = decode_runtime_outcome(&payload, fallback_path)?;
+            let diagnostic = decode_runtime_outcome_with_sources(
+                &payload,
+                fallback_path,
+                Some(&graph.source_map),
+            )?;
             let options = RenderOptions {
                 context_lines: 0,
                 ..diagnostic_options
@@ -1234,12 +1259,13 @@ fn execute_native_output(
     let temp_path = temp_run_executable_path(input);
     let outcome_path = temp_path.with_extension("doria-outcome");
     write_backend_output(&temp_path, output)
-        .map_err(|error| format!("failed to write temp native executable: {error}"))?;
+        .map_err(|error| format!("failed to write temp native executable: {}", error.message))?;
     let status = doriac::native_process::spawn(
         Command::new(&temp_path)
             .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
             .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
             .env("DORIA_RUNTIME_OUTCOME_V4", &outcome_path)
+            .env("DORIA_RUNTIME_OUTCOME_V5", &outcome_path)
             .args(program_args),
     )
     .and_then(|mut child| child.wait())
@@ -1256,11 +1282,19 @@ fn execute_native_output(
 }
 
 fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
+    decode_runtime_outcome_with_sources(payload, source_path, None)
+}
+
+fn decode_runtime_outcome_with_sources(
+    payload: &[u8],
+    source_path: &str,
+    sources: Option<&doriac::source_map::SourceMap>,
+) -> Result<Diagnostic, CliError> {
     if payload.starts_with(b"DORIAO4\0") {
-        return decode_runtime_assertion_outcome(payload, source_path);
+        return decode_runtime_assertion_outcome(payload, source_path, sources);
     }
-    if payload.starts_with(b"DORIAO3\0") {
-        return decode_runtime_error_outcome(payload, source_path);
+    if payload.starts_with(b"DORIAO3\0") || payload.starts_with(b"DORIAO5\0") {
+        return decode_runtime_error_outcome(payload, source_path, sources);
     }
     let mut decoder = RuntimeOutcomeDecoder::new(payload);
     if decoder.take(8)? != b"DORIAO2\0" || decoder.u16()? != 2 {
@@ -1289,6 +1323,7 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
     let record_path = decoder.text(path_length)?;
     let _embedded_source = decoder.text(source_length)?;
     let function = decoder.text(function_length)?;
+    let primary_span = runtime_source_span(sources, &record_path, primary_span)?;
     let catalogue_entry = doriac::diagnostics::runtime_catalogue_entry(&code)
         .ok_or_else(|| "native program returned an unknown runtime diagnostic code".to_string())?;
     let mut facts = Vec::with_capacity(fact_count);
@@ -1363,6 +1398,7 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
         }
         let frame_function = decoder.text(frame_function_length)?;
         let frame_path = decoder.text(frame_path_length)?;
+        let span = runtime_source_span(sources, &frame_path, span)?;
         frames.push(RuntimeOutcomeFrame {
             function: frame_function,
             source: diagnostic_source(&frame_path, source_path),
@@ -1451,6 +1487,7 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
 fn decode_runtime_assertion_outcome(
     payload: &[u8],
     source_path: &str,
+    sources: Option<&doriac::source_map::SourceMap>,
 ) -> Result<Diagnostic, CliError> {
     const ASSERTION_ERROR: &str = "Doria\\Std\\Test\\AssertionError";
     let mut decoder = RuntimeOutcomeDecoder::new(payload);
@@ -1572,6 +1609,11 @@ fn decode_runtime_assertion_outcome(
         }
         (String::new(), None)
     };
+    let span = if origin_known {
+        runtime_source_span(sources, &record_path, span)?
+    } else {
+        span
+    };
     let mut frames = Vec::with_capacity(frame_count);
     for _ in 0..frame_count {
         let frame_function_length = usize::from(decoder.u16()?);
@@ -1580,10 +1622,12 @@ fn decode_runtime_assertion_outcome(
         if frame_function_length > 1024 || frame_path_length > 4096 {
             return Err("native program returned an oversized assertion frame".into());
         }
+        let frame_function = decoder.text(frame_function_length)?;
+        let frame_path = decoder.text(frame_path_length)?;
         frames.push(RuntimeOutcomeFrame {
-            function: decoder.text(frame_function_length)?,
-            source: diagnostic_source(&decoder.text(frame_path_length)?, source_path),
-            span: frame_span,
+            function: frame_function,
+            source: diagnostic_source(&frame_path, source_path),
+            span: runtime_source_span(sources, &frame_path, frame_span)?,
         });
     }
     if !decoder.is_empty() {
@@ -1665,9 +1709,15 @@ fn decode_runtime_assertion_outcome(
     Ok(Diagnostic::runtime_assertion(message, span, outcome))
 }
 
-fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
+fn decode_runtime_error_outcome(
+    payload: &[u8],
+    source_path: &str,
+    sources: Option<&doriac::source_map::SourceMap>,
+) -> Result<Diagnostic, CliError> {
     let mut decoder = RuntimeOutcomeDecoder::new(payload);
-    if decoder.take(8)? != b"DORIAO3\0" || decoder.u16()? != 3 {
+    let magic = decoder.take(8)?;
+    let version = decoder.u16()?;
+    if !((magic == b"DORIAO3\0" && version == 3) || (magic == b"DORIAO5\0" && version == 5)) {
         return Err("native program returned an unsupported runtime Error record".into());
     }
     let error_type_length = decoder.u32()? as usize;
@@ -1682,6 +1732,19 @@ fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Dia
         _ => return Err("native program returned an invalid runtime Error origin state".into()),
     };
     let span = Span::new(decoder.u64()? as usize, decoder.u64()? as usize);
+    let transferred_byte_count = if version == 5 {
+        let present = decoder.byte()?;
+        let count = decoder.u64()? as i64;
+        match present {
+            0 if count == 0 => None,
+            1 => Some(count),
+            _ => {
+                return Err("native program returned invalid I/O progress metadata".into());
+            }
+        }
+    } else {
+        None
+    };
     if error_type_length > 4096
         || path_length > 4096
         || source_length > 4 * 1024 * 1024
@@ -1691,6 +1754,9 @@ fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Dia
         return Err("native program returned an oversized runtime Error record".into());
     }
     let error_type = decoder.text(error_type_length)?;
+    if transferred_byte_count.is_some() && error_type != doriac::compiler_known_io::IO_ERROR {
+        return Err("native program returned I/O progress for a non-IoError type".into());
+    }
     let message = decoder.text(message_length)?;
     let (record_path, function) = if origin_known {
         let path = decoder.text(path_length)?;
@@ -1703,6 +1769,11 @@ fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Dia
             return Err("native program returned facts for an unavailable Error origin".into());
         }
         (String::new(), None)
+    };
+    let span = if origin_known {
+        runtime_source_span(sources, &record_path, span)?
+    } else {
+        span
     };
     if !decoder.is_empty() {
         return Err("native program returned trailing runtime Error bytes".into());
@@ -1721,7 +1792,13 @@ fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Dia
             function,
         },
         path: Vec::new(),
-        facts: Vec::new(),
+        facts: transferred_byte_count
+            .map(|value| RuntimeFact {
+                name: doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_FACT.to_string(),
+                value: RuntimeFactValue::Signed(value),
+            })
+            .into_iter()
+            .collect(),
         error_type: Some(error_type.clone()),
     };
     Ok(Diagnostic::runtime_error(
@@ -1735,6 +1812,31 @@ fn diagnostic_source(path: &str, current: &str) -> DiagnosticSource {
     } else {
         DiagnosticSource::Path(path.to_string())
     }
+}
+
+fn runtime_source_span(
+    sources: Option<&doriac::source_map::SourceMap>,
+    path: &str,
+    offsets: Span,
+) -> Result<Span, CliError> {
+    let Some(sources) = sources else {
+        // Standalone compilation owns source zero. Runtime records carry paths
+        // and offsets, not process-local SourceIds from a compilation graph.
+        return Ok(offsets);
+    };
+    let record = sources.by_path(path).ok_or_else(|| {
+        CliError::from(
+            "native program returned a runtime source absent from the compilation inventory",
+        )
+    })?;
+    if offsets.start > offsets.end || offsets.end > record.source.text.len() {
+        return Err("native program returned a runtime span outside its source".into());
+    }
+    Ok(Span::in_source(
+        record.source.id,
+        offsets.start,
+        offsets.end,
+    ))
 }
 
 struct RuntimeOutcomeDecoder<'a> {
@@ -1895,26 +1997,653 @@ fn parse_diagnostic_options(args: &[String]) -> Result<(Vec<String>, RenderOptio
     Ok((positional, options))
 }
 
-#[cfg(unix)]
-fn make_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| format!("failed to read output permissions: {error}"))?
-        .permissions();
-    permissions.set_mode(permissions.mode() | 0o111);
-    fs::set_permissions(path, permissions)
-        .map_err(|error| format!("failed to mark output executable: {error}"))
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::panic_native_execution::ExecutionDirectory;
     use super::*;
+
+    fn with_panic_fixture_context<T>(
+        path: &str,
+        source: &str,
+        run: impl FnOnce() -> T + std::panic::UnwindSafe,
+    ) -> T {
+        match std::panic::catch_unwind(run) {
+            Ok(value) => value,
+            Err(payload) => {
+                // Add repro context to compiler panics and failed assertions,
+                // then resume the original failure without changing its result.
+                eprintln!("Panic parity fixture: {path}\n{source}");
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    // Keep constructor and cleanup parity strict across the real V2 decoder,
+    // human PHP output, the interpreter, and each enabled native profile.
+    const PHP_LIFECYCLE_PANIC_SOURCES: &[&str] = &[
+        // Ordinary constructors retain the authored `new`, not a declaration.
+        r#"class Value { function __construct(int $value) { panic("constructor"); } }
+function argument(): int { return 7; }
+function main(): void { let $value = new Value(argument()); }"#,
+        r#"function seed(): int { panic("generated constructor initializer"); }
+class Value { int $number = seed(); }
+function main(): void { let $value = new Value(); }"#,
+        r#"open class Base { function __construct() { panic("implicit parent constructor"); } }
+class Value extends Base {}
+function main(): void { let $value = new Value(); }"#,
+        // An intrinsic panic in an initializer has no intervening user call.
+        r#"class Value { Bytes $bytes = Bytes::allocate(-1); }
+function main(): void { let $value = new Value(); }"#,
+        r#"class Marker { function __destruct() { panic("normal cleanup"); } }
+function finish(): void { let $marker = new Marker(); }
+function main(): void { finish(); }"#,
+        r#"class Failure implements Error { function __construct(string $message) {} }
+class Marker { function __destruct() { panic("checked cleanup"); } }
+function attempt(): void throws Failure {
+    let $marker = new Marker();
+    throw new Failure("retry");
+}
+function main(): void throws Failure { attempt(); }"#,
+        // Incomplete construction retains its frame through field cleanup.
+        r#"class Failure implements Error { function __construct(string $message) {} }
+class Marker { function __destruct() { panic("initializer failure cleanup"); } }
+function seed(): int throws Failure { throw new Failure("initialize"); }
+class Value {
+    Marker $marker = new Marker();
+    int $number = seed();
+    function __construct() throws Failure {}
+}
+function main(): void throws Failure { let $value = new Value(); }"#,
+        // A parent without executable construction still owns completed-phase
+        // cleanup when either kind of child constructor subsequently fails.
+        r#"class Failure implements Error { function __construct(string $message) {} }
+open class Base {
+    function __destruct() { try { echo "base;"; } catch (Error) {} }
+}
+class Value extends Base {
+    function __construct() throws Failure { throw new Failure("child"); }
+}
+function main(): void {
+    try { let $value = new Value(); } catch (Failure) {}
+    panic("after explicit child construction failure");
+}"#,
+        // Generated constructors may transport automatic I/O effects, but
+        // E0635 still requires explicit contracts for required user errors.
+        // A literal NUL rejects the path before any filesystem access.
+        concat!(
+            r#"open class Base {
+    function __destruct() { try { echo "base;"; } catch (Error) {} }
+}
+function seed(): string { return read_file("invalid"#,
+            "\0",
+            r#"path"); }
+class Value extends Base { string $contents = seed(); }
+function main(): void {
+    try { let $value = new Value(); } catch (Doria\Std\Io\IoError) {}
+    panic("after generated child construction failure");
+}"#
+        ),
+        // Caught construction failure and later normal property destruction
+        // must remove every lifecycle frame before the subsequent panic.
+        r#"class Failure implements Error { function __construct(string $message) {} }
+class Marker {
+    function __destruct() { try { echo "field;"; } catch (Error) {} }
+}
+class Value {
+    Marker $marker = new Marker();
+    function __construct(bool $fail) throws Failure {
+        if ($fail) { throw new Failure("initialize"); }
+    }
+    function __destruct() { try { echo "value;"; } catch (Error) {} }
+}
+function main(): void throws Failure {
+    try { let $failed = new Value(true); } catch (Failure) {}
+    { let $completed = new Value(false); }
+    panic("after lifecycle cleanup");
+}"#,
+    ];
+
+    #[test]
+    fn php_panic_transport_preserves_typed_facts_and_exact_human_projection() {
+        let path = "php-panic-transport.doria";
+        // Reuse the interface payload exercised by
+        // collection_ingestion_through_shared_access_transfers_owned_values.
+        let shared_payload = r#"
+class Token {
+    function __construct(int $value) {}
+    function __destruct() { try { echo "token{$this->value};"; } catch (Error) {} }
+}
+interface TokenQueue {
+    writable function pushBack(take List<Token> $value): void;
+    writable function popBack(): ?List<Token>;
+}
+class Adapter implements TokenQueue {
+    writable Deque<List<Token>> $values = Deque::from([]);
+    writable function pushBack(take List<Token> $value): void { $this->values->pushBack($value); }
+    writable function popBack(): ?List<Token> { return $this->values->popBack(); }
+}
+"#;
+        let shared_conflicts = [
+            (
+                r#"function main(): void {
+    let $shared = new WritableSharedReference<TokenQueue>(new Adapter());
+    let $readonly = $shared->acquireReadonlyAccess();
+    let writable $writable = $shared->acquireWritableAccess();
+}"#,
+                doria_diagnostic_catalogue::READONLY_THEN_WRITABLE_CONFLICT,
+            ),
+            (
+                r#"function main(): void {
+    let $shared = new WritableSharedReference<TokenQueue>(new Adapter());
+    let writable $writable = $shared->acquireWritableAccess();
+    let $readonly = $shared->acquireReadonlyAccess();
+}"#,
+                doria_diagnostic_catalogue::WRITABLE_THEN_READONLY_CONFLICT,
+            ),
+            (
+                r#"function main(): void {
+    let $shared = new WritableSharedReference<TokenQueue>(new Adapter());
+    let writable $first = $shared->acquireWritableAccess();
+    let writable $second = $shared->acquireWritableAccess();
+}"#,
+                doria_diagnostic_catalogue::WRITABLE_THEN_WRITABLE_CONFLICT,
+            ),
+        ];
+        for (source, conflict_reason) in [
+            "function main(): void { panic(\"stop 界\"); }",
+            "function main(): void { int[] $values = [7]; let $value = $values[-1]; }",
+            "function main(): void { List<int> $values = [7]; let $value = $values[1]; }",
+            "function main(): void { Dictionary<string, int> $values = [\"present\" => 7]; let $value = $values[\"missing\"]; }",
+            "function main(): void { let $values = Bytes::allocate(-7); }",
+            "function main(): void { let $values = Bytes::allocate(1); let $value = $values[-1]; }",
+            "function main(): void { let $values = Bytes::allocate(1); let $view = $values->getRegion(-1, 1); }",
+            include_str!("../../../examples/native/main_stage23c_negative_fill_panic.doria"),
+            // Recursion and repeated same-line calls retain each full caller span.
+            r#"function descend(int $depth): void {
+    if ($depth > 0) { descend($depth - 1); return; }
+    panic("recursive stop");
+}
+function main(): void { descend(2); }"#,
+            r#"function choose(bool $stop): void { if ($stop) { panic("same line"); } }
+function main(): void { choose(false); choose(true); }"#,
+            // Written named-argument order and exactly-once evaluation survive
+            // metadata scopes; the outer call must replace nested call sites.
+            r#"function argument(int $value): int {
+    try { echo "argument{$value};"; } catch (Error) {}
+    return $value;
+}
+function fail(int $first, int $second): void { panic("arguments"); }
+function main(): void { fail(second: argument(2), first: argument(1)); }"#,
+            r#"function fail<T>(T $value): void { panic("specialized"); }
+class Runner { function __doria_list_insert_at(): void { fail(1); } }
+function main(): void { let $runner = new Runner(); $runner->__doria_list_insert_at(); }"#,
+            r#"interface Runner { function run(int $value): void; }
+class Task implements Runner { function run(int $value): void { panic("interface"); } }
+function argument(): int { return 7; }
+function forward(Runner $runner): void { $runner->run(argument()); }
+function main(): void { let $runner = new Task(); forward($runner); }"#,
+            r#"open class Base { open function run(): void { panic("parent"); } }
+class Task extends Base { override function run(): void { parent::run(); } }
+function main(): void { let $runner = new Task(); $runner->run(); }"#,
+            r#"class Runner { static function run(int $value): void { panic("static"); } }
+function argument(): int { return 7; }
+function main(): void { Runner::run(argument()); }"#,
+            r#"class Failure implements Error { function __construct(string $message) {} }
+class Task { function __construct(int $value) throws Failure { panic("constructor"); } }
+function argument(): int { return 7; }
+function main(): void throws Failure { let $task = new Task(argument()); }"#,
+            r#"function argument(): int { return 7; }
+function main(): void {
+    let $callback = function (int $value): void { panic("closure"); };
+    $callback(argument());
+}"#,
+            r#"function main(): void {
+    List<int> $values = [1, 2];
+    let $callback = function (int $value): int { panic("map callback"); };
+    let $mapped = $values->map($callback);
+}"#,
+            r#"class Value { int $number { get { panic("getter"); } } }
+function main(): void { let $value = new Value(); let $number = $value->number; }"#,
+            r#"class Value { writable int $number { set (int $next) { panic("setter"); } } }
+function argument(): int { return 7; }
+function main(): void { let writable $value = new Value(); $value->number = argument(); }"#,
+            r#"class Value implements Displayable { function toString(): string { panic("display"); } }
+function main(): void { let $value = new Value(); echo "value={$value}"; }"#,
+            // Collection helpers invoke authored contracts at the checked
+            // insertion site, not the encompassing assignment/declaration.
+            r#"class Key implements Hashable, Equatable<Key> {
+    function hash(): uint64 { panic("indexed hash"); }
+    function equals(Key $other): bool { return true; }
+}
+function argument(): int { return 7; }
+function main(): void {
+    writable Dictionary<Key, int> $values = [];
+    $values[new Key()] = argument();
+}"#,
+            r#"class Key implements Hashable, Equatable<Key> {
+    function hash(): uint64 { panic("literal hash"); }
+    function equals(Key $other): bool { return true; }
+}
+function argument(): int { return 7; }
+function main(): void { Dictionary<Key, int> $values = [new Key() => argument()]; }"#,
+            r#"class Key implements Hashable, Equatable<Key> {
+    function hash(): uint64 { return 1; }
+    function equals(Key $other): bool { panic("indexed equality"); }
+}
+function argument(): int { return 7; }
+function main(): void {
+    writable Dictionary<Key, int> $values = [new Key() => 1];
+    $values[new Key()] = argument();
+}"#,
+            r#"class Key implements Comparable<Key> {
+    function compare(Key $other): Ordering { panic("indexed comparison"); }
+}
+function argument(): int { return 7; }
+function main(): void {
+    writable SortedDictionary<Key, int> $values = SortedDictionary::from([]);
+    $values[new Key()] = 1;
+    $values[new Key()] = argument();
+}"#,
+            // Checked propagation must run cleanup and remove the failed frame
+            // before a later panic; abort must not run remaining cleanup.
+            r#"class Failure implements Error { function __construct(string $message) {} }
+class Marker { function __destruct() { try { echo "cleanup;"; } catch (Error) {} } }
+function attempt(): int throws Failure {
+    let $marker = new Marker();
+    throw new Failure("retry");
+}
+function main(): void {
+    try { let $result = attempt(); } catch (Failure) {}
+    let $remaining = new Marker();
+    panic("after checked cleanup");
+}"#,
+            // The primary divisor label differs from the complete RMW operation.
+            r#"function main(): void {
+    let writable $bytes = Bytes::allocate(1);
+    uint8 $zero = 0;
+    $bytes[0] /= $zero;
+}"#,
+        ]
+        .into_iter()
+        .map(|source| (source.to_string(), None))
+        .chain(
+            PHP_LIFECYCLE_PANIC_SOURCES
+                .iter()
+                .map(|source| (source.to_string(), None)),
+        )
+        .chain(shared_conflicts.map(|(source, reason)| {
+            (format!("{shared_payload}\n{source}"), Some(reason))
+        }))
+        {
+            let source = source.as_str();
+            with_panic_fixture_context(path, source, || {
+                let mir = doriac::lower_source_to_mir(path, source).unwrap();
+                let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
+                let expected_diagnostic = expected.runtime_diagnostic.as_ref().unwrap();
+                if let Some(reason) = conflict_reason {
+                    assert_eq!(expected_diagnostic.code, "P1501", "{source}");
+                    assert_eq!(expected_diagnostic.explanation.as_deref(), Some(reason));
+                    assert_eq!(
+                        expected_diagnostic.runtime_outcome.as_ref().unwrap().facts,
+                        [RuntimeFact {
+                            name: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT
+                                .to_string(),
+                            value: RuntimeFactValue::StaticString(reason.to_string()),
+                        }],
+                        "{source}"
+                    );
+                }
+                let php = doriac::compile_source_to_php(path, source).unwrap();
+                let script = format!(
+                    "{}\n__DoriaFunction_6d61696e();",
+                    php.strip_prefix("<?php").unwrap()
+                );
+                let directory = ExecutionDirectory::new();
+                let channel = directory.path().join("panic.outcome");
+                let execution = php_execution::Script::new(&script);
+                let execute = |transport: bool| {
+                    let mut command = execution.command(&["-d", "ffi.enable=0"]);
+                    if transport {
+                        command.env("DORIA_RUNTIME_OUTCOME_V2", &channel);
+                    } else {
+                        command.env_remove("DORIA_RUNTIME_OUTCOME_V2");
+                    }
+                    command
+                        .output()
+                        .expect("PHP is required for panic transport compatibility parity")
+                };
+                let human = execute(false);
+                assert_eq!(human.status.code(), Some(101), "{source}\n{human:?}");
+                assert_eq!(human.stdout, expected.stdout, "{source}");
+                assert_eq!(human.stderr, expected.stderr, "{source}");
+                let transported = execute(true);
+                assert_eq!(
+                    transported.status.code(),
+                    Some(101),
+                    "{source}\n{transported:?}"
+                );
+                assert_eq!(transported.stdout, expected.stdout, "{source}");
+                assert!(transported.stderr.is_empty(), "{source}\n{transported:?}");
+                let record = fs::read(&channel).expect("typed panic record must be preserved");
+                let decoded = decode_runtime_outcome(&record, path).unwrap();
+                assert_eq!(decoded.code, expected_diagnostic.code, "{source}");
+                assert_eq!(decoded.span, expected_diagnostic.span, "{source}");
+                assert_eq!(
+                    decoded.runtime_outcome,
+                    expected_diagnostic.runtime_outcome,
+                    "{source}"
+                );
+                let rendered = doriac::render_diagnostics_with_options(
+                    path,
+                    source,
+                    &[decoded],
+                    RenderOptions {
+                        color: doriac::diagnostics::ColorChoice::Never,
+                        context_lines: 0,
+                        ..RenderOptions::default()
+                    },
+                );
+                assert_eq!((rendered + "\n").as_bytes(), expected.stderr, "{source}");
+            });
+        }
+    }
+
+    #[test]
+    fn php_panic_transport_failure_preserves_canonical_stderr_and_no_cleanup() {
+        let path = "php-panic-channel-failure.doria";
+        let source = r#"
+class Marker {
+    function __destruct() {
+        try { echo "unexpected cleanup\n"; } catch (Doria\Std\Io\IoError) {}
+    }
+}
+function main(): void {
+    let $marker = new Marker();
+    int[] $values = [7];
+    let $value = $values[-1];
+}
+"#;
+        let mir = doriac::lower_source_to_mir(path, source).unwrap();
+        let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
+        let php = doriac::compile_source_to_php(path, source).unwrap();
+        let script = format!(
+            "{}\n__DoriaFunction_6d61696e();",
+            php.strip_prefix("<?php").unwrap()
+        );
+        let directory = ExecutionDirectory::new();
+        // A directory cannot receive a record; this fails on every platform
+        // without relying on permissions or writing outside the test's root.
+        let output = php_execution::Script::new(&script)
+            .command(&["-d", "ffi.enable=0"])
+            .env("DORIA_RUNTIME_OUTCOME_V2", directory.path())
+            .output()
+            .expect("PHP is required for panic transport compatibility parity");
+        assert_eq!(output.status.code(), Some(101), "{output:?}");
+        assert_eq!(output.stdout, expected.stdout);
+        assert_eq!(output.stderr, expected.stderr);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn php_authored_caller_sites_match_interpreter_and_native_profiles() {
+        for source in [
+            r#"function argument(): int { return 7; }
+function fail(int $value): void { panic("nested argument"); }
+function main(): void { fail(argument()); }"#,
+            r#"function descend(int $depth): void {
+    if ($depth > 0) { descend($depth - 1); return; }
+    panic("recursive stop");
+}
+function main(): void { descend(2); }"#,
+            r#"class Value { int $number { get { panic("getter"); } } }
+function main(): void { let $value = new Value(); let $number = $value->number; }"#,
+            r#"function main(): void {
+    List<int> $values = [1];
+    let $callback = function (int $value): int { panic("callback"); };
+    let $mapped = $values->map($callback);
+}"#,
+            r#"class Key implements Hashable, Equatable<Key> {
+    function hash(): uint64 { panic("indexed hash"); }
+    function equals(Key $other): bool { return true; }
+}
+function argument(): int { return 7; }
+function main(): void {
+    writable Dictionary<Key, int> $values = [];
+    $values[new Key()] = argument();
+}"#,
+            r#"class Key implements Hashable, Equatable<Key> {
+    function hash(): uint64 { panic("literal hash"); }
+    function equals(Key $other): bool { return true; }
+}
+function argument(): int { return 7; }
+function main(): void { Dictionary<Key, int> $values = [new Key() => argument()]; }"#,
+        ]
+        .into_iter()
+        .chain(PHP_LIFECYCLE_PANIC_SOURCES.iter().copied())
+        {
+            let path = "caller-sites.doria";
+            with_panic_fixture_context(path, source, || {
+                let mir = doriac::lower_source_to_mir(path, source).unwrap();
+                let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
+                let php = doriac::compile_source_to_php(path, source).unwrap();
+                let output = php_execution::Script::new(&format!(
+                    "{}\n__DoriaFunction_6d61696e();",
+                    php.strip_prefix("<?php").unwrap(),
+                ))
+                .command(&["-d", "ffi.enable=0"])
+                .env_remove("DORIA_RUNTIME_OUTCOME_V2")
+                .output()
+                .expect("PHP caller-site parity");
+                assert_eq!(output.status.code(), Some(101), "{source}\n{output:?}");
+                assert_eq!(output.stdout, expected.stdout, "{source}");
+                assert_eq!(output.stderr, expected.stderr, "{source}");
+                let mut profiles = vec![NativeProfile::Fast];
+                if cfg!(feature = "llvm-backend") {
+                    profiles.push(NativeProfile::Release);
+                }
+                for profile in profiles {
+                    let output = crate::panic_native_execution::execute_native(&mir, profile);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(101),
+                        "{source}\n{profile:?}: {output:?}"
+                    );
+                    assert_eq!(output.stdout, expected.stdout, "{source}\n{profile:?}");
+                    assert_eq!(output.stderr, expected.stderr, "{source}\n{profile:?}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn php_multifile_panic_transport_matches_canonical_diagnostic_json() {
+        let text = serde_json::json!({
+            "schemaVersion": 1, "edition": "2026", "rootPackage": "acme/application",
+            "selectedTarget": { "package": "acme/application", "name": "application",
+                "kind": "binary", "entrySource": "acme/application:main.doria",
+                "activeScopes": ["main"] },
+            "packages": [{ "identity": "acme/application", "root": ".",
+                "namespaceMappings": [{ "prefix": "", "path": "", "scope": "main" }],
+                "sources": [
+                { "identity": "acme/application:main.doria", "path": "main.doria",
+                    "scope": "main", "origin": "entry" },
+                { "identity": "acme/application:helpers.doria", "path": "helpers.doria",
+                    "scope": "main", "origin": "explicit" },
+                { "identity": "acme/application:leaf.doria", "path": "leaf.doria",
+                    "scope": "main", "origin": "explicit" }
+            ] }],
+            "compiler": { "target": "php", "nativeProfile": null, "targetTriple": null }
+        })
+        .to_string();
+        let document = doriac::build_plan::BuildPlanDocument {
+            path: "plan.json".into(),
+            directory: env::current_dir().unwrap(),
+            plan: doriac::build_plan::parse_build_plan("plan.json", &text).unwrap(),
+            text,
+        };
+        let mut provider = doriac::source_provider::InMemorySourceProvider::new();
+        provider.insert(
+            "acme/application",
+            "main.doria",
+            "function main(): void { relay(2); }",
+        );
+        provider.insert(
+            "acme/application",
+            "helpers.doria",
+            r#"
+function argument(): int { return 7; }
+function relay(int $depth): void {
+    if ($depth > 0) { relay($depth - 1); return; }
+    leaf(argument());
+}"#,
+        );
+        provider.insert(
+            "acme/application",
+            "leaf.doria",
+            "function leaf(int $value): void { panic(\"multi-file\"); }",
+        );
+        let graph =
+            doriac::compilation_graph::load_compilation_graph(&document, &provider).unwrap();
+        let mir = doriac::lower_compilation_graph_to_mir(&graph).unwrap();
+        let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
+        let BackendOutput::Text { contents: php, .. } =
+            doriac::compile_compilation_graph(&graph).unwrap()
+        else {
+            panic!("this fixture requires no native PHP runtime dependency");
+        };
+        let directory = ExecutionDirectory::new();
+        let channel = directory.path().join("panic.outcome");
+        let output = php_execution::Script::new(&format!(
+            "{}\n__DoriaFunction_6d61696e();",
+            php.strip_prefix("<?php").unwrap(),
+        ))
+        .command(&["-d", "ffi.enable=0"])
+        .env("DORIA_RUNTIME_OUTCOME_V2", &channel)
+        .output()
+        .expect("PHP multi-source transport");
+        assert_eq!(output.status.code(), Some(101), "{output:?}");
+        assert_eq!(output.stdout, expected.stdout);
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let path = &graph
+            .source_map
+            .iter()
+            .find(|source| source.identity.0 == "acme/application:main.doria")
+            .unwrap()
+            .display_path;
+        let decoded = decode_runtime_outcome_with_sources(
+            &fs::read(channel).unwrap(),
+            path,
+            Some(&graph.source_map),
+        )
+        .unwrap();
+        let options = RenderOptions {
+            format: DiagnosticFormat::Json,
+            color: ColorChoice::Never,
+            ..RenderOptions::default()
+        };
+        // Compare the complete public projection through the real renderer:
+        // no span rewriting, frame filtering or rendered-output normalization.
+        assert_eq!(
+            doriac::diagnostics::render_diagnostics_with_source_map(
+                &graph.source_map,
+                &[decoded],
+                options
+            ),
+            doriac::diagnostics::render_diagnostics_with_source_map(
+                &graph.source_map,
+                &[expected.runtime_diagnostic.unwrap()],
+                options
+            ),
+        );
+    }
+
+    fn error_record(version: u16, error_type: &str, progress: Option<i64>) -> Vec<u8> {
+        error_record_with_origin(version, error_type, progress, None)
+    }
+
+    fn error_record_with_origin(
+        version: u16,
+        error_type: &str,
+        progress: Option<i64>,
+        origin: Option<(&str, &str, &str, Span)>,
+    ) -> Vec<u8> {
+        let message = "failed transfer";
+        let (path, source, function, span) = origin.unwrap_or(("", "", "", Span::default()));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(if version == 5 {
+            b"DORIAO5\0"
+        } else {
+            b"DORIAO3\0"
+        });
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&(error_type.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(message.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(function.len() as u32).to_le_bytes());
+        bytes.push(u8::from(origin.is_some()));
+        bytes.extend_from_slice(&(span.start as u64).to_le_bytes());
+        bytes.extend_from_slice(&(span.end as u64).to_le_bytes());
+        if version == 5 {
+            bytes.push(u8::from(progress.is_some()));
+            bytes.extend_from_slice(&progress.unwrap_or(0).to_le_bytes());
+        }
+        bytes.extend_from_slice(error_type.as_bytes());
+        bytes.extend_from_slice(message.as_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(source.as_bytes());
+        bytes.extend_from_slice(function.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn runtime_error_transport_preserves_absent_zero_and_positive_progress() {
+        for count in [None, Some(0), Some(2048)] {
+            let payload = error_record(5, doriac::compiler_known_io::IO_ERROR, count);
+            let diagnostic = decode_runtime_outcome(&payload, "main.doria").unwrap();
+            let outcome = diagnostic.runtime_outcome.as_ref().unwrap();
+            assert_eq!(outcome.process_status, 70);
+            assert_eq!(
+                outcome.termination_behavior,
+                TerminationBehavior::PropagateWithCleanup
+            );
+            let expected = count
+                .map(|value| RuntimeFact {
+                    name: doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_FACT.to_string(),
+                    value: RuntimeFactValue::Signed(value),
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(outcome.facts, expected);
+        }
+        let legacy = error_record(3, doriac::compiler_known_io::IO_ERROR, None);
+        assert!(decode_runtime_outcome(&legacy, "main.doria")
+            .unwrap()
+            .runtime_outcome
+            .as_ref()
+            .unwrap()
+            .facts
+            .is_empty());
+    }
+
+    #[test]
+    fn runtime_error_transport_rejects_forged_or_ambiguous_progress() {
+        let mut invalid_presence = error_record(5, doriac::compiler_known_io::IO_ERROR, None);
+        invalid_presence[51] = 2;
+        assert!(decode_error(&invalid_presence).contains("invalid I/O progress"));
+        let mut hidden_count = error_record(5, doriac::compiler_known_io::IO_ERROR, None);
+        hidden_count[52] = 1;
+        assert!(decode_error(&hidden_count).contains("invalid I/O progress"));
+        assert!(decode_error(&error_record(5, "OtherFailure", Some(0)))
+            .contains("progress for a non-IoError"));
+        let valid = error_record(5, doriac::compiler_known_io::IO_ERROR, Some(4));
+        for length in 0..valid.len() {
+            assert!(decode_runtime_outcome(&valid[..length], "main.doria").is_err());
+        }
+        let mut trailing = valid;
+        trailing.push(0);
+        assert!(decode_error(&trailing).contains("trailing runtime Error"));
+    }
 
     fn runtime_record(code: &str, facts: &[(&str, u8, u64, &str)]) -> Vec<u8> {
         let path = "main.doria";
@@ -2010,6 +2739,121 @@ mod tests {
                 panic!("transport decoding must not create a graph diagnostic")
             }
             Ok(_) => panic!("malformed transport unexpectedly decoded"),
+        }
+    }
+
+    fn runtime_transport_source_map(main_id: SourceId) -> doriac::source_map::SourceMap {
+        doriac::source_map::SourceMap::from_ordered_records(
+            [
+                (SourceId(0), "helpers.doria", "function helper(): void {}\n"),
+                (main_id, "main.doria", "function main(): void {}\n"),
+            ]
+            .into_iter()
+            .map(|(id, path, text)| doriac::source_map::SourceRecord {
+                identity: doriac::names::SourceIdentity(format!("acme/application:{path}")),
+                package: doriac::names::PackageIdentity::Named("acme/application".into()),
+                display_path: path.into(),
+                canonical_path: None,
+                content_fingerprint: String::new(),
+                source: SourceFile::with_id(id, path, text),
+            })
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn runtime_transport_binds_every_known_origin_to_its_compilation_source() {
+        let text = "function main(): void {}\n";
+        let payloads = [
+            runtime_record("P1101", &[]),
+            error_record_with_origin(
+                3,
+                doriac::compiler_known_io::IO_ERROR,
+                None,
+                Some(("main.doria", text, "main", Span::new(0, 8))),
+            ),
+            assertion_record(
+                "Equal",
+                false,
+                Some(("int", "41")),
+                Some(("int", "42")),
+                None,
+            ),
+            error_record_with_origin(
+                5,
+                doriac::compiler_known_io::IO_ERROR,
+                Some(4),
+                Some(("main.doria", text, "main", Span::new(0, 8))),
+            ),
+        ];
+        for main_id in [SourceId(1), SourceId(17)] {
+            let sources = runtime_transport_source_map(main_id);
+            for payload in &payloads {
+                for current in ["main.doria", "helpers.doria"] {
+                    let diagnostic =
+                        decode_runtime_outcome_with_sources(payload, current, Some(&sources))
+                            .unwrap();
+                    let span = Span::in_source(main_id, 0, 8);
+                    assert_eq!(diagnostic.span, span);
+                    assert_eq!(diagnostic.labels[0].span, span);
+                    assert_eq!(
+                        diagnostic.runtime_outcome.as_ref().unwrap().origin.span,
+                        span
+                    );
+                    let rendered = doriac::diagnostics::render_diagnostics_with_source_map(
+                        &sources,
+                        &[diagnostic],
+                        RenderOptions {
+                            format: DiagnosticFormat::Json,
+                            color: ColorChoice::Never,
+                            ..RenderOptions::default()
+                        },
+                    );
+                    let projection: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+                    let diagnostic = &projection["diagnostics"][0];
+                    for location in [
+                        &diagnostic["labels"][0],
+                        &diagnostic["runtimeOutcome"]["origin"],
+                    ] {
+                        assert_eq!(location["source"], "main.doria");
+                        assert_eq!(location["range"]["start"]["line"], 1);
+                        assert_eq!(location["range"]["start"]["column"], 1);
+                        assert_eq!(location["range"]["end"]["line"], 1);
+                        assert_eq!(location["range"]["end"]["column"], 9);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_transport_rejects_missing_or_invalid_graph_locations() {
+        let sources = runtime_transport_source_map(SourceId(17));
+        for (path, span) in [
+            ("missing.doria", Span::new(0, 8)),
+            ("main.doria", Span::new(9, 8)),
+            ("main.doria", Span::new(0, 100)),
+        ] {
+            assert!(runtime_source_span(Some(&sources), path, span).is_err());
+        }
+        let empty = doriac::source_map::SourceMap::default();
+        assert!(decode_runtime_outcome_with_sources(
+            &runtime_record("P1101", &[]),
+            "main.doria",
+            Some(&empty),
+        )
+        .is_err());
+        for version in [3, 5] {
+            let diagnostic = decode_runtime_outcome_with_sources(
+                &error_record(version, doriac::compiler_known_io::IO_ERROR, None),
+                "main.doria",
+                Some(&empty),
+            )
+            .unwrap();
+            assert_eq!(
+                diagnostic.runtime_outcome.as_ref().unwrap().origin.source,
+                DiagnosticSource::Unavailable,
+            );
         }
     }
 

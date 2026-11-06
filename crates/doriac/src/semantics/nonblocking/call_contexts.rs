@@ -2,6 +2,7 @@
 //! closures must not join unrelated callers; stored properties remain shared facts.
 
 use super::*;
+use crate::semantics::callable_contracts::BodyInstance;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScopedValue(Option<usize>, Value);
@@ -14,10 +15,12 @@ struct Origin {
 
 struct Context {
     body: Span,
+    effective: Span,
     parent: Option<usize>,
+    entry: Option<Span>,
     environment: Option<usize>,
     blocking: Option<Span>,
-    bindings: HashMap<String, ResolvedType>,
+    instance: BodyInstance,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -38,18 +41,36 @@ struct Solver<'a, 'program> {
     flows: HashSet<(ScopedValue, ScopedValue)>,
     origins: HashMap<ScopedValue, HashSet<Origin>>,
     unknown: HashSet<ScopedValue>,
-    edges: HashSet<(usize, usize)>,
+    /// Caller context, callee context, and the call site in the caller.
+    edges: HashSet<(usize, usize, Span)>,
     cleanups: HashSet<(usize, usize, Span, Value)>,
-    packed_fields: HashSet<(ScopedValue, ScopedValue, PayloadField)>,
-    unpacked_fields: HashSet<(ScopedValue, ScopedValue, PayloadField)>,
+    packed_fields: HashSet<(ScopedValue, ScopedValue, StoredField)>,
+    unpacked_fields: HashSet<(ScopedValue, ScopedValue, StoredField)>,
+    roots: Roots,
+}
+
+#[derive(Clone, Copy)]
+enum Roots {
+    Executable,
+    AuthoredContract,
 }
 
 pub(super) struct Resolution {
     pub blockers: HashMap<Span, Span>,
     pub known_callback_targets: HashMap<Span, Vec<Span>>,
+    pub callback_captures: HashMap<Span, Vec<crate::ownership::CallbackCaptureTarget>>,
+    pub callback_values: HashMap<Span, Vec<crate::ownership::CallbackCaptureTarget>>,
 }
 
 pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
+    resolve_with_roots(checker, graph, Roots::Executable)
+}
+
+pub(super) fn resolve_contracts(checker: &Checker<'_>, graph: &Graph) -> Resolution {
+    resolve_with_roots(checker, graph, Roots::AuthoredContract)
+}
+
+fn resolve_with_roots(checker: &Checker<'_>, graph: &Graph, roots: Roots) -> Resolution {
     let mut solver = Solver {
         checker,
         graph,
@@ -63,6 +84,7 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
         cleanups: HashSet::new(),
         packed_fields: HashSet::new(),
         unpacked_fields: HashSet::new(),
+        roots,
     };
     for (owner, body) in &graph.bodies {
         solver.parameters.insert(
@@ -101,26 +123,35 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
                 .flat_map(|body| body.calls.iter())
                 .copied(),
         )
+        .map(|declaration| {
+            BodyInstance::new(
+                checker.callable_body_program,
+                declaration,
+                HashMap::new(),
+                &checker.composition,
+            )
+            .declaration
+        })
         .collect::<HashSet<_>>();
     let mut bodies = graph.bodies.keys().copied().collect::<Vec<_>>();
     bodies.sort();
     for body in &bodies {
         if !incoming.contains(body) && !graph.closures.contains_key(body) {
-            solver.root(*body);
+            let _ = solver.root(*body);
         }
     }
     solver.propagate();
     // An otherwise unreachable recursive component still has to obey the hook
     // contract. Seed only components not already instantiated by a real call.
     for body in bodies {
-        if !graph.closures.contains_key(&body)
-            && !solver.contexts.iter().any(|context| context.body == body)
-        {
-            solver.root(body);
+        // A seed that adds no context leaves the fixpoint unchanged.
+        if !graph.closures.contains_key(&body) && solver.root(body) {
             solver.propagate();
         }
     }
     let mut known_callback_targets = HashMap::<Span, HashSet<Span>>::new();
+    let mut callback_captures =
+        HashMap::<Span, Vec<crate::ownership::CallbackCaptureTarget>>::new();
     let mut unknown_calls = HashSet::new();
     for context in 0..solver.contexts.len() {
         let owner = solver.contexts[context].body;
@@ -137,6 +168,13 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
                         .entry(call.site)
                         .or_default()
                         .extend(origins.iter().map(|origin| origin.body));
+                    for origin in origins {
+                        let target = solver.callback_target(context, *origin);
+                        let targets = callback_captures.entry(call.site).or_default();
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                    }
                 }
             }
         }
@@ -149,14 +187,34 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
             solver.contexts[*caller].blocking.get_or_insert(*site);
         }
     }
+    // A context reports its own blocking site, else the earliest site it
+    // reaches through a callee. Compiler-owned sources cannot be shown, so a
+    // site inside one is reported at the call that entered it.
+    let direct = solver
+        .contexts
+        .iter()
+        .map(|context| context.blocking.is_some())
+        .collect::<Vec<_>>();
     loop {
         let mut changed = false;
-        for (caller, callee) in &solver.edges {
-            if solver.contexts[*caller].blocking.is_none() {
-                if let Some(site) = solver.contexts[*callee].blocking {
-                    solver.contexts[*caller].blocking = Some(site);
-                    changed = true;
-                }
+        for &(caller, callee, call_site) in &solver.edges {
+            if direct[caller] {
+                continue;
+            }
+            let Some(site) = solver.contexts[callee].blocking else {
+                continue;
+            };
+            let site = if site.source.is_compiler_owned() {
+                call_site
+            } else {
+                site
+            };
+            if solver.contexts[caller]
+                .blocking
+                .is_none_or(|current| site < current)
+            {
+                solver.contexts[caller].blocking = Some(site);
+                changed = true;
             }
         }
         if !changed {
@@ -164,6 +222,37 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
         }
     }
     let mut blockers = HashMap::new();
+    let mut callback_values = HashMap::<Span, Vec<crate::ownership::CallbackCaptureTarget>>::new();
+    let mut unknown_values = HashSet::new();
+    // Expose the same solved origins for function-valued arguments, not only
+    // their eventual invocation sites. Formal inputs stay symbolic in ownership.
+    for (value, owner) in &graph.owners {
+        let Value::Expression(span) = value else {
+            continue;
+        };
+        if !checker.expression_types.get(span).is_some_and(|ty| matches!(ty, ResolvedType::Function(_)) || matches!(ty, ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Function(_)))) { continue; }
+        for (context, _) in solver
+            .contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.body == *owner)
+        {
+            let value = solver.scoped(context, *value);
+            if solver.unknown.contains(&value)
+                || solver.origins.get(&value).is_none_or(HashSet::is_empty)
+            {
+                unknown_values.insert(*span);
+            } else if let Some(origins) = solver.origins.get(&value) {
+                for origin in origins {
+                    let target = solver.callback_target(context, *origin);
+                    let targets = callback_values.entry(*span).or_default();
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+        }
+    }
     for context in solver.contexts {
         if let Some(site) = context.blocking {
             blockers
@@ -174,6 +263,14 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
     }
     Resolution {
         blockers,
+        callback_values: callback_values
+            .into_iter()
+            .filter(|(span, _)| !unknown_values.contains(span))
+            .collect(),
+        callback_captures: callback_captures
+            .into_iter()
+            .filter(|(site, _)| !unknown_calls.contains(site))
+            .collect(),
         known_callback_targets: known_callback_targets
             .into_iter()
             .filter(|(site, _)| !unknown_calls.contains(site))
@@ -187,14 +284,161 @@ pub(super) fn resolve(checker: &Checker<'_>, graph: &Graph) -> Resolution {
 }
 
 impl Solver<'_, '_> {
-    fn root(&mut self, body: Span) {
-        for bindings in self.checker.blocking_specializations(body) {
-            let context = self.instantiate(body, None, None, bindings);
-            for parameter in self.parameters.get(&body).into_iter().flatten().flatten() {
-                self.unknown
-                    .insert(ScopedValue(Some(context), Value::Binding(*parameter)));
+    fn callback_target(
+        &self,
+        context: usize,
+        origin: Origin,
+    ) -> crate::ownership::CallbackCaptureTarget {
+        crate::ownership::CallbackCaptureTarget {
+            declaration: origin.body,
+            captures: self
+                .checker
+                .closures
+                .get(&ClosureId::from_span(origin.body))
+                .into_iter()
+                .flat_map(|closure| &closure.captures)
+                .map(|capture| {
+                    (
+                        capture.environment_binding_id,
+                        self.capture_sources(
+                            context,
+                            self.scoped(
+                                origin.environment,
+                                Value::Binding(capture.source_binding_id),
+                            ),
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Solver<'_, '_> {
+    fn capture_sources(
+        &self,
+        caller: usize,
+        captured: ScopedValue,
+    ) -> Vec<crate::ownership::CallbackCapturePlace> {
+        use crate::ownership::{CallbackCapturePlace, CallbackCaptureSource};
+        let mut pending = vec![captured];
+        let mut visited = HashSet::new();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            pending.extend(
+                self.flows
+                    .iter()
+                    .filter_map(|(source, target)| (*target == value).then_some(*source)),
+            );
+        }
+        let mut context = Some(caller);
+        let mut callers = Vec::new();
+        while let Some(index) = context {
+            let mut sources = visited
+                .iter()
+                .filter_map(|value| {
+                    if value.0 != Some(index) {
+                        return None;
+                    }
+                    match value.1 {
+                        Value::Binding(binding) => Some(CallbackCaptureSource::Binding(binding)),
+                        Value::Expression(span) => Some(CallbackCaptureSource::Expression(span)),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if sources
+                .iter()
+                .any(|source| matches!(source, CallbackCaptureSource::Binding(_)))
+            {
+                sources.retain(|source| matches!(source, CallbackCaptureSource::Binding(_)));
+            }
+            if !sources.is_empty() {
+                sources.sort();
+                sources.dedup();
+                return sources
+                    .into_iter()
+                    .map(|source| CallbackCapturePlace {
+                        source,
+                        callers: callers.clone(),
+                    })
+                    .collect();
+            }
+            let current = &self.contexts[index];
+            if let Some(entry) = current.entry {
+                callers.push(entry);
+            }
+            context = current.parent;
+        }
+        Vec::new()
+    }
+
+    /// Returns whether the body gained a root context.
+    fn root(&mut self, body: Span) -> bool {
+        // Authored signatures must be inferred even without a concrete caller.
+        // Execution cleanup checks still use only registered specializations.
+        let mut declarations = if matches!(
+            self.checker.callable_body_program,
+            CallableBodyProgram::Authored(_)
+        ) {
+            self.checker
+                .composition
+                .callable_templates
+                .iter()
+                .filter_map(|(effective, template)| {
+                    (template.declaration == body).then_some(*effective)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if declarations.is_empty() {
+            declarations.push(body);
+        }
+        declarations.sort();
+        let before = self.contexts.len();
+        for effective in declarations {
+            if self
+                .contexts
+                .iter()
+                .any(|context| context.effective == effective)
+            {
+                continue;
+            }
+            let specializations = match self.roots {
+                Roots::Executable if effective != body => self
+                    .checker
+                    .callable_instances
+                    .iter()
+                    .filter(|instance| instance.declaration == effective)
+                    .map(|instance| {
+                        instance
+                            .bindings
+                            .iter()
+                            .map(|(name, ty)| (name.clone(), self.checker.types.resolved(*ty)))
+                            .collect()
+                    })
+                    .collect(),
+                Roots::Executable => self.checker.blocking_specializations(effective),
+                Roots::AuthoredContract => vec![HashMap::new()],
+            };
+            for bindings in specializations {
+                let instance = BodyInstance::new(
+                    self.checker.callable_body_program,
+                    effective,
+                    bindings,
+                    &self.checker.composition,
+                );
+                let context = self.instantiate(effective, instance, None, None, None);
+                for parameter in self.parameters.get(&body).into_iter().flatten().flatten() {
+                    self.unknown
+                        .insert(ScopedValue(Some(context), Value::Binding(*parameter)));
+                }
             }
         }
+        self.contexts.len() != before
     }
 
     fn owner(&self, value: Value) -> Option<Span> {
@@ -248,17 +492,21 @@ impl Solver<'_, '_> {
 
     fn instantiate(
         &mut self,
-        body: Span,
+        effective: Span,
+        instance: BodyInstance,
         parent: Option<usize>,
+        entry: Option<Span>,
         environment: Option<usize>,
-        bindings: HashMap<String, ResolvedType>,
     ) -> usize {
+        let body = instance.declaration;
         let index = self.contexts.len();
         self.contexts.push(Context {
             body,
+            effective,
             parent,
+            entry,
             environment,
-            bindings,
+            instance,
             blocking: self.graph.bodies.get(&body).and_then(|body| body.blocking),
         });
         for (source, target) in &self.graph.flows {
@@ -275,7 +523,7 @@ impl Solver<'_, '_> {
                 self.packed_fields.insert((
                     self.scoped(index, *source),
                     self.scoped(index, *target),
-                    *field,
+                    field.clone(),
                 ));
             }
         }
@@ -284,7 +532,7 @@ impl Solver<'_, '_> {
                 self.unpacked_fields.insert((
                     self.scoped(index, *source),
                     self.scoped(index, *target),
-                    *field,
+                    field.clone(),
                 ));
             }
         }
@@ -320,7 +568,7 @@ impl Solver<'_, '_> {
         }
         for (owner, site, ty, value) in &self.graph.generic_cleanups {
             if *owner == body {
-                let ty = crate::types::substitute_resolved_type(ty, &self.contexts[index].bindings);
+                let ty = self.contexts[index].instance.substitute(ty);
                 let mut effects = cleanup_effects::Effects::default();
                 self.checker
                     .drop_effects(&ty, *value, &mut HashSet::new(), &mut effects);
@@ -331,11 +579,25 @@ impl Solver<'_, '_> {
     }
 
     fn call(&mut self, caller: usize, call: &Call, body: Span, environment: Option<usize>) {
+        let effective = body;
+        let instance = if let Some(environment) = environment {
+            let mut instance = self.contexts[environment].instance.clone();
+            instance.declaration = body;
+            instance
+        } else {
+            BodyInstance::new(
+                self.checker.callable_body_program,
+                effective,
+                self.call_bindings(caller, call, environment),
+                &self.checker.composition,
+            )
+        };
+        let body = instance.declaration;
         if !self.graph.bodies.contains_key(&body) {
             return;
         }
-        let bindings = self.call_bindings(caller, call, environment);
-        let mut identity_bindings = bindings
+        let mut identity_bindings = instance
+            .substitutions
             .iter()
             .map(|(name, ty)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
@@ -343,7 +605,7 @@ impl Solver<'_, '_> {
         let key = Instance {
             caller,
             site: call.site,
-            body,
+            body: effective,
             environment,
             bindings: identity_bindings,
         };
@@ -353,18 +615,27 @@ impl Solver<'_, '_> {
             let mut ancestor = Some(caller);
             let mut recursive = None;
             while let Some(index) = ancestor {
-                if self.contexts[index].body == body && self.contexts[index].bindings == bindings {
+                if self.contexts[index].effective == effective
+                    && self.contexts[index].instance == instance
+                {
                     recursive = Some(index);
                     break;
                 }
                 ancestor = self.contexts[index].parent;
             }
-            let callee = recursive
-                .unwrap_or_else(|| self.instantiate(body, Some(caller), environment, bindings));
+            let callee = recursive.unwrap_or_else(|| {
+                self.instantiate(
+                    effective,
+                    instance,
+                    Some(caller),
+                    Some(call.site),
+                    environment,
+                )
+            });
             self.instances.insert(key, callee);
             callee
         };
-        self.edges.insert((caller, callee));
+        self.edges.insert((caller, callee, call.site));
         self.flows.insert((
             self.scoped(callee, Value::Returned(body)),
             self.scoped(caller, Value::Expression(call.site)),
@@ -405,9 +676,9 @@ impl Solver<'_, '_> {
         call: &Call,
         environment: Option<usize>,
     ) -> HashMap<String, ResolvedType> {
-        let outer = &self.contexts[environment.unwrap_or(caller)].bindings;
+        let outer = &self.contexts[environment.unwrap_or(caller)].instance;
         if environment.is_some() {
-            return outer.clone();
+            return outer.substitutions.clone();
         }
         let mut bindings = HashMap::new();
         let target = self.checker.call_targets.get(&call.site).or_else(|| {
@@ -419,33 +690,28 @@ impl Solver<'_, '_> {
         });
         if let Some(CallableTarget::Method { class_type, .. }) = target {
             if let Some(class) = self.checker.classes.get(&class_type.name) {
-                bindings.extend(class.type_params.iter().zip(&class_type.arguments).map(
-                    |(parameter, ty)| {
-                        (
-                            parameter.name.clone(),
-                            crate::types::substitute_resolved_type(ty, outer),
-                        )
-                    },
-                ));
+                bindings.extend(
+                    class
+                        .type_params
+                        .iter()
+                        .zip(&class_type.arguments)
+                        .map(|(parameter, ty)| (parameter.name.clone(), outer.substitute(ty))),
+                );
             }
         }
         if let Some(pending) = self.checker.pending_generic_calls.get(&call.site) {
-            bindings.extend(pending.bindings.iter().map(|(name, ty)| {
+            bindings.extend(pending.inference.bindings.iter().map(|(name, ty)| {
                 (
                     name.clone(),
-                    crate::types::substitute_resolved_type(
-                        &self.checker.types.resolved(*ty),
-                        outer,
-                    ),
+                    outer.substitute(&self.checker.types.resolved(*ty)),
                 )
             }));
         }
-        bindings.extend(call.bindings.iter().map(|(name, ty)| {
-            (
-                name.clone(),
-                crate::types::substitute_resolved_type(ty, outer),
-            )
-        }));
+        bindings.extend(
+            call.bindings
+                .iter()
+                .map(|(name, ty)| (name.clone(), outer.substitute(ty))),
+        );
         bindings
     }
 
@@ -456,7 +722,10 @@ impl Solver<'_, '_> {
         site: Span,
         effects: &cleanup_effects::Effects,
     ) {
-        if effects.unknown || !effects.generic.is_empty() {
+        // Symbolic release obligations are checked again for executable instances.
+        if effects.unknown
+            || (matches!(self.roots, Roots::Executable) && !effects.generic.is_empty())
+        {
             self.contexts[caller].blocking.get_or_insert(site);
         }
         for callback in &effects.callbacks {
@@ -480,6 +749,12 @@ impl Solver<'_, '_> {
     }
 
     fn propagate(&mut self) {
+        // Each pass visits only the calls owned by a context's body.
+        let graph = self.graph;
+        let mut calls_by_owner = HashMap::<Span, Vec<&Call>>::new();
+        for call in &graph.calls {
+            calls_by_owner.entry(call.owner).or_default().push(call);
+        }
         loop {
             let before = (
                 self.contexts.len(),
@@ -498,7 +773,7 @@ impl Solver<'_, '_> {
             self.propagate_fields();
             for caller in 0..self.contexts.len() {
                 let owner = self.contexts[caller].body;
-                for call in self.graph.calls.iter().filter(|call| call.owner == owner) {
+                for call in calls_by_owner.get(&owner).into_iter().flatten().copied() {
                     if let Some(callee) = call.callee {
                         let origins = self
                             .origins
@@ -510,8 +785,15 @@ impl Solver<'_, '_> {
                         }
                     } else {
                         if !call.targets.iter().any(|target| {
-                            self.graph.bodies.contains_key(target)
-                                || self.graph.nonblocking_contracts.contains(target)
+                            self.graph.bodies.contains_key(
+                                &BodyInstance::new(
+                                    self.checker.callable_body_program,
+                                    *target,
+                                    HashMap::new(),
+                                    &self.checker.composition,
+                                )
+                                .declaration,
+                            ) || self.graph.nonblocking_contracts.contains(target)
                         }) {
                             self.contexts[caller].blocking.get_or_insert(call.site);
                         }
@@ -530,7 +812,7 @@ impl Solver<'_, '_> {
                                 targets: vec![*target],
                                 callee: None,
                                 arguments: Vec::new(),
-                                bindings: self.contexts[caller].bindings.clone(),
+                                bindings: self.contexts[caller].instance.substitutions.clone(),
                             },
                             *target,
                             None,
@@ -549,10 +831,7 @@ impl Solver<'_, '_> {
                         self.graph.closure_cleanups.get(&origin.body).cloned()
                     {
                         for (ty, value) in std::mem::take(&mut effects.generic) {
-                            let ty = crate::types::substitute_resolved_type(
-                                &ty,
-                                &self.contexts[origin.environment].bindings,
-                            );
+                            let ty = self.contexts[origin.environment].instance.substitute(&ty);
                             self.checker.drop_effects(
                                 &ty,
                                 value,
@@ -585,12 +864,12 @@ impl Solver<'_, '_> {
         for (source, target) in &self.flows {
             successors.entry(*source).or_default().push(*target);
         }
-        let mut extractions = HashMap::<ScopedValue, Vec<(ScopedValue, PayloadField)>>::new();
+        let mut extractions = HashMap::<ScopedValue, Vec<(ScopedValue, StoredField)>>::new();
         for (source, target, field) in &self.unpacked_fields {
             extractions
                 .entry(*source)
                 .or_default()
-                .push((*target, *field));
+                .push((*target, field.clone()));
             if self.unknown.contains(source) {
                 self.unknown.insert(*target);
             }
@@ -603,7 +882,7 @@ impl Solver<'_, '_> {
                     continue;
                 }
                 for (target, selected) in extractions.get(&current).into_iter().flatten() {
-                    if selected == field {
+                    if selected.overlaps(field) {
                         self.flows.insert((*value, *target));
                     }
                 }

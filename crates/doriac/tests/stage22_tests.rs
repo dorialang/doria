@@ -1,5 +1,11 @@
 use doriac::ast::{BinaryOp, Expr, Item, Stmt};
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage22.doria", source).expect_err("source should be rejected")
 }
@@ -891,11 +897,14 @@ function main(): void
 "#,
         ),
     ] {
-        let diagnostics = doriac::lower_source_to_mir(file, source)
+        let diagnostics = doriac::check_source(file, source)
             .expect_err("a possible coalesce borrow must conflict with a later transfer");
         assert!(
             diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == "B0001" && diagnostic.message.contains("source ownership ended")
+                diagnostic.code == "E0471"
+                    && diagnostic
+                        .message
+                        .contains("borrowed and given away in the same call")
             }),
             "expected a coalesce borrow/transfer conflict, got {diagnostics:#?}"
         );
@@ -1182,7 +1191,7 @@ function add(bool $condition, int $input): int
 
 #[test]
 fn non_null_intrinsics_establish_nullable_flow_facts() {
-    doriac::check_source(
+    doriac::lower_source_to_mir(
         "stage22-intrinsic-flow-facts.doria",
         r#"
 function read(): string throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
@@ -1191,9 +1200,83 @@ function read(): string throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Err
     ?string $contents = read_file("input.txt");
     return $formatted . $contents;
 }
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error {
+    echo read();
+}
 "#,
     )
     .expect("compiler-known non-null intrinsic results should narrow nullable destinations");
+}
+
+#[test]
+fn non_null_strings_wrap_at_nullable_destinations_across_backends() {
+    let source = r#"
+enum Text { case Value(?string $text); }
+class Settings { static writable ?string $text = null; }
+class Label { function __construct(?string $text) {} }
+function accept(?string $text): ?string { return $text; }
+function getText(): ?string { return sprintf("%s", "return"); }
+function main(): void {
+    ?string $formatted = sprintf("%s", "formatted");
+    ?string $trimmed = String::trim(" trimmed ");
+    Settings::text = sprintf("%s", "static");
+    let $label = new Label(sprintf("%s", "property"));
+    let $text = Text::Value(sprintf("%s", "enum"));
+    let $payload = match ($text) { Text::Value($value) => $value };
+    echo ($formatted ?? "missing") . ":" . ($trimmed ?? "missing") . ":";
+    echo (Settings::text ?? "missing") . ":" . ($label->text ?? "missing") . ":";
+    echo (accept(sprintf("%s", "argument")) ?? "missing") . ":";
+    echo (getText() ?? "missing") . ":" . ($payload ?? "missing") . "\n";
+}
+"#;
+    let program =
+        doriac::lower_source_to_mir("nullable-string-destinations.doria", source).unwrap();
+    let expected = "formatted:trimmed:static:property:argument:return:enum\n";
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Fast,
+        expected,
+    );
+    #[cfg(feature = "llvm-backend")]
+    native_execution::assert_native_execution(
+        &program,
+        doriac::backend::NativeProfile::Release,
+        expected,
+    );
+    let diagnostics = doriac::compile_source(
+        "nullable-string-destinations.doria",
+        source,
+        doriac::backend::BackendTarget::Php,
+    )
+    .expect_err("Unicode String intrinsics retain their explicit PHP backend boundary");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "B2501"));
+    let php_source = source.replace(
+        "String::trim(\" trimmed \")",
+        "sprintf(\"%s\", \"trimmed\")",
+    );
+    let artifact = doriac::compile_source(
+        "nullable-string-destinations.doria",
+        &php_source,
+        doriac::backend::BackendTarget::Php,
+    )
+    .unwrap();
+    let directory = native_execution::ExecutionDirectory::new();
+    let path = directory.path().join("main.php");
+    doriac::backend::publish_output(&path, artifact).unwrap();
+    let output = std::process::Command::new("php")
+        .args(["-d", "ffi.enable=0"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]

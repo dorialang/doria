@@ -10,6 +10,12 @@ use doriac::mir::{LocalId, ScalarType, Type};
 use doriac::mir_interpreter::{interpret_with_io, MirIo};
 use doriac::numeric::IntegerType;
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 const ENTRY_ARGUMENTS_EXAMPLE: &str =
     include_str!("../../../examples/native/main_stage23b_entry_arguments.doria");
 const ENTRY_ARGUMENTS_EMPTY_EXAMPLE: &str =
@@ -33,6 +39,62 @@ fn run_with_args(source: &str, args: &[&str]) -> String {
     )
     .expect("MIR should interpret");
     String::from_utf8(output.output.stdout).expect("stdout is UTF-8")
+}
+
+#[test]
+fn native_entry_arguments_keep_the_runtime_owned_home_through_callback_forwarding() {
+    for returns_int in [false, true] {
+        for checked in [false, true] {
+            let result_type = if returns_int { "int" } else { "void" };
+            let observation = if checked {
+                "echo $callback();"
+            } else {
+                "try { echo $callback(); } catch (Error) {}"
+            };
+            let return_value = if returns_int { "return 0;" } else { "" };
+            let source = format!(
+                r#"
+function capture(List<string> $args): function(): int {{
+    return fn() with ($args) => $args->count;
+}}
+function main(List<string> $args): {result_type} {{
+    let $callback = capture($args);
+    {observation}
+    {return_value}
+}}
+"#
+            );
+            let program = doriac::lower_source_to_mir("entry-borrow-home.doria", &source).unwrap();
+            assert_eq!(
+                !program.functions[program.entry.0]
+                    .checked_effects
+                    .is_empty(),
+                checked
+            );
+            #[cfg(not(feature = "llvm-backend"))]
+            let profiles = [doriac::backend::NativeProfile::Fast];
+            #[cfg(feature = "llvm-backend")]
+            let profiles = [
+                doriac::backend::NativeProfile::Fast,
+                doriac::backend::NativeProfile::Release,
+            ];
+            for profile in profiles {
+                native_execution::assert_native_execution(&program, profile, "0");
+                let output = native_execution::execute_native_with_args(
+                    &program,
+                    profile,
+                    &["one", "two words"],
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{result_type}, checked={checked}, {profile:?}: {output:?}"
+                );
+                assert_eq!(output.stdout, b"2");
+                assert!(output.stderr.is_empty(), "{output:?}");
+            }
+        }
+    }
 }
 
 #[test]

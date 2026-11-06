@@ -1,0 +1,6 @@
+typed keys survive appends
+configured without writing
+shared 65:66
+read destination 0
+foreign write key rejected
+reused 67:1

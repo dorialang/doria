@@ -1,3 +1,6 @@
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
 

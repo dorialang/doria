@@ -65,6 +65,8 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
+          extensions: ffi
+          ini-values: ffi.enable=1
           coverage: none
 
       - name: Install native leak checker
@@ -196,24 +198,39 @@ jobs:
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
 
-      - name: Leak-check interface, optimizer, hook, and returned-borrow ownership with Cranelift
+      - name: Leak-check interface, optimizer, hook, consuming, and returned-borrow ownership with Cranelift
         run: |
           for source in \
             examples/native/main_stage35_interface_*.doria \
             examples/native/main_stage35_trait_*.doria \
             examples/native/main_stage35a_*.doria \
             examples/native/main_stage36_*.doria \
+            examples/native/main_consuming_receiver_*.doria \
             examples/native/main_backed_override_initializer_*.doria \
             examples/native/main_returned_collection_borrows.doria \
             examples/native/main_returned_move_borrows.doria \
             examples/native/main_nullable_returned_closures.doria \
             examples/native/main_repeatable_closure_captures.doria \
+            examples/native/main_readiness_set_construction.doria \
             examples/native/main_temporary_returned_borrows.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
             target/debug/doriac compile "$source" --out "build/native/${name}"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
+          done
+
+      - name: Leak-check owned files and readiness membership with Cranelift
+        run: |
+          for name in main_stream_readable_file main_stream_file_ownership main_readiness_membership main_readiness_access main_read_transfer_plan main_write_transfer_plan; do
+            target/debug/doriac compile "examples/native/${name}.doria" --out "build/native/${name}"
+            work=$(mktemp -d)
+            trap 'rm -rf "$work"' EXIT
+            fixture="$GITHUB_WORKSPACE/crates/doriac/tests/fixtures/native_io/$name/files"
+            if [ -d "$fixture" ]; then cp -R "$fixture/." "$work/"; fi
+            (cd "$work" && valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "$GITHUB_WORKSPACE/build/native/${name}")
+            rm -rf "$work"
+            trap - EXIT
           done
 
       - name: Smoke signed and unsigned narrow-width native fixtures
@@ -335,6 +352,8 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
+          extensions: ffi
+          ini-values: ffi.enable=1
           coverage: none
 
       - name: Configure MSVC developer environment
@@ -437,6 +456,11 @@ jobs:
       - name: Run tier-1 Stage 17 runtime I/O tests
         run: cargo test -p doria-rt --release --locked --verbose
 
+      - name: Run tier-1 hosted shared runtime tests
+        run: |
+          cargo clippy -p doria-rt --all-targets --no-default-features --features hosted-shared-runtime --locked -- -D warnings
+          cargo test -p doria-rt --release --no-default-features --features hosted-shared-runtime --locked --verbose
+
       - name: Clippy LLVM-enabled compiler
         run: cargo clippy -p doriac --all-targets --features llvm-backend --locked -- -D warnings
 
@@ -454,13 +478,32 @@ jobs:
           cargo test -p doriac --test stage21_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage22_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage25a_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage27_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test return_borrow_alias_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test writable_borrow_writeback_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test returned_closure_transport_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage35_runtime_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage35a_optimizer_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage36_property_hook_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test property_hook_initializer_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test property_hook_cleanup_effect_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test bytes_allocate_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test byte_region_execution_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test byte_region_transport_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test byte_region_native_structure_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test consuming_receiver_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stream_capability_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test time_contract_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test nullable_default_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test registration_key_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test readiness_set_contract_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test transfer_plan_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test byte_region_mir_validation_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test pending_stream_contract_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test pending_selected_storage_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test pending_selected_storage_mir_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test io_progress_native_structure_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test indexed_access_span_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test performance_report_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test native_testing_slice1_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --lib --features llvm-backend --locked
@@ -550,7 +593,7 @@ jobs:
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage26a_grouped_locals.doria --release --out build/native/main_stage26a_grouped_locals_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage26a_grouped_locals_release
 
-      - name: Leak-check interface, optimizer, hook, and returned-borrow ownership with LLVM
+      - name: Leak-check interface, optimizer, hook, consuming, and returned-borrow ownership with LLVM
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -559,17 +602,34 @@ jobs:
             examples/native/main_stage35_trait_*.doria \
             examples/native/main_stage35a_*.doria \
             examples/native/main_stage36_*.doria \
+            examples/native/main_consuming_receiver_*.doria \
             examples/native/main_backed_override_initializer_*.doria \
             examples/native/main_returned_collection_borrows.doria \
             examples/native/main_returned_move_borrows.doria \
             examples/native/main_nullable_returned_closures.doria \
             examples/native/main_repeatable_closure_captures.doria \
+            examples/native/main_readiness_set_construction.doria \
             examples/native/main_temporary_returned_borrows.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
             target/debug/doriac compile "$source" --release --out "build/native/${name}_release"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}_release"
+          done
+
+      - name: Leak-check owned files and readiness membership with LLVM
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for name in main_stream_readable_file main_stream_file_ownership main_readiness_membership main_readiness_access main_read_transfer_plan main_write_transfer_plan; do
+            target/debug/doriac compile "examples/native/${name}.doria" --release --out "build/native/${name}_release"
+            work=$(mktemp -d)
+            trap 'rm -rf "$work"' EXIT
+            fixture="$GITHUB_WORKSPACE/crates/doriac/tests/fixtures/native_io/$name/files"
+            if [ -d "$fixture" ]; then cp -R "$fixture/." "$work/"; fi
+            (cd "$work" && valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "$GITHUB_WORKSPACE/build/native/${name}_release")
+            rm -rf "$work"
+            trap - EXIT
           done
 
       - name: Smoke LLVM release profile and panic parity on Unix

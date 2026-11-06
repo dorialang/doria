@@ -1,6 +1,14 @@
 class Box
 {
     writable int $value = 1;
+    function getValue(): int { return $this->value; }
+    writable function increment(): void { $this->value++; }
+}
+
+function makeSharedBox(bool $present): ?SharedReference<Box>
+{
+    if ($present) { return shared new Box(); }
+    return null;
 }
 
 function main(): void
@@ -40,4 +48,11 @@ function main(): void
     echo "nullable {$nullableCount}\n";
     echo "list {$owner->acquireReadonlyAccess()->count}\n";
     echo "box {$boxValue}:{$boxOwner->acquireReadonlyAccess()->value}\n";
+
+    ?WritableSharedReference<Box> $maybeBoxOwner = $boxOwner->share();
+    int $nullableBoxValue = $maybeBoxOwner?->acquireReadonlyAccess()?->getValue() ?? -1;
+    $maybeBoxOwner?->acquireWritableAccess()?->increment();
+    echo "nullable box {$nullableBoxValue}:{$boxOwner->acquireReadonlyAccess()->value}\n";
+    echo "shared factory " . (makeSharedBox(true)?->value ?? -1) . " " .
+        (makeSharedBox(false)?->value ?? -1) . "\n";
 }

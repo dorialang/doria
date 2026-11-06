@@ -1,0 +1,26 @@
+interface Ready {}
+
+class Trace { static writable string $events = ""; }
+
+class Item implements Ready {
+    function __destruct() { Trace::events = Trace::events . "item;"; }
+}
+
+class Box<T implements Ready> {
+    T $value;
+    function __construct(parameter take T $value) { $this->value = $value; }
+    function __destruct() { Trace::events = Trace::events . "box;"; }
+}
+
+class Factory<T implements Ready> {
+    function make(take T $value): Box<T> { return new Box<T>($value); }
+    static function makeOther<U implements Ready>(take U $value): Box<U> { return new Box<U>($value); }
+    function makeViaSelf(take T $value): Box<T> { return self::makeOther($value); }
+}
+
+function main(): void {
+    let $factory = new Factory<Item>();
+    { let $first = $factory->make(new Item()); }
+    { Box<Item> $second = $factory->makeViaSelf(new Item()); }
+    echo Trace::events . "formed;";
+}

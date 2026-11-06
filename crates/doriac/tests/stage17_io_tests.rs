@@ -28,6 +28,350 @@ fn interpret_with_host(source: &str, io: MirIo) -> doriac::mir_interpreter::Inte
     interpret_with_io(&program, io).expect("MIR should interpret")
 }
 
+#[test]
+fn interpreter_transfer_faults_preserve_absent_zero_partial_and_committed_prefixes() {
+    for progress in [None, Some(0), Some(3)] {
+        let expected_status = progress.map_or(0, |count| count as i32 + 1);
+        let text = "AéBC".as_bytes();
+        let binary = [65, 0, 255, 66, 67];
+        for (operation, mut faults, path, append, contents, stdout, stderr) in [
+            (
+                "write_file(\"data\", \"AéBC\")",
+                MirIoFaults {
+                    file_write: true,
+                    ..MirIoFaults::default()
+                },
+                true,
+                false,
+                text.to_vec(),
+                false,
+                false,
+            ),
+            (
+                "append_file(\"data\", \"AéBC\")",
+                MirIoFaults {
+                    file_write: true,
+                    ..MirIoFaults::default()
+                },
+                true,
+                true,
+                text.to_vec(),
+                false,
+                false,
+            ),
+            (
+                "write_file_bytes(\"data\", Bytes::fromArray([65, 0, 255, 66, 67]))",
+                MirIoFaults {
+                    file_write: true,
+                    ..MirIoFaults::default()
+                },
+                true,
+                false,
+                binary.to_vec(),
+                false,
+                false,
+            ),
+            (
+                "append_file_bytes(\"data\", Bytes::fromArray([65, 0, 255, 66, 67]))",
+                MirIoFaults {
+                    file_write: true,
+                    ..MirIoFaults::default()
+                },
+                true,
+                true,
+                binary.to_vec(),
+                false,
+                false,
+            ),
+            (
+                "echo \"AéBC\"",
+                MirIoFaults {
+                    stdout_write: Some(MirIoWriteFailure::Other),
+                    ..MirIoFaults::default()
+                },
+                false,
+                false,
+                text.to_vec(),
+                true,
+                false,
+            ),
+            (
+                "write_stderr(\"AéBC\")",
+                MirIoFaults {
+                    stderr_write: Some(MirIoWriteFailure::Other),
+                    ..MirIoFaults::default()
+                },
+                false,
+                false,
+                text.to_vec(),
+                false,
+                true,
+            ),
+            (
+                "write_stdout_bytes(Bytes::fromArray([65, 0, 255, 66, 67]))",
+                MirIoFaults {
+                    stdout_write: Some(MirIoWriteFailure::Other),
+                    ..MirIoFaults::default()
+                },
+                false,
+                false,
+                binary.to_vec(),
+                true,
+                false,
+            ),
+            (
+                "write_stderr_bytes(Bytes::fromArray([65, 0, 255, 66, 67]))",
+                MirIoFaults {
+                    stderr_write: Some(MirIoWriteFailure::Other),
+                    ..MirIoFaults::default()
+                },
+                false,
+                false,
+                binary.to_vec(),
+                false,
+                true,
+            ),
+            (
+                "read_line(\"AéBC\")",
+                MirIoFaults {
+                    prompt_write: Some(MirIoWriteFailure::Other),
+                    ..MirIoFaults::default()
+                },
+                false,
+                false,
+                text.to_vec(),
+                true,
+                false,
+            ),
+        ] {
+            faults.transferred_byte_count = progress;
+            let source = format!(
+                r#"function main(): int throws Doria\Std\Io\InvalidUtf8Error {{
+                try {{ {operation}; }}
+                catch (Doria\Std\Io\IoError $error) {{ return ($error->transferredByteCount ?? -1) + 1; }}
+                return 9;
+            }}"#
+            );
+            let output = interpret_with_host(
+                &source,
+                MirIo {
+                    faults,
+                    files: BTreeMap::from([("data".to_string(), b"old".to_vec())]),
+                    ..MirIo::default()
+                },
+            );
+            assert_eq!(
+                output.output.exit_status, expected_status,
+                "{operation}: {progress:?}"
+            );
+            let prefix = &contents[..progress.unwrap_or(0)];
+            assert_eq!(
+                output.output.stdout,
+                if stdout { prefix } else { b"" },
+                "{operation}"
+            );
+            assert_eq!(
+                output.output.stderr,
+                if stderr { prefix } else { b"" },
+                "{operation}"
+            );
+            if path {
+                let mut expected = if append { b"old".to_vec() } else { Vec::new() };
+                expected.extend_from_slice(prefix);
+                assert_eq!(output.files["data"], expected, "{operation}");
+            }
+        }
+    }
+}
+
+#[test]
+fn interpreter_failed_reads_preserve_progress_and_consume_without_replay() {
+    for progress in [None, Some(0), Some(3)] {
+        for (operation, mut faults) in [
+            (
+                "read_file(\"data\")",
+                MirIoFaults {
+                    file_read: true,
+                    ..MirIoFaults::default()
+                },
+            ),
+            (
+                "read_file_bytes(\"data\")",
+                MirIoFaults {
+                    file_read: true,
+                    ..MirIoFaults::default()
+                },
+            ),
+            (
+                "read_line()",
+                MirIoFaults {
+                    stdin_line_read: true,
+                    ..MirIoFaults::default()
+                },
+            ),
+            (
+                "read_stdin_bytes()",
+                MirIoFaults {
+                    stdin_bytes_read: true,
+                    ..MirIoFaults::default()
+                },
+            ),
+        ] {
+            faults.transferred_byte_count = progress;
+            let source = format!(
+                r#"function main(): int throws Doria\Std\Io\InvalidUtf8Error {{
+                try {{ {operation}; }}
+                catch (Doria\Std\Io\IoError $error) {{ return ($error->transferredByteCount ?? -1) + 1; }}
+                return 9;
+            }}"#
+            );
+            let output = interpret_with_host(
+                &source,
+                MirIo {
+                    faults,
+                    stdin: "AéBC".as_bytes().to_vec(),
+                    files: BTreeMap::from([("data".to_string(), b"ABCDE".to_vec())]),
+                    ..MirIo::default()
+                },
+            );
+            assert_eq!(
+                output.output.exit_status,
+                progress.map_or(0, |count| count as i32 + 1),
+                "{operation}"
+            );
+            assert_eq!(output.files["data"], b"ABCDE");
+        }
+    }
+    for (first, next, faults) in [
+        (
+            "read_line()",
+            "write_file_bytes(\"rest\", read_stdin_bytes());",
+            MirIoFaults {
+                stdin_line_read: true,
+                transferred_byte_count: Some(3),
+                ..MirIoFaults::default()
+            },
+        ),
+        (
+            "read_stdin_bytes()",
+            "let $line = read_line(); if ($line != null) { write_file(\"rest\", $line); }",
+            MirIoFaults {
+                stdin_bytes_read: true,
+                transferred_byte_count: Some(3),
+                ..MirIoFaults::default()
+            },
+        ),
+    ] {
+        let source = format!(
+            r#"function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error {{
+            try {{ {first}; }} catch (Doria\Std\Io\IoError) {{}}
+            {next}
+        }}"#
+        );
+        let output = interpret_with_host(
+            &source,
+            MirIo {
+                faults,
+                stdin: "AéBC".as_bytes().to_vec(),
+                ..MirIo::default()
+            },
+        );
+        assert_eq!(output.output.exit_status, 0, "{first}");
+        assert_eq!(
+            output.files["rest"], b"BC",
+            "{first}: consumed bytes must not replay"
+        );
+    }
+}
+
+#[test]
+fn interpreter_unhandled_io_progress_is_a_signed_fact_and_survives_rethrow() {
+    for (literal, expected) in [
+        ("null", None),
+        ("0", Some(0)),
+        ("3", Some(3)),
+        ("-3", Some(-3)),
+        ("9223372036854775807", Some(i64::MAX)),
+    ] {
+        let source = format!(
+            r#"
+function fail(): void throws Doria\Std\Io\IoError {{
+    throw new Doria\Std\Io\IoError("failed", Doria\Std\Io\IoOperation::Write,
+        Doria\Std\Io\IoTarget::StandardOutput, Doria\Std\Io\IoErrorReason::Other,
+        transferredByteCount: {literal});
+}}
+function main(): void throws Doria\Std\Io\IoError {{
+    try {{ fail(); }} catch (Doria\Std\Io\IoError $error) {{ throw $error; }}
+}}"#
+        );
+        let output = interpret_with_host(&source, MirIo::default());
+        assert_eq!(output.output.exit_status, 70);
+        let details = output
+            .output
+            .runtime_diagnostic
+            .as_ref()
+            .unwrap()
+            .runtime_outcome
+            .as_ref()
+            .unwrap();
+        assert_eq!(details.origin.function.as_deref(), Some("fail"));
+        let fact = details
+            .facts
+            .iter()
+            .find(|fact| fact.name == "transferredByteCount");
+        assert_eq!(
+            fact.map(|fact| &fact.value),
+            expected
+                .map(doriac::diagnostics::RuntimeFactValue::Signed)
+                .as_ref()
+        );
+        let stderr = String::from_utf8(output.output.stderr).unwrap();
+        if let Some(count) = expected {
+            assert!(
+                stderr.contains(&format!("Transferred Byte Count\n  {count}")),
+                "{stderr}"
+            );
+        } else {
+            assert!(!stderr.contains("Transferred Byte Count"));
+        }
+    }
+}
+
+#[test]
+fn interpreter_open_validation_and_flush_failures_do_not_invent_progress() {
+    for (operation, faults) in [
+        ("read_file(\"missing\")", MirIoFaults::default()),
+        (
+            "write_file(\"nul\0path\", \"ABCDE\")",
+            MirIoFaults::default(),
+        ),
+        (
+            "read_line()",
+            MirIoFaults {
+                stdout_flush: Some(MirIoWriteFailure::Other),
+                transferred_byte_count: Some(3),
+                ..MirIoFaults::default()
+            },
+        ),
+    ] {
+        let source = format!(
+            r#"function main(): int throws Doria\Std\Io\InvalidUtf8Error {{
+            try {{ {operation}; }} catch (Doria\Std\Io\IoError $error) {{
+                if ($error->transferredByteCount == null) {{ return 0; }} return 1;
+            }} return 2;
+        }}"#
+        );
+        let output = interpret_with_host(
+            &source,
+            MirIo {
+                faults,
+                ..MirIo::default()
+            },
+        );
+        assert_eq!(output.output.exit_status, 0, "{operation}");
+    }
+}
+
 const PROMPTED_READ: &str = r#"
 function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {

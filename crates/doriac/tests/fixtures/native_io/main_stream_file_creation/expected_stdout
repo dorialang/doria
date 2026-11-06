@@ -1,0 +1,5 @@
+open existing
+open or create
+create new
+truncate existing
+create or truncate

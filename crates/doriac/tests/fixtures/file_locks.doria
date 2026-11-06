@@ -1,0 +1,45 @@
+use Doria\Std\Io\{File, FileCreation, FileWriteMode, FileLockMode, BorrowedLockOutcome, LockOutcome, ReadableFile, IoError, IoOperation};
+
+function probe(writable ReadableFile $reader, FileLockMode $mode): string throws IoError {
+    return match ($reader->tryLock($mode)) {
+        BorrowedLockOutcome::Acquired($guard) => "a",
+        BorrowedLockOutcome::Contended => "c",
+    };
+}
+
+function main(): void {
+    let writable $first = File::openReadWrite("file-locks.bin", FileCreation::CreateOrTruncate, FileWriteMode::Positioned);
+    let writable $second = File::openRead("file-locks.bin");
+    {
+        let writable $guard = $first->lock(FileLockMode::Exclusive);
+        echo probe($second, FileLockMode::Shared);
+        echo $guard->file->getLength();
+        $guard->unlock();
+    }
+    echo probe($second, FileLockMode::Shared) . ";";
+    {
+        let $shared = $first->lock(FileLockMode::Shared);
+        echo probe($second, FileLockMode::Shared);
+        echo probe($second, FileLockMode::Exclusive);
+    }
+    echo probe($second, FileLockMode::Exclusive) . ";";
+    // A second acquisition through the same file is an error, never a conversion.
+    {
+        let writable $held = $first->lock(FileLockMode::Shared);
+        try {
+            let $again = $held->file->lock(FileLockMode::Exclusive);
+            echo "converted";
+        } catch (IoError $error) {
+            echo $error->operation == IoOperation::Lock ? "L" : "?";
+        }
+    }
+    let writable $owned = $first->lockOwned(FileLockMode::Exclusive);
+    echo probe($second, FileLockMode::Shared);
+    let writable $back = $owned->unlock();
+    echo probe($second, FileLockMode::Shared) . ";";
+    echo match ($back->tryLockOwned(FileLockMode::Exclusive)) {
+        LockOutcome::Acquired($locked) => "o" . probe($second, FileLockMode::Shared),
+        LockOutcome::Contended($file) => "x",
+    };
+    echo probe($second, FileLockMode::Exclusive) . "\n";
+}

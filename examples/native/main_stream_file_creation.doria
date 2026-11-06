@@ -1,0 +1,21 @@
+use Doria\Std\Io\FileCreation;
+
+function describeCreation(FileCreation $creation): string
+{
+    return match ($creation) {
+        FileCreation::OpenExisting => "open existing",
+        FileCreation::OpenOrCreate => "open or create",
+        FileCreation::CreateNew => "create new",
+        FileCreation::TruncateExisting => "truncate existing",
+        FileCreation::CreateOrTruncate => "create or truncate"
+    };
+}
+
+function main(): void
+{
+    echo describeCreation(FileCreation::OpenExisting) . "\n";
+    echo describeCreation(FileCreation::OpenOrCreate) . "\n";
+    echo describeCreation(FileCreation::CreateNew) . "\n";
+    echo describeCreation(FileCreation::TruncateExisting) . "\n";
+    echo describeCreation(FileCreation::CreateOrTruncate) . "\n";
+}

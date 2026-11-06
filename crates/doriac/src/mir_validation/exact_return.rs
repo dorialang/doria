@@ -128,6 +128,20 @@ impl Proofs<'_> {
                     success,
                     failure,
                     ..
+                }
+                | mir::Terminator::CheckedDeadlineFromNow {
+                    result,
+                    error,
+                    success,
+                    failure,
+                    ..
+                }
+                | mir::Terminator::CheckedCancellationRequest {
+                    result,
+                    error,
+                    success,
+                    failure,
+                    ..
                 } => {
                     Self::set_result(&mut facts, Some(*error), class, false);
                     Self::set_result(&mut facts, *result, class, false);
@@ -226,7 +240,8 @@ impl Proofs<'_> {
             mir::Statement::CleanupConstructorPhase { object: local, .. }
             | mir::Statement::DropClass { local, .. }
             | mir::Statement::DropError { local }
-            | mir::Statement::ExtractErrorObject { target: local, .. } => {
+            | mir::Statement::ExtractErrorObject { target: local, .. }
+            | mir::Statement::TakeProperty { target: local, .. } => {
                 Self::set_result(facts, Some(*local), class, false)
             }
             _ => {}
@@ -257,6 +272,7 @@ impl Proofs<'_> {
             return Ok(true);
         }
         Ok(match value {
+            mir::ClassExpression::Upcast { value, .. } => self.class(value, class, facts)?,
             mir::ClassExpression::New { concrete_class, .. } => *concrete_class == class,
             mir::ClassExpression::Local { local, .. }
             | mir::ClassExpression::NullableLocalAssumeNonNull { local, .. }

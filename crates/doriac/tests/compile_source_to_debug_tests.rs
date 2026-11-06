@@ -4,9 +4,11 @@ function answer(uint8 $base): uint8
     return $base + 2;
 }
 
+// Widening `Int::from(uint8)` runs on PHP (decision log entry 33); the
+// narrowing `UInt8::from(int)` is what PHP still rejects.
 function main(): int
 {
-    return Int::from(answer(40));
+    return Int::from(answer(UInt8::from(40)));
 }
 "#;
 
@@ -68,7 +70,7 @@ function main(): int
 #[test]
 fn accepts_programs_the_php_backend_rejects() {
     let php_diagnostics = doriac::compile_source_to_php("test.doria", FIXED_WIDTH_SOURCE)
-        .expect_err("fixed-width integers are unsupported by the PHP backend");
+        .expect_err("narrowing integer conversions remain unsupported by the PHP backend");
     assert_eq!(php_diagnostics[0].code, "B1301");
 
     let debug = doriac::compile_source_to_debug("test.doria", FIXED_WIDTH_SOURCE)

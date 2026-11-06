@@ -144,6 +144,16 @@ does not invent abstract classes or incomplete conforming classes. Open and
 closed classes follow the same conformance law; a valid child override updates
 the inherited interface vtable for the child's dynamic specialization.
 
+### Stage 36a Conditional Capability Direction
+
+Andrew approved general explicitly conditional nominal conformance and
+constrained member bodies for generic adapters. Decision 0139 records that
+accepted direction and subsequently approved local-clause spelling and detailed
+coherence contract. Implementation remains pending. This extends authored
+nominal conformance; method-name coincidence and trait-granted conformance
+remain excluded. The master plan assigns the grammar and execution slices.
+Existing unconditional declarations and compiler behavior are unchanged.
+
 ## Requirement Compatibility
 
 Interface conformance reuses Decision 0130's callable substitution machinery:
@@ -191,6 +201,12 @@ carrier without allocating, copying the object, or creating another owner.
 - Interface-typed properties, supported statics, collection elements, and
   closure captures store owned carriers; borrowed carriers cannot escape into
   storage.
+
+Decision 0138's C-B ruling covers inline Copy implementers: erasure creates an
+independent owned Copy snapshot. An implicit carrier temporary lasts through
+the calling statement. A returned borrow may be used within that statement;
+storing it requires an explicitly stored interface owner first. Nullable Copy
+erasure follows the same rule. The original Copy binding remains independent.
 
 Upcasting an interface to an ancestor changes only the vtable word. Sibling
 interface conversion and interface-to-class conversion require checked `is`

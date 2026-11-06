@@ -1,0 +1,126 @@
+use Doria\Std\Io\{ReadableStream, WritableStream, ReadOutcome, WriteOutcome, FlushOutcome,
+    FinishOutcome, BorrowedFinishOutcome, BufferedReader, BufferedWriter, BorrowedBufferedReader,
+    BorrowedBufferedWriter, WritableByteRegion, ByteRegion, IoError};
+
+class Source implements ReadableStream {
+    internal writable Bytes $data;
+    writable int $position = 0;
+    function __construct(int $length) {
+        $this->data = Bytes::allocate($length);
+        let writable $index = 0;
+        let writable $phase = 0;
+        while ($index < $length) {
+            $this->data[$index] = $phase == 0 ? 3 : 5;
+            $phase = $phase == 2 ? 0 : $phase + 1;
+            $index++;
+        }
+    }
+    writable function read(writable WritableByteRegion $destination): ReadOutcome {
+        if ($destination->length == 0) { return ReadOutcome::Data(0); }
+        if ($this->position == $this->data->length) { return ReadOutcome::EndOfStream; }
+        // Short reads exercise refills: at most 5 bytes per call.
+        let writable $count = $this->data->length - $this->position;
+        if ($count > 5) { $count = 5; }
+        if ($count > $destination->length) { $count = $destination->length; }
+        let writable $index = 0;
+        while ($index < $count) {
+            $destination[$index] = $this->data[$this->position + $index];
+            $index++;
+        }
+        $this->position += $count;
+        return ReadOutcome::Data($count);
+    }
+}
+
+class Sink implements WritableStream {
+    writable int $total = 0;
+    writable int $checksum = 0;
+    writable int $calls = 0;
+    writable function write(ByteRegion $source): WriteOutcome {
+        $this->calls++;
+        // Every third call reports no progress; others accept at most 7 bytes.
+        if ($this->calls == 3) {
+            $this->calls = 0;
+            return WriteOutcome::WouldBlock;
+        }
+        let writable $count = $source->length;
+        if ($count > 7) { $count = 7; }
+        let writable $index = 0;
+        while ($index < $count) {
+            let $weight = $this->total + $index + 1;
+            $this->checksum += $weight * ($source[$index] == 3 ? 3 : 5);
+            $index++;
+        }
+        $this->total += $count;
+        return WriteOutcome::Accepted($count);
+    }
+}
+
+function main(): void {
+    let writable $reader = new BufferedReader<Source>(new Source(100), 16);
+    let writable $writer = new BufferedWriter<Sink>(new Sink(), 12);
+    let writable $chunk = Bytes::allocate(9);
+    let writable $done = false;
+    let writable $reads = 0;
+    while (!$done) {
+        let writable $destination = $chunk->getWritableRegion(0, 9);
+        let $count = match ($reader->read($destination)) {
+            ReadOutcome::Data($count) => $count,
+            default => -1,
+        };
+        if ($count < 0) {
+            $done = true;
+        } else {
+            $reads++;
+            let writable $offset = 0;
+            while ($offset < $count) {
+                let $pending = $chunk->getRegion($offset, $count - $offset);
+                $offset += match ($writer->write($pending)) {
+                    WriteOutcome::Accepted($accepted) => $accepted,
+                    WriteOutcome::WouldBlock => 0,
+                };
+            }
+        }
+    }
+    echo finishAll($writer, 1) . ";" . $reads . ";";
+    // Borrowed forms write through to the caller's stream and release it.
+    let writable $sink = new Sink();
+    {
+        let writable $borrowed = new BorrowedBufferedWriter<Sink>($sink, 4);
+        let $bytes = Bytes::allocate(10);
+        let $all = $bytes->getRegion(0, 10);
+        let writable $written = 0;
+        while ($written < 10) {
+            let $rest = $all->getRegion($written, 10 - $written);
+            $written += match ($borrowed->write($rest)) {
+                WriteOutcome::Accepted($accepted) => $accepted,
+                WriteOutcome::WouldBlock => 0,
+            };
+        }
+        echo finishBorrowed($borrowed, 1) . ";";
+    }
+    echo $sink->total . ";";
+    let writable $source = new Source(7);
+    {
+        let writable $peek = new BorrowedBufferedReader<Source>($source, 8);
+        let $first = $peek->fill();
+        echo $peek->buffered->length . ";";
+        $peek->consume(2);
+        echo $peek->buffered->length;
+    }
+    echo ";" . $source->position . "\n";
+}
+
+function finishBorrowed(take BorrowedBufferedWriter<Sink> $writer, int $attempts): int throws IoError {
+    return match (take $writer->finish()) {
+        BorrowedFinishOutcome::Complete => $attempts,
+        BorrowedFinishOutcome::Pending($retry) => finishBorrowed($retry, $attempts + 1),
+    };
+}
+
+function finishAll(take BufferedWriter<Sink> $writer, int $attempts): string throws IoError {
+    return match (take $writer->finish()) {
+        FinishOutcome::Complete($sink) => $sink->total . ";" . $sink->checksum . ";" . $attempts,
+        FinishOutcome::Pending($retry) => finishAll($retry, $attempts + 1),
+    };
+}

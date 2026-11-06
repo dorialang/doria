@@ -248,19 +248,29 @@ aliases:
 - `Doria\Std\Io\Utf8InputSource`
 
 Before general namespaces execute, the compiler may recognize these exact
-qualified identities. `IoError` carries message, operation, target, reason, and
-optional system code. `InvalidUtf8Error` carries message, source, valid byte
+qualified identities. `IoError` carries message, operation, target, reason,
+optional system code, and optional transferred byte count (Decision 0110's
+Stage 36a amendment). `InvalidUtf8Error` carries message, source, valid byte
 count, and optional invalid byte count. The permanent ordinary stdout/stderr
 closed-pipe status-0 rule remains neither panic nor throw.
 
-`IoOperation` has `Open`, `Read`, `Write`, `Append`, and `Flush`. `IoTarget` has
-`File(string $path)`, `StandardInput`, `StandardOutput`, and `StandardError`.
+The original `IoOperation` cases are `Open`, `Read`, `Write`, `Append`, and
+`Flush`; the original `IoTarget` cases are `File(string $path)`, `StandardInput`,
+`StandardOutput`, and `StandardError`. Decision 0110's Stage 36a amendments
+append `Close`, `Register`, `Unregister`, and `Wait` operations and the
+`ReadinessSet` target without changing existing tags. Readiness infrastructure
+keeps this `IoError` family and `null` byte progress; completed transfer errors
+keep their original identity and progress.
 `IoErrorReason` has `NotFound`, `PermissionDenied`, `InvalidInput`,
 `Interrupted`, `ResourceExhausted`, `Unsupported`, `Closed`, and `Other`.
 `Utf8InputSource` has `File(string $path)` and `StandardInput`.
 
 `IoError` exposes externally accessible readonly `message`, `operation`,
-`target`, `reason`, and `?int systemCode`. `InvalidUtf8Error` exposes externally
+`target`, `reason`, `?int systemCode`, and `?int transferredByteCount`. The
+transferred count is a trailing promoted constructor parameter defaulting to
+`null`, preserving existing construction. `null` means unavailable or not
+applicable; zero and positive counts mean known progress within the failing
+operation, not rollback or durability guarantees. `InvalidUtf8Error` exposes externally
 accessible readonly `message`, `source`, `validByteCount`, and
 `?int invalidByteCount`. Counts are bytes. The stable messages are Doria-owned:
 `failed to <operation> <target>: <reason>` and `invalid UTF-8 in <source>`.

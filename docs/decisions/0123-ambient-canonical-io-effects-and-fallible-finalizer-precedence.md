@@ -73,6 +73,22 @@ Error out-slot transport. Structural function values use one compiler-private,
 ambient-capable indirect convention. This convention adds no per-call heap
 allocation and exposes no runtime effect reflection.
 
+A generic or trait body is checked once for every implementation it may
+select. Some calls select their implementation through specialization or trait
+composition: constrained methods, bodyless trait requirements through `$this`
+or `self::`, and an explicit `toString` on a Displayable type parameter. In the
+template these calls carry the complete ambient profile, as erased interface
+calls and constrained core operations do. A catch for ambient I/O around such
+a call is therefore never unreachable, and a generic template's diagnostics
+never depend on its callers. A trait member with a body is the trait's own
+implementation, so a call to it keeps that member's exact profile; each
+composed copy is checked again with the composer's members. Every
+specialization currently shares the template contract. Exact
+per-specialization contracts would narrow only the executable ABI, never the
+template's diagnostics. Each call's executable transport belongs to its
+selected callee, so an effect-free selection uses the ordinary call. (Amended
+2026-11-06, Stage 36a decision log entry 51.)
+
 ### Fallible source finalizers
 
 A source `finally` block may propagate a checked Error. Finalizer effects are

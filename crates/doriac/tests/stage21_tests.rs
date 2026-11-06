@@ -1,3 +1,6 @@
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
 
@@ -19,6 +22,201 @@ fn assert_valid_mir(source: &str) {
     let object = doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("validated MIR should lower through the fast native backend");
     assert!(!object.is_empty());
+}
+
+fn owned_field_case(body: &str) -> String {
+    format!(
+        r#"
+class Cell {{ writable int $value = 0; }}
+class Branch {{
+    writable Cell $left = new Cell();
+    writable Cell $right = new Cell();
+    Cell $view {{ borrowed get => $this->left; }}
+}}
+class Tree {{
+    writable Branch $first = new Branch();
+    writable Branch $second = new Branch();
+}}
+function touch(writable Cell $left, writable Cell $right): void {{}}
+function observe(Cell $left, writable Cell $right): void {{}}
+function identity(Cell $cell): Cell {{ return $cell; }}
+function inspect(Branch $branch, writable Cell $cell): void {{}}
+function consume(take Tree $tree): void {{}}
+function route(writable Tree $tree): void {{ {body} }}
+function main(): void {{}}
+"#
+    )
+}
+
+#[test]
+fn disjoint_owned_fields_borrow_independently_in_calls_and_aliases() {
+    for body in [
+        "touch($tree->first->left, $tree->first->right);",
+        "touch($tree->first->left, $tree->second->left);",
+        "let $left = identity($tree->first->left); observe($left, $tree->first->right); echo $left->value;",
+        "$tree->first->left->value = $tree->first->right->value;",
+        "let $left = identity($tree->first->left); let $read = function(): int with ($left) { return $left->value; }; $tree->first->right->value = 1; echo $read();",
+    ] {
+        // Source acceptance alone hid MIR disagreements; both must accept.
+        let program = doriac::lower_source_to_mir("owned-fields.doria", owned_field_case(body))
+            .unwrap_or_else(|diagnostics| panic!("{body}: {diagnostics:#?}"));
+        doriac::mir_validation::validate_program(&program)
+            .unwrap_or_else(|error| panic!("{body}: {}", error.message));
+    }
+}
+
+#[test]
+fn owned_field_loans_still_conflict_with_aliases_ancestors_and_opaque_views() {
+    for body in [
+        "touch($tree->first->left, $tree->first->left);",
+        "let $left = identity($tree->first->left); observe($left, $tree->first->left); echo $left->value;",
+        "inspect($tree->first, $tree->first->left);",
+        "observe($tree->first->view, $tree->first->right);",
+        "let $left = identity($tree->first->left); $tree->first = new Branch(); echo $left->value;",
+    ] {
+        assert_diagnostic(&owned_field_case(body), "E0477");
+    }
+}
+
+#[test]
+fn captured_owned_field_loan_protects_its_parent() {
+    assert_diagnostic(
+        &owned_field_case(
+            "let $left = identity($tree->first->left); let $read = function(): int with ($left) { return $left->value; }; $tree->first = new Branch(); echo $read();",
+        ),
+        "E0654",
+    );
+}
+
+#[test]
+fn inherited_and_generic_fields_use_canonical_ownership_paths() {
+    let header = r#"
+class Cell { writable int $value = 0; }
+open class Base {
+    writable Cell $left = new Cell();
+    Cell $fixed = new Cell();
+}
+class Child extends Base { writable Cell $right = new Cell(); }
+class Pair<T> {
+    writable T $left;
+    writable T $right;
+    function __construct(parameter take T $left, parameter take T $right) {
+        $this->left = $left;
+        $this->right = $right;
+    }
+}
+function touch(writable Cell $left, writable Cell $right): void {}
+function inspect(Base $base, writable Cell $cell): void {}
+"#;
+    for (parameter, body, valid) in [
+        ("Child", "touch($owner->left, $owner->right);", true),
+        ("Child", "touch($owner->left, $owner->left);", false),
+        ("Child", "inspect($owner, $owner->right);", false),
+        ("Pair<Cell>", "touch($owner->left, $owner->right);", true),
+        ("Pair<Cell>", "touch($owner->left, $owner->left);", false),
+    ] {
+        let source = format!(
+            "{header}\nfunction route(writable {parameter} $owner): void {{ {body} }}\nfunction main(): void {{}}"
+        );
+        if valid {
+            doriac::check_source("canonical-owned-fields.doria", &source)
+                .unwrap_or_else(|diagnostics| panic!("{parameter}: {body}: {diagnostics:#?}"));
+        } else {
+            assert_diagnostic(&source, "E0477");
+        }
+    }
+    for (mode, body) in [
+        ("", "touch($owner->left, $owner->right);"),
+        ("writable ", "touch($owner->fixed, $owner->right);"),
+    ] {
+        assert_diagnostic(
+            &format!(
+                "{header}\nfunction route({mode}Child $owner): void {{ {body} }}\nfunction main(): void {{}}"
+            ),
+            "E0204",
+        );
+    }
+}
+
+#[test]
+fn retained_owned_field_regions_protect_only_overlapping_paths() {
+    let header = r#"
+use Doria\Std\Io\{WritableByteRegion};
+class Buffers {
+    writable Bytes $left = Bytes::allocate(4);
+    writable Bytes $right = Bytes::allocate(4);
+}
+class Owner { writable Buffers $buffers = new Buffers(); }
+function region(writable Owner $owner): WritableByteRegion {
+    return $owner->buffers->left->getWritableRegion(0, 4);
+}
+function consume(take Owner $owner): void {}
+"#;
+    for (body, valid) in [
+        ("$owner->buffers->right[0] = 1;", true),
+        ("$owner->buffers->left[0] = 1;", false),
+        ("$owner->buffers->left = Bytes::allocate(4);", false),
+        ("$owner->buffers = new Buffers();", false),
+        ("consume($owner);", false),
+    ] {
+        let source = format!(
+            "{header}\nfunction main(): void {{ let writable $owner = new Owner(); let writable $view = region($owner); {body} echo $view[0]; }}"
+        );
+        if valid {
+            doriac::check_source("owned-field-region.doria", &source)
+                .unwrap_or_else(|diagnostics| panic!("{body}: {diagnostics:#?}"));
+        } else {
+            assert_diagnostic(&source, "E0763");
+        }
+    }
+}
+
+#[test]
+fn finite_repeated_fields_stay_precise_while_recursive_helpers_terminate() {
+    let header = r#"
+use Doria\Std\Io\WritableByteRegion;
+class Link {
+    writable Link $next;
+    writable Bytes $left = Bytes::allocate(4);
+    writable Bytes $right = Bytes::allocate(4);
+    function __construct(parameter take Link $next) { $this->next = $next; }
+}
+function one(writable Link $link, bool $stop): WritableByteRegion {
+    return $link->next->left->getWritableRegion(0, 4);
+}
+function two(writable Link $link, bool $stop): WritableByteRegion {
+    return one($link->next, $stop);
+}
+function recursive(writable Link $link, bool $stop): WritableByteRegion {
+    if ($stop) { return $link->left->getWritableRegion(0, 4); }
+    return recursive($link->next, true);
+}
+function mutual(writable Link $link, bool $stop): WritableByteRegion {
+    if ($stop) { return $link->left->getWritableRegion(0, 4); }
+    return forward($link->next, true);
+}
+function forward(writable Link $link, bool $stop): WritableByteRegion { return mutual($link, $stop); }
+"#;
+    for (callee, mutation, valid) in [
+        ("two", "$link->next->next->right[0] = 1;", true),
+        ("two", "$link->next->next->left[0] = 1;", false),
+        ("recursive", "$link->right[0] = 1;", true),
+        ("recursive", "$link->next->left[0] = 1;", false),
+        ("mutual", "$link->right[0] = 1;", true),
+        ("mutual", "$link->next->left[0] = 1;", false),
+    ] {
+        let source = format!(
+            "{header}\nfunction route(writable Link $link): void {{\n\
+             let writable $view = {callee}($link, false); {mutation} echo $view[0];\n\
+             }}\nfunction main(): void {{}}"
+        );
+        if valid {
+            doriac::check_source("repeated-owned-fields.doria", &source)
+                .unwrap_or_else(|diagnostics| panic!("{callee}: {mutation}: {diagnostics:#?}"));
+        } else {
+            assert_diagnostic(&source, "E0763");
+        }
+    }
 }
 
 fn assert_linked_native_execution(program: &doriac::mir::Program, stdout: &str) {
@@ -115,8 +313,8 @@ function main(): void throws Error
     let program = doriac::lower_source_to_mir("call-result-capabilities.doria", source)
         .expect("materialized call results should retain their checked capabilities");
     doriac::mir_validation::validate_program(&program).expect("MIR should validate");
-    // Source-level borrowed locals remain readonly. Inspect the intermediate
-    // call results directly instead of granting a writable source alias.
+    // Inspect the intermediate call results as well as the inferred writable
+    // borrowed locals covered by return_borrow_alias_tests.
     // Decision 0123 gives every structural function value ambient checked
     // transport, including the body with no required effects. Exercise both
     // ambient-only and required-Failure profiles, not an infallible ABI.
@@ -245,8 +443,8 @@ fn returned_borrow_elision_counts_resolved_move_parameters() {
         doriac::check_source(
             "borrows.doria",
             format!(
-            "{declarations} function select({ty} $value, Flag $flag): {ty} {{ return $value; }}"
-        ),
+                "{declarations} function select({ty} $value, Flag $flag): {ty} {{ return $value; }}"
+            ),
         )
         .expect("Copy enums must not count as borrowed sources");
         assert_diagnostic(
@@ -430,6 +628,8 @@ function main(): void {
 }
 "#;
     let mut program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&program)
+        .expect("the intact nullable returned-borrow contract must validate");
     let value = program
         .functions
         .iter_mut()
@@ -448,7 +648,14 @@ function main(): void {
         .expect("nullable borrowing call");
     assert!(value.take().is_some());
     let error = doriac::mir_validation::validate_program(&program).unwrap_err();
-    assert!(error.message.contains("return ownership"), "{error:?}");
+    // Erasing the call contract claims an owned result while its destination
+    // remains borrowed. Assignment ownership now rejects this before call validation.
+    assert!(
+        error
+            .message
+            .contains("nullable collection local ownership disagrees with its source value"),
+        "{error:?}"
+    );
 }
 
 fn constructor_diagnostic_snapshot(source: &str, code: &str) -> String {
@@ -1016,8 +1223,10 @@ function main(): void
 }
 
 #[test]
-fn property_assignment_rejects_overlapping_direct_rhs_reads() {
-    assert_diagnostic(
+fn property_assignment_accepts_disjoint_rhs_fields() {
+    // Decision 0136 removes the former whole-owner field-assignment
+    // restriction; source checking and shared MIR validation must both accept.
+    assert_valid_mir(
         r#"
 class Box
 {
@@ -1029,8 +1238,9 @@ function route(writable Box $box): void
 {
     $box->value = $box->other;
 }
+
+function main(): void { let writable $box = new Box(); route($box); }
 "#,
-        "E0477",
     );
 }
 
@@ -1177,7 +1387,8 @@ function main(): void throws Doria\Std\Io\IoError
 
 #[test]
 fn this_property_assignment_holds_writable_access_during_rhs_evaluation() {
-    for source in [
+    // A disjoint field read must pass source checking and MIR validation.
+    assert_valid_mir(
         r#"
 class Box
 {
@@ -1189,7 +1400,11 @@ class Box
         $this->value = $this->other;
     }
 }
+
+function main(): void { let writable $box = new Box(); $box->copy(); }
 "#,
+    );
+    assert_diagnostic(
         r#"
 class Box
 {
@@ -1203,21 +1418,21 @@ class Box
 
 function replace(writable Box $box): int { return 1; }
 "#,
-    ] {
-        assert_diagnostic(source, "E0477");
-    }
+        "E0477",
+    );
 
-    doriac::check_source(
-        "stage21-self-read-modify-write.doria",
+    // An assignment may read the exact property it is replacing.
+    assert_valid_mir(
         r#"
 class Counter
 {
     writable int $value = 0;
     writable function advance(): void { $this->value = $this->value + 1; }
 }
+
+function main(): void { let writable $counter = new Counter(); $counter->advance(); }
 "#,
-    )
-    .expect("an assignment may read the exact property it is replacing");
+    );
 }
 
 #[test]
@@ -1273,8 +1488,9 @@ function collect(writable Box $box): int[]
 
 #[test]
 fn nested_exact_assignment_target_reads_remain_accepted() {
-    doriac::check_source(
-        "stage21-nested-exact-target.doria",
+    // An assignment may read its exact nested property target; the parent's
+    // MIR carrier must not claim more than that destination.
+    assert_valid_mir(
         r#"
 class Child { writable int $value = 0; }
 class Box { writable Child $child = new Child(); }
@@ -1283,9 +1499,168 @@ function update(writable Box $box): void
 {
     $box->child->value = $box->child->value + 1;
 }
+
+function main(): void { let writable $box = new Box(); update($box); }
 "#,
-    )
-    .expect("an assignment may read its exact nested property target");
+    );
+}
+
+/// Run one program on the interpreter, Cranelift, LLVM, and PHP.
+fn assert_every_backend(path: &str, source: &str, stdout: &str) {
+    let program = doriac::lower_source_to_mir(path, source).unwrap_or_else(|diagnostics| {
+        panic!("source and shared MIR validation should accept: {diagnostics:#?}")
+    });
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.exit_status, 0, "{output:?}");
+    assert_eq!(output.stdout, stdout.as_bytes());
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_linked_native_execution(&program, stdout);
+    let php = doriac::compile_source(path, source, doriac::backend::BackendTarget::Php)
+        .expect("source should compile to PHP");
+    let directory = native_execution::ExecutionDirectory::new();
+    let script = directory.path().join("program.php");
+    doriac::backend::publish_output(&script, php).unwrap();
+    let result = std::process::Command::new("php")
+        .arg(&script)
+        .current_dir(directory.path())
+        .output()
+        .expect("PHP is required for backend parity");
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(result.stdout, stdout.as_bytes(), "{result:?}");
+    assert!(result.stderr.is_empty(), "{result:?}");
+}
+
+#[test]
+fn assignment_destinations_claim_only_their_stored_path_on_every_backend() {
+    // Decision 0136: while an assigned value is evaluated, only the destination
+    // path is held. Disjoint siblings at any depth may be read or borrowed, and
+    // the destination itself may be read (compound and read-modify-write).
+    assert_every_backend(
+        "stage21-assignment-destinations.doria",
+        r#"
+class Cell
+{
+    writable int $value = 1;
+    writable int $other = 5;
+}
+
+class Branch
+{
+    writable Cell $left = new Cell();
+    writable Cell $right = new Cell();
+    writable int $count = 2;
+    writable int[] $buffer = [10, 20];
+}
+
+class Sink
+{
+    writable int $total = 4;
+    writable int $checksum = 0;
+    writable Branch $branch = new Branch();
+
+    writable function add(int $value): void
+    {
+        $this->checksum += ($this->total + 1) * $value;
+        $this->checksum = $this->checksum + $this->total;
+        $this->total = $this->branch->count;
+        $this->branch->left->value += $this->branch->left->other;
+        $this->branch->left->value = $this->branch->left->value * 2;
+        $this->branch->count += touch($this->branch->right) + $this->branch->left->value;
+        $this->branch->buffer[0] += $this->branch->count;
+        $this->branch->count = $this->branch->buffer[1];
+    }
+}
+
+function touch(writable Cell $cell): int
+{
+    $cell->other = $cell->other + 1;
+    return $cell->other;
+}
+
+function main(): void
+{
+    let writable $sink = new Sink();
+    $sink->add(3);
+    echo "{$sink->checksum}|{$sink->total}|{$sink->branch->left->value}|{$sink->branch->right->other}|{$sink->branch->count}|{$sink->branch->buffer[0]}\n";
+}
+"#,
+        "19|2|12|6|20|30\n",
+    );
+}
+
+/// Lower `route` with its value reading `$branch->right`, then retarget that
+/// MIR carrier to `$branch->left`, the destination's parent.
+fn validate_retargeted_destination_read(value: &str) -> Result<(), String> {
+    use doriac::mir::{ClassExpression, Rvalue, Statement};
+    let source = format!(
+        r#"
+class Cell {{ writable int $value = 1; writable int $other = 5; }}
+class Branch {{ writable Cell $left = new Cell(); writable Cell $right = new Cell(); }}
+function look(Cell $cell): int {{ return $cell->value; }}
+function route(writable Branch $branch): void {{ $branch->left->value = {value}; }}
+function main(): void {{ let writable $branch = new Branch(); route($branch); echo $branch->left->value; }}
+"#
+    );
+    let mut program = doriac::lower_source_to_mir("stage21-retargeted-carrier.doria", source)
+        .expect("the unmodified program reads a disjoint sibling");
+    let branch = program
+        .classes
+        .iter()
+        .find(|class| class.name == "Branch")
+        .expect("Branch class");
+    let property = |name: &str| {
+        branch
+            .properties
+            .iter()
+            .find(|property| property.name == name)
+            .unwrap_or_else(|| panic!("Branch::{name}"))
+            .id
+    };
+    let (right, left) = (property("right"), property("left"));
+    let route = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "route")
+        .expect("route function");
+    let mut retargeted = 0;
+    for statement in route
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+    {
+        if let Statement::AssignLocal {
+            value: Rvalue::Class(ClassExpression::Property { property, .. }),
+            ..
+        } = statement
+        {
+            if *property == right {
+                *property = left;
+                retargeted += 1;
+            }
+        }
+    }
+    assert_eq!(
+        retargeted, 1,
+        "route materializes one carrier for $branch->right"
+    );
+    doriac::mir_validation::validate_program(&program).map_err(|error| error.message)
+}
+
+#[test]
+fn mir_destination_carriers_reserve_exactly_the_assigned_field() {
+    // Independent of source checking: a carrier of the destination's parent
+    // may read the destination itself or a sibling, but using that parent as
+    // a whole overlaps the reserved destination.
+    validate_retargeted_destination_read("$branch->right->value + 1")
+        .expect("reading exactly the destination is read-modify-write");
+    validate_retargeted_destination_read("$branch->right->other")
+        .expect("reading a sibling of the destination is disjoint");
+    let error = validate_retargeted_destination_read("look($branch->right)")
+        .expect_err("using the destination's parent as a whole overlaps the destination");
+    assert!(
+        error.contains("conflicts with a live borrowed view"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1977,6 +2352,39 @@ function choose(Guard $guard, bool $alternate): Guard { return $guard; }
 }
 
 #[test]
+fn short_circuit_operands_release_completed_calls_but_preserve_enclosing_borrows() {
+    for condition in [
+        "update($box) && $box->flag",
+        "update($box) || $box->flag",
+        "$box->flag && update($box)",
+        "$box->flag || update($box)",
+        "update($box) && update($box) && update($box)",
+        "update($box) || update($box) || update($box)",
+        "(update($box) == true || update($box) == false) || update($box)",
+        "(update($box) == true && update($box) == false) && update($box)",
+    ] {
+        let source = format!(
+            r#"
+class Box {{ writable bool $flag = false; }}
+function update(writable Box $box): bool {{ $box->flag = true; return true; }}
+function route(writable Box $box): bool {{ return {condition}; }}
+function main(): void {{}}
+"#,
+        );
+        assert_valid_mir(&source);
+    }
+    assert_diagnostic(
+        r#"
+class Box { writable bool $flag = false; }
+function update(writable Box $box): bool { $box->flag = true; return true; }
+function observe(Box $box, bool $condition): void {}
+function route(writable Box $box): void { observe($box, true && update($box)); }
+"#,
+        "E0477",
+    );
+}
+
+#[test]
 fn enclosing_borrow_reactivation_respects_constant_short_circuiting() {
     for condition in ["false && $box->flag", "true || $box->flag"] {
         doriac::check_source(
@@ -2121,8 +2529,32 @@ fn writable_property_paths_require_stable_roots() {
 class Child {}
 class Box { writable Child $child = new Child(); }
 function make(): Box { return new Box(); }
+function route(): void { make()->child = new Child(); }
+"#,
+        "E0204",
+    );
+}
+
+#[test]
+fn owned_temporary_properties_allow_writable_call_borrows() {
+    for receiver in ["make()", "new Box()"] {
+        assert_valid_mir(&format!(
+            r#"
+class Child {{ writable int $value = 0; }}
+class Box {{ writable Child $child = new Child(); }}
+function make(): Box {{ return new Box(); }}
+function update(writable Child $child): void {{ $child->value = 1; }}
+function main(): void {{ update(({receiver})->child); }}
+"#
+        ));
+    }
+    assert_diagnostic(
+        r#"
+class Child {}
+class Box { Child $child = new Child(); }
+function make(): Box { return new Box(); }
 function update(writable Child $child): void {}
-function route(): void { update(make()->child); }
+function main(): void { update(make()->child); }
 "#,
         "E0204",
     );

@@ -4,8 +4,8 @@ Where
 examples/native/main_stage23_collection_oob_panic.doria · line 4 · main
 
   4          echo "{$values[1]}";
-             ^^^^^^^^^^^^^^^^^^^^
-             Invalid Collection Index
+                    ^^^^^^^^^^
+                    Invalid Collection Index
 
 Why
 The collection index is outside the valid range of this collection.

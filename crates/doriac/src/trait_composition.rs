@@ -5,9 +5,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::ast::transform::{Transform, Transformable};
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
-use crate::semantics::contracts::ContractFacts;
+use crate::semantics::contracts::{
+    ContractEdge, ContractFacts, NominalConditionFacts, NominalTypeParameter,
+};
 use crate::source::{ExpansionId, Span};
-use crate::types::TypeRef;
+use crate::types::{ClassType, ResolvedType, TypeRef};
 
 mod validation;
 
@@ -34,6 +36,13 @@ pub struct MethodObligation {
     pub failures: Vec<crate::semantics::contracts::ContractMismatch>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallableTemplate {
+    pub declaration: Span,
+    pub bindings: HashMap<String, ResolvedType>,
+    pub receiver: ResolvedType,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompositionPlan {
     pub(crate) classes: BTreeMap<String, ClassDecl>,
@@ -43,6 +52,12 @@ pub struct CompositionPlan {
     pub(crate) candidates: Vec<AdaptationCandidate>,
     pub adaptation_references: Vec<crate::semantics::contracts::ContractMemberReference>,
     pub adaptation_subjects: Vec<AdaptationSubjects>,
+    /// Checked predicates for effective members, never active-member evidence.
+    pub conditions: HashMap<Span, NominalConditionFacts>,
+    pub callable_conditions: HashMap<Span, Span>,
+    pub(crate) callable_templates: HashMap<Span, CallableTemplate>,
+    /// Imported contributions for authored-body checking, keyed by lexical trait.
+    pub(crate) source_trait_members: BTreeMap<String, Vec<ClassMember>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,54 +109,100 @@ struct Candidate {
     authored_name: Span,
     alias: Option<Span>,
     paths: Vec<Vec<Span>>,
+    condition: Option<NominalConditionFacts>,
+    callable_declarations: Vec<Span>,
+    bindings: HashMap<String, ResolvedType>,
 }
 
 pub(crate) fn prepare(
     program: &Program,
     facts: &ContractFacts,
 ) -> (CompositionPlan, Vec<Diagnostic>) {
-    let traits = program
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Trait(trait_decl) => Some((trait_decl.name.clone(), trait_decl)),
-            _ => None,
-        })
-        .collect();
-    let mut composer = Composer {
-        traits,
-        facts,
-        plan: CompositionPlan::default(),
-        diagnostics: Vec::new(),
-        current_class: String::new(),
-        next_expansion: 1,
-    };
+    let mut composer = Composer::new(program, facts);
+    composer.compose_classes(program);
+    (composer.plan, composer.diagnostics)
+}
+
+pub(crate) fn prepare_authored_bodies(
+    program: &Program,
+    facts: &ContractFacts,
+) -> (CompositionPlan, Vec<Diagnostic>) {
+    let mut composer = Composer::new(program, facts);
+    composer.compose_classes(program);
     for item in &program.items {
-        if let Item::Class(class) = item {
-            if class
-                .members
-                .iter()
-                .any(|member| matches!(member, ClassMember::Uses(_)))
-            {
-                composer.compose_class(class);
-            }
+        if let Item::Trait(declaration) = item {
+            composer.compose_source_trait(declaration);
         }
     }
     (composer.plan, composer.diagnostics)
 }
 
+#[derive(Clone, Copy)]
+enum CompositionOwner<'a> {
+    Class(&'a ClassDecl),
+    Trait(&'a TraitDecl),
+}
+
 struct Composer<'a> {
     traits: HashMap<String, &'a TraitDecl>,
     facts: &'a ContractFacts,
+    edges: HashMap<Span, &'a ContractEdge>,
     plan: CompositionPlan,
     diagnostics: Vec<Diagnostic>,
-    current_class: String,
+    current_owner: Option<CompositionOwner<'a>>,
+    current_parameters: Vec<NominalTypeParameter>,
     next_expansion: u32,
 }
 
-impl Composer<'_> {
-    fn compose_class(&mut self, class: &ClassDecl) {
-        self.current_class = class.name.clone();
+impl<'a> Composer<'a> {
+    fn new(program: &'a Program, facts: &'a ContractFacts) -> Self {
+        Self {
+            traits: program
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Trait(declaration) => Some((declaration.name.clone(), declaration)),
+                    _ => None,
+                })
+                .collect(),
+            facts,
+            edges: facts
+                .compositions
+                .iter()
+                .flat_map(|composition| &composition.uses)
+                .chain(
+                    facts
+                        .traits
+                        .iter()
+                        .flat_map(|declaration| &declaration.uses),
+                )
+                .map(|edge| (edge.span, edge))
+                .collect(),
+            plan: CompositionPlan::default(),
+            diagnostics: Vec::new(),
+            current_owner: None,
+            current_parameters: Vec::new(),
+            next_expansion: 1,
+        }
+    }
+
+    fn compose_classes(&mut self, program: &'a Program) {
+        for item in &program.items {
+            if let Item::Class(class) = item {
+                if class
+                    .members
+                    .iter()
+                    .any(|member| matches!(member, ClassMember::Uses(_)))
+                {
+                    self.compose_class(class);
+                }
+            }
+        }
+    }
+
+    fn compose_class(&mut self, class: &'a ClassDecl) {
+        self.current_owner = Some(CompositionOwner::Class(class));
+        self.current_parameters = condition_parameters(&class.type_params);
         let before = self.diagnostics.len();
         let valid = self
             .facts
@@ -156,7 +217,13 @@ impl Composer<'_> {
         for member in &class.members {
             match member {
                 ClassMember::Uses(uses) => {
-                    for candidate in self.expand_uses(uses, &HashMap::new(), &[], &mut Vec::new()) {
+                    for candidate in self.expand_uses(
+                        uses,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &[],
+                        &mut Vec::new(),
+                    ) {
                         if !valid {
                             continue;
                         }
@@ -207,6 +274,7 @@ impl Composer<'_> {
                 substitutions: HashMap::new(),
                 expansion: Some(id),
             });
+            self.record_condition(&member, candidate.condition.as_ref());
             let origin = EffectiveMemberOrigin {
                 id,
                 composing_class: class.name.clone(),
@@ -230,6 +298,11 @@ impl Composer<'_> {
                     });
                 }
             } else {
+                self.record_callable_templates(
+                    &member,
+                    candidate,
+                    crate::property_hooks::PropertyHookContext::Class,
+                );
                 output.members.push(member);
             }
         }
@@ -239,16 +312,127 @@ impl Composer<'_> {
         self.plan.classes.insert(class.name.clone(), output);
     }
 
+    fn compose_source_trait(&mut self, declaration: &'a TraitDecl) {
+        self.current_owner = Some(CompositionOwner::Trait(declaration));
+        self.current_parameters = condition_parameters(&declaration.type_params);
+        let mut members = Vec::new();
+        let mut candidates = Vec::new();
+        for member in &declaration.members {
+            if let ClassMember::Uses(uses) = member {
+                candidates.extend(self.expand_uses(
+                    uses,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &[],
+                    &mut Vec::new(),
+                ));
+            }
+        }
+        let mut order = (0..candidates.len()).map(Err).collect();
+        deduplicate(&mut candidates, &mut order);
+        for entry in order {
+            let Err(index) = entry else { unreachable!() };
+            let candidate = &candidates[index];
+            let mut member = candidate.member.clone();
+            member.transform(&mut Instantiate {
+                substitutions: HashMap::new(),
+                expansion: Some(self.expansion_id()),
+            });
+            self.record_condition(&member, candidate.condition.as_ref());
+            self.record_callable_templates(
+                &member,
+                candidate,
+                crate::property_hooks::PropertyHookContext::Trait,
+            );
+            members.push(member);
+        }
+        self.plan
+            .source_trait_members
+            .insert(declaration.name.clone(), members);
+    }
+
+    fn record_callable_templates(
+        &mut self,
+        member: &ClassMember,
+        candidate: &Candidate,
+        context: crate::property_hooks::PropertyHookContext,
+    ) {
+        for (callable, declaration) in crate::property_hooks::member_callables(member, context)
+            .zip(&candidate.callable_declarations)
+        {
+            self.plan.callable_templates.insert(
+                callable.span,
+                CallableTemplate {
+                    declaration: *declaration,
+                    bindings: candidate.bindings.clone(),
+                    receiver: self.receiver_type(),
+                },
+            );
+        }
+    }
+
+    fn record_condition(
+        &mut self,
+        member: &ClassMember,
+        condition: Option<&NominalConditionFacts>,
+    ) {
+        let declaration = member_span(member);
+        let mut parameters = self.current_parameters.clone();
+        match member {
+            ClassMember::Method(method) if method.availability.is_some() => {
+                parameters.extend(condition_parameters(&method.type_params));
+                self.plan
+                    .callable_conditions
+                    .insert(method.span, declaration);
+            }
+            ClassMember::Property(property) if property.availability.is_some() => {
+                for hook in &property.hooks {
+                    self.plan.callable_conditions.insert(hook.span, declaration);
+                }
+            }
+            _ => return,
+        }
+        let Some(condition) = condition else {
+            if let Some(CompositionOwner::Class(class)) = self.current_owner {
+                self.plan.invalid_classes.insert(class.name.clone());
+            }
+            return;
+        };
+        let mut condition = condition.clone();
+        condition.clause = condition.clause.in_expansion(declaration.expansion);
+        condition.parameters = parameters;
+        self.plan.conditions.insert(declaration, condition);
+    }
+
     fn expansion_id(&mut self) -> ExpansionId {
         let id = ExpansionId(self.next_expansion);
         self.next_expansion += 1;
         id
     }
 
+    fn receiver_type(&self) -> ResolvedType {
+        match self
+            .current_owner
+            .expect("composition has a declaration owner")
+        {
+            CompositionOwner::Trait(declaration) => {
+                ResolvedType::TraitSelf(declaration.name.clone())
+            }
+            CompositionOwner::Class(class) => ResolvedType::Class(ClassType::new(
+                &class.name,
+                self.current_parameters
+                    .iter()
+                    .map(|parameter| ResolvedType::TypeParameter(parameter.name.clone()))
+                    .collect(),
+            )),
+        }
+    }
+
     fn expand_uses(
         &mut self,
         uses: &TraitUse,
         bindings: &HashMap<String, TypeRef>,
+        resolved_bindings: &HashMap<String, ResolvedType>,
         path: &[Span],
         stack: &mut Vec<String>,
     ) -> Vec<Candidate> {
@@ -258,6 +442,25 @@ impl Composer<'_> {
             let Some(declaration) = self.traits.get(&ty.name).copied() else {
                 continue;
             };
+            let Some(edge) = uses
+                .type_spans
+                .get(index)
+                .and_then(|span| self.edges.get(span))
+            else {
+                continue;
+            };
+            let receiver = self.receiver_type();
+            let resolved_bindings = declaration
+                .type_params
+                .iter()
+                .zip(&edge.specialization.arguments)
+                .map(|(parameter, argument)| {
+                    (
+                        parameter.name.clone(),
+                        crate::types::substitute_trait_type(argument, resolved_bindings, &receiver),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
             if stack.contains(&ty.name)
                 || !self
                     .facts
@@ -289,7 +492,7 @@ impl Composer<'_> {
             for member in &declaration.members {
                 if let ClassMember::Uses(nested) = member {
                     candidates.extend(
-                        self.expand_uses(nested, &bindings, &child_path, stack)
+                        self.expand_uses(nested, &bindings, &resolved_bindings, &child_path, stack)
                             .into_iter()
                             .map(|candidate| (ty.clone(), candidate)),
                     );
@@ -299,6 +502,28 @@ impl Composer<'_> {
                         substitutions: bindings.clone(),
                         expansion: None,
                     });
+                    let mut condition_bindings = resolved_bindings.clone();
+                    if let (ClassMember::Method(authored), ClassMember::Method(effective)) =
+                        (member, &instantiated)
+                    {
+                        condition_bindings.extend(
+                            authored.type_params.iter().zip(&effective.type_params).map(
+                                |(authored, effective)| {
+                                    (
+                                        authored.name.clone(),
+                                        ResolvedType::TypeParameter(effective.name.clone()),
+                                    )
+                                },
+                            ),
+                        );
+                    }
+                    let condition =
+                        self.facts
+                            .conditions
+                            .get(&member_span(member))
+                            .map(|condition| {
+                                condition.substitute(&condition_bindings, &receiver, Vec::new())
+                            });
                     candidates.push((
                         ty.clone(),
                         Candidate {
@@ -308,6 +533,14 @@ impl Composer<'_> {
                             authored_name: member_name_span(member),
                             alias: None,
                             paths: vec![child_path.clone()],
+                            condition,
+                            callable_declarations: crate::property_hooks::member_callables(
+                                member,
+                                crate::property_hooks::PropertyHookContext::Trait,
+                            )
+                            .map(|callable| callable.span)
+                            .collect(),
+                            bindings: condition_bindings,
                         },
                     ));
                 }
@@ -327,29 +560,31 @@ impl Composer<'_> {
         let mut candidates = unique;
         let mut excluded = HashSet::new();
         let mut aliases = Vec::new();
-        for (edge, candidate) in &candidates {
-            if let ClassMember::Method(method) = &candidate.member {
-                if method.body.as_block().is_some() {
-                    let mut method = method.clone();
-                    method.transform(&mut Instantiate {
-                        substitutions: HashMap::new(),
-                        expansion: Some(self.expansion_id()),
-                    });
-                    self.plan.candidates.push(AdaptationCandidate {
-                        class: self.current_class.clone(),
-                        uses: uses.span,
-                        edge: edge.clone(),
-                        applicable_origins: uses
-                            .adaptations
-                            .iter()
-                            .filter(|adaptation| {
-                                same_type(edge, &substitute(&adaptation.origin, bindings))
-                            })
-                            .map(|adaptation| adaptation.origin_span)
-                            .collect(),
-                        authored_declaration: candidate.authored_declaration,
-                        method,
-                    });
+        if let Some(CompositionOwner::Class(class)) = self.current_owner {
+            for (edge, candidate) in &candidates {
+                if let ClassMember::Method(method) = &candidate.member {
+                    if method.body.as_block().is_some() {
+                        let mut method = method.clone();
+                        method.transform(&mut Instantiate {
+                            substitutions: HashMap::new(),
+                            expansion: Some(self.expansion_id()),
+                        });
+                        self.plan.candidates.push(AdaptationCandidate {
+                            class: class.name.clone(),
+                            uses: uses.span,
+                            edge: edge.clone(),
+                            applicable_origins: uses
+                                .adaptations
+                                .iter()
+                                .filter(|adaptation| {
+                                    same_type(edge, &substitute(&adaptation.origin, bindings))
+                                })
+                                .map(|adaptation| adaptation.origin_span)
+                                .collect(),
+                            authored_declaration: candidate.authored_declaration,
+                            method,
+                        });
+                    }
                 }
             }
         }
@@ -382,12 +617,14 @@ impl Composer<'_> {
                     .unwrap_or(candidates[chosen].1.authored_name),
                 excluded: Vec::new(),
             };
-            self.plan.adaptation_references.push(
-                crate::semantics::contracts::ContractMemberReference {
-                    span: adaptation.method.span,
-                    origins: vec![candidates[chosen].1.authored_declaration],
-                },
-            );
+            if matches!(self.current_owner, Some(CompositionOwner::Class(_))) {
+                self.plan.adaptation_references.push(
+                    crate::semantics::contracts::ContractMemberReference {
+                        span: adaptation.method.span,
+                        origins: vec![candidates[chosen].1.authored_declaration],
+                    },
+                );
+            }
             match &adaptation.kind {
                 TraitAdaptationKind::InsteadOf {
                     excluded: edges, ..
@@ -456,7 +693,9 @@ impl Composer<'_> {
                     }
                 }
             }
-            self.plan.adaptation_subjects.push(subjects);
+            if matches!(self.current_owner, Some(CompositionOwner::Class(_))) {
+                self.plan.adaptation_subjects.push(subjects);
+            }
         }
         let mut result = candidates
             .into_iter()
@@ -575,30 +814,28 @@ impl Transform for Instantiate {
         for parameter in &function.type_params {
             self.substitutions.remove(&parameter.name);
         }
-        if !self.substitutions.is_empty() {
-            let renamed = function
-                .type_params
-                .iter()
-                .filter(|parameter| !parameter.name.contains('#'))
-                .map(|parameter| {
-                    (
-                        parameter.name.clone(),
-                        TypeRef::named(format!(
-                            "{}#trait{}.{}",
-                            parameter.name, parameter.span.source.0, parameter.span.start
-                        )),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            if !renamed.is_empty() {
-                function.walk(&mut Instantiate {
-                    substitutions: renamed.clone(),
-                    expansion: None,
-                });
-                for parameter in &mut function.type_params {
-                    if let Some(name) = renamed.get(&parameter.name) {
-                        parameter.name = name.name.clone();
-                    }
+        let renamed = function
+            .type_params
+            .iter()
+            .filter(|parameter| !parameter.name.contains('#'))
+            .map(|parameter| {
+                (
+                    parameter.name.clone(),
+                    TypeRef::named(format!(
+                        "{}#trait{}.{}",
+                        parameter.name, parameter.span.source.0, parameter.span.start
+                    )),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        if !renamed.is_empty() {
+            function.walk(&mut Instantiate {
+                substitutions: renamed.clone(),
+                expansion: None,
+            });
+            for parameter in &mut function.type_params {
+                if let Some(name) = renamed.get(&parameter.name) {
+                    parameter.name = name.name.clone();
                 }
             }
         }
@@ -611,6 +848,17 @@ pub fn authored_type_parameter_name(name: &str) -> &str {
     name.split_once("#trait")
         .map_or(name, |(authored, _)| authored)
 }
+
+fn condition_parameters(parameters: &[TypeParamDecl]) -> Vec<NominalTypeParameter> {
+    parameters
+        .iter()
+        .map(|parameter| NominalTypeParameter {
+            name: parameter.name.clone(),
+            declaration: parameter.span,
+        })
+        .collect()
+}
+
 fn substitute(ty: &TypeRef, bindings: &HashMap<String, TypeRef>) -> TypeRef {
     let mut ty = ty.clone();
     ty.transform(&mut Instantiate {

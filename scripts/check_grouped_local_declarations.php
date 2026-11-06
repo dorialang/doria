@@ -56,7 +56,7 @@ function check_grouped_local_declarations(string $root): array
             'Stage 43 — Engine Performance And Optimization Hardening.',
             'Continuous performance rule',
             '`Performance Impact` section',
-            'Stage 36a owns the initial',
+            '**Portable correctness and performance gate:**',
         ],
         'docs/performance-and-benchmarking.md' => [
             '## Stage 26a grouped-local contract',
@@ -76,7 +76,6 @@ function check_grouped_local_declarations(string $root): array
             'Stage 26b — Performance Baseline Foundation — Complete.',
             'Stage 27 — Complete; No Performance-Evidence Dependency.',
             'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit',
-            'Stage 36a — Scheduled, Not Implemented.',
         ],
         'docs/notes/native-parity-matrix.md' => [
             '| Grouped local declarations | Covered | Covered | Covered | Covered |',

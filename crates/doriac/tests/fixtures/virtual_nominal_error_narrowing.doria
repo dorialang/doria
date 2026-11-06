@@ -1,0 +1,31 @@
+open class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+class NarrowFailure extends Failure
+{
+    function __construct(parameter string $message)
+    {
+        parent::__construct($message);
+    }
+}
+
+open class Root
+{
+    open function value(): int throws Failure { throw new Failure("r"); }
+}
+
+class Child extends Root
+{
+    override function value(): int throws NarrowFailure { throw new NarrowFailure("c"); }
+}
+
+function invoke(Root $source): int throws Failure { return $source->value(); }
+
+function main(): void
+{
+    try { echo invoke(new Child()); } catch (Failure $error) { echo $error->message; }
+    let $child = new Child();
+    try { echo $child->value(); } catch (NarrowFailure $error) { echo $error->message; }
+}

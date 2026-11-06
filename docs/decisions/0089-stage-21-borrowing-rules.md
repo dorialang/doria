@@ -32,15 +32,15 @@ and `WeakReference<T>` at Stage 25a, not by Stage 21.
 ### Borrow modes
 
 A readonly parameter or method receiver is a shared borrow. Any number of
-readonly uses of the same owner may overlap.
+readonly uses of the same place may overlap.
 
 A `writable` parameter or method receiver is an exclusive borrow. While that
-exclusive use is live, no other readonly or writable use of the same owner may
-overlap.
+exclusive use is live, no other readonly or writable use of an overlapping
+place is allowed. Decision 0136 defines which stored-property paths overlap.
 
 A `take` parameter receives ownership. Giving a value away cannot overlap with
-any readonly or writable use of that same owner in the same operation, and the
-source binding cannot be used afterward.
+any readonly or writable use of that value or its owned fields in the same
+operation, and the source binding cannot be used afterward.
 
 ### Non-lexical extent
 
@@ -57,10 +57,11 @@ owner because the first call's borrow has ended.
 
 ### Place expressions
 
-Place expressions borrow their owning root for the duration of the enclosing
-operation. `$obj->field` therefore participates in the same one-writer-XOR-many
-readers rule as `$obj`. Indexed places follow the same rule when collection
-indexing lands.
+Decision 0136 amends the original whole-owner place rule: stored owned-property
+paths borrow independently when disjoint. The same place and its ancestors or
+descendants still overlap. A field loan protects its parent's lifetime and
+prevents moving, replacing, or destroying the parent. Indexed places, byte
+ranges, and opaque computed or borrowed projections remain conservative.
 
 ### Returned borrows and elision
 
@@ -75,20 +76,43 @@ writers. A borrow-returning result cannot be bound as an owned `let` when the
 receiver is an owned temporary that drops at the end of the statement.
 
 Returned-borrow provenance is transitive. A result derived from `$this` or one
-borrowed parameter remains tied to that root when it passes through readonly
+borrowed parameter retains its lifetime root and proved storage path when it passes through readonly
 property projection, nested property projection, collection indexing,
 `Dictionary::get`, `List::first`, `List::last`, nullable wrapping, null-safe
 access, or generic substitution. These operations do not turn an element borrow
 into an owned value and do not acquire a cleanup obligation. Ambiguous roots and
 borrows from temporaries that die before the result remain errors.
 
+### Inferred borrowed locals
+
+Andrew approved proved writable borrowed locals on 2026-10-10. An inferred
+`let` remains readonly by default; `let writable` may retain a proved writable
+returned borrow. It does not upgrade a readonly result or acquire ownership.
+
+```doria
+let writable $stream = $set->getWritableStream($key);
+$stream->read($destination);
+```
+
+This rule applies to ordinary functions, methods, getters, generic and erased
+calls, and transitive aliases, not only registration lookup. A writable alias
+keeps its original source in exclusive use until its last required use.
+Reborrowing through that alias suspends conflicting use of the parent alias;
+it does not create a second writer. Readonly aliases remain shared. Neither
+kind may consume its source, initialize owning storage from a borrow, or outlive
+its source. No new owner, allocation, reference count, or runtime borrow guard
+is introduced. The former blanket rejection of writable borrowed locals is
+removed; source checking and independent MIR checking preserve the permission
+and lifetime proof instead.
+
 ### Owned temporaries
 
 An owned rvalue, including `new X()` and a call returning an owned `T`, is an
-exclusive place. It may receive `writable` and `take` calls. This narrows the
+exclusive place. It may receive `writable` and `consuming` method calls. This narrows the
 old `E0203` restriction on owned temporaries and enables `(new X())->mutate()`.
 
-The consuming self-return convention remains deferred by decision 0088.
+The consuming self-return convention remains unimplemented; Decision 0088 fixes
+its `consuming function` spelling and assigns grammar and execution to Stage 36a.
 
 ## Alternatives considered
 
@@ -136,6 +160,10 @@ convention.
 - The Stage 19 temporary native-eligibility gate, now removed by decision 0090.
 - Any checker or MIR path that treats a `$this`-derived collection/property
   projection as an owned return or loses its original borrow root.
+- The blanket claim that inferred borrowed locals can only be readonly;
+  readonly returned borrows still cannot initialize writable aliases.
+- The website's versioned readonly/writable guide and API return contracts,
+  and the language server's borrowed-local descriptions and diagnostic fixtures.
 
 Decision 0130 extends these provenance rules through implicit class upcasts and
 hierarchy narrowing. Readonly and writable borrows retain their access mode and

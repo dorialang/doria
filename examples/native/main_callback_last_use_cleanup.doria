@@ -1,0 +1,65 @@
+class Token
+{
+    function __construct(int $value) {}
+
+    function __destruct()
+    {
+        try { echo "token{$this->value};"; } catch (Error) {}
+    }
+}
+
+interface Reader
+{
+    function(): int $callback { get; }
+}
+
+class Source implements Reader
+{
+    int $value = 42;
+
+    function(): int $callback {
+        get {
+            let $first = new Token(1);
+            let $second = new Token(2);
+            return function (): int with ($this, take $first, take $second) {
+                if ($first->value == 0 || $second->value == 0) { return 0; }
+                return $this->value;
+            };
+        }
+    }
+
+    function __destruct()
+    {
+        try { echo "source;"; } catch (Error) {}
+    }
+}
+
+function forward(Reader $reader): function(): int
+{
+    return $reader->callback;
+}
+
+function consume(take Source $source): void {}
+
+function exercise(bool $choose): void
+{
+    let $source = new Source();
+    {
+        let $callback = forward($source);
+        if ($choose) {
+            echo $callback();
+            consume($source);
+        } else {
+            echo $callback();
+            consume($source);
+        }
+        echo "alive;";
+    }
+}
+
+function main(): void
+{
+    exercise(true);
+    exercise(false);
+    echo "\n";
+}

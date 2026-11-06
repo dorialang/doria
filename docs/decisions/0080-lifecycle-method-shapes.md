@@ -50,6 +50,18 @@ A static constructor reports that `__construct` is invoked by `new` and cannot b
 
 Explicit `writable` on either lifecycle name is a declaration-site error. The fix removes only the `writable` token. Constructor guidance states that construction grants `__construct` its access to the new instance; destructor guidance states that destruction invokes `__destruct` through the lifecycle protocol.
 
+### Destructor receiver access
+
+Amended 2026-11-06 under the Stage 36a standing approval (Stage 36a decision
+log entry 42): `__destruct` has exclusive writable access to the dying object.
+Nothing else can observe the object during destruction, so the access is
+sound, and it matches Rust's `Drop::drop(&mut self)` and C++ destructors. The
+declaration still cannot say `writable` (E0466): the lifecycle protocol, not
+the modifier, grants the access. A destructor may therefore mutate its fields
+and call writable methods on them, for example to flush buffered bytes. It
+still may not let a checked error escape (E0631), and it cannot move `$this`
+or extract fields, which only a consuming method may do.
+
 ### Invocation
 
 Ordinary instance and static calls to either lifecycle name are rejected.

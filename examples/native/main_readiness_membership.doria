@@ -1,0 +1,48 @@
+use Doria\Std\Io\{ReadinessSet, ReadinessStream, ReadinessSource, ReadableFile, File, IoError};
+
+class ReadyOnly implements ReadinessStream {
+    internal ReadableFile $file;
+    function __construct(parameter take ReadableFile $file, string $label) {
+        $this->file = $file;
+    }
+    ReadinessSource $readinessSource { borrowed get => $this->file->readinessSource; }
+    function getLabel(): string { return $this->label; }
+    function __destruct() {
+        try { echo "drop {$this->label}\n"; } catch (IoError) {}
+    }
+}
+
+class ReadyCursor implements ReadinessStream, Iterator<int> {
+    internal ReadableFile $file;
+    function __construct(parameter take ReadableFile $file, borrow List<int> $source) {
+        $this->file = $file;
+    }
+    ReadinessSource $readinessSource { borrowed get => $this->file->readinessSource; }
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): int { return $this->source[0]; }
+    writable function advance(): void {}
+    function __destruct() {
+        try { echo "drop cursor\n"; } catch (IoError) {}
+    }
+}
+
+function main(): void {
+    writable List<int> $source = [7];
+    {
+        writable ReadinessSet $set = new ReadinessSet();
+        let $key = $set->register(new ReadyOnly(File::openRead("input"), "first"));
+        let $cursorKey = $set->register(new ReadyCursor(File::openRead("input"), $source));
+        let $copy = $key;
+        let $returned = $set->unregister($copy);
+        echo "returned {$returned->getLabel()}\n";
+        let $cursor = $set->unregister($cursorKey);
+        echo "borrowed {$cursor->getCurrent()}\n";
+        $set->register(new ReadyOnly(File::openRead("input"), "third"));
+        $set->register(new ReadyOnly(File::openRead("input"), "fourth"));
+        try { let $again = $set->unregister($key); }
+        catch (IoError) { echo "stale key\n"; }
+        echo "leave set\n";
+    }
+    $source->add(8);
+    echo "source {$source->count}\n";
+}

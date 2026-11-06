@@ -1,3 +1,9 @@
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/php_execution.rs"]
+mod php_execution;
+
 use doriac::semantics::CatchCoverage;
 use doriac::{
     mir,
@@ -184,6 +190,31 @@ function main(): void {
         doriac::mir_interpreter::interpret(&program).unwrap().stdout,
         b"1313"
     );
+    let mut invalid = program.clone();
+    let plan = invalid
+        .functions
+        .iter_mut()
+        .filter(|function| {
+            matches!(
+                function.return_type,
+                mir::ReturnType::Value(mir::Type::Interface(_))
+            ) && function
+                .return_borrow
+                .is_some_and(|borrow| borrow.kind == mir::ReturnBorrowKind::Retained)
+        })
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan))
+                if !plan.returns.is_empty() =>
+            {
+                Some(plan)
+            }
+            _ => None,
+        })
+        .expect("an owned iterator return preserves its source loans");
+    plan.returns.clear();
+    assert!(doriac::mir_validation::validate_program(&invalid).is_err());
 }
 
 #[test]
@@ -216,10 +247,10 @@ fn primitive_contracts_remain_unboxed_and_preserve_exact_results() {
             .methods
             .iter()
             .all(|method| {
-                doriac::compiler_known_contracts::CoreValueOperation::from_requirement(
-                    method.requirement,
-                )
-                .is_none()
+                method.requirement_origins.iter().all(|origin| {
+                    doriac::compiler_known_contracts::CoreValueOperation::from_requirement(*origin)
+                        .is_none()
+                })
             })
     }));
     for function in &program.functions {
@@ -910,8 +941,10 @@ fn core_equality_uses_the_static_contract_and_presence_proofs() {
     )
     .unwrap();
     let output = doriac::mir_interpreter::interpret(&program).unwrap();
-    assert_eq!(String::from_utf8(output.stdout).unwrap(),
-        "make 1\nmake 1\nequals 1:1\ntrue\nequals 1:2\nfalse\ntrue\ntrue false\nfalse true\nfalse true\nequals 1:2\nequals 1:2\nfalse true\ntrue false\n");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "make 1\nmake 1\nequals 1:1\ntrue\nequals 1:2\nfalse\ntrue\ntrue false\nfalse true\nfalse true\nequals 1:2\nequals 1:2\nfalse true\ntrue false\n"
+    );
 }
 
 #[test]
@@ -1105,7 +1138,6 @@ fn durable_interface_fixtures_preserve_php_execution_and_cleanup() {
 
 #[test]
 fn php_host_collection_and_shutdown_preserve_strong_cycles() {
-    use std::process::Command;
     let source =
         include_str!("../../../examples/native/main_stage35_interface_strong_cycles.doria");
     let hir = doriac::lower_source("shared-cycles.doria", source).unwrap();
@@ -1125,7 +1157,10 @@ fn php_host_collection_and_shutdown_preserve_strong_cycles() {
             if enabled { "gc_enable();" } else { "gc_disable();" },
             php.strip_prefix("<?php").unwrap(),
         );
-        let output = Command::new("php").args(["-r", &script]).output().unwrap();
+        let output = php_execution::Script::new(&script)
+            .command(&[])
+            .output()
+            .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
         assert_eq!(
@@ -1195,13 +1230,16 @@ function main(): int { return 42; }
         test_assertion_checked_effects: vec![],
     });
     program.interface_types[interface.0]
+        .requirement_origins
+        .push(Default::default());
+    program.interface_types[interface.0]
         .methods
         .push(mir::InterfaceMethod {
-            requirement: Default::default(),
+            requirement_origins: vec![Default::default()],
             name: "read".into(),
             arguments: vec![],
             signature,
-            writable_receiver: false,
+            receiver_mode: mir::ReceiverMode::Readonly,
             exact_dynamic_return: false,
         });
     let receiver = mir::Local {
@@ -1220,6 +1258,7 @@ function main(): int { return 42; }
     entry.locals = vec![receiver.clone()];
     entry.blocks[0].terminator = mir::Terminator::Return(mir::Rvalue::Value(
         mir::ValueExpression::Integer(mir::IntegerExpression::Call {
+            span: entry.source_span,
             ty: doriac::numeric::IntegerType::Int64,
             function: implementation,
             args: vec![mir::Rvalue::Class(
@@ -1227,6 +1266,7 @@ function main(): int { return 42; }
                     class,
                     receiver: receiver.id,
                     vtable,
+                    transfer: false,
                 },
             )],
         }),
@@ -1258,6 +1298,7 @@ function main(): int { return 42; }
                     interface,
                     value: mir::InterfaceValue::FromClass {
                         object: Box::new(mir::ClassExpression::New {
+                            span: main.source_span,
                             class,
                             concrete_class: class,
                             properties: vec![],
@@ -1325,6 +1366,22 @@ fn interface_dispatch_uses_an_ordinary_entry_without_a_closure_environment() {
 #[test]
 fn interface_dispatch_rejects_slot_receiver_and_entry_abi_mismatches() {
     let program = interface_dispatch_mir();
+    for duplicate in [false, true] {
+        let mut bad_origins = program.clone();
+        let interface = bad_origins
+            .interface_types
+            .iter_mut()
+            .find(|interface| !interface.methods.is_empty())
+            .unwrap();
+        if duplicate {
+            interface
+                .requirement_origins
+                .push(interface.requirement_origins[0]);
+        } else {
+            interface.requirement_origins.clear();
+        }
+        assert!(doriac::mir_validation::validate_program(&bad_origins).is_err());
+    }
     let mut bad_slot = program.clone();
     let mir::Terminator::IndirectCall {
         callee: mir::IndirectCallee::InterfaceMethod { slot, .. },
@@ -1474,6 +1531,7 @@ fn interface_carrier_validation_rejects_unknown_and_mismatched_views() {
                 id: mir::InterfaceTypeId(1),
                 name: "Other".into(),
                 ancestors: vec![],
+                requirement_origins: vec![],
                 methods: vec![],
             });
         }

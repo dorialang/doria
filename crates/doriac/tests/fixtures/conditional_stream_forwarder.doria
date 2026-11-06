@@ -1,0 +1,73 @@
+use Doria\Std\Io\{ReadableStream, WritableStream, DuplexStream, FlushableStream,
+    ReadinessStream, PendingReadableStream, PendingWritableStream, ReadinessSource,
+    ReadRequest, WriteRequest, ReadOutcome, WriteOutcome, FlushOutcome,
+    WritableByteRegion, ByteRegion, IoError, StandardInput, StandardOutput, DuplexFile};
+
+class Forward<T> implements ReadableStream where (T implements ReadableStream),
+    WritableStream where (T implements WritableStream),
+    DuplexStream where (T implements DuplexStream),
+    FlushableStream where (T implements FlushableStream),
+    ReadinessStream where (T implements ReadinessStream),
+    PendingReadableStream where (T implements PendingReadableStream),
+    PendingWritableStream where (T implements PendingWritableStream)
+{
+    internal writable T $source;
+
+    function __construct(parameter take T $source) { $this->source = $source; }
+
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError
+        where (T implements ReadableStream) { return $this->source->read($destination); }
+
+    writable function write(ByteRegion $source): WriteOutcome throws IoError
+        where (T implements WritableStream) { return $this->source->write($source); }
+
+    writable function flush(): FlushOutcome throws IoError
+        where (T implements FlushableStream) { return $this->source->flush(); }
+
+    ReadinessSource $readinessSource where (T implements ReadinessStream) {
+        borrowed get => $this->source->readinessSource;
+    }
+
+    writable function prepareRead(writable ReadRequest $request, writable WritableByteRegion $destination): void throws IoError
+        where (T implements PendingReadableStream) { $this->source->prepareRead($request, $destination); }
+
+    writable function completeRead(ReadRequest $request, writable WritableByteRegion $destination): ?ReadOutcome throws IoError
+        where (T implements PendingReadableStream) { return $this->source->completeRead($request, $destination); }
+
+    writable function prepareWrite(writable WriteRequest $request, ByteRegion $source): void throws IoError
+        where (T implements PendingWritableStream) { $this->source->prepareWrite($request, $source); }
+
+    writable function completeWrite(WriteRequest $request, ByteRegion $source): ?WriteOutcome throws IoError
+        where (T implements PendingWritableStream) { return $this->source->completeWrite($request, $source); }
+}
+
+class SyncRead implements ReadableStream {
+    writable function read(writable WritableByteRegion $destination): ReadOutcome {
+        return ReadOutcome::EndOfStream;
+    }
+}
+
+class SyncWrite implements WritableStream {
+    writable function write(ByteRegion $source): WriteOutcome { return WriteOutcome::Accepted($source->length); }
+}
+
+class SyncDuplex implements DuplexStream, FlushableStream {
+    writable int $flushes = 0;
+    writable function read(writable WritableByteRegion $destination): ReadOutcome {
+        if ($destination->length == 0) { return ReadOutcome::Data(0); }
+        $destination[0] = 42;
+        return ReadOutcome::Data(1);
+    }
+    writable function write(ByteRegion $source): WriteOutcome { return WriteOutcome::Accepted($source->length); }
+    writable function flush(): FlushOutcome {
+        $this->flushes++;
+        if ($this->flushes == 1) { return FlushOutcome::Pending; }
+        return FlushOutcome::Complete;
+    }
+}
+
+class Lookalike {
+    writable function read(writable WritableByteRegion $destination): ReadOutcome { return ReadOutcome::EndOfStream; }
+    writable function write(ByteRegion $source): WriteOutcome { return WriteOutcome::Accepted($source->length); }
+    writable function flush(): FlushOutcome { return FlushOutcome::Complete; }
+}

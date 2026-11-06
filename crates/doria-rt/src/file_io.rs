@@ -1,5 +1,21 @@
+#[cfg(windows)]
 use core::ffi::c_void;
 use core::ptr;
+
+#[cfg(unix)]
+use libc::{
+    open, unlink, O_APPEND, O_CLOEXEC, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+};
+
+#[cfg(any(unix, windows))]
+use crate::byte_io::{self, ReadProgress};
+use crate::native_handle::OwnedHandle;
+#[cfg(any(unix, windows))]
+use crate::platform_io::last_failure;
+
+mod checked_stream;
+pub(crate) mod stream;
+use stream::{FileAccess, FileCreation, FileOpenRequest, FileSharing, OwnedFile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileError {
@@ -37,71 +53,95 @@ fn has_nul(path: &[u8]) -> bool {
     path.contains(&0)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
-    let path = unix_path(path)?;
-    let descriptor = open(path.bytes.cast(), O_RDONLY, 0);
-    drop(path);
-    if descriptor < 0 {
-        return Err(FileError::Open(
-            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
-        ));
-    }
-    let result = read_descriptor(descriptor);
-    if close(descriptor) != 0 && result.is_ok() {
-        return Err(FileError::Read(
-            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
-        ));
-    }
-    result
+    let mut file = OwnedFile::open(
+        path,
+        FileOpenRequest {
+            sharing: FileSharing::ReadOnly,
+            ..FileOpenRequest::READ
+        },
+    )?;
+    let result = read_with(|destination, capacity| {
+        file.read(core::slice::from_raw_parts_mut(destination, capacity))
+    });
+    finish_read(result, file.close())
 }
 
-#[cfg(unix)]
-unsafe fn read_descriptor(descriptor: i32) -> Result<OwnedBytes, FileError> {
+#[cfg(any(unix, windows))]
+unsafe fn read_with(
+    mut transfer: impl FnMut(*mut u8, usize) -> Result<ReadProgress, crate::platform_io::Failure>,
+) -> Result<OwnedBytes, FileError> {
     let mut capacity = 4096_usize;
-    let mut bytes = super::allocate(capacity);
-    if bytes.is_null() {
+    let mut contents = OwnedBytes {
+        bytes: super::allocate(capacity),
+        length: 0,
+    };
+    if contents.bytes.is_null() {
         return Err(FileError::Allocation);
     }
-    let mut length = 0;
     loop {
-        if length == capacity {
+        if contents.length == capacity {
             let next = capacity.checked_mul(2).ok_or(FileError::Allocation)?;
             let replacement = super::allocate(next);
             if replacement.is_null() {
-                super::deallocate(bytes);
                 return Err(FileError::Allocation);
             }
-            ptr::copy_nonoverlapping(bytes, replacement, length);
-            super::deallocate(bytes);
-            bytes = replacement;
+            ptr::copy_nonoverlapping(contents.bytes, replacement, contents.length);
+            super::deallocate(contents.bytes);
+            contents.bytes = replacement;
             capacity = next;
         }
-        let result = read(
-            descriptor,
-            bytes.add(length).cast::<c_void>(),
-            capacity - length,
-        );
-        if result > 0 {
-            length += result as usize;
-        } else if result == 0 {
-            return Ok(OwnedBytes { bytes, length });
-        } else if last_errno() != EINTR {
-            let error = last_errno();
-            super::deallocate(bytes);
-            return Err(FileError::Read(
-                crate::platform_io::Failure::from_system_code(i64::from(error)),
-            ));
+        let remaining = capacity - contents.length;
+        match transfer(contents.bytes.add(contents.length), remaining) {
+            Ok(ReadProgress::Data(count)) if count <= remaining => contents.length += count,
+            Ok(ReadProgress::Data(_)) => {
+                return Err(FileError::Read(crate::platform_io::Failure::other()))
+            }
+            Ok(ReadProgress::EndOfStream) => return Ok(contents),
+            Ok(ReadProgress::WouldBlock(failure)) | Err(failure) => {
+                let failure = if failure
+                    .transferred_byte_count
+                    .is_some_and(|n| n > remaining)
+                {
+                    failure.with_transferred_byte_count(None)
+                } else {
+                    failure.after_transferred(contents.length)
+                };
+                return Err(FileError::Read(failure));
+            }
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn finish_read(
+    result: Result<OwnedBytes, FileError>,
+    close: Result<(), crate::platform_io::Failure>,
+) -> Result<OwnedBytes, FileError> {
+    let contents = result?;
+    close.map_err(|failure| {
+        FileError::Read(failure.with_transferred_byte_count(Some(contents.length)))
+    })?;
+    Ok(contents)
+}
+
+#[cfg(any(unix, windows))]
+fn finish_write(
+    result: Result<(), FileError>,
+    close: Result<(), crate::platform_io::Failure>,
+    length: usize,
+) -> Result<(), FileError> {
+    result?;
+    close.map_err(|failure| FileError::Write(failure.with_transferred_byte_count(Some(length))))
+}
+
+#[cfg(any(unix, windows))]
 pub(crate) unsafe fn write_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
     write_file_mode(path, contents, false)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
     write_file_mode(path, contents, true)
 }
@@ -110,55 +150,64 @@ pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), Fil
 pub(crate) unsafe fn remove_file(path: &[u8]) -> Result<(), FileError> {
     let path = unix_path(path)?;
     let result = unlink(path.bytes.cast());
-    drop(path);
     if result == 0 {
         Ok(())
     } else {
-        Err(FileError::Write(
-            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
-        ))
+        Err(FileError::Write(last_failure()))
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
+    let mut file = OwnedFile::open(
+        path,
+        FileOpenRequest {
+            access: if append {
+                FileAccess::AppendOnly
+            } else {
+                FileAccess::Write
+            },
+            creation: if append {
+                FileCreation::OpenOrCreate
+            } else {
+                FileCreation::CreateOrTruncate
+            },
+            append,
+            sharing: FileSharing::Exclusive,
+        },
+    )?;
+    let result = byte_io::write_all(contents.len(), |offset, length| {
+        file.write(&contents[offset..offset + length])
+    })
+    .map_err(FileError::Write);
+    finish_write(result, file.close(), contents.len())
+}
+
+#[cfg(unix)]
+unsafe fn open_file(path: &[u8], request: FileOpenRequest) -> Result<OwnedHandle, FileError> {
     let path = unix_path(path)?;
-    let mode = if append { O_APPEND } else { O_TRUNC };
-    let descriptor = open(path.bytes.cast(), O_WRONLY | O_CREAT | mode, 0o666);
-    drop(path);
+    let access = match request.access {
+        FileAccess::Read => O_RDONLY,
+        FileAccess::Write | FileAccess::AppendOnly => O_WRONLY,
+        FileAccess::ReadWrite => O_RDWR,
+    };
+    let creation = match request.creation {
+        FileCreation::OpenExisting => 0,
+        FileCreation::OpenOrCreate => O_CREAT,
+        FileCreation::CreateNew => O_CREAT | O_EXCL,
+        FileCreation::TruncateExisting => O_TRUNC,
+        FileCreation::CreateOrTruncate => O_CREAT | O_TRUNC,
+    };
+    // Runtime ownership must not leak into an exec'd child. Set this atomically
+    // during open, not through a racy open-then-fcntl sequence.
+    let flags = access | creation | O_CLOEXEC | if request.append { O_APPEND } else { 0 };
+    // C varargs promote Darwin's 16-bit mode_t to int; the permission bits
+    // also fit the Linux mode_t argument without changing their value.
+    let descriptor = open(path.bytes.cast(), flags, 0o666 as libc::c_int);
     if descriptor < 0 {
-        return Err(FileError::Open(
-            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
-        ));
-    }
-    let mut offset = 0;
-    let mut failed = None;
-    while offset < contents.len() {
-        let result = write(
-            descriptor,
-            contents.as_ptr().add(offset).cast::<c_void>(),
-            contents.len() - offset,
-        );
-        if result > 0 {
-            offset += result as usize;
-        } else if result < 0 && last_errno() == EINTR {
-            continue;
-        } else {
-            failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
-                if result < 0 { last_errno() } else { 0 },
-            )));
-            break;
-        }
-    }
-    if close(descriptor) != 0 && failed.is_none() {
-        failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
-            last_errno(),
-        )));
-    }
-    if let Some(failure) = failed {
-        Err(FileError::Write(failure))
+        Err(FileError::Open(last_failure()))
     } else {
-        Ok(())
+        Ok(OwnedHandle::from_raw(descriptor))
     }
 }
 
@@ -177,31 +226,6 @@ unsafe fn unix_path(path: &[u8]) -> Result<OwnedBytes, FileError> {
     Ok(OwnedBytes { bytes, length })
 }
 
-#[cfg(target_os = "linux")]
-const O_CREAT: i32 = 0o100;
-#[cfg(target_os = "linux")]
-const O_TRUNC: i32 = 0o1000;
-#[cfg(target_os = "linux")]
-const O_APPEND: i32 = 0o2000;
-#[cfg(target_os = "macos")]
-const O_CREAT: i32 = 0x0200;
-#[cfg(target_os = "macos")]
-const O_TRUNC: i32 = 0x0400;
-#[cfg(target_os = "macos")]
-const O_APPEND: i32 = 0x0008;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-const O_CREAT: i32 = 0o100;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-const O_TRUNC: i32 = 0o1000;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-const O_APPEND: i32 = 0o2000;
-#[cfg(unix)]
-const O_RDONLY: i32 = 0;
-#[cfg(unix)]
-const O_WRONLY: i32 = 1;
-#[cfg(unix)]
-const EINTR: i32 = 4;
-
 #[cfg(windows)]
 const GENERIC_READ: u32 = 0x8000_0000;
 #[cfg(windows)]
@@ -211,164 +235,67 @@ const FILE_APPEND_DATA: u32 = 0x0000_0004;
 #[cfg(windows)]
 const FILE_SHARE_READ: u32 = 1;
 #[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 2;
+#[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
 #[cfg(windows)]
 const CREATE_ALWAYS: u32 = 2;
 #[cfg(windows)]
 const OPEN_ALWAYS: u32 = 4;
 #[cfg(windows)]
+const CREATE_NEW: u32 = 1;
+#[cfg(windows)]
+const TRUNCATE_EXISTING: u32 = 5;
+#[cfg(windows)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 #[cfg(windows)]
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
 
 #[cfg(windows)]
-pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
+unsafe fn open_file(path: &[u8], request: FileOpenRequest) -> Result<OwnedHandle, FileError> {
     let path = windows_path(path)?;
+    let access = match request.access {
+        FileAccess::Read => GENERIC_READ,
+        FileAccess::Write => GENERIC_WRITE,
+        FileAccess::ReadWrite => GENERIC_READ | GENERIC_WRITE,
+        // Preserve the legacy append helper's append-only permission contract.
+        FileAccess::AppendOnly => FILE_APPEND_DATA,
+    };
+    let creation = match request.creation {
+        FileCreation::OpenExisting => OPEN_EXISTING,
+        FileCreation::OpenOrCreate => OPEN_ALWAYS,
+        FileCreation::CreateNew => CREATE_NEW,
+        FileCreation::TruncateExisting => TRUNCATE_EXISTING,
+        FileCreation::CreateOrTruncate => CREATE_ALWAYS,
+    };
     let handle = CreateFileW(
         path.bytes.cast::<u16>(),
-        GENERIC_READ,
-        FILE_SHARE_READ,
+        access,
+        match request.sharing {
+            FileSharing::ReadWrite => FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FileSharing::ReadOnly => FILE_SHARE_READ,
+            FileSharing::Exclusive => 0,
+        },
         ptr::null_mut(),
-        OPEN_EXISTING,
+        creation,
         FILE_ATTRIBUTE_NORMAL,
         ptr::null_mut(),
     );
-    drop(path);
     if handle == INVALID_HANDLE_VALUE {
-        return Err(FileError::Open(
-            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
-        ));
-    }
-    let mut capacity = 4096_usize;
-    let mut bytes = super::allocate(capacity);
-    if bytes.is_null() {
-        CloseHandle(handle);
-        return Err(FileError::Allocation);
-    }
-    let mut length = 0;
-    let mut failed = None;
-    loop {
-        if length == capacity {
-            let next = capacity.checked_mul(2).ok_or(FileError::Allocation)?;
-            let replacement = super::allocate(next);
-            if replacement.is_null() {
-                failed = Some(FileError::Allocation);
-                break;
-            }
-            ptr::copy_nonoverlapping(bytes, replacement, length);
-            super::deallocate(bytes);
-            bytes = replacement;
-            capacity = next;
-        }
-        let request = core::cmp::min(capacity - length, u32::MAX as usize) as u32;
-        let mut read = 0_u32;
-        if ReadFile(
-            handle,
-            bytes.add(length).cast(),
-            request,
-            &mut read,
-            ptr::null_mut(),
-        ) == 0
-        {
-            failed = Some(FileError::Read(
-                crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
-            ));
-            break;
-        }
-        if read == 0 {
-            break;
-        }
-        length += read as usize;
-    }
-    if CloseHandle(handle) == 0 && failed.is_none() {
-        failed = Some(FileError::Read(
-            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
-        ));
-    }
-    if let Some(failure) = failed {
-        super::deallocate(bytes);
-        Err(failure)
+        Err(FileError::Open(last_failure()))
     } else {
-        Ok(OwnedBytes { bytes, length })
+        Ok(OwnedHandle::from_raw(handle))
     }
-}
-
-#[cfg(windows)]
-pub(crate) unsafe fn write_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
-    write_file_mode(path, contents, false)
-}
-
-#[cfg(windows)]
-pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
-    write_file_mode(path, contents, true)
 }
 
 #[cfg(windows)]
 pub(crate) unsafe fn remove_file(path: &[u8]) -> Result<(), FileError> {
     let path = windows_path(path)?;
     let result = DeleteFileW(path.bytes.cast::<u16>());
-    drop(path);
     if result != 0 {
         Ok(())
     } else {
-        Err(FileError::Write(
-            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
-        ))
-    }
-}
-
-#[cfg(windows)]
-unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
-    let path = windows_path(path)?;
-    let handle = CreateFileW(
-        path.bytes.cast::<u16>(),
-        if append {
-            FILE_APPEND_DATA
-        } else {
-            GENERIC_WRITE
-        },
-        0,
-        ptr::null_mut(),
-        if append { OPEN_ALWAYS } else { CREATE_ALWAYS },
-        FILE_ATTRIBUTE_NORMAL,
-        ptr::null_mut(),
-    );
-    drop(path);
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(FileError::Open(
-            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
-        ));
-    }
-    let mut offset = 0;
-    let mut failed = None;
-    while offset < contents.len() {
-        let request = core::cmp::min(contents.len() - offset, u32::MAX as usize) as u32;
-        let mut written = 0_u32;
-        if WriteFile(
-            handle,
-            contents.as_ptr().add(offset).cast(),
-            request,
-            &mut written,
-            ptr::null_mut(),
-        ) == 0
-            || written == 0
-        {
-            failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
-                GetLastError(),
-            )));
-            break;
-        }
-        offset += written as usize;
-    }
-    if CloseHandle(handle) == 0 && failed.is_none() {
-        failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
-            GetLastError(),
-        )));
-    }
-    if let Some(failure) = failed {
-        Err(FileError::Write(failure))
-    } else {
-        Ok(())
+        Err(FileError::Write(last_failure()))
     }
 }
 
@@ -399,6 +326,11 @@ unsafe fn windows_path(path: &[u8]) -> Result<OwnedBytes, FileError> {
 }
 
 #[cfg(not(any(unix, windows)))]
+unsafe fn open_file(_path: &[u8], _request: FileOpenRequest) -> Result<OwnedHandle, FileError> {
+    Err(FileError::Open(crate::platform_io::Failure::unsupported()))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) unsafe fn read_file(_path: &[u8]) -> Result<OwnedBytes, FileError> {
     Err(FileError::Read(crate::platform_io::Failure::unsupported()))
 }
@@ -418,35 +350,6 @@ pub(crate) unsafe fn remove_file(_path: &[u8]) -> Result<(), FileError> {
     Err(FileError::Write(crate::platform_io::Failure::unsupported()))
 }
 
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-unsafe fn last_errno() -> i32 {
-    *__errno_location()
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-unsafe fn last_errno() -> i32 {
-    *__error()
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn open(path: *const core::ffi::c_char, flags: i32, ...) -> i32;
-    fn read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
-    fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
-    fn close(descriptor: i32) -> i32;
-    fn unlink(path: *const core::ffi::c_char) -> i32;
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-extern "C" {
-    fn __errno_location() -> *mut i32;
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-extern "C" {
-    fn __error() -> *mut i32;
-}
-
 #[cfg(windows)]
 extern "system" {
     fn CreateFileW(
@@ -458,22 +361,6 @@ extern "system" {
         attributes: u32,
         template: *mut c_void,
     ) -> *mut c_void;
-    fn ReadFile(
-        handle: *mut c_void,
-        buffer: *mut c_void,
-        length: u32,
-        read: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
-    fn WriteFile(
-        handle: *mut c_void,
-        buffer: *const c_void,
-        length: u32,
-        written: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
-    fn CloseHandle(handle: *mut c_void) -> i32;
-    fn GetLastError() -> u32;
     fn DeleteFileW(name: *const u16) -> i32;
 }
 
@@ -526,6 +413,7 @@ mod tests {
                 Err(FileError::Open(crate::platform_io::Failure {
                     reason: crate::platform_io::Reason::NotFound,
                     system_code: Some(_),
+                    transferred_byte_count: None,
                 }))
             ));
             assert!(matches!(read_file(b"bad\0path"), Err(FileError::PathNul)));
@@ -539,5 +427,98 @@ mod tests {
             ));
             assert!(matches!(remove_file(b"bad\0path"), Err(FileError::PathNul)));
         }
+    }
+
+    #[test]
+    fn file_reads_preserve_bytes_across_repeated_buffer_growth() {
+        let path = path("growth");
+        let path_bytes = path_bytes(&path);
+        let expected: Vec<u8> = (0..20_003).map(|index| (index % 251) as u8).collect();
+        unsafe {
+            write_file(&path_bytes, &expected).expect("large write");
+            let contents = read_file(&path_bytes).expect("growing read");
+            assert_eq!(contents.length, expected.len());
+            assert_eq!(
+                core::slice::from_raw_parts(contents.bytes, contents.length),
+                expected
+            );
+            remove_file(&path_bytes).expect("fixture cleanup");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn aggregate_reads_preserve_known_failure_progress_without_inventing_unknown_counts() {
+        for raw in [None, Some(0), Some(2)] {
+            for would_block in [false, true] {
+                let failure = crate::platform_io::Failure::from_system_code(5)
+                    .with_transferred_byte_count(raw);
+                let mut calls = 0;
+                let result = unsafe {
+                    read_with(|destination, capacity| {
+                        calls += 1;
+                        if calls == 1 {
+                            assert!(capacity >= 3);
+                            ptr::copy_nonoverlapping(b"abc".as_ptr(), destination, 3);
+                            Ok(ReadProgress::Data(3))
+                        } else {
+                            if raw == Some(2) {
+                                ptr::copy_nonoverlapping(b"de".as_ptr(), destination, 2);
+                            }
+                            if would_block {
+                                Ok(ReadProgress::WouldBlock(failure))
+                            } else {
+                                Err(failure)
+                            }
+                        }
+                    })
+                };
+                assert_eq!(
+                    result.err(),
+                    Some(FileError::Read(failure.after_transferred(3)))
+                );
+                assert_eq!(calls, 2);
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn close_failures_preserve_successful_transfer_counts_and_primary_failures() {
+        let close = crate::platform_io::Failure::from_system_code(5);
+        let primary =
+            crate::platform_io::Failure::from_system_code(13).with_transferred_byte_count(Some(2));
+        assert_eq!(
+            finish_write(Ok(()), Err(close), 7),
+            Err(FileError::Write(close.with_transferred_byte_count(Some(7))))
+        );
+        assert_eq!(
+            finish_write(Ok(()), Err(close), 0),
+            Err(FileError::Write(close.with_transferred_byte_count(Some(0))))
+        );
+        assert_eq!(
+            finish_write(Err(FileError::Write(primary)), Err(close), 7),
+            Err(FileError::Write(primary))
+        );
+        assert_eq!(
+            finish_read(Err(FileError::Read(primary)), Err(close)).err(),
+            Some(FileError::Read(primary))
+        );
+        let mut calls = 0;
+        let contents = unsafe {
+            read_with(|destination, _| {
+                calls += 1;
+                if calls == 1 {
+                    ptr::copy_nonoverlapping(b"abc".as_ptr(), destination, 3);
+                    Ok(ReadProgress::Data(3))
+                } else {
+                    Ok(ReadProgress::EndOfStream)
+                }
+            })
+        };
+        assert_eq!(
+            finish_read(contents, Err(close)).err(),
+            Some(FileError::Read(close.with_transferred_byte_count(Some(3))))
+        );
     }
 }

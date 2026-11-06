@@ -1,0 +1,113 @@
+class Trace {
+    static writable int $drops = 0;
+    static writable bool $record = false;
+    static writable string $events = "";
+}
+class Token {
+    function __construct(int $id) {
+        if (Trace::record) { Trace::events = Trace::events . "new {$id};"; }
+    }
+    function __destruct(): void {
+        Trace::drops++;
+        if (Trace::record) { Trace::events = Trace::events . "drop {$this->id};"; }
+    }
+}
+class Slot {
+    writable int $value = 0;
+    writable string $text = "";
+    writable ?Token $item = null;
+}
+class Box {
+    writable Slot $slot;
+    function __construct(parameter take Slot $slot) { $this->slot = $slot; }
+}
+class GenericBox<T> { writable ?T $item = null; }
+open class Hidden {
+    internal writable int $value = 0;
+    writable function exercise(int $iterations): int {
+        let writable $sum = 0;
+        foreach (0..<$iterations as int $index) {
+            $this->value = when ($index == 0): int { return 0; } else { return $index; };
+            $sum += $this->value;
+        }
+        return $sum;
+    }
+}
+class Exposed extends Hidden { writable int $value = 123; }
+class Failure implements Error { function __construct(string $message) {} }
+function make(int $id): Token { return new Token($id); }
+function readId(?Token $item): int {
+    if ($item == null) { panic("stored owner absent"); }
+    return $item->id;
+}
+function fail(): Token throws Failure {
+    Trace::events = Trace::events . "fail;";
+    throw new Failure("replacement");
+}
+class Broken {
+    Token $item;
+    function __construct() throws Failure {
+        $this->item = make(3);
+        fail();
+    }
+    function __destruct(): void { Trace::events = Trace::events . "unexpected destructor;"; }
+}
+function hot(int $iterations): int {
+    let writable $box = new Box(new Slot());
+    let writable $sum = 0;
+    foreach (0..<$iterations as int $index) {
+        $box->slot->value = when ($index == 0): int { return 0; } else { return $index; };
+        $box->slot->text = match ($index == 0) { true => "first", false => "later", };
+        if (($index == 0 && $box->slot->text != "first") || ($index != 0 && $box->slot->text != "later")) {
+            panic("stored conditional string changed");
+        }
+        $sum += $box->slot->value;
+    }
+    return $sum;
+}
+function hidden(int $iterations): int {
+    let writable $holder = new Exposed();
+    let $sum = $holder->exercise($iterations);
+    if ($holder->value != 123) { panic("internal parent field changed child storage"); }
+    return $sum;
+}
+function generic(int $iterations): int {
+    let writable $holder = new GenericBox<int>();
+    let writable $sum = 0;
+    foreach (0..<$iterations as int $index) {
+        $holder->item = when ($index == 0): int { return 0; } else { return $index; };
+        let $current = $holder->item;
+        if ($current == null) { panic("stored generic value absent"); }
+        $sum += $current;
+    }
+    return $sum;
+}
+function owned(int $iterations): int {
+    Trace::drops = 0;
+    let writable $holder = new GenericBox<Token>();
+    $holder->item = make(-1);
+    let writable $sum = 0;
+    foreach (0..<$iterations as int $index) {
+        $holder->item = when ($index == 0): Token { return make(0); } else { return make($index); };
+        if (Trace::drops != $index + 1) { panic("replacement release changed"); }
+        $sum += readId($holder->item);
+    }
+    return $sum;
+}
+function drops(): int { return Trace::drops; }
+function cleanup(): string {
+    Trace::record = true;
+    Trace::events = "";
+    let writable $holder = new Slot();
+    $holder->item = make(1);
+    $holder->item = when (true): Token { return make(2); } else { return make(9); };
+    try { $holder->item = fail(); } catch (Failure) {}
+    if (readId($holder->item) != 2) { panic("failed replacement changed original storage"); }
+    $holder->item = null;
+    try { let $broken = new Broken(); } catch (Failure) {}
+    Trace::record = false;
+    return Trace::events;
+}
+function main(): void {
+    echo hot(4) . ";" . hidden(4) . ";" . generic(4) . ";" . owned(4) . ";" . drops() . ";" . cleanup();
+}

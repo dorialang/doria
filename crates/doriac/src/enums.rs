@@ -9,6 +9,13 @@ pub struct EnumCaseId {
     pub index: usize,
 }
 
+/// Authored case identity, shared by every application of an enum declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EnumCaseSource {
+    pub declaration: EnumId,
+    pub index: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EnumBackingType {
     Int,
@@ -27,10 +34,12 @@ pub struct EnumValue {
     pub case_id: EnumCaseId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct EnumType {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EnumType<T = crate::types::ResolvedType> {
+    /// Declaration identity; arguments distinguish applications of that declaration.
     pub id: EnumId,
     pub name: String,
+    pub arguments: Vec<T>,
 }
 
 /// Physical facts shared by every compiler consumer of an inline enum.
@@ -191,11 +200,24 @@ fn checked_align_up(value: u32, alignment: u32) -> Result<u32, EnumLayoutError> 
         .ok_or(EnumLayoutError::SizeOverflow)
 }
 
-impl EnumType {
+impl<T> EnumType<T> {
     pub fn new(id: EnumId, name: impl Into<String>) -> Self {
+        Self::with_arguments(id, name, Vec::new())
+    }
+
+    pub fn with_arguments(id: EnumId, name: impl Into<String>, arguments: Vec<T>) -> Self {
         Self {
             id,
             name: name.into(),
+            arguments,
+        }
+    }
+
+    pub fn map_arguments<U>(&self, transform: impl FnMut(&T) -> U) -> EnumType<U> {
+        EnumType {
+            id: self.id,
+            name: self.name.clone(),
+            arguments: self.arguments.iter().map(transform).collect(),
         }
     }
 }

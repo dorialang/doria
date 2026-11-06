@@ -1,5 +1,11 @@
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
+
+#[path = "common/php_execution.rs"]
+mod php_execution;
 
 const OBSERVATIONS: &str = r#"
 class Events { static writable string $text = ""; }
@@ -46,8 +52,8 @@ fn assert_complete_initializer_execution(source: &str, stdout: &str) -> doriac::
         "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").unwrap()
     );
-    let result = std::process::Command::new("php")
-        .args(["-r", &script])
+    let result = php_execution::Script::new(&script)
+        .command(&[])
         .output()
         .unwrap();
     assert!(result.status.success(), "{result:?}");
@@ -167,6 +173,53 @@ function main(): void {
         "argument;new parent;parent body 42 parent;new child;drop parent;child body child;live child;child destructor;base destructor;drop child;\n",
     );
     assert_one_backing_slot(&mir, "Child", "item");
+}
+
+#[test]
+fn failed_explicit_initializer_releases_fields_before_unpromoted_parameters() {
+    assert_initializer_execution(
+        r#"
+class Fault implements Error { function __construct(string $message) {} }
+function fail(): int throws Fault { note("failure;"); throw new Fault("failed"); }
+class Holder {
+    Token $first = new Token("first");
+    int $later = fail();
+    function __construct(take Token $promoted) throws Fault {}
+}
+function main(): void {
+    try { let $value = new Holder(new Token("promoted")); }
+    catch (Fault) { note("caught;"); }
+    echo Events::text . "\n";
+}
+"#,
+        "new promoted;new first;failure;drop first;drop promoted;caught;\n",
+    );
+}
+
+#[test]
+fn lifecycle_receiver_homes_remain_internal_through_parent_calls_and_destructors() {
+    assert_initializer_execution(
+        r#"
+open class Base {
+    open Token $item = new Token("parent") { borrowed get => $this->item; }
+    function __construct(parameter int $seed) { note("base " . $this->item->label . ";"); }
+    function __destruct() { note("base drop " . $this->item->label . ";"); }
+}
+class Child extends Base {
+    override Token $item = new Token("child") { borrowed get => $this->item; }
+    function __construct(parameter int $seed) {
+        parent::__construct($seed);
+        note("child " . $this->item->label . ";");
+    }
+    function __destruct() { note("child drop " . $this->item->label . ";"); }
+}
+function main(): void {
+    { let $value = new Child(42); }
+    echo Events::text . "\n";
+}
+"#,
+        "new parent;base parent;new child;drop parent;child child;child drop child;base drop child;drop child;\n",
+    );
 }
 
 #[test]

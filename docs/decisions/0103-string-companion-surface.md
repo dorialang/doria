@@ -41,6 +41,7 @@ $text->length
 $text->byteLength
 $text->isEmpty
 $text->bytes
+$text->byteRegion
 $text->graphemes
 $text->codePoints
 ```
@@ -57,6 +58,11 @@ until explicitly validated and converted.
 - `isEmpty` is equivalent to `byteLength == 0` and does not require traversal.
 - `bytes` exposes the UTF-8 bytes under the accepted `Bytes` contract, which is
   a copy in v1.0 unless a later decision explicitly changes it.
+- `byteRegion` is a readonly `Doria\Std\Io\ByteRegion` view of the same UTF-8
+  bytes. It borrows the string, so the string cannot be reassigned or
+  released while the view is in use, and it copies nothing; a byte range is
+  the region's own `getRegion`. Added 2026-11-06 under Andrew's Stage 36a
+  approval of recommended forks (Stage 36a decision log entry 49).
 - `graphemes` traverses Unicode extended grapheme clusters.
 - `codePoints` traverses Unicode scalar values.
 

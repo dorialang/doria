@@ -1,0 +1,71 @@
+use Doria\Std\Io\{ReadableStream, ReadOutcome, LineOutcome, LineReader, BorrowedLineReader, WritableByteRegion, InvalidUtf8Error};
+
+class Chunks implements ReadableStream {
+    internal writable Bytes $data;
+    writable int $position = 0;
+    function __construct(parameter take Bytes $data, int $chunk) {
+        $this->data = $data;
+    }
+    writable function read(writable WritableByteRegion $destination): ReadOutcome {
+        if ($destination->length == 0) { return ReadOutcome::Data(0); }
+        if ($this->position == $this->data->length) { return ReadOutcome::EndOfStream; }
+        let writable $count = $this->data->length - $this->position;
+        if ($count > $this->chunk) { $count = $this->chunk; }
+        if ($count > $destination->length) { $count = $destination->length; }
+        let writable $index = 0;
+        while ($index < $count) {
+            $destination[$index] = $this->data[$this->position + $index];
+            $index++;
+        }
+        $this->position += $count;
+        return ReadOutcome::Data($count);
+    }
+}
+
+function describe(LineOutcome $outcome): string {
+    return match ($outcome) {
+        LineOutcome::Line($text) => "[" . $text . "]",
+        LineOutcome::WouldBlock => "wait",
+        LineOutcome::EndOfStream => "end",
+        LineOutcome::TimedOut => "timeout",
+        LineOutcome::TooLong => "long",
+    };
+}
+
+function main(): void {
+    // "héllo\r\nwor€ld\n\nlast" in two-byte reads splits é and € across refills.
+    let writable $reader = new LineReader<Chunks>(new Chunks(Bytes::fromArray([104, 195, 169, 108, 108, 111, 13, 10,
+        119, 111, 114, 226, 130, 172, 108, 100, 10, 10, 108, 97, 115, 116]), 2), 16);
+    let writable $index = 0;
+    while ($index < 5) {
+        echo describe($reader->readLine());
+        $index++;
+    }
+    echo ";";
+    // A line longer than the bound reports TooLong and consumes nothing.
+    let writable $long = new LineReader<Chunks>(new Chunks(Bytes::fromArray([97, 98, 99, 100, 101, 102, 10]), 3), 4);
+    echo describe($long->readLine());
+    echo describe($long->readLine()) . ";";
+    // 0xC3 followed by "(" is invalid; the stream offset counts the earlier line.
+    let writable $source = new Chunks(Bytes::fromArray([111, 107, 10, 195, 40, 10]), 1);
+    {
+        let writable $borrowed = new BorrowedLineReader<Chunks>($source, 8);
+        echo describe($borrowed->readLine());
+        try {
+            echo describe($borrowed->readLine());
+        } catch (InvalidUtf8Error $error) {
+            let $invalid = $error->invalidByteCount ?? -1;
+            echo $error->message . ":" . $error->validByteCount . ":" . $invalid;
+        }
+    }
+    echo ";" . $source->position;
+    // A sequence cut by the end of the stream is incomplete, not invalid.
+    let writable $cut = new LineReader<Chunks>(new Chunks(Bytes::fromArray([97, 226, 130]), 4), 8);
+    try {
+        echo describe($cut->readLine());
+    } catch (InvalidUtf8Error $error) {
+        echo ";" . $error->validByteCount . ":" . ($error->invalidByteCount == null ? "incomplete" : "counted");
+    }
+    let $finished = $cut->finish();
+    echo ";" . $finished->position . "\n";
+}

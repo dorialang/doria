@@ -246,6 +246,7 @@ pub struct FunctionDecl {
     pub is_override: bool,
     pub override_span: Option<Span>,
     pub writable_this: bool,
+    pub consuming_this: bool,
     pub is_static: bool,
     pub name: String,
     pub type_params: Vec<TypeParamDecl>,
@@ -260,6 +261,7 @@ pub struct FunctionDecl {
     pub ambient_checked_effects: Vec<ResolvedType>,
     pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub body: Block,
+    pub intrinsic: Option<crate::ast::CompilerIntrinsic>,
     pub modifier_prefix_span: Span,
     pub span: Span,
 }
@@ -512,6 +514,38 @@ pub struct ForeachStmt {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictionaryForeachProjection {
+    Keys,
+    Values,
+}
+
+impl ForeachStmt {
+    pub fn dictionary_projection(&self) -> Option<(&Expr, DictionaryForeachProjection)> {
+        use crate::semantics::ForeachIterableFamily;
+        let projection = match self.iterable_family {
+            ForeachIterableFamily::DictionaryKeysProjection => DictionaryForeachProjection::Keys,
+            ForeachIterableFamily::DictionaryValuesProjection => {
+                DictionaryForeachProjection::Values
+            }
+            _ => return None,
+        };
+        let mut expr = &self.iterable;
+        while let Expr::Grouped { expr: inner, .. } = expr {
+            expr = inner;
+        }
+        let Expr::PropertyAccess {
+            object,
+            null_safe: false,
+            ..
+        } = expr
+        else {
+            unreachable!("checked dictionary projection has a property expression");
+        };
+        Some((object, projection))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForeachBinding {
     pub writable: bool,
@@ -684,6 +718,8 @@ pub enum Expr {
         object: Box<Expr>,
         property: String,
         null_safe: bool,
+        /// Moves the stored field out of a consumed receiver.
+        take: bool,
         span: Span,
     },
     MethodCall {

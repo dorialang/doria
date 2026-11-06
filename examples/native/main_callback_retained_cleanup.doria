@@ -1,0 +1,30 @@
+class Cursor implements Iterator<int>
+{
+    function __construct(borrow List<int> $source) {}
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): int { return $this->source[0]; }
+    writable function advance(): void {}
+
+    function __destruct()
+    {
+        try { echo "cursor{$this->source[0]};"; } catch (Error) {}
+    }
+}
+
+function capture(List<int> $source): function(): int
+{
+    let $cursor = new Cursor($source);
+    return fn() with (take $cursor) => $cursor->getCurrent();
+}
+
+function main(): void
+{
+    writable List<int> $source = [7];
+    {
+        let $callback = capture($source);
+        echo $callback();
+        echo "alive;";
+    }
+    $source->add(8);
+    echo "{$source->count}\n";
+}

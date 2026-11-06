@@ -1,0 +1,151 @@
+enum Leaf { case Number(int $value); case Empty; }
+enum Envelope { case Pair(Leaf $left, ?Leaf $right); case One(Leaf $value); case Empty; }
+enum Deep { case Wrapped(?Envelope $inner, Leaf $tail); case Empty; }
+enum NestedRoute {
+    case Direct; case NestedCall; case Generic; case StaticCall; case Virtual; case Erased;
+    case Callback; case Defaulted; case Named; case Local; case Property; case GenericProperty;
+    case Capture; case WritableCallback; case NullableResult; case CaseChange; case InnerNullable;
+    case OwnedCapture;
+}
+
+function leafNumber(?Leaf $value): int {
+    if ($value == null) { return 0; }
+    return match ($value) { Leaf::Number($number) => $number, Leaf::Empty => 0, };
+}
+function envelopeNumber(?Envelope $value): int {
+    if ($value == null) { return 0; }
+    return match ($value) {
+        Envelope::Pair($left, $right) => leafNumber($left) + leafNumber($right),
+        Envelope::One($inner) => leafNumber($inner),
+        Envelope::Empty => 0,
+    };
+}
+function number(?Deep $value): int {
+    if ($value == null) { return -1; }
+    return match ($value) {
+        Deep::Wrapped($inner, $tail) => envelopeNumber($inner) + leafNumber($tail),
+        Deep::Empty => -2,
+    };
+}
+function make(int $number): Deep {
+    return Deep::Wrapped(Envelope::Pair(Leaf::Number($number), null), Leaf::Empty);
+}
+function varied(int $number, int $phase): Deep {
+    return match ($phase) {
+        0 => Deep::Wrapped(null, Leaf::Number($number)),
+        1 => Deep::Wrapped(Envelope::Empty, Leaf::Number($number)),
+        default => Deep::Wrapped(Envelope::One(Leaf::Number($number)), Leaf::Empty),
+    };
+}
+function identity<T>(T $value): T { return $value; }
+function maybe(bool $present, int $number): ?Deep {
+    if ($present) { return make($number); }
+    return null;
+}
+function defaulted(Deep $value = Deep::Wrapped(Envelope::Pair(Leaf::Number(0), Leaf::Empty), Leaf::Empty), int $offset = 0): int {
+    return number($value) + $offset;
+}
+interface Reader { function read(Deep $value): Deep; }
+open class BaseReader implements Reader { open function read(Deep $value): Deep { return $value; } }
+class ConcreteReader extends BaseReader { override function read(Deep $value): Deep { return $value; } }
+class StaticReader { static function read(Deep $value): Deep { return $value; } }
+class Holder { writable ?Deep $value = null; }
+class Box<T> {
+    writable T $value;
+    function __construct(parameter take T $value) { $this->value = $value; }
+}
+function ownedCapture(Deep $value): function writable(int): Deep {
+    let writable $phase = 0;
+    return function(int $number): Deep with (take $value, take $phase) {
+        $value = varied($number, $phase);
+        $phase++;
+        if ($phase == 3) { $phase = 0; }
+        return $value;
+    };
+}
+
+function hot(int $iterations, NestedRoute $route): int {
+    BaseReader $virtual = new ConcreteReader();
+    Reader $erased = new ConcreteReader();
+    let $callback = fn(Deep $value) => $value;
+    let writable $holder = new Holder();
+    let writable $generic = new Box<Deep>(Deep::Empty);
+    writable ?Deep $local = null;
+    let writable $captured = Deep::Empty;
+    let writable $callbackHome = Deep::Empty;
+    let writable $capture = function(int $number, int $phase): Deep with (writable $captured) {
+        $captured = varied($number, $phase);
+        return $captured;
+    };
+    let $replace = function(writable Deep $value, int $number, int $phase): Deep {
+        $value = varied($number, $phase);
+        return $value;
+    };
+    let writable $owned = ownedCapture(Deep::Empty);
+    let writable $index = 0;
+    let writable $phase = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        let $value = make($index);
+        $local = Deep::Empty;
+        $local = null;
+        $local = $value;
+        $holder->value = null;
+        $holder->value = $value;
+        $generic->value = $value;
+        $sum += match ($route) {
+            NestedRoute::Direct => number($value),
+            NestedRoute::NestedCall => number(make($index)),
+            NestedRoute::Generic => number(identity($value)),
+            NestedRoute::StaticCall => number(StaticReader::read($value)),
+            NestedRoute::Virtual => number($virtual->read($value)),
+            NestedRoute::Erased => number($erased->read($value)),
+            NestedRoute::Callback => number($callback($value)),
+            NestedRoute::Defaulted => defaulted(offset: $index),
+            NestedRoute::Named => number(Deep::Wrapped(tail: Leaf::Empty, inner: Envelope::Pair(right: Leaf::Number(0), left: Leaf::Number($index)))),
+            NestedRoute::Local => number($local),
+            NestedRoute::Property => number($holder->value),
+            NestedRoute::GenericProperty => number($generic->value),
+            NestedRoute::Capture => number($capture($index, $phase)),
+            NestedRoute::WritableCallback => number($replace($callbackHome, $index, $phase)),
+            NestedRoute::NullableResult => number(maybe(true, $index)),
+            NestedRoute::CaseChange => number(varied($index, $phase)),
+            NestedRoute::InnerNullable => number(Deep::Wrapped(Envelope::Pair(Leaf::Empty, Leaf::Number($index)), Leaf::Empty)),
+            NestedRoute::OwnedCapture => number($owned($index)),
+        };
+        $index++;
+        $phase++;
+        if ($phase == 3) { $phase = 0; }
+    }
+    return $sum;
+}
+
+class Events { static writable string $text = ""; }
+function note(int $value): int { Events::text = Events::text . $value . ";"; return $value; }
+class Failure implements Error { function __construct(string $message) {} }
+function fail(): Leaf throws Failure { throw new Failure("nested replacement"); }
+function controls(): void {
+    let $ordered = Deep::Wrapped(Envelope::Pair(right: Leaf::Number(note(2)), left: Leaf::Number(note(1))), Leaf::Number(note(3)));
+    echo Events::text . number($ordered) . ";";
+    let writable $holder = new Holder();
+    $holder->value = make(7);
+    let $snapshot = $holder->value;
+    try { $holder->value = Deep::Wrapped(Envelope::One(Leaf::Number(9)), fail()); }
+    catch (Failure) {}
+    echo number($holder->value) . ";" . number($snapshot) . ";";
+    $holder->value = varied(8, 2);
+    echo number($holder->value) . ";" . number($snapshot) . ";";
+    echo number(maybe(false, 1)) . ";" . number(Deep::Empty) . ";";
+}
+function main(): void {
+    echo hot(4, NestedRoute::Direct) . ";" . hot(4, NestedRoute::NestedCall) . ";" .
+        hot(4, NestedRoute::Generic) . ";" . hot(4, NestedRoute::StaticCall) . ";" .
+        hot(4, NestedRoute::Virtual) . ";" . hot(4, NestedRoute::Erased) . ";" .
+        hot(4, NestedRoute::Callback) . ";" . hot(4, NestedRoute::Defaulted) . ";" .
+        hot(4, NestedRoute::Named) . ";" . hot(4, NestedRoute::Local) . ";" .
+        hot(4, NestedRoute::Property) . ";" . hot(4, NestedRoute::GenericProperty) . ";" .
+        hot(4, NestedRoute::Capture) . ";" . hot(4, NestedRoute::WritableCallback) . ";" .
+        hot(4, NestedRoute::NullableResult) . ";" . hot(4, NestedRoute::CaseChange) . ";" .
+        hot(4, NestedRoute::InnerNullable) . ";" . hot(4, NestedRoute::OwnedCapture) . ";";
+    controls();
+}

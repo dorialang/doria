@@ -6,6 +6,111 @@ fn analyze(source: &str) -> doriac::semantics::SemanticAnalysis {
         .1
 }
 
+#[test]
+fn class_interface_diamonds_coalesce_independently_of_source_order() {
+    for edges in [
+        "Root<int>, Left<int>, Right<int>",
+        "Left<int>, Right<int>, Root<int>",
+    ] {
+        let source = format!(
+            "interface Root<T> {{}} interface Left<T> extends Root<T> {{}} \
+             interface Right<T> extends Root<T> {{}} class Value implements {edges} {{}}"
+        );
+        let analysis = analyze(&source);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{edges}: {:?}",
+            analysis.diagnostics
+        );
+        let conformances = analysis.info.contracts.conformances.iter().filter(|fact| {
+            matches!(&fact.implementing_type, doriac::types::ResolvedType::Class(class) if class.name == "Value")
+        }).collect::<Vec<_>>();
+        assert_eq!(conformances.len(), 3);
+        assert_eq!(
+            conformances
+                .iter()
+                .filter(|fact| fact.interface.name == "Root")
+                .count(),
+            1
+        );
+        assert!(conformances
+            .iter()
+            .all(|fact| fact.status == ConformanceStatus::Checked));
+    }
+}
+
+#[test]
+fn direct_and_inherited_unconditional_conformance_repeats_remain_errors() {
+    for source in [
+        "interface Root<T> {} class Value implements Root<int>, Root<int> {}",
+        "interface Root<T> {} open class Base implements Root<int> {} class Child extends Base implements Root<int> {}",
+        "interface Root<T> {} interface Derived<T> extends Root<T> {} open class Base implements Derived<int> {} class Child extends Base implements Root<int> {}",
+    ] {
+        let analysis = analyze(source);
+        assert_eq!(analysis.diagnostics.iter().filter(|finding| finding.code == "E0752").count(), 1, "{source}: {:?}", analysis.diagnostics);
+        assert!(analysis.info.contracts.conformances.iter().any(|fact| fact.status == ConformanceStatus::Invalid));
+    }
+}
+
+#[test]
+fn interface_ownership_is_preserved_at_every_taking_boundary() {
+    for ty in ["Capability", "?Capability", "Generic<int>"] {
+        for transfer in [
+            "consume($value);",
+            "consume(value: $value);",
+            "let $sink = new Sink(); $sink->consume($value);",
+            "Sink::consumeStatic($value);",
+            "let $holder = new Holder($value);",
+            "let $consume = function (take TYPE $value): void {}; $consume($value);",
+            "let $wrapped = Envelope::Wrapped($value);",
+            "let $returned = relay($value);",
+        ] {
+            let source = format!(
+                r#"
+interface Capability {{ function inspect(): void; }}
+interface Generic<T> {{ function inspectGeneric(T $value): void; }}
+class Value implements Capability, Generic<int> {{
+    function inspect(): void {{}}
+    function inspectGeneric(int $value): void {{}}
+}}
+function consume(take {ty} $value): void {{}}
+function inspect(Capability $value): void {{}}
+function relay(take {ty} $value): {ty} {{ return $value; }}
+class Sink {{
+    function consume(take {ty} $value): void {{}}
+    static function consumeStatic(take {ty} $value): void {{}}
+}}
+class Holder {{ function __construct(take {ty} $value) {{}} }}
+enum Envelope {{ case Wrapped({ty} $value); }}
+function main(): void {{
+    let $value = new Value();
+    {transfer}
+    inspect($value);
+}}
+"#,
+                transfer = transfer.replace("TYPE", ty),
+            );
+            let analysis = analyze(&source);
+            assert!(
+                analysis
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| !diagnostic.code.starts_with('P')),
+                "{ty}, {transfer}: {:?}",
+                analysis.diagnostics
+            );
+            assert!(
+                analysis
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0470"),
+                "{ty}, {transfer}: {:?}",
+                analysis.diagnostics
+            );
+        }
+    }
+}
+
 const BORROWING_CURSOR: &str = r#"
 class Cursor implements Iterator<int> {
     writable int $position = 0;
@@ -141,6 +246,9 @@ function main(): void {{
             vec![doriac::ownership::RetainedSource {
                 source: doriac::symbols::BorrowSource::Parameter(0),
                 inherited,
+                writable: false,
+                lifetime: doriac::types::RetainedLifetime::Cleanup,
+                owned_path: Vec::new(),
             }],
             "{name}"
         );
@@ -210,15 +318,26 @@ fn retained_iterator_source_loans_reject_mutation_escape_and_reassignment_leaks(
 }
 
 #[test]
-fn borrow_parameters_are_scoped_to_readonly_iterator_promotion() {
-    for declaration in [
-        "function invalid(borrow List<int> $source): void {}",
-        "class Invalid { function __construct(borrow List<int> $source) {} }",
-        "class Invalid implements Iterator<int> { function __construct(borrow writable List<int> $source) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }",
-        "class Invalid implements Iterator<int> { function __construct(borrow take List<int> $source) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }",
+fn borrow_parameters_require_promoted_constructor_caller_places() {
+    let invalid = "Invalid Retained Source Parameter";
+    let caller_place = "Retained Source Requires a Caller Place";
+    for (declaration, titles) in [
+        ("function invalid(borrow List<int> $source): void {}", vec![invalid]),
+        ("class View { function __construct(borrow List<int> $source) {} }", vec![]),
+        ("class Handle { function __construct(borrow writable List<int> $source) {} }", vec![]),
+        ("class Defaulted { function __construct(borrow writable int $source = 1) {} }", vec![caller_place]),
+        ("class Defaulted implements Iterator<int> { function __construct(borrow List<int> $source = [1]) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }", vec![caller_place]),
+        ("class Cursor implements Iterator<int> { function __construct(borrow writable List<int> $source) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }", vec![]),
+        ("class Invalid implements Iterator<int> { function __construct(borrow take List<int> $source) {} function hasCurrent(): bool { return false; } function getCurrent(): int { return 0; } writable function advance(): void {} }", vec![invalid]),
     ] {
         let analysis = analyze(declaration);
-        assert!(analysis.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0761"), "{declaration}: {:?}", analysis.diagnostics);
+        let retained_findings = analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0761")
+            .map(|diagnostic| diagnostic.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_findings, titles, "{declaration}");
     }
 }
 
@@ -245,15 +364,167 @@ fn iterator_loans_follow_match_and_when_results() {
             let invalid = analyze(&format!("{BORROWING_CURSOR} function escape(): Cursor {{ {body} }}"));
             assert!(invalid.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0762"), "{body}: {:?}", invalid.diagnostics);
         }
-        let invalid = analyze(&format!("{BORROWING_CURSOR} function main(): void {{ let $source = [1]; List<Cursor> $stored = [{expression}]; }}"));
-        assert!(invalid.diagnostics.iter().any(|diagnostic| diagnostic.code == "E0762"), "{expression}: {:?}", invalid.diagnostics);
+        let stored = analyze(&format!("{BORROWING_CURSOR} function main(): void {{ let $source = [1]; List<Cursor> $stored = [{expression}]; }}"));
+        assert!(stored.diagnostics.is_empty(), "{expression}: {:?}", stored.diagnostics);
     }
 }
 
 #[test]
-fn iterator_loans_survive_erasure_and_forbid_owned_storage_or_later_argument_mutation() {
+fn collection_literals_preserve_element_source_lifetimes() {
+    for (ty, expression) in [
+        ("List<Iterator<int>>", "[new Cursor($source)]"),
+        ("Iterator<int>[]", "[new Cursor($source)]"),
+        ("List<List<Iterator<int>>>", "[[new Cursor($source)]]"),
+        (
+            "Dictionary<string, ?Iterator<int>>",
+            "[\"cursor\" => new Cursor($source)]",
+        ),
+    ] {
+        let declarations = format!("{BORROWING_CURSOR} function make(List<int> $source): {ty} {{ return {expression}; }} function relay(take {ty} $items): {ty} {{ return $items; }}");
+        let valid = analyze(&format!("{declarations} function main(): void {{ let $source = [1]; {ty} $items = relay(make($source)); }}"));
+        assert!(
+            valid.diagnostics.is_empty(),
+            "{ty}: {:?}",
+            valid.diagnostics
+        );
+        let invalid = analyze(&format!("{declarations} function main(): void {{ let writable $source = [1]; {ty} $items = relay(make($source)); $source->add(2); echo $items->count; }}"));
+        assert!(
+            invalid.diagnostics.iter().any(|d| d.code == "E0763"),
+            "{ty}: {:?}",
+            invalid.diagnostics
+        );
+        let escaping = analyze(&format!(
+            "{declarations} function escape(): {ty} {{ let $source = [1]; return {expression}; }}"
+        ));
+        assert!(
+            escaping.diagnostics.iter().any(|d| d.code == "E0762"),
+            "{ty}: {:?}",
+            escaping.diagnostics
+        );
+        let replacement = analyze(&format!("{declarations} function main(): void {{ writable {ty} $items = []; {{ let $source = [1]; $items = {expression}; }} }}"));
+        assert!(
+            replacement.diagnostics.iter().any(|d| d.code == "E0762"),
+            "{ty}: {:?}",
+            replacement.diagnostics
+        );
+    }
+}
+
+#[test]
+fn nonescaping_callback_parameters_cannot_enter_collection_literals() {
+    let analysis = analyze("function store(function(): int $callback): void { List<function(): int> $items = [$callback]; }");
+    assert!(
+        analysis.diagnostics.iter().any(|d| d.code == "E0657"),
+        "{:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn collection_mutations_preserve_source_loans_and_destination_lifetimes() {
+    for (ty, initial, store) in [
+        (
+            "List<Iterator<int>>",
+            "[]",
+            "$items->add(new Cursor($source));",
+        ),
+        (
+            "List<Iterator<int>>",
+            "[]",
+            "$items->insertAt(0, new Cursor($source));",
+        ),
+        (
+            "Iterator<int>[]",
+            "[new Cursor($source)]",
+            "$items[0] = new Cursor($source);",
+        ),
+        (
+            "Dictionary<string, ?Iterator<int>>",
+            "[]",
+            "$items->set(\"cursor\", new Cursor($source));",
+        ),
+        (
+            "Dictionary<string, ?Iterator<int>>",
+            "[]",
+            "$items[\"cursor\"] = new Cursor($source);",
+        ),
+        (
+            "Deque<Iterator<int>>",
+            "Deque::from([])",
+            "$items->pushBack(new Cursor($source));",
+        ),
+        (
+            "List<List<Iterator<int>>>",
+            "[]",
+            "$items->add([new Cursor($source)]);",
+        ),
+    ] {
+        let observation = if ty.ends_with("[]") {
+            "$items->length"
+        } else {
+            "$items->count"
+        };
+        let valid = analyze(&format!("{BORROWING_CURSOR} function main(): void {{ let $source = [1]; writable {ty} $items = {initial}; {store} echo {observation}; }}"));
+        assert!(
+            valid.diagnostics.is_empty(),
+            "{store}: {:?}",
+            valid.diagnostics
+        );
+        let live = analyze(&format!("{BORROWING_CURSOR} function main(): void {{ let writable $source = [1]; writable {ty} $items = {initial}; {store} $source->clear(); echo {observation}; }}"));
+        assert!(
+            live.diagnostics.iter().any(|d| d.code == "E0763"),
+            "{store}: {:?}",
+            live.diagnostics
+        );
+        if !ty.ends_with("[]") {
+            let invalid = analyze(&format!("{BORROWING_CURSOR} function main(): void {{ writable {ty} $items = {initial}; {{ let $source = [1]; {store} }} echo $items->count; }}"));
+            assert!(
+                invalid.diagnostics.iter().any(|d| d.code == "E0762"),
+                "{store}: {:?}",
+                invalid.diagnostics
+            );
+            let helper = format!(
+                "function install(writable {ty} $items, List<int> $source): void {{ {store} }}"
+            );
+            let valid = analyze(&format!("{BORROWING_CURSOR} {helper} function main(): void {{ let $source = [1]; writable {ty} $items = {initial}; install($items, $source); echo $items->count; }}"));
+            assert!(
+                valid.diagnostics.is_empty(),
+                "{store}: {:?}",
+                valid.diagnostics
+            );
+            let invalid = analyze(&format!("{BORROWING_CURSOR} {helper} function main(): void {{ writable {ty} $items = {initial}; {{ let $source = [1]; install($items, $source); }} echo $items->count; }}"));
+            assert!(
+                invalid.diagnostics.iter().any(|d| d.code == "E0762"),
+                "{store}: {:?}",
+                invalid.diagnostics
+            );
+        }
+    }
+}
+
+#[test]
+fn collection_mutations_do_not_retain_nonescaping_callback_parameters() {
+    for store in ["$items->add($callback);", "$items[0] = $callback;"] {
+        let analysis = analyze(&format!("function store(writable List<function(): int> $items, function(): int $callback): void {{ {store} }}"));
+        assert!(
+            analysis.diagnostics.iter().any(|d| d.code == "E0657"),
+            "{store}: {:?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
+fn iterator_loans_allow_fresh_owners_but_forbid_shared_escape_and_later_mutation() {
+    let valid = format!("{BORROWING_CURSOR} class Holder {{ function __construct(take Cursor $cursor) {{}} }} function main(): void {{ let writable $source = [1]; {{ let $cursor = new Cursor($source); let $holder = new Holder($cursor); }} $source->add(2); }}");
+    let analysis = analyze(&valid);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
     for (tail, expected) in [
-        ("class Holder { function __construct(take Cursor $cursor) {} } function main(): void { let $source = [1]; let $cursor = new Cursor($source); let $holder = new Holder($cursor); }", "E0762"),
+        ("class Holder { function __construct(take Cursor $cursor) {} } function escape(): Holder { let $source = [1]; return new Holder(new Cursor($source)); } function main(): void {}", "E0762"),
         ("function main(): void { let $source = [1]; let $shared = shared new Cursor($source); }", "E0762"),
         ("function main(): void { let writable $source = [1]; Iterator<int> $cursor = new Cursor($source); $source->add(2); echo $cursor->getCurrent(); }", "E0763"),
         ("function mutate(writable List<int> $source): int { $source->add(2); return 0; } function inspect(Cursor $cursor, int $later): void {} function main(): void { let writable $source = [1]; inspect(new Cursor($source), mutate($source)); }", "E0477"),
@@ -894,6 +1165,80 @@ class Concrete implements Child {
         .conformances
         .iter()
         .all(|fact| fact.status == ConformanceStatus::Checked));
+}
+
+#[test]
+fn generic_contracts_distinguish_inherited_owner_and_method_parameters() {
+    for (owner_type, method_type, result_type, result, valid) in [
+        ("U", "W", "int", "1", true),
+        ("W", "U", "int", "1", false),
+        ("W", "W", "int", "1", false),
+        ("U", "U", "int", "1", false),
+    ] {
+        for (base, implementation, code) in [
+            (
+                "interface First<T> { function first<U>(T $owner, U $value): int; }",
+                "class Value<U> implements First<U>",
+                "E0755",
+            ),
+            (
+                "open class Parent<T> { open function first<U>(T $owner, U $value): int { return 1; } }",
+                "class Value<U> extends Parent<U>",
+                "E0729",
+            ),
+        ] {
+            let modifier = if code == "E0729" { "override " } else { "" };
+            let source = format!("{base} {implementation} {{ {modifier}function first<W>({owner_type} $owner, {method_type} $value): {result_type} {{ return {result}; }} }}");
+            let analysis = analyze(&source);
+            if valid {
+                assert!(analysis.diagnostics.is_empty(), "{source}: {:?}", analysis.diagnostics);
+            } else {
+                assert!(analysis.diagnostics.iter().any(|finding| finding.code == code
+                    && !finding.related.is_empty()
+                    && (code == "E0729" || finding.message.contains("parameter types"))), "{source}: {:?}", analysis.diagnostics);
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_return_contracts_do_not_merge_inherited_parameter_names() {
+    for (base, implementation, code) in [
+        (
+            "interface Factory<T> { function make<U>(): ?T; }",
+            "class Value<U> implements Factory<U>",
+            "E0755",
+        ),
+        (
+            "open class Parent<T> { open function make<U>(): ?T { return null; } }",
+            "class Value<U> extends Parent<U>",
+            "E0729",
+        ),
+    ] {
+        for (result, valid) in [("U", true), ("W", false)] {
+            let modifier = if code == "E0729" { "override " } else { "" };
+            let source = format!("{base} {implementation} {{ {modifier}function make<W>(): ?{result} {{ return null; }} }}");
+            let analysis = analyze(&source);
+            if valid {
+                assert!(
+                    analysis.diagnostics.is_empty(),
+                    "{source}: {:?}",
+                    analysis.diagnostics
+                );
+            } else {
+                assert!(
+                    analysis
+                        .diagnostics
+                        .iter()
+                        .any(|finding| finding.code == code
+                            && !finding.related.is_empty()
+                            && (code == "E0729" || finding.message.contains("return type"))),
+                    "{source}: {:?}",
+                    analysis.diagnostics
+                );
+            }
+        }
+    }
 }
 
 #[test]

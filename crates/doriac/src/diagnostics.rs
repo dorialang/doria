@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::ops::{Deref, DerefMut};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use doria_diagnostic_catalogue::source_excerpt::{self, SourceExcerpt};
+use unicode_width::UnicodeWidthStr;
 
 use crate::source::{SourceFile, Span};
 
@@ -705,7 +706,7 @@ impl Default for RenderOptions {
             format: DiagnosticFormat::Human,
             color: ColorChoice::Auto,
             context_lines: 1,
-            terminal_width: 100,
+            terminal_width: source_excerpt::DEFAULT_TERMINAL_WIDTH,
         }
     }
 }
@@ -751,12 +752,7 @@ pub fn render_diagnostics(
     options: RenderOptions,
 ) -> String {
     let prepared = prepare_diagnostics(diagnostics);
-    let prepared = prepared.iter().collect::<Vec<_>>();
-    match options.format {
-        DiagnosticFormat::Human => render_human(source, None, &prepared, options),
-        DiagnosticFormat::Concise => render_concise(source, None, &prepared),
-        DiagnosticFormat::Json => diagnostics_json(source, None, &prepared),
-    }
+    render_prepared(Presentation::Single(source), &prepared, options)
 }
 
 pub fn render_diagnostics_with_source_map(
@@ -764,24 +760,69 @@ pub fn render_diagnostics_with_source_map(
     diagnostics: &[Diagnostic],
     options: RenderOptions,
 ) -> String {
-    let fallback = sources
-        .iter()
-        .next()
-        .map(|record| &record.source)
-        .cloned()
-        .unwrap_or_else(|| SourceFile::new("<source unavailable>", ""));
-    let prepared = prepare_diagnostics(diagnostics);
+    let prepared = prepare_diagnostics_with_source_map(sources, diagnostics);
+    render_prepared(Presentation::Map(sources), &prepared, options)
+}
+
+fn render_prepared(
+    presentation: Presentation<'_>,
+    prepared: &[Diagnostic],
+    options: RenderOptions,
+) -> String {
     let prepared = prepared.iter().collect::<Vec<_>>();
     match options.format {
-        DiagnosticFormat::Human => render_human(&fallback, Some(sources), &prepared, options),
-        DiagnosticFormat::Concise => render_concise(&fallback, Some(sources), &prepared),
-        DiagnosticFormat::Json => diagnostics_json(&fallback, Some(sources), &prepared),
+        DiagnosticFormat::Human => render_human(presentation, &prepared, options),
+        DiagnosticFormat::Concise => render_concise(presentation, &prepared),
+        DiagnosticFormat::Json => diagnostics_json(presentation, &prepared),
     }
 }
 
+/// The sources a prepared diagnostic is presented against.
+#[derive(Clone, Copy)]
+enum Presentation<'a> {
+    /// One source; `DiagnosticSource::Current` is this source.
+    Single(&'a SourceFile),
+    /// Every source of a graph; prepared locations name their source.
+    Map(&'a crate::source_map::SourceMap),
+}
+
+impl<'a> Presentation<'a> {
+    /// The text a location is shown from, when a reader can open its source.
+    /// A location is never shown from a different source's text.
+    fn file(self, identity: &DiagnosticSource, span: Span) -> Option<&'a SourceFile> {
+        match (self, identity) {
+            (_, DiagnosticSource::Unavailable) => None,
+            (Self::Single(source), DiagnosticSource::Current) => Some(source),
+            (Self::Single(source), DiagnosticSource::Path(path)) => {
+                (path == &source.path).then_some(source)
+            }
+            (Self::Map(sources), DiagnosticSource::Current) => {
+                sources.by_id(span.source).map(|record| &record.source)
+            }
+            (Self::Map(sources), DiagnosticSource::Path(path)) => {
+                sources.by_path(path).map(|record| &record.source)
+            }
+        }
+    }
+
+    fn name<'b>(self, identity: &'b DiagnosticSource, span: Span) -> &'b str
+    where
+        'a: 'b,
+    {
+        match identity {
+            DiagnosticSource::Path(path) => path,
+            DiagnosticSource::Current => self
+                .file(identity, span)
+                .map_or(UNAVAILABLE_SOURCE_NAME, |source| source.path.as_str()),
+            DiagnosticSource::Unavailable => UNAVAILABLE_SOURCE_NAME,
+        }
+    }
+}
+
+const UNAVAILABLE_SOURCE_NAME: &str = "<source unavailable>";
+
 fn render_human(
-    source: &SourceFile,
-    sources: Option<&crate::source_map::SourceMap>,
+    presentation: Presentation<'_>,
     diagnostics: &[&Diagnostic],
     options: RenderOptions,
 ) -> String {
@@ -813,7 +854,7 @@ fn render_human(
         let mut labels = diagnostic.labels.clone();
         labels.sort_by_key(|label| {
             (
-                source_name(&label.source, source).to_string(),
+                presentation.name(&label.source, label.span).to_string(),
                 label.span.start,
                 label.role != LabelRole::Primary,
             )
@@ -822,7 +863,8 @@ fn render_human(
             block.push_str("\n\nWhere\n");
             render_label(
                 &mut block,
-                diagnostic_source_file(sources, source, &primary.source, primary.span),
+                presentation.name(&primary.source, primary.span),
+                presentation.file(&primary.source, primary.span),
                 primary,
                 options,
                 diagnostic
@@ -841,7 +883,8 @@ fn render_human(
                 block.push('\n');
                 render_label(
                     &mut block,
-                    diagnostic_source_file(sources, source, &label.source, label.span),
+                    presentation.name(&label.source, label.span),
+                    presentation.file(&label.source, label.span),
                     label,
                     options,
                     None,
@@ -850,6 +893,9 @@ fn render_human(
         }
         if diagnostic.kind == DiagnosticKind::RuntimeAssertion {
             render_assertion_values(&mut block, diagnostic);
+        }
+        if diagnostic.kind == DiagnosticKind::RuntimeError {
+            render_io_progress(&mut block, diagnostic);
         }
         if let Some(explanation) = &diagnostic.explanation {
             if matches!(
@@ -878,8 +924,7 @@ fn render_human(
                 fix.title
             ));
             for edit in &fix.edits {
-                let edit_source = diagnostic_source_file(sources, source, &edit.source, edit.span);
-                let location = display_location(edit_source, &edit.source, edit.span.start);
+                let location = display_location(presentation, &edit.source, edit.span);
                 block.push_str(&format!(
                     "\n{location} · Replace With `{}`",
                     edit.replacement
@@ -908,15 +953,18 @@ fn render_human(
             if !outcome.path.is_empty() {
                 block.push_str("\n\nCall Path");
                 for frame in &outcome.path {
-                    let frame_source =
-                        diagnostic_source_file(sources, source, &frame.source, frame.span);
-                    let (line, _) = display_line_col(frame_source, frame.span.start, 4);
-                    block.push_str(&format!(
-                        "\n{} · {}:{}",
-                        frame.function,
-                        source_name(&frame.source, frame_source),
-                        line
-                    ));
+                    let name = presentation.name(&frame.source, frame.span);
+                    match presentation.file(&frame.source, frame.span) {
+                        Some(frame_source) => {
+                            let (line, _) = display_line_col(
+                                frame_source,
+                                frame.span.start,
+                                source_excerpt::TAB_WIDTH,
+                            );
+                            block.push_str(&format!("\n{} · {name}:{line}", frame.function));
+                        }
+                        None => block.push_str(&format!("\n{} · {name}", frame.function)),
+                    }
                 }
             }
             block.push_str(&format!(
@@ -936,37 +984,46 @@ fn render_human(
     rendered.join("\n\n")
 }
 
+/// Renders a label's location header and, when its source text is available,
+/// the excerpt. Without the text, only the source name and message are shown.
 fn render_label(
     rendered: &mut String,
-    source: &SourceFile,
+    name: &str,
+    source: Option<&SourceFile>,
     label: &DiagnosticLabel,
     options: RenderOptions,
     context: Option<&str>,
 ) {
-    let (line, _) = display_line_col(source, label.span.start, 4);
-    let label_source = source_name(&label.source, source);
-    rendered.push_str(&format!("{label_source} · line {line}"));
+    rendered.push_str(name);
+    let Some(source) = source else {
+        if let Some(context) = context {
+            rendered.push_str(" · ");
+            rendered.push_str(context);
+        }
+        rendered.push('\n');
+        if !label.message.is_empty() {
+            rendered.push_str(&label.message);
+        }
+        return;
+    };
+    let (line, _) = display_line_col(source, label.span.start, source_excerpt::TAB_WIDTH);
+    rendered.push_str(&format!(" · line {line}"));
     if let Some(context) = context {
         rendered.push_str(" · ");
         rendered.push_str(context);
     }
     rendered.push('\n');
 
-    if matches!(label.source, DiagnosticSource::Path(ref path) if path != &source.path) {
-        if !label.message.is_empty() {
-            rendered.push_str(&label.message);
-        }
-        return;
-    }
-
     let (end_line, _) = source.line_col(label.span.end.min(source.text.len()));
     let first_line = line.saturating_sub(options.context_lines).max(1);
     let last_line = (end_line + options.context_lines).min(source.line_count());
-    let gutter_width = last_line.to_string().len().max(3);
+    let gutter_width = last_line
+        .to_string()
+        .len()
+        .max(source_excerpt::MINIMUM_GUTTER_WIDTH);
+    let gutter_gap = source_excerpt::GUTTER_GAP;
     for context_line in first_line..=last_line {
         let raw_line = source.line_text(context_line);
-        let display_line = expand_tabs(raw_line, 4);
-        let maximum_width = options.terminal_width.saturating_sub(12).max(8);
         let line_start = source.line_start(context_line);
         let line_end = line_start.saturating_add(raw_line.len());
         let is_labelled = context_line >= line
@@ -975,26 +1032,20 @@ fn render_label(
             && label.span.end >= line_start;
         let marker_start_byte = label.span.start.max(line_start).min(line_end);
         let marker_end_byte = label.span.end.min(line_end).max(marker_start_byte);
-        let before = source.text.get(line_start..marker_start_byte).unwrap_or("");
-        let selected = source
-            .text
-            .get(marker_start_byte..marker_end_byte)
-            .unwrap_or("");
-        let marker_offset = display_width_with_tabs(before, 4);
-        let marker_width = display_width_with_tabs(selected, 4).max(1);
-        let (visible_line, visible_marker_offset) = if is_labelled {
-            visible_window(&display_line, marker_offset, marker_width, maximum_width)
-        } else {
-            (
-                truncate_display(&display_line, maximum_width),
-                marker_offset,
-            )
-        };
-        if visible_line.is_empty() {
+        let excerpt = SourceExcerpt::new(
+            raw_line,
+            is_labelled.then_some((marker_start_byte - line_start, marker_end_byte - line_start)),
+            options.terminal_width,
+            doria_unicode::grapheme_boundaries,
+            UnicodeWidthStr::width,
+        );
+        if excerpt.is_empty() {
             rendered.push_str(&format!("\n{:>gutter_width$}", context_line));
         } else {
-            rendered.push_str(&format!("\n{:>gutter_width$}      ", context_line));
-            rendered.push_str(&visible_line);
+            rendered.push_str(&format!("\n{:>gutter_width$}{gutter_gap}", context_line));
+            excerpt.write(|bytes| {
+                rendered.push_str(std::str::from_utf8(bytes).expect("source excerpt is UTF-8"))
+            });
         }
         if is_labelled {
             let marker = if label.role == LabelRole::Primary {
@@ -1003,20 +1054,16 @@ fn render_label(
                 '-'
             };
             rendered.push_str(&format!(
-                "\n{:>gutter_width$}      {}{}",
+                "\n{:>gutter_width$}{gutter_gap}{}{}",
                 "",
-                " ".repeat(visible_marker_offset.min(maximum_width)),
-                marker.to_string().repeat(
-                    marker_width
-                        .min(maximum_width.saturating_sub(visible_marker_offset))
-                        .max(1)
-                )
+                " ".repeat(excerpt.marker_offset),
+                marker.to_string().repeat(excerpt.marker_width)
             ));
             if context_line == line && !label.message.is_empty() {
                 rendered.push_str(&format!(
-                    "\n{:>gutter_width$}      {}",
+                    "\n{:>gutter_width$}{gutter_gap}{}",
                     "",
-                    " ".repeat(visible_marker_offset.min(maximum_width))
+                    " ".repeat(excerpt.marker_offset)
                 ));
                 rendered.push_str(&label.message);
             }
@@ -1066,11 +1113,7 @@ fn push_prose_section(
     rendered.pop();
 }
 
-fn render_concise(
-    source: &SourceFile,
-    sources: Option<&crate::source_map::SourceMap>,
-    diagnostics: &[&Diagnostic],
-) -> String {
+fn render_concise(presentation: Presentation<'_>, diagnostics: &[&Diagnostic]) -> String {
     let mut lines = diagnostics
         .iter()
         .map(|diagnostic| {
@@ -1079,14 +1122,15 @@ fn render_concise(
                 .iter()
                 .find(|label| label.role == LabelRole::Primary)
                 .or_else(|| diagnostic.labels.first());
-            let (path, line, col) = primary.map_or((source.path.as_str(), 1, 1), |label| {
-                let label_source =
-                    diagnostic_source_file(sources, source, &label.source, label.span);
-                let (line, col) = display_line_col(label_source, label.span.start, 4);
-                (source_name(&label.source, label_source), line, col)
-            });
+            let location = match primary {
+                Some(label) => display_location(presentation, &label.source, label.span),
+                None => match presentation {
+                    Presentation::Single(source) => format!("{}:1:1", source.path),
+                    Presentation::Map(_) => UNAVAILABLE_SOURCE_NAME.to_string(),
+                },
+            };
             format!(
-                "{path}:{line}:{col}: {}[{}]: {}{}",
+                "{location}: {}[{}]: {}{}",
                 diagnostic.kind.title(diagnostic.severity),
                 diagnostic.code,
                 if matches!(
@@ -1117,6 +1161,31 @@ fn render_concise(
         lines.push(format_summary(summary));
     }
     lines.join("\n")
+}
+
+fn render_io_progress(rendered: &mut String, diagnostic: &Diagnostic) {
+    let Some(outcome) = &diagnostic.runtime_outcome else {
+        return;
+    };
+    if outcome.error_type.as_deref() != Some(crate::compiler_known_io::IO_ERROR) {
+        return;
+    }
+    let count = outcome.facts.iter().find_map(|fact| {
+        if fact.name == doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_FACT {
+            match fact.value {
+                RuntimeFactValue::Signed(value) => Some(value),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    });
+    if let Some(count) = count {
+        rendered.push_str(&format!(
+            "\n\n{}\n  {count}",
+            doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_HEADING
+        ));
+    }
 }
 
 fn render_assertion_values(rendered: &mut String, diagnostic: &Diagnostic) {
@@ -1186,11 +1255,7 @@ fn terminal_safe_runtime_text(
     String::from_utf8(bytes).expect("terminal-safe runtime text remains valid UTF-8")
 }
 
-fn diagnostics_json(
-    source: &SourceFile,
-    sources: Option<&crate::source_map::SourceMap>,
-    diagnostics: &[&Diagnostic],
-) -> String {
+fn diagnostics_json(presentation: Presentation<'_>, diagnostics: &[&Diagnostic]) -> String {
     let summary = DiagnosticSummary::from_diagnostics(diagnostics);
     let values = diagnostics
         .iter()
@@ -1203,26 +1268,15 @@ fn diagnostics_json(
                 "message": diagnostic.message,
                 "explanation": diagnostic.explanation,
                 "labels": diagnostic.labels.iter().map(|label| {
-                    let label_source = diagnostic_source_file(
-                        sources,
-                        source,
-                        &label.source,
-                        label.span,
-                    );
-                    let (line, column) = display_line_col(label_source, label.span.start, 4);
-                    let (end_line, end_column) = display_line_col(label_source, label.span.end, 4);
                     serde_json::json!({
-                        "source": source_name(&label.source, label_source),
+                        "source": presentation.name(&label.source, label.span),
                         "role": label.role.as_str(),
                         "message": label.message,
                         "span": {
                             "start": label.span.start,
                             "end": label.span.end,
                         },
-                        "range": {
-                            "start": { "line": line, "column": column },
-                            "end": { "line": end_line, "column": end_column },
-                        },
+                        "range": json_range(presentation.file(&label.source, label.span), label.span),
                     })
                 }).collect::<Vec<_>>(),
                 "notes": diagnostic.notes,
@@ -1231,14 +1285,8 @@ fn diagnostics_json(
                     "title": fix.title,
                     "applicability": fix.applicability.as_str(),
                     "edits": fix.edits.iter().map(|edit| {
-                        let edit_source = diagnostic_source_file(
-                            sources,
-                            source,
-                            &edit.source,
-                            edit.span,
-                        );
                         serde_json::json!({
-                            "source": source_name(&edit.source, edit_source),
+                            "source": presentation.name(&edit.source, edit.span),
                             "span": { "start": edit.span.start, "end": edit.span.end },
                             "replacement": edit.replacement,
                         })
@@ -1256,25 +1304,21 @@ fn diagnostics_json(
                     serde_json::json!({
                         "processStatus": outcome.process_status,
                         "terminationBehavior": outcome.termination_behavior.as_str(),
-                        "origin": runtime_origin_json(source, sources, &outcome.origin),
+                        "origin": runtime_origin_json(presentation, &outcome.origin),
                         "pathKind": if outcome.path.is_empty() { "none" } else { "callPath" },
                         "frames": outcome.path.iter().map(|frame| {
-                            let frame_source = diagnostic_source_file(
-                                sources,
-                                source,
-                                &frame.source,
-                                frame.span,
-                            );
-                            let (line, column) = display_line_col(frame_source, frame.span.start, 4);
+                            let position = presentation.file(&frame.source, frame.span).map(|frame_source| {
+                                display_line_col(frame_source, frame.span.start, source_excerpt::TAB_WIDTH)
+                            });
                             serde_json::json!({
                                 "function": frame.function,
-                                "source": source_name(&frame.source, frame_source),
+                                "source": presentation.name(&frame.source, frame.span),
                                 "span": {
                                     "start": frame.span.start,
                                     "end": frame.span.end,
                                 },
-                                "line": line,
-                                "column": column,
+                                "line": position.map(|(line, _)| line),
+                                "column": position.map(|(_, column)| column),
                             })
                         }).collect::<Vec<_>>(),
                         "facts": outcome.facts.iter().map(runtime_fact_json).collect::<Vec<_>>(),
@@ -1303,24 +1347,31 @@ fn diagnostics_json(
 }
 
 fn runtime_origin_json(
-    source: &SourceFile,
-    sources: Option<&crate::source_map::SourceMap>,
+    presentation: Presentation<'_>,
     origin: &RuntimeOutcomeOrigin,
 ) -> serde_json::Value {
-    let origin_source = diagnostic_source_file(sources, source, &origin.source, origin.span);
-    let (line, column) = display_line_col(origin_source, origin.span.start, 4);
-    let (end_line, end_column) = display_line_col(origin_source, origin.span.end, 4);
     serde_json::json!({
-        "source": source_name(&origin.source, origin_source),
+        "source": presentation.name(&origin.source, origin.span),
         "function": origin.function,
         "span": {
             "start": origin.span.start,
             "end": origin.span.end,
         },
-        "range": {
-            "start": { "line": line, "column": column },
-            "end": { "line": end_line, "column": end_column },
-        },
+        "range": json_range(presentation.file(&origin.source, origin.span), origin.span),
+    })
+}
+
+/// Line and column range of a location, or `null` when its source text is
+/// unavailable. A position is never computed against another source's text.
+fn json_range(source: Option<&SourceFile>, span: Span) -> serde_json::Value {
+    let Some(source) = source else {
+        return serde_json::Value::Null;
+    };
+    let (line, column) = display_line_col(source, span.start, source_excerpt::TAB_WIDTH);
+    let (end_line, end_column) = display_line_col(source, span.end, source_excerpt::TAB_WIDTH);
+    serde_json::json!({
+        "start": { "line": line, "column": column },
+        "end": { "line": end_line, "column": end_column },
     })
 }
 
@@ -1338,14 +1389,111 @@ fn runtime_fact_json(fact: &RuntimeFact) -> serde_json::Value {
     })
 }
 
-/// Applies presentation-independent duplicate and explicit cause grouping.
+/// Prepares diagnostics presented against one source: location resolution,
+/// then presentation-independent duplicate and explicit cause grouping.
 ///
-/// Every consumer (CLI, language server, Playground JSON) must use this rather
-/// than implementing its own fuzzy or protocol-specific suppression.
+/// Every consumer (CLI, language server, Playground JSON) must prepare through
+/// this or [`prepare_diagnostics_with_source_map`] rather than implementing its
+/// own fuzzy or protocol-specific suppression. Use this one only when every
+/// authored location is in the presented source; multi-source presentation
+/// must prepare with its source map.
 pub fn prepare_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
+    prepare(diagnostics, None)
+}
+
+/// Prepares diagnostics presented against a source map. Every location then
+/// names the source its span is in, whichever compiler phase produced it.
+pub fn prepare_diagnostics_with_source_map(
+    sources: &crate::source_map::SourceMap,
+    diagnostics: &[Diagnostic],
+) -> Vec<Diagnostic> {
+    prepare(diagnostics, Some(sources))
+}
+
+/// Resolves locations in place for a result published with its source map,
+/// using the same rule as preparation.
+pub(crate) fn resolve_diagnostic_sources(
+    sources: &crate::source_map::SourceMap,
+    diagnostics: &mut [Diagnostic],
+) {
+    for diagnostic in diagnostics {
+        resolve_locations(diagnostic, Some(sources));
+    }
+}
+
+/// Gives every location in `diagnostic` the identity of the source its span
+/// is in.
+///
+/// Builders record `DiagnosticSource::Current` because a diagnostic is built
+/// without the sources it will be presented with. With a source map, `Current`
+/// becomes the path of the span's source, or `Unavailable` when the map does
+/// not hold it. Without one, `Current` remains the single presented source.
+///
+/// A compiler-owned source is embedded in the compiler and no reader can open
+/// it, so its locations never reach a presentation: a secondary label in one is
+/// removed, a fix that edits one is removed, and a primary or runtime location
+/// keeps its message with an unavailable source. Producers report such sites
+/// at the authored location that reached them (Stage 36a decision log entry
+/// 30); this is the boundary that guarantees it for every producer.
+fn resolve_locations(diagnostic: &mut Diagnostic, sources: Option<&crate::source_map::SourceMap>) {
+    let identity = |source: &DiagnosticSource, span: Span| {
+        if span.source.is_compiler_owned() {
+            return DiagnosticSource::Unavailable;
+        }
+        match (source, sources) {
+            (DiagnosticSource::Current, Some(sources)) => sources
+                .by_id(span.source)
+                .map_or(DiagnosticSource::Unavailable, |record| {
+                    DiagnosticSource::Path(record.display_path.clone())
+                }),
+            _ => source.clone(),
+        }
+    };
+    let details = &mut *diagnostic.details;
+    details
+        .labels
+        .retain(|label| label.role == LabelRole::Primary || !label.span.source.is_compiler_owned());
+    details
+        .related
+        .retain(|related| !related.span.source.is_compiler_owned());
+    details.fixes.retain(|fix| {
+        fix.edits
+            .iter()
+            .all(|edit| !edit.span.source.is_compiler_owned())
+    });
+    if details
+        .fix
+        .as_ref()
+        .is_some_and(|fix| fix.span.source.is_compiler_owned())
+    {
+        details.fix = None;
+    }
+    for label in &mut details.labels {
+        label.source = identity(&label.source, label.span);
+    }
+    for edit in details.fixes.iter_mut().flat_map(|fix| &mut fix.edits) {
+        edit.source = identity(&edit.source, edit.span);
+    }
+    if let Some(outcome) = &mut details.runtime_outcome {
+        outcome.origin.source = identity(&outcome.origin.source, outcome.origin.span);
+        for frame in &mut outcome.path {
+            frame.source = identity(&frame.source, frame.span);
+        }
+    }
+}
+
+fn prepare(
+    diagnostics: &[Diagnostic],
+    sources: Option<&crate::source_map::SourceMap>,
+) -> Vec<Diagnostic> {
     let mut seen = HashSet::new();
     let mut prepared = diagnostics
         .iter()
+        .cloned()
+        .map(|mut diagnostic| {
+            resolve_locations(&mut diagnostic, sources);
+            diagnostic
+        })
         .filter(|diagnostic| {
             let primary = diagnostic
                 .labels
@@ -1359,13 +1507,13 @@ pub fn prepare_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
             seen.insert((
                 diagnostic.code,
                 source,
+                span.source,
                 span.start,
                 span.end,
-                diagnostic.title.as_str(),
-                diagnostic.cause_id.as_deref(),
+                diagnostic.title.clone(),
+                diagnostic.cause_id.clone(),
             ))
         })
-        .cloned()
         .collect::<Vec<_>>();
 
     let roots = prepared
@@ -1419,43 +1567,19 @@ pub fn prepare_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
     prepared
 }
 
-fn source_name<'a>(source: &'a DiagnosticSource, current: &'a SourceFile) -> &'a str {
-    match source {
-        DiagnosticSource::Current => &current.path,
-        DiagnosticSource::Path(path) => path,
-        DiagnosticSource::Unavailable => "<source unavailable>",
-    }
-}
-
-fn diagnostic_source_file<'a>(
-    sources: Option<&'a crate::source_map::SourceMap>,
-    fallback: &'a SourceFile,
+fn display_location(
+    presentation: Presentation<'_>,
     identity: &DiagnosticSource,
     span: Span,
-) -> &'a SourceFile {
-    let Some(sources) = sources else {
-        return fallback;
-    };
-    sources
-        .by_id(span.source)
-        .or_else(|| match identity {
-            DiagnosticSource::Path(path) => sources.by_path(path),
-            DiagnosticSource::Current | DiagnosticSource::Unavailable => None,
-        })
-        .map(|record| &record.source)
-        .unwrap_or(fallback)
-}
-
-fn display_location(source: &SourceFile, identity: &DiagnosticSource, offset: usize) -> String {
-    if matches!(identity, DiagnosticSource::Current)
-        || matches!(identity, DiagnosticSource::Path(path) if path == &source.path)
-    {
-        let (line, column) = display_line_col(source, offset, 4);
-        format!("{}:{line}:{column}", source_name(identity, source))
-    } else if !matches!(identity, DiagnosticSource::Unavailable) {
-        format!("{} at byte {offset}", source_name(identity, source))
-    } else {
-        source_name(identity, source).to_string()
+) -> String {
+    let name = presentation.name(identity, span);
+    match (presentation.file(identity, span), identity) {
+        (Some(source), _) => {
+            let (line, column) = display_line_col(source, span.start, source_excerpt::TAB_WIDTH);
+            format!("{name}:{line}:{column}")
+        }
+        (None, DiagnosticSource::Path(_)) => format!("{name} at byte {}", span.start),
+        (None, _) => name.to_string(),
     }
 }
 
@@ -1464,94 +1588,14 @@ fn display_line_col(source: &SourceFile, byte_index: usize, tab_width: usize) ->
     let (line, _) = source.line_col(safe_index);
     let line_start = source.line_start(line);
     let prefix = source.text.get(line_start..safe_index).unwrap_or("");
-    (line, display_width_with_tabs(prefix, tab_width) + 1)
-}
-
-fn expand_tabs(text: &str, tab_width: usize) -> String {
-    let mut expanded = String::new();
-    let mut width = 0;
-    for character in text.chars() {
-        if character == '\t' {
-            let spaces = tab_width - (width % tab_width);
-            expanded.push_str(&" ".repeat(spaces));
-            width += spaces;
-        } else {
-            expanded.push(character);
-            width += character.width().unwrap_or(0);
-        }
-    }
-    expanded
-}
-
-fn display_width_with_tabs(text: &str, tab_width: usize) -> usize {
-    expand_tabs(text, tab_width).width()
-}
-
-fn truncate_display(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_string();
-    }
-    if width <= 1 {
-        return "…".to_string();
-    }
-    let mut output = String::new();
-    let mut used = 0;
-    for character in text.chars() {
-        let character_width = character.width().unwrap_or(0);
-        if used + character_width >= width {
-            break;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output.push('…');
-    output
-}
-
-fn visible_window(
-    text: &str,
-    marker_start: usize,
-    marker_width: usize,
-    maximum_width: usize,
-) -> (String, usize) {
-    if text.width() <= maximum_width {
-        return (text.to_string(), marker_start);
-    }
-    let content_width = maximum_width.saturating_sub(2).max(1);
-    let desired_start = marker_start
-        .saturating_sub(content_width / 3)
-        .min(text.width().saturating_sub(content_width));
-    let desired_end = desired_start + content_width;
-    let mut output = String::new();
-    let mut display_column = 0;
-    let mut actual_start = desired_start;
-    for character in text.chars() {
-        let width = character.width().unwrap_or(0);
-        let next = display_column + width;
-        if next > desired_start && display_column < desired_end {
-            if output.is_empty() {
-                actual_start = display_column;
-            }
-            output.push(character);
-        }
-        display_column = next;
-        if display_column >= desired_end {
-            break;
-        }
-    }
-    let has_left = actual_start > 0;
-    let has_right = display_column < text.width();
-    if has_left {
-        output.insert(0, '…');
-    }
-    if has_right {
-        output.push('…');
-    }
-    let adjusted = marker_start.saturating_sub(actual_start) + usize::from(has_left);
-    let marker_capacity = maximum_width.saturating_sub(adjusted).max(1);
     (
-        output,
-        adjusted.min(maximum_width.saturating_sub(marker_width.min(marker_capacity))),
+        line,
+        source_excerpt::display_width_with_tabs(
+            prefix,
+            tab_width,
+            doria_unicode::grapheme_boundaries,
+            UnicodeWidthStr::width,
+        ) + 1,
     )
 }
 
@@ -1693,6 +1737,7 @@ pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
         // archive that was selected, which is the one fact that explains it.
         title_family: match code {
             "B0003" => "Runtime Artifact Is Incompatible With This Compiler",
+            "B3602" => "PHP Native Runtime Dependency Is Unavailable",
             _ => match code.as_bytes().first().copied() {
                 Some(b'L') => "Lexical Error",
                 Some(b'P') if runtime => "Runtime Panic",
@@ -1730,12 +1775,15 @@ fn contains_development_stage_reference(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_development_stage_reference, is_title_case, render_diagnostics, ColorChoice,
-        Diagnostic, DiagnosticFormat, DiagnosticKind, DiagnosticSeverity, DiagnosticSource,
-        FixApplicability, FixEdit, LabelRole, RenderOptions, RuntimeOutcomeDetails,
-        RuntimeOutcomeOrigin, TerminationBehavior,
+        contains_development_stage_reference, display_line_col, is_title_case, render_diagnostics,
+        render_label, ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticKind,
+        DiagnosticSeverity, DiagnosticSource, FixApplicability, FixEdit, LabelRole, RenderOptions,
+        RuntimeFact, RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeOrigin,
+        TerminationBehavior,
     };
     use crate::source::{SourceFile, Span};
+    use doria_diagnostic_catalogue::source_excerpt::{self, SourceExcerpt};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn user_facing_diagnostics_reject_numbered_development_stages() {
@@ -1895,6 +1943,70 @@ mod tests {
     }
 
     #[test]
+    fn io_error_progress_remains_optional_in_human_and_json_diagnostics() {
+        let source = SourceFile::new("main.doria", "function main(): void {}\n");
+        for count in [None, Some(0), Some(2048)] {
+            let diagnostic = Diagnostic::runtime_error(
+                crate::compiler_known_io::IO_ERROR,
+                "failed transfer",
+                Span::default(),
+                RuntimeOutcomeDetails {
+                    process_status: 70,
+                    termination_behavior: TerminationBehavior::PropagateWithCleanup,
+                    origin: RuntimeOutcomeOrigin {
+                        source: DiagnosticSource::Unavailable,
+                        span: Span::default(),
+                        function: None,
+                    },
+                    path: Vec::new(),
+                    facts: count
+                        .map(|value| RuntimeFact {
+                            name: doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_FACT
+                                .to_string(),
+                            value: RuntimeFactValue::Signed(value),
+                        })
+                        .into_iter()
+                        .collect(),
+                    error_type: Some(crate::compiler_known_io::IO_ERROR.to_string()),
+                },
+            );
+            let human = render_diagnostics(
+                &source,
+                std::slice::from_ref(&diagnostic),
+                RenderOptions {
+                    color: ColorChoice::Never,
+                    ..RenderOptions::default()
+                },
+            );
+            if let Some(value) = count {
+                assert!(human.contains(&format!("Transferred Byte Count\n  {value}")));
+            } else {
+                assert!(!human.contains("Transferred Byte Count"));
+            }
+            let json = render_diagnostics(
+                &source,
+                &[diagnostic],
+                RenderOptions {
+                    format: DiagnosticFormat::Json,
+                    ..RenderOptions::default()
+                },
+            );
+            let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let facts = json["diagnostics"][0]["runtimeOutcome"]["facts"]
+                .as_array()
+                .unwrap();
+            if let Some(value) = count {
+                assert_eq!(facts.len(), 1);
+                assert_eq!(facts[0]["name"], "transferredByteCount");
+                assert_eq!(facts[0]["kind"], "signedInteger");
+                assert_eq!(facts[0]["value"], value);
+            } else {
+                assert!(facts.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn renderer_aligns_tabs_unicode_multiline_spans_and_narrow_windows() {
         let text = "\t🙂 prefix with a deliberately long description\n\tsecond $value line\n";
         let source = SourceFile::new("unicode.doria", text);
@@ -1921,6 +2033,88 @@ mod tests {
         assert!(rendered.contains("second $value"));
         assert_eq!(rendered.lines().filter(|line| *line == "Help").count(), 2);
         assert!(rendered.lines().filter(|line| line.contains('^')).count() >= 2);
+    }
+
+    #[test]
+    fn source_labels_share_default_windows_and_bounded_late_markers() {
+        let text = "0123456789".repeat(20);
+        let source = SourceFile::new("long.doria", &text);
+        let diagnostic = Diagnostic::new("E0403", "test", Span::new(170, 200))
+            .with_primary_label("Selected Here");
+        let mut rendered = String::new();
+        render_label(
+            &mut rendered,
+            &source.path,
+            Some(&source),
+            &diagnostic.labels[0],
+            RenderOptions {
+                context_lines: 0,
+                ..RenderOptions::default()
+            },
+            None,
+        );
+        assert_eq!(
+            rendered,
+            format!(
+                "long.doria · line 1\n\n  1      …{}\n         {}{}\n         {}Selected Here",
+                &text[114..],
+                " ".repeat(57),
+                "^".repeat(30),
+                " ".repeat(57),
+            )
+        );
+    }
+
+    #[test]
+    fn source_labels_align_tabs_graphemes_multiline_and_empty_lines() {
+        let text = "a\t👩‍💻\te\u{301}界\n\n\tend";
+        let source = SourceFile::new("unicode.doria", text);
+        let diagnostic = Diagnostic::new("E0403", "test", Span::new(2, text.len()))
+            .with_primary_label("Selected Here");
+        let mut rendered = String::new();
+        render_label(
+            &mut rendered,
+            &source.path,
+            Some(&source),
+            &diagnostic.labels[0],
+            RenderOptions {
+                context_lines: 0,
+                ..RenderOptions::default()
+            },
+            None,
+        );
+        assert_eq!(
+            rendered,
+            concat!(
+                "unicode.doria · line 1\n\n",
+                "  1      a   👩‍💻  e\u{301}界\n",
+                "             ^^^^^^^\n",
+                "             Selected Here\n",
+                "  2\n",
+                "         ^\n",
+                "  3          end\n",
+                "         ^^^^^^^",
+            )
+        );
+        assert_eq!(
+            display_line_col(&source, text.find('e').unwrap(), source_excerpt::TAB_WIDTH),
+            (1, 9)
+        );
+
+        let narrow = format!("{}👩‍💻{}", "a".repeat(30), "界".repeat(30));
+        let excerpt = SourceExcerpt::new(
+            &narrow,
+            Some((30, 30 + "👩‍💻".len())),
+            38,
+            doria_unicode::grapheme_boundaries,
+            UnicodeWidthStr::width,
+        );
+        let mut visible = String::new();
+        excerpt.write(|bytes| visible.push_str(std::str::from_utf8(bytes).unwrap()));
+        assert!(visible.contains("👩‍💻"));
+        assert!(visible.starts_with('…') && visible.ends_with('…'));
+        assert!(visible.width() <= source_excerpt::source_width(38));
+        assert_eq!(excerpt.marker_width, 2);
     }
 
     #[test]

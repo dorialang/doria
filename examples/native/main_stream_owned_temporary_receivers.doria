@@ -1,0 +1,58 @@
+use Doria\Std\Io\{ReadableStream, WritableByteRegion, ReadOutcome, IoError};
+
+class Reader implements ReadableStream
+{
+    writable function read(writable WritableByteRegion $destination): ReadOutcome
+    {
+        $destination[0] = 9;
+        return ReadOutcome::Data(1);
+    }
+
+    function __destruct(): void
+    {
+        try { echo "drop reader\n"; } catch (IoError) {}
+    }
+}
+
+interface ReaderFactory
+{
+    function makeReader(): ReadableStream;
+}
+
+class Factory implements ReaderFactory
+{
+    function makeReader(): ReadableStream { return new Reader(); }
+    static function makeStaticReader(): ReadableStream { return new Reader(); }
+}
+
+class Holder
+{
+    writable ReadableStream $reader = new Reader();
+}
+
+function makeReader(): ReadableStream { return new Reader(); }
+
+function readFromFactory(ReaderFactory $factory, writable WritableByteRegion $destination): void
+{
+    $factory->makeReader()->read($destination);
+}
+
+function main(): void
+{
+    writable Bytes $buffer = Bytes::allocate(1);
+    let $factory = new Factory();
+    let $make = function (): ReadableStream { return new Reader(); };
+    {
+        let writable $destination = $buffer->getWritableRegion(0, 1);
+        makeReader()->read($destination);
+        Factory::makeStaticReader()->read($destination);
+        $factory->makeReader()->read($destination);
+        $make()->read($destination);
+        readFromFactory($factory, $destination);
+        (new Holder())->reader->read($destination);
+        writable List<Holder> $holders = [new Holder()];
+        $holders[0]->reader->read($destination);
+        echo "stored reader lives\n";
+    }
+    echo "byte {$buffer[0]}\n";
+}

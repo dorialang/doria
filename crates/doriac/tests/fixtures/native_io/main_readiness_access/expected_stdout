@@ -1,0 +1,10 @@
+byte 97 reads 1
+count 1
+byte 98 reads 2
+foreign true true true
+returned 2
+stale true true true
+drop 2
+byte 97 reads 1
+erased 1
+drop 1

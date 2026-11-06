@@ -1,0 +1,74 @@
+use Doria\Std\Io\{File, FileCreation, FileWriteMode, WritableStream, ByteRegion, ReadOutcome, WriteOutcome, IoError};
+
+function writeErased(writable WritableStream $file, ByteRegion $source): WriteOutcome throws IoError
+{
+    return $file->write($source);
+}
+
+function main(): void
+{
+    write_file("positioned.bin", "ABCD");
+    writable Bytes $message = Bytes::allocate(1);
+    $message[0] = 88;
+    let $source = $message->getRegion(0, 1);
+    writable Bytes $buffer = Bytes::allocate(1);
+    {
+        let writable $first = File::openReadWrite("positioned.bin", FileCreation::OpenExisting, FileWriteMode::Positioned);
+        let writable $second = File::openReadWrite("positioned.bin", FileCreation::OpenExisting, FileWriteMode::Positioned);
+        echo match (writeErased($first, $source)) {
+            WriteOutcome::Accepted($count) => "written {$count}\n",
+            WriteOutcome::WouldBlock => "unexpected would block\n",
+        };
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            $first->read($destination);
+        }
+        echo "first cursor {$buffer[0]}\n";
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            $second->read($destination);
+        }
+        echo "independent cursor {$buffer[0]}\n";
+        $first->close();
+    }
+    echo "positioned " . read_file("positioned.bin") . "\n";
+    {
+        let writable $first = File::openWrite("positioned.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+        let writable $second = File::openWrite("positioned.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+        let $empty = $source->getRegion(1, 0);
+        if ($first->write($empty) == WriteOutcome::Accepted(0)) { echo "empty\n"; }
+        $first->write($source);
+        $second->write($source);
+        $first->write($source);
+        $second->close();
+    }
+    echo "append " . read_file("positioned.bin") . "\n";
+    write_file("duplex.bin", "AB");
+    {
+        let writable $first = File::openReadWrite("duplex.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+        let writable $second = File::openReadWrite("duplex.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            $first->read($destination);
+        }
+        echo "append initial cursor {$buffer[0]}\n";
+        let $empty = $source->getRegion(1, 0);
+        $first->write($empty);
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            $first->read($destination);
+        }
+        echo "append empty cursor {$buffer[0]}\n";
+        $second->write($source);
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            if ($second->read($destination) == ReadOutcome::EndOfStream) { echo "second append eof\n"; }
+        }
+        $first->write($source);
+        {
+            let writable $destination = $buffer->getWritableRegion(0, 1);
+            if ($first->read($destination) == ReadOutcome::EndOfStream) { echo "first append eof\n"; }
+        }
+    }
+    echo "duplex append " . read_file("duplex.bin") . "\n";
+}

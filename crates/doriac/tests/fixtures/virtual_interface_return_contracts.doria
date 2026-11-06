@@ -1,0 +1,79 @@
+interface Read { function value(): int; }
+interface Detailed extends Read { function extra(): int; }
+
+class Reader implements Detailed
+{
+    function value(): int { return 7; }
+    function extra(): int { return 8; }
+    function __destruct() { try { echo "c"; } catch (Error) {} }
+}
+
+open class OpenReader implements Read
+{
+    open function value(): int { return 7; }
+    function __destruct() { try { echo "o"; } catch (Error) {} }
+}
+class LeafReader extends OpenReader { override function value(): int { return 9; } }
+class Failure implements Error { string $message = "failure"; }
+class Token { function __destruct() { try { echo "t"; } catch (Error) {} } }
+
+open class Root
+{
+    Reader $stored = new Reader();
+    open function obtain(bool $fail, take Token $token): Read throws Failure
+    {
+        if ($fail) { throw new Failure(); }
+        return new Reader();
+    }
+    open function optional(bool $present): ?Read
+    {
+        if ($present) { return new Reader(); }
+        return null;
+    }
+    open function details(): Read { return new Reader(); }
+    open function borrowed(): Read { return $this->stored; }
+}
+
+open class Child extends Root
+{
+    override function obtain(bool $fail, take Token $token): OpenReader throws Failure
+    {
+        if ($fail) { throw new Failure(); }
+        return new LeafReader();
+    }
+    override function optional(bool $present): ?OpenReader
+    {
+        if ($present) { return new LeafReader(); }
+        return null;
+    }
+    override function details(): Detailed { return new Reader(); }
+    override function borrowed(): Reader { return $this->stored; }
+}
+class Leaf extends Child {}
+
+function throughRoot(Root $source): void throws Failure
+{
+    { let $value = $source->obtain(false, new Token()); echo $value->value(); }
+    try { $source->obtain(true, new Token()); } catch (Failure) { echo "f"; }
+    { let $value = $source->optional(true); echo $value?->value() ?? 0; }
+    { let $value = $source->optional(false); echo $value?->value() ?? 0; }
+    { let $value = $source->details(); echo $value->value(); }
+    { let $value = $source->borrowed(); echo $value->value(); }
+}
+
+function throughChild(Child $source): void throws Failure
+{
+    { let $value = $source->obtain(false, new Token()); echo $value->value(); }
+    try { $source->obtain(true, new Token()); } catch (Failure) { echo "f"; }
+    { let $value = $source->optional(true); echo $value?->value() ?? 0; }
+    { let $value = $source->optional(false); echo $value?->value() ?? 0; }
+    { let $value = $source->details(); echo $value->extra(); }
+    { let $value = $source->borrowed(); echo $value->value(); }
+}
+
+function main(): void
+{
+    let $source = new Leaf();
+    throughRoot($source);
+    throughChild($source);
+}

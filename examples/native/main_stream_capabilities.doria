@@ -1,0 +1,211 @@
+use Doria\Std\Io\{ByteRegion, WritableByteRegion, ReadOutcome, WriteOutcome, FlushOutcome, ReadableStream, WritableStream, DuplexStream, FlushableStream, IoError, IoOperation, IoTarget, IoErrorReason};
+
+class ChunkStream implements DuplexStream, FlushableStream
+{
+    writable int $position = 0;
+    writable int $written = 0;
+    writable bool $flushed = false;
+    writable bool $fail = false;
+
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError
+    {
+        if ($destination->length == 0) { return ReadOutcome::Data(0); }
+        if ($this->fail) {
+            $destination[0] = 7;
+            throw new IoError("fixture read failed", IoOperation::Read, IoTarget::StandardInput, IoErrorReason::Other, null, 1);
+        }
+        if ($this->position == 0) {
+            $destination[0] = 42;
+            $this->position = 1;
+            return ReadOutcome::Data(1);
+        }
+        if ($this->position == 1) {
+            $this->position = 2;
+            return ReadOutcome::WouldBlock;
+        }
+        return ReadOutcome::EndOfStream;
+    }
+
+    writable function write(ByteRegion $source): WriteOutcome throws IoError
+    {
+        $this->written = $source->length;
+        return WriteOutcome::Accepted($source->length);
+    }
+
+    writable function flush(): FlushOutcome throws IoError
+    {
+        $this->flushed = true;
+        return FlushOutcome::Complete;
+    }
+}
+
+class FlushDestination implements WritableStream
+{
+    writable int $attempt = 0;
+
+    writable function write(ByteRegion $source): WriteOutcome throws IoError
+    {
+        $this->attempt++;
+        if ($this->attempt == 2 || $this->attempt == 3) { return WriteOutcome::WouldBlock; }
+        echo "flushed byte {$source[0]}\n";
+        if ($this->attempt == 4) {
+            throw new IoError("fixture flush failed", IoOperation::Write, IoTarget::StandardOutput, IoErrorReason::Other, null, 1);
+        }
+        return WriteOutcome::Accepted(1);
+    }
+}
+
+class RetainedFlush implements FlushableStream
+{
+    function __construct(take Bytes $bytes) {}
+    writable FlushDestination $destination = new FlushDestination();
+    writable int $offset = 0;
+
+    writable function flush(): FlushOutcome throws IoError
+    {
+        while ($this->offset < $this->bytes->length) {
+            let $remaining = $this->bytes->getRegion($this->offset, $this->bytes->length - $this->offset);
+            try {
+                let $outcome = $this->destination->write($remaining);
+                if ($outcome == WriteOutcome::WouldBlock) { return FlushOutcome::Pending; }
+                $this->offset += match ($outcome) {
+                    WriteOutcome::Accepted($byteCount) => $byteCount,
+                    WriteOutcome::WouldBlock => 0,
+                };
+            } catch (IoError $error) {
+                let $progress = $error->transferredByteCount;
+                if ($progress != null) { $this->offset += $progress; }
+                throw $error;
+            }
+        }
+        return FlushOutcome::Complete;
+    }
+}
+
+function readConcrete<S implements ReadableStream>(writable S $stream, writable WritableByteRegion $destination): ReadOutcome throws IoError
+{
+    return $stream->read($destination);
+}
+
+function readErased(writable ReadableStream $stream, writable WritableByteRegion $destination): ReadOutcome throws IoError
+{
+    return $stream->read($destination);
+}
+
+function writeErased(writable WritableStream $stream, ByteRegion $source): WriteOutcome throws IoError
+{
+    return $stream->write($source);
+}
+
+function flushErased(writable FlushableStream $stream): FlushOutcome throws IoError { return $stream->flush(); }
+function flushConcrete<S implements FlushableStream>(writable S $stream): FlushOutcome throws IoError { return $stream->flush(); }
+
+function describeFlush(FlushOutcome $outcome): string
+{
+    return match ($outcome) {
+        FlushOutcome::Complete => "complete",
+        FlushOutcome::Pending => "pending",
+    };
+}
+
+function describe(ReadOutcome $outcome): string
+{
+    return match ($outcome) {
+        ReadOutcome::Data($byteCount) => "data {$byteCount}",
+        ReadOutcome::WouldBlock => "would block",
+        ReadOutcome::EndOfStream => "end",
+        ReadOutcome::TimedOut => "timed out",
+    };
+}
+
+function forwardRead(?ReadOutcome $outcome): ?ReadOutcome { return $outcome; }
+function forwardWrite(?WriteOutcome $outcome): ?WriteOutcome { return $outcome; }
+
+function describeOptionalRead(?ReadOutcome $outcome): string
+{
+    return match ($outcome) {
+        null => "absent",
+        ReadOutcome::Data($byteCount) => "data {$byteCount}",
+        ReadOutcome::WouldBlock => "would block",
+        ReadOutcome::EndOfStream => "end",
+        ReadOutcome::TimedOut => "timed out",
+    };
+}
+
+function describeOptionalWrite(?WriteOutcome $outcome): string
+{
+    return match ($outcome) {
+        null => "absent",
+        WriteOutcome::Accepted($byteCount) => "accepted {$byteCount}",
+        WriteOutcome::WouldBlock => "would block",
+    };
+}
+
+function main(): void
+{
+    let writable $stream = new ChunkStream();
+    writable Bytes $buffer = Bytes::allocate(4);
+    {
+        let writable $destination = $buffer->getWritableRegion(0, 4);
+        echo describe(readConcrete($stream, $destination)) . "\n";
+        echo describe(readErased($stream, $destination)) . "\n";
+        echo describe(readErased($stream, $destination)) . "\n";
+    }
+    echo "byte {$buffer[0]}\n";
+    {
+        let writable $empty = $buffer->getWritableRegion(4, 0);
+        echo describe(readErased($stream, $empty)) . "\n";
+    }
+    let $outcome = writeErased($stream, $buffer->getRegion(0, 1));
+    echo match ($outcome) {
+        WriteOutcome::Accepted($byteCount) => "accepted {$byteCount}\n",
+        WriteOutcome::WouldBlock => "would block\n",
+    };
+    if (flushErased($stream) != FlushOutcome::Complete) { panic("synchronous flush incomplete"); }
+    if ($stream->flushed) { echo "flushed {$stream->written}\n"; }
+    echo describe(ReadOutcome::TimedOut) . "\n";
+    echo match (WriteOutcome::WouldBlock) {
+        WriteOutcome::Accepted($byteCount) => "accepted {$byteCount}\n",
+        WriteOutcome::WouldBlock => "would block\n",
+    };
+    $stream->fail = true;
+    {
+        let writable $destination = $buffer->getWritableRegion(0, 4);
+        try { readConcrete($stream, $destination); }
+        catch (IoError $error) { echo "concrete failure {$error->transferredByteCount ?? -1}\n"; }
+        try { readErased($stream, $destination); }
+        catch (IoError $error) { echo "erased failure {$error->transferredByteCount ?? -1}\n"; }
+    }
+    echo "partial byte {$buffer[0]}\n";
+    echo "optional read " . describeOptionalRead(forwardRead(null)) . "\n";
+    echo "optional read " . describeOptionalRead(forwardRead(ReadOutcome::Data(0))) . "\n";
+    echo "optional read " . describeOptionalRead(forwardRead(ReadOutcome::Data(3))) . "\n";
+    echo "optional read " . describeOptionalRead(forwardRead(ReadOutcome::WouldBlock)) . "\n";
+    echo "optional read " . describeOptionalRead(forwardRead(ReadOutcome::EndOfStream)) . "\n";
+    echo "optional read " . describeOptionalRead(forwardRead(ReadOutcome::TimedOut)) . "\n";
+    echo "optional write " . describeOptionalWrite(forwardWrite(null)) . "\n";
+    echo "optional write " . describeOptionalWrite(forwardWrite(WriteOutcome::Accepted(0))) . "\n";
+    echo "optional write " . describeOptionalWrite(forwardWrite(WriteOutcome::Accepted(3))) . "\n";
+    echo "optional write " . describeOptionalWrite(forwardWrite(WriteOutcome::WouldBlock)) . "\n";
+    let writable $bytes = Bytes::allocate(3);
+    $bytes[0] = 10;
+    $bytes[1] = 20;
+    $bytes[2] = 30;
+    let writable $retained = new RetainedFlush($bytes);
+    let $firstFlush = flushConcrete($retained);
+    echo "flush " . describeFlush($firstFlush) . ":{$retained->offset}\n";
+    let $secondFlush = flushErased($retained);
+    echo "flush " . describeFlush($secondFlush) . ":{$retained->offset}\n";
+    try { flushConcrete($retained); }
+    catch (IoError $error) {
+        if ($error->operation != IoOperation::Write || $error->message != "fixture flush failed") {
+            panic("flush replaced original failure");
+        }
+        echo "flush failed {$error->transferredByteCount ?? -1}:{$retained->offset}\n";
+    }
+    let $retriedFlush = flushErased($retained);
+    echo "flush " . describeFlush($retriedFlush) . ":{$retained->offset}\n";
+    let $completedFlush = $retained->flush();
+    echo "flush " . describeFlush($completedFlush) . ":{$retained->offset}\n";
+    echo "retained {$retained->bytes[0]}:{$retained->bytes[1]}:{$retained->bytes[2]}\n";
+}

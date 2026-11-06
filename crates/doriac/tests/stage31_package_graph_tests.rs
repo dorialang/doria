@@ -1,3 +1,6 @@
+#[path = "common/php_execution.rs"]
+mod php_execution;
+
 use doriac::build_plan::{
     BuildNativeProfile, BuildPlan, BuildPlanDocument, CompilerOptions, CompilerTarget, Dependency,
     DependencyKind, GeneratedFor, NamespaceMapping, Package, SelectedTarget, Source, SourceOrigin,
@@ -10,6 +13,12 @@ use doriac::compilation_graph::{
 };
 use doriac::source_provider::InMemorySourceProvider;
 use std::process::Command;
+
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/native_execution_runner.rs"]
+mod panic_native_execution;
 
 fn source(package: &str, path: &str, origin: SourceOrigin) -> Source {
     Source {
@@ -101,6 +110,136 @@ fn strict_schema_rejects_unknown_fields() {
     assert!(diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "E0676"));
+}
+
+#[test]
+fn php_collection_fill_count_registers_its_non_entry_source_span() {
+    let package_name = "acme/application";
+    let helper = "function negativeCount(): int { return -2; }\nfunction makeFlags(): void { bool[] $flags = [true; negativeCount()]; }\n";
+    let mut document = plan(
+        vec![package(
+            package_name,
+            vec![
+                source(package_name, "main.doria", SourceOrigin::Entry),
+                source(package_name, "helpers.doria", SourceOrigin::Explicit),
+            ],
+            Vec::new(),
+        )],
+        "acme/application:main.doria",
+    );
+    document.plan.compiler.target = CompilerTarget::Php;
+    document.plan.compiler.native_profile = None;
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        package_name,
+        "main.doria",
+        "function main(): void { makeFlags(); }",
+    );
+    provider.insert(package_name, "helpers.doria", helper);
+    let graph = load_compilation_graph(&document, &provider).expect("complete source graph");
+    let hir = doriac::lower_compilation_graph(&graph).expect("checked source graph");
+    let helper_source = hir
+        .sources
+        .iter()
+        .find(|source| source.identity.0 == "acme/application:helpers.doria")
+        .unwrap();
+    assert_ne!(helper_source.id, doriac::source::SourceId(0));
+    let start = helper.rfind("negativeCount()").unwrap() as u64;
+    let end = start + "negativeCount()".len() as u64;
+    let source_bits = u64::from(helper_source.id.0) << 32;
+    let output = doriac::compile_compilation_graph(&graph).expect("PHP source emission");
+    let doriac::backend::BackendOutput::Text { contents: php, .. } = output else {
+        panic!("this fixture requires no native PHP runtime dependency");
+    };
+    let output = php_execution::Script::new(&format!(
+        "{}\necho json_encode(array_values($__doria_diagnostic_sites), JSON_THROW_ON_ERROR);",
+        php.strip_prefix("<?php").unwrap(),
+    ))
+    .command(&["-d", "ffi.enable=0"])
+    .env_remove("DORIA_RUNTIME_OUTCOME_V2")
+    .output()
+    .expect("PHP is required for source-identified diagnostic metadata parity");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let sites: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        sites.iter().any(|site| {
+            site["known"] == true
+                && site["start"].as_u64() == Some(source_bits | start)
+                && site["end"].as_u64() == Some(source_bits | end)
+        }),
+        "the exact source-identified fill-count span is absent: {sites:#?}"
+    );
+}
+
+#[test]
+fn php_multifile_recursive_caller_paths_match_the_interpreter_and_native_profiles() {
+    let package_name = "acme/application";
+    let mut document = plan(
+        vec![package(
+            package_name,
+            vec![
+                source(package_name, "main.doria", SourceOrigin::Entry),
+                source(package_name, "helpers.doria", SourceOrigin::Explicit),
+                source(package_name, "leaf.doria", SourceOrigin::Explicit),
+            ],
+            Vec::new(),
+        )],
+        "acme/application:main.doria",
+    );
+    document.plan.compiler.target = CompilerTarget::Php;
+    document.plan.compiler.native_profile = None;
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        package_name,
+        "main.doria",
+        "function main(): void { relay(2); }",
+    );
+    provider.insert(
+        package_name,
+        "helpers.doria",
+        r#"
+function argument(): int { return 7; }
+function relay(int $depth): void {
+    if ($depth > 0) { relay($depth - 1); return; }
+    leaf(argument());
+}
+"#,
+    );
+    provider.insert(
+        package_name,
+        "leaf.doria",
+        "function leaf(int $value): void { panic(\"multi-file\"); }",
+    );
+    let graph = load_compilation_graph(&document, &provider).expect("complete source graph");
+    let mir = doriac::lower_compilation_graph_to_mir(&graph).expect("checked multi-source MIR");
+    let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
+    assert_eq!(expected.exit_status, 101);
+    let output = doriac::compile_compilation_graph(&graph).expect("PHP source emission");
+    let doriac::backend::BackendOutput::Text { contents: php, .. } = output else {
+        panic!("this fixture requires no native PHP runtime dependency");
+    };
+    let output = php_execution::Script::new(&format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").unwrap(),
+    ))
+    .command(&["-d", "ffi.enable=0"])
+    .env_remove("DORIA_RUNTIME_OUTCOME_V2")
+    .output()
+    .expect("PHP caller-path parity");
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    assert_eq!(output.stdout, expected.stdout);
+    assert_eq!(output.stderr, expected.stderr);
+    let mut profiles = vec![doriac::backend::NativeProfile::Fast];
+    if cfg!(feature = "llvm-backend") {
+        profiles.push(doriac::backend::NativeProfile::Release);
+    }
+    for profile in profiles {
+        let output = panic_native_execution::execute_native(&mir, profile);
+        assert_eq!(output.status.code(), Some(101), "{profile:?}: {output:?}");
+        assert_eq!(output.stdout, expected.stdout, "{profile:?}");
+        assert_eq!(output.stderr, expected.stderr, "{profile:?}");
+    }
 }
 
 #[test]

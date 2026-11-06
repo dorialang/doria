@@ -1,0 +1,111 @@
+class Trace {
+    static writable int $order = 0;
+    static writable int $drops = 0;
+    static writable int $receivers = 0;
+}
+class Counter {
+    writable int $value = 10;
+    writable float64 $real = 1.0;
+    writable uint8 $small = 10;
+    function __destruct(): void {
+        Trace::drops++;
+        Trace::order = Trace::order * 10 + 5;
+    }
+}
+class Box {
+    writable Counter $counter;
+    function __construct(parameter take Counter $counter) { $this->counter = $counter; }
+}
+class Hidden {
+    internal writable int $value = 0;
+    writable function exercise(int $iterations): int {
+        foreach (0..<$iterations as int $index) {
+            $this->value += 3;
+            $this->value++;
+            --$this->value;
+            $this->value -= 2;
+        }
+        return $this->value;
+    }
+}
+class Failure implements Error { function __construct(string $message) {} }
+class Operand { function __destruct(): void { Trace::order = Trace::order * 10 + 4; } }
+class TemporaryTarget {
+    writable int $value = 10 {
+        get => $this->value;
+        set (int $next) => $this->value = $next;
+    }
+    function __destruct(): void {
+        Trace::drops++;
+        Trace::order = Trace::order * 10 + 5;
+    }
+}
+function target(): TemporaryTarget {
+    Trace::receivers++;
+    Trace::order = Trace::order * 10 + 1;
+    return new TemporaryTarget();
+}
+function right(Operand $operand): int {
+    Trace::order = Trace::order * 10 + 2;
+    return 3;
+}
+function failed(Operand $operand): int throws Failure {
+    Trace::order = Trace::order * 10 + 2;
+    throw new Failure("rhs");
+}
+function hot(int $iterations): int {
+    Trace::order = 0;
+    Trace::drops = 0;
+    let writable $box = new Box(new Counter());
+    foreach (0..<$iterations as int $index) {
+        $box->counter->value += 3;
+        $box->counter->value++;
+        --$box->counter->value;
+        $box->counter->value -= 2;
+        $box->counter->real *= 2.0;
+        $box->counter->real /= 2.0;
+        $box->counter->small++;
+        $box->counter->small--;
+    }
+    if ($box->counter->real != 1.0 || $box->counter->small != 10) { panic("numeric width changed"); }
+    return $box->counter->value - 10;
+}
+function hidden(int $iterations): int {
+    let writable $counter = new Hidden();
+    return $counter->exercise($iterations);
+}
+function forHeader(int $iterations): int {
+    Trace::order = 0;
+    let writable $box = new Box(new Counter());
+    $box->counter->value = 0;
+    for (; $box->counter->value < $iterations; $box->counter->value++) {
+        continue;
+    }
+    return $box->counter->value;
+}
+function oldValue(): int {
+    Trace::order = 0;
+    let writable $counter = new Counter();
+    $counter->value += when (true): int {
+        Trace::order = 2;
+        return 3;
+    } else { return 0; };
+    return $counter->value;
+}
+function cleanup(): string {
+    Trace::order = 0;
+    Trace::receivers = 0;
+    Trace::drops = 0;
+    target()->value += right(new Operand());
+    let $success = Trace::order;
+    Trace::order = 0;
+    try { target()->value += failed(new Operand()); } catch (Failure) {}
+    let $failure = Trace::order;
+    Trace::order = 0;
+    target()->value++;
+    if (Trace::receivers != 3 || Trace::drops != 3) { panic("receiver lifetime changed"); }
+    return $success . ";" . $failure . ";" . Trace::order;
+}
+function main(): void {
+    echo hot(4) . ";" . hidden(4) . ";" . forHeader(4) . ";" . oldValue() . ";" . cleanup();
+}

@@ -4,11 +4,11 @@ Where
 examples/native/main_stage23_bytes_oob_panic.doria · line 5 · main
 
   5          echo "{$bytes[1]}";
-             ^^^^^^^^^^^^^^^^^^^
-             Invalid Byte Index
+                    ^^^^^^^^^
+                    Invalid Byte Index
 
 Why
-The byte index is outside the valid range of this Bytes value.
+The byte index is outside the valid range of this byte buffer or region.
 
 Call Path
 main · examples/native/main_stage23_bytes_oob_panic.doria:5

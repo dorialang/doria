@@ -1,0 +1,55 @@
+open class Root
+{
+    open function values(): Iterable<int> { return [5, 6]; }
+    open function input(): Doria\Std\Io\ReadableStream { return Doria\Std\Io\StandardStreams::input; }
+    open function output(): Doria\Std\Io\WritableStream { return Doria\Std\Io\StandardStreams::output; }
+    open function optionalOutput(bool $present): ?Doria\Std\Io\WritableStream
+    {
+        if ($present) { return Doria\Std\Io\StandardStreams::output; }
+        return null;
+    }
+}
+
+open class Child extends Root
+{
+    override function values(): List<int> { return [7, 8]; }
+    override function input(): Doria\Std\Io\StandardInput { return Doria\Std\Io\StandardStreams::input; }
+    override function output(): Doria\Std\Io\StandardOutput { return Doria\Std\Io\StandardStreams::output; }
+    override function optionalOutput(bool $present): ?Doria\Std\Io\StandardOutput
+    {
+        if ($present) { return Doria\Std\Io\StandardStreams::output; }
+        return null;
+    }
+}
+class Leaf extends Child {}
+
+function throughRoot(Root $source): void
+{
+    let $input = $source->input();
+    echo $input is Doria\Std\Io\StandardInput;
+    let $output = $source->output();
+    echo $output is Doria\Std\Io\StandardOutput;
+    let $values = $source->values();
+    foreach ($values as int $value) { echo $value; }
+    echo $source->optionalOutput(true) != null;
+    echo $source->optionalOutput(false) != null;
+}
+
+function throughChild(Child $source): void
+{
+    let $input = $source->input();
+    echo $input == Doria\Std\Io\StandardStreams::input;
+    let $output = $source->output();
+    echo $output == Doria\Std\Io\StandardStreams::output;
+    let $values = $source->values();
+    echo $values->count;
+    echo $source->optionalOutput(true) != null;
+    echo $source->optionalOutput(false) != null;
+}
+
+function main(): void
+{
+    let $source = new Leaf();
+    throughRoot($source);
+    throughChild($source);
+}

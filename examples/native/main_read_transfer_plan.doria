@@ -1,0 +1,52 @@
+use Doria\Std\Io\{TransferPlan, PendingReadableStream, RegistrationKey,
+    ReadinessSet, WritableByteRegion, File, IoError, IoOperation, IoTarget, IoErrorReason};
+
+function configure<T implements PendingReadableStream>(
+    RegistrationKey<T> $key, writable WritableByteRegion $destination
+): TransferPlan throws IoError {
+    return TransferPlan::read($key, $destination);
+}
+
+function append<T implements PendingReadableStream>(
+    take TransferPlan $plan, RegistrationKey<T> $key, writable WritableByteRegion $destination
+): TransferPlan throws IoError {
+    return $plan->andReadFrom($key, $destination);
+}
+
+function forward(take TransferPlan $plan): TransferPlan { return $plan; }
+
+function main(): void {
+    write_file("input", "unread bytes\n");
+    writable ReadinessSet $set = new ReadinessSet();
+    let $firstKey = $set->register(File::openRead("input"));
+    let $secondKey = $set->register(File::openRead("input"));
+    writable ReadinessSet $other = new ReadinessSet();
+    let $foreignKey = $other->register(File::openRead("input"));
+    writable Bytes $first = Bytes::allocate(2);
+    writable Bytes $second = Bytes::allocate(2);
+    writable Bytes $empty = Bytes::allocate(0);
+    {
+        let $plan = forward(append(
+            configure($firstKey, $first->getWritableRegion(0, 2)),
+            $secondKey, $second->getWritableRegion(0, 2)
+        )->andReadFrom($firstKey, $empty->getWritableRegion(0, 0)));
+        echo "configured without reading\n";
+    }
+    echo "unchanged {$first[0]}:{$second[0]}\n";
+    try {
+        let $plan = configure($firstKey, $first->getWritableRegion(0, 2));
+        let $replacement = $plan->andReadFrom($foreignKey, $second->getWritableRegion(0, 2));
+        panic("foreign key accepted");
+    } catch (IoError $error) {
+        if ($error->operation != IoOperation::Configure
+            or $error->target != IoTarget::TransferPlan
+            or $error->reason != IoErrorReason::InvalidInput
+            or $error->systemCode != null or $error->transferredByteCount != null) {
+            panic("wrong setup failure");
+        }
+        echo "foreign key rejected\n";
+    }
+    $first[0] = 7;
+    $second[0] = 9;
+    echo "reused {$first[0]}:{$second[0]}\n";
+}

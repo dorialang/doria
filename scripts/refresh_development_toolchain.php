@@ -3,10 +3,25 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/cargo_artifacts.php';
+
+// Policy tests import the production identity helpers without refreshing.
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') !== __FILE__) {
+    return;
+}
+
 $root = dirname(__DIR__);
 $languageServerRoot = null;
+$identityJson = false;
 
 for ($index = 1; $index < count($argv); $index++) {
+    if ($argv[$index] === '--identity-json') {
+        if ($identityJson) {
+            fail('--identity-json may only be specified once');
+        }
+        $identityJson = true;
+        continue;
+    }
     if ($argv[$index] !== '--language-server') {
         fail("unknown option `{$argv[$index]}`");
     }
@@ -43,15 +58,29 @@ if (!is_file($languageServerRoot . DIRECTORY_SEPARATOR . 'scripts' . DIRECTORY_S
 }
 
 $commit = trim(capture(['git', 'rev-parse', 'HEAD'], $root));
-$compilerStatus = repository_status($root);
-$compilerRevision = $compilerStatus === ''
-    ? $commit
-    : development_revision($root, $commit);
+$compilerStatus = repository_status($root, $identityJson);
+$compilerRevision = source_revision($root, $commit, $compilerStatus);
 $languageServerCommit = trim(capture(['git', 'rev-parse', 'HEAD'], $languageServerRoot));
-$languageServerStatus = repository_status($languageServerRoot);
-$languageServerRevision = $languageServerStatus === ''
-    ? $languageServerCommit
-    : development_revision($languageServerRoot, $languageServerCommit);
+$languageServerStatus = repository_status($languageServerRoot, $identityJson);
+$languageServerRevision = source_revision(
+    $languageServerRoot,
+    $languageServerCommit,
+    $languageServerStatus,
+);
+
+// Read-only source provenance uses exactly the same identities as refresh.
+// Return before install-root discovery, tool probes, builds, or cache cleanup.
+if ($identityJson) {
+    fwrite(STDOUT, json_encode([
+        'schemaVersion' => 1,
+        'compilerCommit' => $compilerRevision,
+        'compilerHeadCommit' => $commit,
+        'languageServerCommit' => $languageServerRevision,
+        'languageServerHeadCommit' => $languageServerCommit,
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
+    exit(0);
+}
+
 $cargoRoot = cargo_install_root();
 $executableSuffix = PHP_OS_FAMILY === 'Windows' ? '.exe' : '';
 $compiler = $cargoRoot . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'doriac'
@@ -63,7 +92,12 @@ $managedTarget = getenv('DORIA_VALIDATION_TARGET_DIR');
 $managedTarget = is_string($managedTarget) && $managedTarget !== ''
     ? absolute_path($managedTarget, $root)
     : $root . DIRECTORY_SEPARATOR . 'target';
-$environment = current_environment();
+try {
+    $managedTarget = doria_prepare_managed_target($managedTarget, $root, true);
+} catch (RuntimeException $error) {
+    fail($error->getMessage());
+}
+$environment = doria_build_environment($managedTarget);
 $environment['CARGO_INSTALL_ROOT'] = $cargoRoot;
 $installTarget = $managedTarget
     . DIRECTORY_SEPARATOR
@@ -109,7 +143,7 @@ require_executable($languageServer, 'installed doria-lsp');
 // workflow cannot accidentally certify a compiler that still references files
 // beneath it.
 run(['cargo', 'clean', '--target-dir', $installTarget], $root, $environment);
-verify_installed_native_compiler($compiler);
+verify_installed_native_compiler($compiler, $environment);
 
 $compilerIdentity = decode_json(capture([$compiler, '--version', '--json'], $root));
 if (($compilerIdentity['commit'] ?? null) !== $compilerRevision) {
@@ -141,10 +175,21 @@ fwrite(
         . "    {$languageServer}\n"
 );
 
-function repository_status(string $path): string
+function source_revision(string $path, string $headCommit, string $status): string
 {
+    return $status === '' ? $headCommit : development_revision($path, $headCommit);
+}
+
+function repository_status(string $path, bool $readOnly = false): string
+{
+    $command = ['git'];
+    if ($readOnly) {
+        // Even an index-stat refresh is unnecessary for a read-only query.
+        $command[] = '--no-optional-locks';
+    }
+    array_push($command, 'status', '--porcelain=v1', '--untracked-files=all');
     return trim(capture(
-        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        $command,
         $path,
     ));
 }
@@ -226,6 +271,20 @@ function capture(
     ?array $environment = null,
 ): string
 {
+    $result = capture_result($command, $workingDirectory, $environment);
+    if ($result['status'] !== 0) {
+        fail(trim($result['stderr']) ?: 'command failed: ' . display_command($command));
+    }
+    return $result['stdout'];
+}
+
+/** @param list<string> $command @return array{status: int, stdout: string, stderr: string} */
+function capture_result(
+    array $command,
+    string $workingDirectory,
+    ?array $environment = null,
+): array
+{
     $process = proc_open(
         $command,
         [
@@ -245,11 +304,11 @@ function capture(
     fclose($pipes[1]);
     fclose($pipes[2]);
     $status = proc_close($process);
-    if ($status !== 0) {
-        fail(trim($stderr ?: '') ?: 'command failed: ' . display_command($command));
-    }
-
-    return $stdout === false ? '' : $stdout;
+    return [
+        'status' => $status,
+        'stdout' => $stdout === false ? '' : $stdout,
+        'stderr' => $stderr === false ? '' : $stderr,
+    ];
 }
 
 /**
@@ -314,9 +373,10 @@ function require_executable(string $path, string $label): void
     }
 }
 
-function verify_installed_native_compiler(string $compiler): void
+/** @param array<string, string> $environment */
+function verify_installed_native_compiler(string $compiler, array $environment): void
 {
-    $directory = sys_get_temp_dir()
+    $directory = $environment['TMPDIR']
         . DIRECTORY_SEPARATOR
         . 'doria-installed-compiler-smoke-'
         . bin2hex(random_bytes(8));
@@ -328,7 +388,7 @@ function verify_installed_native_compiler(string $compiler): void
     });
 
     try {
-        $probeEnvironment = current_environment();
+        $probeEnvironment = $environment;
         unset($probeEnvironment['DORIA_RT_PATH']);
         $probeTarget = $directory . DIRECTORY_SEPARATOR . 'empty-cargo-target';
         if (!mkdir($probeTarget, 0700, true) && !is_dir($probeTarget)) {
@@ -374,8 +434,109 @@ DORIA;
                     . describe($output)
             );
         }
+        verify_installed_php_compiler($compiler, $probeEnvironment, $directory);
+        if (scandir($probeTarget) !== ['.', '..']) {
+            fail('installed compiler verification populated its isolated empty Cargo target');
+        }
     } finally {
         remove_tree($directory);
+    }
+}
+
+/** @param array<string, string> $environment @param list<string> $phpOptions */
+function verify_installed_php_compiler(string $compiler, array $environment, string $directory, array $phpOptions = []): void
+{
+    $root = dirname(__DIR__);
+    $availability = capture_result([
+        PHP_BINARY, ...$phpOptions, '-r', 'echo extension_loaded("FFI") ? "available" : "absent";',
+    ], $directory, $environment);
+    if ($availability['status'] !== 0 || $availability['stderr'] !== ''
+        || !in_array($availability['stdout'], ['available', 'absent'], true)) {
+        fail('could not determine PHP FFI availability: ' . describe($availability));
+    }
+    $ffiAvailable = $availability['stdout'] === 'available';
+    foreach (['main_stream_capabilities' => false, 'main_stream_writable_file' => true] as $fixture => $native) {
+        $published = $directory . DIRECTORY_SEPARATOR . $fixture;
+        $php = $published . DIRECTORY_SEPARATOR . 'main.php';
+        run([
+            $compiler, 'compile', $root . '/examples/native/' . $fixture . '.doria',
+            '--target', 'php', '--out', $php,
+            '--diagnostic-color', 'never',
+        ], $directory, $environment);
+        $relocated = $published . '-relocated';
+        if (!rename($published, $relocated)) {
+            fail('could not relocate installed-compiler PHP publication');
+        }
+        $php = $relocated . DIRECTORY_SEPARATOR . 'main.php';
+        $runtime = $relocated . DIRECTORY_SEPARATOR . '.doria-runtime';
+        if (is_dir($runtime) !== $native) {
+            fail("installed compiler published incorrect PHP dependencies for {$fixture}");
+        }
+        $sidecars = $native ? verify_php_runtime_assets($runtime) : [];
+        $result = capture_result(
+            [PHP_BINARY, ...$phpOptions, '-d', $native ? 'ffi.enable=1' : 'ffi.enable=0', $php],
+            $relocated,
+            $environment,
+        );
+        if ($native && !$ffiAvailable) {
+            require_php_dependency_diagnostic($result);
+            fwrite(STDOUT, "PHP native-backed execution unavailable (FFI extension absent); positive execution skipped. Published assets and B3602 verified.\n");
+            continue;
+        }
+        $golden = $root . '/crates/doriac/tests/fixtures/native_io/' . $fixture;
+        foreach (['status', 'stdout', 'stderr'] as $field) {
+            $expected = file_get_contents($golden . '/expected_' . $field);
+            if ($expected === false || $result[$field] !== ($field === 'status' ? (int) trim($expected) : $expected)) {
+                fail("installed compiler PHP probe {$fixture} has unexpected {$field}: " . describe($result[$field]));
+            }
+        }
+        if (!$native) {
+            continue;
+        }
+        foreach (['positioned.bin' => 'XBCDXXX', 'duplex.bin' => 'ABXX'] as $file => $expected) {
+            if (file_get_contents($relocated . DIRECTORY_SEPARATOR . $file) !== $expected) {
+                fail("installed compiler PHP probe produced incorrect file bytes for {$file}");
+            }
+        }
+        require_php_dependency_diagnostic(capture_result(
+            [PHP_BINARY, ...$phpOptions, '-d', 'ffi.enable=0', $php], $relocated, $environment,
+        ));
+        if (!unlink($sidecars[0])) {
+            fail('could not isolate the published PHP runtime sidecar for the missing-dependency probe');
+        }
+        require_php_dependency_diagnostic(capture_result(
+            [PHP_BINARY, ...$phpOptions, '-d', 'ffi.enable=1', $php], $relocated, $environment,
+        ));
+        fwrite(STDOUT, "PHP native-backed execution validated after relocation.\n");
+    }
+}
+
+/** @return list<string> */
+function verify_php_runtime_assets(string $runtime): array
+{
+    $sidecars = glob($runtime . '/*/*.doria-runtime.json');
+    if ($sidecars === false || count($sidecars) !== 1) {
+        fail('published PHP runtime must contain one identified shared library');
+    }
+    $metadata = json_decode(file_get_contents($sidecars[0]) ?: '', true);
+    $library = substr($sidecars[0], 0, -strlen('.doria-runtime.json'));
+    if (!is_array($metadata) || ($metadata['artifactKind'] ?? null) !== 'shared'
+        || ($metadata['featureSet'] ?? null) !== ['hosted-shared-runtime']
+        || !is_file($library) || filesize($library) !== ($metadata['bytes'] ?? null)
+        || hash_file('sha256', $library) !== ($metadata['sha256'] ?? null)) {
+        fail('published PHP runtime bytes or metadata are invalid');
+    }
+    return $sidecars;
+}
+
+/** @param array{status: int, stdout: string, stderr: string} $result */
+function require_php_dependency_diagnostic(array $result): void
+{
+    if ($result['status'] !== 1 || $result['stdout'] !== ''
+        || !str_contains($result['stderr'], 'Error[B3602]')
+        || str_contains($result['stderr'], 'Fatal error')
+        || str_contains($result['stderr'], 'Stack trace')) {
+        fail('installed compiler PHP dependency probe did not report B3602: ' . describe($result));
     }
 }
 

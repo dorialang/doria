@@ -55,7 +55,7 @@
         "publicSpellingStatus": "deferred",
         "stage26Blocked": false,
         "stage26Status": "next",
-        "stage36aStatus": "scheduled",
+        "stage36aStatus": "in-progress",
         "stage36aImplemented": false
     },
     "performance": {
@@ -1319,7 +1319,13 @@
             "migrationAction": "Direct Typed Rewrite",
             "byteTextSemantics": "bytes",
             "semanticDifferences": [
-                "Mutated arrays become a typed readiness result"
+                "Mutated arrays become a typed readiness result",
+                "Persistent registration transfers stream ownership; removal returns ownership and set destruction cleans up remaining streams",
+                "Typed registration preserves the registered static type T; removal returns owned T without automatic erasure or runtime type discovery",
+                "Temporary one-stream waits may borrow for the call; explicit borrowing adapters retain their separate contract",
+                "TransferGroup::getReadRegion(ReadTransferKey $key) returns a nullable readonly completed prefix without I/O or allocation; active or unknown progress is null, known zero-byte completion is present and empty",
+                "Invalid or foreign completed-read access uses existing IoError with Access, TransferGroup and InvalidInput, no path, system code or byte progress",
+                "Invalid resubmitRead/resubmitWrite keys or ranges use existing IoError with Configure, TransferGroup and InvalidInput, no path, system code or byte progress; validation submits no work and takes no original transfer Error"
             ],
             "designerDecisionRequired": true,
             "aliasOf": null,
@@ -1852,7 +1858,9 @@
             "partialProgress": false,
             "eofRelevant": true,
             "wouldBlockRelevant": true,
-            "platformConstraints": [],
+            "platformConstraints": [
+                "Native locking depends on platform, filesystem and mount configuration"
+            ],
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "typed-capability-discovery",
@@ -1869,10 +1877,13 @@
             "semanticDifferences": [
                 "Mixed metadata arrays become properties, interfaces, or typed result values"
             ],
-            "designerDecisionRequired": true,
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0138",
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0138 approved native platform locking on 2026-10-18. Capability checks preserve platform/filesystem limitations; public names remain deferred."
         },
         {
             "phpSurface": "streams",
@@ -2653,8 +2664,10 @@
             "blockingBehavior": "operation-defined",
             "partialProgress": false,
             "eofRelevant": false,
-            "wouldBlockRelevant": false,
-            "platformConstraints": [],
+            "wouldBlockRelevant": true,
+            "platformConstraints": [
+                "Native locking depends on platform, filesystem and mount configuration"
+            ],
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "stream-operation",
@@ -2671,13 +2684,16 @@
             "semanticDifferences": [
                 "Dynamic protocol dispatch becomes typed construction and capability interfaces"
             ],
-            "designerDecisionRequired": true,
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0138",
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed Constructors",
                 "Typed Adapters"
             ],
-            "notes": ""
+            "notes": "Decision 0138 approved explicit borrowed and owning native lock guards on 2026-10-18. Typed composition retains native platform differences rather than a dynamic wrapper registry; public names remain deferred."
         },
         {
             "phpSurface": "wrapper",
@@ -2805,7 +2821,7 @@
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "SeekableStream::seek(int $offset, SeekOrigin $origin): int",
             "doriaStatus": "v1-recommended",
             "v1Recommendation": "Recommended For v1.0",
             "landingStage": "36a",
@@ -2818,13 +2834,13 @@
             "semanticDifferences": [
                 "Dynamic protocol dispatch becomes typed construction and capability interfaces"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed Constructors",
                 "Typed Adapters"
             ],
-            "notes": ""
+            "notes": "Decision 0110: required typed byte origin and new-position result approved 2026-10-13; Seek errors preserve the original IoError and opening-path target. Public execution integration is in progress, not delivered."
         },
         {
             "phpSurface": "wrapper",
@@ -4120,14 +4136,14 @@
             "inputCapabilities": [],
             "outputCapabilities": [],
             "blockingBehavior": "operation-defined",
-            "partialProgress": true,
+            "partialProgress": false,
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "WritableFile/DuplexFile::synchronizeData(): void",
             "doriaStatus": "v1-required",
             "v1Recommendation": "Required For v1.0",
             "landingStage": "36a",
@@ -4140,10 +4156,10 @@
             "semanticDifferences": [
                 "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0110: full-word synchronization method and distinct IoOperation label approved 2026-10-13. Metadata synchronization includes data; platform guarantees may strengthen but never weaken. Checked errors retain opening path and null progress. Stage 36a validation is in progress, not delivered."
         },
         {
             "phpSurface": "filesystem",
@@ -4462,8 +4478,11 @@
             "blockingBehavior": "operation-defined",
             "partialProgress": false,
             "eofRelevant": false,
-            "wouldBlockRelevant": false,
-            "platformConstraints": [],
+            "wouldBlockRelevant": true,
+            "platformConstraints": [
+                "Native locking depends on platform, filesystem and mount configuration",
+                "Windows range locks may deny ordinary reads/writes; local Unix flock locks are advisory"
+            ],
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
@@ -4475,15 +4494,20 @@
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Direct Typed Rewrite",
+            "migrationAction": "Rewrite With Semantic Warning",
             "byteTextSemantics": "bytes",
             "semanticDifferences": [
-                "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
+                "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes",
+                "Explicit borrowed and owning guards share one native file owner; borrowed cleanup does not close the caller's file",
+                "Native platform locking replaces a uniform advisory-only promise; nonblocking contention uses a typed outcome"
             ],
-            "designerDecisionRequired": true,
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0138",
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0138 approved borrowed/owning lock guards and native platform locking on 2026-10-18. This replaces the advisory-only assumption: Windows locks can restrict ordinary reads/writes. Nonblocking contention is typed, real host failures are checked, and public names remain deferred."
         },
         {
             "phpSurface": "filesystem",
@@ -4702,7 +4726,7 @@
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "SeekableStream::seek(int $offset, SeekOrigin $origin): int",
             "doriaStatus": "v1-required",
             "v1Recommendation": "Required For v1.0",
             "landingStage": "36a",
@@ -4715,10 +4739,10 @@
             "semanticDifferences": [
                 "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0110: required typed byte origin and new-position result approved 2026-10-13; Seek errors preserve the original IoError and opening-path target. Public execution integration is in progress, not delivered."
         },
         {
             "phpSurface": "filesystem",
@@ -4763,14 +4787,14 @@
             "inputCapabilities": [],
             "outputCapabilities": [],
             "blockingBehavior": "operation-defined",
-            "partialProgress": true,
+            "partialProgress": false,
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "WritableFile/DuplexFile::synchronizeMetadata(): void",
             "doriaStatus": "v1-required",
             "v1Recommendation": "Required For v1.0",
             "landingStage": "36a",
@@ -4783,10 +4807,10 @@
             "semanticDifferences": [
                 "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0110: full-word synchronization method and distinct IoOperation label approved 2026-10-13. Metadata synchronization includes data; platform guarantees may strengthen but never weaken. Checked errors retain opening path and null progress. Stage 36a validation is in progress, not delivered."
         },
         {
             "phpSurface": "filesystem",
@@ -4804,7 +4828,7 @@
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "ReadableFile/WritableFile/DuplexFile::getPosition(): int",
             "doriaStatus": "v1-required",
             "v1Recommendation": "Required For v1.0",
             "landingStage": "36a",
@@ -4817,10 +4841,10 @@
             "semanticDifferences": [
                 "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0110: readonly inspection method approved 2026-10-13, preserving fresh queries and the global nonblocking property-hook rule. No property alias; checked Access errors retain opening path and null progress. Stage 36a validation is tracked separately."
         },
         {
             "phpSurface": "filesystem",
@@ -4831,14 +4855,14 @@
             "inputCapabilities": [],
             "outputCapabilities": [],
             "blockingBehavior": "operation-defined",
-            "partialProgress": true,
+            "partialProgress": false,
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "WritableFile/DuplexFile::setLength(int $length): void",
             "doriaStatus": "v1-required",
             "v1Recommendation": "Required For v1.0",
             "landingStage": "36a",
@@ -4851,10 +4875,10 @@
             "semanticDifferences": [
                 "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0110: setLength and IoOperation::Resize approved 2026-10-13. Required nonnegative byte extent; shrinking discards the tail, growth reads as zero, cursor and ownership remain unchanged, and append still uses current EOF. Checked opening-path errors have null progress. Stage 36a validation remains in progress."
         },
         {
             "phpSurface": "filesystem",
@@ -5008,7 +5032,7 @@
             "doriaClassification": "Proposed Doria Std Io",
             "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "file-stream-operation",
-            "doriaCandidateSpelling": null,
+            "doriaCandidateSpelling": "SeekableStream::seek(0, SeekOrigin::Start)",
             "doriaStatus": "v1-required",
             "v1Recommendation": "Required For v1.0",
             "landingStage": "36a",
@@ -5021,10 +5045,10 @@
             "semanticDifferences": [
                 "PHP resources and sentinels become typed file handles, checked errors, and explicit outcomes"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
-            "notes": ""
+            "notes": "Decision 0110: required typed byte origin and new-position result approved 2026-10-13; Seek errors preserve the original IoError and opening-path target. Public execution integration is in progress, not delivered."
         },
         {
             "phpSurface": "filesystem",

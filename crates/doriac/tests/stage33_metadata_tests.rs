@@ -68,6 +68,8 @@ function ambient(): void
     assert_eq!(first.applications[0].target, task.identity);
 
     let transform = callable(&first, "Box::transform");
+    assert_eq!(transform.source, "callables.doria");
+    assert_eq!(transform.package, "standalone");
     assert_eq!(transform.identity, "member:Box:method:transform");
     assert_eq!(transform.kind, "method");
     assert_eq!(transform.access, "internal");
@@ -109,13 +111,12 @@ function ambient(): void
     }
 }
 
-#[test]
-fn metadata_schema_2_includes_main_development_and_generated_sources() {
+fn development_plan() -> BuildPlanDocument {
     let package = "acme/application";
     let main_identity = format!("{package}:main.doria");
     let development_identity = format!("{package}:Feature.doria");
     let generated_identity = format!("{package}:GeneratedTest.doria");
-    let plan = BuildPlanDocument {
+    BuildPlanDocument {
         path: "plan.json".to_string(),
         directory: std::env::current_dir().expect("current directory"),
         text: String::new(),
@@ -188,7 +189,16 @@ fn metadata_schema_2_includes_main_development_and_generated_sources() {
                 target_triple: None,
             },
         },
-    };
+    }
+}
+
+#[test]
+fn metadata_schema_2_includes_main_development_and_generated_sources() {
+    let plan = development_plan();
+    let package = plan.plan.root_package.as_str();
+    let main_identity = format!("{package}:main.doria");
+    let development_identity = format!("{package}:Feature.doria");
+    let generated_identity = format!("{package}:GeneratedTest.doria");
     let mut provider = InMemorySourceProvider::new();
     provider.insert(package, "main.doria", "function main(): void {}");
     provider.insert(
@@ -245,6 +255,224 @@ fn processor_protocol_remains_schema_1() {
     .expect("processor request should encode");
     assert_eq!(fields["schemaVersion"], 1);
     assert!(fields.get("callables").is_none());
+}
+
+#[test]
+fn composed_generic_callables_keep_authored_type_names_in_frozen_metadata_schemas() {
+    let source = format!(
+        "{}\n{}",
+        include_str!("fixtures/nongeneric_trait_method_parameters.doria"),
+        r#"
+trait Callable<T> {
+    function relay<U>(function(U): U $callback): ?U { return null; }
+}
+class Other<V> { uses Callable<V>; }
+"#,
+    );
+    let one = doriac::metadata_source("generic-metadata.doria", &source).unwrap();
+    let two = doriac::metadata_source_v2("generic-metadata.doria", &source).unwrap();
+    let three = doriac::metadata_source_v3("generic-metadata.doria", &source).unwrap();
+    assert_eq!(one.schema_version, 1);
+    assert_eq!(two.schema_version, 2);
+    assert_eq!(three.schema_version, 3);
+    assert_eq!(two.callables, three.callables);
+    for name in ["Box::identity", "Plain::identity"] {
+        let method = callable(&two, name);
+        assert_eq!(method.generic_parameter_count, 1);
+        assert_eq!(method.parameters[0].r#type, "U");
+        assert_eq!(method.return_type, "U");
+    }
+    let relay = callable(&two, "Other::relay");
+    assert_eq!(relay.parameters[0].r#type, "function(U): U");
+    assert_eq!(relay.return_type, "?U");
+    let json_one = serde_json::to_value(&one).unwrap();
+    let json_two = serde_json::to_value(&two).unwrap();
+    let json_three = serde_json::to_value(&three).unwrap();
+    assert!(json_one.get("callables").is_none());
+    assert_eq!(
+        serde_json::from_value::<AttributeMetadataDocumentV2>(json_two.clone()).unwrap(),
+        two
+    );
+    assert_eq!(
+        serde_json::from_value::<doriac::attributes::AttributeMetadataDocumentV3>(
+            json_three.clone()
+        )
+        .unwrap(),
+        three
+    );
+    for json in [json_one, json_two, json_three] {
+        let text = serde_json::to_string(&json).unwrap();
+        for private in ["#trait", "TypeId(", "ExpansionId("] {
+            assert!(
+                !text.contains(private),
+                "metadata exposed {private}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn guarded_composed_callables_preserve_authored_signatures_in_frozen_metadata() {
+    let source = r#"
+interface Ready {}
+trait Relay<T> {
+    function relay<U>(function(U): U $callback): ?U where (T implements Ready) {
+        return null;
+    }
+}
+class Adapter<V> { uses Relay<V>; }
+"#;
+    let one = doriac::metadata_source("guarded-metadata.doria", source).unwrap();
+    let two = doriac::metadata_source_v2("guarded-metadata.doria", source).unwrap();
+    let three = doriac::metadata_source_v3("guarded-metadata.doria", source).unwrap();
+    assert_eq!(one.schema_version, 1);
+    assert_eq!(two.schema_version, 2);
+    assert_eq!(three.schema_version, 3);
+    assert_eq!(two.callables, three.callables);
+    assert_eq!(
+        two,
+        doriac::metadata_source_v2("guarded-metadata.doria", source).unwrap()
+    );
+    let relay = callable(&two, "Adapter::relay");
+    assert_eq!(relay.identity, "member:Adapter:method:relay");
+    assert_eq!(relay.source, "guarded-metadata.doria");
+    assert_eq!(relay.generic_parameter_count, 1);
+    assert_eq!(relay.parameters[0].r#type, "function(U): U");
+    assert_eq!(relay.return_type, "?U");
+
+    let one_json = serde_json::to_value(&one).unwrap();
+    let two_json = serde_json::to_value(&two).unwrap();
+    let three_json = serde_json::to_value(&three).unwrap();
+    assert!(one_json.get("callables").is_none());
+    assert_eq!(
+        serde_json::from_value::<doriac::attributes::AttributeMetadataDocumentV1>(one_json.clone())
+            .unwrap(),
+        one
+    );
+    assert_eq!(
+        serde_json::from_value::<AttributeMetadataDocumentV2>(two_json.clone()).unwrap(),
+        two
+    );
+    assert_eq!(
+        serde_json::from_value::<doriac::attributes::AttributeMetadataDocumentV3>(
+            three_json.clone()
+        )
+        .unwrap(),
+        three
+    );
+    for json in [one_json, two_json, three_json] {
+        let text = serde_json::to_string(&json).unwrap();
+        for private in ["#trait", "TypeId(", "ExpansionId(", "callable_conditions"] {
+            assert!(
+                !text.contains(private),
+                "metadata exposed {private}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn conditional_conformance_without_guarded_members_reaches_public_lowering() {
+    let source = r#"
+interface Ready {}
+class Yes implements Ready {}
+interface Answer { function answer(): int; }
+class Adapter<T> implements Answer where (T implements Ready) {
+    function answer(): int { return 42; }
+}
+function inspect(Answer $value): int { return $value->answer(); }
+function main(): int {
+    let $inactive = new Adapter<int>();
+    return $inactive->answer() + inspect(new Adapter<Yes>());
+}
+"#;
+    let one = doriac::metadata_source("conformance-only.doria", source).unwrap();
+    let two = doriac::metadata_source_v2("conformance-only.doria", source).unwrap();
+    let three = doriac::metadata_source_v3("conformance-only.doria", source).unwrap();
+    assert_eq!(one.schema_version, 1);
+    assert_eq!(two.callables, three.callables);
+    assert_eq!(callable(&two, "Adapter::answer").return_type, "int");
+
+    let parsed = doriac::parse_source("conformance-only.doria", source).unwrap();
+    let diagnostics =
+        doriac::lowering::lower_program_with_semantics(&parsed, Default::default()).unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].kind,
+        doriac::diagnostics::DiagnosticKind::InternalCompiler
+    );
+
+    let inactive = source.replace("inspect(new Adapter<Yes>())", "inspect(new Adapter<int>())");
+    let diagnostics = doriac::metadata_source_v2("conformance-only.doria", &inactive).unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, "E0408");
+    assert_eq!(
+        &inactive[diagnostics[0].span.start..diagnostics[0].span.end],
+        "new Adapter<int>()"
+    );
+}
+
+#[test]
+fn conditional_project_metadata_checks_cross_source_capability_at_the_caller() {
+    let mut plan = development_plan();
+    let declarations = [
+        ("Ready.doria", "interface Ready { function read(): int; }"),
+        ("Yes.doria", "class Yes implements Ready { function read(): int { return 7; } }"),
+        ("No.doria", "class No {}"),
+        ("Reading.doria", "trait Reading<T> { function read(T $source): int where (T implements Ready) { return $source->read(); } }"),
+        ("Adapter.doria", "class Adapter<T> { uses Reading<T>; }"),
+    ];
+    for (path, _) in declarations {
+        plan.plan.packages[0].sources.push(Source {
+            identity: format!("{}:{path}", plan.plan.root_package),
+            path: path.to_string(),
+            scope: SourceScope::Development,
+            origin: SourceOrigin::Explicit,
+            generated_for: None,
+        });
+    }
+    let package = plan.plan.root_package.as_str();
+    for (source_type, accepted) in [("Yes", true), ("No", false)] {
+        let caller = format!(
+            "function inspect(Adapter<{source_type}> $adapter, {source_type} $source): int {{ return $adapter->read($source); }}"
+        );
+        let mut provider = InMemorySourceProvider::new();
+        provider.insert(package, "main.doria", "function main(): void {}");
+        provider.insert(package, "Feature.doria", "function feature(): void {}");
+        for (path, source) in declarations {
+            provider.insert(package, path, source);
+        }
+        provider.insert(package, "GeneratedTest.doria", &caller);
+        let graph = load_compilation_graph(&plan, &provider).unwrap();
+        let result = doriac::metadata_compilation_graph_v2(&graph);
+        if accepted {
+            let metadata = result.expect("active cross-source capability should lower");
+            assert_eq!(
+                callable(&metadata, "inspect").source,
+                format!("{package}:GeneratedTest.doria")
+            );
+            assert_eq!(
+                callable(&metadata, "inspect").parameters[0].r#type,
+                "Adapter<Yes>"
+            );
+            assert_eq!(
+                callable(&metadata, "Adapter::read").source,
+                format!("{package}:Reading.doria")
+            );
+        } else {
+            let diagnostics = result.expect_err("inactive cross-source member must be rejected");
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(diagnostics[0].code, "E0779");
+            let span = diagnostics[0].span;
+            assert_eq!(&caller[span.start..span.end], "$adapter->read($source)");
+            let source = graph
+                .sources
+                .values()
+                .find(|source| source.id == span.source)
+                .unwrap();
+            assert_eq!(source.identity.0, format!("{package}:GeneratedTest.doria"));
+        }
+    }
 }
 
 fn callable<'a>(

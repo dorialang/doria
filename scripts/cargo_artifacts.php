@@ -8,6 +8,26 @@ const DORIA_CARGO_CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n"
     . "# This file is a cache directory tag created by cargo.\n"
     . "# For information about cache directory tags see https://bford.info/cachedir/\n";
 
+/** @return array<string, string> */
+function doria_build_environment(string $target): array
+{
+    $environment = getenv();
+    $environment = is_array($environment) ? $environment : [];
+    $environment['CARGO_TARGET_DIR'] = $target;
+    $temporary = $target . DIRECTORY_SEPARATOR . 'tmp';
+    if (!is_dir($temporary) && !mkdir($temporary, 0700, true) && !is_dir($temporary)) {
+        throw new RuntimeException("could not create build scratch directory {$temporary}");
+    }
+
+    // Native linking, compiler subprocesses, and PHP fixtures must follow the
+    // selected build volume too, not only Cargo's reusable artifacts.
+    foreach (['TMPDIR', 'TMP', 'TEMP'] as $variable) {
+        $environment[$variable] = $temporary;
+    }
+
+    return $environment;
+}
+
 function doria_canonical_path(string $path, string $base): string
 {
     if ($path === '') {

@@ -1,0 +1,21 @@
+use Doria\Std\Io\ByteRegion;
+
+class Marker {
+    function __destruct() {
+        try { echo "unexpected cleanup\n"; } catch (Doria\Std\Io\IoError) {}
+    }
+}
+
+function index(): int {
+    echo "index\n";
+    return 1;
+}
+
+function main(): void {
+    let $marker = new Marker();
+    let $bytes = Bytes::allocate(2);
+    ByteRegion $view = $bytes->getRegion(1, 1);
+    echo "before\n";
+    echo $view[index()];
+    echo "unexpected continuation\n";
+}

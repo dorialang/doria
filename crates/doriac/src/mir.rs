@@ -4,7 +4,10 @@
 //! 11 grows into the debug/interpreter oracle and future native lowering input.
 //! The text dump is deterministic but not a stable public format.
 
-use std::fmt;
+pub(crate) mod return_adaptation;
+pub(crate) mod value_factory;
+
+use std::{borrow::Cow, fmt};
 
 use crate::build_plan::{SourceOrigin, SourceScope, TargetKind};
 use crate::class_layout::{ClassId, ClassLayout, PropertyId};
@@ -15,8 +18,9 @@ use crate::format_string::FormatPiece;
 use crate::names::{PackageIdentity, SourceIdentity};
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::{SourceFile, SourceId, Span};
+pub use crate::symbols::ReceiverMode;
 use crate::symbols::{BindingId, ClosureId};
-pub use crate::types::ReturnBorrowKind;
+pub use crate::types::{ByteRegionKind, RetainedLifetime, ReturnBorrowKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
@@ -24,7 +28,7 @@ pub struct FunctionId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub usize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,6 +204,87 @@ impl Program {
     pub fn source_for_span(&self, span: Span) -> Option<&SourceFile> {
         self.source_by_id(span.source)
     }
+
+    pub(crate) fn carries_retained_sources(&self, ty: Type) -> bool {
+        self.carries_retained_sources_inner(ty, &mut std::collections::HashSet::new())
+    }
+
+    fn carries_retained_sources_inner(
+        &self,
+        ty: Type,
+        visited: &mut std::collections::HashSet<Type>,
+    ) -> bool {
+        if !visited.insert(ty) {
+            return false;
+        }
+        match ty {
+            Type::ByteRegion(_)
+            | Type::NullableByteRegion(_)
+            | Type::Function(_)
+            | Type::NullableFunction(_) => true,
+            Type::PayloadEnum(payload) | Type::NullablePayloadEnum(payload) => {
+                self.enums.get(payload.id.0).is_some_and(|definition| {
+                    definition.cases.iter().any(|case| {
+                        case.payload
+                            .iter()
+                            .any(|field| self.carries_retained_sources_inner(field.ty, visited))
+                    })
+                })
+            }
+            Type::Class(class) | Type::NullableClass(class) => {
+                self.classes.get(class.0).is_some_and(|class| {
+                    matches!(
+                        class.runtime_payload,
+                        Some(
+                            RuntimeClassPayload::ReadinessSet
+                                | RuntimeClassPayload::TransferPlan
+                                | RuntimeClassPayload::TransferGroup
+                        )
+                    ) || class.properties.iter().any(|property| {
+                        property.borrowed_source.is_some()
+                            || self.carries_retained_sources_inner(property.ty, visited)
+                    })
+                })
+            }
+            Type::Collection(collection) | Type::NullableCollection(collection) => self
+                .collection_types
+                .get(collection.0)
+                .is_some_and(|collection| {
+                    collection
+                        .key
+                        .is_some_and(|key| self.carries_retained_sources_inner(key, visited))
+                        || self.carries_retained_sources_inner(collection.value, visited)
+                }),
+            Type::Interface(interface) | Type::NullableInterface(interface) => {
+                self.interface_types
+                    .get(interface.0)
+                    .is_some_and(|definition| {
+                        definition.requirement_origins.iter().any(|origin| {
+                            crate::compiler_known_contracts::IterationOperation::from_requirement(
+                                *origin,
+                            ) == Some(
+                                crate::compiler_known_contracts::IterationOperation::HasCurrent,
+                            )
+                        })
+                    })
+                    || self.interface_vtables.iter().any(|table| {
+                        table.interface == interface
+                            && match table.implementing_type {
+                                ImplementingType::Class(class) => {
+                                    self.carries_retained_sources_inner(Type::Class(class), visited)
+                                }
+                                ImplementingType::CollectionIterator(_) => true,
+                                ImplementingType::Collection(collection) => self
+                                    .carries_retained_sources_inner(
+                                        Type::Collection(collection),
+                                        visited,
+                                    ),
+                            }
+                    })
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +398,21 @@ pub struct CollectionType {
 }
 
 impl CollectionType {
+    pub fn access_key_type(&self, access: NullableCollectionAccess) -> Option<Type> {
+        match access {
+            NullableCollectionAccess::Get | NullableCollectionAccess::Remove => self.key,
+            NullableCollectionAccess::Index
+                if matches!(
+                    self.kind,
+                    CollectionKind::Dictionary | CollectionKind::SortedDictionary
+                ) =>
+            {
+                self.key
+            }
+            _ => Some(Type::Scalar(ScalarType::Integer(IntegerType::Int64))),
+        }
+    }
+
     pub fn uses_core_operations(&self) -> bool {
         self.comparator == Some(CollectionComparator::Core)
             || (matches!(self.kind, CollectionKind::Dictionary | CollectionKind::Set)
@@ -337,6 +437,8 @@ pub enum CoreCollectionOperation {
         key: Option<LocalId>,
         value: LocalId,
         hash: Option<LocalId>,
+        /// Mutations identify stored effects; fresh construction has no member identity.
+        storage_origin: Option<Span>,
     },
     Remove {
         position: LocalId,
@@ -359,6 +461,7 @@ pub enum CoreCollectionOperation {
         position: LocalId,
         value: LocalId,
         previous: LocalId,
+        storage_origin: Option<Span>,
     },
     HashNext {
         hash: LocalId,
@@ -382,6 +485,7 @@ impl CoreCollectionOperation {
                 key,
                 value,
                 hash,
+                ..
             } => [Some(*position), *key, Some(*value), *hash]
                 .into_iter()
                 .flatten()
@@ -432,24 +536,35 @@ pub struct InterfaceType {
     pub id: InterfaceTypeId,
     pub name: String,
     pub ancestors: Vec<InterfaceTypeId>,
+    /// Nominal requirements survive pruning of unreachable executable methods.
+    pub requirement_origins: Vec<Span>,
     pub methods: Vec<InterfaceMethod>,
 }
 
 impl InterfaceType {
+    pub fn stream_operation(
+        &self,
+        slot: usize,
+    ) -> Option<crate::compiler_known_stream::StreamOperation> {
+        self.methods
+            .get(slot)?
+            .requirement_origins
+            .iter()
+            .find_map(|origin| {
+                crate::compiler_known_stream::StreamOperation::from_requirement(*origin)
+            })
+    }
+
     pub fn iteration_operation(
         &self,
         slot: usize,
-        interfaces: &[Self],
     ) -> Option<crate::compiler_known_contracts::IterationOperation> {
-        let method = self.methods.get(slot)?;
-        std::iter::once(self)
-            .chain(self.ancestors.iter().filter_map(|id| interfaces.get(id.0)))
-            .flat_map(|interface| &interface.methods)
-            .filter(|candidate| candidate.name == method.name)
-            .find_map(|candidate| {
-                crate::compiler_known_contracts::IterationOperation::from_requirement(
-                    candidate.requirement,
-                )
+        self.methods
+            .get(slot)?
+            .requirement_origins
+            .iter()
+            .find_map(|origin| {
+                crate::compiler_known_contracts::IterationOperation::from_requirement(*origin)
             })
     }
 
@@ -458,6 +573,7 @@ impl InterfaceType {
             id: InterfaceTypeId::ERROR,
             name: "Error".into(),
             ancestors: Vec::new(),
+            requirement_origins: Vec::new(),
             methods: Vec::new(),
         }
     }
@@ -465,11 +581,13 @@ impl InterfaceType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceMethod {
-    pub requirement: Span,
+    /// Every checked declaration satisfied by this slot, including redeclared
+    /// inherited contracts. Display names do not establish nominal capability.
+    pub requirement_origins: Vec<Span>,
     pub name: String,
     pub arguments: Vec<Type>,
     pub signature: FunctionTypeId,
-    pub writable_receiver: bool,
+    pub receiver_mode: ReceiverMode,
     pub exact_dynamic_return: bool,
 }
 
@@ -486,7 +604,110 @@ pub struct InterfaceVtable {
     pub error_descriptor: Option<ErrorDescriptorId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCallbackTarget {
+    /// A closed concrete receiver calls its existing entry directly.
+    Static {
+        vtable: InterfaceVtableId,
+        entry: FunctionId,
+    },
+    /// Resolve the selected interface from the original class descriptor.
+    ClassDescriptor,
+    /// Use the original erased receiver's vtable, without changing its view.
+    InterfaceDescriptor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCallbackPlan {
+    pub receiver: Type,
+    pub operation: crate::compiler_known_stream::StreamOperation,
+    pub interface: InterfaceTypeId,
+    pub slot: usize,
+    pub signature: FunctionTypeId,
+    pub target: StreamCallbackTarget,
+}
+
 impl Program {
+    /// Public diagnostics identify authored callables, not executable symbols.
+    pub fn diagnostic_callable_name<'a>(&'a self, function: &'a Function) -> Cow<'a, str> {
+        if let Some(closure) = &function.closure {
+            Cow::Borrowed(&self.closure_descriptors[closure.descriptor.0].debug_identity)
+        } else if let Some(method) = &function.method {
+            let class = self
+                .classes
+                .iter()
+                .find(|class| class.id == method.class)
+                .expect("validated method class exists");
+            Cow::Owned(format!("{}::{}", class.name, method.name))
+        } else {
+            Cow::Borrowed(&function.name)
+        }
+    }
+
+    /// Select a callback from validated nominal conformance, retaining the
+    /// registered static type and its ordinary dispatch metadata. This does not
+    /// convert, copy, own or borrow a runtime receiver.
+    pub fn stream_callback(
+        &self,
+        receiver: Type,
+        operation: crate::compiler_known_stream::StreamOperation,
+    ) -> Option<StreamCallbackPlan> {
+        let slot_in = |interface: InterfaceTypeId| {
+            let definition = self.interface_types.get(interface.0)?;
+            definition
+                .methods
+                .iter()
+                .enumerate()
+                .find(|(slot, _)| definition.stream_operation(*slot) == Some(operation))
+                .map(|(slot, method)| (slot, method.signature))
+        };
+        let concrete_receiver = match receiver {
+            Type::Scalar(ScalarType::Inline(ty)) => {
+                ty.nominal_class().map_or(receiver, Type::Class)
+            }
+            _ => receiver,
+        };
+        let (interface, slot, signature, target) = match concrete_receiver {
+            Type::Class(class) => {
+                let definition = self.classes.get(class.0)?;
+                let (table, slot, signature) = self.interface_vtables.iter().find_map(|table| {
+                    if table.implementing_type != ImplementingType::Class(class) {
+                        return None;
+                    }
+                    let (slot, signature) = slot_in(table.interface)?;
+                    Some((table, slot, signature))
+                })?;
+                let target = if definition.is_open {
+                    StreamCallbackTarget::ClassDescriptor
+                } else {
+                    StreamCallbackTarget::Static {
+                        vtable: table.id,
+                        entry: *table.methods.get(slot)?,
+                    }
+                };
+                (table.interface, slot, signature, target)
+            }
+            Type::Interface(interface) => {
+                let (slot, signature) = slot_in(interface)?;
+                (
+                    interface,
+                    slot,
+                    signature,
+                    StreamCallbackTarget::InterfaceDescriptor,
+                )
+            }
+            _ => return None,
+        };
+        Some(StreamCallbackPlan {
+            receiver,
+            operation,
+            interface,
+            slot,
+            signature,
+            target,
+        })
+    }
+
     pub fn interface_vtable(
         &self,
         implementing_type: ImplementingType,
@@ -531,17 +752,105 @@ pub struct PayloadEnumConstant {
 pub struct Class {
     pub id: ClassId,
     pub name: String,
+    pub declaration_name: String,
+    /// Concrete specialization identity; names are only display metadata.
+    pub arguments: Vec<Type>,
     pub source_span: Span,
     pub is_open: bool,
     pub parent: Option<ClassId>,
     pub ancestors: Vec<ClassId>,
-    pub virtual_methods: Vec<FunctionId>,
+    pub virtual_methods: Vec<VirtualMethodSlot>,
     pub properties: Vec<Property>,
     pub layout: ClassLayout,
+    /// Runtime-owned opaque storage has no source-visible property layout.
+    pub runtime_payload: Option<RuntimeClassPayload>,
     pub constructor: Option<FunctionId>,
     pub destructor: Option<FunctionId>,
     pub error_descriptor: Option<ErrorDescriptorId>,
     pub error_origin_offset: Option<u32>,
+}
+
+impl Class {
+    pub fn inline_copy_type(&self) -> Option<crate::inline_value::InlineValueType> {
+        crate::inline_value::InlineValueKind::for_name(&self.declaration_name)
+            .map(|kind| kind.specialize(self.id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeClassPayload {
+    OwnedFile,
+    ReadinessSet,
+    TransferPlan,
+    TransferGroup,
+    CancellationSource,
+    /// A spawned `Child`: its handle, pipes, cleanup policy and cached exit
+    /// status. Dropping it closes the pipes, then applies the policy once.
+    ChildProcess,
+}
+
+impl RuntimeClassPayload {
+    pub fn for_declaration(name: &str, source: crate::source::SourceId) -> Option<Self> {
+        if source == crate::compiler_known_concurrency::SOURCE_ID
+            && name == crate::compiler_known_concurrency::CANCELLATION_SOURCE
+        {
+            return Some(Self::CancellationSource);
+        }
+        if source != crate::compiler_known_stream::SOURCE_ID {
+            return None;
+        }
+        if crate::compiler_known_stream::owns_native_file(name) {
+            Some(Self::OwnedFile)
+        } else if name == crate::compiler_known_stream::READINESS_SET {
+            Some(Self::ReadinessSet)
+        } else if name == crate::compiler_known_stream::TRANSFER_PLAN {
+            Some(Self::TransferPlan)
+        } else if name == crate::compiler_known_stream::TRANSFER_GROUP {
+            Some(Self::TransferGroup)
+        } else if name == crate::compiler_known_stream::CHILD {
+            Some(Self::ChildProcess)
+        } else {
+            None
+        }
+    }
+
+    /// A runtime factory owns allocation and initialization of opaque storage.
+    pub const fn constructor_factory(self) -> Option<&'static str> {
+        match self {
+            Self::CancellationSource => Some(crate::native_abi::CANCELLATION_NEW),
+            Self::OwnedFile
+            | Self::ReadinessSet
+            | Self::TransferPlan
+            | Self::TransferGroup
+            | Self::ChildProcess => None,
+        }
+    }
+
+    pub const fn drop_entry_point(self) -> &'static str {
+        match self {
+            Self::OwnedFile => "dr_v1_file_object_drop",
+            Self::ReadinessSet => "dr_v1_readiness_set_drop",
+            Self::TransferPlan => "dr_v1_transfer_plan_drop",
+            Self::TransferGroup => "dr_v1_transfer_adapter_group_drop",
+            Self::CancellationSource => crate::native_abi::CANCELLATION_RELEASE,
+            Self::ChildProcess => "dr_v1_child_process_drop",
+        }
+    }
+
+    pub const fn drop_deallocates(self) -> bool {
+        matches!(
+            self,
+            Self::ReadinessSet
+                | Self::TransferPlan
+                | Self::TransferGroup
+                | Self::CancellationSource
+                | Self::ChildProcess
+        )
+    }
+
+    pub const fn drop_uses_frame(self) -> bool {
+        !matches!(self, Self::TransferPlan | Self::CancellationSource)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,6 +860,7 @@ pub struct ErrorDescriptor {
     pub type_name: String,
     pub message_property: PropertyId,
     pub assertion: Option<AssertionErrorDescriptor>,
+    pub io_transferred_byte_count_property: Option<PropertyId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,7 +889,30 @@ pub struct Property {
     pub ty: Type,
     pub writable: bool,
     pub promoted: bool,
-    pub borrowed_source: bool,
+    pub borrowed_source: Option<crate::types::RetainedFieldAccess>,
+}
+
+impl Property {
+    pub(crate) fn stores_retained_place(&self) -> bool {
+        self.borrowed_source
+            .is_some_and(crate::types::RetainedFieldAccess::is_writable)
+    }
+
+    pub fn permits_write_through(&self) -> bool {
+        crate::types::RetainedFieldAccess::permits_write_through(
+            self.borrowed_source,
+            self.writable,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticFrame {
+    Authored,
+    /// A dispatch adapter forwards to this authored implementation.
+    Forwarded(FunctionId),
+    /// A compiler-owned collection entry executes at the caller's site.
+    Caller,
 }
 
 #[derive(Debug, Clone)]
@@ -587,6 +920,7 @@ pub struct Function {
     pub id: FunctionId,
     pub name: String,
     pub source_span: Span,
+    pub diagnostic_frame: DiagnosticFrame,
     pub method: Option<MethodIdentity>,
     pub virtual_slot: Option<u32>,
     pub receiver_mode: Option<ReceiverMode>,
@@ -609,6 +943,7 @@ impl PartialEq for Function {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && self.name == other.name
+            && self.diagnostic_frame == other.diagnostic_frame
             && self.method == other.method
             && self.virtual_slot == other.virtual_slot
             && self.receiver_mode == other.receiver_mode
@@ -628,8 +963,75 @@ impl PartialEq for Function {
 }
 
 impl Function {
+    pub(crate) fn retained_sources_plan(&self) -> Option<&RetainedSourcesPlan> {
+        self.blocks
+            .get(self.entry_block.0)?
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                Statement::ControlFlowPlan(ControlFlowPlan::RetainedSources(plan)) => Some(plan),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn retains_writable_input(&self, local: LocalId) -> bool {
+        self.retained_sources_plan().is_some_and(|plan| {
+            plan.constructs
+                .iter()
+                .any(|source| source.local == local && !source.inherited && source.writable)
+        })
+    }
+
+    pub(crate) fn promotes_writable_input(&self, local: LocalId) -> bool {
+        self.retains_writable_input(local)
+            && self
+                .retained_sources_plan()
+                .is_some_and(|plan| plan.promotions.iter().any(|(_, input)| *input == local))
+    }
+
+    pub fn has_checked_transport(&self) -> bool {
+        self.method
+            .as_ref()
+            .and_then(|method| method.virtual_family.as_ref())
+            .map_or(!self.checked_effects.is_empty(), |family| {
+                family.checked_transport
+            })
+    }
+
+    pub fn owns_diagnostic_frame(&self) -> bool {
+        self.diagnostic_frame == DiagnosticFrame::Authored
+    }
+
     pub fn uses_virtual_receiver_abi(&self) -> bool {
         self.virtual_slot.is_some() && self.receiver_mode.is_some()
+    }
+
+    /// Replacing an exclusive borrowed place destroys its previous value, but
+    /// does not give this frame ownership of the replacement.
+    pub fn is_writable_borrowed_place(&self, local: LocalId) -> bool {
+        self.params
+            .iter()
+            .position(|parameter| *parameter == local)
+            .is_some_and(|index| {
+                self.parameter_modes.get(index) == Some(&FunctionParameterMode::Writable)
+                    && (self.closure.is_some()
+                        || self.promotes_writable_input(local)
+                        || (index > 0 || self.receiver_mode.is_none())
+                            && self
+                                .locals
+                                .get(local.0)
+                                .is_some_and(|definition| definition.ty.has_move_ownership()))
+            })
+            || self.closure.as_ref().is_some_and(|closure| {
+                closure
+                    .capture_locals
+                    .iter()
+                    .any(|(_, capture)| *capture == local)
+                    && self
+                        .locals
+                        .get(local.0)
+                        .is_some_and(|definition| definition.writable && !definition.owned)
+            })
     }
 }
 
@@ -732,9 +1134,8 @@ impl ClosureEnvironmentStorage {
     /// call borrows an owned capture; only a consuming call transfers it.
     pub fn invocation_binding(self, invocation_mode: FunctionInvocationMode) -> Self {
         match (self, invocation_mode) {
-            (Self::Owned, FunctionInvocationMode::Readonly | FunctionInvocationMode::Writable) => {
-                Self::ReadonlyBorrow
-            }
+            (Self::Owned, FunctionInvocationMode::Readonly) => Self::ReadonlyBorrow,
+            (Self::Owned, FunctionInvocationMode::Writable) => Self::WritableBorrow,
             _ => self,
         }
     }
@@ -779,14 +1180,46 @@ pub struct ClosureFunction {
 pub struct MethodIdentity {
     pub class: ClassId,
     pub name: String,
+    pub return_adapter: Option<VirtualReturnAdapter>,
+    pub virtual_family: Option<VirtualMethodFamily>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiverMode {
-    Readonly,
-    Writable,
-    /// Reserved for a future accepted consuming-receiver design.
-    UnsupportedConsuming,
+pub struct VirtualReturnAdapter {
+    pub implementation: FunctionId,
+    pub direct: FunctionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VirtualMethodFamily {
+    pub declaration: Span,
+    pub owner: ClassId,
+    pub arguments: Vec<Type>,
+    pub return_type: ReturnType,
+    pub return_borrow: Option<ReturnBorrow>,
+    pub receiver_mode: ReceiverMode,
+    /// Physical status/result transport survives logical error narrowing.
+    pub checked_transport: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualMethodSlot {
+    pub family: VirtualMethodFamily,
+    /// The selected declaration's contract survives inactive body admission.
+    pub receiver_mode: ReceiverMode,
+    pub return_type: ReturnType,
+    pub return_borrow: Option<ReturnBorrow>,
+    pub implementation: Option<FunctionId>,
+}
+
+impl ReceiverMode {
+    pub fn parameter_mode(self) -> FunctionParameterMode {
+        match self {
+            Self::Readonly => FunctionParameterMode::Readonly,
+            Self::Writable => FunctionParameterMode::Writable,
+            Self::Consuming => FunctionParameterMode::Take,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -794,6 +1227,7 @@ pub struct ReturnBorrow {
     pub source: BorrowSource,
     pub writable: bool,
     pub kind: ReturnBorrowKind,
+    pub lifetime: RetainedLifetime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -815,6 +1249,7 @@ pub enum ScalarType {
     Bool,
     /// A nominal unit/backed enum whose physical tag width is backend-private.
     Enum(EnumId),
+    Inline(crate::inline_value::InlineValueType),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -823,6 +1258,7 @@ pub enum ScalarValue {
     Float(FloatValue),
     Bool(bool),
     Enum(EnumValue),
+    Inline(crate::inline_value::InlineValue),
 }
 
 impl ScalarValue {
@@ -832,6 +1268,7 @@ impl ScalarValue {
             Self::Float(value) => ScalarType::Float(value.ty),
             Self::Bool(_) => ScalarType::Bool,
             Self::Enum(value) => ScalarType::Enum(value.enum_id),
+            Self::Inline(value) => ScalarType::Inline(value.ty),
         }
     }
 }
@@ -850,6 +1287,8 @@ pub struct Local {
 pub enum Type {
     Scalar(ScalarType),
     String,
+    ByteRegion(ByteRegionKind),
+    NullableByteRegion(ByteRegionKind),
     Mixed,
     NullableScalar(ScalarType),
     NullableString,
@@ -947,6 +1386,19 @@ impl Type {
     pub const ERROR: Self = Self::Interface(InterfaceTypeId::ERROR);
     pub const NULLABLE_ERROR: Self = Self::NullableInterface(InterfaceTypeId::ERROR);
 
+    pub fn interface_implementing_type(self) -> Option<ImplementingType> {
+        match self {
+            Self::Class(class) | Self::NullableClass(class) => Some(ImplementingType::Class(class)),
+            Self::Collection(collection) | Self::NullableCollection(collection) => {
+                Some(ImplementingType::Collection(collection))
+            }
+            Self::Scalar(ScalarType::Inline(ty)) | Self::NullableScalar(ScalarType::Inline(ty)) => {
+                ty.nominal_class().map(ImplementingType::Class)
+            }
+            _ => None,
+        }
+    }
+
     pub const fn shared_payload(self) -> Option<SharedPayload> {
         match self {
             Self::SharedReference(payload)
@@ -976,6 +1428,8 @@ impl Type {
         matches!(
             self,
             Self::Mixed
+                | Self::ByteRegion(ByteRegionKind::Writable)
+                | Self::NullableByteRegion(ByteRegionKind::Writable)
                 | Self::NullableMixed
                 | Self::Interface(_)
                 | Self::NullableInterface(_)
@@ -1008,23 +1462,16 @@ impl Type {
         )
     }
 
-    /// Carrier ownership is independent of a returned value's retained sources.
-    pub const fn borrows_returned_value(self, return_borrow: Option<ReturnBorrow>) -> bool {
+    /// Copy capability does not remove an independently owned value's cleanup.
+    /// Strings use their separate implicit local-cleanup transport.
+    pub const fn requires_owned_cleanup(self) -> bool {
         self.has_move_ownership()
-            && matches!(
-                return_borrow,
-                Some(ReturnBorrow {
-                    kind: ReturnBorrowKind::Value,
-                    ..
-                })
+            || matches!(
+                self,
+                Self::Scalar(ScalarType::Inline(ty))
+                    | Self::NullableScalar(ScalarType::Inline(ty))
+                    if ty.requires_owned_cleanup()
             )
-    }
-
-    /// Writable closure captures of these types temporarily move the source
-    /// value into the invocation frame. Payload enums can be source-level Copy
-    /// while still containing managed fields that require exact destruction.
-    pub const fn transfers_writable_capture_ownership(self) -> bool {
-        self.has_move_ownership()
             || matches!(
                 self,
                 Self::PayloadEnum(PayloadEnumType {
@@ -1038,6 +1485,32 @@ impl Type {
                         needs_drop: true,
                         ..
                     },
+                    ..
+                })
+            )
+    }
+
+    pub const fn managed_inline_carrier(
+        self,
+    ) -> Option<(crate::inline_value::InlineValueType, bool)> {
+        match self {
+            Self::Scalar(ScalarType::Inline(ty)) if ty.requires_owned_cleanup() => {
+                Some((ty, false))
+            }
+            Self::NullableScalar(ScalarType::Inline(ty)) if ty.requires_owned_cleanup() => {
+                Some((ty, true))
+            }
+            _ => None,
+        }
+    }
+
+    /// Carrier ownership is independent of a returned value's retained sources.
+    pub const fn borrows_returned_value(self, return_borrow: Option<ReturnBorrow>) -> bool {
+        self.has_move_ownership()
+            && matches!(
+                return_borrow,
+                Some(ReturnBorrow {
+                    kind: ReturnBorrowKind::Value,
                     ..
                 })
             )
@@ -1085,6 +1558,12 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
+    ByteRegionLength(LocalId),
+    ByteRegionIndex {
+        region: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+    },
     Scalar(ScalarValue),
     Local(LocalId),
     NullablePayload(LocalId),
@@ -1099,6 +1578,7 @@ pub enum Operand {
         vtable: InterfaceVtableId,
     },
     CollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -1106,6 +1586,7 @@ pub enum Operand {
         remove: bool,
     },
     CollectionKeyAt {
+        index_span: Span,
         collection: LocalId,
         offset: Box<Rvalue>,
     },
@@ -1204,8 +1685,10 @@ pub enum FunctionExpression {
         function: FunctionId,
         return_borrow: Option<ReturnBorrow>,
         args: Vec<Rvalue>,
+        span: Span,
     },
     CollectionIndex {
+        index_span: Span,
         function_type: FunctionTypeId,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -1258,14 +1741,17 @@ pub enum NullableFunctionExpression {
         function: FunctionId,
         return_borrow: Option<ReturnBorrow>,
         args: Vec<Rvalue>,
+        span: Span,
     },
     DictionaryGet {
+        index_span: Span,
         function_type: FunctionTypeId,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
     },
     CollectionIndex {
+        index_span: Span,
         function_type: FunctionTypeId,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -1292,6 +1778,8 @@ impl NullableFunctionExpression {
 pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
+    ByteRegion(ByteRegionExpression),
+    NullableByteRegion(NullableByteRegionExpression),
     Mixed(MixedExpression),
     NullableScalar(NullableScalarExpression),
     NullableString(NullableStringExpression),
@@ -1349,6 +1837,8 @@ impl Rvalue {
         match self {
             Self::Value(value) => Type::Scalar(value.ty()),
             Self::String(_) => Type::String,
+            Self::ByteRegion(value) => Type::ByteRegion(value.kind()),
+            Self::NullableByteRegion(value) => Type::NullableByteRegion(value.kind()),
             Self::Mixed(_) => Type::Mixed,
             Self::NullableScalar(value) => Type::NullableScalar(value.ty()),
             Self::NullableString(_) => Type::NullableString,
@@ -1388,7 +1878,9 @@ impl Rvalue {
             | Self::NullableCollection(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
-            Self::Value(_)
+            Self::ByteRegion(_)
+            | Self::NullableByteRegion(_)
+            | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
             | Self::NullableScalar(_)
@@ -1415,7 +1907,9 @@ impl Rvalue {
         match self {
             Self::Collection(value) => value.owned_temporary_collection(),
             Self::NullableCollection(value) => value.owned_temporary_collection(),
-            Self::Value(_)
+            Self::ByteRegion(_)
+            | Self::NullableByteRegion(_)
+            | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
             | Self::NullableScalar(_)
@@ -1482,7 +1976,9 @@ impl Rvalue {
                     OwnedSharedTemporary::ReadonlyAccess
                 })
             }
-            Self::Value(_)
+            Self::ByteRegion(_)
+            | Self::NullableByteRegion(_)
+            | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
             | Self::NullableScalar(_)
@@ -1513,7 +2009,9 @@ impl Rvalue {
         match self {
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
-            Self::Value(_)
+            Self::ByteRegion(_)
+            | Self::NullableByteRegion(_)
+            | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
             | Self::NullableScalar(_)
@@ -1545,6 +2043,8 @@ impl Rvalue {
             return false;
         }
         match self {
+            Self::ByteRegion(value) => value.borrows_descriptor(),
+            Self::NullableByteRegion(value) => value.borrows_descriptor(),
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
             Self::Collection(value) => value.owned_temporary_collection().is_none(),
@@ -1569,17 +2069,25 @@ impl Rvalue {
             Self::NullablePayloadEnum(value) => !value.owned_temporary(),
             Self::Function(value) => function_expression_is_borrowed(value),
             Self::NullableFunction(value) => nullable_function_expression_is_borrowed(value),
-            Self::Value(_)
-            | Self::String(_)
-            | Self::NullableScalar(_)
-            | Self::NullableString(_) => false,
+            Self::Value(ValueExpression::Inline(value)) => {
+                value.ty().requires_owned_cleanup() && !value.owned_temporary()
+            }
+            Self::NullableScalar(value) => {
+                matches!(value.ty(), ScalarType::Inline(ty) if ty.requires_owned_cleanup())
+                    && !value.owned_inline_temporary()
+            }
+            Self::Value(_) | Self::String(_) | Self::NullableString(_) => false,
         }
     }
 
     pub const fn is_null_value(&self) -> bool {
+        if let Self::NullableClass(value) = self {
+            return matches!(value.without_upcasts(), NullableClassExpression::Null(_));
+        }
         matches!(
             self,
-            Self::NullableClass(NullableClassExpression::Null(_))
+            Self::NullableScalar(NullableScalarExpression::Null(_))
+                | Self::NullableByteRegion(NullableByteRegionExpression::Null { .. })
                 | Self::NullableCollection(NullableCollectionExpression::Null(_))
                 | Self::NullableSharedReference(NullableSharedReferenceExpression::Null(_))
                 | Self::NullableWeakReference(NullableWeakReferenceExpression::Null(_))
@@ -1606,6 +2114,71 @@ impl Rvalue {
 
     pub const fn transferred_owned_local(&self) -> Option<LocalId> {
         match self {
+            Self::Class(value) => match value.without_upcasts() {
+                ClassExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                }
+                | ClassExpression::InterfacePayload {
+                    local,
+                    transfer: true,
+                    ..
+                } => Some(*local),
+                _ => None,
+            },
+            Self::NullableClass(value) => match value.without_upcasts() {
+                NullableClassExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                } => Some(*local),
+                _ => None,
+            },
+            Self::Value(ValueExpression::Inline(InlineValueExpression::InterfaceReceiver {
+                receiver,
+                transfer: true,
+                ..
+            })) => Some(*receiver),
+            Self::Value(ValueExpression::Inline(InlineValueExpression::Use {
+                operand: Operand::Local(local) | Operand::NullablePayload(local),
+                mode: InlineValueUseMode::TransferOwnedCopy,
+                ..
+            })) => Some(*local),
+            Self::NullableScalar(NullableScalarExpression::InlineClaim {
+                value,
+                mode: InlineValueUseMode::TransferOwnedCopy,
+                ..
+            }) => match &**value {
+                NullableScalarExpression::Local { local, .. } => Some(*local),
+                _ => None,
+            },
+            Self::ByteRegion(ByteRegionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::NullableByteRegion(NullableByteRegionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            }) => Some(*local),
+            Self::ByteRegion(ByteRegionExpression::AssumePresent { value, .. }) => match &**value {
+                NullableByteRegionExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                } => Some(*local),
+                _ => None,
+            },
+            Self::NullableByteRegion(NullableByteRegionExpression::Present(value)) => match value {
+                ByteRegionExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                } => Some(*local),
+                _ => None,
+            },
             Self::Collection(CollectionExpression::FinishConstruction { source, .. }) => {
                 Some(*source)
             }
@@ -1618,21 +2191,6 @@ impl Rvalue {
             | Self::NullableMixed(NullableMixedExpression::Local {
                 local,
                 transfer: true,
-            })
-            | Self::Class(ClassExpression::Local {
-                local,
-                transfer: true,
-                ..
-            })
-            | Self::Class(ClassExpression::InterfacePayload {
-                local,
-                transfer: true,
-                ..
-            })
-            | Self::NullableClass(NullableClassExpression::Local {
-                local,
-                transfer: true,
-                ..
             })
             | Self::Collection(CollectionExpression::Local {
                 local,
@@ -1715,13 +2273,13 @@ impl Rvalue {
             Self::PayloadEnum(PayloadEnumExpression::Use {
                 place:
                     PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
-                mode: PayloadEnumUseMode::Move,
+                mode: PayloadEnumUseMode::Move | PayloadEnumUseMode::TransferOwnedCopy,
                 ..
             })
             | Self::NullablePayloadEnum(NullablePayloadEnumExpression::Use {
                 place:
                     PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
-                mode: PayloadEnumUseMode::Move,
+                mode: PayloadEnumUseMode::Move | PayloadEnumUseMode::TransferOwnedCopy,
                 ..
             }) => Some(*local),
             Self::Function(FunctionExpression::Local {
@@ -1734,14 +2292,14 @@ impl Rvalue {
                 transfer: true,
                 ..
             }) => Some(*local),
-            Self::Value(_)
+            Self::ByteRegion(_)
+            | Self::NullableByteRegion(_)
+            | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
-            | Self::Class(_)
-            | Self::NullableClass(_)
             | Self::Collection(_)
             | Self::NullableCollection(_)
             | Self::SharedReference(_)
@@ -1763,23 +2321,76 @@ impl Rvalue {
 
     /// Returns the source local only when this value is a direct read of one
     /// place. Writable call arguments use this identity to transport the place,
-    /// rather than a detached value snapshot, across the callable ABI.
+    /// rather than a detached value snapshot, across the callable ABI. A
+    /// narrowed nullable payload re-wrapped as nullable still has its local's
+    /// exact type and storage; `direct_borrow_home_place` resolves the same home.
     pub fn direct_place_local(&self) -> Option<LocalId> {
         let operand_local = |operand: &Operand| match operand {
             Operand::Local(local) | Operand::NullablePayload(local) => Some(*local),
             _ => None,
         };
         match self {
+            Self::Class(value) => match value.without_upcasts() {
+                ClassExpression::Local { local, .. }
+                | ClassExpression::NullableLocalAssumeNonNull { local, .. } => Some(*local),
+                _ => None,
+            },
+            Self::NullableClass(value) => match value.without_upcasts() {
+                NullableClassExpression::Local { local, .. } => Some(*local),
+                _ => None,
+            },
             Self::Value(
                 ValueExpression::Integer(IntegerExpression::Use { operand, .. })
                 | ValueExpression::Float(FloatExpression::Use { operand, .. })
                 | ValueExpression::Bool(BoolExpression::Use { operand })
                 | ValueExpression::Enum(EnumExpression::Use { operand, .. }),
             ) => operand_local(operand),
+            Self::Value(ValueExpression::Inline(InlineValueExpression::Use {
+                operand,
+                mode: InlineValueUseMode::Borrow,
+                ..
+            })) => operand_local(operand),
+            Self::NullableScalar(NullableScalarExpression::Value(
+                ValueExpression::Integer(IntegerExpression::Use {
+                    operand: Operand::NullablePayload(local),
+                    ..
+                })
+                | ValueExpression::Float(FloatExpression::Use {
+                    operand: Operand::NullablePayload(local),
+                    ..
+                })
+                | ValueExpression::Bool(BoolExpression::Use {
+                    operand: Operand::NullablePayload(local),
+                })
+                | ValueExpression::Enum(EnumExpression::Use {
+                    operand: Operand::NullablePayload(local),
+                    ..
+                })
+                | ValueExpression::Inline(InlineValueExpression::Use {
+                    operand: Operand::NullablePayload(local),
+                    mode: InlineValueUseMode::Borrow,
+                    ..
+                }),
+            )) => Some(*local),
+            Self::NullableScalar(NullableScalarExpression::InlineClaim {
+                value,
+                mode: InlineValueUseMode::Borrow,
+                ..
+            }) => match value.as_ref() {
+                NullableScalarExpression::Local { local, .. } => Some(*local),
+                _ => None,
+            },
+            Self::ByteRegion(ByteRegionExpression::Local { local, .. })
+            | Self::NullableByteRegion(NullableByteRegionExpression::Local { local, .. }) => {
+                Some(*local)
+            }
             Self::String(
                 StringExpression::Local(local)
                 | StringExpression::NullableLocalAssumeNonNull(local),
             )
+            | Self::NullableString(NullableStringExpression::String(
+                StringExpression::NullableLocalAssumeNonNull(local),
+            ))
             | Self::NullableString(NullableStringExpression::Local(local))
             | Self::NullableScalar(NullableScalarExpression::Local { local, .. })
             | Self::Mixed(MixedExpression::Local { local, .. })
@@ -1794,11 +2405,6 @@ impl Rvalue {
                 value: NullableInterfaceValue::Local { local, .. },
                 ..
             })
-            | Self::Class(
-                ClassExpression::Local { local, .. }
-                | ClassExpression::NullableLocalAssumeNonNull { local, .. },
-            )
-            | Self::NullableClass(NullableClassExpression::Local { local, .. })
             | Self::Collection(CollectionExpression::Local { local, .. })
             | Self::NullableCollection(NullableCollectionExpression::Local { local, .. })
             | Self::Function(FunctionExpression::Local { local, .. })
@@ -1856,7 +2462,9 @@ impl Rvalue {
         match self {
             Self::Mixed(value) => value.ownership(),
             Self::NullableMixed(value) => value.ownership(),
-            Self::Value(_)
+            Self::ByteRegion(_)
+            | Self::NullableByteRegion(_)
+            | Self::Value(_)
             | Self::String(_)
             | Self::NullableScalar(_)
             | Self::NullableString(_)
@@ -1960,7 +2568,7 @@ pub enum InterfaceValue {
         object: Box<NullableClassExpression>,
         vtable: InterfaceVtableId,
     },
-    FromCollection {
+    FromValue {
         value: Box<Rvalue>,
         vtable: InterfaceVtableId,
     },
@@ -1977,8 +2585,10 @@ pub enum InterfaceValue {
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
+        span: Span,
     },
     CollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Box<Rvalue>,
         positional: bool,
@@ -2010,13 +2620,16 @@ pub enum NullableInterfaceValue {
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
+        span: Span,
     },
     DictionaryGet {
+        index_span: Span,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
     },
     CollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Box<Rvalue>,
         positional: bool,
@@ -2041,7 +2654,7 @@ impl InterfaceValue {
                 local,
                 transfer: true,
             } => Some(*local),
-            Self::FromClass { object, .. } => match &**object {
+            Self::FromClass { object, .. } => match object.without_upcasts() {
                 ClassExpression::Local {
                     local,
                     transfer: true,
@@ -2054,7 +2667,7 @@ impl InterfaceValue {
                 } => Some(*local),
                 _ => None,
             },
-            Self::FromNullableClass { object, .. } => match &**object {
+            Self::FromNullableClass { object, .. } => match object.without_upcasts() {
                 NullableClassExpression::Local {
                     local,
                     transfer: true,
@@ -2062,7 +2675,7 @@ impl InterfaceValue {
                 } => Some(*local),
                 _ => None,
             },
-            Self::FromCollection { value, .. } => value.transferred_owned_local(),
+            Self::FromValue { value, .. } => value.transferred_owned_local(),
             _ => None,
         }
     }
@@ -2085,7 +2698,7 @@ impl InterfaceValue {
             ),
             Self::FromClass { object, .. } => object.borrows_class_value(),
             Self::FromNullableClass { object, .. } => object.borrows_class_value(),
-            Self::FromCollection { value, .. } => value.borrows_move_value(),
+            Self::FromValue { value, .. } => value.borrows_move_value(),
             Self::NewCollectionIterator { .. } => false,
         }
     }
@@ -2129,6 +2742,8 @@ pub enum PayloadEnumUseMode {
     Borrow,
     Copy,
     Move,
+    /// Private handoff of a synthetic owned Copy carrier, not a source move.
+    TransferOwnedCopy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2141,6 +2756,7 @@ pub enum PayloadEnumPlace {
         property: PropertyId,
     },
     CollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Box<Rvalue>,
         positional: bool,
@@ -2168,6 +2784,7 @@ pub enum PayloadEnumExpression {
         ty: PayloadEnumType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Coalesce {
@@ -2225,9 +2842,11 @@ pub enum NullablePayloadEnumExpression {
         ty: PayloadEnumType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     CollectionGet {
+        index_span: Span,
         ty: PayloadEnumType,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -2298,6 +2917,7 @@ pub enum SharedReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Share {
@@ -2311,6 +2931,7 @@ pub enum SharedReferenceExpression {
         transfer: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2397,6 +3018,7 @@ pub enum WeakReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Create {
@@ -2410,6 +3032,7 @@ pub enum WeakReferenceExpression {
         transfer: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2492,6 +3115,7 @@ pub enum NullableSharedReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Acquire {
@@ -2513,6 +3137,7 @@ pub enum NullableSharedReferenceExpression {
         transfer: bool,
     },
     DictionaryGet {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -2520,6 +3145,7 @@ pub enum NullableSharedReferenceExpression {
         stored_nullable: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2617,6 +3243,7 @@ pub enum NullableWeakReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     NullSafeCreate {
@@ -2630,6 +3257,7 @@ pub enum NullableWeakReferenceExpression {
         transfer: bool,
     },
     DictionaryGet {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -2637,6 +3265,7 @@ pub enum NullableWeakReferenceExpression {
         stored_nullable: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2736,6 +3365,7 @@ pub enum WritableSharedReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Share {
@@ -2749,6 +3379,7 @@ pub enum WritableSharedReferenceExpression {
         transfer: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2812,6 +3443,7 @@ pub enum WritableWeakReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Create {
@@ -2825,6 +3457,7 @@ pub enum WritableWeakReferenceExpression {
         transfer: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2884,6 +3517,7 @@ pub enum NullableWritableSharedReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Acquire {
@@ -2905,6 +3539,7 @@ pub enum NullableWritableSharedReferenceExpression {
         transfer: bool,
     },
     DictionaryGet {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -2967,6 +3602,7 @@ pub enum NullableWritableWeakReferenceExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     NullSafeCreate {
@@ -2980,6 +3616,7 @@ pub enum NullableWritableWeakReferenceExpression {
         transfer: bool,
     },
     DictionaryGet {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -3041,6 +3678,7 @@ pub enum SharedReferenceAccessExpression {
         writable: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -3053,6 +3691,7 @@ pub enum SharedReferenceAccessExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
         writable: bool,
     },
@@ -3084,6 +3723,7 @@ pub enum NullableSharedReferenceAccessExpression {
         writable: bool,
     },
     CollectionIndex {
+        index_span: Span,
         payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -3093,6 +3733,7 @@ pub enum NullableSharedReferenceAccessExpression {
         remove: bool,
     },
     CollectionGet {
+        index_span: Span,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
@@ -3102,6 +3743,7 @@ pub enum NullableSharedReferenceAccessExpression {
         payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
         writable: bool,
     },
@@ -3217,6 +3859,133 @@ impl SharedReferenceAccessExpression {
     }
 }
 
+/// A region owns only its inline descriptor, never its source byte storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ByteRegionExpression {
+    CollectionIndex {
+        kind: ByteRegionKind,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+        positional: bool,
+        remove: bool,
+    },
+    Region {
+        kind: ByteRegionKind,
+        source: Box<Rvalue>,
+        offset: Box<Rvalue>,
+        length: Box<Rvalue>,
+        span: Span,
+    },
+    Local {
+        kind: ByteRegionKind,
+        local: LocalId,
+        transfer: bool,
+    },
+    Call {
+        kind: ByteRegionKind,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    AssumePresent {
+        kind: ByteRegionKind,
+        value: Box<NullableByteRegionExpression>,
+    },
+    Coalesce {
+        kind: ByteRegionKind,
+        left: Box<NullableByteRegionExpression>,
+        right: Box<ByteRegionExpression>,
+    },
+}
+
+impl ByteRegionExpression {
+    pub const fn kind(&self) -> ByteRegionKind {
+        match self {
+            Self::Region { kind, .. }
+            | Self::Local { kind, .. }
+            | Self::Call { kind, .. }
+            | Self::AssumePresent { kind, .. }
+            | Self::CollectionIndex { kind, .. }
+            | Self::Coalesce { kind, .. } => *kind,
+        }
+    }
+
+    pub fn borrows_descriptor(&self) -> bool {
+        self.kind().is_writable()
+            && match self {
+                Self::Local { transfer, .. } => !transfer,
+                Self::CollectionIndex { remove, .. } => !remove,
+                Self::AssumePresent { value, .. } => value.borrows_descriptor(),
+                Self::Coalesce { left, right, .. } => {
+                    left.borrows_descriptor() || right.borrows_descriptor()
+                }
+                Self::Region { .. } | Self::Call { .. } => false,
+            }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableByteRegionExpression {
+    CollectionIndex {
+        kind: ByteRegionKind,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+        positional: bool,
+        remove: bool,
+    },
+    CollectionGet {
+        kind: ByteRegionKind,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        index_span: Span,
+        access: NullableCollectionAccess,
+    },
+    Null {
+        kind: ByteRegionKind,
+    },
+    Present(ByteRegionExpression),
+    Local {
+        kind: ByteRegionKind,
+        local: LocalId,
+        transfer: bool,
+    },
+    Call {
+        kind: ByteRegionKind,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+        return_borrow: Option<ReturnBorrow>,
+    },
+}
+
+impl NullableByteRegionExpression {
+    pub const fn kind(&self) -> ByteRegionKind {
+        match self {
+            Self::Null { kind }
+            | Self::Local { kind, .. }
+            | Self::Call { kind, .. }
+            | Self::CollectionIndex { kind, .. }
+            | Self::CollectionGet { kind, .. } => *kind,
+            Self::Present(value) => value.kind(),
+        }
+    }
+
+    pub fn borrows_descriptor(&self) -> bool {
+        match self {
+            Self::Null { .. } | Self::Call { .. } => false,
+            Self::Present(value) => value.borrows_descriptor(),
+            Self::Local { kind, transfer, .. } => kind.is_writable() && !transfer,
+            Self::CollectionIndex { kind, remove, .. } => kind.is_writable() && !remove,
+            Self::CollectionGet { kind, access, .. } => {
+                kind.is_writable() && !access.removes_element()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectionExpression {
     InterfaceReceiver {
@@ -3290,6 +4059,11 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         source: LocalId,
     },
+    BytesAllocate {
+        collection: CollectionTypeId,
+        length: Box<IntegerExpression>,
+        length_span: Span,
+    },
     ReadFileBytes {
         collection: CollectionTypeId,
         path: Box<StringExpression>,
@@ -3303,6 +4077,7 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
 }
@@ -3316,6 +4091,21 @@ pub enum NullableCollectionExpression {
         local: LocalId,
         transfer: bool,
     },
+    Index {
+        collection: CollectionTypeId,
+        source: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        index_span: Span,
+        transfer: bool,
+    },
+    CollectionGet {
+        collection: CollectionTypeId,
+        source: LocalId,
+        key: Box<Rvalue>,
+        index_span: Span,
+        access: NullableCollectionAccess,
+    },
     Property {
         collection: CollectionTypeId,
         object: LocalId,
@@ -3325,6 +4115,7 @@ pub enum NullableCollectionExpression {
         collection: CollectionTypeId,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Coalesce {
@@ -3340,6 +4131,8 @@ impl NullableCollectionExpression {
         match self {
             Self::Null(collection)
             | Self::Local { collection, .. }
+            | Self::Index { collection, .. }
+            | Self::CollectionGet { collection, .. }
             | Self::Property { collection, .. }
             | Self::Call { collection, .. }
             | Self::Coalesce { collection, .. } => *collection,
@@ -3351,6 +4144,11 @@ impl NullableCollectionExpression {
         match self {
             Self::Collection(value) => value.owned_temporary_collection(),
             Self::Local {
+                collection,
+                transfer: true,
+                ..
+            }
+            | Self::Index {
                 collection,
                 transfer: true,
                 ..
@@ -3370,8 +4168,13 @@ impl NullableCollectionExpression {
                 transfer: true,
                 ..
             } => Some(*collection),
+            Self::CollectionGet {
+                collection, access, ..
+            } if access.removes_element() => Some(*collection),
             Self::Null(_)
             | Self::Local { .. }
+            | Self::Index { .. }
+            | Self::CollectionGet { .. }
             | Self::Property { .. }
             | Self::Call { .. }
             | Self::Coalesce { .. } => None,
@@ -3425,6 +4228,7 @@ impl CollectionExpression {
             | Self::FinishConstruction { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
+            | Self::BytesAllocate { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
             | Self::Call { collection, .. } => *collection,
@@ -3454,6 +4258,7 @@ impl CollectionExpression {
             | Self::FinishConstruction { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
+            | Self::BytesAllocate { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
             | Self::Call {
@@ -3509,6 +4314,7 @@ pub enum MixedTag {
     Enum(EnumId),
     PayloadEnum(PayloadEnumType),
     Function(FunctionTypeId),
+    Inline(crate::inline_value::InlineValueType),
 }
 
 impl MixedTag {
@@ -3525,6 +4331,7 @@ impl MixedTag {
             Self::Enum(enum_id) => Type::Scalar(ScalarType::Enum(enum_id)),
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
             Self::Function(ty) => Type::Function(ty),
+            Self::Inline(ty) => Type::Scalar(ScalarType::Inline(ty)),
         }
     }
 
@@ -3536,6 +4343,7 @@ impl MixedTag {
                 | Self::Enum(_)
                 | Self::PayloadEnum(_)
                 | Self::Function(_)
+                | Self::Inline(_)
         )
     }
 }
@@ -3567,6 +4375,7 @@ pub enum MixedExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     BoxValue(ValueExpression),
@@ -3590,6 +4399,7 @@ pub enum MixedExpression {
         payload_owned: bool,
     },
     CollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -3655,6 +4465,20 @@ pub enum NullableMixedExpression {
         local: LocalId,
         transfer: bool,
     },
+    CollectionIndex {
+        index_span: Span,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        transfer: bool,
+        remove: bool,
+    },
+    CollectionGet {
+        collection: LocalId,
+        key: Box<Rvalue>,
+        index_span: Span,
+        access: NullableCollectionAccess,
+    },
     Property {
         object: LocalId,
         property: PropertyId,
@@ -3662,6 +4486,7 @@ pub enum NullableMixedExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Coalesce {
@@ -3674,9 +4499,18 @@ pub enum NullableMixedExpression {
 impl NullableMixedExpression {
     pub const fn ownership(&self) -> MixedOwnership {
         match self {
+            Self::CollectionGet { access, .. } => {
+                if access.removes_element() {
+                    MixedOwnership::Owned
+                } else {
+                    MixedOwnership::None
+                }
+            }
             Self::Mixed(value) => value.ownership(),
             Self::BoxNullablePayloadEnum(_) => MixedOwnership::Owned,
-            Self::Local { transfer: true, .. } | Self::Coalesce { .. } => MixedOwnership::Owned,
+            Self::Local { transfer: true, .. }
+            | Self::CollectionIndex { transfer: true, .. }
+            | Self::Coalesce { .. } => MixedOwnership::Owned,
             Self::Call {
                 return_borrow:
                     None
@@ -3688,6 +4522,9 @@ impl NullableMixedExpression {
             } => MixedOwnership::Owned,
             Self::Null
             | Self::Local {
+                transfer: false, ..
+            }
+            | Self::CollectionIndex {
                 transfer: false, ..
             }
             | Self::Property { .. }
@@ -3706,6 +4543,15 @@ impl NullableMixedExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableScalarExpression {
     Null(ScalarType),
+    InlineClaim {
+        ty: crate::inline_value::InlineValueType,
+        value: Box<NullableScalarExpression>,
+        mode: InlineValueUseMode,
+    },
+    TransferGroupKey {
+        group: LocalId,
+        key: crate::inline_value::InlineValueType,
+    },
     Value(ValueExpression),
     Local {
         ty: ScalarType,
@@ -3724,6 +4570,7 @@ pub enum NullableScalarExpression {
         ty: ScalarType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     NullSafeProperty {
         ty: ScalarType,
@@ -3735,6 +4582,7 @@ pub enum NullableScalarExpression {
         object: Box<NullableClassExpression>,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     EnumBacking {
         enum_id: EnumId,
@@ -3746,6 +4594,7 @@ pub enum NullableScalarExpression {
         right: Box<NullableScalarExpression>,
     },
     DictionaryGet {
+        index_span: Span,
         ty: ScalarType,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -3779,6 +4628,8 @@ impl NullableScalarExpression {
             | Self::Parse { ty, .. } => *ty,
             Self::EnumBacking { .. } => ScalarType::Integer(IntegerType::Int64),
             Self::CollectionIndexOf { .. } => ScalarType::Integer(IntegerType::Int64),
+            Self::TransferGroupKey { key, .. } => ScalarType::Inline(*key),
+            Self::InlineClaim { ty, .. } => ScalarType::Inline(*ty),
             Self::StringIntrinsic(call) => match call.result {
                 Type::NullableScalar(ty) => ty,
                 _ => panic!("validated String intrinsic nullable scalar result"),
@@ -3786,20 +4637,59 @@ impl NullableScalarExpression {
             Self::Value(value) => value.ty(),
         }
     }
+
+    pub const fn owned_inline_temporary(&self) -> bool {
+        match self {
+            Self::InlineClaim { mode, .. } => mode.owns_claim(),
+            Self::DictionaryGet {
+                ty: ScalarType::Inline(ty),
+                access,
+                ..
+            } => ty.requires_owned_cleanup() && access.removes_element(),
+            Self::Value(ValueExpression::Inline(value)) => value.owned_temporary(),
+            Self::Call {
+                ty: ScalarType::Inline(ty),
+                ..
+            }
+            | Self::NullSafeCall {
+                ty: ScalarType::Inline(ty),
+                ..
+            } => ty.requires_owned_cleanup(),
+            Self::Coalesce { left, right, .. } => {
+                (left.owned_inline_temporary() || matches!(**left, Self::Null(_)))
+                    && (right.owned_inline_temporary() || matches!(**right, Self::Null(_)))
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassExpression {
+    /// Retain the checked receiver domain while converting to a base ABI.
+    Upcast {
+        class: ClassId,
+        value: Box<ClassExpression>,
+    },
+    /// Opaque, non-owning readiness view of a live compiler-owned file.
+    FileReadinessSource { class: ClassId, file: LocalId },
+    /// Process-owned source metadata with the logical receiver's checked loan.
+    StandardReadinessSource {
+        class: ClassId,
+        stream: StandardIoStream,
+        borrowed_from: LocalId,
+    },
     InterfacePayload {
         class: ClassId,
         local: LocalId,
         transfer: bool,
     },
-    /// Borrow the exact implementing payload inside its statically checked entry thunk.
+    /// Project the exact implementing payload inside its checked entry thunk.
     InterfaceReceiver {
         class: ClassId,
         receiver: LocalId,
         vtable: InterfaceVtableId,
+        transfer: bool,
     },
     Local {
         class: ClassId,
@@ -3816,6 +4706,7 @@ pub enum ClassExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
+        span: Span,
     },
     New {
         /// The source-visible result type after any implicit upcast.
@@ -3825,6 +4716,7 @@ pub enum ClassExpression {
         properties: Vec<PropertyValue>,
         constructor: Option<FunctionId>,
         args: Vec<Rvalue>,
+        span: Span,
     },
     NullableLocalAssumeNonNull {
         class: ClassId,
@@ -3838,6 +4730,7 @@ pub enum ClassExpression {
         transfer: bool,
     },
     CollectionIndex {
+        index_span: Span,
         class: ClassId,
         collection: LocalId,
         index: Box<Rvalue>,
@@ -3862,9 +4755,26 @@ pub enum ClassExpression {
 }
 
 impl ClassExpression {
+    pub const fn without_upcasts(&self) -> &Self {
+        match self {
+            Self::Upcast { value, .. } => value.without_upcasts(),
+            _ => self,
+        }
+    }
+
+    pub fn static_receiver_class(&self) -> ClassId {
+        match self {
+            Self::Upcast { value, .. } => value.static_receiver_class(),
+            _ => self.class(),
+        }
+    }
+
     pub const fn class(&self) -> ClassId {
         match self {
-            Self::InterfacePayload { class, .. }
+            Self::Upcast { class, .. }
+            | Self::FileReadinessSource { class, .. }
+            | Self::StandardReadinessSource { class, .. }
+            | Self::InterfacePayload { class, .. }
             | Self::InterfaceReceiver { class, .. }
             | Self::Local { class, .. }
             | Self::Property { class, .. }
@@ -3881,6 +4791,10 @@ impl ClassExpression {
 
     pub const fn owned_temporary_class(&self) -> Option<ClassId> {
         match self {
+            Self::Upcast { class, value } => match value.owned_temporary_class() {
+                Some(_) => Some(*class),
+                None => None,
+            },
             Self::New { class, .. }
             | Self::Call {
                 class,
@@ -3901,8 +4815,17 @@ impl ClassExpression {
                 class,
                 transfer: true,
                 ..
+            }
+            | Self::InterfaceReceiver {
+                class,
+                transfer: true,
+                ..
             } => Some(*class),
-            Self::InterfaceReceiver { .. }
+            Self::FileReadinessSource { .. }
+            | Self::StandardReadinessSource { .. }
+            | Self::InterfaceReceiver {
+                transfer: false, ..
+            }
             | Self::InterfacePayload {
                 transfer: false, ..
             }
@@ -3929,13 +4852,16 @@ impl ClassExpression {
 
     pub const fn borrows_class_value(&self) -> bool {
         match self {
+            Self::Upcast { value, .. } => value.borrows_class_value(),
             Self::InterfacePayload { transfer, .. }
+            | Self::InterfaceReceiver { transfer, .. }
             | Self::Local { transfer, .. }
             | Self::NullableLocalAssumeNonNull { transfer, .. }
             | Self::Coalesce { transfer, .. }
             | Self::CollectionIndex { transfer, .. }
             | Self::MixedPayload { transfer, .. } => !*transfer,
-            Self::InterfaceReceiver { .. }
+            Self::FileReadinessSource { .. }
+            | Self::StandardReadinessSource { .. }
             | Self::Property { .. }
             | Self::SharedPayload { .. }
             | Self::SharedAccessPayload { .. }
@@ -3980,6 +4906,7 @@ pub enum ValueExpression {
     Float(FloatExpression),
     Bool(BoolExpression),
     Enum(EnumExpression),
+    Inline(InlineValueExpression),
 }
 
 impl ValueExpression {
@@ -3989,6 +4916,83 @@ impl ValueExpression {
             Self::Float(value) => ScalarType::Float(value.ty()),
             Self::Bool(_) => ScalarType::Bool,
             Self::Enum(value) => ScalarType::Enum(value.enum_id()),
+            Self::Inline(value) => ScalarType::Inline(value.ty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineValueUseMode {
+    Borrow,
+    Copy,
+    TransferOwnedCopy,
+}
+
+impl InlineValueUseMode {
+    pub const fn owns_claim(self) -> bool {
+        !matches!(self, Self::Borrow)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineValueExpression {
+    DurationFromNanoseconds(Box<IntegerExpression>),
+    InterfaceReceiver {
+        ty: crate::inline_value::InlineValueType,
+        receiver: LocalId,
+        vtable: InterfaceVtableId,
+        transfer: bool,
+    },
+    /// Acquires an independent owned claim on the source's shared state.
+    CancellationToken {
+        ty: crate::inline_value::InlineValueType,
+        source: LocalId,
+        span: Span,
+    },
+    Use {
+        ty: crate::inline_value::InlineValueType,
+        operand: Operand,
+        mode: InlineValueUseMode,
+    },
+    Call {
+        ty: crate::inline_value::InlineValueType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+    },
+    Coalesce {
+        ty: crate::inline_value::InlineValueType,
+        left: Box<NullableScalarExpression>,
+        right: Box<InlineValueExpression>,
+    },
+}
+
+impl InlineValueExpression {
+    pub const fn ty(&self) -> crate::inline_value::InlineValueType {
+        match self {
+            Self::DurationFromNanoseconds(_) => crate::inline_value::InlineValueType::Duration,
+            Self::CancellationToken { ty, .. }
+            | Self::InterfaceReceiver { ty, .. }
+            | Self::Use { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        if !self.ty().requires_owned_cleanup() {
+            return false;
+        }
+        match self {
+            Self::InterfaceReceiver { transfer, .. } => *transfer,
+            Self::Use { mode, .. } => mode.owns_claim(),
+            Self::CancellationToken { .. } | Self::Call { .. } => true,
+            Self::Coalesce { left, right, .. } => {
+                (left.owned_inline_temporary()
+                    || matches!(**left, NullableScalarExpression::Null(_)))
+                    && right.owned_temporary()
+            }
+            Self::DurationFromNanoseconds(_) => false,
         }
     }
 }
@@ -4004,6 +5008,7 @@ pub enum EnumExpression {
         enum_id: EnumId,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     Coalesce {
         enum_id: EnumId,
@@ -4045,6 +5050,7 @@ pub enum IntegerBinaryOp {
 
 #[derive(Debug, Clone)]
 pub enum IntegerExpression {
+    DurationNanoseconds(Box<InlineValueExpression>),
     Use {
         ty: IntegerType,
         operand: Operand,
@@ -4078,6 +5084,7 @@ pub enum IntegerExpression {
         ty: IntegerType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     Coalesce {
         ty: IntegerType,
@@ -4088,11 +5095,20 @@ pub enum IntegerExpression {
         enum_id: EnumId,
         value: Box<EnumExpression>,
     },
+    /// `WritableByteRegion::copyFrom`: copies the leading bytes of the
+    /// readonly `source` region into the writable `destination` region and
+    /// yields the count copied, the smaller of the two lengths.
+    CopyByteRegion {
+        destination: Box<Rvalue>,
+        source: Box<Rvalue>,
+        span: Span,
+    },
 }
 
 impl PartialEq for IntegerExpression {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::DurationNanoseconds(left), Self::DurationNanoseconds(right)) => left == right,
             (
                 Self::Use {
                     ty: left_ty,
@@ -4158,11 +5174,13 @@ impl PartialEq for IntegerExpression {
                     ty: left_ty,
                     function: left_function,
                     args: left_args,
+                    ..
                 },
                 Self::Call {
                     ty: right_ty,
                     function: right_function,
                     args: right_args,
+                    ..
                 },
             ) => left_ty == right_ty && left_function == right_function && left_args == right_args,
             (
@@ -4187,6 +5205,18 @@ impl PartialEq for IntegerExpression {
                     value: right,
                 },
             ) => left_enum == right_enum && left == right,
+            (
+                Self::CopyByteRegion {
+                    destination: left_destination,
+                    source: left_source,
+                    ..
+                },
+                Self::CopyByteRegion {
+                    destination: right_destination,
+                    source: right_source,
+                    ..
+                },
+            ) => left_destination == right_destination && left_source == right_source,
             _ => false,
         }
     }
@@ -4203,8 +5233,8 @@ impl IntegerExpression {
             | Self::Convert { ty, .. }
             | Self::Call { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
-            Self::FloatToInt { .. } => IntegerType::Int64,
-            Self::EnumBacking { .. } => IntegerType::Int64,
+            Self::FloatToInt { .. } | Self::DurationNanoseconds(_) => IntegerType::Int64,
+            Self::EnumBacking { .. } | Self::CopyByteRegion { .. } => IntegerType::Int64,
         }
     }
 
@@ -4251,6 +5281,7 @@ pub enum FloatExpression {
         ty: FloatType,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     Coalesce {
         ty: FloatType,
@@ -4295,6 +5326,7 @@ pub enum StringExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     ReadFile {
         path: Box<StringExpression>,
@@ -4306,6 +5338,7 @@ pub enum StringExpression {
         right: Box<StringExpression>,
     },
     CollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -4313,6 +5346,7 @@ pub enum StringExpression {
         remove: bool,
     },
     CollectionKeyAt {
+        index_span: Span,
         collection: LocalId,
         offset: Box<Rvalue>,
     },
@@ -4362,6 +5396,7 @@ pub enum NullableStringExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     NullSafeProperty {
         object: Box<NullableClassExpression>,
@@ -4371,6 +5406,7 @@ pub enum NullableStringExpression {
         object: Box<NullableClassExpression>,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     EnumBacking {
         enum_id: EnumId,
@@ -4381,6 +5417,7 @@ pub enum NullableStringExpression {
         right: Box<NullableStringExpression>,
     },
     DictionaryGet {
+        index_span: Span,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
@@ -4392,6 +5429,10 @@ pub enum NullableStringExpression {
 pub enum NullableClassExpression {
     Null(ClassId),
     Class(ClassExpression),
+    Upcast {
+        class: ClassId,
+        value: Box<NullableClassExpression>,
+    },
     SharedPayload {
         class: ClassId,
         reference: Box<NullableSharedReferenceExpression>,
@@ -4411,6 +5452,7 @@ pub enum NullableClassExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
+        span: Span,
     },
     NullSafeProperty {
         class: ClassId,
@@ -4422,6 +5464,7 @@ pub enum NullableClassExpression {
         object: Box<NullableClassExpression>,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     Coalesce {
@@ -4431,6 +5474,7 @@ pub enum NullableClassExpression {
         transfer: bool,
     },
     DictionaryGet {
+        index_span: Span,
         class: ClassId,
         collection: LocalId,
         key: Box<Rvalue>,
@@ -4439,9 +5483,25 @@ pub enum NullableClassExpression {
 }
 
 impl NullableClassExpression {
+    pub const fn without_upcasts(&self) -> &Self {
+        match self {
+            Self::Upcast { value, .. } => value.without_upcasts(),
+            _ => self,
+        }
+    }
+
+    pub fn static_receiver_class(&self) -> ClassId {
+        match self {
+            Self::Upcast { value, .. } => value.static_receiver_class(),
+            Self::Class(value) => value.static_receiver_class(),
+            _ => self.class(),
+        }
+    }
+
     pub const fn class(&self) -> ClassId {
         match self {
             Self::Null(class)
+            | Self::Upcast { class, .. }
             | Self::SharedPayload { class, .. }
             | Self::Local { class, .. }
             | Self::Property { class, .. }
@@ -4456,6 +5516,10 @@ impl NullableClassExpression {
 
     pub const fn owned_temporary_class(&self) -> Option<ClassId> {
         match self {
+            Self::Upcast { class, value } => match value.owned_temporary_class() {
+                Some(_) => Some(*class),
+                None => None,
+            },
             Self::Class(value) => value.owned_temporary_class(),
             Self::Local {
                 class,
@@ -4512,6 +5576,7 @@ impl NullableClassExpression {
 
     pub const fn borrows_class_value(&self) -> bool {
         match self {
+            Self::Upcast { value, .. } => value.borrows_class_value(),
             Self::Class(value) => value.borrows_class_value(),
             Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => !*transfer,
             Self::Property { .. }
@@ -4572,6 +5637,9 @@ pub struct FormatExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoolExpression {
+    CancellationRequested {
+        source: LocalId,
+    },
     NominalIs {
         local: LocalId,
         target: Type,
@@ -4609,6 +5677,7 @@ pub enum BoolExpression {
         target: ClassId,
     },
     NullableCollectionIsPresent(Box<NullableCollectionExpression>),
+    NullableByteRegionIsPresent(Box<NullableByteRegionExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
     NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
     NullableWritableSharedReferenceIsPresent(Box<NullableWritableSharedReferenceExpression>),
@@ -4643,6 +5712,7 @@ pub enum BoolExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     Coalesce {
         left: Box<NullableScalarExpression>,
@@ -4693,6 +5763,36 @@ pub enum BoolBinaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
+    /// Restores the authored statement site after nested expression evaluation.
+    SetDiagnosticSite {
+        span: Span,
+    },
+    /// Configures a call-scoped group slot; this never submits native I/O.
+    CompletePendingRequest {
+        request: LocalId,
+        outcome: LocalId,
+        span: Span,
+    },
+    /// Ends a borrowed descriptor's lexical lifetime without dropping storage.
+    EndBorrow {
+        local: LocalId,
+    },
+    AssignByteRegionIndex {
+        region: LocalId,
+        index: Rvalue,
+        value: Rvalue,
+        index_span: Span,
+    },
+    /// `WritableByteRegion::copyWithin`: moves `length` bytes from `offset`
+    /// to `destination` inside the writable region local. Both ranges are
+    /// bounds-checked (P1304), source first; they may overlap.
+    CopyWithinByteRegion {
+        region: LocalId,
+        offset: Rvalue,
+        length: Rvalue,
+        destination: Rvalue,
+        span: Span,
+    },
     CoreCollection {
         collection: LocalId,
         operation: CoreCollectionOperation,
@@ -4734,6 +5834,7 @@ pub enum Statement {
         result: LocalId,
         arms: Vec<MatchArmPlan>,
         merge: BlockId,
+        error_exit: Option<ConditionalErrorExit>,
     },
     /// Validation-only identity for source control flow that lowers to ordinary
     /// blocks and branches. Backends execute the CFG and ignore this statement.
@@ -4789,6 +5890,9 @@ pub enum Statement {
     DropClass {
         local: LocalId,
         class: ClassId,
+        /// False only after a field take consumed the receiver: its own
+        /// destructor does not run; ancestors have none.
+        runs_destructor: bool,
     },
     /// Cleans a failed constructor's own initialized fields, then its completed
     /// parent phases. The incomplete phase has no destructor; the allocating
@@ -4833,21 +5937,31 @@ pub enum Statement {
         error: LocalId,
         descriptor: ErrorDescriptorId,
     },
+    /// Moves an owned stored field out of a consumed receiver and leaves its
+    /// slot vacated. Lowering destroys the receiver immediately afterwards.
+    TakeProperty {
+        target: LocalId,
+        object: LocalId,
+        property: crate::class_layout::PropertyId,
+    },
     DropError {
         local: LocalId,
     },
     CollectionAdd {
+        span: Span,
         collection: LocalId,
         value: Rvalue,
         index: Option<Rvalue>,
         op: CollectionMutationOp,
     },
     CollectionSet {
+        index_span: Span,
         collection: LocalId,
         key: Rvalue,
         value: Rvalue,
     },
     AssignCollectionIndex {
+        index_span: Span,
         collection: LocalId,
         index: Rvalue,
         /// True when `index` is a position in the collection rather than a key.
@@ -4865,6 +5979,11 @@ pub enum Statement {
     DropPayloadEnum {
         local: LocalId,
         ty: PayloadEnumType,
+        nullable: bool,
+    },
+    DropInlineValue {
+        local: LocalId,
+        ty: crate::inline_value::InlineValueType,
         nullable: bool,
     },
     DropFunction {
@@ -4885,7 +6004,248 @@ pub enum PropertyWriteKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileControlOperation {
+    SynchronizeData,
+    SynchronizeMetadata,
+    SetLength {
+        length: LocalId,
+    },
+    Seek {
+        offset: LocalId,
+        origin: LocalId,
+    },
+    Position,
+    Length,
+    /// Waits for the whole-file lock in `FileLockMode` `mode`.
+    Lock {
+        mode: LocalId,
+    },
+    /// Acquires without waiting; the bool result is false on contention.
+    TryLock {
+        mode: LocalId,
+    },
+    /// Explicit release by the holding guard.
+    Unlock,
+    /// Best-effort release while the holding guard is destroyed.
+    AbandonLock,
+    /// Closes a child's input pipe; the owner stays, later writes are Closed.
+    CloseInput,
+}
+
+impl FileControlOperation {
+    pub fn tag(&self) -> u8 {
+        match self {
+            Self::SynchronizeData => 1,
+            Self::SynchronizeMetadata => 2,
+            Self::SetLength { .. } => 6,
+            Self::Seek { .. } => 3,
+            Self::Position => 4,
+            Self::Length => 5,
+            Self::Lock { .. } => 7,
+            Self::TryLock { .. } => 8,
+            Self::Unlock => 9,
+            Self::AbandonLock => 10,
+            Self::CloseInput => 11,
+        }
+    }
+
+    pub fn result_type(&self) -> Option<Type> {
+        match self {
+            Self::Seek { .. } | Self::Position | Self::Length => Some(Type::Scalar(
+                ScalarType::Integer(crate::types::IntegerType::Int64),
+            )),
+            Self::TryLock { .. } => Some(Type::Scalar(ScalarType::Bool)),
+            Self::SynchronizeData
+            | Self::SynchronizeMetadata
+            | Self::SetLength { .. }
+            | Self::Lock { .. }
+            | Self::Unlock
+            | Self::AbandonLock
+            | Self::CloseInput => None,
+        }
+    }
+
+    /// A lock's release goes through the guard's exclusive loan or owned file,
+    /// so it is not a Doria-visible write of the file value.
+    pub fn requires_writable_file(&self) -> bool {
+        !matches!(
+            self,
+            Self::Position | Self::Length | Self::Unlock | Self::AbandonLock
+        )
+    }
+
+    /// The enum operand passed as the runtime's `origin` byte, with the enum's
+    /// canonical name and cases in tag order.
+    pub fn enum_argument(&self) -> Option<(LocalId, &'static str, &'static [&'static str])> {
+        match self {
+            Self::Seek { origin, .. } => Some((
+                *origin,
+                "Doria\\Std\\Io\\SeekOrigin",
+                &["Start", "Current", "End"],
+            )),
+            Self::Lock { mode } | Self::TryLock { mode } => Some((
+                *mode,
+                "Doria\\Std\\Io\\FileLockMode",
+                &["Shared", "Exclusive"],
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn integer_argument(&self) -> Option<LocalId> {
+        match self {
+            Self::Seek { offset, .. } => Some(*offset),
+            Self::SetLength { length } => Some(*length),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical non-owning devices. This is private compiler transport, independent
+/// of the deferred source-level declarations used to obtain standard views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandardIoStream {
+    Input,
+    Output,
+    Error,
+}
+
+impl StandardIoStream {
+    pub const fn is_input(self) -> bool {
+        matches!(self, Self::Input)
+    }
+
+    pub const fn runtime_tag(self) -> u8 {
+        match self {
+            Self::Input => 0,
+            Self::Output => 1,
+            Self::Error => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckedIoOperation {
+    /// Observes one result without consuming the owner or releasing its loans.
+    ObserveTransferGroup {
+        group: LocalId,
+        wait: LocalId,
+        outcome: PayloadEnumType,
+    },
+    /// Reuses one observed operation over its original retained buffer.
+    ResubmitTransfer {
+        group: LocalId,
+        key: LocalId,
+        reading: bool,
+        offset: LocalId,
+        length: LocalId,
+    },
+    TransferGroupReadRegion {
+        group: LocalId,
+        key: LocalId,
+    },
+    /// Consumes configuration on both edges. Success retains the set's
+    /// exclusive loan and all loans inherited from the plan until group cleanup.
+    BeginTransferGroup {
+        class: ClassId,
+        set: LocalId,
+        plan: LocalId,
+        /// Call-only nullable Copy inputs; the runtime retains state, not loans.
+        deadline: LocalId,
+        cancellation: LocalId,
+    },
+    /// Readonly metadata lookup. The Copy key retains no plan or region loan.
+    TransferPlanKey {
+        plan: LocalId,
+        position: LocalId,
+        key: crate::inline_value::InlineValueType,
+    },
+    /// Configuration only. Append consumes the old owner on either edge,
+    /// forwarding its retained loans only into a successful replacement.
+    ConfigureTransferPlan {
+        class: ClassId,
+        previous: Option<LocalId>,
+        key: LocalId,
+        region: LocalId,
+        reading: bool,
+    },
+    NewReadinessSet {
+        class: ClassId,
+    },
+    /// Obtains the stream's nominal readiness getter before consuming the
+    /// original complete value. Getter failure and admission both resolve take.
+    RegisterReadinessStream {
+        set: LocalId,
+        stream: LocalId,
+        key: crate::inline_value::InlineValueType,
+    },
+    UnregisterReadinessStream {
+        set: LocalId,
+        key: LocalId,
+        stream_type: Type,
+    },
+    BorrowReadinessStream {
+        set: LocalId,
+        key: LocalId,
+        stream_type: Type,
+        writable: bool,
+    },
+    PendingRequestOutcome {
+        request: LocalId,
+        outcome: PayloadEnumType,
+    },
+    /// Selects the current native leaf and storage without submitting I/O.
+    /// Source resolution and configuration preserve ordinary checked failures.
+    PreparePendingFile {
+        file: LocalId,
+        request: LocalId,
+        region: LocalId,
+    },
+    PreparePendingStandard {
+        stream: StandardIoStream,
+        request: LocalId,
+        region: LocalId,
+    },
+    OpenOwnedFile {
+        path: StringExpression,
+        class: ClassId,
+        creation: Option<LocalId>,
+        mode: Option<LocalId>,
+    },
+    ReadOwnedFile {
+        file: LocalId,
+        destination: LocalId,
+        outcome: PayloadEnumType,
+    },
+    WriteOwnedFile {
+        file: LocalId,
+        source: LocalId,
+        outcome: PayloadEnumType,
+    },
+    /// One best-effort transfer over the intrinsic device owner. The borrowed
+    /// region and inline outcome add no device handle, buffer or close claim.
+    TransferStandardBytes {
+        stream: StandardIoStream,
+        region: LocalId,
+        outcome: PayloadEnumType,
+    },
+    CloseOwnedFile {
+        file: LocalId,
+    },
+    ControlOwnedFile {
+        file: LocalId,
+        control: FileControlOperation,
+    },
+    /// A runtime operation of the internal `ChildProcess` owner. `process` is
+    /// the receiver of every operation except launch; `arguments` are the
+    /// intrinsic's other parameters in declaration order; `class` is the
+    /// class a launch or pipe take creates.
+    Process {
+        operation: crate::compiler_known_stream::ProcessFunction,
+        process: Option<LocalId>,
+        arguments: Vec<LocalId>,
+        class: Option<ClassId>,
+    },
     ReadLine {
         prompt: StringExpression,
     },
@@ -4947,19 +6307,84 @@ pub enum ControlFlowPlan {
     ListAlgorithm(Box<ListAlgorithmPlan>),
 }
 
-/// Static lifetime contract; it does not change the native calling convention.
+/// Checked lifetime contract, including inputs that need a native borrow home.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetainedSourcesPlan {
     pub returns: Vec<RetainedSource>,
     pub constructs: Vec<RetainedSource>,
     pub independent_parameters: Vec<LocalId>,
     pub promotions: Vec<(PropertyId, LocalId)>,
+    pub stores: Vec<RetainedStore>,
+    pub exceptional_stores: Vec<RetainedStore>,
+    pub removals: Vec<RetainedStorageSelection>,
+    pub exceptional_removals: Vec<RetainedStorageSelection>,
+    pub returned_selectors: Vec<RetainedStorageSelector>,
+    pub returned_storage: Option<RetainedReturnedStorage>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedReturnedStorage {
+    pub inputs: Vec<LocalId>,
+    pub direct: Vec<RetainedSource>,
+    pub members: Vec<RetainedReturnedMember>,
+    pub selections: Vec<RetainedStorageSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RetainedStorageSelection {
+    pub destination: LocalId,
+    pub path: Vec<PropertyId>,
+    pub selectors: Vec<RetainedStorageSelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedReturnedMember {
+    pub identity: RetainedStorageIdentity,
+    pub path: Vec<PropertyId>,
+    pub sources: Vec<RetainedSource>,
+    pub repeated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RetainedStorageSelector {
+    Member(RetainedStorageIdentity),
+    Input(LocalId),
+    All,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RetainedStorageIdentity {
+    pub origin: Span,
+    pub callers: Vec<Span>,
+}
+
+impl RetainedStorageIdentity {
+    pub(crate) fn at_call(&self, site: Span) -> Self {
+        let mut identity = self.clone();
+        if !identity.callers.contains(&site) {
+            identity.callers.push(site);
+        }
+        identity
+    }
+}
+
+/// An input owner receives these loans on the corresponding call outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedStore {
+    pub destination: LocalId,
+    pub path: Vec<PropertyId>,
+    pub identity: RetainedStorageIdentity,
+    pub sources: Vec<RetainedSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RetainedSource {
     pub local: LocalId,
     pub inherited: bool,
+    pub writable: bool,
+    pub lifetime: RetainedLifetime,
+    pub owned_path: Vec<PropertyId>,
 }
 
 /// Selection evidence for an implicit core-contract call. Execution still uses
@@ -5246,6 +6671,14 @@ pub struct WhenResultPlan {
     pub ownership: WhenResultOwnership,
     pub branches: Vec<BlockId>,
     pub merge: BlockId,
+    pub error_exit: Option<ConditionalErrorExit>,
+}
+
+/// An enclosing checked-error destination, outside a conditional value region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionalErrorExit {
+    pub error: LocalId,
+    pub destination: BlockId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5366,6 +6799,24 @@ pub enum Terminator {
         failure: BlockId,
         span: Span,
     },
+    /// An observable, fallible Time operation, never a pure value expression.
+    CheckedDeadlineFromNow {
+        duration: LocalId,
+        result: Option<LocalId>,
+        error: LocalId,
+        success: BlockId,
+        failure: BlockId,
+        span: Span,
+    },
+    /// Concurrency owns notification failure; success has no result value.
+    CheckedCancellationRequest {
+        source: LocalId,
+        result: Option<LocalId>,
+        error: LocalId,
+        success: BlockId,
+        failure: BlockId,
+        span: Span,
+    },
     ErrorSwitch {
         error: LocalId,
         cases: Vec<(ErrorDescriptorId, BlockId)>,
@@ -5394,6 +6845,8 @@ pub(crate) fn class_temporary_capacity(function: &Function) -> usize {
 
 fn statement_class_temporary_capacity(statement: &Statement) -> usize {
     match statement {
+        Statement::SetDiagnosticSite { .. } => 0,
+        Statement::CompletePendingRequest { .. } => 0,
         Statement::CoreCollection { .. } => 0,
         Statement::AssignLocal { value, .. }
         | Statement::AssignLocalGroup { value, .. }
@@ -5403,10 +6856,22 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::CollectionSet { key, value, .. } => {
             rvalue_class_temporary_capacity(key) + rvalue_class_temporary_capacity(value)
         }
-        Statement::AssignCollectionIndex { index, value, .. } => {
+        Statement::AssignByteRegionIndex { index, value, .. }
+        | Statement::AssignCollectionIndex { index, value, .. } => {
             rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
         }
-        Statement::AdvanceCollectionIterator { .. }
+        Statement::CopyWithinByteRegion {
+            offset,
+            length,
+            destination,
+            ..
+        } => {
+            rvalue_class_temporary_capacity(offset)
+                + rvalue_class_temporary_capacity(length)
+                + rvalue_class_temporary_capacity(destination)
+        }
+        Statement::EndBorrow { .. }
+        | Statement::AdvanceCollectionIterator { .. }
         | Statement::EchoStringLiteral(_)
         | Statement::BindClosureEnvironment { .. }
         | Statement::BindPayloadEnumFields { .. }
@@ -5423,8 +6888,10 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropMixed { .. }
         | Statement::EnsureErrorOrigin { .. }
         | Statement::ExtractErrorObject { .. }
+        | Statement::TakeProperty { .. }
         | Statement::DropError { .. }
         | Statement::DropPayloadEnum { .. }
+        | Statement::DropInlineValue { .. }
         | Statement::CollectionClear { .. }
         | Statement::DropCollection { .. }
         | Statement::DropFunction { .. }
@@ -5487,6 +6954,8 @@ fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
                     .sum::<usize>()
         }
         Terminator::CheckedIo { operation, .. } => checked_io_class_temporary_capacity(operation),
+        Terminator::CheckedDeadlineFromNow { .. }
+        | Terminator::CheckedCancellationRequest { .. } => 0,
         Terminator::ErrorSwitch { .. } | Terminator::PropagateError { .. } => 0,
         Terminator::ReturnVoid | Terminator::Unreachable | Terminator::Jump(_) => 0,
     }
@@ -5494,6 +6963,26 @@ fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
 
 fn checked_io_class_temporary_capacity(operation: &CheckedIoOperation) -> usize {
     match operation {
+        CheckedIoOperation::ObserveTransferGroup { .. } => 0,
+        CheckedIoOperation::ConfigureTransferPlan { .. }
+        | CheckedIoOperation::BeginTransferGroup { .. }
+        | CheckedIoOperation::TransferGroupReadRegion { .. }
+        | CheckedIoOperation::ResubmitTransfer { .. }
+        | CheckedIoOperation::TransferPlanKey { .. } => 0,
+        CheckedIoOperation::NewReadinessSet { .. }
+        | CheckedIoOperation::RegisterReadinessStream { .. }
+        | CheckedIoOperation::UnregisterReadinessStream { .. }
+        | CheckedIoOperation::BorrowReadinessStream { .. }
+        | CheckedIoOperation::PendingRequestOutcome { .. } => 0,
+        CheckedIoOperation::OpenOwnedFile { path, .. } => string_class_temporary_capacity(path),
+        CheckedIoOperation::ReadOwnedFile { .. }
+        | CheckedIoOperation::WriteOwnedFile { .. }
+        | CheckedIoOperation::TransferStandardBytes { .. }
+        | CheckedIoOperation::PreparePendingFile { .. }
+        | CheckedIoOperation::PreparePendingStandard { .. }
+        | CheckedIoOperation::CloseOwnedFile { .. }
+        | CheckedIoOperation::ControlOwnedFile { .. }
+        | CheckedIoOperation::Process { .. } => 0,
         CheckedIoOperation::ReadLine { prompt } => string_class_temporary_capacity(prompt),
         CheckedIoOperation::ReadFile { path, .. } => string_class_temporary_capacity(path),
         CheckedIoOperation::ReadStdinBytes => 0,
@@ -5522,6 +7011,10 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
         )
         + match value {
             Rvalue::Value(value) => value_class_temporary_capacity(value),
+            Rvalue::ByteRegion(value) => byte_region_class_temporary_capacity(value),
+            Rvalue::NullableByteRegion(value) => {
+                nullable_byte_region_class_temporary_capacity(value)
+            }
             Rvalue::String(value) => string_class_temporary_capacity(value),
             Rvalue::Mixed(value) => mixed_class_temporary_capacity(value),
             Rvalue::NullableScalar(value) => nullable_scalar_class_temporary_capacity(value),
@@ -5530,9 +7023,7 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::Interface(InterfaceExpression { value, .. }) => match value {
                 InterfaceValue::SharedPayload { .. }
                 | InterfaceValue::NewCollectionIterator { .. } => 0,
-                InterfaceValue::FromCollection { value, .. } => {
-                    rvalue_class_temporary_capacity(value)
-                }
+                InterfaceValue::FromValue { value, .. } => rvalue_class_temporary_capacity(value),
                 InterfaceValue::Upcast { source, .. } => {
                     rvalue_class_temporary_capacity(&Rvalue::Interface(*source.clone()))
                 }
@@ -5651,6 +7142,49 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
         }
 }
 
+fn byte_region_class_temporary_capacity(value: &ByteRegionExpression) -> usize {
+    match value {
+        ByteRegionExpression::CollectionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
+        ByteRegionExpression::Region {
+            source,
+            offset,
+            length,
+            ..
+        } => {
+            rvalue_class_temporary_capacity(source)
+                + rvalue_class_temporary_capacity(offset)
+                + rvalue_class_temporary_capacity(length)
+        }
+        ByteRegionExpression::Local { .. } => 0,
+        ByteRegionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        ByteRegionExpression::AssumePresent { value, .. } => {
+            nullable_byte_region_class_temporary_capacity(value)
+        }
+        ByteRegionExpression::Coalesce { left, right, .. } => {
+            nullable_byte_region_class_temporary_capacity(left)
+                + byte_region_class_temporary_capacity(right)
+        }
+    }
+}
+
+fn nullable_byte_region_class_temporary_capacity(value: &NullableByteRegionExpression) -> usize {
+    match value {
+        NullableByteRegionExpression::CollectionIndex { index: key, .. }
+        | NullableByteRegionExpression::CollectionGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableByteRegionExpression::Null { .. } | NullableByteRegionExpression::Local { .. } => 0,
+        NullableByteRegionExpression::Present(value) => byte_region_class_temporary_capacity(value),
+        NullableByteRegionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+    }
+}
+
 fn function_class_temporary_capacity(value: &FunctionExpression) -> usize {
     match value {
         FunctionExpression::Create { captures, .. } => captures
@@ -5742,6 +7276,10 @@ fn nullable_collection_class_temporary_capacity(value: &NullableCollectionExpres
         }
         NullableCollectionExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableCollectionExpression::Index { index, .. }
+        | NullableCollectionExpression::CollectionGet { key: index, .. } => {
+            rvalue_class_temporary_capacity(index)
         }
         NullableCollectionExpression::Coalesce { left, right, .. } => {
             nullable_collection_class_temporary_capacity(left)
@@ -6011,6 +7549,10 @@ fn nullable_mixed_class_temporary_capacity(value: &NullableMixedExpression) -> u
         NullableMixedExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        NullableMixedExpression::CollectionIndex { index, .. }
+        | NullableMixedExpression::CollectionGet { key: index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
         NullableMixedExpression::Coalesce { left, right, .. } => {
             nullable_mixed_class_temporary_capacity(left)
                 + nullable_mixed_class_temporary_capacity(right)
@@ -6050,7 +7592,8 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
             CollectionExpression::Fill { value, count, .. } => {
                 rvalue_class_temporary_capacity(value) + integer_class_temporary_capacity(count)
             }
-            CollectionExpression::ConstructionCapacity { count, .. } => {
+            CollectionExpression::ConstructionCapacity { count, .. }
+            | CollectionExpression::BytesAllocate { length: count, .. } => {
                 integer_class_temporary_capacity(count)
             }
             CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
@@ -6068,6 +7611,24 @@ fn value_class_temporary_capacity(value: &ValueExpression) -> usize {
         ValueExpression::Float(value) => float_class_temporary_capacity(value),
         ValueExpression::Bool(value) => bool_class_temporary_capacity(value),
         ValueExpression::Enum(value) => enum_class_temporary_capacity(value),
+        ValueExpression::Inline(value) => inline_class_temporary_capacity(value),
+    }
+}
+
+fn inline_class_temporary_capacity(value: &InlineValueExpression) -> usize {
+    match value {
+        InlineValueExpression::DurationFromNanoseconds(value) => {
+            integer_class_temporary_capacity(value)
+        }
+        InlineValueExpression::CancellationToken { .. }
+        | InlineValueExpression::InterfaceReceiver { .. }
+        | InlineValueExpression::Use { .. } => 0,
+        InlineValueExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        InlineValueExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_class_temporary_capacity(left) + inline_class_temporary_capacity(right)
+        }
     }
 }
 
@@ -6083,6 +7644,7 @@ fn enum_class_temporary_capacity(value: &EnumExpression) -> usize {
 
 fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
     match value {
+        IntegerExpression::DurationNanoseconds(value) => inline_class_temporary_capacity(value),
         IntegerExpression::Use { .. } => 0,
         IntegerExpression::Unary { operand, .. }
         | IntegerExpression::Convert { value: operand, .. } => {
@@ -6099,6 +7661,11 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
             nullable_scalar_class_temporary_capacity(left) + integer_class_temporary_capacity(right)
         }
         IntegerExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
+        IntegerExpression::CopyByteRegion {
+            destination,
+            source,
+            ..
+        } => rvalue_class_temporary_capacity(destination) + rvalue_class_temporary_capacity(source),
     }
 }
 
@@ -6188,7 +7755,10 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
 
 fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
     match value {
-        ClassExpression::InterfacePayload { .. }
+        ClassExpression::Upcast { value, .. } => class_expression_temporary_capacity(value),
+        ClassExpression::FileReadinessSource { .. }
+        | ClassExpression::StandardReadinessSource { .. }
+        | ClassExpression::InterfacePayload { .. }
         | ClassExpression::InterfaceReceiver { .. }
         | ClassExpression::Local { .. }
         | ClassExpression::Property { .. }
@@ -6196,7 +7766,8 @@ fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
         | ClassExpression::MixedPayload { .. }
         | ClassExpression::SharedAccessPayload { .. } => 0,
         ClassExpression::SharedPayload { reference, .. } => {
-            shared_class_temporary_capacity(reference)
+            usize::from(reference.owned_temporary().is_some())
+                + shared_class_temporary_capacity(reference)
         }
         ClassExpression::Call { args, .. } => {
             usize::from(value.owned_temporary_class().is_some())
@@ -6232,6 +7803,9 @@ fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
 
 fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) -> usize {
     match value {
+        NullableScalarExpression::InlineClaim { value, .. } => {
+            nullable_scalar_class_temporary_capacity(value)
+        }
         NullableScalarExpression::Value(value) => value_class_temporary_capacity(value),
         NullableScalarExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
@@ -6261,6 +7835,7 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
         NullableScalarExpression::Parse { .. }
+        | NullableScalarExpression::TransferGroupKey { .. }
         | NullableScalarExpression::Null(_)
         | NullableScalarExpression::Local { .. }
         | NullableScalarExpression::Property { .. }
@@ -6270,6 +7845,7 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
 
 fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
     match value {
+        NullableClassExpression::Upcast { value, .. } => nullable_class_temporary_capacity(value),
         NullableClassExpression::Class(value) => class_expression_temporary_capacity(value),
         NullableClassExpression::Call { args, .. } => {
             usize::from(value.owned_temporary_class().is_some())
@@ -6293,8 +7869,11 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
             nullable_class_temporary_capacity(left) + nullable_class_temporary_capacity(right)
         }
         NullableClassExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
+        NullableClassExpression::SharedPayload { reference, .. } => {
+            usize::from(reference.owned_temporary().is_some())
+                + nullable_shared_class_temporary_capacity(reference)
+        }
         NullableClassExpression::Null(_)
-        | NullableClassExpression::SharedPayload { .. }
         | NullableClassExpression::Local { .. }
         | NullableClassExpression::Property { .. } => 0,
     }
@@ -6302,7 +7881,7 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
 
 pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
     match value {
-        BoolExpression::NominalIs { .. } => 0,
+        BoolExpression::CancellationRequested { .. } | BoolExpression::NominalIs { .. } => 0,
         BoolExpression::Use { .. } => 0,
         BoolExpression::Compare { left, right, .. } => {
             value_class_temporary_capacity(left) + value_class_temporary_capacity(right)
@@ -6325,6 +7904,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         BoolExpression::ClassIs { value, .. } => nullable_class_temporary_capacity(value),
         BoolExpression::NullableCollectionIsPresent(value) => {
             nullable_collection_class_temporary_capacity(value)
+        }
+        BoolExpression::NullableByteRegionIsPresent(value) => {
+            nullable_byte_region_class_temporary_capacity(value)
         }
         BoolExpression::NullableSharedReferenceIsPresent(value) => {
             nullable_shared_class_temporary_capacity(value)
@@ -6435,6 +8017,9 @@ impl fmt::Display for Program {
 
 impl fmt::Display for Function {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.owns_diagnostic_frame() {
+            write!(formatter, "diagnostic-frame {:?} ", self.diagnostic_frame)?;
+        }
         if let Some(slot) = self.virtual_slot {
             write!(formatter, "virtual-slot#{slot} ")?;
         }
@@ -6576,6 +8161,8 @@ impl fmt::Display for Type {
         match self {
             Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
+            Type::ByteRegion(kind) => write!(formatter, "{}", kind.source_name()),
+            Type::NullableByteRegion(kind) => write!(formatter, "?{}", kind.source_name()),
             Type::Mixed => write!(formatter, "mixed"),
             Type::NullableScalar(ty) => write!(formatter, "?{ty}"),
             Type::NullableString => write!(formatter, "?string"),
@@ -6663,6 +8250,10 @@ impl fmt::Display for BasicBlock {
 impl fmt::Display for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ByteRegionLength(local) => write!(formatter, "region_length(local{})", local.0),
+            Self::ByteRegionIndex { region, index, .. } => {
+                write!(formatter, "region local{}[{index}]", region.0)
+            }
             Operand::CollectionIteratorPosition { receiver, vtable } => write!(
                 formatter,
                 "iterator_position(local{}, vtable#{})",
@@ -6687,7 +8278,11 @@ impl fmt::Display for Operand {
             } => {
                 write!(formatter, "local{}[{index}]", collection.0)
             }
-            Operand::CollectionKeyAt { collection, offset } => {
+            Operand::CollectionKeyAt {
+                index_span: _,
+                collection,
+                offset,
+            } => {
                 write!(formatter, "key_at(local{}, {offset})", collection.0)
             }
             Operand::MixedPayload { mixed, tag } => {
@@ -6701,8 +8296,10 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ByteRegion(value) => write!(formatter, "{value}"),
+            Self::NullableByteRegion(value) => write!(formatter, "{value}"),
             Self::Interface(InterfaceExpression {
-                value: InterfaceValue::FromCollection { value, vtable },
+                value: InterfaceValue::FromValue { value, vtable },
                 ..
             }) => write!(formatter, "erase {value} with vtable#{}", vtable.0),
             Self::Interface(InterfaceExpression {
@@ -7066,6 +8663,103 @@ impl fmt::Display for NullableFunctionExpression {
     }
 }
 
+impl fmt::Display for ByteRegionExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => write!(
+                formatter,
+                "{}local{}[{}{}]",
+                if *remove { "remove " } else { "" },
+                collection.0,
+                if *positional { "position " } else { "" },
+                index
+            ),
+            Self::Region {
+                kind,
+                source,
+                offset,
+                length,
+                ..
+            } => write!(
+                formatter,
+                "{}({source}, {offset}, {length})",
+                kind.source_name()
+            ),
+            Self::Local {
+                local, transfer, ..
+            } => write!(
+                formatter,
+                "{}local{}",
+                if *transfer { "move " } else { "" },
+                local.0
+            ),
+            Self::Call { function, args, .. } => write!(
+                formatter,
+                "call function#{}({})",
+                function.0,
+                args.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::AssumePresent { value, .. } => write!(formatter, "present({value})"),
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
+        }
+    }
+}
+
+impl fmt::Display for NullableByteRegionExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => write!(
+                formatter,
+                "{}local{}[{}{}]",
+                if *remove { "remove " } else { "" },
+                collection.0,
+                if *positional { "position " } else { "" },
+                index
+            ),
+            Self::CollectionGet {
+                collection,
+                key,
+                access,
+                ..
+            } => write!(formatter, "local{}->{access:?}({key})", collection.0),
+            Self::Null { .. } => write!(formatter, "null"),
+            Self::Present(value) => write!(formatter, "{value}"),
+            Self::Local {
+                local, transfer, ..
+            } => write!(
+                formatter,
+                "{}local{}",
+                if *transfer { "move " } else { "" },
+                local.0
+            ),
+            Self::Call { function, args, .. } => write!(
+                formatter,
+                "call function#{}({})",
+                function.0,
+                args.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
 impl fmt::Display for CollectionExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -7164,6 +8858,9 @@ impl fmt::Display for CollectionExpression {
             Self::BytesFromArray { source, .. } => {
                 write!(formatter, "Bytes::fromArray(local{})", source.0)
             }
+            Self::BytesAllocate { length, .. } => {
+                write!(formatter, "Bytes::allocate({length})")
+            }
             Self::ReadFileBytes { path, .. } => write!(formatter, "read_file_bytes({path})"),
             Self::ReadStdinBytes { .. } => formatter.write_str("read_stdin_bytes()"),
             Self::StringIntrinsic(call) => write!(formatter, "{call}"),
@@ -7175,6 +8872,23 @@ impl fmt::Display for CollectionExpression {
 impl fmt::Display for ClassExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Upcast { class, value } => {
+                write!(formatter, "upcast ({value}) as class#{}", class.0)
+            }
+            Self::FileReadinessSource { class, file } => write!(
+                formatter,
+                "borrow readiness_source local{} as class#{}",
+                file.0, class.0
+            ),
+            Self::StandardReadinessSource {
+                class,
+                stream,
+                borrowed_from,
+            } => write!(
+                formatter,
+                "borrow {stream:?} readiness_source local{} as class#{}",
+                borrowed_from.0, class.0
+            ),
             Self::InterfacePayload {
                 class,
                 local,
@@ -7190,10 +8904,14 @@ impl fmt::Display for ClassExpression {
                 class,
                 receiver,
                 vtable,
+                transfer,
             } => write!(
                 formatter,
-                "borrow interface local{} as class#{} via vtable#{}",
-                receiver.0, class.0, vtable.0
+                "{} interface local{} as class#{} via vtable#{}",
+                if *transfer { "move" } else { "borrow" },
+                receiver.0,
+                class.0,
+                vtable.0
             ),
             Self::Local {
                 local,
@@ -7231,6 +8949,7 @@ impl fmt::Display for ClassExpression {
             ),
             Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
             Self::CollectionIndex {
+                index_span: _,
                 positional: _,
                 class,
                 collection,
@@ -7400,6 +9119,7 @@ impl fmt::Display for MixedTag {
         match self {
             Self::Bool => formatter.write_str("bool"),
             Self::Enum(enum_id) => write!(formatter, "enum#{}", enum_id.0),
+            Self::Inline(ty) => formatter.write_str(ty.name()),
             Self::Integer(ty) => write!(formatter, "{ty}"),
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::String => formatter.write_str("string"),
@@ -7440,6 +9160,7 @@ impl fmt::Display for MixedExpression {
                 write!(formatter, "mixed(payload-enum#{})", value.ty().id.0)
             }
             Self::CollectionIndex {
+                index_span: _,
                 positional: _,
                 collection,
                 index,
@@ -7464,6 +9185,12 @@ impl fmt::Display for MixedExpression {
 impl fmt::Display for NullableMixedExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CollectionGet {
+                collection,
+                key,
+                access,
+                ..
+            } => write!(formatter, "local{}.{access:?}({key})", collection.0),
             Self::Null => formatter.write_str("null"),
             Self::Mixed(value) => write!(formatter, "some({value})"),
             Self::BoxNullablePayloadEnum(value) => {
@@ -7477,6 +9204,24 @@ impl fmt::Display for NullableMixedExpression {
                 local,
                 transfer: false,
             } => write!(formatter, "borrow ?mixed local{}", local.0),
+            Self::CollectionIndex {
+                collection,
+                index,
+                transfer,
+                remove,
+                ..
+            } => write!(
+                formatter,
+                "{} ?mixed local{}[{index}]",
+                if *remove {
+                    "remove"
+                } else if *transfer {
+                    "move"
+                } else {
+                    "borrow"
+                },
+                collection.0
+            ),
             Self::Property { object, property } => write!(
                 formatter,
                 "borrow local{}->property#{}:{}",
@@ -7495,6 +9240,7 @@ impl fmt::Display for ScalarType {
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::Bool => formatter.write_str("bool"),
             Self::Enum(enum_id) => write!(formatter, "enum#{}", enum_id.0),
+            Self::Inline(ty) => formatter.write_str(ty.name()),
         }
     }
 }
@@ -7508,6 +9254,7 @@ impl fmt::Display for ScalarValue {
                 FloatType::Float64 => write!(formatter, "0x{:016x}: float", value.bits),
             },
             Self::Bool(value) => write!(formatter, "{value}: bool"),
+            Self::Inline(value) => write!(formatter, "0x{:016x}: {}", value.bits, value.ty.name()),
             Self::Enum(value) => write!(
                 formatter,
                 "enum#{}::case{}",
@@ -7524,6 +9271,41 @@ impl fmt::Display for ValueExpression {
             Self::Float(value) => write!(formatter, "{value}"),
             Self::Bool(value) => write!(formatter, "{value}"),
             Self::Enum(value) => write!(formatter, "{value}"),
+            Self::Inline(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for InlineValueExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InterfaceReceiver {
+                ty,
+                receiver,
+                vtable,
+                transfer,
+            } => write!(
+                formatter,
+                "inline_interface_payload<{}>(local{}, vtable#{}, transfer={transfer})",
+                ty.name(),
+                receiver.0,
+                vtable.0,
+            ),
+            Self::DurationFromNanoseconds(value) => {
+                write!(formatter, "durationFromNanoseconds({value})")
+            }
+            Self::CancellationToken { source, .. } => {
+                write!(formatter, "cancellationToken(local{})", source.0)
+            }
+            Self::Use { ty, operand, mode } => {
+                if *mode == InlineValueUseMode::Borrow {
+                    write!(formatter, "{operand:?}: {}", ty.name())
+                } else {
+                    write!(formatter, "{mode:?} {operand:?}: {}", ty.name())
+                }
+            }
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
@@ -7541,6 +9323,7 @@ impl fmt::Display for EnumExpression {
                 enum_id,
                 function,
                 args,
+                ..
             } => {
                 write_call(formatter, *function, args)?;
                 write!(formatter, ": enum#{}", enum_id.0)
@@ -7583,7 +9366,11 @@ impl fmt::Display for IntegerBinaryOp {
 impl fmt::Display for IntegerExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DurationNanoseconds(value) => write!(formatter, "durationNanoseconds({value})"),
             IntegerExpression::Use { ty, operand } => match operand {
+                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                    write!(formatter, "{operand}: {ty}")
+                }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
                 Operand::Scalar(ScalarValue::Integer(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
@@ -7605,7 +9392,11 @@ impl fmt::Display for IntegerExpression {
                 } => {
                     write!(formatter, "local{}[{index}]: {ty}", collection.0)
                 }
-                Operand::CollectionKeyAt { collection, offset } => {
+                Operand::CollectionKeyAt {
+                    index_span: _,
+                    collection,
+                    offset,
+                } => {
                     write!(formatter, "key_at(local{}, {offset}): {ty}", collection.0)
                 }
                 Operand::MixedPayload { mixed, tag } => {
@@ -7631,7 +9422,9 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::FloatToInt { value, .. } => {
                 write!(formatter, "Float::toInt({value}): int")
             }
-            IntegerExpression::Call { ty, function, args } => {
+            IntegerExpression::Call {
+                ty, function, args, ..
+            } => {
                 write_call(formatter, *function, args)?;
                 write!(formatter, ": {ty}")
             }
@@ -7641,6 +9434,11 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::EnumBacking { enum_id, value } => {
                 write!(formatter, "enum_backing<{:?}>({value})", enum_id)
             }
+            IntegerExpression::CopyByteRegion {
+                destination,
+                source,
+                ..
+            } => write!(formatter, "region_copy({destination}, {source}): int"),
         }
     }
 }
@@ -7660,6 +9458,9 @@ impl fmt::Display for FloatExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Use { ty, operand } => match operand {
+                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                    write!(formatter, "{operand}: {ty}")
+                }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
                 Operand::Scalar(ScalarValue::Float(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
@@ -7681,7 +9482,11 @@ impl fmt::Display for FloatExpression {
                 } => {
                     write!(formatter, "local{}[{index}]: {ty}", collection.0)
                 }
-                Operand::CollectionKeyAt { collection, offset } => {
+                Operand::CollectionKeyAt {
+                    index_span: _,
+                    collection,
+                    offset,
+                } => {
                     write!(formatter, "key_at(local{}, {offset}): {ty}", collection.0)
                 }
                 Operand::MixedPayload { mixed, tag } => {
@@ -7697,7 +9502,9 @@ impl fmt::Display for FloatExpression {
                 right,
             } => write!(formatter, "({left} {op} {right}): {ty}"),
             Self::IntToFloat { value } => write!(formatter, "Int::toFloat({value}): float"),
-            Self::Call { ty, function, args } => {
+            Self::Call {
+                ty, function, args, ..
+            } => {
                 write_call(formatter, *function, args)?;
                 write!(formatter, ": {ty}")
             }
@@ -7741,7 +9548,7 @@ impl fmt::Display for StringExpression {
                 write!(formatter, ")")
             }
             StringExpression::Display(value) => write!(formatter, "display({value})"),
-            StringExpression::Call { function, args } => write_call(formatter, *function, args),
+            StringExpression::Call { function, args, .. } => write_call(formatter, *function, args),
             StringExpression::ReadFile { path, .. } => write!(formatter, "read_file({path})"),
             StringExpression::Format(format) => write!(formatter, "format({format})"),
             StringExpression::Coalesce { left, right } => {
@@ -7752,7 +9559,11 @@ impl fmt::Display for StringExpression {
             } => {
                 write!(formatter, "local{}[{index}]", collection.0)
             }
-            StringExpression::CollectionKeyAt { collection, offset } => {
+            StringExpression::CollectionKeyAt {
+                index_span: _,
+                collection,
+                offset,
+            } => {
                 write!(formatter, "key_at(local{}, {offset})", collection.0)
             }
             StringExpression::Intrinsic(call) => write!(formatter, "{call}"),
@@ -7774,7 +9585,7 @@ impl fmt::Display for NullableStringExpression {
             }
             Self::Static(id) => write!(formatter, "static{}", id.0),
             Self::ReadLine { prompt, .. } => write!(formatter, "read_line({prompt})"),
-            Self::Call { function, args } => write_call(formatter, *function, args),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::NullSafeProperty { object, property } => {
                 write!(formatter, "{object}?->property{}", property.index)
             }
@@ -7782,6 +9593,7 @@ impl fmt::Display for NullableStringExpression {
                 object,
                 function,
                 args,
+                ..
             } => {
                 write!(formatter, "{object}?->")?;
                 write_call(formatter, *function, args)
@@ -7827,8 +9639,15 @@ impl fmt::Display for FormatExpression {
 impl fmt::Display for BoolExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CancellationRequested { source } => {
+                write!(formatter, "cancellation requested local{}", source.0)
+            }
+            Self::NullableByteRegionIsPresent(value) => write!(formatter, "is_present({value})"),
             Self::NominalIs { local, target } => write!(formatter, "local{} is {target}", local.0),
             Self::Use { operand } => match operand {
+                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                    write!(formatter, "{operand}: bool")
+                }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: bool"),
                 Operand::Scalar(ScalarValue::Bool(value)) => write!(formatter, "{value}: bool"),
                 Operand::Local(id) => write!(formatter, "local{}: bool", id.0),
@@ -7852,7 +9671,11 @@ impl fmt::Display for BoolExpression {
                 } => {
                     write!(formatter, "local{}[{index}]: bool", collection.0)
                 }
-                Operand::CollectionKeyAt { collection, offset } => {
+                Operand::CollectionKeyAt {
+                    index_span: _,
+                    collection,
+                    offset,
+                } => {
                     write!(formatter, "key_at(local{}, {offset}): bool", collection.0)
                 }
                 Operand::MixedPayload { mixed, tag } => {
@@ -7932,7 +9755,7 @@ impl fmt::Display for BoolExpression {
             Self::Binary { op, left, right } => {
                 write!(formatter, "({left}) {op} ({right})")
             }
-            Self::Call { function, args } => write_call(formatter, *function, args),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
             Self::CollectionHas {
                 collection, value, ..
@@ -7952,7 +9775,15 @@ impl fmt::Display for BoolExpression {
 impl fmt::Display for NullableScalarExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InlineClaim { value, mode, .. } => write!(formatter, "{mode:?}({value})"),
             Self::Null(ty) => write!(formatter, "null: ?{ty}"),
+            Self::TransferGroupKey { group, key } => {
+                write!(
+                    formatter,
+                    "observed_transfer_key<{key:?}>(local{})",
+                    group.0
+                )
+            }
             Self::Value(value) => write!(formatter, "some({value})"),
             Self::Local { local, .. } => write!(formatter, "local{}", local.0),
             Self::Property {
@@ -8055,6 +9886,9 @@ impl fmt::Display for StringIntrinsicKind {
 impl fmt::Display for NullableClassExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Upcast { class, value } => {
+                write!(formatter, "upcast ({value}) as ?class#{}", class.0)
+            }
             Self::Null(class) => write!(formatter, "null: ?class#{}", class.0),
             Self::Class(value) => write!(formatter, "some({value})"),
             Self::SharedPayload { reference, .. } => {
@@ -8117,6 +9951,38 @@ impl fmt::Display for BoolBinaryOp {
 impl fmt::Display for Statement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Statement::SetDiagnosticSite { span } => {
+                write!(
+                    formatter,
+                    "diagnostic_site {}:{}..{}",
+                    span.source.0, span.start, span.end
+                )
+            }
+            Self::CompletePendingRequest {
+                request, outcome, ..
+            } => write!(
+                formatter,
+                "complete_pending_request local{} local{}",
+                request.0, outcome.0
+            ),
+            Self::EndBorrow { local } => write!(formatter, "end_borrow local{}", local.0),
+            Self::AssignByteRegionIndex {
+                region,
+                index,
+                value,
+                ..
+            } => write!(formatter, "region local{}[{index}] = {value}", region.0),
+            Self::CopyWithinByteRegion {
+                region,
+                offset,
+                length,
+                destination,
+                ..
+            } => write!(
+                formatter,
+                "region_copy_within local{} ({offset}, {length}) -> {destination}",
+                region.0
+            ),
             Statement::CoreCollection {
                 collection,
                 operation,
@@ -8255,9 +10121,21 @@ impl fmt::Display for Statement {
             Statement::AssignStatic { target, value } => {
                 write!(formatter, "static{} = {value}", target.0)
             }
-            Statement::DropClass { local, class } => {
-                write!(formatter, "drop class#{} local{}", class.0, local.0)
-            }
+            Statement::DropClass {
+                local,
+                class,
+                runs_destructor,
+            } => write!(
+                formatter,
+                "drop class#{} local{}{}",
+                class.0,
+                local.0,
+                if *runs_destructor {
+                    ""
+                } else {
+                    " without destructor"
+                }
+            ),
             Statement::CleanupConstructorPhase { object, class } => {
                 write!(
                     formatter,
@@ -8313,6 +10191,15 @@ impl fmt::Display for Statement {
                 "extract error#{} local{} -> local{}",
                 descriptor.0, error.0, target.0
             ),
+            Statement::TakeProperty {
+                target,
+                object,
+                property,
+            } => write!(
+                formatter,
+                "take local{}.property#{} -> local{}",
+                object.0, property.index, target.0
+            ),
             Statement::DropError { local } => write!(formatter, "drop Error local{}", local.0),
             Statement::CollectionAdd {
                 collection, value, ..
@@ -8320,11 +10207,13 @@ impl fmt::Display for Statement {
                 write!(formatter, "local{}.add({value})", collection.0)
             }
             Statement::CollectionSet {
+                index_span: _,
                 collection,
                 key,
                 value,
             } => write!(formatter, "local{}.set({key}, {value})", collection.0),
             Statement::AssignCollectionIndex {
+                index_span: _,
                 positional: _,
                 collection,
                 index,
@@ -8367,6 +10256,17 @@ impl fmt::Display for Statement {
                 function_type.0,
                 local.0
             ),
+            Statement::DropInlineValue {
+                local,
+                ty,
+                nullable,
+            } => write!(
+                formatter,
+                "drop {}{} local{}",
+                if *nullable { "nullable " } else { "" },
+                ty.name(),
+                local.0
+            ),
         }
     }
 }
@@ -8374,18 +10274,46 @@ impl fmt::Display for Statement {
 impl fmt::Display for ControlFlowPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RetainedSources(plan) => write!(formatter, "retained sources returns {:?} constructs {:?} independent {:?} promotions {:?}", plan.returns, plan.constructs, plan.independent_parameters, plan.promotions),
-            Self::PublicForeach(plan) => write!(formatter, "public foreach source {:?} cursor {:?} element {:?} calls {:?} header {:?} body {:?} update {:?} exit {:?}", plan.source, plan.cursor, plan.value_binding, plan.calls, plan.header, plan.body, plan.update, plan.exit),
-            Self::CoreValue(plan) => write!(formatter,
+            Self::RetainedSources(plan) => write!(
+                formatter,
+                "retained sources returns {:?} constructs {:?} independent {:?} promotions {:?} stores {:?} exceptional stores {:?} returned selectors {:?}",
+                plan.returns, plan.constructs, plan.independent_parameters, plan.promotions,
+                plan.stores, plan.exceptional_stores, plan.returned_selectors
+            ),
+            Self::PublicForeach(plan) => write!(
+                formatter,
+                "public foreach source {:?} cursor {:?} element {:?} calls {:?} header {:?} body {:?} update {:?} exit {:?}",
+                plan.source,
+                plan.cursor,
+                plan.value_binding,
+                plan.calls,
+                plan.header,
+                plan.body,
+                plan.update,
+                plan.exit
+            ),
+            Self::CoreValue(plan) => write!(
+                formatter,
                 "core {:?} local{} interface#{} slot{} {:?} result local{} block{} -> block{}",
-                plan.operation, plan.receiver.0, plan.interface.0, plan.slot, plan.target,
-                plan.result.0, plan.call.0, plan.success.0),
-            Self::ElementDuplication(plan) => write!(formatter,
+                plan.operation,
+                plan.receiver.0,
+                plan.interface.0,
+                plan.slot,
+                plan.target,
+                plan.result.0,
+                plan.call.0,
+                plan.success.0
+            ),
+            Self::ElementDuplication(plan) => write!(
+                formatter,
                 "duplicate local{} -> local{} block{} call block{} exit block{}",
-                plan.source.0, plan.result.0, plan.entry.0, plan.call.0, plan.exit.0),
-            Self::CollectionBuild(plan) => write!(formatter,
+                plan.source.0, plan.result.0, plan.entry.0, plan.call.0, plan.exit.0
+            ),
+            Self::CollectionBuild(plan) => write!(
+                formatter,
                 "fill local{} from local{} count local{} block{}..block{}",
-                plan.output.0, plan.source.0, plan.count.0, plan.header.0, plan.exit.0),
+                plan.output.0, plan.source.0, plan.count.0, plan.header.0, plan.exit.0
+            ),
             Self::Assertion(plan) => write!(
                 formatter,
                 "assert {:?}{} block{} success block{} failure block{} error local{}",
@@ -8618,6 +10546,29 @@ impl fmt::Display for Terminator {
                 error.0,
                 success.0,
                 failure.0
+            ),
+            Terminator::CheckedDeadlineFromNow {
+                duration,
+                result,
+                error,
+                success,
+                failure,
+                ..
+            } => write!(
+                formatter,
+                "checked deadline from-now local{} -> {:?}, error local{}, block{}, block{}",
+                duration.0, result, error.0, success.0, failure.0
+            ),
+            Terminator::CheckedCancellationRequest {
+                source,
+                error,
+                success,
+                failure,
+                ..
+            } => write!(
+                formatter,
+                "checked cancellation request local{} -> error local{}, block{}, block{}",
+                source.0, error.0, success.0, failure.0
             ),
             Terminator::ErrorSwitch {
                 error,

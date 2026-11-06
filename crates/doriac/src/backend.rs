@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::diagnostics::Diagnostic;
+use crate::runtime_artifact::SharedRuntimeDependency;
 use crate::source::Span;
 use crate::{codegen_native, codegen_php, hir, mir, mir_interpreter, mir_lowering};
 
@@ -12,10 +13,112 @@ pub trait Backend {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendOutput {
-    Text { extension: String, contents: String },
-    Binary { extension: String, bytes: Vec<u8> },
-    Executable { extension: String, bytes: Vec<u8> },
-    Artifact { path: PathBuf },
+    Text {
+        extension: String,
+        contents: String,
+    },
+    TextWithRuntime {
+        extension: String,
+        contents: String,
+        runtime: Box<SharedRuntimeDependency>,
+    },
+    Binary {
+        extension: String,
+        bytes: Vec<u8>,
+    },
+    Executable {
+        extension: String,
+        bytes: Vec<u8>,
+    },
+    Artifact {
+        path: PathBuf,
+    },
+}
+
+/// Publish compiler output and its verified dependencies through one CLI/library boundary.
+pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), BackendError> {
+    let directory = out_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(directory).map_err(|error| {
+        BackendError::new(format!("failed to create output directory: {error}"))
+    })?;
+    match output {
+        BackendOutput::Text { contents, .. } => write_output(out_path, contents.as_bytes()),
+        BackendOutput::TextWithRuntime {
+            contents, runtime, ..
+        } => {
+            runtime.publish(directory)?;
+            write_output(out_path, contents.as_bytes())
+        }
+        BackendOutput::Binary { bytes, .. } => write_output(out_path, &bytes),
+        BackendOutput::Executable { bytes, .. } => {
+            write_output(out_path, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(out_path)
+                    .map_err(|error| {
+                        BackendError::new(format!("failed to read output permissions: {error}"))
+                    })?
+                    .permissions();
+                permissions.set_mode(permissions.mode() | 0o111);
+                std::fs::set_permissions(out_path, permissions).map_err(|error| {
+                    BackendError::new(format!("failed to mark output executable: {error}"))
+                })?;
+            }
+            Ok(())
+        }
+        BackendOutput::Artifact { path } => {
+            std::fs::copy(path, out_path).map_err(|error| {
+                BackendError::new(format!("failed to copy backend artifact: {error}"))
+            })?;
+            Ok(())
+        }
+    }
+}
+
+/// Replaces `path` by renaming a fully written sibling over it, never by
+/// rewriting the existing file. A rewritten executable keeps its old file
+/// identity, and macOS kills it at launch against the code signature it
+/// cached for the previous contents; a renamed file is new. Readers also never
+/// observe a partly written output. As with an in-place write, a symlinked
+/// destination replaces the file it points to, and an existing file's
+/// permissions carry over.
+fn write_output(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let destination = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    };
+    let name = destination
+        .file_name()
+        .ok_or_else(|| BackendError::new("output path has no file name"))?;
+    let temporary = destination.with_file_name(format!(
+        ".{}.doria-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let existing = std::fs::metadata(&destination)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let written = std::fs::write(&temporary, bytes)
+        .and_then(|()| match existing {
+            Some(permissions) => std::fs::set_permissions(&temporary, permissions),
+            None => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&temporary, &destination));
+    written.map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        BackendError::new(format!(
+            "failed to write output file {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,10 +249,7 @@ impl Backend for PhpBackend {
         } else {
             Some(lower_validated_mir(program)?)
         };
-        Ok(BackendOutput::Text {
-            extension: "php".to_string(),
-            contents: codegen_php::generate(program, mir.as_ref())?,
-        })
+        codegen_php::generate_artifact(program, mir.as_ref())
     }
 }
 

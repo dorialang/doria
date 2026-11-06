@@ -1,0 +1,47 @@
+enum Packet { case Number(int $count); case Empty; }
+function read(Packet $value): int {
+    return match ($value) { Packet::Number($count) => $count, Packet::Empty => -1, };
+}
+function replace(writable Packet $value): int { $value = Packet::Number(13); return read($value); }
+function inspectTake(take Packet $value): int { return read($value); }
+function replaceGeneric<T>(writable T $value, take T $replacement): void { $value = $replacement; }
+function replaceOptional(writable ?Packet $value): bool { $value = Packet::Number(7); return $value != null; }
+function replaceDefault(writable Packet $value = Packet::Number(3)): int { $value = Packet::Number(17); return read($value); }
+function append(writable List<int> $values): void { $values->add(9); }
+interface Editor { function replace(writable Packet $value): int; }
+open class Base implements Editor {
+    open function replace(writable Packet $value): int { $value = Packet::Number(21); return read($value); }
+}
+class Derived extends Base {
+    override function replace(writable Packet $value): int { $value = Packet::Number(22); return read($value); }
+    static function replaceStatic(writable Packet $value): int { $value = Packet::Number(23); return read($value); }
+}
+class Owner {
+    function __construct(writable Packet $value) { $value = Packet::Number(30); }
+}
+function erased(Editor $editor, writable Packet $value): int { return $editor->replace($value); }
+function main(): void {
+    let writable $value = Packet::Number(4);
+    if (replace($value) != 13 || read($value) != 4) { panic("free Copy parameter"); }
+    if (inspectTake($value) != 4 || read($value) != 4) { panic("take Copy parameter"); }
+    replaceGeneric($value, Packet::Number(15));
+    if (read($value) != 4) { panic("generic Copy parameter"); }
+    let $editor = new Derived();
+    if ($editor->replace($value) != 22 || read($value) != 4) { panic("virtual Copy parameter"); }
+    if (erased($editor, $value) != 22 || read($value) != 4) { panic("erased Copy parameter"); }
+    if (Derived::replaceStatic(value: $value) != 23 || read($value) != 4) { panic("named static Copy parameter"); }
+    let $owner = new Owner($value);
+    if (read($owner->value) != 4 || read($value) != 4) { panic("promoted Copy parameter"); }
+    ?Packet $absent = null;
+    if (!replaceOptional($absent) || $absent != null) { panic("nullable Copy parameter"); }
+    if (replaceDefault() != 17) { panic("default Copy parameter"); }
+    let $callback = function(writable Packet $argument): int { $argument = Packet::Number(24); return read($argument); };
+    if ($callback($value) != 24 || read($value) != 24) { panic("writable callback borrow ABI"); }
+    let writable $number = 1;
+    let $scalar = function(writable int $argument): int { $argument = 10; return $argument; };
+    if ($scalar($number) != 10 || $number != 10) { panic("writable scalar callback borrow ABI"); }
+    writable List<int> $values = [1];
+    append($values);
+    if ($values->count != 2) { panic("Move parameter borrowing"); }
+    echo "copy parameters passed";
+}

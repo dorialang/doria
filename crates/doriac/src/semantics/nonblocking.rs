@@ -18,10 +18,44 @@ enum Value {
     Property(Span),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PayloadField {
-    case: EnumCaseId,
-    index: usize,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum StoredField {
+    Payload {
+        case: crate::enums::EnumCaseSource,
+        index: usize,
+    },
+    Element(Option<crate::ownership::cleanup::CollectionKey>),
+}
+
+impl StoredField {
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Element(left), Self::Element(right)) => {
+                left.is_none() || right.is_none() || left == right
+            }
+            _ => self == other,
+        }
+    }
+}
+
+fn literal_collection_key(expression: &Expr) -> Option<crate::ownership::cleanup::CollectionKey> {
+    use crate::ownership::cleanup::CollectionKey as K;
+    match expression {
+        Expr::Int { value, .. } => crate::numeric::parse_decimal_magnitude(value)
+            .and_then(|value| i128::try_from(value).ok())
+            .map(K::Integer),
+        Expr::String { value, .. } => Some(K::String(value.clone())),
+        Expr::Bool { value, .. } => Some(K::Bool(*value)),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr,
+            ..
+        } => match literal_collection_key(expr)? {
+            K::Integer(value) => value.checked_neg().map(K::Integer),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -54,13 +88,19 @@ struct Graph {
     cleanups: Vec<(Span, Span, Value)>,
     generic_cleanups: Vec<(Span, Span, ResolvedType, Value)>,
     closure_cleanups: HashMap<Span, cleanup_effects::Effects>,
-    packed_fields: HashSet<(Value, Value, PayloadField)>,
-    unpacked_fields: HashSet<(Value, Value, PayloadField)>,
+    packed_fields: HashSet<(Value, Value, StoredField)>,
+    unpacked_fields: HashSet<(Value, Value, StoredField)>,
 }
 
 pub(super) struct CallProvenance {
     graph: Graph,
-    hooks: Vec<Span>,
+    requirements: HashMap<Span, NonblockingRequirement>,
+}
+
+#[derive(Clone, Copy)]
+enum NonblockingRequirement {
+    PropertyHook,
+    PendingTransfer,
 }
 
 impl Graph {
@@ -110,22 +150,24 @@ impl Graph {
 
 impl Checker<'_> {
     pub(super) fn prepare_call_provenance(
-        &self,
+        &mut self,
         backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
     ) -> CallProvenance {
-        let mut hooks = Vec::new();
+        let mut requirements = HashMap::new();
         let mut functions = Vec::new();
         let mut initializers = Vec::new();
-        for item in &self.program.items {
+        for item in &self.callable_body_program().items {
             match item {
                 Item::Function(function) => functions.push(function.clone()),
                 Item::Class(class) => {
                     for member in &class.members {
                         if let ClassMember::Property(property) = member {
-                            hooks.extend(property.hooks.iter().map(|hook| hook.span));
-                            if let Some(initializer) = &property.initializer {
-                                initializers.push((class.span, property.span, initializer.clone()));
-                            }
+                            requirements.extend(
+                                property
+                                    .hooks
+                                    .iter()
+                                    .map(|hook| (hook.span, NonblockingRequirement::PropertyHook)),
+                            );
                         }
                         functions.extend(
                             crate::property_hooks::member_callables(
@@ -139,7 +181,12 @@ impl Checker<'_> {
                 Item::Trait(declaration) => {
                     for member in &declaration.members {
                         if let ClassMember::Property(property) = member {
-                            hooks.extend(property.hooks.iter().map(|hook| hook.span));
+                            requirements.extend(
+                                property
+                                    .hooks
+                                    .iter()
+                                    .map(|hook| (hook.span, NonblockingRequirement::PropertyHook)),
+                            );
                         }
                         functions.extend(
                             crate::property_hooks::member_callables(
@@ -153,16 +200,54 @@ impl Checker<'_> {
                 _ => {}
             }
         }
-        if hooks.is_empty()
+        // Initializers belong to the composing class, even when a trait authors them.
+        for item in &self.program.items {
+            if let Item::Class(class) = item {
+                for member in &class.members {
+                    if let ClassMember::Property(property) = member {
+                        if let Some(initializer) = &property.initializer {
+                            initializers.push((class.span, property.span, initializer.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let pending_contracts = self.pending_transfer_requirements();
+        if matches!(self.callable_body_program, CallableBodyProgram::Authored(_)) {
+            for declaration in self.declared_requirement_implementations(&pending_contracts) {
+                let body = callable_contracts::BodyInstance::new(
+                    self.callable_body_program,
+                    declaration,
+                    HashMap::new(),
+                    &self.composition,
+                );
+                requirements.insert(body.declaration, NonblockingRequirement::PendingTransfer);
+            }
+        }
+        for conformance in &self.contracts.conformances {
+            for implementation in &conformance.implementations {
+                if implementation
+                    .requirement_origins
+                    .iter()
+                    .any(|origin| pending_contracts.contains(&origin.declaration))
+                {
+                    if let Some(declaration) = implementation.implementation {
+                        requirements.insert(declaration, NonblockingRequirement::PendingTransfer);
+                    }
+                }
+            }
+        }
+        if requirements.is_empty()
             && self.callable_value_calls.is_empty()
             && self.list_algorithm_calls.is_empty()
         {
             return CallProvenance {
                 graph: Graph::default(),
-                hooks,
+                requirements,
             };
         }
         let mut graph = Graph::default();
+        graph.nonblocking_contracts.extend(pending_contracts);
         for item in &self.program.items {
             if let Item::Interface(interface) = item {
                 graph.nonblocking_contracts.extend(
@@ -179,7 +264,13 @@ impl Checker<'_> {
                 Value::Property(field.declaration),
             );
         }
-        for class in self.classes.values() {
+        for (name, class) in &self.classes {
+            if class.declaration.source == crate::compiler_known_stream::SOURCE_ID
+                && crate::compiler_known_stream::cleanup_may_block(name)
+            {
+                graph.bodies.entry(class.declaration).or_default().blocking =
+                    Some(class.declaration);
+            }
             if let Some(parent) = class
                 .parent
                 .as_ref()
@@ -218,6 +309,16 @@ impl Checker<'_> {
             }
         }
         for function in &functions {
+            if let crate::ast::FunctionBody::Intrinsic { implementation, .. } = function.body {
+                let body = graph.bodies.entry(function.span).or_default();
+                body.parameters = function
+                    .params
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect();
+                body.blocking = implementation.may_block().then_some(function.span);
+                continue;
+            }
             if function.body.as_block().is_none() {
                 continue;
             }
@@ -310,7 +411,10 @@ impl Checker<'_> {
                 graph.owners.insert(Value::Binding(binding.id), owner);
             }
         }
-        CallProvenance { graph, hooks }
+        CallProvenance {
+            graph,
+            requirements,
+        }
     }
 
     pub(super) fn known_callback_targets(
@@ -325,31 +429,85 @@ impl Checker<'_> {
         {
             return HashMap::new();
         }
-        call_contexts::resolve(self, &provenance.graph).known_callback_targets
+        call_contexts::resolve_contracts(self, &provenance.graph).known_callback_targets
     }
 
-    pub(super) fn check_nonblocking_property_hooks(
+    pub(super) fn callback_capture_targets(
+        &self,
+        provenance: &CallProvenance,
+    ) -> (
+        HashMap<Span, Vec<crate::ownership::CallbackCaptureTarget>>,
+        HashMap<Span, Vec<crate::ownership::CallbackCaptureTarget>>,
+    ) {
+        if !provenance
+            .graph
+            .calls
+            .iter()
+            .any(|call| call.callee.is_some())
+        {
+            return (HashMap::new(), HashMap::new());
+        }
+        let resolution = call_contexts::resolve(self, &provenance.graph);
+        (resolution.callback_captures, resolution.callback_values)
+    }
+
+    pub(super) fn check_nonblocking_contracts(
         &mut self,
         provenance: &mut CallProvenance,
         cleanup: &crate::ownership::cleanup::Analysis,
         partial_cleanups: &[crate::constructor_init::ConstructorPartialCleanup],
     ) {
-        if provenance.hooks.is_empty() {
+        if provenance.requirements.is_empty() {
             return;
         }
         self.blocking_cleanups(&mut provenance.graph, cleanup, partial_cleanups);
-        let blockers = call_contexts::resolve(self, &provenance.graph).blockers;
-        for hook in provenance.hooks.iter().copied() {
-            if let Some(site) = blockers.get(&hook).copied() {
-                self.diagnostics.push(
-                    Diagnostic::new("E0770", "property hooks must not perform potentially blocking work", hook)
+        let mut blockers = call_contexts::resolve(self, &provenance.graph).blockers;
+        blockers.extend(call_contexts::resolve_contracts(self, &provenance.graph).blockers);
+        let mut requirements = provenance.requirements.iter().collect::<Vec<_>>();
+        requirements.sort_by_key(|(span, _)| (span.source, span.start, span.end));
+        for (&declaration, requirement) in requirements {
+            if let Some(site) = blockers.get(&declaration).copied() {
+                let diagnostic = match requirement {
+                    NonblockingRequirement::PropertyHook =>
+                    Diagnostic::new("E0770", "property hooks must not perform potentially blocking work", declaration)
                         .with_title("Property Hook May Block")
                         .with_related(site, "Potentially Blocking Operation")
                         .with_explanation("the nonblocking rule applies through helpers and callback invocation; catching an I/O error does not make the operation nonblocking")
                         .with_help("perform input/output outside the hook, and use callbacks whose nonblocking body can be established"),
-                );
+                    NonblockingRequirement::PendingTransfer =>
+                    Diagnostic::new("E0771", "pending transfer preparation and completion must not perform potentially blocking work", declaration)
+                        .with_title("Pending Transfer Phase May Block")
+                        .with_related(site, "Potentially Blocking Operation")
+                        .with_explanation("both phases must remain nonblocking through helpers, callbacks, and cleanup; native submission and waiting belong to the transfer group")
+                        .with_help("configure the request during preparation and observe its retired outcome during completion; perform blocking work outside these phases"),
+                };
+                self.diagnostics.push(diagnostic);
             }
         }
+    }
+
+    fn pending_transfer_requirements(&self) -> HashSet<Span> {
+        self.contracts
+            .interfaces
+            .iter()
+            .filter(|interface| {
+                interface.declaration.source == crate::compiler_known_stream::SOURCE_ID
+            })
+            .flat_map(|interface| {
+                interface
+                    .requirements
+                    .iter()
+                    .filter(|requirement| {
+                        crate::compiler_known_stream::is_pending_phase(
+                            &interface.name,
+                            &requirement.name,
+                        )
+                    })
+                    .flat_map(|requirement| {
+                        requirement.origins.iter().map(|origin| origin.declaration)
+                    })
+            })
+            .collect()
     }
 
     fn blocking_call_targets(&self, declaration: Span, direct: bool) -> Vec<Span> {
@@ -449,7 +607,11 @@ impl Checker<'_> {
             };
             return self.blocking_receiver_targets(
                 method.declaration,
-                method.direct_parent || method.virtual_root.is_none(),
+                method.direct_parent
+                    || method.virtual_root.is_none()
+                    || self
+                        .exact_method_calls
+                        .contains(&(span, method.declaration)),
                 receiver,
             );
         }
@@ -469,15 +631,20 @@ impl Checker<'_> {
             CallableTarget::InterfaceMethod { requirement, .. } => {
                 self.blocking_call_targets(*requirement, false)
             }
+            // A constrained receiver reaches only the implementations its
+            // instances select; a symbolic body is governed by the requirement.
+            // Erased interface calls above keep whole-program dispatch.
             CallableTarget::ConstrainedMethod {
                 requirement,
                 implementations,
                 ..
             } => {
-                let mut targets = self.blocking_call_targets(*requirement, false);
+                let mut targets = vec![*requirement];
                 targets.extend(implementations.iter().flat_map(|implementation| {
                     self.blocking_call_targets(implementation.declaration, false)
                 }));
+                targets.sort();
+                targets.dedup();
                 targets
             }
             CallableTarget::Method {
@@ -547,15 +714,40 @@ impl Checker<'_> {
                     }
                 }
             }
-            Expr::Index { collection, .. } => {
-                graph.alias(Value::Expression(collection.span()), value)
+            Expr::Index {
+                collection, index, ..
+            } => {
+                graph.unpacked_fields.insert((
+                    Value::Expression(collection.span()),
+                    value,
+                    StoredField::Element(literal_collection_key(index)),
+                ));
             }
             Expr::Array { elements, .. } => {
-                for element in elements {
+                for (position, element) in elements.iter().enumerate() {
+                    let key = element
+                        .key
+                        .as_ref()
+                        .map(literal_collection_key)
+                        .unwrap_or_else(|| {
+                            Some(crate::ownership::cleanup::CollectionKey::Integer(
+                                position as i128,
+                            ))
+                        });
+                    graph.packed_fields.insert((
+                        Value::Expression(element.value.span()),
+                        value,
+                        StoredField::Element(key),
+                    ));
                     graph.flow(Value::Expression(element.value.span()), value);
                 }
             }
             Expr::ArrayRepeat { value: element, .. } => {
+                graph.packed_fields.insert((
+                    Value::Expression(element.span()),
+                    value,
+                    StoredField::Element(None),
+                ));
                 graph.flow(Value::Expression(element.span()), value)
             }
             Expr::MethodCall {
@@ -571,6 +763,11 @@ impl Checker<'_> {
                 {
                     for index in family.ingested_arguments(method) {
                         if let Some(argument) = args.get(*index) {
+                            graph.packed_fields.insert((
+                                Value::Expression(argument.value.span()),
+                                Value::Expression(object.span()),
+                                StoredField::Element(None),
+                            ));
                             graph.flow(
                                 Value::Expression(argument.value.span()),
                                 Value::Expression(object.span()),
@@ -617,7 +814,7 @@ impl Checker<'_> {
                                 graph.unpacked_fields.insert((
                                     Value::Expression(scrutinee.span()),
                                     Value::Binding(*id),
-                                    PayloadField {
+                                    StoredField::Payload {
                                         case: *case_id,
                                         index: field,
                                     },
@@ -690,7 +887,7 @@ impl Checker<'_> {
             if let Some(case) = self
                 .enums
                 .values()
-                .find(|definition| definition.id == case_id.enum_id)
+                .find(|definition| definition.source_type.id == case_id.declaration)
                 .and_then(|definition| definition.cases.get(case_id.index))
             {
                 let parameters = case
@@ -711,7 +908,7 @@ impl Checker<'_> {
                         graph.packed_fields.insert((
                             *argument,
                             value,
-                            PayloadField {
+                            StoredField::Payload {
                                 case: *case_id,
                                 index: field,
                             },
@@ -751,7 +948,10 @@ impl Checker<'_> {
                     span,
                     &self.blocking_receiver_targets(
                         accessor.declaration,
-                        accessor.virtual_root.is_none(),
+                        accessor.virtual_root.is_none()
+                            || self
+                                .exact_method_calls
+                                .contains(&(span, accessor.declaration)),
                         receiver,
                     ),
                     &[],
@@ -904,6 +1104,18 @@ impl Checker<'_> {
     fn blocking_assignment(&self, graph: &mut Graph, owner: Span, assignment: &Assignment) {
         let source = Value::Expression(assignment.value.span());
         graph.flow(source, Value::Expression(assignment.target.span()));
+        if let Expr::Index {
+            collection, index, ..
+        } = Self::ungroup_expr(&assignment.target)
+        {
+            let collection = Value::Expression(collection.span());
+            graph.packed_fields.insert((
+                source,
+                collection,
+                StoredField::Element(literal_collection_key(index)),
+            ));
+            graph.flow(source, collection);
+        }
         if let Some(setter) = self
             .property_accessor_calls
             .get(&assignment.target.span())

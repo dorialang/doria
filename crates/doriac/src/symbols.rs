@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
@@ -81,6 +81,16 @@ pub struct BindingResolution {
     pub lexical_parents: HashMap<LexicalOwner, LexicalOwner>,
 }
 
+impl BindingResolution {
+    pub fn receiver_for_callable(&self, span: Span) -> Option<BindingId> {
+        self.declarations_by_id.values().find_map(|binding| {
+            (binding.kind == BindingKind::MethodReceiver
+                && binding.owner == LexicalOwner::Callable(span))
+            .then_some(binding.id)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub id: BindingId,
@@ -123,7 +133,6 @@ pub struct ClassInfo {
     pub parent: Option<ClassType<TypeId>>,
     pub parent_span: Option<Span>,
     pub type_params: Vec<TypeParamInfo>,
-    pub builtin_interfaces: HashSet<BuiltinInterface>,
     pub properties: HashMap<String, PropertyInfo>,
     pub static_properties: HashMap<String, StaticPropertyInfo>,
     pub constants: HashMap<String, ConstantInfo>,
@@ -135,12 +144,6 @@ pub struct ClassInfo {
 pub enum BuiltinInterface {
     Displayable,
     Error,
-}
-
-impl ClassInfo {
-    pub fn implements(&self, interface: BuiltinInterface) -> bool {
-        self.builtin_interfaces.contains(&interface)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,11 +185,20 @@ impl MemberKind {
 pub struct PropertyInfo {
     pub access: MemberAccess,
     pub writable: bool,
-    pub borrowed_source: bool,
+    pub borrowed_source: Option<crate::types::RetainedFieldAccess>,
     pub ty: TypeId,
     pub init_state: PropertyInitState,
     pub declaration_span: Span,
     pub hooks: Option<PropertyHooksInfo>,
+}
+
+impl PropertyInfo {
+    pub fn permits_write_through(&self) -> bool {
+        crate::types::RetainedFieldAccess::permits_write_through(
+            self.borrowed_source,
+            self.writable,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +221,7 @@ pub struct StaticPropertyInfo {
     pub access: MemberAccess,
     pub writable: bool,
     pub ty: TypeId,
+    pub hooks: Option<PropertyHooksInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +278,7 @@ pub struct ReturnBorrow {
     pub source: BorrowSource,
     pub writable: bool,
     pub kind: crate::types::ReturnBorrowKind,
+    pub lifetime: crate::types::RetainedLifetime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,17 +287,39 @@ pub enum BorrowSource {
     Parameter(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiverMode {
     Readonly,
     Writable,
-    /// Reserved representation point for a future accepted consuming receiver.
-    UnsupportedConsuming,
+    Consuming,
 }
 
 impl ReceiverMode {
+    pub fn from_declaration(method: &crate::ast::FunctionDecl) -> Self {
+        if method.consuming_this {
+            Self::Consuming
+        } else if method.has_writable_receiver() {
+            Self::Writable
+        } else {
+            Self::Readonly
+        }
+    }
+
     pub const fn is_writable(self) -> bool {
         matches!(self, Self::Writable)
+    }
+
+    pub const fn is_consuming(self) -> bool {
+        matches!(self, Self::Consuming)
+    }
+
+    pub const fn can_override(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (Self::Readonly, Self::Readonly | Self::Writable)
+                | (Self::Writable, Self::Writable)
+                | (Self::Consuming, Self::Consuming)
+        )
     }
 }
 

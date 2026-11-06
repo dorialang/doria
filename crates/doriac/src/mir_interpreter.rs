@@ -1,6 +1,6 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
 
@@ -14,6 +14,16 @@ use crate::diagnostics::{
 use crate::mir;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 use crate::source::Span;
+
+mod byte_region;
+mod child_process;
+mod file_stream;
+mod inline_value;
+mod readiness_set;
+mod standard_stream;
+use byte_region::ByteRegionValue;
+mod transfer_group;
+mod transfer_plan;
 
 type SharedString = Rc<str>;
 type SharedControl = Rc<RefCell<SharedControlValue>>;
@@ -29,12 +39,36 @@ struct ClosureEnvironmentHandle {
 struct InterpreterPlace {
     storage: InterpreterPlaceStorage,
     ty: mir::Type,
+    payload_projection: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PayloadProjection {
+    parent: Option<usize>,
+    ty: mir::PayloadEnumType,
+    case: crate::enums::EnumCaseId,
+    field: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterpreterPlaceStorage {
+    Static(mir::StaticId),
     // An absent readonly borrowed result has no addressable source slot.
     Absent(mir::Type),
+    ReadinessSource {
+        source: readiness_set::Source,
+        class: crate::class_layout::ClassId,
+    },
+    ReadinessMember {
+        set: usize,
+        registration: u64,
+        ty: mir::Type,
+    },
+    /// An object a runtime owner keeps for its whole life: a child's pipe.
+    RuntimeObject {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
     CollectionElement(CollectionElementPlace),
     ObjectProperty {
         object: usize,
@@ -130,12 +164,21 @@ pub struct InterpreterLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterError {
     pub message: String,
+    runtime_panic: Option<&'static str>,
 }
 
 impl InterpreterError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            runtime_panic: None,
+        }
+    }
+
+    fn runtime_panic(code: &'static str) -> Self {
+        Self {
+            message: code.to_string(),
+            runtime_panic: Some(code),
         }
     }
 }
@@ -204,6 +247,7 @@ enum CheckedIoResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalValue {
+    ByteRegion(ByteRegionValue),
     Scalar(mir::ScalarValue),
     String(SharedString),
     Mixed(MixedValue),
@@ -307,6 +351,7 @@ enum OwnedDrop {
     Error(InterfaceCarrier),
     Function(FunctionValue),
     CollectionView(usize),
+    Inline(crate::inline_value::InlineValue),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +363,7 @@ enum WritableDropKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvaluationValue {
+    ByteRegion(ByteRegionValue),
     Scalar(mir::ScalarValue),
     String(SharedString),
     Mixed(MixedValue),
@@ -435,6 +481,7 @@ impl MixedValue {
             }
             Self::Scalar(mir::ScalarValue::Float(value)) => Some(mir::MixedTag::Float(value.ty)),
             Self::Scalar(mir::ScalarValue::Enum(value)) => Some(mir::MixedTag::Enum(value.enum_id)),
+            Self::Scalar(mir::ScalarValue::Inline(value)) => Some(mir::MixedTag::Inline(value.ty)),
             Self::String(_) => Some(mir::MixedTag::String),
             Self::Class { class, .. } => Some(mir::MixedTag::Class(*class)),
             Self::PayloadEnum { value, .. } => Some(mir::MixedTag::PayloadEnum(value.ty)),
@@ -520,7 +567,21 @@ impl CollectionValue {
 struct ObjectValue {
     class: crate::class_layout::ClassId,
     properties: Vec<Option<LocalValue>>,
+    retained_places: BTreeMap<usize, InterpreterPlace>,
     error_origin: Option<mir::ErrorOriginId>,
+}
+
+impl ObjectValue {
+    /// A newly allocated object retains no borrowed caller places and has no
+    /// checked-error origin; construction and `throw` record those later.
+    fn new(class: crate::class_layout::ClassId, properties: Vec<Option<LocalValue>>) -> Self {
+        Self {
+            class,
+            properties,
+            retained_places: BTreeMap::new(),
+            error_origin: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,8 +591,11 @@ enum ReturnExpectation {
     Void,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CheckedContinuation {
+    Register(readiness_set::Registration),
+    TransferGroup(transfer_group::Callback),
+    PendingFile(file_stream::PendingFileConfiguration),
     Call {
         result: Option<mir::LocalId>,
         error: mir::LocalId,
@@ -565,7 +629,10 @@ struct CheckedConstruction {
 
 #[derive(Debug, Clone)]
 enum EvaluationTask {
+    ByteRegion(byte_region::Task),
+    Inline(inline_value::Task),
     Rvalue(mir::Rvalue),
+    SetPanicSite(Span),
     SetResultPlace(InterpreterPlace),
     Value(mir::ValueExpression),
     Enum(mir::EnumExpression),
@@ -733,6 +800,7 @@ enum EvaluationTask {
         property_expression_count: usize,
         temporary_arg_drops: Vec<usize>,
         checked: Option<CheckedConstruction>,
+        call_site: Span,
     },
     FinishClassNew {
         object: usize,
@@ -742,7 +810,7 @@ enum EvaluationTask {
     BuildNullableScalarSome(mir::ScalarType),
     BuildNullableClassSome(crate::class_layout::ClassId),
     BuildInterface(mir::InterfaceVtableId),
-    BuildCollectionInterface(mir::InterfaceVtableId),
+    BuildValueInterface(mir::InterfaceVtableId),
     ErrorMessage,
     BuildNullableErrorSome(mir::InterfaceTypeId),
     ConvertInterfaceView {
@@ -870,12 +938,13 @@ enum EvaluationTask {
         args: Vec<mir::Rvalue>,
         result: mir::Type,
         owned_receiver: Option<crate::class_layout::ClassId>,
+        call_site: Span,
     },
     AfterNullSafeStatementCall {
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
         owned_receiver: Option<crate::class_layout::ClassId>,
-        call_site: Option<Span>,
+        call_site: Span,
     },
     NullableStringCompare(mir::CompareOp),
     Format(mir::FormatExpression),
@@ -885,6 +954,7 @@ enum EvaluationTask {
     WriteFile,
     AppendFile,
     ReadFileBytes(mir::CollectionTypeId, Span),
+    AllocateBytes(mir::CollectionTypeId, Span),
     WriteFileBytes {
         contents: mir::LocalId,
         append: bool,
@@ -944,7 +1014,7 @@ enum EvaluationTask {
         argument_places: Vec<Option<InterpreterPlace>>,
         expectation: ReturnExpectation,
         temporary_arg_drops: Vec<usize>,
-        call_site: Option<Span>,
+        call_site: Span,
     },
     InvokeChecked {
         function: mir::FunctionId,
@@ -1010,6 +1080,9 @@ enum EvaluationTask {
     },
     DropCollection(mir::LocalId),
     DropPayloadEnum(mir::LocalId),
+    DropInlineValue(mir::LocalId),
+    ReleaseInlineValue(crate::inline_value::InlineValue),
+    RetainInlineClaims,
     DropFunction(mir::LocalId),
     DropFunctionValue(FunctionValue),
     DropObject {
@@ -1060,7 +1133,6 @@ struct CallFrame {
     active_panic_site: Span,
     closure_environment: Option<ClosureEnvironmentHandle>,
     consume_closure_environment: bool,
-    write_back_writable_parameters: bool,
 }
 
 /// Evaluated borrowed call results carry their actual place alongside the
@@ -1103,19 +1175,36 @@ impl EvaluationStack {
 
 struct Interpreter<'program> {
     program: &'program mir::Program,
+    monotonic_clock: fn() -> Result<u64, doria_time::ClockFailure>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     stdin: Vec<u8>,
     stdin_cursor: usize,
+    stdin_buffered_end: usize,
+    stdin_eof_observed: bool,
     io_faults: MirIoFaults,
     io_trace: MirIoTrace,
     files: BTreeMap<String, Vec<u8>>,
+    file_owners: BTreeMap<usize, file_stream::FileOwner>,
+    programs: BTreeMap<String, MirProgram>,
+    child_processes: BTreeMap<usize, child_process::ChildEmulation>,
+    next_process_id: i64,
+    readiness_sets: BTreeMap<usize, readiness_set::SetOwner>,
+    transfer_plans: BTreeMap<usize, transfer_plan::PlanOwner>,
+    transfer_groups: BTreeMap<usize, transfer_group::GroupOwner>,
+    cancellation_states: BTreeMap<u128, inline_value::CancellationState>,
+    pending_requests: BTreeMap<usize, file_stream::RequestView>,
+    standard_claims: [Option<usize>; 3],
+    standard_source_homes: [usize; 3],
     heap: BTreeMap<usize, ObjectValue>,
     interface_collections: BTreeMap<usize, CollectionValue>,
     collection_iterators: BTreeMap<usize, (CollectionValue, usize)>,
     borrowed_collections: BTreeMap<usize, BorrowedCollection>,
+    /// `string->byteRegion` storage: each viewed string's bytes as a `Bytes`
+    /// collection, kept alive exactly as long as the string (held weakly).
+    string_regions: BTreeMap<usize, (std::rc::Weak<str>, Rc<RefCell<CollectionEntries>>)>,
+    payload_projections: Vec<PayloadProjection>,
     next_borrowed_collection: u64,
-    transferred_collection_elements: BTreeSet<(u64, usize)>,
     statics: Vec<LocalValue>,
     next_object: usize,
     next_frame: u64,
@@ -1172,9 +1261,17 @@ pub struct MirIoFaults {
     pub stdout_write: Option<MirIoWriteFailure>,
     pub stderr_write: Option<MirIoWriteFailure>,
     pub stdin_line_read: bool,
+    pub stdin_bytes_read: bool,
+    pub file_read: bool,
+    pub file_write: bool,
+    pub file_close: bool,
     pub line_allocation: bool,
     pub failure_reason: MirIoFailureReason,
     pub system_code: Option<i64>,
+    /// Explicit progress supplied by a transfer fault. `None` means unknown,
+    /// not zero; known progress also commits the corresponding input/output
+    /// prefix before the checked failure is delivered.
+    pub transferred_byte_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1182,6 +1279,44 @@ pub struct MirIoTrace {
     pub prompt_writes: usize,
     pub stdout_flushes: usize,
     pub stdin_line_reads: usize,
+    pub file_opens: usize,
+    pub file_reads: usize,
+    pub file_writes: usize,
+    pub file_close_attempts: usize,
+    /// Every launch request, in order, whether or not the program exists.
+    pub spawns: Vec<MirSpawn>,
+    /// Children whose cleanup policy ran at destruction, by policy case name.
+    pub cleanups: Vec<&'static str>,
+}
+
+/// One `Command::spawn` request seen by the interpreter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirSpawn {
+    pub program: String,
+    pub shell: bool,
+    pub arguments: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub removed_environment: Vec<String>,
+    pub directory: Option<String>,
+}
+
+/// A scripted child for the interpreter's sandbox. A spawn finds its program
+/// by the executable path, or by the script text for `Command::shell`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirProgram {
+    pub output: Vec<u8>,
+    pub errors: Vec<u8>,
+    /// Bytes written to the child's input are appended to its output, and the
+    /// child exits only once its input is closed (like `cat`).
+    pub echo_input: bool,
+    /// `None` runs until terminated.
+    pub exit: Option<MirExitStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirExitStatus {
+    Exited(i64),
+    Signaled(i64),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1192,6 +1327,8 @@ pub struct MirIo {
     /// 0099). These are the arguments only — the executable path is stripped by
     /// the entry glue, so element 0 is the first real argument.
     pub args: Vec<String>,
+    /// Programs a spawned child can run; anything else is not found.
+    pub programs: BTreeMap<String, MirProgram>,
     /// Deterministic host failures used to verify the shared standard-I/O
     /// contract without depending on platform-specific devices.
     pub faults: MirIoFaults,
@@ -1209,6 +1346,7 @@ struct InterpreterMetrics {
     closure_environment_allocations: usize,
     live_closure_environments: usize,
     borrowed_collection_sources: usize,
+    payload_projection_paths: usize,
 }
 
 enum StepOutcome {
@@ -1267,6 +1405,15 @@ fn interpret_internal_observed(
     limits: InterpreterLimits,
     io: MirIo,
 ) -> Result<(InterpreterIoOutput, InterpreterMetrics), InterpreterError> {
+    interpret_internal_with_clock(program, limits, io, doria_time::monotonic_nanoseconds)
+}
+
+fn interpret_internal_with_clock(
+    program: &mir::Program,
+    limits: InterpreterLimits,
+    io: MirIo,
+    monotonic_clock: fn() -> Result<u64, doria_time::ClockFailure>,
+) -> Result<(InterpreterIoOutput, InterpreterMetrics), InterpreterError> {
     crate::mir_validation::validate_program(program)
         .map_err(|error| InterpreterError::new(error.message))?;
     let entry = function_in(program, program.entry)?;
@@ -1303,39 +1450,7 @@ fn interpret_internal_observed(
         ))
     });
 
-    let statics = program
-        .statics
-        .iter()
-        .map(|property| static_local_value(program, &property.initializer, property.ty))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut interpreter = Interpreter {
-        program,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        stdin: io.stdin,
-        stdin_cursor: 0,
-        io_faults: io.faults,
-        io_trace: MirIoTrace::default(),
-        files: io.files,
-        heap: BTreeMap::new(),
-        interface_collections: BTreeMap::new(),
-        collection_iterators: BTreeMap::new(),
-        borrowed_collections: BTreeMap::new(),
-        next_borrowed_collection: 0,
-        transferred_collection_elements: BTreeSet::new(),
-        statics,
-        next_object: 1,
-        next_frame: 1,
-        next_closure_environment: 0,
-        closure_environments: BTreeMap::new(),
-        active_closure_fields: BTreeMap::new(),
-        closure_environment_allocations: 0,
-        frames: Vec::new(),
-        limits,
-        executed_blocks: 0,
-        pending_panic: None,
-    };
+    let mut interpreter = Interpreter::new(program, limits, io, monotonic_clock)?;
     let entry_frame_arguments: Vec<LocalValue> = entry_arguments.into_iter().collect();
     interpreter.push_frame(
         program.entry,
@@ -1343,7 +1458,6 @@ fn interpret_internal_observed(
         &vec![None; entry_frame_arguments.len()],
         None,
         None,
-        false,
     )?;
 
     loop {
@@ -1354,6 +1468,7 @@ fn interpret_internal_observed(
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
                     borrowed_collection_sources: interpreter.borrowed_collections.len(),
+                    payload_projection_paths: interpreter.payload_projections.len(),
                 };
                 return Ok((
                     InterpreterIoOutput {
@@ -1375,6 +1490,7 @@ fn interpret_internal_observed(
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
                     borrowed_collection_sources: interpreter.borrowed_collections.len(),
+                    payload_projection_paths: interpreter.payload_projections.len(),
                 };
                 return Ok((
                     InterpreterIoOutput {
@@ -1391,6 +1507,7 @@ fn interpret_internal_observed(
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
                     borrowed_collection_sources: interpreter.borrowed_collections.len(),
+                    payload_projection_paths: interpreter.payload_projections.len(),
                 };
                 return Ok((
                     InterpreterIoOutput {
@@ -1490,8 +1607,77 @@ fn static_local_value(
     }
 }
 
-impl Interpreter<'_> {
+impl<'a> Interpreter<'a> {
+    fn new(
+        program: &'a mir::Program,
+        limits: InterpreterLimits,
+        io: MirIo,
+        monotonic_clock: fn() -> Result<u64, doria_time::ClockFailure>,
+    ) -> Result<Self, InterpreterError> {
+        let statics = program
+            .statics
+            .iter()
+            .map(|property| static_local_value(program, &property.initializer, property.ty))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            program,
+            monotonic_clock,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdin: io.stdin,
+            stdin_cursor: 0,
+            stdin_buffered_end: 0,
+            stdin_eof_observed: false,
+            io_faults: io.faults,
+            io_trace: MirIoTrace::default(),
+            files: io.files,
+            file_owners: BTreeMap::new(),
+            programs: io.programs,
+            child_processes: BTreeMap::new(),
+            next_process_id: 1000,
+            readiness_sets: BTreeMap::new(),
+            transfer_plans: BTreeMap::new(),
+            transfer_groups: BTreeMap::new(),
+            cancellation_states: BTreeMap::new(),
+            pending_requests: BTreeMap::new(),
+            standard_claims: [None; 3],
+            // Canonical process-owned opaque homes, matching the native static
+            // source homes. Reserve identities only: no object or buffer alloc.
+            standard_source_homes: [1, 2, 3],
+            heap: BTreeMap::new(),
+            interface_collections: BTreeMap::new(),
+            collection_iterators: BTreeMap::new(),
+            borrowed_collections: BTreeMap::new(),
+            string_regions: BTreeMap::new(),
+            payload_projections: Vec::new(),
+            next_borrowed_collection: 0,
+            statics,
+            next_object: 4,
+            next_frame: 1,
+            next_closure_environment: 0,
+            closure_environments: BTreeMap::new(),
+            active_closure_fields: BTreeMap::new(),
+            closure_environment_allocations: 0,
+            frames: Vec::new(),
+            limits,
+            executed_blocks: 0,
+            pending_panic: None,
+        })
+    }
+
     fn step(&mut self) -> Result<StepOutcome, InterpreterError> {
+        // Nested value transport reports typed panics at the execution boundary;
+        // malformed MIR remains an interpreter error instead of a language panic.
+        match self.step_inner() {
+            Err(InterpreterError {
+                runtime_panic: Some(code),
+                ..
+            }) => self.runtime_panic_step(code),
+            result => result,
+        }
+    }
+
+    fn step_inner(&mut self) -> Result<StepOutcome, InterpreterError> {
         if let Some(code) = self.pending_panic.take() {
             return self.runtime_panic_step(code);
         }
@@ -1541,6 +1727,49 @@ impl Interpreter<'_> {
         statement: mir::Statement,
     ) -> Result<StepOutcome, InterpreterError> {
         match statement {
+            mir::Statement::SetDiagnosticSite { span } => self.set_active_panic_site(span)?,
+            mir::Statement::CompletePendingRequest {
+                request, outcome, ..
+            } => {
+                self.complete_pending_request(request, outcome)?;
+            }
+            mir::Statement::EndBorrow { local } => {
+                self.current_frame_mut()?.locals[local.0].take();
+            }
+            mir::Statement::AssignByteRegionIndex {
+                region,
+                index,
+                value,
+                index_span,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Set {
+                        region,
+                        span: index_span,
+                    }));
+                frame.tasks.push(EvaluationTask::Rvalue(value));
+                frame.tasks.push(EvaluationTask::Rvalue(index));
+            }
+            mir::Statement::CopyWithinByteRegion {
+                region,
+                offset,
+                length,
+                destination,
+                span,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::CopyWithin {
+                        region,
+                        span,
+                    }));
+                frame.tasks.push(EvaluationTask::Rvalue(destination));
+                frame.tasks.push(EvaluationTask::Rvalue(length));
+                frame.tasks.push(EvaluationTask::Rvalue(offset));
+            }
             mir::Statement::AdvanceCollectionIterator { receiver, .. } => {
                 let carrier = self.error_local(receiver)?;
                 let (source, position) = self
@@ -1617,7 +1846,44 @@ impl Interpreter<'_> {
                         }
                     }
                 }
-                for (target, value) in targets.into_iter().zip(values) {
+                let source_place = self.place_for_local(source)?;
+                for (index, ((target, value), field)) in
+                    targets.into_iter().zip(values).zip(field_types).enumerate()
+                {
+                    let origin = if !matches!(mode, mir::MatchBindingMode::ConsumedArm)
+                        && field.has_move_ownership()
+                    {
+                        let projection = PayloadProjection {
+                            parent: source_place.payload_projection,
+                            ty,
+                            case,
+                            field: index,
+                        };
+                        // Intern only layout paths, never runtime owners. Nested inline
+                        // enum layouts are finite, and repeated bindings reuse the path.
+                        let index = self
+                            .payload_projections
+                            .iter()
+                            .position(|candidate| *candidate == projection)
+                            .unwrap_or_else(|| {
+                                let index = self.payload_projections.len();
+                                self.payload_projections.push(projection);
+                                index
+                            });
+                        Some(InterpreterPlace {
+                            ty: field,
+                            payload_projection: Some(index),
+                            ..source_place
+                        })
+                    } else {
+                        None
+                    };
+                    self.assign_result_origin(function, target, origin)?;
+                    if !matches!(mode, mir::MatchBindingMode::GuardView)
+                        && !field.has_move_ownership()
+                    {
+                        inline_value::retain_owned_claims(&mut self.cancellation_states, &value)?;
+                    }
                     assign_local(
                         self.program,
                         &function.locals,
@@ -1915,6 +2181,16 @@ impl Interpreter<'_> {
                             "MIR collection local received a non-collection value",
                         ));
                     }
+                    (ty @ (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)), value) => {
+                        if value.ty() != ty {
+                            return Err(InterpreterError::new(
+                                "MIR region local received another value type",
+                            ));
+                        }
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::Rvalue(value));
+                    }
                     (
                         mir::Type::NullableCollection(expected),
                         mir::Rvalue::NullableCollection(expression),
@@ -1994,7 +2270,7 @@ impl Interpreter<'_> {
                 args,
                 span,
             } => {
-                self.queue_call_at(function, args, ReturnExpectation::Void, Some(span))?;
+                self.queue_call(function, args, ReturnExpectation::Void, span)?;
             }
             mir::Statement::CallBorrowed {
                 function,
@@ -2007,11 +2283,11 @@ impl Interpreter<'_> {
                         "MIR borrowed call targeted a void function",
                     ));
                 };
-                self.queue_call_at(
+                self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Discard(return_type),
-                    Some(span),
+                    span,
                 )?;
             }
             mir::Statement::CallNullSafe {
@@ -2029,7 +2305,7 @@ impl Interpreter<'_> {
                         function,
                         args,
                         owned_receiver,
-                        call_site: Some(span),
+                        call_site: span,
                     });
                 frame.tasks.push(EvaluationTask::NullableClass(object));
             }
@@ -2078,23 +2354,49 @@ impl Interpreter<'_> {
                 kind,
                 ..
             } => {
-                let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::AssignProperty {
-                    object,
-                    property,
-                    kind,
-                });
-                frame.tasks.push(EvaluationTask::Rvalue(value));
+                if class_in(self.program, property.class)?.properties[property.index]
+                    .stores_retained_place()
+                {
+                    self.bind_retained_property(object, property, &value)?;
+                } else {
+                    let frame = self.current_frame_mut()?;
+                    frame.tasks.push(EvaluationTask::AssignProperty {
+                        object,
+                        property,
+                        kind,
+                    });
+                    frame.tasks.push(EvaluationTask::Rvalue(value));
+                }
             }
             mir::Statement::AssignStatic { target, value } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AssignStatic(target));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
             }
-            mir::Statement::DropClass { local, .. } => {
+            mir::Statement::DropClass {
+                local,
+                runs_destructor: true,
+                ..
+            } => {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::DropClass(local));
+            }
+            mir::Statement::DropClass {
+                local,
+                class,
+                runs_destructor: false,
+            } => {
+                let value = self.current_frame_mut()?.locals[local.0].take();
+                if let Some(LocalValue::Class { object, .. }) = value {
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FreeObject { object, class });
+                    frame
+                        .tasks
+                        .push(EvaluationTask::DropObjectProperties { object, class });
+                }
             }
             mir::Statement::CleanupConstructorPhase { object, class } => {
                 let LocalValue::Class { object, .. } =
@@ -2192,10 +2494,48 @@ impl Interpreter<'_> {
                     ));
                 }
             }
+            mir::Statement::TakeProperty {
+                target,
+                object,
+                property,
+            } => {
+                let LocalValue::Class { object, .. } =
+                    read_local(&self.current_frame()?.locals, object)?
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR property take receiver is not a class value",
+                    ));
+                };
+                let object = *object;
+                let value = self
+                    .heap
+                    .get_mut(&object)
+                    .ok_or_else(|| InterpreterError::new("MIR property take uses a freed object"))?
+                    .properties
+                    .get_mut(property.index)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        InterpreterError::new("MIR property take found a vacated field")
+                    })?;
+                let function = function_in(self.program, self.current_frame()?.function)?;
+                let old = assign_local(
+                    self.program,
+                    &function.locals,
+                    &mut self.current_frame_mut()?.locals,
+                    target,
+                    value,
+                )?;
+                if old.is_some() {
+                    return Err(InterpreterError::new(
+                        "MIR property take initialized an occupied binding",
+                    ));
+                }
+            }
             mir::Statement::DropError { local } => {
                 self.drop_error_local(local)?;
             }
             mir::Statement::CollectionAdd {
+                span,
                 collection,
                 value,
                 index,
@@ -2207,18 +2547,21 @@ impl Interpreter<'_> {
                     op,
                     has_index: index.is_some(),
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(span));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
                 if let Some(index) = index {
                     frame.tasks.push(EvaluationTask::Rvalue(index));
                 }
             }
             mir::Statement::CollectionSet {
+                index_span,
                 collection,
                 key,
                 value,
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::CollectionSet(collection));
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
                 frame.tasks.push(EvaluationTask::Rvalue(key));
             }
@@ -2231,6 +2574,7 @@ impl Interpreter<'_> {
                 }
             }
             mir::Statement::AssignCollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index,
@@ -2240,6 +2584,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::AssignCollectionIndex(
                     collection, positional,
                 ));
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
                 frame.tasks.push(EvaluationTask::Rvalue(index));
             }
@@ -2257,6 +2602,11 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::DropPayloadEnum(local));
+            }
+            mir::Statement::DropInlineValue { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropInlineValue(local));
             }
             mir::Statement::DropFunction { local, .. } => {
                 self.current_frame_mut()?
@@ -2497,6 +2847,7 @@ impl Interpreter<'_> {
                     property_expression_count,
                     temporary_arg_drops,
                     checked: Some(checked),
+                    call_site: span,
                 });
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -2507,6 +2858,28 @@ impl Interpreter<'_> {
                     }
                 }
                 Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::CheckedCancellationRequest {
+                source,
+                error,
+                success,
+                failure,
+                span,
+                ..
+            } => {
+                self.set_active_panic_site(span)?;
+                self.execute_cancellation_request(source, error, success, failure)
+            }
+            mir::Terminator::CheckedDeadlineFromNow {
+                duration,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                self.set_active_panic_site(span)?;
+                self.execute_deadline_from_now(duration, result, error, success, failure)
             }
             mir::Terminator::CheckedIo {
                 operation,
@@ -2528,6 +2901,28 @@ impl Interpreter<'_> {
                     span,
                 });
                 match operation {
+                    mir::CheckedIoOperation::OpenOwnedFile { path, .. } => {
+                        frame.tasks.push(EvaluationTask::String(path));
+                    }
+                    mir::CheckedIoOperation::NewReadinessSet { .. }
+                    | mir::CheckedIoOperation::BeginTransferGroup { .. }
+                    | mir::CheckedIoOperation::ObserveTransferGroup { .. }
+                    | mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+                    | mir::CheckedIoOperation::TransferPlanKey { .. }
+                    | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
+                    | mir::CheckedIoOperation::ResubmitTransfer { .. }
+                    | mir::CheckedIoOperation::RegisterReadinessStream { .. }
+                    | mir::CheckedIoOperation::UnregisterReadinessStream { .. }
+                    | mir::CheckedIoOperation::BorrowReadinessStream { .. }
+                    | mir::CheckedIoOperation::PendingRequestOutcome { .. }
+                    | mir::CheckedIoOperation::ReadOwnedFile { .. }
+                    | mir::CheckedIoOperation::WriteOwnedFile { .. }
+                    | mir::CheckedIoOperation::TransferStandardBytes { .. }
+                    | mir::CheckedIoOperation::PreparePendingFile { .. }
+                    | mir::CheckedIoOperation::PreparePendingStandard { .. }
+                    | mir::CheckedIoOperation::CloseOwnedFile { .. } => {}
+                    mir::CheckedIoOperation::ControlOwnedFile { .. }
+                    | mir::CheckedIoOperation::Process { .. } => {}
                     mir::CheckedIoOperation::ReadLine { prompt } => {
                         frame.tasks.push(EvaluationTask::String(prompt));
                     }
@@ -2586,6 +2981,12 @@ impl Interpreter<'_> {
         // call may select that storage at runtime, so reconstructing it from
         // the syntactic return-borrow root would lose child/property aliases.
         let expression = match &task {
+            EvaluationTask::ByteRegion(byte_region::Task::Value(value)) => {
+                Some(mir::Rvalue::ByteRegion(value.clone()))
+            }
+            EvaluationTask::ByteRegion(byte_region::Task::Nullable(value)) => {
+                Some(mir::Rvalue::NullableByteRegion(value.clone()))
+            }
             EvaluationTask::Mixed(value) => Some(mir::Rvalue::Mixed(value.clone())),
             EvaluationTask::NullableMixed(value) => Some(mir::Rvalue::NullableMixed(value.clone())),
             EvaluationTask::Error(value) => Some(mir::Rvalue::Interface(value.clone())),
@@ -2648,9 +3049,24 @@ impl Interpreter<'_> {
         // later evaluation supplies its own place instead of inheriting left.
         let preserves_place = matches!(
             &task,
-            EvaluationTask::BuildNullableClassSome(_)
+            EvaluationTask::ByteRegion(
+                byte_region::Task::Wrap
+                    | byte_region::Task::AssumePresent
+                    | byte_region::Task::Coalesce(_)
+            ) | EvaluationTask::Inline(
+                inline_value::Task::CheckType(_)
+                    | inline_value::Task::Coalesce { .. }
+                    | inline_value::Task::Claim {
+                        mode: mir::InlineValueUseMode::Borrow,
+                        ..
+                    }
+                    | inline_value::Task::NullableClaim {
+                        mode: mir::InlineValueUseMode::Borrow,
+                        ..
+                    }
+            ) | EvaluationTask::BuildNullableClassSome(_)
                 | EvaluationTask::BuildInterface(_)
-                | EvaluationTask::BuildCollectionInterface(_)
+                | EvaluationTask::BuildValueInterface(_)
                 | EvaluationTask::BuildNullableErrorSome(_)
                 | EvaluationTask::ConvertInterfaceView { .. }
                 | EvaluationTask::BuildNullableMixedSome
@@ -2717,10 +3133,24 @@ impl Interpreter<'_> {
         task: EvaluationTask,
     ) -> Result<StepOutcome, InterpreterError> {
         match task {
+            EvaluationTask::ByteRegion(task) => return self.execute_region_task(task),
+            EvaluationTask::Inline(task) => return self.execute_inline_task(task),
+            EvaluationTask::SetPanicSite(span) => self.set_active_panic_site(span)?,
             EvaluationTask::SetResultPlace(place) => {
                 self.current_frame_mut()?.values.set_place(Some(place))
             }
             EvaluationTask::Rvalue(expression) => match expression {
+                mir::Rvalue::ByteRegion(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Value(value))),
+                mir::Rvalue::NullableByteRegion(value) => {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::ByteRegion(byte_region::Task::Nullable(
+                            value,
+                        )))
+                }
                 mir::Rvalue::Value(value) => self
                     .current_frame_mut()?
                     .tasks
@@ -2846,6 +3276,11 @@ impl Interpreter<'_> {
                     self.current_frame_mut()?
                         .tasks
                         .push(EvaluationTask::Enum(value));
+                }
+                mir::ValueExpression::Inline(value) => {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::Inline(inline_value::Task::Value(value)));
                 }
             },
             EvaluationTask::Enum(expression) => self.expand_enum_expression(expression)?,
@@ -3743,15 +4178,28 @@ impl Interpreter<'_> {
                     return Ok(StepOutcome::Continue);
                 }
                 let value = self.pop_local_value()?;
-                if !matches!(value, LocalValue::Scalar(_) | LocalValue::String(_)) {
+                if !matches!(
+                    value,
+                    LocalValue::Scalar(_)
+                        | LocalValue::NullableScalar { .. }
+                        | LocalValue::String(_)
+                        | LocalValue::PayloadEnum(_)
+                        | LocalValue::NullablePayloadEnum { .. }
+                ) {
                     return Err(InterpreterError::new(
-                        "MIR collection fill value is not a Copy scalar or string",
+                        "MIR collection fill value is not a supported Copy value",
                     ));
                 }
-                let entries = match repeat_collection_entries(value, count) {
+                let entries = match repeat_collection_entries(value.clone(), count) {
                     Ok(entries) => entries,
                     Err(code) => return self.runtime_panic_step_at(code, count_span),
                 };
+                inline_value::retain_collection_claims(&mut self.cancellation_states, &entries)?;
+                let mut drops = Vec::new();
+                collect_owned_objects_from_value(value, &mut drops);
+                for drop in drops {
+                    self.push_owned_drop_task(drop)?;
+                }
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Collection(CollectionValue::new(
@@ -3799,7 +4247,7 @@ impl Interpreter<'_> {
                     return Ok(StepOutcome::Continue);
                 }
                 let index = has_index
-                    .then(|| self.pop_collection_offset())
+                    .then(|| self.pop_integer().map(|value| value.signed_value()))
                     .transpose()?;
                 let collection_kind = {
                     let collection = self.collection_local(collection)?;
@@ -3830,7 +4278,7 @@ impl Interpreter<'_> {
                         let index = index.expect("insertAt task carries an index");
                         let collection = self.collection_local(collection)?;
                         let length = collection.entries().len();
-                        if index > length {
+                        if index < 0 || index as u128 > length as u128 {
                             return self.collection_access_panic_step(
                                 CollectionAccessError::Bounds {
                                     code: "P1310",
@@ -3839,7 +4287,9 @@ impl Interpreter<'_> {
                                 },
                             );
                         }
-                        collection.entries_mut().insert(index, (None, value));
+                        collection
+                            .entries_mut()
+                            .insert(index as usize, (None, value));
                     }
                     mir::CollectionMutationOp::Remove => {
                         let position = self
@@ -3984,9 +4434,10 @@ impl Interpreter<'_> {
                     mir::CollectionMembershipOp::Remove => {
                         let position = {
                             let collection = self.collection_local(collection)?;
-                            collection.entries().iter().position(|(_, value)| {
+                            let position = collection.entries().iter().position(|(_, value)| {
                                 collection_values_equal(needle_type, value, &needle)
-                            })
+                            });
+                            position
                         };
                         if let Some(position) = position {
                             let (_, removed) = self
@@ -4014,9 +4465,10 @@ impl Interpreter<'_> {
                 let position = {
                     let collection = self.collection_local(collection)?;
                     let definition = &self.program.collection_types[collection.ty.0];
-                    collection.entries().iter().position(|(_, value)| {
+                    let position = collection.entries().iter().position(|(_, value)| {
                         collection_values_equal(definition.value, value, &needle)
-                    })
+                    });
+                    position
                 };
                 if ownership == mir::MixedOwnership::Owned {
                     self.queue_value_drops(needle)?;
@@ -4209,10 +4661,46 @@ impl Interpreter<'_> {
                                 },
                             );
                         }
-                        Some(values.entries_mut().remove(position).1)
+                        let removed = values.entries_mut().remove(position).1;
+                        Some(removed)
                     }
                 };
                 match (expected, value) {
+                    (mir::Type::ByteRegion(kind), Some(LocalValue::ByteRegion(mut value)))
+                        if value.kind == kind =>
+                    {
+                        value.nullable = true;
+                        self.current_frame_mut()?
+                            .values
+                            .push(EvaluationValue::ByteRegion(value));
+                    }
+                    (mir::Type::ByteRegion(kind), None) => {
+                        self.current_frame_mut()?
+                            .values
+                            .push(EvaluationValue::ByteRegion(ByteRegionValue::absent(kind)));
+                    }
+                    (mir::Type::Mixed, Some(LocalValue::Mixed(value))) => {
+                        self.push_nullable_mixed(Some(value))?
+                    }
+                    (mir::Type::Mixed, Some(LocalValue::NullableMixed(value))) => {
+                        self.push_nullable_mixed(value)?
+                    }
+                    (mir::Type::Mixed, None) => self.push_nullable_mixed(None)?,
+                    (mir::Type::Collection(ty), Some(LocalValue::Collection(mut value)))
+                        if ty == value.ty =>
+                    {
+                        value.nullable = true;
+                        self.current_frame_mut()?
+                            .values
+                            .push(EvaluationValue::Collection(value));
+                    }
+                    (mir::Type::Collection(ty), None) => {
+                        self.current_frame_mut()?
+                            .values
+                            .push(EvaluationValue::Collection(CollectionValue::nullable(
+                                ty, None,
+                            )));
+                    }
                     (mir::Type::Scalar(ty), Some(LocalValue::Scalar(value)))
                         if value.ty() == ty =>
                     {
@@ -4506,7 +4994,7 @@ impl Interpreter<'_> {
                             _ => {
                                 return Err(InterpreterError::new(
                                     "Dictionary::get produced another shared access type",
-                                ))
+                                ));
                             }
                         };
                         self.current_frame_mut()?.values.push(
@@ -4520,7 +5008,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "Dictionary::get produced another value type",
-                        ))
+                        ));
                     }
                 }
                 if borrowed_access {
@@ -4614,7 +5102,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR indexed shared handle has another type",
-                        ))
+                        ));
                     }
                 };
                 self.current_frame_mut()?.values.push(value);
@@ -4677,7 +5165,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR indexed writable shared handle has another type",
-                        ))
+                        ));
                     }
                 };
                 self.current_frame_mut()?.values.push(value);
@@ -4727,7 +5215,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR indexed shared access produced another value type",
-                        ))
+                        ));
                     }
                 };
                 self.current_frame_mut()?.values.push(result);
@@ -4741,16 +5229,29 @@ impl Interpreter<'_> {
                 property_expression_count,
                 temporary_arg_drops,
                 checked,
+                call_site,
             } => {
                 let argument_places =
                     self.evaluated_argument_places(argument_count, argument_places)?;
                 let arguments = self.take_call_arguments(argument_count)?;
                 let property_expressions = self.take_call_arguments(property_expression_count)?;
+                self.set_active_panic_site(call_site)?;
                 let object_id = self.next_object;
                 self.next_object += 1;
                 let class_definition = self.program.classes.get(class.0).ok_or_else(|| {
                     InterpreterError::new(format!("MIR class#{} does not exist", class.0))
                 })?;
+                if class_definition.runtime_payload
+                    == Some(mir::RuntimeClassPayload::CancellationSource)
+                    && self
+                        .cancellation_states
+                        .insert(object_id as u128, inline_value::CancellationState::new(1))
+                        .is_some()
+                {
+                    return Err(InterpreterError::new(
+                        "cancellation source identity is already live",
+                    ));
+                }
                 let mut slots = vec![None; class_definition.properties.len()];
                 let mut expression_values = property_expressions.into_iter();
                 for property in &properties {
@@ -4779,14 +5280,7 @@ impl Interpreter<'_> {
                     })?;
                     *slot = Some(value);
                 }
-                self.heap.insert(
-                    object_id,
-                    ObjectValue {
-                        class,
-                        properties: slots,
-                        error_origin: None,
-                    },
-                );
+                self.heap.insert(object_id, ObjectValue::new(class, slots));
                 if let Some(constructor) = constructor {
                     let mut temporary_drops = Vec::new();
                     for index in temporary_arg_drops {
@@ -4837,8 +5331,7 @@ impl Interpreter<'_> {
                             &constructor_arguments,
                             &constructor_argument_places,
                             Some(ReturnExpectation::Void),
-                            None,
-                            false,
+                            Some(call_site),
                         )?;
                     }
                 } else {
@@ -4913,8 +5406,27 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_class(actual, Some(object))?;
             }
-            EvaluationTask::BuildCollectionInterface(vtable) => {
-                let collection = self.pop_collection_value()?;
+            EvaluationTask::BuildValueInterface(vtable) => {
+                let value = self.pop_local_value()?;
+                if let Some((_, object)) = inline_value::nominal_parts(&value)? {
+                    if let Some(object) = object {
+                        self.push_error(InterfaceCarrier { object, vtable })?;
+                    } else {
+                        self.push_nullable_error(
+                            self.program.interface_vtables[vtable.0].interface,
+                            None,
+                        )?;
+                    }
+                    return Ok(StepOutcome::Continue);
+                }
+                let collection = match value {
+                    LocalValue::Collection(collection) => collection,
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "interface conversion received an incompatible value",
+                        ))
+                    }
+                };
                 if !collection.present {
                     self.push_nullable_error(
                         self.program.interface_vtables[vtable.0].interface,
@@ -5019,7 +5531,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "nullable interface conversion produced an incompatible value",
-                        ))
+                        ));
                     }
                 };
                 self.push_nullable_error(interface, value)?;
@@ -5126,9 +5638,8 @@ impl Interpreter<'_> {
                         .push(OwnedDrop::Class { object, class });
                 }
                 let matches = object.is_some_and(|object| {
-                    self.heap
-                        .get(&object)
-                        .is_some_and(|value| class_is_subtype(self.program, value.class, target))
+                    self.class_value_type(object, class)
+                        .is_ok_and(|class| class_is_subtype(self.program, class, target))
                 });
                 self.push_scalar(mir::ScalarValue::Bool(matches))?;
             }
@@ -5399,6 +5910,11 @@ impl Interpreter<'_> {
             }
             EvaluationTask::AfterNullableScalarCoalesce(right) => {
                 let (ty, value) = self.pop_nullable_scalar()?;
+                if ty != right.ty() {
+                    return Err(InterpreterError::new(
+                        "MIR nullable scalar coalesce changed type identity",
+                    ));
+                }
                 if value.is_some() {
                     self.push_nullable_scalar(ty, value)?;
                 } else {
@@ -5858,6 +6374,7 @@ impl Interpreter<'_> {
                         .set_place(Some(InterpreterPlace {
                             storage: InterpreterPlaceStorage::ObjectProperty { object, property },
                             ty: result,
+                            payload_projection: None,
                         }));
                 } else {
                     self.push_null(result)?;
@@ -5868,16 +6385,20 @@ impl Interpreter<'_> {
                 args,
                 result,
                 owned_receiver,
+                call_site,
             } => {
                 let receiver_place = self.current_frame()?.values.place();
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
-                    if owned_receiver.is_some() {
+                    if owned_receiver.is_some()
+                        && function_in(self.program, function)?.receiver_mode
+                            != Some(mir::ReceiverMode::Consuming)
+                    {
                         self.current_frame_mut()?
                             .statement_temporary_drops
                             .push(OwnedDrop::Class { object, class });
                     }
-                    self.queue_null_safe_call(object, class, function, args, result)?;
+                    self.queue_null_safe_call(object, class, function, args, result, call_site)?;
                     self.current_frame_mut()?.values.set_place(receiver_place);
                 } else {
                     self.push_null(result)?;
@@ -5892,7 +6413,10 @@ impl Interpreter<'_> {
                 let receiver_place = self.current_frame()?.values.place();
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
-                    if owned_receiver.is_some() {
+                    if owned_receiver.is_some()
+                        && function_in(self.program, function)?.receiver_mode
+                            != Some(mir::ReceiverMode::Consuming)
+                    {
                         self.current_frame_mut()?
                             .statement_temporary_drops
                             .push(OwnedDrop::Class { object, class });
@@ -5910,7 +6434,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR ordered nullable-string comparison is invalid",
-                        ))
+                        ));
                     }
                 };
                 self.push_scalar(mir::ScalarValue::Bool(result))?;
@@ -6029,6 +6553,48 @@ impl Interpreter<'_> {
                     .or_default()
                     .extend_from_slice(contents.as_bytes());
             }
+            EvaluationTask::AllocateBytes(collection, length_span) => {
+                let LocalValue::Scalar(mir::ScalarValue::Integer(length)) =
+                    self.pop_local_value()?
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR Bytes allocation length produced another value type",
+                    ));
+                };
+                if length.ty != IntegerType::Int64 {
+                    return Err(InterpreterError::new(
+                        "MIR Bytes allocation length is not canonical int",
+                    ));
+                }
+                let length = length.signed_value();
+                if length < 0 {
+                    return self.runtime_panic_step_with_facts_at(
+                        "P1303",
+                        length_span,
+                        vec![RuntimeFact {
+                            name: doria_diagnostic_catalogue::BYTE_BUFFER_LENGTH_FACT.to_string(),
+                            value: RuntimeFactValue::Signed(length as i64),
+                        }],
+                    );
+                }
+                let Ok(length) = usize::try_from(length) else {
+                    return self.runtime_panic_step_at("P1302", length_span);
+                };
+                let mut entries = Vec::new();
+                if entries.try_reserve_exact(length).is_err() {
+                    return self.runtime_panic_step_at("P1302", length_span);
+                }
+                let zero = IntegerValue::from_u128(IntegerType::UInt8, 0).expect("zero fits uint8");
+                entries.resize(
+                    length,
+                    (None, LocalValue::Scalar(mir::ScalarValue::Integer(zero))),
+                );
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
             EvaluationTask::ReadFileBytes(collection, path_span) => {
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
@@ -6094,7 +6660,7 @@ impl Interpreter<'_> {
             }
             EvaluationTask::StringDisplay => {
                 let value = self.pop_scalar()?;
-                self.push_string(display_scalar(value))?;
+                self.push_string(display_scalar(value)?)?;
             }
             EvaluationTask::StringCompare(op) => {
                 let right = self.pop_string()?;
@@ -6135,7 +6701,7 @@ impl Interpreter<'_> {
                     Err(panic) => {
                         return Ok(StepOutcome::RuntimePanic(Self::integer_panic_event(
                             panic, span,
-                        )))
+                        )));
                     }
                 };
                 self.current_frame_mut()?
@@ -6158,10 +6724,9 @@ impl Interpreter<'_> {
                             | IntegerPanic::ShiftCountOutOfRange => right_span,
                             _ => span,
                         };
-                        return Ok(StepOutcome::RuntimePanic(Self::integer_panic_event(
-                            panic,
-                            primary_span,
-                        )));
+                        let mut event = Self::integer_panic_event(panic, span);
+                        event.primary_span = primary_span;
+                        return Ok(StepOutcome::RuntimePanic(event));
                     }
                 };
                 self.current_frame_mut()?
@@ -6303,6 +6868,7 @@ impl Interpreter<'_> {
                 let argument_places =
                     self.evaluated_argument_places(argument_count, argument_places)?;
                 let args = self.take_call_arguments(argument_count)?;
+                self.set_active_panic_site(call_site)?;
                 let function = self.resolve_virtual_function(function, &args)?;
                 let mut drops = Vec::new();
                 for index in temporary_arg_drops {
@@ -6318,8 +6884,7 @@ impl Interpreter<'_> {
                     &args,
                     &argument_places,
                     Some(expectation),
-                    call_site,
-                    false,
+                    Some(call_site),
                 )?;
             }
             EvaluationTask::InvokeChecked {
@@ -6333,6 +6898,7 @@ impl Interpreter<'_> {
                 let argument_places =
                     self.evaluated_argument_places(argument_count, argument_places)?;
                 let args = self.take_call_arguments(argument_count)?;
+                self.set_active_panic_site(call_site)?;
                 let function = self.resolve_virtual_function(function, &args)?;
                 let mut drops = Vec::new();
                 for index in temporary_arg_drops {
@@ -6363,16 +6929,10 @@ impl Interpreter<'_> {
             } => {
                 let argument_places =
                     self.evaluated_argument_places(argument_count, argument_places)?;
+                self.set_active_panic_site(call_site)?;
                 if let Some(entry) = interface_entry {
                     let values = self.take_call_arguments(argument_count)?;
-                    self.push_frame(
-                        entry,
-                        &values,
-                        &argument_places,
-                        None,
-                        Some(call_site),
-                        false,
-                    )?;
+                    self.push_frame(entry, &values, &argument_places, None, Some(call_site))?;
                     self.current_frame_mut()?.indirect_continuation = Some((result, continuation));
                     return Ok(StepOutcome::Continue);
                 }
@@ -6400,6 +6960,7 @@ impl Interpreter<'_> {
             } => {
                 let argument_places =
                     self.evaluated_argument_places(argument_count, argument_places)?;
+                self.set_active_panic_site(call_site)?;
                 if let Some(entry) = interface_entry {
                     let values = self.take_call_arguments(argument_count)?;
                     self.push_checked_frame(
@@ -6452,20 +7013,9 @@ impl Interpreter<'_> {
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 self.assign_result_origin(function, target, place)?;
                 let owned = local_in(function, target)?.owned;
-                let writable_origin = self
-                    .current_frame()?
-                    .write_back_writable_parameters
-                    .then(|| {
-                        function
-                            .params
-                            .iter()
-                            .position(|parameter| *parameter == target)
-                            .filter(|index| {
-                                function.parameter_modes[*index]
-                                    == mir::FunctionParameterMode::Writable
-                            })
-                            .and_then(|_| self.current_frame().ok()?.local_origins[target.0])
-                    })
+                let writable_origin = function
+                    .is_writable_borrowed_place(target)
+                    .then_some(self.current_frame()?.local_origins[target.0])
                     .flatten();
                 let old = assign_local(
                     self.program,
@@ -6480,7 +7030,7 @@ impl Interpreter<'_> {
                         .expect("assigned writable parameter remains initialized")
                         .clone();
                     let replaced = self.write_place(origin, current.clone())?;
-                    if replaced != current {
+                    if self.project_place_value(replaced.clone(), origin.ty)? != current {
                         self.queue_value_drops(replaced)?;
                     }
                 }
@@ -6494,7 +7044,10 @@ impl Interpreter<'_> {
                 let place = self.current_frame()?.values.place();
                 let value = self.pop_local_value()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
-                for target in targets {
+                for (index, target) in targets.into_iter().enumerate() {
+                    if index > 0 {
+                        inline_value::retain_owned_claims(&mut self.cancellation_states, &value)?;
+                    }
                     self.assign_result_origin(function, target, place)?;
                     let old = assign_local(
                         self.program,
@@ -6630,6 +7183,35 @@ impl Interpreter<'_> {
                     self.queue_value_drops(value)?;
                 }
             }
+            EvaluationTask::DropInlineValue(local) => {
+                let value = self
+                    .current_frame_mut()?
+                    .locals
+                    .get_mut(local.0)
+                    .ok_or_else(|| InterpreterError::new("inline value local does not exist"))?
+                    .take();
+                match value {
+                    Some(LocalValue::Scalar(mir::ScalarValue::Inline(value))) => {
+                        self.release_inline_claim(value)?
+                    }
+                    Some(LocalValue::NullableScalar {
+                        value: Some(mir::ScalarValue::Inline(value)),
+                        ..
+                    }) => self.release_inline_claim(value)?,
+                    Some(LocalValue::NullableScalar { value: None, .. }) | None => {}
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "inline cleanup references another value type",
+                        ))
+                    }
+                }
+            }
+            EvaluationTask::ReleaseInlineValue(value) => self.release_inline_claim(value)?,
+            EvaluationTask::RetainInlineClaims => {
+                let value = self.pop_local_value()?;
+                inline_value::retain_owned_claims(&mut self.cancellation_states, &value)?;
+                self.push_local_value(value)?;
+            }
             EvaluationTask::DropFunction(local) => {
                 let value = self
                     .current_frame_mut()?
@@ -6695,17 +7277,22 @@ impl Interpreter<'_> {
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 self.current_frame_mut()?.returned_place =
                     if expected.borrows_returned_value(function.return_borrow) {
-                        let place = place
-                            .or(evaluated_place)
-                            .or_else(|| {
-                                is_absent_nullable_value(&value).then_some(InterpreterPlace {
-                                    storage: InterpreterPlaceStorage::Absent(expected),
-                                    ty: expected,
-                                })
+                        let readonly_absent = is_absent_nullable_value(&value)
+                            && !function.return_borrow.is_some_and(|borrow| borrow.writable);
+                        let place = if readonly_absent {
+                            // Absence owns no storage. A callee-local null slot
+                            // cannot be its home after that frame returns.
+                            Some(InterpreterPlace {
+                                storage: InterpreterPlaceStorage::Absent(expected),
+                                ty: expected,
+                                payload_projection: None,
                             })
-                            .ok_or_else(|| {
-                                InterpreterError::new("borrowed return value has no source place")
-                            })?;
+                        } else {
+                            place.or(evaluated_place)
+                        }
+                        .ok_or_else(|| {
+                            InterpreterError::new("borrowed return value has no source place")
+                        })?;
                         Some(InterpreterPlace {
                             ty: expected,
                             ..place
@@ -6739,6 +7326,15 @@ impl Interpreter<'_> {
         expression: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            mir::IntegerExpression::DurationNanoseconds(value) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::Inline(inline_value::Task::Nanoseconds));
+                frame
+                    .tasks
+                    .push(EvaluationTask::Inline(inline_value::Task::Value(*value)));
+            }
             mir::IntegerExpression::Use { ty, operand } => {
                 if self.queue_collection_scalar_operand(&operand)? {
                     return Ok(());
@@ -6830,11 +7426,18 @@ impl Interpreter<'_> {
                 });
                 frame.tasks.push(EvaluationTask::Float(*value));
             }
-            mir::IntegerExpression::Call { ty, function, args } => {
+            mir::IntegerExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))),
+                    span,
                 )?;
             }
             mir::IntegerExpression::Coalesce { left, right, .. } => {
@@ -6848,6 +7451,18 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::EnumBackingInt(enum_id));
                 frame.tasks.push(EvaluationTask::Enum(*value));
+            }
+            mir::IntegerExpression::CopyByteRegion {
+                destination,
+                source,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Copy));
+                frame.tasks.push(EvaluationTask::Rvalue(*source));
+                frame.tasks.push(EvaluationTask::Rvalue(*destination));
             }
         }
         Ok(())
@@ -6882,10 +7497,13 @@ impl Interpreter<'_> {
                 enum_id,
                 function,
                 args,
+                span,
+                ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Enum(enum_id))),
+                span,
             )?,
             mir::EnumExpression::Coalesce { left, right, .. } => {
                 let frame = self.current_frame_mut()?;
@@ -6937,11 +7555,18 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::IntToFloat);
                 frame.tasks.push(EvaluationTask::Integer(*value));
             }
-            mir::FloatExpression::Call { ty, function, args } => {
+            mir::FloatExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Float(ty))),
+                    span,
                 )?;
             }
             mir::FloatExpression::Coalesce { left, right, .. } => {
@@ -6958,6 +7583,17 @@ impl Interpreter<'_> {
         condition: mir::BoolExpression,
     ) -> Result<(), InterpreterError> {
         match condition {
+            mir::BoolExpression::NullableByteRegionIsPresent(value) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::IsPresent));
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Nullable(
+                        *value,
+                    )));
+            }
             mir::BoolExpression::NominalIs { local, target } => {
                 let parts = self.nominal_local_parts(local, false)?;
                 let matches = parts.is_some_and(|(_, implementing)| match target {
@@ -6992,6 +7628,10 @@ impl Interpreter<'_> {
                     }
                 };
                 self.push_scalar(mir::ScalarValue::Bool(matches))?;
+            }
+            mir::BoolExpression::CancellationRequested { source } => {
+                let requested = self.cancellation_requested(source)?;
+                self.push_scalar(mir::ScalarValue::Bool(requested))?;
             }
             mir::BoolExpression::Use { operand } => {
                 if self.queue_collection_scalar_operand(&operand)? {
@@ -7228,11 +7868,17 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Bool(*right));
                 frame.tasks.push(EvaluationTask::Bool(*left));
             }
-            mir::BoolExpression::Call { function, args } => {
+            mir::BoolExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Bool)),
+                    span,
                 )?;
             }
             mir::BoolExpression::Coalesce { left, right } => {
@@ -7272,41 +7918,46 @@ impl Interpreter<'_> {
             mir::StringExpression::Local(id) => {
                 match read_local(&self.current_frame()?.locals, id)? {
                     LocalValue::String(value) => self.push_string(value.clone())?,
+                    LocalValue::ByteRegion(_) => {
+                        return Err(InterpreterError::new(
+                            "MIR byte region was used as a string",
+                        ));
+                    }
                     LocalValue::Scalar(_) => {
                         return Err(InterpreterError::new(format!(
                             "MIR scalar local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::NullableString(_) => {
                         return Err(InterpreterError::new(format!(
                             "MIR nullable-string local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::Mixed(_) | LocalValue::NullableMixed(_) => {
                         return Err(InterpreterError::new(format!(
                             "MIR mixed local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::Error(_) | LocalValue::NullableError { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR Error local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::Class { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR class local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::NullableScalar { .. } | LocalValue::NullableClass { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR nullable local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::SharedReference { .. }
                     | LocalValue::WeakReference { .. }
@@ -7321,31 +7972,31 @@ impl Interpreter<'_> {
                         return Err(InterpreterError::new(format!(
                             "MIR shared handle local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::Collection(_) => {
                         return Err(InterpreterError::new(format!(
                             "MIR collection local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::PayloadEnum(_) | LocalValue::NullablePayloadEnum { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR payload enum local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::Function(_) | LocalValue::NullableFunction { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR function local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                     LocalValue::ClosureEnvironment(_) => {
                         return Err(InterpreterError::new(format!(
                             "MIR closure environment local local{} was used as a string value",
                             id.0
-                        )))
+                        )));
                     }
                 }
             }
@@ -7355,7 +8006,7 @@ impl Interpreter<'_> {
                     return Err(InterpreterError::new(format!(
                         "MIR static{} was used as string",
                         id.0
-                    )))
+                    )));
                 }
             },
             mir::StringExpression::MixedPayload(local) => {
@@ -7379,12 +8030,12 @@ impl Interpreter<'_> {
                     LocalValue::NullableString(None) => {
                         return Err(InterpreterError::new(
                             "MIR nonnull string expression observed null",
-                        ))
+                        ));
                     }
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR nonnull string expression references another local type",
-                        ))
+                        ));
                     }
                 }
             }
@@ -7395,7 +8046,7 @@ impl Interpreter<'_> {
                         return Err(InterpreterError::new(format!(
                             "MIR property{} was used as a string value",
                             property.index
-                        )))
+                        )));
                     }
                 }
             }
@@ -7422,8 +8073,18 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::StringDisplay);
                 frame.tasks.push(EvaluationTask::Value(value));
             }
-            mir::StringExpression::Call { function, args } => {
-                self.queue_call(function, args, ReturnExpectation::Value(mir::Type::String))?;
+            mir::StringExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::String),
+                    span,
+                )?;
             }
             mir::StringExpression::ReadFile { path, path_span } => {
                 let frame = self.current_frame_mut()?;
@@ -7443,6 +8104,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableString(*left));
             }
             mir::StringExpression::CollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index,
@@ -7452,16 +8114,22 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     positional,
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
-            mir::StringExpression::CollectionKeyAt { collection, offset } => {
+            mir::StringExpression::CollectionKeyAt {
+                collection,
+                offset,
+                index_span,
+            } => {
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
                     .push(EvaluationTask::CollectionKeyString(collection));
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*offset));
             }
             mir::StringExpression::Intrinsic(call) => {
@@ -7483,6 +8151,25 @@ impl Interpreter<'_> {
         let ty = expression.ty();
         match expression {
             mir::NullableScalarExpression::Null(_) => self.push_nullable_scalar(ty, None)?,
+            mir::NullableScalarExpression::InlineClaim { ty, value, mode } => {
+                let local = match value.as_ref() {
+                    mir::NullableScalarExpression::Local { local, .. } => Some(*local),
+                    _ => None,
+                };
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::Inline(inline_value::Task::NullableClaim {
+                        ty,
+                        mode,
+                        local,
+                    }));
+                frame.tasks.push(EvaluationTask::NullableScalar(*value));
+            }
+            mir::NullableScalarExpression::TransferGroupKey { group, key } => {
+                let value = self.observed_transfer_key(group, key)?;
+                self.push_nullable_scalar(ty, value)?;
+            }
             mir::NullableScalarExpression::Value(value) => {
                 let frame = self.current_frame_mut()?;
                 frame
@@ -7491,42 +8178,63 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Value(value));
             }
             mir::NullableScalarExpression::Local { local, .. } => {
-                let LocalValue::NullableScalar { ty, value } =
+                let LocalValue::NullableScalar { ty: actual, value } =
                     read_local(&self.current_frame()?.locals, local)?.clone()
                 else {
                     return Err(InterpreterError::new(
                         "nullable scalar references another local type",
                     ));
                 };
+                if actual != ty {
+                    return Err(InterpreterError::new(
+                        "nullable scalar local changed type identity",
+                    ));
+                }
                 self.push_nullable_scalar(ty, value)?;
             }
             mir::NullableScalarExpression::Property {
                 object, property, ..
             } => {
-                let LocalValue::NullableScalar { ty, value } =
+                let LocalValue::NullableScalar { ty: actual, value } =
                     self.read_property(object, property)?
                 else {
                     return Err(InterpreterError::new(
                         "nullable scalar property has another type",
                     ));
                 };
+                if actual != ty {
+                    return Err(InterpreterError::new(
+                        "nullable scalar property changed type identity",
+                    ));
+                }
                 self.push_nullable_scalar(ty, value)?;
             }
             mir::NullableScalarExpression::Static { id, .. } => {
-                let Some(LocalValue::NullableScalar { ty, value }) =
+                let Some(LocalValue::NullableScalar { ty: actual, value }) =
                     self.statics.get(id.0).cloned()
                 else {
                     return Err(InterpreterError::new(
                         "nullable scalar static has another type",
                     ));
                 };
+                if actual != ty {
+                    return Err(InterpreterError::new(
+                        "nullable scalar static changed type identity",
+                    ));
+                }
                 self.push_nullable_scalar(ty, value)?;
             }
-            mir::NullableScalarExpression::Call { function, args, .. } => {
+            mir::NullableScalarExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::NullableScalar(ty)),
+                    span,
                 )?;
             }
             mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
@@ -7555,6 +8263,7 @@ impl Interpreter<'_> {
                 object,
                 function,
                 args,
+                span,
                 ..
             } => {
                 let owned_receiver = object.owned_temporary_class();
@@ -7564,10 +8273,16 @@ impl Interpreter<'_> {
                     args,
                     result: mir::Type::NullableScalar(ty),
                     owned_receiver,
+                    call_site: span,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
             mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+                if left.ty() != ty || right.ty() != ty {
+                    return Err(InterpreterError::new(
+                        "MIR nullable scalar coalesce operands changed type identity",
+                    ));
+                }
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
@@ -7575,6 +8290,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableScalar(*left));
             }
             mir::NullableScalarExpression::DictionaryGet {
+                index_span,
                 ty,
                 collection,
                 key,
@@ -7586,6 +8302,7 @@ impl Interpreter<'_> {
                     expected: mir::Type::Scalar(ty),
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
@@ -7642,8 +8359,18 @@ impl Interpreter<'_> {
                 };
                 self.push_mixed(value)?;
             }
-            mir::MixedExpression::Call { function, args, .. } => {
-                self.queue_call(function, args, ReturnExpectation::Value(mir::Type::Mixed))?;
+            mir::MixedExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::Mixed),
+                    span,
+                )?;
             }
             mir::MixedExpression::BoxValue(value) => {
                 let frame = self.current_frame_mut()?;
@@ -7692,6 +8419,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Function(*value));
             }
             mir::MixedExpression::CollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index,
@@ -7708,9 +8436,10 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     positional,
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -7725,11 +8454,11 @@ impl Interpreter<'_> {
         }: mir::InterfaceExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::InterfaceValue::FromCollection { value, vtable } => {
+            mir::InterfaceValue::FromValue { value, vtable } => {
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
-                    .push(EvaluationTask::BuildCollectionInterface(vtable));
+                    .push(EvaluationTask::BuildValueInterface(vtable));
                 frame.tasks.push(EvaluationTask::Rvalue(*value));
             }
             mir::InterfaceValue::NewCollectionIterator { source, vtable } => {
@@ -7773,20 +8502,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Error(*source));
             }
             mir::InterfaceValue::Local { local, transfer } => {
-                let value = if transfer {
-                    self.current_frame_mut()?
-                        .locals
-                        .get_mut(local.0)
-                        .and_then(Option::take)
-                        .ok_or_else(|| {
-                            InterpreterError::new(format!(
-                                "MIR error local local{} was moved before use",
-                                local.0
-                            ))
-                        })?
-                } else {
-                    read_local(&self.current_frame()?.locals, local)?.clone()
-                };
+                let value = self.read_or_take_local(local, transfer)?;
                 let LocalValue::Error(value) = value else {
                     return Err(InterpreterError::new(
                         "MIR error expression used another local type",
@@ -7846,14 +8562,21 @@ impl Interpreter<'_> {
                 };
                 self.push_error(value)?;
             }
-            mir::InterfaceValue::Call { function, args, .. } => {
+            mir::InterfaceValue::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::Interface(interface)),
+                    span,
                 )?;
             }
             mir::InterfaceValue::CollectionIndex {
+                index_span,
                 collection,
                 index,
                 positional,
@@ -7862,10 +8585,11 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                     positional,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -7944,14 +8668,21 @@ impl Interpreter<'_> {
                 };
                 self.push_nullable_error(interface, value)?;
             }
-            mir::NullableInterfaceValue::Call { function, args, .. } => {
+            mir::NullableInterfaceValue::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::NullableInterface(interface)),
+                    span,
                 )?;
             }
             mir::NullableInterfaceValue::DictionaryGet {
+                index_span,
                 collection,
                 key,
                 access,
@@ -7962,9 +8693,11 @@ impl Interpreter<'_> {
                     expected: mir::Type::Interface(interface),
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableInterfaceValue::CollectionIndex {
+                index_span,
                 collection,
                 index,
                 positional,
@@ -7973,10 +8706,11 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                     positional,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -8033,11 +8767,55 @@ impl Interpreter<'_> {
                 };
                 self.push_nullable_mixed(value)?;
             }
-            mir::NullableMixedExpression::Call { function, args, .. } => {
+            mir::NullableMixedExpression::CollectionGet {
+                collection,
+                key,
+                index_span,
+                access,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: mir::Type::Mixed,
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableMixedExpression::CollectionIndex {
+                collection,
+                index,
+                index_span,
+                positional,
+                transfer,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                if transfer && !remove {
+                    frame
+                        .tasks
+                        .push(EvaluationTask::OwnNullableMixed(mir::MixedOwnership::None));
+                }
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection,
+                    index_span,
+                    transfer: remove,
+                    positional,
+                });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::NullableMixedExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::NullableMixed),
+                    span,
                 )?;
             }
             mir::NullableMixedExpression::Coalesce {
@@ -8079,7 +8857,7 @@ impl Interpreter<'_> {
                         return Err(InterpreterError::new(format!(
                             "MIR non-nullable local local{} used as ?string",
                             local.0
-                        )))
+                        )));
                     }
                 }
             }
@@ -8091,7 +8869,7 @@ impl Interpreter<'_> {
                     return Err(InterpreterError::new(format!(
                         "MIR static{} was used as ?string",
                         id.0
-                    )))
+                    )));
                 }
             },
             mir::NullableStringExpression::Property { object, property } => {
@@ -8101,7 +8879,7 @@ impl Interpreter<'_> {
                         return Err(InterpreterError::new(format!(
                             "MIR property{} was used as a nullable string value",
                             property.index
-                        )))
+                        )));
                     }
                 }
             }
@@ -8115,11 +8893,17 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::ReadLine(prompt_span));
                 frame.tasks.push(EvaluationTask::String(*prompt));
             }
-            mir::NullableStringExpression::Call { function, args } => {
+            mir::NullableStringExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::NullableString),
+                    span,
                 )?;
             }
             mir::NullableStringExpression::EnumBacking { enum_id, value } => {
@@ -8146,6 +8930,8 @@ impl Interpreter<'_> {
                 object,
                 function,
                 args,
+                span,
+                ..
             } => {
                 let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
@@ -8154,6 +8940,7 @@ impl Interpreter<'_> {
                     args,
                     result: mir::Type::NullableString,
                     owned_receiver,
+                    call_site: span,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -8165,6 +8952,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableString(*left));
             }
             mir::NullableStringExpression::DictionaryGet {
+                index_span,
                 collection,
                 key,
                 access,
@@ -8175,6 +8963,7 @@ impl Interpreter<'_> {
                     expected: mir::Type::String,
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
@@ -8237,12 +9026,19 @@ impl Interpreter<'_> {
                 function.owns_environment = false;
                 self.push_local_value(value)?;
             }
-            mir::FunctionExpression::Call { function, args, .. } => self.queue_call(
+            mir::FunctionExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::Function(function_type)),
+                span,
             )?,
             mir::FunctionExpression::CollectionIndex {
+                index_span,
                 collection,
                 index,
                 positional,
@@ -8252,10 +9048,11 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                     positional,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
             mir::FunctionExpression::MixedPayload {
@@ -8378,12 +9175,19 @@ impl Interpreter<'_> {
                 }
                 self.push_local_value(value)?;
             }
-            mir::NullableFunctionExpression::Call { function, args, .. } => self.queue_call(
+            mir::NullableFunctionExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullableFunction(function_type)),
+                span,
             )?,
             mir::NullableFunctionExpression::DictionaryGet {
+                index_span,
                 collection,
                 key,
                 access,
@@ -8395,9 +9199,11 @@ impl Interpreter<'_> {
                     expected: mir::Type::Function(function_type),
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableFunctionExpression::CollectionIndex {
+                index_span,
                 collection,
                 index,
                 positional,
@@ -8407,10 +9213,11 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                     positional,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -8518,6 +9325,10 @@ impl Interpreter<'_> {
         expression: mir::ClassExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            mir::ClassExpression::Upcast { value, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::Class(*value));
+            }
             mir::ClassExpression::InterfacePayload {
                 class,
                 local,
@@ -8544,14 +9355,14 @@ impl Interpreter<'_> {
                 class,
                 receiver,
                 vtable,
+                transfer,
             } => {
-                let LocalValue::Error(value) = read_local(&self.current_frame()?.locals, receiver)?
-                else {
+                let LocalValue::Error(value) = self.read_or_take_local(receiver, transfer)? else {
                     return Err(InterpreterError::new(
                         "interface entry receiver is not a carrier",
                     ));
                 };
-                if value.vtable != vtable || self.interface_class(*value)? != class {
+                if value.vtable != vtable || self.interface_class(value)? != class {
                     return Err(InterpreterError::new(
                         "interface entry received an incompatible dynamic payload",
                     ));
@@ -8566,26 +9377,7 @@ impl Interpreter<'_> {
                 local,
                 transfer,
             } => {
-                let value = if transfer {
-                    self.current_frame_mut()?
-                        .locals
-                        .get_mut(local.0)
-                        .ok_or_else(|| {
-                            InterpreterError::new(format!(
-                                "MIR local local{} does not exist",
-                                local.0
-                            ))
-                        })?
-                        .take()
-                        .ok_or_else(|| {
-                            InterpreterError::new(format!(
-                                "MIR local local{} was moved before use",
-                                local.0
-                            ))
-                        })?
-                } else {
-                    read_local(&self.current_frame()?.locals, local)?.clone()
-                };
+                let value = self.read_or_take_local(local, transfer)?;
                 let LocalValue::Class {
                     object,
                     class: actual,
@@ -8609,6 +9401,33 @@ impl Interpreter<'_> {
                         object,
                         class: actual,
                     });
+            }
+            mir::ClassExpression::FileReadinessSource { class, file } => {
+                let LocalValue::Class { object, .. } =
+                    read_local(&self.current_frame()?.locals, file)?
+                else {
+                    return Err(InterpreterError::new("readiness source has no file owner"));
+                };
+                let object = *object;
+                let source = readiness_set::Source::File(object);
+                let values = &mut self.current_frame_mut()?.values;
+                values.push(EvaluationValue::Class { object, class });
+                values.set_place(Some(InterpreterPlace {
+                    storage: InterpreterPlaceStorage::ReadinessSource { source, class },
+                    ty: mir::Type::Class(class),
+                    payload_projection: None,
+                }));
+            }
+            mir::ClassExpression::StandardReadinessSource { class, stream, .. } => {
+                let source = readiness_set::Source::Standard(stream);
+                let object = self.readiness_source_home(source);
+                let values = &mut self.current_frame_mut()?.values;
+                values.push(EvaluationValue::Class { object, class });
+                values.set_place(Some(InterpreterPlace {
+                    storage: InterpreterPlaceStorage::ReadinessSource { source, class },
+                    ty: mir::Type::Class(class),
+                    payload_projection: None,
+                }));
             }
             mir::ClassExpression::Property {
                 class,
@@ -8643,12 +9462,14 @@ impl Interpreter<'_> {
                 class,
                 function,
                 args,
+                span,
                 ..
             } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::Class(class)),
+                    span,
                 )?;
             }
             mir::ClassExpression::New {
@@ -8657,6 +9478,7 @@ impl Interpreter<'_> {
                 properties,
                 constructor,
                 args,
+                span,
             } => {
                 let temporary_arg_drops = if let Some(constructor) = constructor {
                     let definition = function_in(self.program, constructor)?;
@@ -8697,6 +9519,7 @@ impl Interpreter<'_> {
                     property_expression_count,
                     temporary_arg_drops,
                     checked: None,
+                    call_site: span,
                 });
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -8712,17 +9535,7 @@ impl Interpreter<'_> {
                 local,
                 transfer,
             } => {
-                let value = if transfer {
-                    self.current_frame_mut()?
-                        .locals
-                        .get_mut(local.0)
-                        .and_then(Option::take)
-                        .ok_or_else(|| {
-                            InterpreterError::new("nullable class was moved before use")
-                        })?
-                } else {
-                    read_local(&self.current_frame()?.locals, local)?.clone()
-                };
+                let value = self.read_or_take_local(local, transfer)?;
                 let LocalValue::NullableClass {
                     object: Some(object),
                     class: actual,
@@ -8760,6 +9573,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
             mir::ClassExpression::CollectionIndex {
+                index_span,
                 positional,
                 class,
                 collection,
@@ -8773,6 +9587,7 @@ impl Interpreter<'_> {
                     class,
                     transfer,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
             mir::ClassExpression::MixedPayload {
@@ -8932,11 +9747,13 @@ impl Interpreter<'_> {
                 payload: class,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::SharedReference(class)),
+                span,
             )?,
             mir::SharedReferenceExpression::Share {
                 payload: class,
@@ -8967,6 +9784,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableSharedReference(*left));
             }
             mir::SharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -8982,6 +9800,7 @@ impl Interpreter<'_> {
                     nullable: false,
                     transfer: remove,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -9070,11 +9889,13 @@ impl Interpreter<'_> {
                 payload: class,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::WeakReference(class)),
+                span,
             )?,
             mir::WeakReferenceExpression::Create {
                 payload: class,
@@ -9105,6 +9926,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWeakReference(*left));
             }
             mir::WeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -9120,6 +9942,7 @@ impl Interpreter<'_> {
                     nullable: false,
                     transfer: remove,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -9198,11 +10021,13 @@ impl Interpreter<'_> {
                 payload: class,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullableSharedReference(class)),
+                span,
             )?,
             mir::NullableSharedReferenceExpression::Acquire {
                 payload: class,
@@ -9262,6 +10087,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableSharedReference(*left));
             }
             mir::NullableSharedReferenceExpression::DictionaryGet {
+                index_span,
                 payload: class,
                 collection,
                 key,
@@ -9278,9 +10104,11 @@ impl Interpreter<'_> {
                     },
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableSharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -9296,6 +10124,7 @@ impl Interpreter<'_> {
                     nullable: true,
                     transfer: remove,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -9374,11 +10203,13 @@ impl Interpreter<'_> {
                 payload: class,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullableWeakReference(class)),
+                span,
             )?,
             mir::NullableWeakReferenceExpression::NullSafeCreate {
                 payload: class,
@@ -9412,6 +10243,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWeakReference(*left));
             }
             mir::NullableWeakReferenceExpression::DictionaryGet {
+                index_span,
                 payload: class,
                 collection,
                 key,
@@ -9428,9 +10260,11 @@ impl Interpreter<'_> {
                     },
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableWeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -9446,6 +10280,7 @@ impl Interpreter<'_> {
                     nullable: true,
                     transfer: remove,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -9543,11 +10378,13 @@ impl Interpreter<'_> {
                 payload,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::WritableSharedReference(payload)),
+                span,
             )?,
             mir::WritableSharedReferenceExpression::Share { payload, value } => {
                 let drop_receiver = value.owned_temporary();
@@ -9580,6 +10417,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWritableSharedReference(*left));
             }
             mir::WritableSharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload,
                 collection,
@@ -9597,6 +10435,7 @@ impl Interpreter<'_> {
                         nullable: false,
                         transfer: remove,
                     });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -9687,11 +10526,13 @@ impl Interpreter<'_> {
                 payload,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::WritableWeakReference(payload)),
+                span,
             )?,
             mir::WritableWeakReferenceExpression::Create { payload, value } => {
                 let drop_receiver = value.owned_temporary();
@@ -9722,6 +10563,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWritableWeakReference(*left));
             }
             mir::WritableWeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload,
                 collection,
@@ -9739,6 +10581,7 @@ impl Interpreter<'_> {
                         nullable: false,
                         transfer: remove,
                     });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
         }
@@ -9820,11 +10663,13 @@ impl Interpreter<'_> {
                 payload,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullableWritableSharedReference(payload)),
+                span,
             )?,
             mir::NullableWritableSharedReferenceExpression::Acquire { payload, value } => {
                 let drop_receiver = value.owned_temporary();
@@ -9883,6 +10728,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWritableSharedReference(*left));
             }
             mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                index_span,
                 payload,
                 collection,
                 key,
@@ -9900,6 +10746,7 @@ impl Interpreter<'_> {
                     expected,
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
@@ -9981,11 +10828,13 @@ impl Interpreter<'_> {
                 payload,
                 function,
                 args,
+                span,
                 ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullableWritableWeakReference(payload)),
+                span,
             )?,
             mir::NullableWritableWeakReferenceExpression::NullSafeCreate { payload, value } => {
                 let drop_receiver = value.owned_temporary();
@@ -10020,6 +10869,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWritableWeakReference(*left));
             }
             mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                index_span,
                 payload,
                 collection,
                 key,
@@ -10037,6 +10887,7 @@ impl Interpreter<'_> {
                     expected,
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
@@ -10142,6 +10993,7 @@ impl Interpreter<'_> {
                     });
             }
             mir::SharedReferenceAccessExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload,
                 collection,
@@ -10160,6 +11012,7 @@ impl Interpreter<'_> {
                         nullable: false,
                         remove,
                     });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
             mir::SharedReferenceAccessExpression::Call {
@@ -10167,6 +11020,7 @@ impl Interpreter<'_> {
                 function,
                 args,
                 writable,
+                span,
                 ..
             } => {
                 let ty = if writable {
@@ -10174,7 +11028,7 @@ impl Interpreter<'_> {
                 } else {
                     mir::Type::ReadonlySharedReferenceAccess(payload)
                 };
-                self.queue_call(function, args, ReturnExpectation::Value(ty))?;
+                self.queue_call(function, args, ReturnExpectation::Value(ty), span)?;
             }
             mir::SharedReferenceAccessExpression::Acquire {
                 payload,
@@ -10285,6 +11139,7 @@ impl Interpreter<'_> {
                 );
             }
             mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload,
                 collection,
@@ -10303,9 +11158,11 @@ impl Interpreter<'_> {
                         nullable: true,
                         remove,
                     });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
             mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                index_span,
                 collection,
                 key,
                 access,
@@ -10317,6 +11174,7 @@ impl Interpreter<'_> {
                     expected: stored.into_type(),
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableSharedReferenceAccessExpression::Call {
@@ -10324,6 +11182,7 @@ impl Interpreter<'_> {
                 function,
                 args,
                 writable,
+                span,
                 ..
             } => {
                 let ty = if writable {
@@ -10331,7 +11190,7 @@ impl Interpreter<'_> {
                 } else {
                     mir::Type::NullableReadonlySharedReferenceAccess(payload)
                 };
-                self.queue_call(function, args, ReturnExpectation::Value(ty))?;
+                self.queue_call(function, args, ReturnExpectation::Value(ty), span)?;
             }
             mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
                 payload,
@@ -10390,20 +11249,7 @@ impl Interpreter<'_> {
                 transfer,
                 ..
             } => {
-                let value = if transfer {
-                    self.current_frame_mut()?
-                        .locals
-                        .get_mut(local.0)
-                        .and_then(Option::take)
-                        .ok_or_else(|| {
-                            InterpreterError::new(format!(
-                                "MIR collection local local{} was moved before use",
-                                local.0
-                            ))
-                        })?
-                } else {
-                    read_local(&self.current_frame()?.locals, local)?.clone()
-                };
+                let value = self.read_or_take_local(local, transfer)?;
                 let LocalValue::Collection(value) = value else {
                     return Err(InterpreterError::new(
                         "MIR collection expression used another local type",
@@ -10507,6 +11353,7 @@ impl Interpreter<'_> {
                     index_span,
                     transfer,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
             mir::CollectionExpression::Property {
@@ -10592,6 +11439,10 @@ impl Interpreter<'_> {
                     }
                     let definition = &self.program.collection_types[collection.0];
                     order_collection_entries(definition, &mut entries)?;
+                    inline_value::retain_collection_claims(
+                        &mut self.cancellation_states,
+                        &entries,
+                    )?;
                     self.current_frame_mut()?
                         .values
                         .push(EvaluationValue::Collection(CollectionValue::new(
@@ -10621,6 +11472,12 @@ impl Interpreter<'_> {
                 let mut entries = Vec::new();
                 let mut drops = Vec::new();
                 let source_entries = source.entries().clone();
+                if !transfer {
+                    inline_value::retain_collection_claims(
+                        &mut self.cancellation_states,
+                        &source_entries,
+                    )?;
+                }
                 for (key, value) in source_entries {
                     if matches!(
                         definition.kind,
@@ -10648,6 +11505,17 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::Collection(CollectionValue::new(
                         collection, entries,
                     )));
+            }
+            mir::CollectionExpression::BytesAllocate {
+                collection,
+                length,
+                length_span,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AllocateBytes(collection, length_span));
+                frame.tasks.push(EvaluationTask::Integer(*length));
             }
             mir::CollectionExpression::FromBytes { collection, source }
             | mir::CollectionExpression::BytesFromArray { collection, source } => {
@@ -10681,12 +11549,14 @@ impl Interpreter<'_> {
                 collection,
                 function,
                 args,
+                span,
                 ..
             } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::Collection(collection)),
+                    span,
                 )?;
             }
         }
@@ -10712,6 +11582,40 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::BuildNullableCollectionSome(collection));
                 frame.tasks.push(EvaluationTask::Collection(value));
+            }
+            mir::NullableCollectionExpression::CollectionGet {
+                source,
+                key,
+                index_span,
+                access,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection: source,
+                    expected: mir::Type::Collection(collection),
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableCollectionExpression::Index {
+                source,
+                index,
+                index_span,
+                transfer,
+                positional,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    positional,
+                    collection: source,
+                    index_span,
+                    transfer,
+                });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
             mir::NullableCollectionExpression::Local {
                 local, transfer, ..
@@ -10761,11 +11665,17 @@ impl Interpreter<'_> {
                     .values
                     .push(EvaluationValue::Collection(value));
             }
-            mir::NullableCollectionExpression::Call { function, args, .. } => {
+            mir::NullableCollectionExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::NullableCollection(collection)),
+                    span,
                 )?;
             }
             mir::NullableCollectionExpression::Coalesce {
@@ -10794,6 +11704,10 @@ impl Interpreter<'_> {
         let class = expression.class();
         match expression {
             mir::NullableClassExpression::Null(_) => self.push_nullable_class(class, None)?,
+            mir::NullableClassExpression::Upcast { value, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::NullableClass(*value));
+            }
             mir::NullableClassExpression::Class(value) => {
                 let frame = self.current_frame_mut()?;
                 frame
@@ -10817,17 +11731,7 @@ impl Interpreter<'_> {
             mir::NullableClassExpression::Local {
                 local, transfer, ..
             } => {
-                let value = if transfer {
-                    self.current_frame_mut()?
-                        .locals
-                        .get_mut(local.0)
-                        .and_then(Option::take)
-                        .ok_or_else(|| {
-                            InterpreterError::new("nullable class was moved before use")
-                        })?
-                } else {
-                    read_local(&self.current_frame()?.locals, local)?.clone()
-                };
+                let value = self.read_or_take_local(local, transfer)?;
                 let LocalValue::NullableClass {
                     object,
                     class: actual,
@@ -10863,11 +11767,17 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_class(actual, object)?;
             }
-            mir::NullableClassExpression::Call { function, args, .. } => {
+            mir::NullableClassExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => {
                 self.queue_call(
                     function,
                     args,
                     ReturnExpectation::Value(mir::Type::NullableClass(class)),
+                    span,
                 )?;
             }
             mir::NullableClassExpression::NullSafeProperty {
@@ -10886,6 +11796,7 @@ impl Interpreter<'_> {
                 object,
                 function,
                 args,
+                span,
                 ..
             } => {
                 let owned_receiver = object.owned_temporary_class();
@@ -10895,6 +11806,7 @@ impl Interpreter<'_> {
                     args,
                     result: mir::Type::NullableClass(class),
                     owned_receiver,
+                    call_site: span,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -10916,6 +11828,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
             mir::NullableClassExpression::DictionaryGet {
+                index_span,
                 class,
                 collection,
                 key,
@@ -10927,6 +11840,7 @@ impl Interpreter<'_> {
                     expected: mir::Type::Class(class),
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
@@ -10956,11 +11870,16 @@ impl Interpreter<'_> {
                 self.queue_payload_enum_place(place, mir::Type::PayloadEnum(ty), mode)?;
             }
             mir::PayloadEnumExpression::Call {
-                ty, function, args, ..
+                ty,
+                function,
+                args,
+                span,
+                ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::PayloadEnum(ty)),
+                span,
             )?,
             mir::PayloadEnumExpression::Coalesce { left, right, .. } => {
                 let frame = self.current_frame_mut()?;
@@ -10995,25 +11914,36 @@ impl Interpreter<'_> {
                 self.queue_payload_enum_place(place, mir::Type::NullablePayloadEnum(ty), mode)?;
             }
             mir::NullablePayloadEnumExpression::Call {
-                ty, function, args, ..
+                ty,
+                function,
+                args,
+                span,
+                ..
             } => self.queue_call(
                 function,
                 args,
                 ReturnExpectation::Value(mir::Type::NullablePayloadEnum(ty)),
+                span,
             )?,
             mir::NullablePayloadEnumExpression::CollectionGet {
+                index_span,
                 ty,
                 collection,
                 key,
                 access,
+                mode,
                 ..
             } => {
                 let frame = self.current_frame_mut()?;
+                if mode == mir::PayloadEnumUseMode::Copy && !access.removes_element() {
+                    frame.tasks.push(EvaluationTask::RetainInlineClaims);
+                }
                 frame.tasks.push(EvaluationTask::DictionaryGet {
                     collection,
                     expected: mir::Type::PayloadEnum(ty),
                     access,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullablePayloadEnumExpression::Coalesce { left, right, .. } => {
@@ -11033,7 +11963,10 @@ impl Interpreter<'_> {
         expected: mir::Type,
         mode: mir::PayloadEnumUseMode,
     ) -> Result<(), InterpreterError> {
-        let transfer = matches!(mode, mir::PayloadEnumUseMode::Move);
+        let transfer = matches!(
+            mode,
+            mir::PayloadEnumUseMode::Move | mir::PayloadEnumUseMode::TransferOwnedCopy
+        );
         let value = match place {
             mir::PayloadEnumPlace::Local(local) => self.read_or_take_local(local, transfer)?,
             mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => {
@@ -11066,18 +11999,23 @@ impl Interpreter<'_> {
                 self.read_property(object, property)?
             }
             mir::PayloadEnumPlace::CollectionIndex {
+                index_span,
                 collection,
                 index,
                 positional,
                 remove,
             } => {
                 let frame = self.current_frame_mut()?;
+                if mode == mir::PayloadEnumUseMode::Copy && !remove {
+                    frame.tasks.push(EvaluationTask::RetainInlineClaims);
+                }
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
-                    index_span: Span::default(),
+                    index_span,
                     transfer: remove,
                     positional,
                 });
+                frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
                 return Ok(());
             }
@@ -11129,6 +12067,9 @@ impl Interpreter<'_> {
                 }
             }
         };
+        if mode == mir::PayloadEnumUseMode::Copy {
+            inline_value::retain_owned_claims(&mut self.cancellation_states, &value)?;
+        }
         self.push_local_value(value)
     }
 
@@ -11141,15 +12082,10 @@ impl Interpreter<'_> {
         // Parameters and capture bindings denote caller-owned places already.
         // Materialized borrowed aliases must instead inherit the initializer's
         // original place, and replace that provenance on each assignment.
-        if local_in(function, target)?.owned
-            || function.params.contains(&target)
-            || function.closure.as_ref().is_some_and(|closure| {
-                closure
-                    .capture_locals
-                    .iter()
-                    .any(|(_, local)| *local == target)
-            })
-        {
+        if !crate::native_closure_abi::local_needs_borrow_home(
+            function,
+            local_in(function, target)?,
+        ) {
             return Ok(());
         }
         let origin = if value.borrows_move_value() {
@@ -11169,14 +12105,7 @@ impl Interpreter<'_> {
         target: mir::LocalId,
         place: Option<InterpreterPlace>,
     ) -> Result<(), InterpreterError> {
-        if !local_in(function, target)?.owned
-            && !function.params.contains(&target)
-            && !function.closure.as_ref().is_some_and(|closure| {
-                closure
-                    .capture_locals
-                    .iter()
-                    .any(|(_, local)| *local == target)
-            })
+        if crate::native_closure_abi::local_needs_borrow_home(function, local_in(function, target)?)
         {
             self.current_frame_mut()?.local_origins[target.0] = place;
         }
@@ -11226,6 +12155,7 @@ impl Interpreter<'_> {
                 |origin| origin.storage,
             ),
             ty,
+            payload_projection: origin.and_then(|origin| origin.payload_projection),
         })
     }
 
@@ -11239,13 +12169,63 @@ impl Interpreter<'_> {
             Some(InterpreterPlace {
                 storage: InterpreterPlaceStorage::Absent(argument.ty()),
                 ty: argument.ty(),
+                payload_projection: None,
             })
         } else if let Some(local) = argument.direct_place_local() {
+            Some(self.place_for_local(local)?)
+        } else if let Some(crate::native_closure_abi::BorrowHomePlace::Static(id)) =
+            crate::native_closure_abi::direct_borrow_home_place(argument)
+        {
+            Some(InterpreterPlace {
+                storage: InterpreterPlaceStorage::Static(id),
+                ty: self.program.statics[id.0].ty,
+                payload_projection: None,
+            })
+        } else if let Some(crate::native_closure_abi::BorrowHomePlace::Local {
+            local,
+            projection:
+                crate::native_closure_abi::BorrowHomeProjection::Direct
+                | crate::native_closure_abi::BorrowHomeProjection::MixedPayload(_),
+        }) = crate::native_closure_abi::direct_borrow_home_place(argument)
+        {
             Some(self.place_for_local(local)?)
         } else if let Some(value) = crate::native_shared::Expression::from_rvalue(argument) {
             self.shared_argument_place(value)?
         } else {
             match argument {
+                mir::Rvalue::Class(mir::ClassExpression::Upcast { value, .. }) => {
+                    self.argument_place(&mir::Rvalue::Class((**value).clone()))?
+                }
+                mir::Rvalue::NullableClass(mir::NullableClassExpression::Upcast {
+                    value, ..
+                }) => self.argument_place(&mir::Rvalue::NullableClass((**value).clone()))?,
+                mir::Rvalue::Class(mir::ClassExpression::FileReadinessSource { class, file }) => {
+                    let LocalValue::Class { object, .. } =
+                        read_local(&self.current_frame()?.locals, *file)?
+                    else {
+                        return Err(InterpreterError::new("readiness source has no file owner"));
+                    };
+                    Some(InterpreterPlace {
+                        storage: InterpreterPlaceStorage::ReadinessSource {
+                            source: readiness_set::Source::File(*object),
+                            class: *class,
+                        },
+                        ty: argument.ty(),
+                        payload_projection: None,
+                    })
+                }
+                mir::Rvalue::Class(mir::ClassExpression::StandardReadinessSource {
+                    class,
+                    stream,
+                    ..
+                }) => Some(InterpreterPlace {
+                    storage: InterpreterPlaceStorage::ReadinessSource {
+                        source: readiness_set::Source::Standard(*stream),
+                        class: *class,
+                    },
+                    ty: argument.ty(),
+                    payload_projection: None,
+                }),
                 mir::Rvalue::Class(mir::ClassExpression::Property {
                     object, property, ..
                 })
@@ -11304,6 +12284,12 @@ impl Interpreter<'_> {
                     ..
                 }) => Some(self.place_for_property(*object, *property)?),
                 mir::Rvalue::Value(value) => {
+                    if let mir::ValueExpression::Inline(
+                        mir::InlineValueExpression::InterfaceReceiver { receiver, .. },
+                    ) = value
+                    {
+                        return Ok(Some(self.place_for_local(*receiver)?));
+                    }
                     let operand = match value {
                         mir::ValueExpression::Integer(mir::IntegerExpression::Use {
                             operand,
@@ -11315,6 +12301,10 @@ impl Interpreter<'_> {
                         | mir::ValueExpression::Bool(mir::BoolExpression::Use { operand })
                         | mir::ValueExpression::Enum(mir::EnumExpression::Use {
                             operand, ..
+                        })
+                        | mir::ValueExpression::Inline(mir::InlineValueExpression::Use {
+                            operand,
+                            ..
                         }) => Some(operand),
                         _ => None,
                     };
@@ -11327,6 +12317,12 @@ impl Interpreter<'_> {
                 }
                 mir::Rvalue::NullableClass(mir::NullableClassExpression::Class(value)) => {
                     self.argument_place(&mir::Rvalue::Class(value.clone()))?
+                }
+                mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)) => {
+                    self.argument_place(&mir::Rvalue::Value(value.clone()))?
+                }
+                mir::Rvalue::NullableString(mir::NullableStringExpression::String(value)) => {
+                    self.argument_place(&mir::Rvalue::String(value.clone()))?
                 }
                 mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(
                     value,
@@ -11410,7 +12406,7 @@ impl Interpreter<'_> {
             mir::InterfaceValue::FromNullableClass { object, .. } => {
                 self.argument_place(&mir::Rvalue::NullableClass((**object).clone()))
             }
-            mir::InterfaceValue::FromCollection { value, .. } => self.argument_place(value),
+            mir::InterfaceValue::FromValue { value, .. } => self.argument_place(value),
             mir::InterfaceValue::Upcast { source, .. } => {
                 self.argument_place(&mir::Rvalue::Interface((**source).clone()))
             }
@@ -11428,22 +12424,30 @@ impl Interpreter<'_> {
         object: mir::LocalId,
         property: crate::class_layout::PropertyId,
     ) -> Result<InterpreterPlace, InterpreterError> {
-        let object = match read_local(&self.current_frame()?.locals, object)? {
+        let object = match self.read_local_value(object)? {
             LocalValue::Class { object, .. }
             | LocalValue::NullableClass {
                 object: Some(object),
                 ..
-            } => *object,
+            } => object,
             _ => {
                 return Err(InterpreterError::new(
                     "borrowed property source is not a class",
-                ))
+                ));
             }
         };
+        if let Some(place) = self
+            .heap
+            .get(&object)
+            .and_then(|object| object.retained_places.get(&property.index))
+        {
+            return Ok(*place);
+        }
         let storage = InterpreterPlaceStorage::ObjectProperty { object, property };
         Ok(InterpreterPlace {
             storage,
             ty: self.place_storage_type(storage)?,
+            payload_projection: None,
         })
     }
 
@@ -11501,20 +12505,8 @@ impl Interpreter<'_> {
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
         expectation: ReturnExpectation,
+        call_site: Span,
     ) -> Result<(), InterpreterError> {
-        self.queue_call_at(function, args, expectation, None)
-    }
-
-    fn queue_call_at(
-        &mut self,
-        function: mir::FunctionId,
-        args: Vec<mir::Rvalue>,
-        expectation: ReturnExpectation,
-        call_site: Option<Span>,
-    ) -> Result<(), InterpreterError> {
-        if let Some(call_site) = call_site {
-            self.set_active_panic_site(call_site)?;
-        }
         let callee = function_in(self.program, function)?;
         let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 0, |_| false)?;
         let argument_places = self.direct_call_argument_places(callee, &args, 0)?;
@@ -11540,6 +12532,7 @@ impl Interpreter<'_> {
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
         nullable_result: mir::Type,
+        call_site: Span,
     ) -> Result<(), InterpreterError> {
         let callee = function_in(self.program, function)?;
         let non_nullable_result = non_nullable_type(nullable_result)
@@ -11573,7 +12566,7 @@ impl Interpreter<'_> {
             argument_places,
             expectation: ReturnExpectation::Value(result),
             temporary_arg_drops,
-            call_site: None,
+            call_site,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -11587,7 +12580,7 @@ impl Interpreter<'_> {
         class: crate::class_layout::ClassId,
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
-        call_site: Option<Span>,
+        call_site: Span,
     ) -> Result<(), InterpreterError> {
         let callee = function_in(self.program, function)?;
         let expectation = match callee.return_type {
@@ -11623,7 +12616,6 @@ impl Interpreter<'_> {
         argument_places: &[Option<InterpreterPlace>],
         caller_expectation: Option<ReturnExpectation>,
         entered_from: Option<Span>,
-        write_back_writable_parameters: bool,
     ) -> Result<(), InterpreterError> {
         if let Some(limit) = self.limits.max_call_frames {
             if self.frames.len() >= limit {
@@ -11660,11 +12652,19 @@ impl Interpreter<'_> {
                 )));
             }
         }
-        for ((parameter, value), origin) in function
+        let parameter_offset = usize::from(function.closure.is_some());
+        let returned_source = function.return_borrow.map(|borrow| {
+            crate::native_closure_abi::return_borrow_argument_index(
+                borrow,
+                function.receiver_mode.is_some(),
+            ) + parameter_offset
+        });
+        for (index, ((parameter, value), origin)) in function
             .params
             .iter()
             .zip(args.iter().cloned())
             .zip(argument_places.iter().copied())
+            .enumerate()
         {
             let _ = assign_local(
                 self.program,
@@ -11673,7 +12673,14 @@ impl Interpreter<'_> {
                 *parameter,
                 value,
             )?;
-            local_origins[parameter.0] = origin;
+            // Native call policy distinguishes private Copy slots from borrowed storage.
+            let keeps_home = crate::native_closure_abi::parameter_uses_borrow_home(
+                function.locals[parameter.0].ty,
+                function.parameter_modes[index],
+                function.closure.is_some(),
+            ) || function.retains_writable_input(*parameter)
+                || returned_source == Some(index);
+            local_origins[parameter.0] = if keeps_home { origin } else { None };
         }
         block_in(function, function.entry_block)?;
         let frame_id = self.next_frame;
@@ -11681,6 +12688,11 @@ impl Interpreter<'_> {
             .next_frame
             .checked_add(1)
             .ok_or_else(|| InterpreterError::new("MIR interpreter frame identity overflow"))?;
+        let active_panic_site = if function.owns_diagnostic_frame() {
+            function.source_span
+        } else {
+            self.current_frame()?.active_panic_site
+        };
         self.frames.push(CallFrame {
             id: frame_id,
             function: function_id,
@@ -11697,10 +12709,9 @@ impl Interpreter<'_> {
             checked_continuation: None,
             indirect_continuation: None,
             entered_from,
-            active_panic_site: function.source_span,
+            active_panic_site,
             closure_environment: None,
             consume_closure_environment: false,
-            write_back_writable_parameters,
         });
         Ok(())
     }
@@ -11724,19 +12735,10 @@ impl Interpreter<'_> {
             .get(object)
             .ok_or_else(|| InterpreterError::new("virtual receiver is not allocated"))?
             .class;
-        let dispatch_class = self
-            .frames
-            .last()
-            .and_then(|frame| function_in(self.program, frame.function).ok())
-            .and_then(|caller| {
-                let method = caller.method.as_ref()?;
-                matches!(method.name.as_str(), "__construct" | "__destruct").then_some(method.class)
-            })
-            .unwrap_or(dynamic_class);
-        class_in(self.program, dispatch_class)?
+        class_in(self.program, dynamic_class)?
             .virtual_methods
             .get(slot as usize)
-            .copied()
+            .and_then(|entry| entry.implementation)
             .ok_or_else(|| InterpreterError::new("virtual method slot does not exist"))
     }
 
@@ -11748,14 +12750,7 @@ impl Interpreter<'_> {
         continuation: CheckedContinuation,
         entered_from: Span,
     ) -> Result<(), InterpreterError> {
-        self.push_frame(
-            function_id,
-            args,
-            argument_places,
-            None,
-            Some(entered_from),
-            false,
-        )?;
+        self.push_frame(function_id, args, argument_places, None, Some(entered_from))?;
         self.frames
             .last_mut()
             .expect("checked frame was just pushed")
@@ -11850,7 +12845,6 @@ impl Interpreter<'_> {
             &frame_argument_places,
             None,
             Some(call_site),
-            true,
         )?;
         let frame = self
             .frames
@@ -11920,7 +12914,11 @@ impl Interpreter<'_> {
         storage: InterpreterPlaceStorage,
     ) -> Result<mir::Type, InterpreterError> {
         match storage {
+            InterpreterPlaceStorage::Static(id) => Ok(self.program.statics[id.0].ty),
             InterpreterPlaceStorage::Absent(ty) => Ok(ty),
+            InterpreterPlaceStorage::ReadinessSource { class, .. }
+            | InterpreterPlaceStorage::RuntimeObject { class, .. } => Ok(mir::Type::Class(class)),
+            InterpreterPlaceStorage::ReadinessMember { ty, .. } => Ok(ty),
             InterpreterPlaceStorage::CollectionElement(place) => Ok(place.ty),
             InterpreterPlaceStorage::ObjectProperty { property, .. } => {
                 class_in(self.program, property.class)?
@@ -11947,6 +12945,46 @@ impl Interpreter<'_> {
         }
     }
 
+    fn class_value_type(
+        &self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+    ) -> Result<crate::class_layout::ClassId, InterpreterError> {
+        let view = class_in(self.program, class)?;
+        if view.inline_copy_type().is_some() {
+            return Ok(class);
+        }
+        if view.source_span.source == crate::compiler_known_stream::SOURCE_ID
+            && crate::compiler_known_stream::is_pending_request(&view.name)
+        {
+            let request = self.pending_requests.get(&object).ok_or_else(|| {
+                InterpreterError::new("pending request is outside its callback lifetime")
+            })?;
+            if request.reading != (view.name == crate::compiler_known_stream::READ_REQUEST) {
+                return Err(InterpreterError::new(
+                    "pending request changed its direction",
+                ));
+            }
+            return Ok(class);
+        }
+        if view.name == crate::compiler_known_stream::READINESS_SOURCE
+            && view.source_span.source == crate::compiler_known_stream::SOURCE_ID
+        {
+            if !self.file_owners.contains_key(&object)
+                && !self.standard_source_homes.contains(&object)
+            {
+                return Err(InterpreterError::new("readiness source has no live owner"));
+            }
+            // Opaque source homes borrow owner storage, not its nominal type.
+            return Ok(class);
+        }
+        let owner = self
+            .heap
+            .get(&object)
+            .ok_or_else(|| InterpreterError::new("borrowed class source was destroyed"))?;
+        Ok(owner.class)
+    }
+
     // The native home points at a representation, not necessarily the callee's
     // representation. Keep that distinction in the interpreter too: reads view
     // the same value and writes restore the storage's declared representation.
@@ -11959,45 +12997,119 @@ impl Interpreter<'_> {
         if local_value_matches_type(self.program, ty, &value) {
             return Ok(value);
         }
-        let nominal = match &value {
-            LocalValue::Class { object, class } => {
-                Some((Some(*object), Some(mir::ImplementingType::Class(*class))))
+        let stored_type = local_value_type(self.program, &value);
+        if matches!(
+            ty,
+            mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Interface(_)
+                | mir::Type::NullableInterface(_)
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
+                | mir::Type::PayloadEnum(_)
+                | mir::Type::NullablePayloadEnum(_)
+        ) {
+            if let Some(mixed) = mixed_value_from_local(&value) {
+                let payload = match mixed {
+                    MixedValue::Class { object, class, .. } => LocalValue::Class {
+                        object: *object,
+                        class: *class,
+                    },
+                    MixedValue::Interface { value, .. } => LocalValue::Error(*value),
+                    MixedValue::Function { value, .. } => {
+                        let mut value = value.clone();
+                        value.owns_environment = false;
+                        LocalValue::Function(value)
+                    }
+                    MixedValue::PayloadEnum { value, .. } => {
+                        LocalValue::PayloadEnum((**value).clone())
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "borrowed mixed payload does not match its requested view",
+                        ));
+                    }
+                };
+                return self.project_place_value(payload, ty);
             }
-            LocalValue::NullableClass { object, class } => {
-                Some((*object, Some(mir::ImplementingType::Class(*class))))
+        }
+        let inline = if matches!(
+            ty,
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+        ) {
+            inline_value::nominal_parts(&value)?
+        } else {
+            None
+        };
+        let nominal = if let Some((class, object)) = inline {
+            Some((object, Some(mir::ImplementingType::Class(class))))
+        } else {
+            match &value {
+                LocalValue::Class { object, class } => {
+                    Some((Some(*object), Some(mir::ImplementingType::Class(*class))))
+                }
+                LocalValue::NullableClass { object, class } => {
+                    Some((*object, Some(mir::ImplementingType::Class(*class))))
+                }
+                LocalValue::Error(carrier) => Some((
+                    Some(carrier.object),
+                    Some(self.program.interface_vtables[carrier.vtable.0].implementing_type),
+                )),
+                LocalValue::NullableError { value, .. } => Some((
+                    value.map(|carrier| carrier.object),
+                    value.map(|carrier| {
+                        self.program.interface_vtables[carrier.vtable.0].implementing_type
+                    }),
+                )),
+                LocalValue::Collection(collection) => Some((
+                    collection
+                        .present
+                        .then_some(Rc::as_ptr(&collection.entries) as usize),
+                    Some(mir::ImplementingType::Collection(collection.ty)),
+                )),
+                _ => None,
             }
-            LocalValue::Error(carrier) => Some((
-                Some(carrier.object),
-                Some(self.program.interface_vtables[carrier.vtable.0].implementing_type),
-            )),
-            LocalValue::NullableError { value, .. } => Some((
-                value.map(|carrier| carrier.object),
-                value.map(|carrier| {
-                    self.program.interface_vtables[carrier.vtable.0].implementing_type
-                }),
-            )),
-            LocalValue::Collection(collection) => Some((
-                collection
-                    .present
-                    .then_some(Rc::as_ptr(&collection.entries) as usize),
-                Some(mir::ImplementingType::Collection(collection.ty)),
-            )),
-            _ => None,
         };
         if let Some((object, implementing)) = nominal {
             match ty {
+                mir::Type::Scalar(mir::ScalarType::Inline(inline))
+                | mir::Type::NullableScalar(mir::ScalarType::Inline(inline)) => {
+                    if object.is_some()
+                        && inline.nominal_class().map(mir::ImplementingType::Class) != implementing
+                    {
+                        return Err(InterpreterError::new(
+                            "borrowed place has an incompatible inline view",
+                        ));
+                    }
+                    let value = object.map(|bits| {
+                        mir::ScalarValue::Inline(crate::inline_value::InlineValue {
+                            ty: inline,
+                            bits: bits as u128,
+                        })
+                    });
+                    if matches!(ty, mir::Type::NullableScalar(_)) {
+                        return Ok(LocalValue::NullableScalar {
+                            ty: mir::ScalarType::Inline(inline),
+                            value,
+                        });
+                    }
+                    if let Some(value) = value {
+                        return Ok(LocalValue::Scalar(value));
+                    }
+                }
                 mir::Type::Class(class) | mir::Type::NullableClass(class) => {
                     if let Some(object) = object {
-                        let actual = self
-                            .heap
-                            .get(&object)
-                            .ok_or_else(|| {
-                                InterpreterError::new("borrowed class source was destroyed")
-                            })?
-                            .class;
-                        if !matches!(implementing, Some(mir::ImplementingType::Class(_)))
-                            || !class_is_subtype(self.program, actual, class)
-                        {
+                        let actual = match implementing {
+                            Some(mir::ImplementingType::Class(class)) => {
+                                self.class_value_type(object, class)?
+                            }
+                            _ => {
+                                return Err(InterpreterError::new(
+                                    "borrowed place has an incompatible class view",
+                                ));
+                            }
+                        };
+                        if !class_is_subtype(self.program, actual, class) {
                             return Err(InterpreterError::new(
                                 "borrowed place has an incompatible class view",
                             ));
@@ -12025,23 +13137,16 @@ impl Interpreter<'_> {
                     let carrier = object
                         .map(|object| {
                             let implementing = match implementing {
-                                Some(mir::ImplementingType::Class(_)) => {
+                                Some(mir::ImplementingType::Class(class)) => {
                                     mir::ImplementingType::Class(
-                                        self.heap
-                                            .get(&object)
-                                            .ok_or_else(|| {
-                                                InterpreterError::new(
-                                                    "borrowed interface source was destroyed",
-                                                )
-                                            })?
-                                            .class,
+                                        self.class_value_type(object, class)?,
                                     )
                                 }
                                 Some(implementing) => implementing,
                                 None => {
                                     return Err(InterpreterError::new(
                                         "borrowed interface source has no payload type",
-                                    ))
+                                    ));
                                 }
                             };
                             let vtable = self
@@ -12105,6 +13210,18 @@ impl Interpreter<'_> {
             }
         }
         let projected = match (ty, value) {
+            (mir::Type::ByteRegion(expected), LocalValue::ByteRegion(mut value))
+                if expected == value.kind && value.source.is_some() =>
+            {
+                value.nullable = false;
+                LocalValue::ByteRegion(value)
+            }
+            (mir::Type::NullableByteRegion(expected), LocalValue::ByteRegion(mut value))
+                if expected == value.kind =>
+            {
+                value.nullable = true;
+                LocalValue::ByteRegion(value)
+            }
             (
                 mir::Type::Scalar(expected),
                 LocalValue::NullableScalar {
@@ -12252,19 +13369,79 @@ impl Interpreter<'_> {
                 }
             }
             _ => {
-                return Err(InterpreterError::new(
-                    "borrowed place representation does not match its requested view",
-                ))
+                return Err(InterpreterError::new(format!(
+                    "borrowed place representation {stored_type} does not match its requested view {ty}",
+                )));
             }
         };
         Ok(projected)
     }
 
     fn read_place(&self, place: InterpreterPlace) -> Result<LocalValue, InterpreterError> {
+        if let Some(index) = place.payload_projection {
+            let projection = self.payload_projections.get(index).ok_or_else(|| {
+                InterpreterError::new("borrowed payload projection does not exist")
+            })?;
+            let source = self.read_place(InterpreterPlace {
+                ty: mir::Type::PayloadEnum(projection.ty),
+                payload_projection: projection.parent,
+                ..place
+            })?;
+            let LocalValue::PayloadEnum(payload) = source else {
+                return Err(InterpreterError::new(
+                    "borrowed payload source is not an enum",
+                ));
+            };
+            if payload.case != projection.case
+                || payload.moved_fields.get(projection.field) != Some(&false)
+            {
+                return Err(InterpreterError::new(
+                    "borrowed payload field is unavailable",
+                ));
+            }
+            let value = payload
+                .fields
+                .get(projection.field)
+                .cloned()
+                .ok_or_else(|| InterpreterError::new("borrowed payload field does not exist"))?;
+            return self.project_place_value(value, place.ty);
+        }
         let value = match place.storage {
+            InterpreterPlaceStorage::Static(id) => self
+                .statics
+                .get(id.0)
+                .cloned()
+                .ok_or_else(|| InterpreterError::new("borrowed static source is unavailable")),
             InterpreterPlaceStorage::Absent(ty) => typed_null_value(ty),
+            InterpreterPlaceStorage::ReadinessSource { source, class } => {
+                if let readiness_set::Source::File(object) = source {
+                    if !self.file_owners.contains_key(&object) || !self.heap.contains_key(&object) {
+                        return Err(InterpreterError::new(
+                            "readiness source owner was destroyed",
+                        ));
+                    }
+                }
+                Ok(LocalValue::Class {
+                    object: self.readiness_source_home(source),
+                    class,
+                })
+            }
+            InterpreterPlaceStorage::RuntimeObject { object, class } => {
+                if !self.heap.contains_key(&object) {
+                    return Err(InterpreterError::new("a runtime-owned object was destroyed"));
+                }
+                Ok(LocalValue::Class { object, class })
+            }
+            InterpreterPlaceStorage::ReadinessMember {
+                set, registration, ..
+            } => self
+                .readiness_member_slot(set, registration)?
+                .clone()
+                .ok_or_else(|| {
+                    InterpreterError::new("borrowed registration source is unavailable")
+                }),
             InterpreterPlaceStorage::CollectionElement(id) => {
-                let (entries, index) = self.collection_element_storage(id, false)?;
+                let (entries, index) = self.collection_element_storage(id)?;
                 let value = entries.borrow().get(index).map(|(_, value)| value.clone());
                 value.ok_or_else(|| {
                     InterpreterError::new("borrowed collection element is unavailable")
@@ -12281,7 +13458,8 @@ impl Interpreter<'_> {
                 .and_then(Option::as_ref)
                 .cloned()
                 .ok_or_else(|| {
-                    InterpreterError::new("closure capture source place is unavailable")
+                    InterpreterError::new(format!("borrowed source local{} in frame {frame} is unavailable; active frames: {:?}",
+                        local.0, self.frames.iter().map(|frame| (frame.id, self.program.functions[frame.function.0].name.as_str())).collect::<Vec<_>>()))
                 }),
             InterpreterPlaceStorage::EnvironmentField { environment, field } => {
                 if let Some(active) = self
@@ -12312,208 +13490,88 @@ impl Interpreter<'_> {
         self.project_place_value(value, place.ty)
     }
 
-    fn take_place(&mut self, place: InterpreterPlace) -> Result<LocalValue, InterpreterError> {
-        let value = match place.storage {
-            InterpreterPlaceStorage::Absent(_) => Err(InterpreterError::new(
-                "absent readonly borrowed place cannot be transferred",
-            )),
-            InterpreterPlaceStorage::CollectionElement(id) => {
-                let (entries, index) = self.collection_element_storage(id, false)?;
-                let value = entries
-                    .borrow_mut()
-                    .get_mut(index)
-                    .map(|(_, value)| {
-                        // This inert placeholder owns nothing. The place remains
-                        // unavailable until the exclusive capture restores it.
-                        std::mem::replace(value, LocalValue::Mixed(MixedValue::Null))
-                    })
-                    .ok_or_else(|| {
-                        InterpreterError::new("borrowed collection element is unavailable")
-                    })?;
-                self.transferred_collection_elements
-                    .insert((id.generation, id.index));
-                Ok(value)
-            }
-            InterpreterPlaceStorage::ObjectProperty { object, property } => self
-                .heap
-                .get_mut(&object)
-                .and_then(|value| value.properties.get_mut(property.index))
-                .and_then(Option::take)
-                .ok_or_else(|| InterpreterError::new("borrowed property source is unavailable")),
-            InterpreterPlaceStorage::FrameLocal { frame, local } => self
-                .frames
-                .iter_mut()
-                .find(|candidate| candidate.id == frame)
-                .and_then(|frame| frame.locals.get_mut(local.0))
-                .and_then(Option::take)
-                .ok_or_else(|| {
-                    InterpreterError::new("closure capture source place is unavailable")
-                }),
-            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
-                if let Some(active) = self
-                    .active_closure_fields
-                    .get(&(environment, field.0))
-                    .copied()
-                {
-                    return self.take_place(InterpreterPlace {
-                        ty: place.ty,
-                        ..active
-                    });
-                }
-                let index = self.closure_environment_field_index(environment, field)?;
-                let borrowed = match &self
-                    .closure_environments
-                    .get(&environment)
-                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
-                    .fields[index]
-                {
-                    ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
-                        if !writable {
-                            return Err(InterpreterError::new(
-                                "readonly closure environment field was transferred",
-                            ));
-                        }
-                        Some(*place)
-                    }
-                    ClosureEnvironmentFieldValue::Owned(_) => None,
-                };
-                if let Some(origin) = borrowed {
-                    return self.take_place(InterpreterPlace {
-                        ty: place.ty,
-                        ..origin
-                    });
-                }
-                let environment = self
-                    .closure_environments
-                    .get_mut(&environment)
-                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
-                let ClosureEnvironmentFieldValue::Owned(slot) = &mut environment.fields[index]
-                else {
-                    unreachable!("borrowed environment field handled above");
-                };
-                slot.take()
-                    .ok_or_else(|| InterpreterError::new("closure owned capture was already moved"))
-            }
-        }?;
-        self.project_place_value(value, place.ty)
-    }
-
-    fn restore_place(
-        &mut self,
-        place: InterpreterPlace,
-        value: LocalValue,
-    ) -> Result<(), InterpreterError> {
-        if matches!(place.storage, InterpreterPlaceStorage::Absent(_)) {
-            return Err(InterpreterError::new(
-                "absent readonly borrowed place cannot be restored",
-            ));
-        }
-        let value = self.project_place_value(value, self.place_storage_type(place.storage)?)?;
-        match place.storage {
-            InterpreterPlaceStorage::Absent(_) => unreachable!("absent place rejected above"),
-            InterpreterPlaceStorage::CollectionElement(id) => {
-                let (entries, index) = self.collection_element_storage(id, true)?;
-                let mut entries = entries.borrow_mut();
-                let (_, slot) = entries.get_mut(index).ok_or_else(|| {
-                    InterpreterError::new("borrowed collection element is unavailable")
-                })?;
-                *slot = value;
-                self.transferred_collection_elements
-                    .remove(&(id.generation, id.index));
-                Ok(())
-            }
-            InterpreterPlaceStorage::ObjectProperty { object, property } => {
-                let slot = self
-                    .heap
-                    .get_mut(&object)
-                    .and_then(|value| value.properties.get_mut(property.index))
-                    .ok_or_else(|| {
-                        InterpreterError::new("borrowed property source is unavailable")
-                    })?;
-                if slot.replace(value).is_some() {
-                    return Err(InterpreterError::new(
-                        "transferred property source was unexpectedly occupied",
-                    ));
-                }
-                Ok(())
-            }
-            InterpreterPlaceStorage::FrameLocal { frame, local } => {
-                let slot = self
-                    .frames
-                    .iter_mut()
-                    .find(|candidate| candidate.id == frame)
-                    .and_then(|frame| frame.locals.get_mut(local.0))
-                    .ok_or_else(|| {
-                        InterpreterError::new("closure capture source place is unavailable")
-                    })?;
-                if slot.replace(value).is_some() {
-                    return Err(InterpreterError::new(
-                        "transferred closure capture source was unexpectedly occupied",
-                    ));
-                }
-                Ok(())
-            }
-            InterpreterPlaceStorage::EnvironmentField { environment, field } => {
-                if let Some(active) = self
-                    .active_closure_fields
-                    .get(&(environment, field.0))
-                    .copied()
-                {
-                    return self.restore_place(active, value);
-                }
-                let index = self.closure_environment_field_index(environment, field)?;
-                let borrowed = match &self
-                    .closure_environments
-                    .get(&environment)
-                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
-                    .fields[index]
-                {
-                    ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
-                        if !writable {
-                            return Err(InterpreterError::new(
-                                "readonly closure environment field was restored",
-                            ));
-                        }
-                        Some(*place)
-                    }
-                    ClosureEnvironmentFieldValue::Owned(_) => None,
-                };
-                if let Some(place) = borrowed {
-                    return self.restore_place(place, value);
-                }
-                let environment = self
-                    .closure_environments
-                    .get_mut(&environment)
-                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
-                let ClosureEnvironmentFieldValue::Owned(slot) = &mut environment.fields[index]
-                else {
-                    unreachable!("borrowed environment field handled above");
-                };
-                if slot.replace(value).is_some() {
-                    return Err(InterpreterError::new(
-                        "transferred closure environment field was unexpectedly occupied",
-                    ));
-                }
-                Ok(())
-            }
-        }
-    }
-
     fn write_place(
         &mut self,
         place: InterpreterPlace,
         value: LocalValue,
     ) -> Result<LocalValue, InterpreterError> {
+        if place.payload_projection.is_some() {
+            return Err(InterpreterError::new(
+                "readonly payload binding cannot be replaced",
+            ));
+        }
         if matches!(place.storage, InterpreterPlaceStorage::Absent(_)) {
             return Err(InterpreterError::new(
                 "absent readonly borrowed place cannot be written",
             ));
         }
-        let value = self.project_place_value(value, self.place_storage_type(place.storage)?)?;
+        if let InterpreterPlaceStorage::EnvironmentField { environment, field } = place.storage {
+            let origin =
+                if let Some(active) = self.active_closure_fields.get(&(environment, field.0)) {
+                    Some(*active)
+                } else {
+                    let index = self.closure_environment_field_index(environment, field)?;
+                    match &self
+                        .closure_environments
+                        .get(&environment)
+                        .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                        .fields[index]
+                    {
+                        ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
+                            if !writable {
+                                return Err(InterpreterError::new(
+                                    "readonly closure environment field was written",
+                                ));
+                            }
+                            Some(*place)
+                        }
+                        ClosureEnvironmentFieldValue::Owned(_) => None,
+                    }
+                };
+            if let Some(origin) = origin {
+                return self.write_place(
+                    InterpreterPlace {
+                        ty: place.ty,
+                        ..origin
+                    },
+                    value,
+                );
+            }
+        }
+        let storage_type = self.place_storage_type(place.storage)?;
+        let boxed_payload = matches!(storage_type, mir::Type::Mixed | mir::Type::NullableMixed)
+            && !matches!(place.ty, mir::Type::Mixed | mir::Type::NullableMixed);
+        let value = if boxed_payload {
+            let stored = self.read_place(InterpreterPlace {
+                ty: storage_type,
+                ..place
+            })?;
+            let value = self.restore_boxed_payload(stored, value, place.ty)?;
+            self.project_place_value(LocalValue::Mixed(value), storage_type)?
+        } else {
+            self.project_place_value(value, storage_type)?
+        };
         let old = match place.storage {
+            InterpreterPlaceStorage::Static(id) => self
+                .statics
+                .get_mut(id.0)
+                .map(|slot| std::mem::replace(slot, value))
+                .ok_or_else(|| InterpreterError::new("borrowed static source is unavailable")),
             InterpreterPlaceStorage::Absent(_) => unreachable!("absent place rejected above"),
+            InterpreterPlaceStorage::ReadinessSource { .. } => Err(InterpreterError::new(
+                "borrowed readiness source cannot be written",
+            )),
+            InterpreterPlaceStorage::RuntimeObject { .. } => Err(InterpreterError::new(
+                "a runtime-owned object cannot be replaced",
+            )),
+            InterpreterPlaceStorage::ReadinessMember {
+                set, registration, ..
+            } => self
+                .readiness_member_slot_mut(set, registration)?
+                .replace(value)
+                .ok_or_else(|| InterpreterError::new("borrowed registration source is empty")),
             InterpreterPlaceStorage::CollectionElement(id) => {
-                let (entries, index) = self.collection_element_storage(id, false)?;
+                let (entries, index) = self.collection_element_storage(id)?;
                 let old = entries
                     .borrow_mut()
                     .get_mut(index)
@@ -12540,45 +13598,7 @@ impl Interpreter<'_> {
                 .replace(value)
                 .ok_or_else(|| InterpreterError::new("closure capture source place is empty")),
             InterpreterPlaceStorage::EnvironmentField { environment, field } => {
-                if let Some(active) = self
-                    .active_closure_fields
-                    .get(&(environment, field.0))
-                    .copied()
-                {
-                    return self.write_place(
-                        InterpreterPlace {
-                            ty: place.ty,
-                            ..active
-                        },
-                        value,
-                    );
-                }
                 let index = self.closure_environment_field_index(environment, field)?;
-                let borrowed = match &self
-                    .closure_environments
-                    .get(&environment)
-                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
-                    .fields[index]
-                {
-                    ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
-                        if !writable {
-                            return Err(InterpreterError::new(
-                                "readonly closure environment field was written",
-                            ));
-                        }
-                        Some(*place)
-                    }
-                    ClosureEnvironmentFieldValue::Owned(_) => None,
-                };
-                if let Some(origin) = borrowed {
-                    return self.write_place(
-                        InterpreterPlace {
-                            ty: place.ty,
-                            ..origin
-                        },
-                        value,
-                    );
-                }
                 let environment = self
                     .closure_environments
                     .get_mut(&environment)
@@ -12592,7 +13612,96 @@ impl Interpreter<'_> {
                 })
             }
         }?;
-        self.project_place_value(old, place.ty)
+        if boxed_payload {
+            // Cleanup needs the box's ownership claim, not its borrowed read view.
+            Ok(old)
+        } else {
+            self.project_place_value(old, place.ty)
+        }
+    }
+
+    fn restore_boxed_payload(
+        &self,
+        stored: LocalValue,
+        value: LocalValue,
+        view: mir::Type,
+    ) -> Result<MixedValue, InterpreterError> {
+        let value = self.project_place_value(value, view)?;
+        let owner = Rc::new(Cell::new(1));
+        let payload = match (mixed_value_from_local(&stored), value) {
+            (Some(MixedValue::Class { .. }), LocalValue::Class { object, class })
+            | (
+                Some(MixedValue::Class { .. }),
+                LocalValue::NullableClass {
+                    object: Some(object),
+                    class,
+                },
+            ) => MixedValue::Class {
+                object,
+                class: self.class_value_type(object, class)?,
+                owner,
+                payload_owned: true,
+            },
+            (Some(MixedValue::Interface { interface, .. }), value) => {
+                let LocalValue::Error(value) =
+                    self.project_place_value(value, mir::Type::Interface(*interface))?
+                else {
+                    return Err(InterpreterError::new(
+                        "boxed interface replacement has no payload",
+                    ));
+                };
+                MixedValue::Interface {
+                    value,
+                    interface: *interface,
+                    owner,
+                    payload_owned: true,
+                }
+            }
+            (
+                Some(MixedValue::Function {
+                    value: previous, ..
+                }),
+                value,
+            ) => {
+                let LocalValue::Function(value) =
+                    self.project_place_value(value, mir::Type::Function(previous.function_type))?
+                else {
+                    return Err(InterpreterError::new(
+                        "boxed function replacement has no payload",
+                    ));
+                };
+                MixedValue::Function {
+                    value,
+                    owner,
+                    payload_owned: true,
+                }
+            }
+            (
+                Some(MixedValue::PayloadEnum {
+                    value: previous, ..
+                }),
+                value,
+            ) => {
+                let LocalValue::PayloadEnum(value) =
+                    self.project_place_value(value, mir::Type::PayloadEnum(previous.ty))?
+                else {
+                    return Err(InterpreterError::new(
+                        "boxed enum replacement has no payload",
+                    ));
+                };
+                MixedValue::PayloadEnum {
+                    value: Box::new(value),
+                    owner,
+                    payload_owned: true,
+                }
+            }
+            _ => {
+                return Err(InterpreterError::new(
+                    "boxed replacement does not match its payload storage",
+                ));
+            }
+        };
+        Ok(payload)
     }
 
     fn drop_function_value(&mut self, value: FunctionValue) -> Result<(), InterpreterError> {
@@ -12692,15 +13801,8 @@ impl Interpreter<'_> {
             };
             let field = &layout.fields[index];
             let binding = field.storage.invocation_binding(invocation_mode);
-            let transfer = binding == mir::ClosureEnvironmentStorage::WritableBorrow
-                && field.ty.transfers_writable_capture_ownership();
             let (value, origin, owned) = if let Some(place) = borrowed_place {
-                let value = if transfer {
-                    self.take_place(place)?
-                } else {
-                    self.read_place(place)?
-                };
-                (value, place, false)
+                (self.read_place(place)?, place, false)
             } else {
                 let environment_value = self
                     .closure_environments
@@ -12723,6 +13825,7 @@ impl Interpreter<'_> {
                             field: *field_id,
                         },
                         ty: field.ty,
+                        payload_projection: None,
                     },
                     owned,
                 )
@@ -12747,6 +13850,7 @@ impl Interpreter<'_> {
                             local: target,
                         },
                         ty: local_in(function, target)?.ty,
+                        payload_projection: None,
                     },
                 );
             }
@@ -12787,11 +13891,6 @@ impl Interpreter<'_> {
                 field: mir::ClosureEnvironmentFieldId,
                 value: Option<LocalValue>,
             },
-            WritableBorrow {
-                place: InterpreterPlace,
-                value: LocalValue,
-                transferred: bool,
-            },
         }
         let mut actions = Vec::new();
         for (physical_index, ((field_id, local), field)) in closure
@@ -12825,23 +13924,6 @@ impl Interpreter<'_> {
                         value: slot.take(),
                     })
                 }
-                ClosureEnvironmentFieldValue::Borrowed { place, writable } if *writable => {
-                    let transferred = field.ty.transfers_writable_capture_ownership();
-                    let value = if transferred {
-                        slot.take().ok_or_else(|| {
-                            InterpreterError::new("writable closure capture was moved")
-                        })?
-                    } else {
-                        slot.as_ref().cloned().ok_or_else(|| {
-                            InterpreterError::new("writable closure capture was moved")
-                        })?
-                    };
-                    actions.push(SyncAction::WritableBorrow {
-                        place: *place,
-                        value,
-                        transferred,
-                    });
-                }
                 ClosureEnvironmentFieldValue::Owned(_)
                 | ClosureEnvironmentFieldValue::Borrowed { .. } => {}
             }
@@ -12869,21 +13951,6 @@ impl Interpreter<'_> {
                         ));
                     };
                     *slot = value;
-                }
-                SyncAction::WritableBorrow {
-                    place,
-                    value,
-                    transferred,
-                } => {
-                    if transferred {
-                        self.restore_place(place, value)?;
-                    } else {
-                        let current = self.read_place(place)?;
-                        if current != value {
-                            let old = self.write_place(place, value)?;
-                            collect_owned_objects_from_value(old, &mut drops);
-                        }
-                    }
                 }
             }
         }
@@ -12914,6 +13981,19 @@ impl Interpreter<'_> {
         self.active_closure_fields
             .retain(|(candidate, _), _| *candidate != environment);
         Ok(drops)
+    }
+
+    fn project_virtual_call_result(
+        &self,
+        function: mir::FunctionId,
+        value: LocalValue,
+        expected: mir::Type,
+    ) -> Result<LocalValue, InterpreterError> {
+        if function_in(self.program, function)?.virtual_slot.is_some() {
+            self.project_place_value(value, expected)
+        } else {
+            Ok(value)
+        }
     }
 
     fn complete_frame(
@@ -12948,7 +14028,17 @@ impl Interpreter<'_> {
             return Ok(StepOutcome::Continue);
         }
         if let Some(continuation) = frame.checked_continuation {
+            let direct_call = matches!(&continuation, CheckedContinuation::Call { .. });
             let (target, assignment, failed_construction) = match (continuation, outcome) {
+                (CheckedContinuation::Register(registration), outcome) => {
+                    return self.finish_readiness_registration(registration, outcome);
+                }
+                (CheckedContinuation::TransferGroup(callback), outcome) => {
+                    return self.finish_transfer_callback(callback, outcome);
+                }
+                (CheckedContinuation::PendingFile(configuration), outcome) => {
+                    return self.finish_pending_file_configuration(configuration, outcome);
+                }
                 (
                     CheckedContinuation::Call {
                         result: Some(result),
@@ -13053,6 +14143,15 @@ impl Interpreter<'_> {
             let caller = function_in(self.program, caller_id)?;
             block_in(caller, target)?;
             if let Some((local, value)) = assignment {
+                let value = if direct_call {
+                    self.project_virtual_call_result(
+                        frame.function,
+                        value,
+                        local_in(caller, local)?.ty,
+                    )?
+                } else {
+                    value
+                };
                 self.assign_result_origin(caller, local, frame.returned_place)?;
                 let replaced = assign_local(
                     self.program,
@@ -13086,6 +14185,7 @@ impl Interpreter<'_> {
         };
         match (expectation, outcome) {
             (ReturnExpectation::Value(expected), FunctionOutcome::Value(value)) => {
+                let value = self.project_virtual_call_result(frame.function, value, expected)?;
                 if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR scalar call expected {expected}, returned {}",
@@ -13098,6 +14198,7 @@ impl Interpreter<'_> {
                     .set_place(frame.returned_place);
             }
             (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
+                let value = self.project_virtual_call_result(frame.function, value, expected)?;
                 if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR discarded call expected {expected}, returned {}",
@@ -13153,18 +14254,247 @@ impl Interpreter<'_> {
         use crate::compiler_known_io::{IoErrorReason, IoOperation, IoTarget, Utf8InputSource};
 
         let outcome = match operation {
+            mir::CheckedIoOperation::ObserveTransferGroup {
+                group,
+                wait,
+                outcome,
+            } => {
+                return self.observe_transfer_group(
+                    group,
+                    wait,
+                    outcome,
+                    transfer_group::CheckedCall {
+                        result,
+                        error,
+                        success,
+                        failure,
+                        span,
+                    },
+                );
+            }
+            mir::CheckedIoOperation::ResubmitTransfer {
+                group,
+                key,
+                reading,
+                offset,
+                length,
+            } => {
+                return self.resubmit_transfer(
+                    group,
+                    key,
+                    reading,
+                    [offset, length],
+                    transfer_group::CheckedCall {
+                        result,
+                        error,
+                        success,
+                        failure,
+                        span,
+                    },
+                );
+            }
+            mir::CheckedIoOperation::TransferGroupReadRegion { group, key } => {
+                self.transfer_group_read_region(group, key)?
+            }
+            mir::CheckedIoOperation::BeginTransferGroup {
+                class,
+                set,
+                plan,
+                deadline,
+                cancellation,
+            } => {
+                return self.begin_transfer_group(
+                    class,
+                    set,
+                    plan,
+                    [deadline, cancellation],
+                    transfer_group::CheckedCall {
+                        result,
+                        error,
+                        success,
+                        failure,
+                        span,
+                    },
+                );
+            }
+            mir::CheckedIoOperation::TransferPlanKey {
+                plan,
+                position,
+                key,
+            } => self.transfer_plan_key(plan, position, key)?,
+            mir::CheckedIoOperation::ConfigureTransferPlan {
+                class,
+                previous,
+                key,
+                region,
+                reading,
+            } => self.configure_transfer_plan(class, previous, key, region, reading)?,
+            mir::CheckedIoOperation::NewReadinessSet { class } => {
+                let object = self.next_object;
+                self.next_object += 1;
+                self.heap
+                    .insert(object, ObjectValue::new(class, Vec::new()));
+                self.readiness_sets
+                    .insert(object, readiness_set::SetOwner::default());
+                CheckedIoResult::Success(Some(LocalValue::Class { object, class }))
+            }
+            mir::CheckedIoOperation::RegisterReadinessStream { set, stream, key } => {
+                return self.begin_readiness_registration(
+                    readiness_set::Registration::new(
+                        set, stream, key, result, error, success, failure,
+                    ),
+                    span,
+                );
+            }
+            mir::CheckedIoOperation::UnregisterReadinessStream { set, key, .. } => {
+                self.unregister_readiness_stream(set, key)?
+            }
+            mir::CheckedIoOperation::BorrowReadinessStream {
+                set,
+                key,
+                stream_type,
+                ..
+            } => {
+                let (outcome, origin) = self.borrow_readiness_stream(set, key, stream_type)?;
+                if let (Some(result), Some(origin)) = (result, origin) {
+                    let function =
+                        function_in(self.program, self.current_frame()?.function)?.clone();
+                    self.assign_result_origin(&function, result, Some(origin))?;
+                }
+                return self.finish_checked_io_result(outcome, result, error, success, failure);
+            }
+            mir::CheckedIoOperation::PendingRequestOutcome { request, outcome } => {
+                self.pending_request_outcome(request, outcome)?
+            }
+            mir::CheckedIoOperation::OpenOwnedFile {
+                class,
+                creation,
+                mode,
+                ..
+            } => self.open_owned_file(class, creation, mode)?,
+            mir::CheckedIoOperation::ReadOwnedFile {
+                file,
+                destination,
+                outcome,
+            } => self.read_owned_file(file, destination, outcome)?,
+            mir::CheckedIoOperation::WriteOwnedFile {
+                file,
+                source,
+                outcome,
+            } => self.write_owned_file(file, source, outcome)?,
+            mir::CheckedIoOperation::TransferStandardBytes {
+                stream,
+                region,
+                outcome,
+            } => {
+                return self.transfer_standard_bytes(
+                    stream,
+                    region,
+                    outcome,
+                    transfer_group::CheckedCall {
+                        result,
+                        error,
+                        success,
+                        failure,
+                        span,
+                    },
+                );
+            }
+            mir::CheckedIoOperation::PreparePendingFile {
+                file,
+                request,
+                region,
+            } => {
+                return self.begin_pending_file_configuration(
+                    file,
+                    request,
+                    region,
+                    transfer_group::CheckedCall {
+                        result,
+                        error,
+                        success,
+                        failure,
+                        span,
+                    },
+                );
+            }
+            mir::CheckedIoOperation::PreparePendingStandard {
+                stream,
+                request,
+                region,
+            } => {
+                return self.begin_pending_native_configuration(
+                    readiness_set::Source::Standard(stream),
+                    request,
+                    region,
+                    transfer_group::CheckedCall {
+                        result,
+                        error,
+                        success,
+                        failure,
+                        span,
+                    },
+                );
+            }
+            mir::CheckedIoOperation::CloseOwnedFile { file } => self.close_owned_file(file)?,
+            mir::CheckedIoOperation::ControlOwnedFile { file, control } => {
+                self.control_owned_file(file, control)?
+            }
+            mir::CheckedIoOperation::Process {
+                operation,
+                process,
+                arguments,
+                class,
+            } => {
+                let outcome =
+                    self.process_operation(operation, process, &arguments, class, result)?;
+                if let (
+                    true,
+                    Some(target),
+                    CheckedIoResult::Success(Some(LocalValue::Class { object, class })),
+                ) = (operation.is_pipe(), result, &outcome)
+                {
+                    let function =
+                        function_in(self.program, self.current_frame()?.function)?.clone();
+                    self.assign_result_origin(
+                        &function,
+                        target,
+                        Some(InterpreterPlace {
+                            storage: InterpreterPlaceStorage::RuntimeObject {
+                                object: *object,
+                                class: *class,
+                            },
+                            ty: mir::Type::Class(*class),
+                            payload_projection: None,
+                        }),
+                    )?;
+                }
+                outcome
+            }
             mir::CheckedIoOperation::ReadLine { .. } => {
                 let prompt = self.pop_string()?;
+                if !prompt.is_empty() && self.standard_claims[1].is_some() {
+                    let outcome = self
+                        .standard_access_error(mir::StandardIoStream::Output, IoOperation::Write)?;
+                    return self.finish_checked_io_result(outcome, result, error, success, failure);
+                }
                 if !prompt.is_empty() {
                     self.io_trace.prompt_writes += 1;
                     match self.io_faults.prompt_write {
-                        Some(MirIoWriteFailure::BrokenPipe) => return Ok(StepOutcome::CleanExit),
-                        Some(MirIoWriteFailure::Other) => {
+                        Some(failure) => {
+                            let transferred = self.fault_transfer_length(prompt.len())?;
+                            if let Some(length) = transferred {
+                                self.stdout.extend_from_slice(&prompt.as_bytes()[..length]);
+                            }
+                            if failure == MirIoWriteFailure::BrokenPipe {
+                                return Ok(StepOutcome::CleanExit);
+                            }
                             CheckedIoResult::Error(self.allocate_io_error(
                                 IoOperation::Write,
                                 IoTarget::StandardOutput,
                                 self.io_faults.failure_reason.compiler_reason(),
                                 self.io_faults.system_code,
+                                transferred,
                             )?)
                         }
                         None => {
@@ -13172,7 +14502,7 @@ impl Interpreter<'_> {
                             self.io_trace.stdout_flushes += 1;
                             match self.io_faults.stdout_flush {
                                 Some(MirIoWriteFailure::BrokenPipe) => {
-                                    return Ok(StepOutcome::CleanExit)
+                                    return Ok(StepOutcome::CleanExit);
                                 }
                                 Some(MirIoWriteFailure::Other) => {
                                     CheckedIoResult::Error(self.allocate_io_error(
@@ -13180,6 +14510,7 @@ impl Interpreter<'_> {
                                         IoTarget::StandardOutput,
                                         self.io_faults.failure_reason.compiler_reason(),
                                         self.io_faults.system_code,
+                                        None,
                                     )?)
                                 }
                                 None => self.read_checked_line(span)?,
@@ -13196,6 +14527,7 @@ impl Interpreter<'_> {
                                 IoTarget::StandardOutput,
                                 self.io_faults.failure_reason.compiler_reason(),
                                 self.io_faults.system_code,
+                                None,
                             )?)
                         }
                         None => self.read_checked_line(span)?,
@@ -13210,9 +14542,19 @@ impl Interpreter<'_> {
                         IoTarget::File(path),
                         IoErrorReason::InvalidInput,
                         None,
+                        None,
                     )?)
                 } else if let Some(contents) = self.files.get(&path).cloned() {
-                    if bytes {
+                    if self.io_faults.file_read {
+                        let transferred = self.fault_transfer_length(contents.len())?;
+                        CheckedIoResult::Error(self.allocate_io_error(
+                            IoOperation::Read,
+                            IoTarget::File(path),
+                            self.io_faults.failure_reason.compiler_reason(),
+                            self.io_faults.system_code,
+                            transferred,
+                        )?)
+                    } else if bytes {
                         let collection = self.checked_io_collection_result(result)?;
                         self.push_byte_collection(collection, &contents)?;
                         CheckedIoResult::Success(Some(self.pop_local_value()?))
@@ -13237,15 +14579,33 @@ impl Interpreter<'_> {
                         IoTarget::File(path),
                         IoErrorReason::NotFound,
                         None,
+                        None,
                     )?)
                 }
             }
             mir::CheckedIoOperation::ReadStdinBytes => {
-                let contents = self.stdin[self.stdin_cursor..].to_vec();
-                self.stdin_cursor = self.stdin.len();
-                let collection = self.checked_io_collection_result(result)?;
-                self.push_byte_collection(collection, &contents)?;
-                CheckedIoResult::Success(Some(self.pop_local_value()?))
+                if self.standard_claims[0].is_some() {
+                    self.standard_access_error(mir::StandardIoStream::Input, IoOperation::Read)?
+                } else if self.io_faults.stdin_bytes_read {
+                    let transferred =
+                        self.fault_transfer_length(self.stdin.len() - self.stdin_cursor)?;
+                    self.stdin_cursor += transferred.unwrap_or(0);
+                    CheckedIoResult::Error(self.allocate_io_error(
+                        IoOperation::Read,
+                        IoTarget::StandardInput,
+                        self.io_faults.failure_reason.compiler_reason(),
+                        self.io_faults.system_code,
+                        transferred,
+                    )?)
+                } else {
+                    let contents = self.stdin[self.stdin_cursor..].to_vec();
+                    self.stdin_cursor = self.stdin.len();
+                    self.stdin_buffered_end = self.stdin.len();
+                    self.stdin_eof_observed = true;
+                    let collection = self.checked_io_collection_result(result)?;
+                    self.push_byte_collection(collection, &contents)?;
+                    CheckedIoResult::Success(Some(self.pop_local_value()?))
+                }
             }
             mir::CheckedIoOperation::WriteFile {
                 contents, append, ..
@@ -13271,6 +14631,29 @@ impl Interpreter<'_> {
                         IoTarget::File(path),
                         IoErrorReason::InvalidInput,
                         None,
+                        None,
+                    )?)
+                } else if self.io_faults.file_write {
+                    let transferred = self.fault_transfer_length(contents.len())?;
+                    let written = &contents[..transferred.unwrap_or(0)];
+                    if append {
+                        self.files
+                            .entry(path.clone())
+                            .or_default()
+                            .extend_from_slice(written);
+                    } else {
+                        self.files.insert(path.clone(), written.to_vec());
+                    }
+                    CheckedIoResult::Error(self.allocate_io_error(
+                        if append {
+                            IoOperation::Append
+                        } else {
+                            IoOperation::Write
+                        },
+                        IoTarget::File(path),
+                        self.io_faults.failure_reason.compiler_reason(),
+                        self.io_faults.system_code,
+                        transferred,
                     )?)
                 } else {
                     if append {
@@ -13291,14 +14674,35 @@ impl Interpreter<'_> {
                     }
                     mir::IoContents::Bytes(local) => self.byte_collection(local)?,
                 };
+                let stream = if stderr {
+                    mir::StandardIoStream::Error
+                } else {
+                    mir::StandardIoStream::Output
+                };
+                if !contents.is_empty()
+                    && self.standard_claims[usize::from(stream.runtime_tag())].is_some()
+                {
+                    let outcome = self.standard_access_error(stream, IoOperation::Write)?;
+                    return self.finish_checked_io_result(outcome, result, error, success, failure);
+                }
                 let fault = if stderr {
                     self.io_faults.stderr_write
                 } else {
                     self.io_faults.stdout_write
                 };
                 match fault {
-                    Some(MirIoWriteFailure::BrokenPipe) => return Ok(StepOutcome::CleanExit),
-                    Some(MirIoWriteFailure::Other) => {
+                    Some(failure) => {
+                        let transferred = self.fault_transfer_length(contents.len())?;
+                        if let Some(length) = transferred {
+                            if stderr {
+                                self.stderr.extend_from_slice(&contents[..length]);
+                            } else {
+                                self.stdout.extend_from_slice(&contents[..length]);
+                            }
+                        }
+                        if failure == MirIoWriteFailure::BrokenPipe {
+                            return Ok(StepOutcome::CleanExit);
+                        }
                         CheckedIoResult::Error(self.allocate_io_error(
                             IoOperation::Write,
                             if stderr {
@@ -13308,6 +14712,7 @@ impl Interpreter<'_> {
                             },
                             self.io_faults.failure_reason.compiler_reason(),
                             self.io_faults.system_code,
+                            transferred,
                         )?)
                     }
                     None => {
@@ -13322,6 +14727,17 @@ impl Interpreter<'_> {
             }
         };
 
+        self.finish_checked_io_result(outcome, result, error, success, failure)
+    }
+
+    fn finish_checked_io_result(
+        &mut self,
+        outcome: CheckedIoResult,
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+    ) -> Result<StepOutcome, InterpreterError> {
         let function_id = self.current_frame()?.function;
         let function = function_in(self.program, function_id)?.clone();
         match outcome {
@@ -13345,7 +14761,7 @@ impl Interpreter<'_> {
                     _ => {
                         return Err(InterpreterError::new(
                             "checked I/O result does not match its MIR result local",
-                        ))
+                        ));
                     }
                 }
                 self.move_to_block(&function, success)?;
@@ -13375,21 +14791,33 @@ impl Interpreter<'_> {
     fn read_checked_line(&mut self, span: Span) -> Result<CheckedIoResult, InterpreterError> {
         use crate::compiler_known_io::{IoOperation, IoTarget, Utf8InputSource};
 
+        if self.standard_claims[0].is_some() {
+            return self.standard_access_error(mir::StandardIoStream::Input, IoOperation::Read);
+        }
+
         self.io_trace.stdin_line_reads += 1;
         if self.io_faults.stdin_line_read {
+            let transferred = self.fault_transfer_length(self.stdin.len() - self.stdin_cursor)?;
+            self.stdin_cursor += transferred.unwrap_or(0);
             return Ok(CheckedIoResult::Error(self.allocate_io_error(
                 IoOperation::Read,
                 IoTarget::StandardInput,
                 self.io_faults.failure_reason.compiler_reason(),
                 self.io_faults.system_code,
+                transferred,
             )?));
         }
         if self.stdin_cursor == self.stdin.len() {
+            self.stdin_buffered_end = self.stdin_cursor;
+            self.stdin_eof_observed = true;
             return Ok(CheckedIoResult::Success(Some(LocalValue::NullableString(
                 None,
             ))));
         }
         let remaining = &self.stdin[self.stdin_cursor..];
+        // Supplied virtual input is the same queue used by byte operations.
+        // Preparation may consume its prefetched remainder without a raw read.
+        self.stdin_buffered_end = self.stdin.len();
         let newline = remaining.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(remaining.len(), |index| index + 1);
         let mut line_length = newline.unwrap_or(remaining.len());
@@ -13405,7 +14833,7 @@ impl Interpreter<'_> {
                     Utf8InputSource::StandardInput,
                     error.valid_up_to(),
                     error.error_len(),
-                )?))
+                )?));
             }
         };
         if self.io_faults.line_allocation {
@@ -13444,6 +14872,7 @@ impl Interpreter<'_> {
         target: crate::compiler_known_io::IoTarget,
         reason: crate::compiler_known_io::IoErrorReason,
         system_code: Option<i64>,
+        transferred_byte_count: Option<usize>,
     ) -> Result<InterfaceCarrier, InterpreterError> {
         let message = crate::compiler_known_io::io_error_message(operation, &target, reason);
         let operation = self.unit_enum_value(
@@ -13454,12 +14883,19 @@ impl Interpreter<'_> {
             crate::compiler_known_io::IO_TARGET,
             target.case_name(),
             match target {
-                crate::compiler_known_io::IoTarget::File(path) => {
+                crate::compiler_known_io::IoTarget::File(path)
+                | crate::compiler_known_io::IoTarget::Process(path)
+                | crate::compiler_known_io::IoTarget::ProcessInput(path)
+                | crate::compiler_known_io::IoTarget::ProcessOutput(path)
+                | crate::compiler_known_io::IoTarget::ProcessErrors(path) => {
                     vec![LocalValue::String(path.into())]
                 }
                 crate::compiler_known_io::IoTarget::StandardInput
                 | crate::compiler_known_io::IoTarget::StandardOutput
-                | crate::compiler_known_io::IoTarget::StandardError => Vec::new(),
+                | crate::compiler_known_io::IoTarget::StandardError
+                | crate::compiler_known_io::IoTarget::ReadinessSet
+                | crate::compiler_known_io::IoTarget::TransferPlan
+                | crate::compiler_known_io::IoTarget::TransferGroup => Vec::new(),
             },
         )?;
         let reason = self.unit_enum_value(
@@ -13475,6 +14911,18 @@ impl Interpreter<'_> {
                 )
             }),
         };
+        let transferred_byte_count = LocalValue::NullableScalar {
+            ty: mir::ScalarType::Integer(IntegerType::Int64),
+            value: transferred_byte_count
+                .map(|count| {
+                    IntegerValue::from_i128(IntegerType::Int64, count as i128)
+                        .map(mir::ScalarValue::Integer)
+                        .ok_or_else(|| {
+                            InterpreterError::new("I/O transfer count exceeds Doria int")
+                        })
+                })
+                .transpose()?,
+        };
         self.allocate_error_object(
             crate::compiler_known_io::IO_ERROR,
             vec![
@@ -13483,8 +14931,19 @@ impl Interpreter<'_> {
                 ("target", target),
                 ("reason", reason),
                 ("systemCode", system_code),
+                ("transferredByteCount", transferred_byte_count),
             ],
         )
+    }
+
+    fn fault_transfer_length(&self, available: usize) -> Result<Option<usize>, InterpreterError> {
+        let transferred = self.io_faults.transferred_byte_count;
+        if transferred.is_some_and(|count| count > available) {
+            return Err(InterpreterError::new(
+                "injected I/O transfer count exceeds available bytes",
+            ));
+        }
+        Ok(transferred)
     }
 
     fn allocate_invalid_utf8_error(
@@ -13649,14 +15108,8 @@ impl Interpreter<'_> {
         }
         let object = self.next_object;
         self.next_object += 1;
-        self.heap.insert(
-            object,
-            ObjectValue {
-                class: descriptor.class,
-                properties: slots,
-                error_origin: None,
-            },
-        );
+        self.heap
+            .insert(object, ObjectValue::new(descriptor.class, slots));
         Ok(InterfaceCarrier {
             object,
             vtable: self
@@ -13683,6 +15136,7 @@ impl Interpreter<'_> {
             .values
             .drain(start..)
             .map(|value| match value {
+                EvaluationValue::ByteRegion(value) => Ok(LocalValue::ByteRegion(value)),
                 EvaluationValue::Scalar(value) => Ok(LocalValue::Scalar(value)),
                 EvaluationValue::String(value) => Ok(LocalValue::String(value)),
                 EvaluationValue::Mixed(value) => Ok(LocalValue::Mixed(value)),
@@ -13770,6 +15224,9 @@ impl Interpreter<'_> {
 
     fn pop_scalar(&mut self) -> Result<mir::ScalarValue, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::ByteRegion(_)) => Err(InterpreterError::new(
+                "MIR byte region was used as a scalar",
+            )),
             Some(EvaluationValue::Scalar(value)) => Ok(value),
             Some(EvaluationValue::String(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a string",
@@ -13831,6 +15288,9 @@ impl Interpreter<'_> {
 
     fn pop_string(&mut self) -> Result<SharedString, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::ByteRegion(_)) => Err(InterpreterError::new(
+                "MIR byte region was used as a string",
+            )),
             Some(EvaluationValue::String(value)) => Ok(value),
             Some(EvaluationValue::Scalar(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a scalar",
@@ -14261,6 +15721,7 @@ impl Interpreter<'_> {
 
     fn pop_local_value(&mut self) -> Result<LocalValue, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::ByteRegion(value)) => Ok(LocalValue::ByteRegion(value)),
             Some(EvaluationValue::Scalar(value)) => Ok(LocalValue::Scalar(value)),
             Some(EvaluationValue::String(value)) => Ok(LocalValue::String(value)),
             Some(EvaluationValue::Mixed(value)) => Ok(LocalValue::Mixed(value)),
@@ -14381,6 +15842,7 @@ impl Interpreter<'_> {
 
     fn push_local_value(&mut self, value: LocalValue) -> Result<(), InterpreterError> {
         let value = match value {
+            LocalValue::ByteRegion(value) => EvaluationValue::ByteRegion(value),
             LocalValue::Scalar(value) => EvaluationValue::Scalar(value),
             LocalValue::String(value) => EvaluationValue::String(value),
             LocalValue::Mixed(value) => EvaluationValue::Mixed(value),
@@ -14463,6 +15925,29 @@ impl Interpreter<'_> {
         operand: &mir::Operand,
     ) -> Result<bool, InterpreterError> {
         match operand {
+            mir::Operand::ByteRegionLength(local) => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Length(
+                        *local,
+                    )));
+                Ok(true)
+            }
+            mir::Operand::ByteRegionIndex {
+                region,
+                index,
+                index_span,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Index {
+                        region: *region,
+                        span: *index_span,
+                    }));
+                frame.tasks.push(EvaluationTask::Rvalue((**index).clone()));
+                Ok(true)
+            }
             mir::Operand::CollectionLength(collection) => {
                 self.current_frame_mut()?
                     .tasks
@@ -14470,6 +15955,7 @@ impl Interpreter<'_> {
                 Ok(true)
             }
             mir::Operand::CollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index,
@@ -14480,7 +15966,7 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::LoadCollectionValue {
                         positional: *positional,
                         collection: *collection,
-                        index_span: Span::default(),
+                        index_span: *index_span,
                         transfer: true,
                     });
                 } else {
@@ -14489,14 +15975,20 @@ impl Interpreter<'_> {
                         *positional,
                     ));
                 }
+                frame.tasks.push(EvaluationTask::SetPanicSite(*index_span));
                 frame.tasks.push(EvaluationTask::Rvalue((**index).clone()));
                 Ok(true)
             }
-            mir::Operand::CollectionKeyAt { collection, offset } => {
+            mir::Operand::CollectionKeyAt {
+                collection,
+                offset,
+                index_span,
+            } => {
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
                     .push(EvaluationTask::CollectionKeyScalar(*collection));
+                frame.tasks.push(EvaluationTask::SetPanicSite(*index_span));
                 frame.tasks.push(EvaluationTask::Rvalue((**offset).clone()));
                 Ok(true)
             }
@@ -14561,7 +16053,7 @@ impl Interpreter<'_> {
                 StringError::PaddingTextEmpty => {
                     return Err(InterpreterError::new(
                         "empty string padding must use the operation-aware panic path",
-                    ))
+                    ));
                 }
                 StringError::ResultTooLarge => Vec::new(),
             };
@@ -14916,15 +16408,15 @@ impl Interpreter<'_> {
                             },
                         ];
                         return Ok(Some(string_panic_event(
-                                StringError::PaddingTextEmpty,
-                                kind,
-                                span,
-                                argument_spans,
-                                facts,
-                                Some(format!(
-                                    "`{operation}` was asked to extend `\"{text}\"` from {current} to {length} graphemes,\nbut an empty padding string cannot add any graphemes."
-                                )),
-                            )));
+                            StringError::PaddingTextEmpty,
+                            kind,
+                            span,
+                            argument_spans,
+                            facts,
+                            Some(format!(
+                                "`{operation}` was asked to extend `\"{text}\"` from {current} to {length} graphemes,\nbut an empty padding string cannot add any graphemes."
+                            )),
+                        )));
                     }
                     Err(error) => return panic(error),
                 };
@@ -15043,6 +16535,9 @@ impl Interpreter<'_> {
                     "MIR collection local local{} was used as a scalar value",
                     id.0
                 ))),
+                LocalValue::ByteRegion(_) => Err(InterpreterError::new(
+                    "MIR byte region was used as a scalar",
+                )),
                 LocalValue::PayloadEnum(_) | LocalValue::NullablePayloadEnum { .. } => {
                     Err(InterpreterError::new(format!(
                         "MIR payload enum local local{} was used as a scalar value",
@@ -15090,6 +16585,8 @@ impl Interpreter<'_> {
                 }
             }
             mir::Operand::CollectionLength(_)
+            | mir::Operand::ByteRegionLength(_)
+            | mir::Operand::ByteRegionIndex { .. }
             | mir::Operand::CollectionIndex { .. }
             | mir::Operand::CollectionKeyAt { .. } => Err(InterpreterError::new(
                 "MIR collection operand requires queued evaluation",
@@ -15125,17 +16622,17 @@ impl Interpreter<'_> {
         object: mir::LocalId,
         property: crate::class_layout::PropertyId,
     ) -> Result<LocalValue, InterpreterError> {
-        let object_id = match read_local(&self.current_frame()?.locals, object)? {
-            LocalValue::Class { object, .. } => *object,
+        let object_id = match self.read_local_value(object)? {
+            LocalValue::Class { object, .. } => object,
             LocalValue::NullableClass {
                 object: Some(object),
                 ..
-            } => *object,
+            } => object,
             _ => {
                 return Err(InterpreterError::new(format!(
                     "MIR property access uses non-class local local{}",
                     object.0
-                )))
+                )));
             }
         };
         self.read_object_property(object_id, property)
@@ -15155,6 +16652,9 @@ impl Interpreter<'_> {
                 property.class.0, object_value.class.0
             )));
         }
+        if let Some(place) = object_value.retained_places.get(&property.index) {
+            return self.read_place(*place);
+        }
         object_value
             .properties
             .get(property.index)
@@ -15165,6 +16665,38 @@ impl Interpreter<'_> {
                     property.index
                 ))
             })
+    }
+
+    fn bind_retained_property(
+        &mut self,
+        receiver: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+        value: &mir::Rvalue,
+    ) -> Result<(), InterpreterError> {
+        let source = value.direct_place_local().ok_or_else(|| {
+            InterpreterError::new("retained field initializer has no constructor source")
+        })?;
+        let place = self.current_frame()?.local_origins[source.0].ok_or_else(|| {
+            InterpreterError::new("retained field initializer has no caller place")
+        })?;
+        let LocalValue::Class { object, .. } = self.read_local_value(receiver)? else {
+            return Err(InterpreterError::new(
+                "retained field receiver is not a class",
+            ));
+        };
+        let object = self
+            .heap
+            .get_mut(&object)
+            .ok_or_else(|| InterpreterError::new("retained field receiver is unavailable"))?;
+        match object.retained_places.entry(property.index) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(place);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(InterpreterError::new(
+                "retained field was already initialized",
+            )),
+        }
     }
 
     fn assign_property(
@@ -15184,7 +16716,7 @@ impl Interpreter<'_> {
                 return Err(InterpreterError::new(format!(
                     "MIR property assignment uses non-class local local{}",
                     object.0
-                )))
+                )));
             }
         };
         let object_value = self.heap.get_mut(&object_id).ok_or_else(|| {
@@ -15236,7 +16768,7 @@ impl Interpreter<'_> {
                 return Err(InterpreterError::new(format!(
                     "MIR property transfer uses non-class local local{}",
                     object.0
-                )))
+                )));
             }
         };
         let object_value = self.heap.get_mut(&object_id).ok_or_else(|| {
@@ -15285,7 +16817,7 @@ impl Interpreter<'_> {
                 return Err(InterpreterError::new(format!(
                     "MIR drop local{} did not contain a class value",
                     local.0
-                )))
+                )));
             }
         }
         Ok(())
@@ -15312,7 +16844,22 @@ impl Interpreter<'_> {
                     ))
                 });
         }
-        Ok(read_local(&self.current_frame()?.locals, local)?.clone())
+        self.read_local_value(local)
+    }
+
+    fn read_local_value(&self, local: mir::LocalId) -> Result<LocalValue, InterpreterError> {
+        let frame = self.current_frame()?;
+        let function = function_in(self.program, frame.function)?;
+        let definition = local_in(function, local)?;
+        if crate::native_closure_abi::local_reads_borrow_home(function, definition) {
+            if let Some(origin) = frame.local_origins[local.0] {
+                return self.read_place(InterpreterPlace {
+                    ty: definition.ty,
+                    ..origin
+                });
+            }
+        }
+        Ok(read_local(&frame.locals, local)?.clone())
     }
 
     fn drop_shared_local(
@@ -15354,7 +16901,7 @@ impl Interpreter<'_> {
                 return Err(InterpreterError::new(format!(
                     "MIR shared drop local{} contained another value type",
                     local.0
-                )))
+                )));
             }
         };
         if let Some(control) = control {
@@ -15430,7 +16977,7 @@ impl Interpreter<'_> {
                 return Err(InterpreterError::new(format!(
                     "MIR writable shared drop local{} contained another value type",
                     local.0
-                )))
+                )));
             }
         };
         if let Some(task) = task {
@@ -15444,6 +16991,9 @@ impl Interpreter<'_> {
         object: usize,
         static_class: crate::class_layout::ClassId,
     ) -> Result<(), InterpreterError> {
+        if self.transfer_groups.contains_key(&object) {
+            return self.drop_transfer_group(object);
+        }
         let value = self.heap.get(&object).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object} is not allocated"))
         })?;
@@ -15458,6 +17008,19 @@ impl Interpreter<'_> {
         frame
             .tasks
             .push(EvaluationTask::FreeObject { object, class });
+        if let Some(set) = self.readiness_sets.remove(&object) {
+            for (_, value) in set.members.into_values() {
+                let value = value.ok_or_else(|| {
+                    InterpreterError::new("registration source was transferred during set cleanup")
+                })?;
+                let mut drops = Vec::new();
+                collect_owned_objects_from_value(value, &mut drops);
+                for drop in drops {
+                    self.push_owned_drop_task(drop)?;
+                }
+            }
+        }
+        self.transfer_plans.remove(&object);
         self.queue_object_phase(object, class)
     }
 
@@ -15471,14 +17034,14 @@ impl Interpreter<'_> {
         frame
             .tasks
             .push(EvaluationTask::DropObjectProperties { object, class });
+        let call_site = frame.active_panic_site;
         if let Some(function) = destructor {
             self.push_frame(
                 function,
                 &[LocalValue::Class { object, class }],
                 &[None],
                 Some(ReturnExpectation::Void),
-                None,
-                false,
+                Some(call_site),
             )?;
         }
         Ok(())
@@ -15506,12 +17069,15 @@ impl Interpreter<'_> {
             )));
         }
         let mut drops = Vec::new();
+        object_value
+            .retained_places
+            .retain(|index, _| !(first_property..property_count).contains(index));
         for (property, definition) in object_value.properties[first_property..property_count]
             .iter_mut()
             .zip(&class_definition.properties[first_property..property_count])
         {
             if let Some(value) = property.take() {
-                if !definition.borrowed_source || !definition.ty.has_move_ownership() {
+                if definition.borrowed_source.is_none() || !definition.ty.has_move_ownership() {
                     collect_owned_objects_from_value(value, &mut drops);
                 }
             }
@@ -15544,41 +17110,23 @@ impl Interpreter<'_> {
                 class.0, value.class.0
             )));
         }
+        if class_in(self.program, class)?.runtime_payload
+            == Some(mir::RuntimeClassPayload::CancellationSource)
+        {
+            inline_value::release_source_claim(&mut self.cancellation_states, object as u128)?;
+        }
+        self.release_file_owner(object);
+        self.release_child_process(object)?;
         Ok(())
     }
 
     fn cleanup_current_frame(&mut self) -> Result<(), InterpreterError> {
         let function = function_in(self.program, self.current_frame()?.function)?;
-        let transferred_writable_captures = function
-            .closure
-            .as_ref()
-            .and_then(|closure| closure.environment_layout)
-            .and_then(|layout| self.program.closure_environment_layouts.get(layout.0))
-            .map(|layout| {
-                function
-                    .closure
-                    .as_ref()
-                    .expect("closure metadata exists")
-                    .capture_locals
-                    .iter()
-                    .zip(&layout.fields)
-                    .filter_map(|((_, local), field)| {
-                        (field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
-                            && field.ty.transfers_writable_capture_ownership())
-                        .then_some(*local)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let owned_classes = function
             .locals
             .iter()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Class(_))
-                    if !transferred_writable_captures.contains(&local.id) =>
-                {
-                    Some(local.id)
-                }
+                (true, mir::Type::Class(_)) => Some(local.id),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -15586,11 +17134,7 @@ impl Interpreter<'_> {
             .locals
             .iter()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Collection(_))
-                    if !transferred_writable_captures.contains(&local.id) =>
-                {
-                    Some(local.id)
-                }
+                (true, mir::Type::Collection(_)) => Some(local.id),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -15598,11 +17142,7 @@ impl Interpreter<'_> {
             .locals
             .iter()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Mixed | mir::Type::NullableMixed)
-                    if !transferred_writable_captures.contains(&local.id) =>
-                {
-                    Some(local.id)
-                }
+                (true, mir::Type::Mixed | mir::Type::NullableMixed) => Some(local.id),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -15641,12 +17181,15 @@ impl Interpreter<'_> {
     }
 
     fn set_active_panic_site(&mut self, span: Span) -> Result<(), InterpreterError> {
+        if !function_in(self.program, self.current_frame()?.function)?.owns_diagnostic_frame() {
+            return Ok(());
+        }
         self.current_frame_mut()?.active_panic_site = span;
         Ok(())
     }
 
-    fn collection_local(&self, local: mir::LocalId) -> Result<&CollectionValue, InterpreterError> {
-        match read_local(&self.current_frame()?.locals, local)? {
+    fn collection_local(&self, local: mir::LocalId) -> Result<CollectionValue, InterpreterError> {
+        match self.read_local_value(local)? {
             LocalValue::Collection(value) => Ok(value),
             _ => Err(InterpreterError::new(format!(
                 "MIR local local{} is not a collection",
@@ -15686,6 +17229,7 @@ impl Interpreter<'_> {
                 key,
                 value,
                 hash,
+                ..
             } => {
                 let position = integer(position)? as usize;
                 let hash = hash.map(integer).transpose()?;
@@ -15779,6 +17323,7 @@ impl Interpreter<'_> {
                 position,
                 value,
                 previous,
+                ..
             } => {
                 let position = integer(position)? as usize;
                 let replacement = self.current_frame_mut()?.locals[value.0]
@@ -15858,7 +17403,7 @@ impl Interpreter<'_> {
             _ => {
                 return Err(InterpreterError::new(
                     "interface projection used another handle family",
-                ))
+                ));
             }
         };
         match payload {
@@ -15898,7 +17443,7 @@ impl Interpreter<'_> {
                 "MIR Bytes operation used another collection",
             ));
         }
-        collection
+        let bytes = collection
             .entries()
             .iter()
             .map(|(_, value)| match value {
@@ -15911,7 +17456,8 @@ impl Interpreter<'_> {
                     "MIR Bytes contains a non-uint8 value",
                 )),
             })
-            .collect()
+            .collect();
+        bytes
     }
 
     fn push_byte_collection(
@@ -15937,6 +17483,38 @@ impl Interpreter<'_> {
                 collection, entries,
             )));
         Ok(())
+    }
+
+    /// The byte storage a region over `text` borrows. Strings are immutable,
+    /// so one storage serves every region of the same string value; entries
+    /// whose string has been released are reclaimed.
+    fn string_region_storage(&mut self, text: &SharedString) -> Weak<RefCell<CollectionEntries>> {
+        let identity = Rc::as_ptr(text) as *const u8 as usize;
+        if let Some((string, entries)) = self.string_regions.get(&identity) {
+            if string.upgrade().is_some_and(|live| Rc::ptr_eq(&live, text)) {
+                return Rc::downgrade(entries);
+            }
+        }
+        self.string_regions
+            .retain(|_, (string, _)| string.strong_count() != 0);
+        let entries = text
+            .as_bytes()
+            .iter()
+            .map(|byte| {
+                (
+                    None,
+                    LocalValue::Scalar(mir::ScalarValue::Integer(
+                        IntegerValue::from_u128(IntegerType::UInt8, u128::from(*byte))
+                            .expect("u8 always fits uint8"),
+                    )),
+                )
+            })
+            .collect();
+        let entries = Rc::new(RefCell::new(entries));
+        let weak = Rc::downgrade(&entries);
+        self.string_regions
+            .insert(identity, (Rc::downgrade(text), entries));
+        weak
     }
 
     fn collection_position(
@@ -16007,15 +17585,15 @@ impl Interpreter<'_> {
                 .collection_local(local)
                 .map(|collection| collection.entries()[position].1.clone())
                 .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
-            if local_value_type(self.program, &value).has_move_ownership() {
-                let place = self
-                    .place_for_collection_element(local, position)
-                    .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
-                self.current_frame_mut()
-                    .map_err(|_| CollectionAccessError::Catalogued("P1001"))?
-                    .tasks
-                    .push(EvaluationTask::SetResultPlace(place));
-            }
+            // Copy and Move values both denote the selected slot when passed
+            // as writable arguments. The weak place adds no storage owner.
+            let place = self
+                .place_for_collection_element(local, position)
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
+            self.current_frame_mut()
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))?
+                .tasks
+                .push(EvaluationTask::SetResultPlace(place));
             Ok(value)
         }
     }
@@ -16028,6 +17606,23 @@ impl Interpreter<'_> {
         let collection = self.collection_local(local)?;
         let ty = self.program.collection_types[collection.ty.0].value;
         let entries = Rc::downgrade(&collection.entries);
+        let (identity, generation) = self.register_borrowed_collection(entries);
+        Ok(InterpreterPlace {
+            storage: InterpreterPlaceStorage::CollectionElement(CollectionElementPlace {
+                collection: identity,
+                generation,
+                index,
+                ty,
+            }),
+            ty,
+            payload_projection: None,
+        })
+    }
+
+    fn register_borrowed_collection(
+        &mut self,
+        entries: Weak<RefCell<CollectionEntries>>,
+    ) -> (usize, u64) {
         // A weak handle does not extend the owner's lifetime. Repeated reads
         // reuse its entry; newly borrowed owners reclaim expired entries.
         // Generations prevent an expired place from aliasing a later owner
@@ -16049,31 +17644,13 @@ impl Interpreter<'_> {
             );
             generation
         };
-        Ok(InterpreterPlace {
-            storage: InterpreterPlaceStorage::CollectionElement(CollectionElementPlace {
-                collection: identity,
-                generation,
-                index,
-                ty,
-            }),
-            ty,
-        })
+        (identity, generation)
     }
 
     fn collection_element_storage(
         &self,
         place: CollectionElementPlace,
-        transferred: bool,
     ) -> Result<(SharedCollectionEntries, usize), InterpreterError> {
-        if self
-            .transferred_collection_elements
-            .contains(&(place.generation, place.index))
-            != transferred
-        {
-            return Err(InterpreterError::new(
-                "borrowed collection element has incompatible transfer state",
-            ));
-        }
         let entries = self
             .borrowed_collections
             .get(&place.collection)
@@ -16122,7 +17699,8 @@ impl Interpreter<'_> {
         let entries = {
             let collection = self.collection_local(local)?;
             collection.core_hashes.borrow_mut().clear();
-            std::mem::take(&mut *collection.entries_mut())
+            let entries = std::mem::take(&mut *collection.entries_mut());
+            entries
         };
         let mut drops = Vec::new();
         collect_owned_objects_from_entries(entries, &mut drops);
@@ -16173,51 +17751,61 @@ impl Interpreter<'_> {
         let value = read_local(&self.current_frame()?.locals, local)?;
         let mut mixed_owner = None;
         let mut interface_type = None;
-        let object = match value {
-            LocalValue::Class { object, .. } => Some(*object),
-            LocalValue::NullableClass { object, .. } => *object,
-            LocalValue::Error(value) => {
-                interface_type =
-                    Some(self.program.interface_vtables[value.vtable.0].implementing_type);
-                Some(value.object)
-            }
-            LocalValue::NullableError { value, .. } => value.map(|value| {
-                interface_type =
-                    Some(self.program.interface_vtables[value.vtable.0].implementing_type);
-                value.object
-            }),
-            LocalValue::Mixed(value) | LocalValue::NullableMixed(Some(value)) => match value {
-                MixedValue::Class {
-                    object,
-                    owner,
-                    payload_owned,
-                    ..
-                } => {
-                    mixed_owner = Some((Rc::clone(owner), *payload_owned));
-                    Some(*object)
-                }
-                MixedValue::Interface {
-                    value,
-                    owner,
-                    payload_owned,
-                    ..
-                } => {
-                    mixed_owner = Some((Rc::clone(owner), *payload_owned));
+        let object = if let Some((class, object)) = inline_value::nominal_parts(value)? {
+            interface_type = Some(mir::ImplementingType::Class(class));
+            object
+        } else {
+            match value {
+                LocalValue::Class { object, .. } => Some(*object),
+                LocalValue::NullableClass { object, .. } => *object,
+                LocalValue::Error(value) => {
                     interface_type =
                         Some(self.program.interface_vtables[value.vtable.0].implementing_type);
                     Some(value.object)
                 }
-                _ => None,
-            },
-            LocalValue::NullableMixed(None) => None,
-            _ => {
-                return Err(InterpreterError::new(
-                    "nominal projection has a non-nominal source",
-                ))
+                LocalValue::NullableError { value, .. } => value.map(|value| {
+                    interface_type =
+                        Some(self.program.interface_vtables[value.vtable.0].implementing_type);
+                    value.object
+                }),
+                LocalValue::Mixed(value) | LocalValue::NullableMixed(Some(value)) => match value {
+                    MixedValue::Class {
+                        object,
+                        owner,
+                        payload_owned,
+                        ..
+                    } => {
+                        mixed_owner = Some((Rc::clone(owner), *payload_owned));
+                        Some(*object)
+                    }
+                    MixedValue::Interface {
+                        value,
+                        owner,
+                        payload_owned,
+                        ..
+                    } => {
+                        mixed_owner = Some((Rc::clone(owner), *payload_owned));
+                        interface_type =
+                            Some(self.program.interface_vtables[value.vtable.0].implementing_type);
+                        Some(value.object)
+                    }
+                    _ => None,
+                },
+                LocalValue::NullableMixed(None) => None,
+                _ => {
+                    return Err(InterpreterError::new(
+                        "nominal projection has a non-nominal source",
+                    ));
+                }
             }
         };
         let parts = object
             .map(|object| {
+                if let Some(mir::ImplementingType::Class(class)) = interface_type {
+                    if class_in(self.program, class)?.inline_copy_type().is_some() {
+                        return Ok((object, mir::ImplementingType::Class(class)));
+                    }
+                }
                 if let Some(
                     implementing @ (mir::ImplementingType::Collection(_)
                     | mir::ImplementingType::CollectionIterator(_)),
@@ -16279,6 +17867,39 @@ impl Interpreter<'_> {
                 InterpreterError::new("MIR interface has no Error reporting metadata")
             })?;
         self.error_descriptor(descriptor)
+    }
+
+    fn io_error_progress(
+        &self,
+        error: InterfaceCarrier,
+        bound: usize,
+    ) -> Result<Option<usize>, InterpreterError> {
+        let Some(property) = self
+            .interface_error_metadata(error)?
+            .io_transferred_byte_count_property
+        else {
+            return Ok(None);
+        };
+        let value = self
+            .heap
+            .get(&error.object)
+            .and_then(|object| object.properties.get(property.index))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| InterpreterError::new("owned IoError progress storage was released"))?;
+        let LocalValue::NullableScalar { value, .. } = value else {
+            return Err(InterpreterError::new(
+                "IoError progress has another storage shape",
+            ));
+        };
+        match value {
+            None => Ok(None),
+            Some(mir::ScalarValue::Integer(count)) => Ok(usize::try_from(count.signed_value())
+                .ok()
+                .filter(|count| *count <= bound)),
+            _ => Err(InterpreterError::new(
+                "IoError progress has another scalar type",
+            )),
+        }
     }
 
     fn take_error_local(
@@ -16348,10 +17969,19 @@ impl Interpreter<'_> {
             }
             OwnedDrop::Error(value) => {
                 match self.program.interface_vtables[value.vtable.0].implementing_type {
-                    mir::ImplementingType::Class(class) => EvaluationTask::DropObject {
-                        object: value.object,
-                        class,
-                    },
+                    mir::ImplementingType::Class(class) => {
+                        if let Some(ty) = class_in(self.program, class)?.inline_copy_type() {
+                            EvaluationTask::ReleaseInlineValue(crate::inline_value::InlineValue {
+                                ty,
+                                bits: value.object as u128,
+                            })
+                        } else {
+                            EvaluationTask::DropObject {
+                                object: value.object,
+                                class,
+                            }
+                        }
+                    }
                     mir::ImplementingType::Collection(_) => {
                         let collection = self
                             .interface_collections
@@ -16372,6 +18002,7 @@ impl Interpreter<'_> {
                 }
             }
             OwnedDrop::Function(value) => EvaluationTask::DropFunctionValue(value),
+            OwnedDrop::Inline(value) => EvaluationTask::ReleaseInlineValue(value),
         };
         self.current_frame_mut()?.tasks.push(task);
         Ok(())
@@ -16460,6 +18091,31 @@ impl Interpreter<'_> {
         let (span, function) = origin
             .map(|origin| (origin.span, origin.callable.clone()))
             .unwrap_or((entry.source_span, entry.name.clone()));
+        let mut facts = Vec::new();
+        if let Some(property) = descriptor.io_transferred_byte_count_property {
+            let transferred = object
+                .properties
+                .get(property.index)
+                .and_then(Option::as_ref);
+            match transferred {
+                Some(LocalValue::NullableScalar {
+                    ty: mir::ScalarType::Integer(IntegerType::Int64),
+                    value: Some(mir::ScalarValue::Integer(value)),
+                }) => facts.push(RuntimeFact {
+                    name: doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_FACT.to_string(),
+                    value: RuntimeFactValue::Signed(value.signed_value() as i64),
+                }),
+                Some(LocalValue::NullableScalar {
+                    ty: mir::ScalarType::Integer(IntegerType::Int64),
+                    value: None,
+                }) => {}
+                _ => {
+                    return Err(InterpreterError::new(
+                        "escaping IoError has malformed transfer progress",
+                    ));
+                }
+            }
+        }
         let outcome = RuntimeOutcomeDetails {
             process_status: 70,
             termination_behavior: TerminationBehavior::PropagateWithCleanup,
@@ -16469,7 +18125,7 @@ impl Interpreter<'_> {
                 function: Some(function),
             },
             path: Vec::new(),
-            facts: Vec::new(),
+            facts,
             error_type: Some(descriptor.type_name.clone()),
         };
         let diagnostic = if let Some(assertion) = &descriptor.assertion {
@@ -16663,15 +18319,27 @@ impl Interpreter<'_> {
         }))
     }
 
-    fn runtime_panic_output(&self, event: RuntimePanicEvent) -> InterpreterOutput {
+    fn runtime_panic_output(&self, mut event: RuntimePanicEvent) -> InterpreterOutput {
+        let origin_index = self
+            .frames
+            .iter()
+            .rposition(|frame| self.program.functions[frame.function.0].owns_diagnostic_frame());
+        if let Some(frame) = self
+            .frames
+            .last()
+            .filter(|frame| !self.program.functions[frame.function.0].owns_diagnostic_frame())
+        {
+            event.primary_span = frame.active_panic_site;
+            event.operation_span = frame.active_panic_site;
+        }
         let code = event.code;
         let primary_span = event.primary_span;
         let explanation = event.explanation;
         let origin_function = self
             .frames
-            .last()
+            .get(origin_index.unwrap_or(self.frames.len()))
             .and_then(|frame| self.program.functions.get(frame.function.0))
-            .map(|function| function.name.clone());
+            .map(|function| self.program.diagnostic_callable_name(function).into_owned());
         let mut path = Vec::with_capacity(self.frames.len());
         for reverse_index in 0..self.frames.len() {
             let frame_index = self.frames.len() - 1 - reverse_index;
@@ -16679,7 +18347,10 @@ impl Interpreter<'_> {
             let Some(function) = self.program.functions.get(frame.function.0) else {
                 continue;
             };
-            let span = if reverse_index == 0 {
+            if !function.owns_diagnostic_frame() {
+                continue;
+            }
+            let span = if Some(frame_index) == origin_index {
                 event.operation_span
             } else {
                 self.frames[frame_index + 1]
@@ -16687,7 +18358,7 @@ impl Interpreter<'_> {
                     .unwrap_or(function.source_span)
             };
             path.push(RuntimeOutcomeFrame {
-                function: function.name.clone(),
+                function: self.program.diagnostic_callable_name(function).into_owned(),
                 source: DiagnosticSource::Current,
                 span,
             });
@@ -16721,10 +18392,10 @@ impl Interpreter<'_> {
             origin: RuntimeOutcomeOrigin {
                 source: DiagnosticSource::Current,
                 span: event.primary_span,
-                function: Some(entry.name.clone()),
+                function: Some(self.program.diagnostic_callable_name(entry).into_owned()),
             },
             path: vec![RuntimeOutcomeFrame {
-                function: entry.name.clone(),
+                function: self.program.diagnostic_callable_name(entry).into_owned(),
                 source: DiagnosticSource::Current,
                 span: event.operation_span,
             }],
@@ -16895,10 +18566,23 @@ fn eval_compare(
                 }
             }
         }
+        (mir::ScalarValue::Inline(left), mir::ScalarValue::Inline(right))
+            if left.ty == right.ty =>
+        {
+            match op {
+                mir::CompareOp::Equal => left.bits == right.bits,
+                mir::CompareOp::NotEqual => left.bits != right.bits,
+                _ => {
+                    return Err(InterpreterError::new(
+                        "MIR inline values only support equality comparison",
+                    ));
+                }
+            }
+        }
         _ => {
             return Err(InterpreterError::new(
                 "MIR comparison operands have different scalar types",
-            ))
+            ));
         }
     };
     Ok(result)
@@ -16976,6 +18660,36 @@ fn local_values_equal(
             LocalValue::NullableString(right),
         ) => Ok(left.as_ref().map(|value| value.as_bytes())
             == right.as_ref().map(|value| value.as_bytes())),
+        (
+            mir::Type::Class(_),
+            LocalValue::Class { object: left, .. },
+            LocalValue::Class { object: right, .. },
+        ) => Ok(left == right),
+        (
+            mir::Type::NullableClass(_),
+            LocalValue::NullableClass { object: left, .. },
+            LocalValue::NullableClass { object: right, .. },
+        ) => Ok(left == right),
+        (mir::Type::Interface(_), LocalValue::Error(left), LocalValue::Error(right)) => {
+            Ok(left == right)
+        }
+        (
+            mir::Type::NullableInterface(_),
+            LocalValue::NullableError { value: left, .. },
+            LocalValue::NullableError { value: right, .. },
+        ) => Ok(left == right),
+        (
+            mir::Type::Collection(collection) | mir::Type::NullableCollection(collection),
+            LocalValue::Collection(left),
+            LocalValue::Collection(right),
+        ) if program
+            .collection_types
+            .get(collection.0)
+            .is_some_and(|definition| definition.kind == mir::CollectionKind::Bytes) =>
+        {
+            Ok(left.present == right.present
+                && (!left.present || left.entries().as_slice() == right.entries().as_slice()))
+        }
         (
             mir::Type::PayloadEnum(_),
             LocalValue::PayloadEnum(left),
@@ -17128,14 +18842,14 @@ fn assertion_collection_presentation(
                     InterpreterError::new("dictionary assertion presentation is missing a key")
                 })?,
                 definition.key.expect("dictionary has a key type"),
-            ));
+            )?);
             result.push_str(" => ");
         }
         result.push_str(&assertion_local_value_presentation(
             program,
             value,
             definition.value,
-        ));
+        )?);
     }
     if entries.len() > crate::assertions::COLLECTION_PRESENTATION_ITEMS {
         if !entries.is_empty() {
@@ -17151,12 +18865,12 @@ fn assertion_local_value_presentation(
     program: &mir::Program,
     value: &LocalValue,
     ty: mir::Type,
-) -> String {
-    match value {
+) -> Result<String, InterpreterError> {
+    Ok(match value {
         LocalValue::Scalar(mir::ScalarValue::Enum(value)) => {
             assertion_enum_presentation(program, *value, ty)
         }
-        LocalValue::Scalar(value) => display_scalar(*value),
+        LocalValue::Scalar(value) => display_scalar(*value)?,
         LocalValue::String(value) => crate::assertions::quote_string(value),
         LocalValue::NullableScalar { value: None, .. }
         | LocalValue::NullableString(None)
@@ -17176,10 +18890,10 @@ fn assertion_local_value_presentation(
         } => assertion_enum_presentation(program, *value, ty),
         LocalValue::NullableScalar {
             value: Some(value), ..
-        } => display_scalar(*value),
+        } => display_scalar(*value)?,
         LocalValue::NullableString(Some(value)) => crate::assertions::quote_string(value),
         _ => format!("<{ty}>"),
-    }
+    })
 }
 
 fn assertion_enum_presentation(
@@ -17296,6 +19010,9 @@ fn typed_null_value(ty: mir::Type) -> Result<LocalValue, InterpreterError> {
         mir::Type::NullableCollection(collection) => {
             LocalValue::Collection(CollectionValue::nullable(collection, None))
         }
+        mir::Type::NullableByteRegion(kind) => {
+            LocalValue::ByteRegion(ByteRegionValue::absent(kind))
+        }
         mir::Type::NullablePayloadEnum(ty) => LocalValue::NullablePayloadEnum { ty, value: None },
         mir::Type::NullableFunction(function_type) => LocalValue::NullableFunction {
             function_type,
@@ -17327,12 +19044,14 @@ fn is_absent_nullable_value(value: &LocalValue) -> bool {
         | LocalValue::NullablePayloadEnum { value: None, .. }
         | LocalValue::NullableFunction { value: None, .. } => true,
         LocalValue::Collection(value) => value.nullable && !value.present,
+        LocalValue::ByteRegion(value) => value.nullable && value.source.is_none(),
         _ => false,
     }
 }
 
 fn local_value_type(program: &mir::Program, value: &LocalValue) -> mir::Type {
     match value {
+        LocalValue::ByteRegion(value) => value.ty(),
         LocalValue::Scalar(value) => mir::Type::Scalar(value.ty()),
         LocalValue::String(_) => mir::Type::String,
         LocalValue::Mixed(_) => mir::Type::Mixed,
@@ -17420,6 +19139,7 @@ fn writable_payload_type(payload: mir::SharedPayload) -> mir::Type {
 
 fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
     match ty {
+        mir::Type::NullableByteRegion(kind) => Some(mir::Type::ByteRegion(kind)),
         mir::Type::NullableScalar(ty) => Some(mir::Type::Scalar(ty)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
@@ -17508,6 +19228,12 @@ fn collect_owned_objects_from_entries(
 
 fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop>) {
     match value {
+        LocalValue::Scalar(mir::ScalarValue::Inline(value))
+        | LocalValue::NullableScalar {
+            value: Some(mir::ScalarValue::Inline(value)),
+            ..
+        } if value.ty.requires_owned_cleanup() => drops.push(OwnedDrop::Inline(value)),
+        LocalValue::ByteRegion(_) => {}
         LocalValue::Error(value)
         | LocalValue::NullableError {
             value: Some(value), ..
@@ -18007,13 +19733,18 @@ fn repeat_collection_entries(
     Ok(entries)
 }
 
-fn display_scalar(value: mir::ScalarValue) -> String {
-    match value {
+fn display_scalar(value: mir::ScalarValue) -> Result<String, InterpreterError> {
+    Ok(match value {
         mir::ScalarValue::Integer(value) => value.display(),
         mir::ScalarValue::Bool(value) => value.to_string(),
         mir::ScalarValue::Float(value) => value.display(),
         mir::ScalarValue::Enum(_) => "<enum>".to_string(),
-    }
+        mir::ScalarValue::Inline(_) => {
+            return Err(InterpreterError::new(
+                "MIR inline value has no display conversion",
+            ));
+        }
+    })
 }
 
 fn render_format(
@@ -18032,7 +19763,7 @@ fn render_format(
                 })?;
                 let rendered = match (spec.conversion, value) {
                     (FormatConversion::Display, EvaluationValue::Scalar(value)) => {
-                        display_scalar(*value)
+                        display_scalar(*value)?
                     }
                     (FormatConversion::Display, EvaluationValue::String(value)) => {
                         value.to_string()
@@ -18061,7 +19792,7 @@ fn render_format(
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR format conversion and argument type disagree",
-                        ))
+                        ));
                     }
                 };
                 output.push_str(&apply_width(rendered, *spec));
@@ -18272,6 +20003,9 @@ fn assign_local(
         (mir::Type::Collection(expected), LocalValue::Collection(collection)) if expected == collection.ty
     ) || matches!(
         (definition.ty, &value),
+        (ty @ (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)), LocalValue::ByteRegion(region)) if ty == region.ty()
+    ) || matches!(
+        (definition.ty, &value),
         (mir::Type::NullableCollection(expected), LocalValue::Collection(collection))
             if expected == collection.ty && collection.nullable
     ) || matches!(
@@ -18291,11 +20025,13 @@ fn assign_local(
     );
     if !compatible {
         let actual = match &value {
+            LocalValue::ByteRegion(_) => "byte region",
             LocalValue::Scalar(value) => match value.ty() {
                 mir::ScalarType::Integer(value) => value.source_name(),
                 mir::ScalarType::Float(value) => value.source_name(),
                 mir::ScalarType::Bool => "bool",
                 mir::ScalarType::Enum(_) => "enum",
+                mir::ScalarType::Inline(ty) => ty.name(),
             },
             LocalValue::String(_) => "string",
             LocalValue::Mixed(_) => "mixed",
@@ -18484,6 +20220,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nullable_wide_inline_places_do_not_use_interface_payload_rules() {
+        let program =
+            crate::lower_source_to_mir("wide-inline-home.doria", "function main(): void {}")
+                .unwrap();
+        let interpreter = Interpreter::new(
+            &program,
+            InterpreterLimits::default(),
+            MirIo::default(),
+            || Ok(0),
+        )
+        .unwrap();
+        let class = crate::class_layout::ClassId(0);
+        for ty in [
+            crate::inline_value::InlineValueType::Deadline,
+            crate::inline_value::InlineValueType::RegistrationKey(class),
+            crate::inline_value::InlineValueType::ReadTransferKey(class),
+            crate::inline_value::InlineValueType::WriteTransferKey(class),
+        ] {
+            for bits in [0, (1_u128 << 96) | 27, u128::MAX] {
+                let scalar = mir::ScalarType::Inline(ty);
+                let value = mir::ScalarValue::Inline(crate::inline_value::InlineValue { ty, bits });
+                let source = LocalValue::Scalar(value);
+                let widened = interpreter
+                    .project_place_value(source.clone(), mir::Type::NullableScalar(scalar))
+                    .unwrap();
+                assert_eq!(
+                    widened,
+                    LocalValue::NullableScalar {
+                        ty: scalar,
+                        value: Some(value)
+                    }
+                );
+                assert_eq!(
+                    interpreter
+                        .project_place_value(widened, mir::Type::Scalar(scalar))
+                        .unwrap(),
+                    source
+                );
+                if ty.nominal_class().is_some() {
+                    assert!(inline_value::nominal_parts(&source).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn borrowed_collection_places_reuse_live_sources_and_reclaim_expired_sources() {
         for (setup, iteration) in [
             (
@@ -18512,6 +20294,32 @@ function main(): void {{
             let metrics = closure_metrics(&source);
             assert_eq!(metrics.borrowed_collection_sources, 1, "{source}");
         }
+    }
+
+    #[test]
+    fn borrowed_payload_places_reuse_layout_paths_across_owner_lifetimes() {
+        let metrics = closure_metrics(
+            r#"
+class Item { int $value = 42; }
+enum Packet { case Value(Item $item); }
+enum Envelope { case Wrapped(Packet $packet); }
+function item(Packet $packet): Item {
+    return match ($packet) { Packet::Value($item) => $item, };
+}
+function nested(Envelope $envelope): Item {
+    return match ($envelope) { Envelope::Wrapped($packet) => item($packet), };
+}
+function main(): void {
+    let writable $count = 0;
+    while ($count < 1000) {
+        let $owner = Envelope::Wrapped(Packet::Value(new Item()));
+        if (nested($owner)->value != 42) { panic("payload"); }
+        $count++;
+    }
+}
+"#,
+        );
+        assert_eq!(metrics.payload_projection_paths, 2);
     }
 
     fn closure_metrics(source: &str) -> InterpreterMetrics {

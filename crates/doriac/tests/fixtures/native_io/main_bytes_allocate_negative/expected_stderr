@@ -1,0 +1,16 @@
+Panic[P1303]: Byte Buffer Length Cannot Be Negative
+
+Where
+examples/native/main_bytes_allocate_negative.doria · line 9 · main
+
+  9          let $bytes = Bytes::allocate(-7);
+                                          ^^
+                                          Negative Byte Length
+
+Why
+A byte buffer length describes how many bytes to allocate and therefore cannot be negative.
+
+Call Path
+main · examples/native/main_bytes_allocate_negative.doria:9
+
+Process Exited With Status 101

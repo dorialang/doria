@@ -1,6 +1,39 @@
 use super::*;
 use crate::compiler_known_contracts::CoreValueOperation;
 
+/// The canonical core requirement selected by a constrained call whose
+/// specialized receiver is a primitive. Such a call is a compiler intrinsic:
+/// it has no class callee and raises no checked Error.
+fn selected_primitive_requirement(span: Span, context: &LoweringContext<'_>) -> Option<Span> {
+    let crate::semantics::CallableTarget::ConstrainedMethod {
+        receiver,
+        requirement,
+        ..
+    } = context
+        .semantic_info
+        .call_targets
+        .get(&span)
+        .and_then(|target| {
+            target.specialize(|ty| substitute_resolved_type(ty, &context.type_substitutions))
+        })?
+    else {
+        return None;
+    };
+    matches!(
+        receiver,
+        ResolvedType::Integer(_)
+            | ResolvedType::Float(_)
+            | ResolvedType::Bool
+            | ResolvedType::String
+    )
+    .then_some(requirement)
+}
+
+pub(super) fn selects_primitive_call(expr: &hir::Expr, context: &LoweringContext<'_>) -> bool {
+    matches!(expr, hir::Expr::MethodCall { span, .. }
+        if selected_primitive_requirement(*span, context).is_some())
+}
+
 pub(super) fn primitive_call(
     expr: &hir::Expr,
     context: &mut LoweringContext<'_>,
@@ -11,29 +44,9 @@ pub(super) fn primitive_call(
     else {
         return Ok(None);
     };
-    let Some(crate::semantics::CallableTarget::ConstrainedMethod {
-        receiver,
-        requirement,
-        ..
-    }) = context
-        .semantic_info
-        .call_targets
-        .get(span)
-        .and_then(|target| {
-            target.specialize(|ty| substitute_resolved_type(ty, &context.type_substitutions))
-        })
-    else {
+    let Some(requirement) = selected_primitive_requirement(*span, context) else {
         return Ok(None);
     };
-    if !matches!(
-        receiver,
-        ResolvedType::Integer(_)
-            | ResolvedType::Float(_)
-            | ResolvedType::Bool
-            | ResolvedType::String
-    ) {
-        return Ok(None);
-    }
     let operation = CoreValueOperation::from_requirement(requirement).ok_or_else(|| {
         vec![unsupported(
             *span,
@@ -86,7 +99,7 @@ pub(super) fn primitive_call(
             return Err(vec![unsupported(
                 *span,
                 "Copy primitives do not select an owned class clone",
-            )])
+            )]);
         }
     };
     Ok(Some(result))
@@ -332,7 +345,7 @@ pub(super) fn index_of(
         else_block: exit,
     });
     context.current_block = Some(body);
-    let element = core_collection::value_at(collection, index, ty, context)?;
+    let element = core_collection::value_at(collection, index, ty, span, context)?;
     let element = materialize_value(element, context);
     let condition = lower_local_equality(element, expected, false, span, context)?;
     context.terminate_current(mir::Terminator::Branch {
@@ -448,7 +461,7 @@ pub(super) fn membership(
         span,
         context,
     )?;
-    let removed = collection_remove_at_rvalue(collection, index, definition.value)?;
+    let removed = collection_remove_at_rvalue(collection, index, definition.value, span)?;
     lower_discarded_rvalue(removed, context);
     context.terminate_current(mir::Terminator::Jump(exit));
     context.current_block = Some(exit);
@@ -598,8 +611,13 @@ fn build(
         mir::CollectionBuildKind::Fill => (None, local_rvalue(source, definition.value, false)),
         mir::CollectionBuildKind::PreservingFrom => {
             let key = if let Some(ty) = definition.key {
-                let value =
-                    collection_key_at_rvalue(source, collection_offset_rvalue(index), ty, context)?;
+                let value = collection_key_at_rvalue(
+                    source,
+                    collection_offset_rvalue(index),
+                    ty,
+                    span,
+                    context,
+                )?;
                 let value = duplicate(value, span, context)?;
                 let (local, ty) = materialize_value(value, context);
                 Some(local_rvalue(local, ty, true))
@@ -609,7 +627,14 @@ fn build(
             let offset = collection_offset_rvalue(index);
             (
                 key,
-                collection_value_rvalue(source, offset.clone(), offset, definition.value, true)?,
+                collection_value_rvalue(
+                    source,
+                    offset.clone(),
+                    offset,
+                    definition.value,
+                    true,
+                    span,
+                )?,
             )
         }
     };
@@ -618,6 +643,7 @@ fn build(
         .current_block
         .expect("duplication has a success continuation");
     context.push_statement(mir::Statement::CollectionAdd {
+        span,
         collection: output,
         value: duplicate,
         index: key,
@@ -678,6 +704,16 @@ pub(super) fn duplicate(
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::Rvalue> {
     if !value.ty().has_move_ownership() {
+        if (value.ty().requires_owned_cleanup()
+            || matches!(
+                value.ty(),
+                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+            ))
+            && value.borrows_move_value()
+        {
+            let (source, ty) = materialize_value(value, context);
+            return Ok(read_local_as_rvalue(source, ty, true));
+        }
         return Ok(value);
     }
     let ty = value.ty();
@@ -712,7 +748,7 @@ pub(super) fn duplicate(
                 return Err(vec![unsupported(
                     span,
                     "nullable duplication requires a Cloneable class or interface",
-                )])
+                )]);
             }
         };
         context.push_statement(mir::Statement::AssignLocal {
@@ -742,7 +778,7 @@ pub(super) fn duplicate(
                 return Err(vec![unsupported(
                     span,
                     "Cloneable duplication returned another representation",
-                )])
+                )]);
             }
         };
         context.push_statement(mir::Statement::AssignLocal {
@@ -876,6 +912,13 @@ fn invoke_equality(
     )
     .is_none()
     {
+        if let (mir::Rvalue::Value(left), mir::Rvalue::Value(right)) = (&receiver, &argument) {
+            return Ok(mir::BoolExpression::Compare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(left.clone()),
+                right: Box::new(right.clone()),
+            });
+        }
         let mir::Type::Class(class) = non_null_match_type(left.1).0 else {
             return Err(vec![unsupported(
                 span,
@@ -994,8 +1037,9 @@ pub(super) fn invoke(
                     .iter()
                     .enumerate()
                     .find(|(_, method)| {
-                        method.requirement.source == crate::compiler_known_contracts::SOURCE_ID
-                            && method.name == operation.method()
+                        method.requirement_origins.iter().any(|origin| {
+                            CoreValueOperation::from_requirement(*origin) == Some(operation)
+                        })
                     })
                     .map(|(slot, _)| (table.id, table.interface, slot))
             })
@@ -1018,8 +1062,13 @@ pub(super) fn invoke(
         let mut lowered = vec![receiver];
         lowered.extend(args);
         let result = if signature.checked_effects.is_empty() {
-            let value =
-                interface::direct_call_result(ty, signature.id, lowered, signature.return_borrow);
+            let value = interface::direct_call_result(
+                ty,
+                signature.id,
+                lowered,
+                signature.return_borrow,
+                span,
+            );
             let owned = user_local_type_owns_value(ty) && !value.borrows_move_value();
             let local = context.declare_checked_call_slot(ty, owned);
             context.push_statement(mir::Statement::AssignLocal {

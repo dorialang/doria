@@ -1,0 +1,47 @@
+use Doria\Std\Io\{IoError, IoErrorReason, IoOperation, IoTarget};
+
+function failClose(): void throws IoError
+{
+    throw new IoError(
+        "I/O close failed: closed (file: fixture.bin)",
+        IoOperation::Close,
+        IoTarget::File("fixture.bin"),
+        IoErrorReason::Closed
+    );
+}
+
+function operationName(IoOperation $operation): string
+{
+    return match ($operation) {
+        IoOperation::Open => "open",
+        IoOperation::Read => "read",
+        IoOperation::Write => "write",
+        IoOperation::Append => "append",
+        IoOperation::Flush => "flush",
+        IoOperation::Close => "close",
+        IoOperation::Register => "register",
+        IoOperation::Unregister => "unregister",
+        IoOperation::Wait => "wait",
+        IoOperation::Configure => "configure",
+        IoOperation::Access => "access",
+        IoOperation::Seek => "seek",
+        IoOperation::SynchronizeData => "synchronizeData",
+        IoOperation::SynchronizeMetadata => "synchronizeMetadata",
+        IoOperation::Resize => "resize",
+        IoOperation::Lock => "lock",
+        IoOperation::Unlock => "unlock",
+        IoOperation::Spawn => "spawn",
+        IoOperation::Terminate => "terminate"
+    };
+}
+
+function main(): void
+{
+    try {
+        failClose();
+    } catch (IoError $error) {
+        echo operationName($error->operation) . "\n";
+        echo $error->message . "\n";
+        echo ($error->systemCode == null) . " " . ($error->transferredByteCount == null) . "\n";
+    }
+}

@@ -73,6 +73,7 @@ pub(super) fn collection_operation(
             key,
             value,
             hash,
+            ..
         } => {
             check(*position, integer, None)?;
             keys(*key, true)?;
@@ -124,6 +125,7 @@ pub(super) fn collection_operation(
             position,
             value,
             previous,
+            ..
         } => {
             check(*position, integer, None)?;
             check(*value, definition.value, Some(true))?;
@@ -177,9 +179,9 @@ pub(super) fn validate(
                 .find(|method| method.name == plan.operation.method())
         })
         .expect("core operation has a compiler-owned requirement");
-    if method.requirement != requirement.span
+    if !method.requirement_origins.contains(&requirement.span)
         || method.name != plan.operation.method()
-        || method.writable_receiver
+        || method.receiver_mode != mir::ReceiverMode::Readonly
         || receiver.owned
         || receiver.writable
         || !receiver.synthetic
@@ -275,7 +277,7 @@ pub(super) fn validate(
                     _ => {
                         return Err(malformed_mir(
                             "core operation proof does not describe its checked call",
-                        ))
+                        ));
                     }
                 }
             }
@@ -346,16 +348,19 @@ pub(super) fn validate(
 fn direct_call(value: &mir::Rvalue) -> Option<(mir::FunctionId, &Vec<mir::Rvalue>)> {
     use mir::*;
     match value {
-        Rvalue::Value(ValueExpression::Bool(BoolExpression::Call { function, args }))
+        Rvalue::Value(ValueExpression::Bool(BoolExpression::Call { function, args, .. }))
         | Rvalue::Value(ValueExpression::Integer(IntegerExpression::Call {
             function, args, ..
         }))
         | Rvalue::Value(ValueExpression::Enum(EnumExpression::Call { function, args, .. }))
-        | Rvalue::Class(ClassExpression::Call { function, args, .. })
         | Rvalue::Interface(InterfaceExpression {
             value: InterfaceValue::Call { function, args, .. },
             ..
         }) => Some((*function, args)),
+        Rvalue::Class(value) => match value.without_upcasts() {
+            ClassExpression::Call { function, args, .. } => Some((*function, args)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -436,7 +441,7 @@ pub(super) fn validate_duplication(
         _ => {
             return Err(malformed_mir(
                 "nullable duplication has a non-nullable source",
-            ))
+            ));
         }
     };
     if !matches!(&block_in(function, plan.entry)?.terminator, mir::Terminator::Branch {
@@ -639,7 +644,7 @@ pub(super) fn validate_fill(
     }
     let append = block_in(function, plan.append)?;
     if !append.statements.iter().any(|statement| matches!(statement,
-        mir::Statement::CollectionAdd { collection, value, index: key, op: mir::CollectionMutationOp::Initialize }
+        mir::Statement::CollectionAdd { collection, value, index: key, op: mir::CollectionMutationOp::Initialize, .. }
             if *collection == plan.output && value.direct_place_local() == Some(duplication.result) && !value.borrows_move_value()
                 && match (definition.key, key) {
                     (None, None) => true,
@@ -784,7 +789,7 @@ pub(super) fn validate_constructions(function: &mir::Function) -> Result<(), Bac
                     _ => {
                         return Err(malformed_mir(
                             "unfinished collection is observed or escapes its construction region",
-                        ))
+                        ));
                     }
                 }
             }

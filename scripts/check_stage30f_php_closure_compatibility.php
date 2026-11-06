@@ -65,7 +65,7 @@ declare(strict_types=1);
         'program.semantic_info.closures.is_empty()',
         'program.semantic_info.callable_value_calls.is_empty()',
         'Some(lower_validated_mir(program)?)',
-        'codegen_php::generate(program, mir.as_ref())',
+        'codegen_php::generate_artifact(program, mir.as_ref())',
     ]);
     $forbid($paths['backend'], $files['backend'], [
         'Closure PHP Output Is Not Yet Available',
@@ -85,7 +85,7 @@ declare(strict_types=1);
     ]);
     $require($paths['php'], $files['php'], [
         'interface __DoriaFunctionValue',
-        'final class __DoriaCell',
+        'class __DoriaCell',
         'final class {} implements __DoriaFunctionValue',
         'format!("final class {name}")',
         'layout.logical_release_order',
@@ -93,12 +93,13 @@ declare(strict_types=1);
         '__doria_drop_cell',
         '__doria_replace_cell',
         'new __DoriaCell(__doria_take_cell({cell}))',
-        '$__doria_generated_closure_frames',
+        'diagnostic_sites::emit_frame_body',
         'validated MIR must back executable PHP closures',
     ]);
     $forbid($paths['php'], $files['php'], [
         'call_user_func(',
         'call_user_func_array(',
+        'debug_backtrace(',
         'PHP closure route reached code generation',
     ]);
 

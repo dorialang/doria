@@ -1,10 +1,40 @@
 use std::collections::{HashMap, HashSet};
 
+mod callable_contracts;
 pub mod composition;
+mod composition_availability;
 pub mod composition_rename;
+pub(crate) mod conditional_capabilities;
 pub mod contracts;
+mod enum_inference;
+#[cfg(test)]
+mod enum_specialization_tests;
+mod instantiation;
+mod interface_witnesses;
+mod nominal_proof;
 mod nonblocking;
+mod ownership_checking;
 mod property_hooks;
+mod return_specialization;
+mod scoped_requests;
+mod specialized_ownership;
+mod type_formation;
+mod virtual_dispatch;
+pub(crate) use callable_contracts::Admissions as CallableAdmissions;
+pub(crate) use callable_contracts::{
+    CallGraph as GenericCallGraph, GenericCall as CheckedGenericCall,
+    Instance as CallableInstanceKey, InterfaceGenericCall,
+};
+pub(crate) use return_specialization::Facts as SpecializedReturnBorrows;
+pub(crate) use virtual_dispatch::Family as VirtualMethodFamily;
+
+pub(crate) fn specialized_return_borrow(
+    facts: &SpecializedReturnBorrows,
+    declaration: Span,
+    substitutions: &HashMap<String, ResolvedType>,
+) -> Option<Option<ReturnBorrow>> {
+    return_specialization::lookup(facts, declaration, substitutions)
+}
 
 use contracts::ContractMismatch;
 
@@ -28,7 +58,7 @@ use crate::diagnostics::{
 };
 use crate::enums::{
     EnumBackingType, EnumBackingValue, EnumCapabilities, EnumCaseId, EnumId, EnumLayout, EnumType,
-    EnumValue, LayoutShape,
+    LayoutShape,
 };
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -42,8 +72,8 @@ use crate::symbols::{
 use crate::types::{
     resolved_type_complexity, ClassType, FunctionBorrowSource, FunctionInvocationMode,
     FunctionReturnBorrow, FunctionTypeParameterMode, FunctionTypeRef, ResolvedType,
-    ReturnBorrowKind, SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeId,
-    TypeKind, TypeRef, TypeRegistry,
+    RetainedLifetime, ReturnBorrowKind, SemanticFunctionParameter, SemanticFunctionType,
+    SharedHandleKind, TypeId, TypeKind, TypeRef, TypeRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +181,54 @@ pub struct MixedBoxPlan {
     pub nullable_target: bool,
 }
 
+impl MixedBoxPlan {
+    /// Existing mixed carriers pass through unchanged. A nullable mixed carrier
+    /// is an identity only for a nullable destination; its absent case cannot
+    /// stand in for the owned null box required by non-nullable `mixed`.
+    pub fn requires_boxing(&self) -> bool {
+        match &self.source_type {
+            ResolvedType::Mixed => false,
+            ResolvedType::Null => !self.nullable_target,
+            ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Mixed) => {
+                !self.nullable_target
+            }
+            _ => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mixed_box_plan_tests {
+    use super::{MixedBoxPlan, ResolvedType};
+
+    #[test]
+    fn identity_boxing_depends_on_the_destination_nullability() {
+        for (source_type, to_mixed, to_nullable_mixed) in [
+            (ResolvedType::Mixed, false, false),
+            (
+                ResolvedType::Nullable(Box::new(ResolvedType::Mixed)),
+                true,
+                false,
+            ),
+            (ResolvedType::Null, true, false),
+            (ResolvedType::String, true, true),
+            (
+                ResolvedType::Nullable(Box::new(ResolvedType::String)),
+                true,
+                true,
+            ),
+        ] {
+            for (nullable_target, expected) in [(false, to_mixed), (true, to_nullable_mixed)] {
+                let plan = MixedBoxPlan {
+                    source_type: source_type.clone(),
+                    nullable_target,
+                };
+                assert_eq!(plan.requires_boxing(), expected, "{plan:?}");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssertionSemanticInfo {
     pub matcher: crate::assertions::AssertionMatcher,
@@ -192,6 +270,7 @@ pub struct SemanticInfo {
     pub contracts: contracts::ContractFacts,
     pub composition: crate::trait_composition::CompositionPlan,
     pub class_member_surfaces: Vec<composition::ClassMemberSurface>,
+    pub class_member_availability: HashMap<Span, composition::ClassMemberAvailability>,
     pub trait_adaptation_surfaces: Vec<composition::TraitAdaptationSurface>,
     pub composition_rename: composition_rename::CompositionRenameFacts,
     /// Compiler-owned suites and unified test declarations. Runtime backends
@@ -228,9 +307,9 @@ pub struct SemanticInfo {
     /// width, signedness, or nominal identity has been erased.
     pub mixed_box_plans: HashMap<Span, MixedBoxPlan>,
     /// Resolved enum case for each unit/backed case expression.
-    pub enum_case_values: HashMap<Span, EnumValue>,
+    pub enum_case_values: HashMap<Span, crate::enums::EnumCaseSource>,
     /// Resolved payload-enum construction for each checked case call.
-    pub enum_case_constructions: HashMap<Span, EnumCaseId>,
+    pub enum_case_constructions: HashMap<Span, crate::enums::EnumCaseSource>,
     /// Resolved concrete target for each checked `is` expression.
     pub type_test_types: HashMap<Span, ResolvedType>,
     /// Fully checked match plans consumed by backend-independent MIR lowering.
@@ -242,6 +321,14 @@ pub struct SemanticInfo {
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
     pub retained_callables: HashMap<Span, crate::ownership::RetainedCallableInfo>,
+    /// Concrete ownership facts for generic bodies whose erasures depend on Copy/Move.
+    pub(crate) specialized_ownership: specialized_ownership::FactsByInstance,
+    pub(crate) specialized_return_borrows: SpecializedReturnBorrows,
+    /// Concrete guarded instances admitted by the shared nominal checker.
+    pub(crate) callable_admissions: CallableAdmissions,
+    pub(crate) generic_call_graph: GenericCallGraph,
+    pub(crate) virtual_dispatch: virtual_dispatch::Plan,
+    pub(crate) interface_witnesses: interface_witnesses::Plan,
     /// Source ownership transfers and releases shared by semantic consumers.
     pub cleanup: crate::ownership::cleanup::Analysis,
     /// Canonical initialized fields released when construction fails.
@@ -271,6 +358,8 @@ pub struct SemanticInfo {
     /// HIR lowering canonicalizes storage through this map instead of reproducing
     /// hierarchy lookup in each backend.
     pub static_member_targets: HashMap<Span, ClassType<ResolvedType>>,
+    /// Authored static receiver types, including guarded bodies without an
+    /// executable specialization. Editor lookup uses the caller's source scope.
     pub static_receiver_types: HashMap<Span, ClassType<ResolvedType>>,
     /// Concrete generic arguments selected for each checked user-defined call.
     ///
@@ -292,7 +381,9 @@ pub struct SemanticInfo {
     /// Declaration-level hierarchy facts for every class, including generic
     /// classes that have not yet been instantiated in executable code.
     pub class_hierarchy: HashMap<Span, ClassHierarchySemanticInfo>,
-    /// Stable nominal enum identities and declaration-order case metadata.
+    /// Authored enum templates, including generic declarations without instances.
+    pub enum_declarations: Vec<EnumDeclarationSemanticInfo>,
+    /// Materialized enum identities and declaration-order case metadata.
     pub enums: Vec<EnumSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
     pub const_evaluation: crate::const_eval::Evaluation,
@@ -301,6 +392,8 @@ pub struct SemanticInfo {
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     /// Elided class-result borrows keyed by callable source span.
     pub return_borrows: HashMap<Span, ReturnBorrow>,
+    /// Checked writable storage permission for borrowed expression results.
+    pub(crate) writable_borrow_sources: HashSet<Span>,
     /// Flow facts at checked source uses, consumed by MIR lowering so
     /// statically selected nullable paths stay selected after lowering.
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
@@ -311,6 +404,9 @@ pub struct SemanticInfo {
     /// effects that escape its body. Source syntax remains in the AST/HIR
     /// `throws` field and is never synthesized for inferred effects.
     pub callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
+    /// Source-owned virtual call profiles; exact bodies retain their own effects.
+    pub(crate) virtual_ambient_checked_effects: HashMap<Span, Vec<ResolvedType>>,
+    pub(crate) exact_method_calls: HashSet<(Span, Span)>,
     /// Resolved callable signatures keyed by declaration span for tooling
     /// metadata. Runtime lowering uses the existing HIR callable fields.
     pub callable_signatures: HashMap<Span, CallableSignatureSemanticInfo>,
@@ -424,7 +520,7 @@ pub struct PropertyAccessorCallSemanticInfo {
     pub declaring_type: ResolvedType,
     pub declaration: Span,
     pub virtual_root: Option<Span>,
-    pub receiver_mode: ReceiverMode,
+    pub receiver_mode: Option<ReceiverMode>,
     pub return_type: ResolvedType,
     pub return_borrow: Option<ReturnBorrow>,
     pub checked_effects: Vec<ResolvedType>,
@@ -556,6 +652,7 @@ pub enum CallableTarget {
     ConstrainedMethod {
         receiver: ResolvedType,
         method_name: String,
+        /// Interface requirement or authored trait member declaration.
         requirement: Span,
         implementations: Vec<ConstrainedMethodImplementation>,
     },
@@ -744,13 +841,47 @@ pub struct PropertySemanticInfo {
     pub ty: ResolvedType,
     pub writable: bool,
     pub promoted: bool,
-    pub borrowed_source: bool,
+    pub borrowed_source: Option<crate::types::RetainedFieldAccess>,
+}
+
+impl PropertySemanticInfo {
+    /// Whether writable access to the owner reaches the stored value. A
+    /// retained source decides this itself; its slot is never replaced.
+    pub fn permits_write_through(&self) -> bool {
+        crate::types::RetainedFieldAccess::permits_write_through(
+            self.borrowed_source,
+            self.writable,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDeclarationSemanticInfo {
+    pub source_type: EnumType,
+    pub declaration: Span,
+    pub name_span: Span,
+    pub backing_type: Option<EnumBackingType>,
+    pub cases: Vec<EnumCaseDeclarationSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumCaseDeclarationSemanticInfo {
+    pub name: String,
+    pub declaration: Span,
+    pub name_span: Span,
+    pub backing_value: Option<EnumBackingValue>,
+    pub payload: Vec<EnumPayloadSemanticInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumSemanticInfo {
+    /// Materialized enum identity used by case IDs and physical layouts.
     pub id: EnumId,
     pub name: String,
+    /// Authored declaration identity and substituted type arguments.
+    pub source_type: EnumType,
+    pub declaration: Span,
+    pub name_span: Span,
     pub backing_type: Option<EnumBackingType>,
     pub cases: Vec<EnumCaseSemanticInfo>,
     pub capabilities: EnumCapabilities,
@@ -761,15 +892,37 @@ pub struct EnumSemanticInfo {
 pub struct EnumCaseSemanticInfo {
     pub id: EnumCaseId,
     pub name: String,
+    pub declaration: Span,
+    pub name_span: Span,
     pub tag: u32,
     pub backing_value: Option<EnumBackingValue>,
     pub payload: Vec<EnumPayloadSemanticInfo>,
+}
+
+impl EnumSemanticInfo {
+    pub fn resolve_typed_case(
+        &self,
+        source_type: &EnumType,
+        source: crate::enums::EnumCaseSource,
+    ) -> Option<EnumCaseId> {
+        (source_type == &self.source_type)
+            .then(|| self.resolve_case(source))
+            .flatten()
+    }
+
+    pub fn resolve_case(&self, source: crate::enums::EnumCaseSource) -> Option<EnumCaseId> {
+        if source.declaration != self.source_type.id {
+            return None;
+        }
+        self.cases.get(source.index).map(|case| case.id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumPayloadSemanticInfo {
     pub name: String,
     pub ty: ResolvedType,
+    pub declaration: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,8 +1075,7 @@ pub enum ResolvedMatchPattern {
     Constant(crate::const_eval::ConstValue),
     Null,
     EnumCase {
-        enum_id: EnumId,
-        case_id: EnumCaseId,
+        case_id: crate::enums::EnumCaseSource,
     },
     ExactType(ResolvedType),
     Condition,
@@ -1048,6 +1200,32 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     test_semantics: crate::testing::TestSemanticFacts,
 ) -> SemanticAnalysis {
     let authored_program = program;
+    let declarations = conditional_capabilities::check_declarations(program);
+    if !declarations.diagnostics.is_empty() {
+        return SemanticAnalysis {
+            info: SemanticInfo {
+                compilation_context,
+                compilation_contexts,
+                source_semantic_contexts,
+                global_symbols,
+                test_semantics,
+                ..SemanticInfo::default()
+            },
+            diagnostics: declarations.diagnostics,
+        };
+    }
+    if declarations.first_condition.is_some() {
+        return conditional_capabilities::checked_analysis(Checker::new(
+            program,
+            crate::const_eval::evaluate_program_with_diagnostics(program).0,
+            source_texts,
+            compilation_context,
+            compilation_contexts,
+            global_symbols,
+            source_semantic_contexts,
+            test_semantics,
+        ));
+    }
     let mut composition = crate::trait_composition::CompositionPlan::default();
     let mut composition_diagnostics = Vec::new();
     // Validate authored accessor declarations before trait composition.
@@ -1104,6 +1282,14 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let program = &expanded_program;
     let configure_composition = |checker: &mut Checker<'_>| {
         checker.composition = composition.clone();
+        checker
+            .contracts
+            .conditions
+            .extend(composition.conditions.clone());
+        checker
+            .contracts
+            .callable_conditions
+            .extend(composition.callable_conditions.clone());
         checker.contracts.compositions = composition_facts.compositions.clone();
         checker.contracts.member_references = composition_facts.member_references.clone();
         for reference in &composition.adaptation_references {
@@ -1125,86 +1311,34 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     };
     let (const_evaluation, const_diagnostics) =
         crate::const_eval::evaluate_program_with_diagnostics(program);
-    // Discover ambient I/O through the complete direct-call graph before the
-    // diagnostic pass. This preserves forward-call precision without making
-    // source order part of a callable's runtime Error transport.
-    let mut discovery = Checker::new(
-        program,
-        const_evaluation.clone(),
-        source_texts,
-        compilation_context.clone(),
-        compilation_contexts.clone(),
-        global_symbols.clone(),
-        source_semantic_contexts.clone(),
-        test_semantics.clone(),
+    let mut checker = callable_contracts::refined_checker(
+        || {
+            let mut checker = Checker::new(
+                program,
+                const_evaluation.clone(),
+                source_texts,
+                compilation_context.clone(),
+                compilation_contexts.clone(),
+                global_symbols.clone(),
+                source_semantic_contexts.clone(),
+                test_semantics.clone(),
+            );
+            configure_composition(&mut checker);
+            checker
+        },
+        Checker::check,
     );
-    configure_composition(&mut discovery);
-    discovery.check();
-    let mut ambient_effect_seed = discovery.inferred_ambient_effects();
-    let discovery_backing_fields = discovery.property_backing_fields();
-    let discovery_provenance = discovery.prepare_call_provenance(&discovery_backing_fields);
-    let mut callback_ambient_effect_seed = discovery
-        .callback_ambient_effects(&discovery.known_callback_targets(&discovery_provenance));
-    let generated_test_effect_seed = discovery
-        .callable_effective_checked_effects
-        .iter()
-        .filter(|(span, _)| test_semantics.is_generated_function(**span))
-        .map(|(span, effects)| (*span, effects.clone()))
-        .collect::<HashMap<_, _>>();
-
-    // The first pass deliberately over-approximates transitive ambient effects
-    // so forward and recursive calls have checked transport available. Narrow
-    // that seed to the effects which actually escape each callable after local
-    // catch coverage. Repeating to a fixpoint removes stale effects through
-    // arbitrarily deep call chains without making source order observable.
-    loop {
-        let mut refinement = Checker::new(
-            program,
-            const_evaluation.clone(),
-            source_texts,
-            compilation_context.clone(),
-            compilation_contexts.clone(),
-            global_symbols.clone(),
-            source_semantic_contexts.clone(),
-            test_semantics.clone(),
-        );
-        refinement.ambient_effect_seed = ambient_effect_seed.clone();
-        refinement.callback_ambient_effect_seed = callback_ambient_effect_seed.clone();
-        configure_composition(&mut refinement);
-        refinement.generated_test_effect_seed = generated_test_effect_seed.clone();
-        refinement.check();
-        let refined = refinement.escaping_ambient_effects();
-        let backing_fields = refinement.property_backing_fields();
-        let provenance = refinement.prepare_call_provenance(&backing_fields);
-        let refined_callbacks =
-            refinement.callback_ambient_effects(&refinement.known_callback_targets(&provenance));
-        if ambient_effect_maps_equal(&ambient_effect_seed, &refined)
-            && ambient_effect_maps_equal(&callback_ambient_effect_seed, &refined_callbacks)
-        {
-            ambient_effect_seed = refined;
-            callback_ambient_effect_seed = refined_callbacks;
-            break;
-        }
-        ambient_effect_seed = refined;
-        callback_ambient_effect_seed = refined_callbacks;
-    }
-
-    let mut checker = Checker::new(
-        program,
-        const_evaluation,
-        source_texts,
-        compilation_context,
-        compilation_contexts,
-        global_symbols,
-        source_semantic_contexts,
-        test_semantics,
-    );
-    checker.ambient_effect_seed = ambient_effect_seed;
-    checker.callback_ambient_effect_seed = callback_ambient_effect_seed;
-    configure_composition(&mut checker);
-    checker.generated_test_effect_seed = generated_test_effect_seed;
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
+    finish_checked_analysis(checker, authored_program, composition_diagnostics)
+}
+
+fn finish_checked_analysis(
+    mut checker: Checker<'_>,
+    authored_program: &Program,
+    composition_diagnostics: Vec<Diagnostic>,
+) -> SemanticAnalysis {
+    let program = checker.program;
     checker.check_behavioral_arrow_bodies();
     checker.check_attributes();
     checker
@@ -1217,172 +1351,43 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
         ));
     let property_backing_fields = checker.property_backing_fields();
     let mut call_provenance = checker.prepare_call_provenance(&property_backing_fields);
-    let constructor_cleanup_contexts = checker
-        .classes
-        .values()
-        .map(|class| {
-            let parent = class
-                .parent
-                .as_ref()
-                .and_then(|parent| checker.classes.get(&parent.name));
-            let mut inherited_stored_properties = HashSet::new();
-            let mut ancestor = parent;
-            let mut visited = HashSet::new();
-            while let Some(info) = ancestor {
-                if !visited.insert(info.declaration) {
-                    break;
-                }
-                for property in info.properties.values() {
-                    if property.hooks.as_ref().is_some_and(|hooks| {
-                        hooks.storage == Some(crate::property_hooks::PropertyHookStorage::Computed)
-                    }) {
-                        continue;
-                    }
-                    inherited_stored_properties.insert(
-                        property_backing_fields
-                            .get(&property.declaration_span)
-                            .map_or(property.declaration_span, |field| field.declaration),
-                    );
-                }
-                ancestor = info
-                    .parent
-                    .as_ref()
-                    .and_then(|parent| checker.classes.get(&parent.name));
-            }
-            let mut inherited_stored_properties =
-                inherited_stored_properties.into_iter().collect::<Vec<_>>();
-            inherited_stored_properties.sort();
-            (
-                class.declaration,
-                crate::constructor_init::ConstructorCleanupContext {
-                    parent_class: parent.map(|parent| parent.declaration),
-                    parent_constructor: parent
-                        .and_then(|parent| parent.methods.get("__construct"))
-                        .map(|method| method.declaration),
-                    inherited_stored_properties,
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let constructor_analysis = crate::constructor_init::check_program_with_cleanup_context(
-        program,
-        &property_backing_fields,
-        &checker.given_preludes,
-        &checker.checked_effect_sites,
-        &checker.catch_error_types,
-        &checker.catch_coverage,
-        &constructor_cleanup_contexts,
-    );
-    for (span, kind) in constructor_analysis.property_writes {
-        if let Some(write) = checker.property_writes.get_mut(&span) {
-            write.kind = kind;
-        }
-    }
-    checker.diagnostics.extend(constructor_analysis.diagnostics);
-    let inferred_move_returns = checker
-        .function_signatures
-        .iter()
-        .filter_map(|(span_start, signature)| {
-            checker
-                .type_is_move_type(signature.return_ty)
-                .then_some(*span_start)
-        })
-        .collect();
-    let return_borrows = checker
-        .function_signatures
-        .iter()
-        .map(|(span, signature)| (*span, signature.return_borrow))
-        .collect();
-    let move_enum_names = checker
-        .enums
-        .values()
-        .filter(|definition| !definition.capabilities.copy)
-        .map(|definition| definition.name.clone())
-        .collect();
+    let constructor_partial_cleanups =
+        checker.check_constructor_initialization(&property_backing_fields);
     let classes = collect_ordered_class_semantics(program, &mut checker, &property_backing_fields);
-    checker.specialize_conformance_facts(&classes);
     checker.publish_interface_specializations();
     checker.publish_constrained_member_surfaces();
-    let interface_conversion_types = checker
-        .contextual_expression_types
-        .iter()
-        .filter_map(|(span, ty)| {
-            let resolved = checker.types.resolved(*ty);
-            let inner = if let ResolvedType::Nullable(inner) = &resolved {
-                inner.as_ref()
-            } else {
-                &resolved
-            };
-            matches!(inner, ResolvedType::Interface(_)).then_some((*span, resolved))
-        })
-        .collect();
+    let interface_conversion_types = checker.interface_conversion_types();
+    let enum_declarations = collect_ordered_enum_declarations(&checker);
     let enums = collect_ordered_enum_semantics(&checker);
-    let ownership_analysis = crate::ownership::check_program_with_inferred_move_returns(
-        program,
-        &crate::ownership::OwnershipAnalysisContext {
-            inferred_move_returns: &inferred_move_returns,
-            return_borrows: &return_borrows,
-            resolved_types: &checker.expression_types,
-            flow_facts: &checker.flow_facts,
-            move_enum_names: &move_enum_names,
-            given_preludes: &checker.given_preludes,
-            checked_effect_sites: &checker.checked_effect_sites,
-            catch_error_types: &checker.catch_error_types,
-            catch_coverage: &checker.catch_coverage,
-            binding_resolution: &checker.binding_resolution,
-            closures: &checker.closures,
-            callable_value_calls: &checker.callable_value_calls,
-            assertion_callable_invocations: &checker.assertion_callable_invocations,
-            list_algorithm_calls: &checker.list_algorithm_calls,
-            call_targets: &checker.call_targets,
-            property_accessor_calls: &checker.property_accessor_calls,
-            property_writes: &checker.property_writes,
-            matches: &checker.matches,
-            enum_semantics: &enums,
-            enum_case_constructions: &checker.enum_case_constructions,
-            contracts: &checker.contracts,
-            classes: &classes,
-        },
+    let ownership_classes = match checker.callable_body_program {
+        CallableBodyProgram::Expanded(_) => std::borrow::Cow::Borrowed(classes.as_slice()),
+        CallableBodyProgram::Authored(_) => {
+            std::borrow::Cow::Owned(collect_ordered_class_semantics_once(
+                program,
+                &mut checker,
+                &property_backing_fields,
+                ClassFactsPurpose::SourceOwnership,
+            ))
+        }
+    };
+    let ownership_program = checker.callable_body_program();
+    let (specialized_ownership, mut ownership_analysis) = checker.analyze_ownership(
+        ownership_program,
+        &ownership_classes,
+        &enums,
+        &interface_conversion_types,
+        &call_provenance,
+    );
+    checker.check_post_ownership_contracts(
+        &mut ownership_analysis,
+        &mut call_provenance,
+        &constructor_partial_cleanups,
     );
     let cleanup = ownership_analysis.cleanup;
-    let constructor_partial_cleanups = constructor_analysis.partial_cleanups;
     let closure_ownership = ownership_analysis.closures;
     let retained_callables = ownership_analysis.retained_callables;
     let return_borrows = ownership_analysis.return_borrows;
-    // Return-loan inference determines local carrier ownership. Publish those
-    // canonical facts so every consumer agrees with the ownership checker.
-    for (binding, ownership) in ownership_analysis.binding_ownership {
-        if let Some(declaration) = checker
-            .binding_resolution
-            .declarations_by_id
-            .get_mut(&binding)
-        {
-            declaration.ownership = ownership;
-        }
-    }
-    let mut accessor_calls = std::mem::take(&mut checker.property_accessor_calls);
-    for calls in accessor_calls.values_mut() {
-        if let Some(getter) = &mut calls.getter {
-            let result = checker.types.intern_resolved(&getter.return_type);
-            if !checker.type_is_move_type(result) {
-                getter.return_borrow = None;
-            } else if !matches!(
-                getter.declaring_type,
-                ResolvedType::Interface(_) | ResolvedType::TypeParameter(_)
-            ) {
-                getter.return_borrow = return_borrows.get(&getter.declaration).copied();
-            }
-        }
-    }
-    checker.property_accessor_calls = accessor_calls;
-    checker.check_nonblocking_property_hooks(
-        &mut call_provenance,
-        &cleanup,
-        &constructor_partial_cleanups,
-    );
-    checker.diagnostics.extend(ownership_analysis.diagnostics);
-    checker.check_property_hook_return_contracts(&return_borrows);
-    checker.invalidate_erroneous_compositions();
+    let writable_borrow_sources = ownership_analysis.writable_borrow_sources;
     let class_hierarchy = collect_class_hierarchy_semantics(&checker);
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let property_families = collect_property_family_semantics(&checker);
@@ -1410,7 +1415,8 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
                 })
         })
         .collect::<HashSet<_>>();
-    let class_member_surfaces = checker.collect_class_member_surfaces(&classes, &return_borrows);
+    let (class_member_surfaces, class_member_availability) =
+        checker.collect_class_member_surfaces(&classes, &return_borrows);
     let trait_adaptation_surfaces = checker.collect_trait_adaptation_surfaces();
     let callable_signatures = checker
         .function_signatures
@@ -1464,6 +1470,43 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             }
         }
     }
+    let callable_admissions = checker.checked_callable_admissions();
+    let member_declarations = callable_contracts::member_declarations(program);
+    let virtual_dispatch = if checker
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == crate::diagnostics::DiagnosticSeverity::Error)
+    {
+        virtual_dispatch::Plan::Unprepared
+    } else {
+        match virtual_dispatch::collect(&member_declarations, &checker, &classes, &method_hierarchy)
+        {
+            Ok(plan) => plan,
+            Err(diagnostics) => {
+                checker.diagnostics.extend(diagnostics);
+                virtual_dispatch::Plan::Unprepared
+            }
+        }
+    };
+    let interface_witnesses = if checker
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == crate::diagnostics::DiagnosticSeverity::Error)
+    {
+        interface_witnesses::Plan::Unprepared
+    } else {
+        match interface_witnesses::collect(&member_declarations, &classes, &checker.contracts) {
+            Ok(plan) => plan,
+            Err(diagnostics) => {
+                checker.diagnostics.extend(diagnostics);
+                interface_witnesses::Plan::Unprepared
+            }
+        }
+    };
+    conditional_capabilities::remove_source_view_conditions(
+        &mut checker.contracts,
+        &checker.composition,
+    );
     let mut analysis = SemanticAnalysis {
         info: SemanticInfo {
             compilation_context: checker.compilation_context,
@@ -1473,6 +1516,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             contracts: checker.contracts,
             composition: checker.composition,
             class_member_surfaces,
+            class_member_availability,
             trait_adaptation_surfaces,
             composition_rename: composition_rename::CompositionRenameFacts::default(),
             test_semantics: checker.test_semantics,
@@ -1493,6 +1537,12 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             retained_callables,
+            specialized_ownership,
+            specialized_return_borrows: checker.specialized_return_borrow_seed,
+            callable_admissions,
+            generic_call_graph: checker.generic_call_graph,
+            virtual_dispatch,
+            interface_witnesses,
             cleanup,
             constructor_partial_cleanups,
             method_hierarchy,
@@ -1510,12 +1560,16 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             core_operation_calls: checker.core_operation_calls,
             classes,
             class_hierarchy,
+            enum_declarations,
             enums,
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
             return_borrows,
+            writable_borrow_sources,
             flow_facts: checker.flow_facts,
             callable_effective_checked_effects: checker.callable_effective_checked_effects,
+            virtual_ambient_checked_effects: checker.ambient_effect_seed.virtual_calls,
+            exact_method_calls: checker.exact_method_calls,
             callable_signatures,
             checked_effect_sites: checker.checked_effect_sites,
             throw_error_types: checker.throw_error_types,
@@ -1552,8 +1606,43 @@ fn ambient_effect_maps_equal(
         })
 }
 
-fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
+fn collect_ordered_enum_declarations(checker: &Checker<'_>) -> Vec<EnumDeclarationSemanticInfo> {
     let mut enums = checker.enums.values().cloned().collect::<Vec<_>>();
+    enums.sort_by_key(|definition| definition.source_type.id);
+    enums
+        .into_iter()
+        .map(|definition| EnumDeclarationSemanticInfo {
+            source_type: definition
+                .source_type
+                .map_arguments(|argument| checker.types.resolved(*argument)),
+            declaration: definition.span,
+            name_span: definition.name_span,
+            backing_type: definition.backing_type,
+            cases: definition
+                .cases
+                .into_iter()
+                .map(|case| EnumCaseDeclarationSemanticInfo {
+                    name: case.name,
+                    declaration: case.span,
+                    name_span: case.name_span,
+                    backing_value: case.backing_value,
+                    payload: case
+                        .payload
+                        .into_iter()
+                        .map(|field| EnumPayloadSemanticInfo {
+                            name: field.name,
+                            ty: checker.types.resolved(field.ty),
+                            declaration: field.span,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
+    let mut enums = checker.enum_instances.values().cloned().collect::<Vec<_>>();
     enums.sort_by_key(|definition| definition.id);
     enums
         .into_iter()
@@ -1562,6 +1651,11 @@ fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo
             EnumSemanticInfo {
                 id: definition.id,
                 name: definition.name,
+                source_type: definition
+                    .source_type
+                    .map_arguments(|argument| checker.types.resolved(*argument)),
+                declaration: definition.span,
+                name_span: definition.name_span,
                 backing_type: definition.backing_type,
                 cases: definition
                     .cases
@@ -1569,6 +1663,8 @@ fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo
                     .map(|case| EnumCaseSemanticInfo {
                         id: case.id,
                         name: case.name,
+                        declaration: case.span,
+                        name_span: case.name_span,
                         tag: case.tag,
                         backing_value: case.backing_value,
                         payload: case
@@ -1577,6 +1673,7 @@ fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo
                             .map(|field| EnumPayloadSemanticInfo {
                                 name: field.name,
                                 ty: checker.types.resolved(field.ty),
+                                declaration: field.span,
                             })
                             .collect(),
                     })
@@ -1599,7 +1696,7 @@ fn collect_method_hierarchy_semantics(
         .classes
         .iter()
         .flat_map(|(class_name, class)| {
-            class.methods.iter().map(move |(method_name, method)| {
+            let methods = class.methods.iter().map(move |(method_name, method)| {
                 (
                     method.declaration,
                     MethodHierarchySemanticInfo {
@@ -1618,7 +1715,51 @@ fn collect_method_hierarchy_semantics(
                         is_static: method.is_static,
                     },
                 )
-            })
+            });
+            let accessors = class
+                .properties
+                .iter()
+                .map(|(name, property)| (name, property.access, property.hooks.as_ref(), false))
+                .chain(
+                    class.static_properties.iter().map(|(name, property)| {
+                        (name, property.access, property.hooks.as_ref(), true)
+                    }),
+                )
+                .flat_map(move |(name, access, hooks, is_static)| {
+                    hooks.into_iter().flat_map(move |hooks| {
+                        [
+                            (crate::ast::PropertyHookKind::Get, hooks.getter),
+                            (crate::ast::PropertyHookKind::Set, hooks.setter),
+                        ]
+                        .into_iter()
+                        .filter_map(move |(kind, accessor)| {
+                            let accessor = accessor?;
+                            Some((
+                                accessor.declaration,
+                                MethodHierarchySemanticInfo {
+                                    declaring_class: class_name.clone(),
+                                    name: crate::property_hooks::accessor_name(name, kind),
+                                    declaration: accessor.declaration,
+                                    is_open: hooks.is_open,
+                                    is_override: hooks.is_override,
+                                    virtual_root: checker
+                                        .override_roots
+                                        .get(&accessor.declaration)
+                                        .copied()
+                                        .or_else(|| hooks.is_open.then_some(accessor.declaration)),
+                                    overridden_declaration: checker
+                                        .overridden_declarations
+                                        .get(&accessor.declaration)
+                                        .copied(),
+                                    access,
+                                    receiver_mode: (!is_static).then_some(accessor.receiver_mode),
+                                    is_static,
+                                },
+                            ))
+                        })
+                    })
+                });
+            methods.chain(accessors)
         })
         .collect()
 }
@@ -1711,19 +1852,58 @@ fn collect_class_hierarchy_semantics(
         .collect()
 }
 
+fn collect_concrete_instances(program: &Program, checker: &mut Checker<'_>) {
+    let mut expanded_nominals = HashSet::new();
+    loop {
+        let previous_count = checker.class_instantiations.len() + checker.enum_instantiations.len();
+        collect_callable_nominal_instantiations(program, checker);
+        instantiation::expand_nominal_instantiations(checker, &mut expanded_nominals);
+        if checker.class_instantiations.len() + checker.enum_instantiations.len() == previous_count
+        {
+            break;
+        }
+    }
+    checker.finalize_enum_metadata();
+    checker.check_pending_class_conformances();
+}
+
 fn collect_ordered_class_semantics(
     program: &Program,
     checker: &mut Checker<'_>,
     backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
 ) -> Vec<ClassSemanticInfo> {
-    let mut expanded_classes = HashSet::new();
     loop {
-        let previous_count = checker.class_instantiations.len();
-        collect_callable_class_instantiations(program, checker);
-        expand_class_instantiations(program, checker, &mut expanded_classes);
-        if checker.class_instantiations.len() == previous_count {
-            break;
+        let classes = collect_ordered_class_semantics_once(
+            program,
+            checker,
+            backing_fields,
+            ClassFactsPurpose::Execution,
+        );
+        let count = checker.class_instantiations.len();
+        checker.specialize_conformance_facts(&classes);
+        collect_concrete_instances(program, checker);
+        if checker.class_instantiations.len() == count {
+            checker.check_pending_class_conformances();
+            return classes;
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassFactsPurpose {
+    Execution,
+    // Source storage identities do not select executable conformance witnesses.
+    SourceOwnership,
+}
+
+fn collect_ordered_class_semantics_once(
+    program: &Program,
+    checker: &mut Checker<'_>,
+    backing_fields: &HashMap<Span, crate::property_hooks::PropertyBackingField>,
+    purpose: ClassFactsPurpose,
+) -> Vec<ClassSemanticInfo> {
+    if purpose == ClassFactsPurpose::Execution {
+        collect_concrete_instances(program, checker);
     }
 
     let mut instances = checker
@@ -1747,8 +1927,10 @@ fn collect_ordered_class_semantics(
                 .collect::<Vec<_>>(),
         )
     });
-    if !checker.pending_relational_comparisons.is_empty()
-        || !checker.core_operation_calls.is_empty()
+
+    if purpose == ClassFactsPurpose::Execution
+        && (!checker.pending_relational_comparisons.is_empty()
+            || !checker.core_operation_calls.is_empty())
     {
         for instance in &instances {
             if let Some(declaration) = checker
@@ -1757,7 +1939,16 @@ fn collect_ordered_class_semantics(
                 .map(|class| class.declaration)
             {
                 let substitutions = checker.class_type_substitutions(instance);
-                checker.check_specialized_core_operations(declaration, &substitutions);
+                let body = callable_contracts::BodyInstance::new(
+                    checker.callable_body_program,
+                    declaration,
+                    substitutions
+                        .iter()
+                        .map(|(name, ty)| (name.clone(), checker.types.resolved(*ty)))
+                        .collect(),
+                    &checker.composition,
+                );
+                checker.check_specialized_core_operations(&body);
             }
         }
     }
@@ -1774,6 +1965,19 @@ fn collect_ordered_class_semantics(
         };
         let mut instances = if declaration.type_params.is_empty() {
             vec![ClassType::new(declaration.name.clone(), Vec::new())]
+        } else if purpose == ClassFactsPurpose::SourceOwnership {
+            vec![ClassType::new(
+                &declaration.name,
+                declaration
+                    .type_params
+                    .iter()
+                    .map(|parameter| {
+                        checker
+                            .types
+                            .intern(TypeKind::TypeParameter(parameter.name.clone()))
+                    })
+                    .collect(),
+            )]
         } else {
             concrete_instances
                 .iter()
@@ -1818,12 +2022,9 @@ fn collect_ordered_class_semantics(
                         .members
                         .iter()
                         .filter_map(|member| match member {
-                            ClassMember::Property(property) if !property.is_static => Some((
-                                hierarchy_class.name.clone(),
-                                property.name.clone(),
-                                property.writable,
-                                false,
-                            )),
+                            ClassMember::Property(property) if !property.is_static => {
+                                Some((hierarchy_class.name.clone(), property.name.clone(), false))
+                            }
                             ClassMember::Property(_)
                             | ClassMember::Method(_)
                             | ClassMember::Constant(_)
@@ -1840,12 +2041,7 @@ fn collect_ordered_class_semantics(
                                     .iter()
                                     .filter(|param| param.constructor_role.is_promoted())
                                     .map(|param| {
-                                        (
-                                            hierarchy_class.name.clone(),
-                                            param.name.clone(),
-                                            param.writable,
-                                            true,
-                                        )
+                                        (hierarchy_class.name.clone(), param.name.clone(), true)
                                     }),
                             ),
                             _ => None,
@@ -1854,7 +2050,9 @@ fn collect_ordered_class_semantics(
                 if let Some(promoted) = promoted {
                     declared.extend(promoted);
                 }
-                for (declaring_class, name, writable, promoted) in declared {
+                // Slot writability comes from the checked property: a retained
+                // source is bound once even when its access is writable.
+                for (declaring_class, name, promoted) in declared {
                     let Some(property) = hierarchy_info.properties.get(&name) else {
                         continue;
                     };
@@ -1871,20 +2069,21 @@ fn collect_ordered_class_semantics(
                         declaring_class,
                         name,
                         checker.types.resolved(ty),
-                        writable,
+                        property.writable,
                         promoted,
                         property.borrowed_source,
                     ));
                 }
             }
             let class_type_id = checker.types.intern(TypeKind::Class(instance.clone()));
-            let mut builtin_interfaces = hierarchy
-                .iter()
-                .filter_map(|class| checker.classes.get(&class.name))
-                .flat_map(|class| class.builtin_interfaces.iter().copied())
-                .collect::<Vec<_>>();
-            builtin_interfaces.sort();
-            builtin_interfaces.dedup();
+            let builtin_interfaces = if purpose == ClassFactsPurpose::Execution {
+                [BuiltinInterface::Displayable, BuiltinInterface::Error]
+                    .into_iter()
+                    .filter(|interface| checker.type_implements_builtin(class_type_id, *interface))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             classes.push(ClassSemanticInfo {
                 id,
                 declaration_name: declaration.name.clone(),
@@ -1964,6 +2163,17 @@ impl SemanticCallableInstance {
     fn substitutions(&self) -> HashMap<String, TypeId> {
         self.bindings.iter().cloned().collect()
     }
+
+    fn resolved(&self, types: &TypeRegistry) -> callable_contracts::Instance {
+        callable_contracts::Instance::new(
+            self.declaration,
+            &self
+                .bindings
+                .iter()
+                .map(|(name, ty)| (name.clone(), types.resolved(*ty)))
+                .collect(),
+        )
+    }
 }
 
 fn enqueue_callable_instance(
@@ -1972,8 +2182,9 @@ fn enqueue_callable_instance(
     instances: &mut Vec<SemanticCallableInstance>,
     parents: &mut Vec<Option<usize>>,
     ids: &mut HashMap<SemanticCallableInstance, usize>,
+    checker: &mut Checker<'_>,
 ) {
-    if ids.contains_key(&instance) {
+    if ids.contains_key(&instance) || !checker.callable_instance_available(&instance) {
         return;
     }
     let index = instances.len();
@@ -1982,8 +2193,256 @@ fn enqueue_callable_instance(
     parents.push(parent);
 }
 
-fn collect_callable_class_instantiations(program: &Program, checker: &mut Checker<'_>) {
-    let mut declarations = HashMap::new();
+fn interface_callable_instances(
+    span: Span,
+    parameters: &[TypeParamInfo],
+    bindings: &HashMap<String, TypeId>,
+    body: &callable_contracts::BodyInstance,
+    checker: &mut Checker<'_>,
+) -> Option<(Vec<SemanticCallableInstance>, InterfaceGenericCall)> {
+    let CallableTarget::InterfaceMethod {
+        interface,
+        requirement,
+        method_name,
+    } = checker
+        .call_targets
+        .get(&span)?
+        .specialize(|ty| body.substitute(ty))?
+    else {
+        return None;
+    };
+    let arguments = parameters
+        .iter()
+        .map(|parameter| bindings.get(&parameter.name).copied())
+        .collect::<Option<Vec<_>>>()?;
+    let call = InterfaceGenericCall {
+        interface: interface.clone(),
+        requirement,
+        arguments: arguments
+            .iter()
+            .map(|argument| GenericArgument::Type(checker.types.resolved(*argument)))
+            .collect(),
+    };
+    let implementations = checker
+        .contracts
+        .method_implementations(&interface, requirement)
+        .filter_map(|(ty, declaration)| match (ty, declaration) {
+            (ResolvedType::Class(class), Some(declaration)) => Some((class.clone(), declaration)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut instances = Vec::new();
+    for (class, declaration) in implementations {
+        let class = ClassType::new(
+            class.name,
+            class
+                .arguments
+                .iter()
+                .map(|argument| checker.types.intern_resolved(argument))
+                .collect(),
+        );
+        let Some((_, method)) = checker.lookup_instance_method(&class, &method_name) else {
+            continue;
+        };
+        if method.declaration != declaration || method.type_params.len() != arguments.len() {
+            continue;
+        }
+        let mut bindings = method.enclosing_type_bindings;
+        bindings.extend(
+            method
+                .type_params
+                .iter()
+                .zip(&arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), *argument)),
+        );
+        instances.push(SemanticCallableInstance::new(declaration, bindings));
+    }
+    Some((instances, call))
+}
+
+fn virtual_callable_instances(
+    span: Span,
+    parameters: &[TypeParamInfo],
+    bindings: &HashMap<String, TypeId>,
+    body: &callable_contracts::BodyInstance,
+    checker: &mut Checker<'_>,
+) -> Option<Vec<SemanticCallableInstance>> {
+    if checker
+        .method_call_targets
+        .get(&span)
+        .is_some_and(|method| {
+            checker
+                .exact_method_calls
+                .contains(&(span, method.declaration))
+        })
+    {
+        return None;
+    }
+    let (receiver, name) = match checker.call_targets.get(&span)? {
+        CallableTarget::Method {
+            method_name,
+            direct_parent: false,
+            ..
+        } => (checker.method_receiver_types.get(&span)?, method_name),
+        CallableTarget::ConstrainedMethod {
+            receiver,
+            method_name,
+            ..
+        } => (receiver, method_name),
+        _ => return None,
+    };
+    let ResolvedType::Class(receiver) = body.substitute(receiver) else {
+        return None;
+    };
+    let name = name.clone();
+    let receiver = ClassType::new(
+        receiver.name,
+        receiver
+            .arguments
+            .iter()
+            .map(|argument| checker.types.intern_resolved(argument))
+            .collect(),
+    );
+    let (_, selected) = checker.lookup_instance_method(&receiver, &name)?;
+    let root = selected.virtual_root?;
+    let arguments = parameters
+        .iter()
+        .map(|parameter| bindings.get(&parameter.name).copied())
+        .collect::<Option<Vec<_>>>()?;
+    let mut candidates = std::iter::once(receiver.clone())
+        .chain(checker.class_instantiations.iter().cloned())
+        .filter(|class| {
+            !class
+                .arguments
+                .iter()
+                .any(|argument| checker.type_is_symbolic(*argument))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|class| {
+        (
+            class.name.clone(),
+            class
+                .arguments
+                .iter()
+                .map(|argument| checker.types.resolved(*argument))
+                .collect::<Vec<_>>(),
+        )
+    });
+    candidates.dedup();
+    let mut instances = Vec::new();
+    for candidate in candidates {
+        if !checker.class_is_subtype(&candidate, &receiver) {
+            continue;
+        }
+        let Some((_, method)) = checker.lookup_instance_method(&candidate, &name) else {
+            continue;
+        };
+        if method.virtual_root != Some(root) || method.type_params.len() != arguments.len() {
+            continue;
+        }
+        let mut bindings = method.enclosing_type_bindings;
+        bindings.extend(
+            method
+                .type_params
+                .iter()
+                .zip(&arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), *argument)),
+        );
+        let instance = SemanticCallableInstance::new(method.declaration, bindings);
+        if !instances.contains(&instance) {
+            instances.push(instance);
+        }
+    }
+    Some(instances)
+}
+
+fn resolve_generic_callable_instances(
+    span: Span,
+    pending: &PendingGenericCall,
+    body: &callable_contracts::BodyInstance,
+    checker: &mut Checker<'_>,
+) -> (Vec<SemanticCallableInstance>, Option<InterfaceGenericCall>) {
+    let declaration = pending.declaration;
+    let pending = &pending.inference;
+    let mut bindings = pending
+        .bindings
+        .iter()
+        .map(|(name, ty)| (name.clone(), body.substitute_id(*ty, &mut checker.types)))
+        .collect::<HashMap<_, _>>();
+    if bindings
+        .values()
+        .any(|argument| checker.type_is_symbolic(*argument))
+    {
+        return (Vec::new(), None);
+    }
+    if let Some((targets, interface)) =
+        interface_callable_instances(span, &pending.type_params, &bindings, body, checker)
+    {
+        return (targets, Some(interface));
+    }
+    if let Some(targets) =
+        virtual_callable_instances(span, &pending.type_params, &bindings, body, checker)
+    {
+        return (targets, None);
+    }
+    let declaration = if matches!(
+        checker.call_targets.get(&span),
+        Some(CallableTarget::ConstrainedMethod { .. })
+    ) {
+        let Some(method) = checker.specialize_constrained_method(span, body) else {
+            return (Vec::new(), None);
+        };
+        let Some(arguments) = pending
+            .type_params
+            .iter()
+            .map(|parameter| bindings.get(&parameter.name).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return (Vec::new(), None);
+        };
+        bindings = method.enclosing_type_bindings;
+        bindings.extend(
+            method
+                .type_params
+                .iter()
+                .zip(arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), argument)),
+        );
+        method.declaration
+    } else {
+        declaration
+    };
+    (
+        vec![SemanticCallableInstance::new(declaration, bindings)],
+        None,
+    )
+}
+
+fn record_generic_call(
+    caller: Option<callable_contracts::Instance>,
+    site: Span,
+    targets: &[SemanticCallableInstance],
+    interface: Option<InterfaceGenericCall>,
+    checker: &mut Checker<'_>,
+) {
+    let targets = targets
+        .iter()
+        .map(|target| target.resolved(&checker.types))
+        .collect();
+    checker.generic_call_graph.record(
+        caller,
+        callable_contracts::GenericCall {
+            site,
+            targets,
+            interface,
+        },
+    );
+}
+
+fn collect_callable_nominal_instantiations(program: &Program, checker: &mut Checker<'_>) {
+    checker.generic_call_graph = GenericCallGraph::begin();
+    checker.generic_call_graph.scope(None);
+    let mut declarations = std::collections::BTreeMap::new();
     for item in &program.items {
         match item {
             Item::Function(function) => {
@@ -2023,6 +2482,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
                     &mut instances,
                     &mut parents,
                     &mut ids,
+                    checker,
                 );
             }
             Some(class) if class.type_params.is_empty() => {
@@ -2032,10 +2492,11 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
                     &mut instances,
                     &mut parents,
                     &mut ids,
+                    checker,
                 );
             }
             Some(class) => {
-                let concrete_classes = checker
+                let mut concrete_classes = checker
                     .class_instantiations
                     .iter()
                     .filter(|instance| {
@@ -2047,6 +2508,13 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                concrete_classes.sort_by_key(|class| {
+                    class
+                        .arguments
+                        .iter()
+                        .map(|argument| checker.types.resolved(*argument))
+                        .collect::<Vec<_>>()
+                });
                 for instance in concrete_classes {
                     enqueue_callable_instance(
                         SemanticCallableInstance::new(
@@ -2057,6 +2525,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
                         &mut instances,
                         &mut parents,
                         &mut ids,
+                        checker,
                     );
                 }
             }
@@ -2071,26 +2540,106 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
         .collect::<Vec<_>>();
     calls.sort_by_key(|(span, _)| *span);
     for (span, pending) in &calls {
-        if matches!(
-            checker.call_targets.get(span),
-            Some(CallableTarget::ConstrainedMethod { .. })
-        ) {
-            continue;
-        }
-        if pending
-            .bindings
-            .values()
-            .any(|argument| checker.type_is_symbolic(*argument))
+        if checker
+            .function_signatures
+            .keys()
+            .any(|declaration| declaration.contains(*span))
         {
             continue;
         }
-        enqueue_callable_instance(
-            SemanticCallableInstance::new(pending.declaration, pending.bindings.clone()),
-            None,
-            &mut instances,
-            &mut parents,
-            &mut ids,
+        if program.items.iter().any(|item| matches!(item, Item::Class(class) if class.members.iter().any(|member|
+            matches!(member, ClassMember::Property(property) if property.initializer.as_ref().is_some_and(|initializer| initializer.span().contains(*span)))))) {
+            continue;
+        }
+        let body = callable_contracts::BodyInstance::new(
+            CallableBodyProgram::Expanded(program),
+            *span,
+            HashMap::new(),
+            &checker.composition,
         );
+        let (targets, interface) =
+            resolve_generic_callable_instances(*span, pending, &body, checker);
+        record_generic_call(None, *span, &targets, interface, checker);
+        for target in targets {
+            enqueue_callable_instance(
+                target,
+                None,
+                &mut instances,
+                &mut parents,
+                &mut ids,
+                checker,
+            );
+        }
+    }
+
+    for item in &program.items {
+        let Item::Class(class) = item else {
+            continue;
+        };
+        let mut owners = if class.type_params.is_empty() {
+            vec![ClassType::new(class.name.clone(), Vec::new())]
+        } else {
+            checker
+                .class_instantiations
+                .iter()
+                .filter(|owner| {
+                    owner.name == class.name
+                        && !owner
+                            .arguments
+                            .iter()
+                            .any(|argument| checker.type_is_symbolic(*argument))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        owners.sort_by_key(|owner| {
+            owner
+                .arguments
+                .iter()
+                .map(|argument| checker.types.resolved(*argument))
+                .collect::<Vec<_>>()
+        });
+        for owner in owners {
+            let bindings = checker.class_type_substitutions(&owner);
+            let resolved = bindings
+                .iter()
+                .map(|(name, ty)| (name.clone(), checker.types.resolved(*ty)))
+                .collect();
+            let key = callable_contracts::Instance::new(class.span, &resolved);
+            checker.generic_call_graph.scope(Some(key.clone()));
+            let body = callable_contracts::BodyInstance::new(
+                CallableBodyProgram::Expanded(program),
+                class.span,
+                resolved,
+                &checker.composition,
+            );
+            for member in &class.members {
+                let ClassMember::Property(property) = member else {
+                    continue;
+                };
+                let Some(initializer) = &property.initializer else {
+                    continue;
+                };
+                for (span, pending) in &calls {
+                    if !initializer.span().contains(*span) {
+                        continue;
+                    }
+                    let (targets, interface) =
+                        resolve_generic_callable_instances(*span, pending, &body, checker);
+                    record_generic_call(Some(key.clone()), *span, &targets, interface, checker);
+                    for target in targets {
+                        enqueue_callable_instance(
+                            target,
+                            None,
+                            &mut instances,
+                            &mut parents,
+                            &mut ids,
+                            checker,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let mut cursor = 0;
@@ -2098,136 +2647,118 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
         let instance_index = cursor;
         let instance = instances[cursor].clone();
         cursor += 1;
-        let Some((function, _)) = declarations.get(&instance.declaration) else {
+        let Some((function, owner)) = declarations.get(&instance.declaration) else {
             continue;
         };
         let substitutions = instance.substitutions();
-        checker.check_specialized_core_operations(function.span, &substitutions);
+        let body = callable_contracts::BodyInstance::new(
+            checker.callable_body_program,
+            instance.declaration,
+            substitutions
+                .iter()
+                .map(|(name, ty)| (name.clone(), checker.types.resolved(*ty)))
+                .collect(),
+            &checker.composition,
+        );
+        let caller = instance.resolved(&checker.types);
+        checker.generic_call_graph.scope(Some(caller.clone()));
+        let owner = owner.and_then(|owner| {
+            Some(ClassType::new(
+                &owner.name,
+                owner
+                    .type_params
+                    .iter()
+                    .map(|parameter| substitutions.get(&parameter.name).copied())
+                    .collect::<Option<Vec<_>>>()?,
+            ))
+        });
+        let owner = owner.map(instantiation::NominalInstance::Class);
+        if let Some(owner) = &owner {
+            checker.materialize_nominal_dependency(None, owner.clone(), function.span);
+        }
+        checker.check_specialized_core_operations(&body);
+        checker.check_specialized_callable_coherence(&body);
         let constrained_calls = checker
             .call_targets
             .iter()
             .filter_map(|(span, target)| {
-                (function.span.contains(*span)
+                (body.declaration.contains(*span)
                     && matches!(target, CallableTarget::ConstrainedMethod { .. }))
                 .then_some(*span)
             })
             .collect::<Vec<_>>();
         for span in constrained_calls {
-            checker.specialize_constrained_method(span, &substitutions);
+            checker.specialize_constrained_method(span, &body);
         }
-        checker.specialize_constrained_property_accessors(function.span, &substitutions);
+        checker.specialize_constrained_property_accessors(&body);
 
         if let Some(templates) = checker
-            .callable_class_instantiation_templates
-            .get(&instance.declaration)
+            .callable_nominal_instantiation_templates
+            .get(&body.declaration)
             .cloned()
         {
+            let mut templates = templates.into_iter().collect::<Vec<_>>();
+            templates.sort_by_key(|template| template.resolved(&checker.types));
             for template in templates {
-                let arguments = template
-                    .arguments
-                    .iter()
-                    .map(|argument| checker.substitute_type_id(*argument, &substitutions))
-                    .collect::<Vec<_>>();
-                if arguments
-                    .iter()
-                    .any(|argument| checker.type_is_symbolic(*argument))
-                {
-                    continue;
-                }
-                let class = ClassType::new(template.name, arguments);
-                checker.check_concrete_class_constraints(&class, function.span);
-                checker.class_instantiations.insert(class);
+                let specialized = template
+                    .map_arguments(|argument| body.substitute_id(*argument, &mut checker.types));
+                checker.materialize_nominal_dependency(owner.as_ref(), specialized, function.span);
             }
         }
 
         for (span, pending) in &calls {
-            if !function.span.contains(*span) {
+            if !body.declaration.contains(*span) {
                 continue;
             }
-            let mut bindings = pending
-                .bindings
-                .iter()
-                .map(|(name, ty)| {
-                    (
-                        name.clone(),
-                        checker.substitute_type_id(*ty, &substitutions),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            if bindings
-                .values()
-                .any(|argument| checker.type_is_symbolic(*argument))
-            {
-                continue;
-            }
-            let declaration = if matches!(
-                checker.call_targets.get(span),
-                Some(CallableTarget::ConstrainedMethod { .. })
-            ) {
-                let Some(method) = checker.specialize_constrained_method(*span, &substitutions)
-                else {
-                    continue;
-                };
-                let arguments = pending
-                    .type_params
-                    .iter()
-                    .map(|parameter| bindings.get(&parameter.name).copied())
-                    .collect::<Option<Vec<_>>>();
-                let Some(arguments) = arguments else {
-                    continue;
-                };
-                bindings = method.enclosing_type_bindings.clone();
-                bindings.extend(
-                    method
-                        .type_params
-                        .iter()
-                        .zip(arguments)
-                        .map(|(parameter, argument)| (parameter.name.clone(), argument)),
-                );
-                method.declaration
+            let (targets, interface) =
+                resolve_generic_callable_instances(*span, pending, &body, checker);
+            let site = if body.declaration.expansion != instance.declaration.expansion {
+                span.in_expansion(instance.declaration.expansion)
             } else {
-                pending.declaration
+                *span
             };
-            let target = SemanticCallableInstance::new(declaration, bindings);
-            if ids.contains_key(&target) {
-                continue;
-            }
-            if callable_specialization_expands_recursively(
-                &instances,
-                &parents,
-                instance_index,
-                &target,
-                &checker.types,
-            ) {
-                let name = declarations
-                    .get(&target.declaration)
-                    .map(|(function, _)| function.name.as_str())
-                    .unwrap_or(pending.callee.as_str());
-                let message = format!(
+            record_generic_call(Some(caller.clone()), site, &targets, interface, checker);
+            for target in targets {
+                if ids.contains_key(&target) || !checker.callable_instance_available(&target) {
+                    continue;
+                }
+                if callable_specialization_expands_recursively(
+                    &instances,
+                    &parents,
+                    instance_index,
+                    &target,
+                    &checker.types,
+                ) {
+                    let name = declarations
+                        .get(&target.declaration)
+                        .map(|(function, _)| function.name.as_str())
+                        .unwrap_or(pending.inference.callee.as_str());
+                    let message = format!(
                     "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
                 );
-                if !checker
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
-                {
-                    checker.diagnostics.push(
+                    if !checker.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "E0539" && diagnostic.message == message
+                    }) {
+                        checker.diagnostics.push(
                         Diagnostic::new("E0539", message, *span).with_help(
                             "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
                         ),
                     );
+                    }
+                    continue;
                 }
-                continue;
+                enqueue_callable_instance(
+                    target,
+                    Some(instance_index),
+                    &mut instances,
+                    &mut parents,
+                    &mut ids,
+                    checker,
+                );
             }
-            enqueue_callable_instance(
-                target,
-                Some(instance_index),
-                &mut instances,
-                &mut parents,
-                &mut ids,
-            );
         }
     }
+    checker.callable_instances = instances;
 }
 
 fn callable_specialization_expands_recursively(
@@ -2268,148 +2799,6 @@ fn callable_specialization_complexity(
         .sum()
 }
 
-fn expand_class_instantiations(
-    program: &Program,
-    checker: &mut Checker<'_>,
-    expanded: &mut HashSet<ClassType<TypeId>>,
-) {
-    let mut instances = checker
-        .class_instantiations
-        .iter()
-        .filter(|class| {
-            !expanded.contains(*class)
-                && !class
-                    .arguments
-                    .iter()
-                    .any(|argument| checker.type_is_symbolic(*argument))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut parents = vec![None; instances.len()];
-    let mut ids = checker
-        .class_instantiations
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut cursor = 0;
-    while cursor < instances.len() {
-        let instance_index = cursor;
-        let instance = instances[cursor].clone();
-        cursor += 1;
-        expanded.insert(instance.clone());
-        let instance_span = program
-            .items
-            .iter()
-            .find_map(|item| match item {
-                Item::Class(class) if class.name == instance.name => Some(class.span),
-                _ => None,
-            })
-            .unwrap_or_default();
-        checker.check_specialized_class_shared_payloads(&instance, instance_span);
-        let mut templates = checker
-            .class_instantiation_templates
-            .get(&instance.name)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(parent) = checker
-            .classes
-            .get(&instance.name)
-            .and_then(|class| class.parent.clone())
-        {
-            templates.insert(parent);
-        }
-        let substitutions = checker.class_type_substitutions(&instance);
-        for template in templates {
-            let arguments = template
-                .arguments
-                .iter()
-                .map(|argument| checker.substitute_type_id(*argument, &substitutions))
-                .collect::<Vec<_>>();
-            if arguments
-                .iter()
-                .any(|argument| checker.type_is_symbolic(*argument))
-            {
-                continue;
-            }
-            let specialized = ClassType::new(template.name, arguments);
-            if ids.contains(&specialized) {
-                continue;
-            }
-            let span = program
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    Item::Class(class) if class.name == specialized.name => Some(class.span),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if class_specialization_expands_recursively(
-                &instances,
-                &parents,
-                instance_index,
-                &specialized,
-                &checker.types,
-            ) {
-                let message = format!(
-                    "generic specialization of class `{}` recursively expands its type arguments and has no finite monomorphization",
-                    specialized.name
-                );
-                if !checker
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
-                {
-                    checker.diagnostics.push(
-                        Diagnostic::new("E0539", message, span).with_help(
-                            "keep recursive class references at the same concrete type, or move the type-changing step outside the recursive class",
-                        ),
-                    );
-                }
-                continue;
-            }
-            checker.check_concrete_class_constraints(&specialized, span);
-            ids.insert(specialized.clone());
-            checker.class_instantiations.insert(specialized.clone());
-            instances.push(specialized);
-            parents.push(Some(instance_index));
-        }
-    }
-}
-
-fn class_specialization_expands_recursively(
-    instances: &[ClassType<TypeId>],
-    parents: &[Option<usize>],
-    current: usize,
-    target: &ClassType<TypeId>,
-    types: &TypeRegistry,
-) -> bool {
-    let mut matching_ancestors = Vec::new();
-    let mut cursor = Some(current);
-    while let Some(index) = cursor {
-        if instances[index].name == target.name {
-            matching_ancestors.push(&instances[index]);
-            if matching_ancestors.len() == 2 {
-                break;
-            }
-        }
-        cursor = parents[index];
-    }
-    let [nearest, previous] = matching_ancestors.as_slice() else {
-        return false;
-    };
-    class_specialization_complexity(target, types) > class_specialization_complexity(nearest, types)
-        && class_specialization_complexity(nearest, types)
-            > class_specialization_complexity(previous, types)
-}
-
-fn class_specialization_complexity(class: &ClassType<TypeId>, types: &TypeRegistry) -> usize {
-    class
-        .arguments
-        .iter()
-        .map(|argument| resolved_type_complexity(&types.resolved(*argument)))
-        .sum()
-}
-
 pub fn check_program(program: &Program) -> DiagnosticResult<()> {
     analyze_program(program).map(|_| ())
 }
@@ -2422,8 +2811,15 @@ struct ThrowAssertionCheck<'expression> {
     span: Span,
 }
 
+#[derive(Clone, Copy)]
+enum CallableBodyProgram<'program> {
+    Expanded(&'program Program),
+    Authored(&'program Program),
+}
+
 struct Checker<'program> {
     program: &'program Program,
+    callable_body_program: CallableBodyProgram<'program>,
     source_texts: HashMap<crate::source::SourceId, &'program str>,
     compilation_context: crate::names::CompilationContext,
     compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
@@ -2440,7 +2836,10 @@ struct Checker<'program> {
     interface_requirements:
         HashMap<crate::types::InterfaceType<TypeId>, contracts::InterfaceRequirements>,
     constrained_receivers: HashMap<Span, contracts::ConstrainedReceiver>,
+    class_member_lookups: HashMap<Span, composition_availability::ClassMemberLookup>,
     enums: HashMap<String, EnumDefinition>,
+    enum_instances: HashMap<EnumType<TypeId>, EnumDefinition>,
+    enum_metadata_dirty: bool,
     functions: HashMap<String, FunctionInfo>,
     function_signatures: HashMap<Span, FunctionInfo>,
     types: TypeRegistry,
@@ -2451,8 +2850,8 @@ struct Checker<'program> {
     shared_construction_types: HashMap<Span, ResolvedType>,
     collection_construction_types: HashMap<Span, ResolvedType>,
     mixed_box_plans: HashMap<Span, MixedBoxPlan>,
-    enum_case_values: HashMap<Span, EnumValue>,
-    enum_case_constructions: HashMap<Span, EnumCaseId>,
+    enum_case_values: HashMap<Span, crate::enums::EnumCaseSource>,
+    enum_case_constructions: HashMap<Span, crate::enums::EnumCaseSource>,
     type_test_types: HashMap<Span, ResolvedType>,
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
@@ -2466,14 +2865,33 @@ struct Checker<'program> {
     display_conversion_sites: HashSet<Span>,
     core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
+    pending_enum_constructions: HashMap<Span, GenericInference>,
+    pending_availability_calls: HashMap<(Span, Span), conditional_capabilities::AvailabilityCall>,
     pending_relational_comparisons: Vec<(Span, TypeId, TypeId)>,
-    class_conformance_cache: HashMap<ClassType<TypeId>, contracts::ClassConformances>,
+    declared_class_conformance_cache:
+        HashMap<ClassType<TypeId>, contracts::DeclaredClassConformances>,
+    declared_conformance_types: HashMap<Span, Option<crate::types::InterfaceType<TypeId>>>,
     type_parameter_scopes: Vec<HashMap<String, Vec<TypeRef>>>,
+    nominal_condition_scopes: Vec<Vec<nominal_proof::Step>>,
+    nominal_identity_depth: usize,
+    pending_condition_type_checks: Vec<type_formation::ConditionTypeCheck>,
+    pending_class_conformance_checks: Vec<type_formation::ClassConformanceCheck>,
+    callable_coherence_obligations: HashMap<Span, HashSet<ClassType<TypeId>>>,
     contract_type_depth: usize,
     checking_type_constraints: HashSet<(String, Vec<TypeId>)>,
     class_instantiations: HashSet<ClassType<TypeId>>,
-    class_instantiation_templates: HashMap<String, HashSet<ClassType<TypeId>>>,
-    callable_class_instantiation_templates: HashMap<Span, HashSet<ClassType<TypeId>>>,
+    enum_instantiations: HashSet<EnumType<TypeId>>,
+    // Metadata and returned-borrow fixed points share discovery ancestry.
+    nominal_instantiation_parents:
+        HashMap<instantiation::NominalInstance, instantiation::NominalInstance>,
+    nominal_instantiation_templates: HashMap<String, HashSet<instantiation::NominalDependency>>,
+    callable_nominal_instantiation_templates:
+        HashMap<Span, HashSet<instantiation::NominalInstance>>,
+    instantiation_declaration: Option<String>,
+    instantiation_condition: Option<Span>,
+    callable_instances: Vec<SemanticCallableInstance>,
+    generic_call_graph: GenericCallGraph,
+    method_receiver_types: HashMap<Span, ResolvedType>,
     current_callable: Option<Span>,
     integer_literals: HashMap<Span, u128>,
     negative_integer_literals: HashMap<Span, u128>,
@@ -2494,12 +2912,21 @@ struct Checker<'program> {
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
     callable_observed_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     callable_declared_checked_effects: HashMap<Span, Vec<ResolvedType>>,
-    callable_dependencies: HashMap<Span, Vec<Span>>,
-    ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
+    callable_dependencies: HashMap<Span, Vec<callable_contracts::EffectDependency>>,
+    exact_method_calls: HashSet<(Span, Span)>,
+    ambient_effect_seed: callable_contracts::AmbientProfiles,
     /// An entry, including an empty one, proves the complete set of ambient
     /// effects for this invocation through the shared call-provenance solver.
     /// Missing entries retain the ambient-capable unknown-call contract.
     callback_ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
+    /// Complete named-callable contracts from the preceding body-check pass.
+    /// A present `None` records an independent result, not an unknown contract.
+    return_borrow_seed: HashMap<Span, Option<ReturnBorrow>>,
+    specialized_return_borrow_seed: SpecializedReturnBorrows,
+    /// Complete loan-carrying type graph from discovery/refinement, independent
+    /// of member declaration order in the fresh checking pass.
+    retained_source_seed: Option<crate::ownership::SourceTypes>,
+    retained_callable_seed: HashMap<Span, crate::ownership::RetainedCallableInfo>,
     generated_test_effect_seed: HashMap<Span, Vec<ResolvedType>>,
     callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     checked_effect_sites: crate::checked_effects::EffectSiteMap,
@@ -2546,6 +2973,7 @@ struct ActiveClosure {
     id: ClosureId,
     captures: Vec<CaptureDraft>,
     capture_by_environment: HashMap<BindingId, usize>,
+    authored_captures: HashMap<BindingId, Span>,
     missing: HashMap<BindingId, MissingCaptureDraft>,
 }
 
@@ -2625,18 +3053,23 @@ struct FinalizerBoundary {
 struct EnumDefinition {
     id: EnumId,
     name: String,
+    source_type: EnumType<TypeId>,
+    type_params: Vec<TypeParamInfo>,
     backing_type: Option<EnumBackingType>,
     cases: Vec<EnumCaseDefinition>,
     case_by_name: HashMap<String, usize>,
     capabilities: EnumCapabilities,
     layout: Option<EnumLayout>,
     span: Span,
+    name_span: Span,
 }
 
 #[derive(Debug, Clone)]
 struct EnumCaseDefinition {
     id: EnumCaseId,
     name: String,
+    span: Span,
+    name_span: Span,
     tag: u32,
     backing_value: Option<EnumBackingValue>,
     payload: Vec<EnumPayloadDefinition>,
@@ -2651,26 +3084,23 @@ struct EnumPayloadDefinition {
 
 #[allow(clippy::too_many_arguments)]
 fn detect_inline_enum_cycles(
-    id: EnumId,
-    definitions: &HashMap<EnumId, EnumDefinition>,
+    source_type: &EnumType<TypeId>,
+    definitions: &HashMap<EnumType<TypeId>, EnumDefinition>,
     types: &TypeRegistry,
-    states: &mut [u8],
-    stack: &mut Vec<EnumId>,
-    recursive: &mut HashSet<EnumId>,
+    states: &mut HashMap<EnumType<TypeId>, u8>,
+    stack: &mut Vec<EnumType<TypeId>>,
+    recursive: &mut HashSet<EnumType<TypeId>>,
     reported: &mut HashSet<Vec<usize>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if states[id.0] == 2 {
+    if matches!(states.get(source_type), Some(1 | 2)) {
         return;
     }
-    if states[id.0] == 1 {
-        return;
-    }
-    states[id.0] = 1;
-    stack.push(id);
-    let Some(definition) = definitions.get(&id) else {
+    states.insert(source_type.clone(), 1);
+    stack.push(source_type.clone());
+    let Some(definition) = definitions.get(source_type) else {
         stack.pop();
-        states[id.0] = 2;
+        states.insert(source_type.clone(), 2);
         return;
     };
     for (case, field) in definition
@@ -2681,14 +3111,17 @@ fn detect_inline_enum_cycles(
         let Some(dependency) = inline_enum_dependency(types, field.ty) else {
             continue;
         };
-        if states[dependency.0] == 1 {
+        if states.get(dependency) == Some(&1) {
             let start = stack
                 .iter()
-                .position(|candidate| *candidate == dependency)
+                .position(|candidate| candidate == dependency)
                 .unwrap_or(0);
             let cycle = stack[start..].to_vec();
-            recursive.extend(cycle.iter().copied());
-            let mut identity = cycle.iter().map(|value| value.0).collect::<Vec<_>>();
+            recursive.extend(cycle.iter().cloned());
+            let mut identity = cycle
+                .iter()
+                .map(|source_type| definitions[source_type].id.0)
+                .collect::<Vec<_>>();
             identity.sort_unstable();
             identity.dedup();
             if reported.insert(identity) {
@@ -2698,7 +3131,7 @@ fn detect_inline_enum_cycles(
                     .collect::<Vec<_>>();
                 names.push(
                     definitions
-                        .get(&dependency)
+                        .get(dependency)
                         .map_or("<unknown>", |value| value.name.as_str()),
                 );
                 diagnostics.push(
@@ -2733,12 +3166,12 @@ fn detect_inline_enum_cycles(
         );
     }
     stack.pop();
-    states[id.0] = 2;
+    states.insert(source_type.clone(), 2);
 }
 
-fn inline_enum_dependency(types: &TypeRegistry, ty: TypeId) -> Option<EnumId> {
+fn inline_enum_dependency(types: &TypeRegistry, ty: TypeId) -> Option<&EnumType<TypeId>> {
     match types.kind(ty) {
-        TypeKind::Enum(enum_type) => Some(enum_type.id),
+        TypeKind::Enum(enum_type) => Some(enum_type),
         TypeKind::Nullable(inner) => inline_enum_dependency(types, *inner),
         _ => None,
     }
@@ -2747,7 +3180,7 @@ fn inline_enum_dependency(types: &TypeRegistry, ty: TypeId) -> Option<EnumId> {
 fn semantic_type_capabilities(
     types: &TypeRegistry,
     ty: TypeId,
-    enums: &HashMap<EnumId, EnumCapabilities>,
+    enums: &HashMap<EnumType<TypeId>, EnumCapabilities>,
 ) -> EnumCapabilities {
     let copy_trivial = EnumCapabilities {
         copy: true,
@@ -2763,18 +3196,24 @@ fn semantic_type_capabilities(
             needs_drop: true,
             equality: true,
         },
-        TypeKind::Enum(enum_type) => {
-            enums
-                .get(&enum_type.id)
-                .copied()
-                .unwrap_or(EnumCapabilities {
-                    copy: false,
-                    trivial_copy: false,
-                    needs_drop: true,
-                    equality: false,
-                })
-        }
+        TypeKind::Enum(enum_type) => enums.get(enum_type).copied().unwrap_or(EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: false,
+        }),
         TypeKind::Nullable(inner) => semantic_type_capabilities(types, *inner, enums),
+        TypeKind::Class(class) if class.inline_copy_type().is_some() => {
+            let needs_drop = class
+                .inline_copy_type()
+                .expect("inline Copy type")
+                .requires_owned_cleanup();
+            EnumCapabilities {
+                trivial_copy: !needs_drop,
+                needs_drop,
+                ..copy_trivial
+            }
+        }
         TypeKind::Class(_) => EnumCapabilities {
             copy: false,
             trivial_copy: false,
@@ -2792,6 +3231,12 @@ fn semantic_type_capabilities(
             trivial_copy: false,
             needs_drop: true,
             equality: true,
+        },
+        TypeKind::ByteRegion(kind) => EnumCapabilities {
+            copy: !kind.is_writable(),
+            trivial_copy: !kind.is_writable(),
+            needs_drop: false,
+            equality: false,
         },
         TypeKind::Void
         | TypeKind::Interface(_)
@@ -2823,7 +3268,7 @@ fn semantic_type_capabilities(
 fn semantic_layout_shape(
     types: &TypeRegistry,
     ty: TypeId,
-    enum_layouts: &HashMap<EnumId, EnumLayout>,
+    enum_layouts: &HashMap<EnumType<TypeId>, EnumLayout>,
     classes: &HashMap<String, ClassInfo>,
 ) -> Option<LayoutShape> {
     const POINTER: u32 = 8;
@@ -2835,6 +3280,10 @@ fn semantic_layout_shape(
         TypeKind::Integer(value) => Some(scalar(value.storage_bytes())),
         TypeKind::Float(value) => Some(scalar(value.storage_bytes())),
         TypeKind::Bool => Some(scalar(1)),
+        TypeKind::ByteRegion(_) | TypeKind::Error | TypeKind::Interface(_) => Some(LayoutShape {
+            size: POINTER * 2,
+            align: POINTER,
+        }),
         TypeKind::String
         | TypeKind::Bytes
         | TypeKind::Mixed
@@ -2847,6 +3296,9 @@ fn semantic_layout_shape(
         | TypeKind::PriorityQueue(_)
         | TypeKind::Deque(_)
         | TypeKind::SharedHandle(_, _) => Some(scalar(POINTER)),
+        TypeKind::Class(class) if class.inline_copy_type().is_some() => {
+            Some(scalar(class.inline_copy_type()?.storage_bytes()))
+        }
         TypeKind::Class(class) => Some(scalar(
             if classes.get(&class.name).is_some_and(|class| class.is_open) {
                 POINTER * 2
@@ -2858,26 +3310,37 @@ fn semantic_layout_shape(
             size: POINTER * crate::native_closure_abi::CARRIER_WORDS,
             align: POINTER,
         }),
-        TypeKind::Enum(enum_type) => enum_layouts.get(&enum_type.id).map(|layout| LayoutShape {
-            size: layout.size,
-            align: layout.align,
+        TypeKind::Enum(enum_type) => enum_layouts.get(enum_type).map(|layout| {
+            if layout.cases.iter().all(|case| case.fields.is_empty()) {
+                scalar(4)
+            } else {
+                LayoutShape {
+                    size: layout.size,
+                    align: layout.align,
+                }
+            }
         }),
         TypeKind::Nullable(inner) => {
             let inner_kind = types.kind(*inner);
-            if matches!(inner_kind, TypeKind::Function(_)) {
+            if matches!(
+                inner_kind,
+                TypeKind::Function(_) | TypeKind::Error | TypeKind::Interface(_)
+            ) {
                 return Some(LayoutShape {
                     size: POINTER * crate::native_closure_abi::CARRIER_WORDS,
                     align: POINTER,
                 });
             }
             if let TypeKind::Class(class) = inner_kind {
-                return Some(scalar(
-                    if classes.get(&class.name).is_some_and(|class| class.is_open) {
-                        POINTER * 2
-                    } else {
-                        POINTER
-                    },
-                ));
+                if class.inline_copy_type().is_none() {
+                    return Some(scalar(
+                        if classes.get(&class.name).is_some_and(|class| class.is_open) {
+                            POINTER * 2
+                        } else {
+                            POINTER
+                        },
+                    ));
+                }
             }
             if matches!(
                 inner_kind,
@@ -2903,10 +3366,8 @@ fn semantic_layout_shape(
         }
         TypeKind::Null => Some(LayoutShape { size: 0, align: 1 }),
         TypeKind::Void
-        | TypeKind::Interface(_)
         | TypeKind::InterfaceSelf(_)
         | TypeKind::TraitSelf(_)
-        | TypeKind::Error
         | TypeKind::Unknown
         | TypeKind::Heterogeneous
         | TypeKind::EmptyCollection
@@ -2958,22 +3419,11 @@ fn type_parameter_scope(params: &[TypeParamDecl]) -> HashMap<String, Vec<TypeRef
         .collect()
 }
 
-/// The callee facts a call site needs to resolve a returned borrow back to the
-/// argument that feeds it. Carrying the parameter list alongside the arguments
-/// is what lets named-argument binding (decision 0098) find the right argument
-/// when the written order differs from the parameter order.
-#[derive(Clone, Copy)]
-struct CallSite<'a> {
-    return_ty: TypeId,
-    return_borrow: Option<ReturnBorrow>,
-    params: &'a [ParamInfo],
-    args: &'a [Argument],
-}
-
 #[derive(Clone, Copy)]
 struct CollectionMethodCall<'a> {
     object: &'a Expr,
     method: &'a str,
+    null_safe: bool,
     args: &'a [Argument],
     member_span: Span,
     argument_list_span: Span,
@@ -2984,8 +3434,13 @@ struct CollectionMethodCall<'a> {
 
 #[derive(Debug, Clone)]
 struct PendingGenericCall {
-    callee: String,
     declaration: Span,
+    inference: GenericInference,
+}
+
+#[derive(Debug, Clone)]
+struct GenericInference {
+    callee: String,
     type_params: Vec<TypeParamInfo>,
     bindings: HashMap<String, TypeId>,
     return_ty: TypeId,
@@ -3172,6 +3627,7 @@ impl<'program> Checker<'program> {
     ) -> Self {
         Self {
             program,
+            callable_body_program: CallableBodyProgram::Expanded(program),
             source_texts: source_texts.clone(),
             compilation_context,
             compilation_contexts,
@@ -3186,7 +3642,10 @@ impl<'program> Checker<'program> {
             interface_definitions: HashMap::new(),
             interface_requirements: HashMap::new(),
             constrained_receivers: HashMap::new(),
+            class_member_lookups: HashMap::new(),
             enums: HashMap::new(),
+            enum_instances: HashMap::new(),
+            enum_metadata_dirty: true,
             functions: HashMap::new(),
             function_signatures: HashMap::new(),
             types: TypeRegistry::new(),
@@ -3212,14 +3671,29 @@ impl<'program> Checker<'program> {
             display_conversion_sites: HashSet::new(),
             core_operation_calls: HashMap::new(),
             pending_generic_calls: HashMap::new(),
+            pending_enum_constructions: HashMap::new(),
+            pending_availability_calls: HashMap::new(),
             pending_relational_comparisons: Vec::new(),
-            class_conformance_cache: HashMap::new(),
+            declared_class_conformance_cache: HashMap::new(),
+            declared_conformance_types: HashMap::new(),
             type_parameter_scopes: Vec::new(),
+            nominal_condition_scopes: Vec::new(),
+            nominal_identity_depth: 0,
+            pending_condition_type_checks: Vec::new(),
+            pending_class_conformance_checks: Vec::new(),
+            callable_coherence_obligations: HashMap::new(),
             contract_type_depth: 0,
             checking_type_constraints: HashSet::new(),
             class_instantiations: HashSet::new(),
-            class_instantiation_templates: HashMap::new(),
-            callable_class_instantiation_templates: HashMap::new(),
+            enum_instantiations: HashSet::new(),
+            nominal_instantiation_parents: HashMap::new(),
+            nominal_instantiation_templates: HashMap::new(),
+            callable_nominal_instantiation_templates: HashMap::new(),
+            instantiation_declaration: None,
+            instantiation_condition: None,
+            callable_instances: Vec::new(),
+            generic_call_graph: GenericCallGraph::default(),
+            method_receiver_types: HashMap::new(),
             current_callable: None,
             integer_literals: HashMap::new(),
             negative_integer_literals: HashMap::new(),
@@ -3240,8 +3714,13 @@ impl<'program> Checker<'program> {
             callable_observed_checked_effects: HashMap::new(),
             callable_declared_checked_effects: HashMap::new(),
             callable_dependencies: HashMap::new(),
-            ambient_effect_seed: HashMap::new(),
+            exact_method_calls: HashSet::new(),
+            ambient_effect_seed: callable_contracts::AmbientProfiles::default(),
             callback_ambient_effect_seed: HashMap::new(),
+            return_borrow_seed: HashMap::new(),
+            specialized_return_borrow_seed: HashMap::new(),
+            retained_source_seed: None,
+            retained_callable_seed: HashMap::new(),
             generated_test_effect_seed: HashMap::new(),
             callable_effective_checked_effects: HashMap::new(),
             checked_effect_sites: HashMap::new(),
@@ -3276,26 +3755,58 @@ impl<'program> Checker<'program> {
         self.collect_classes();
         self.collect_interface_declarations();
         self.collect_trait_declarations();
+        self.check_class_conformance_types();
         self.validate_class_hierarchies();
+        self.check_callable_bodies();
+        self.validate_checked_callable_contracts();
+    }
+
+    fn validate_checked_callable_contracts(&mut self) {
+        self.validate_override_return_provenance();
+        self.validate_property_hook_hierarchies();
+        self.materialize_override_parameter_defaults();
+        self.invalidate_erroneous_compositions();
+        self.check_nominal_conformances();
+        self.validate_parent_constructor_protocols();
+        self.report_unresolved_generic_calls();
+        self.check_pending_integer_literal_ranges();
+        self.check_pending_class_conformances();
+        self.publish_interface_specializations();
+    }
+
+    fn callable_body_program(&self) -> &'program Program {
+        match self.callable_body_program {
+            CallableBodyProgram::Expanded(program) | CallableBodyProgram::Authored(program) => {
+                program
+            }
+        }
+    }
+
+    fn check_callable_bodies(&mut self) {
         self.finalize_enum_metadata();
         self.collect_functions();
         self.apply_ambient_effect_seed();
         self.check_instance_property_initializers();
         self.infer_return_borrow_signatures(false);
-        self.infer_unannotated_move_return_signatures();
+        self.apply_return_borrow_seed();
 
         // A clause-free selected entrypoint infers its public checked-effect
         // contract from the body. Check it provisionally to establish that
         // contract before the source-order pass reaches recursive calls and
         // earlier callers. Only the source-order pass publishes diagnostics.
-        let inferred_entrypoint = self.program.items.iter().find_map(|item| match item {
-            Item::Function(function)
-                if function.throws.is_none() && self.is_accepted_program_entrypoint(function) =>
-            {
-                Some(function.clone())
-            }
-            _ => None,
-        });
+        let inferred_entrypoint =
+            self.callable_body_program()
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Function(function)
+                        if function.throws.is_none()
+                            && self.is_accepted_program_entrypoint(function) =>
+                    {
+                        Some(function.clone())
+                    }
+                    _ => None,
+                });
         if let Some(entrypoint) = inferred_entrypoint.as_ref() {
             let diagnostics_before_inference = self.diagnostics.len();
             self.check_function(entrypoint, None);
@@ -3303,7 +3814,7 @@ impl<'program> Checker<'program> {
         }
 
         let mut scopes = ScopeStack::new();
-        for item in &self.program.items {
+        for item in &self.callable_body_program().items {
             match item {
                 Item::Statement(statement) => {
                     if !self
@@ -3324,14 +3835,7 @@ impl<'program> Checker<'program> {
         // Closure capture identities are available only after checking bodies.
         // Publish their returned loans before comparing callable contracts.
         self.infer_return_borrow_signatures(true);
-        self.validate_override_return_provenance();
-        self.validate_property_hook_hierarchies();
-        self.materialize_override_parameter_defaults();
-        self.invalidate_erroneous_compositions();
-        self.check_nominal_conformances();
-        self.validate_parent_constructor_protocols();
-        self.report_unresolved_generic_calls();
-        self.check_pending_integer_literal_ranges();
+        self.check_pending_availability_calls();
     }
 
     fn check_attributes(&mut self) {
@@ -3578,6 +4082,9 @@ impl<'program> Checker<'program> {
                     Some(class_decl.name.as_str()),
                 ) {
                     Ok(value) => {
+                        if !self.admit_constant_enum_applications(&value, default.span(), None) {
+                            return None;
+                        }
                         let converted = crate::attributes::attribute_value_from_const(
                             self.types.resolved(ty),
                             value,
@@ -3767,6 +4274,9 @@ impl<'program> Checker<'program> {
                 schema.declaring_class.as_deref(),
             ) {
                 Ok(value) => {
+                    if !self.admit_constant_enum_applications(&value, argument.span, None) {
+                        continue;
+                    }
                     evaluated_args[argument_index] = crate::attributes::attribute_value_from_const(
                         self.types.resolved(parameter.ty),
                         value,
@@ -3854,7 +4364,7 @@ impl<'program> Checker<'program> {
     fn attribute_metadata_type_is_compatible(
         &self,
         ty: TypeId,
-        visiting: &mut HashSet<EnumId>,
+        visiting: &mut HashSet<EnumType<TypeId>>,
     ) -> bool {
         match self.types.kind(ty) {
             TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::String | TypeKind::Bool => true,
@@ -3862,21 +4372,22 @@ impl<'program> Checker<'program> {
                 self.attribute_metadata_type_is_compatible(*inner, visiting)
             }
             TypeKind::Enum(enum_type) => {
-                if !visiting.insert(enum_type.id) {
+                if !visiting.insert(enum_type.clone()) {
                     return false;
                 }
-                let compatible = self.enums.get(&enum_type.name).is_some_and(|definition| {
+                let compatible = self.enum_definition(enum_type).is_some_and(|definition| {
                     definition.cases.iter().all(|case| {
                         case.payload.iter().all(|field| {
                             self.attribute_metadata_type_is_compatible(field.ty, visiting)
                         })
                     })
                 });
-                visiting.remove(&enum_type.id);
+                visiting.remove(enum_type);
                 compatible
             }
             TypeKind::Void
             | TypeKind::Bytes
+            | TypeKind::ByteRegion(_)
             | TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
@@ -4117,7 +4628,7 @@ impl<'program> Checker<'program> {
         None
     }
 
-    fn inferred_ambient_effects(&self) -> HashMap<Span, Vec<ResolvedType>> {
+    fn inferred_ambient_effects(&self) -> callable_contracts::AmbientProfiles {
         let mut ambient = HashMap::<Span, Vec<ResolvedType>>::new();
         for (callable, effects) in self
             .callable_declared_checked_effects
@@ -4133,11 +4644,12 @@ impl<'program> Checker<'program> {
         }
 
         loop {
-            let mut changed = false;
+            let mut changed = self.project_composed_ambient_effects(&mut ambient);
+            let profiles = self.ambient_profiles(ambient.clone());
             for (caller, callees) in &self.callable_dependencies {
                 let inherited = callees
                     .iter()
-                    .flat_map(|callee| ambient.get(callee).into_iter().flatten())
+                    .flat_map(|callee| profiles.effects(*callee))
                     .cloned()
                     .collect::<Vec<_>>();
                 let target = ambient.entry(*caller).or_default();
@@ -4152,12 +4664,10 @@ impl<'program> Checker<'program> {
                 break;
             }
         }
-        self.close_virtual_ambient_effects(&mut ambient);
-        ambient.retain(|_, effects| !effects.is_empty());
-        ambient
+        self.ambient_profiles(ambient)
     }
 
-    fn escaping_ambient_effects(&self) -> HashMap<Span, Vec<ResolvedType>> {
+    fn escaping_ambient_effects(&self) -> callable_contracts::AmbientProfiles {
         let mut ambient = HashMap::<Span, Vec<ResolvedType>>::new();
         for (callable, effects) in self
             .callable_declared_checked_effects
@@ -4171,9 +4681,8 @@ impl<'program> Checker<'program> {
                 }
             }
         }
-        self.close_virtual_ambient_effects(&mut ambient);
-        ambient.retain(|_, effects| !effects.is_empty());
-        ambient
+        self.project_composed_ambient_effects(&mut ambient);
+        self.ambient_profiles(ambient)
     }
 
     fn callback_ambient_effects(
@@ -4206,24 +4715,25 @@ impl<'program> Checker<'program> {
             .collect()
     }
 
-    fn close_virtual_ambient_effects(&self, ambient: &mut HashMap<Span, Vec<ResolvedType>>) {
+    fn ambient_profiles(
+        &self,
+        exact: HashMap<Span, Vec<ResolvedType>>,
+    ) -> callable_contracts::AmbientProfiles {
+        let mut virtual_calls = exact.clone();
         loop {
             let mut changed = false;
-            for (declaration, root) in &self.override_roots {
-                let family = ambient
-                    .get(root)
+            for (declaration, parent) in &self.overridden_declarations {
+                let inherited = virtual_calls
+                    .get(declaration)
                     .into_iter()
                     .flatten()
-                    .chain(ambient.get(declaration).into_iter().flatten())
                     .cloned()
                     .collect::<Vec<_>>();
-                for member in [root, declaration] {
-                    let effects = ambient.entry(*member).or_default();
-                    for effect in &family {
-                        if !effects.contains(effect) {
-                            effects.push(effect.clone());
-                            changed = true;
-                        }
+                let effects = virtual_calls.entry(*parent).or_default();
+                for effect in inherited {
+                    if !effects.contains(&effect) {
+                        effects.push(effect);
+                        changed = true;
                     }
                 }
             }
@@ -4231,13 +4741,47 @@ impl<'program> Checker<'program> {
                 break;
             }
         }
+        callable_contracts::AmbientProfiles {
+            exact,
+            virtual_calls,
+        }
+    }
+
+    fn inferred_return_borrows(&self) -> HashMap<Span, Option<ReturnBorrow>> {
+        self.function_signatures
+            .iter()
+            .map(|(declaration, signature)| (*declaration, signature.return_borrow))
+            .collect()
+    }
+
+    fn apply_return_borrow_seed(&mut self) {
+        // Pre-body inference cannot yet inspect checked closure captures. Apply
+        // the previous complete pass afterward, before any body caches inferred
+        // callable types. All declaration-backed signature views share the seed.
+        for (declaration, signature) in &mut self.function_signatures {
+            if let Some(borrow) = self.return_borrow_seed.get(declaration) {
+                signature.return_borrow = *borrow;
+            }
+        }
+        for signature in self.functions.values_mut() {
+            if let Some(borrow) = self.return_borrow_seed.get(&signature.declaration) {
+                signature.return_borrow = *borrow;
+            }
+        }
+        for class in self.classes.values_mut() {
+            for method in class.methods.values_mut() {
+                if let Some(borrow) = self.return_borrow_seed.get(&method.declaration) {
+                    method.return_borrow = *borrow;
+                }
+            }
+        }
     }
 
     fn apply_ambient_effect_seed(&mut self) {
-        if self.ambient_effect_seed.is_empty() && self.generated_test_effect_seed.is_empty() {
+        if self.ambient_effect_seed.exact.is_empty() && self.generated_test_effect_seed.is_empty() {
             return;
         }
-        let mut seeds = self.ambient_effect_seed.clone();
+        let mut seeds = self.ambient_effect_seed.exact.clone();
         for (declaration, effects) in self.generated_test_effect_seed.clone() {
             let target = seeds.entry(declaration).or_default();
             for effect in effects {
@@ -4319,7 +4863,6 @@ impl<'program> Checker<'program> {
                             constraints: param.constraints.clone(),
                         })
                         .collect(),
-                    builtin_interfaces: HashSet::new(),
                     properties: HashMap::new(),
                     static_properties: HashMap::new(),
                     constants: HashMap::new(),
@@ -4383,21 +4926,6 @@ impl<'program> Checker<'program> {
                         constraints: param.constraints.clone(),
                     })
                     .collect(),
-                builtin_interfaces: [
-                    (BuiltinInterface::Displayable, "Displayable"),
-                    (BuiltinInterface::Error, "Error"),
-                ]
-                .into_iter()
-                .filter_map(|(interface, name)| {
-                    class_decl
-                        .implements
-                        .iter()
-                        .any(|ty| {
-                            self.interface_declares_ancestor(&ty.name, name, &mut HashSet::new())
-                        })
-                        .then_some(interface)
-                })
-                .collect(),
                 properties: HashMap::new(),
                 static_properties: HashMap::new(),
                 constants: HashMap::new(),
@@ -4477,11 +5005,9 @@ impl<'program> Checker<'program> {
                                     virtual_root: method.is_open.then_some(signature.declaration),
                                     access: method.access,
                                     receiver_mode: (!method.is_static).then_some(
-                                        if method.writable_this
-                                            && LifecycleMethod::from_method_name(&method.name)
-                                                .is_none()
+                                        if LifecycleMethod::from_method_name(&method.name).is_none()
                                         {
-                                            ReceiverMode::Writable
+                                            ReceiverMode::from_declaration(method)
                                         } else {
                                             ReceiverMode::Readonly
                                         },
@@ -4663,6 +5189,8 @@ impl<'program> Checker<'program> {
                 continue;
             };
             self.validate_constructor_parameter_roles(declaration, &class_info, Some(&parent));
+            self.type_parameter_scopes
+                .push(type_parameter_scope(&declaration.type_params));
             for (name, member) in &class_info.members {
                 let Some((declaring_class, inherited)) =
                     self.lookup_inherited_member(&parent, name)
@@ -4800,6 +5328,7 @@ impl<'program> Checker<'program> {
                     );
                 }
             }
+            self.type_parameter_scopes.pop();
         }
     }
 
@@ -5341,11 +5870,28 @@ impl<'program> Checker<'program> {
                 continue;
             }
             let id = EnumId(self.enums.len());
+            let arguments = declaration
+                .type_params
+                .iter()
+                .map(|parameter| {
+                    self.types
+                        .intern(TypeKind::TypeParameter(parameter.name.clone()))
+                })
+                .collect();
             self.enums.insert(
                 declaration.name.clone(),
                 EnumDefinition {
                     id,
                     name: declaration.name.clone(),
+                    source_type: EnumType::with_arguments(id, &declaration.name, arguments),
+                    type_params: declaration
+                        .type_params
+                        .iter()
+                        .map(|parameter| TypeParamInfo {
+                            name: parameter.name.clone(),
+                            constraints: parameter.constraints.clone(),
+                        })
+                        .collect(),
                     backing_type: None,
                     cases: Vec::new(),
                     case_by_name: HashMap::new(),
@@ -5357,6 +5903,7 @@ impl<'program> Checker<'program> {
                     },
                     layout: None,
                     span: declaration.span,
+                    name_span: declaration.name_span,
                 },
             );
         }
@@ -5394,16 +5941,16 @@ impl<'program> Checker<'program> {
                 }
                 self.diagnostics.push(diagnostic);
             }
-            if !declaration.type_params.is_empty() {
-                self.diagnostics.push(
-                    Diagnostic::unsupported_stage(
-                        "E0572",
-                        "generic enum syntax is accepted, but generic enums are not implemented",
-                        declaration.span,
-                    )
-                    .with_title("Generic Enums Are Not Implemented"),
-                );
-            }
+            self.check_type_parameter_declarations(
+                &declaration.type_params,
+                &format!("enum `{}`", declaration.name),
+            );
+            self.type_parameter_scopes
+                .push(type_parameter_scope(&declaration.type_params));
+            // Concrete payload dependencies also belong to their enum template.
+            let previous_owner = self
+                .instantiation_declaration
+                .replace(declaration.name.clone());
             if declaration.cases.is_empty() {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -5548,32 +6095,64 @@ impl<'program> Checker<'program> {
                 definition.cases.push(EnumCaseDefinition {
                     id,
                     name: case.name.clone(),
+                    span: case.span,
+                    name_span: case.name_span,
                     tag,
                     backing_value,
                     payload,
                 });
             }
+            self.type_parameter_scopes.pop();
+            self.instantiation_declaration = previous_owner;
             self.enums.insert(declaration.name.clone(), definition);
+        }
+        let mut definitions = self
+            .enums
+            .values()
+            .filter(|definition| definition.type_params.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        definitions.sort_by_key(|definition| definition.source_type.id);
+        for mut definition in definitions {
+            definition.id = EnumId(self.enum_instances.len());
+            for case in &mut definition.cases {
+                case.id.enum_id = definition.id;
+            }
+            self.enum_instantiations
+                .insert(definition.source_type.clone());
+            self.enum_instances
+                .insert(definition.source_type.clone(), definition);
         }
     }
 
     fn check_enum(&mut self, _declaration: &EnumDecl) {}
 
+    fn enum_definition(&self, source_type: &EnumType<TypeId>) -> Option<&EnumDefinition> {
+        self.enum_instances.get(source_type).or_else(|| {
+            self.enums.get(&source_type.name).filter(|definition| {
+                !definition.type_params.is_empty() && definition.source_type == *source_type
+            })
+        })
+    }
+
     fn finalize_enum_metadata(&mut self) {
+        if !std::mem::take(&mut self.enum_metadata_dirty) {
+            return;
+        }
         let definitions = self
-            .enums
+            .enum_instances
             .values()
             .cloned()
-            .map(|definition| (definition.id, definition))
+            .map(|definition| (definition.source_type.clone(), definition))
             .collect::<HashMap<_, _>>();
-        let mut states = vec![0_u8; definitions.len()];
+        let mut states = HashMap::new();
         let mut stack = Vec::new();
         let mut recursive = HashSet::new();
         let mut reported_cycles = HashSet::new();
         let mut diagnostics = Vec::new();
-        for id in definitions.keys().copied() {
+        for source_type in definitions.keys() {
             detect_inline_enum_cycles(
-                id,
+                source_type,
                 &definitions,
                 &self.types,
                 &mut states,
@@ -5583,15 +6162,18 @@ impl<'program> Checker<'program> {
                 &mut diagnostics,
             );
         }
-        self.diagnostics.extend(diagnostics);
+        for diagnostic in diagnostics {
+            if !self.diagnostics.contains(&diagnostic) {
+                self.diagnostics.push(diagnostic);
+            }
+        }
 
         let mut capabilities = definitions
             .keys()
-            .copied()
-            .map(|id| {
+            .map(|source_type| {
                 (
-                    id,
-                    if recursive.contains(&id) {
+                    source_type.clone(),
+                    if recursive.contains(source_type) {
                         EnumCapabilities {
                             copy: false,
                             trivial_copy: false,
@@ -5612,7 +6194,7 @@ impl<'program> Checker<'program> {
         loop {
             let mut changed = false;
             for definition in definitions.values() {
-                if recursive.contains(&definition.id) {
+                if recursive.contains(&definition.source_type) {
                     continue;
                 }
                 let mut next = EnumCapabilities {
@@ -5628,8 +6210,8 @@ impl<'program> Checker<'program> {
                     next.needs_drop |= field.needs_drop;
                     next.equality &= field.equality;
                 }
-                if capabilities.get(&definition.id) != Some(&next) {
-                    capabilities.insert(definition.id, next);
+                if capabilities.get(&definition.source_type) != Some(&next) {
+                    capabilities.insert(definition.source_type.clone(), next);
                     changed = true;
                 }
             }
@@ -5638,11 +6220,13 @@ impl<'program> Checker<'program> {
             }
         }
 
-        let mut layouts = HashMap::<EnumId, EnumLayout>::new();
+        let mut layouts = HashMap::<EnumType<TypeId>, EnumLayout>::new();
         loop {
             let mut changed = false;
             for definition in definitions.values() {
-                if recursive.contains(&definition.id) || layouts.contains_key(&definition.id) {
+                if recursive.contains(&definition.source_type)
+                    || layouts.contains_key(&definition.source_type)
+                {
                     continue;
                 }
                 let case_fields = definition
@@ -5667,7 +6251,7 @@ impl<'program> Checker<'program> {
                 };
                 match crate::enums::compute_enum_layout(definition.id, &case_fields) {
                     Ok(layout) => {
-                        layouts.insert(definition.id, layout);
+                        layouts.insert(definition.source_type.clone(), layout);
                         changed = true;
                     }
                     Err(error) => self.diagnostics.push(
@@ -5688,9 +6272,40 @@ impl<'program> Checker<'program> {
             }
         }
 
-        for definition in self.enums.values_mut() {
-            definition.capabilities = capabilities[&definition.id];
-            definition.layout = layouts.get(&definition.id).cloned();
+        for definition in self.enum_instances.values_mut() {
+            definition.capabilities = capabilities[&definition.source_type];
+            definition.layout = layouts.get(&definition.source_type).cloned();
+        }
+        for definition in self
+            .enums
+            .values_mut()
+            .filter(|definition| definition.type_params.is_empty())
+        {
+            if let Some(instance) = self.enum_instances.get(&definition.source_type) {
+                *definition = instance.clone();
+            }
+        }
+        // A generic body checks its own symbolic application. Payloads of a
+        // type parameter may specialize to move types, so they are not Copy.
+        for definition in self
+            .enums
+            .values_mut()
+            .filter(|definition| !definition.type_params.is_empty())
+        {
+            let mut template = EnumCapabilities {
+                copy: true,
+                trivial_copy: true,
+                needs_drop: false,
+                equality: true,
+            };
+            for field in definition.cases.iter().flat_map(|case| &case.payload) {
+                let field = semantic_type_capabilities(&self.types, field.ty, &capabilities);
+                template.copy &= field.copy;
+                template.trivial_copy &= field.trivial_copy;
+                template.needs_drop |= field.needs_drop;
+                template.equality &= field.equality;
+            }
+            definition.capabilities = template;
         }
     }
 
@@ -5775,14 +6390,19 @@ impl<'program> Checker<'program> {
         if self.class_requires_trait_composition(&class_decl.name) {
             return;
         }
-        if info.implements(BuiltinInterface::Error) {
+        // Declaration shape is checked even when a conformance condition is false.
+        if class_decl
+            .implements
+            .iter()
+            .any(|ty| self.interface_declares_ancestor(&ty.ty.name, "Error", &mut HashSet::new()))
+        {
             self.check_error_interface(class_decl, info);
         }
 
         if !class_decl
             .implements
             .iter()
-            .any(|ty| ty.name == "Displayable")
+            .any(|ty| ty.ty.name == "Displayable")
         {
             return;
         }
@@ -5918,6 +6538,17 @@ impl<'program> Checker<'program> {
                     span,
                 )
                 .with_help(help)
+                .with_fix(span, ""),
+            );
+        }
+        if let Some(span) = method.consuming_span {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0466",
+                    format!("`{}` cannot be declared `consuming`", lifecycle.doria_name()),
+                    span,
+                )
+                .with_help("remove `consuming`; lifecycle methods use the compiler-invoked construction and destruction protocols")
                 .with_fix(span, ""),
             );
         }
@@ -6095,10 +6726,48 @@ impl<'program> Checker<'program> {
         function: &FunctionDecl,
         declaring_class: Option<&str>,
     ) -> FunctionInfo {
-        self.check_function_type_parameter_declarations(function, declaring_class);
+        let lifecycle = declaring_class.is_some()
+            && LifecycleMethod::from_method_name(&function.name).is_some();
+        let requirement = declaring_class.is_some_and(|owner| {
+            self.interface_declaration(owner).is_some()
+                || (self.trait_declaration(owner).is_some() && function.body.as_block().is_none())
+        });
+        if function.return_type.is_none()
+            && !lifecycle
+            && !requirement
+            && !self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0617" && diagnostic.span == function.span)
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0617",
+                    format!("function `{}` must declare its return type", function.name),
+                    function.span,
+                )
+                .with_title("Function Return Type Is Required")
+                .with_help(
+                    "write an explicit return type, including `: void` when no value is returned",
+                ),
+            );
+        }
+        if function.consuming_this && (declaring_class.is_none() || function.is_static) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0497",
+                    "`consuming` requires an instance method with a `$this` receiver",
+                    function.consuming_span.unwrap_or(function.span),
+                )
+                .with_title("Consuming Modifier Requires An Instance Method"),
+            );
+        }
         let previous_callable = self.current_callable.replace(function.span);
         self.type_parameter_scopes
             .push(type_parameter_scope(&function.type_params));
+        let condition_scope_depth = self.nominal_condition_scopes.len();
+        self.assume_callable_condition(function.span);
+        self.check_function_type_parameter_declarations(function, declaring_class);
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
         let checked_effects = self.resolve_throws_clause(function, declaring_class);
@@ -6111,22 +6780,25 @@ impl<'program> Checker<'program> {
         self.callable_effective_checked_effects
             .insert(function.span, resolved_checked_effects);
         self.type_parameter_scopes.pop();
+        self.nominal_condition_scopes
+            .truncate(condition_scope_depth);
         self.current_callable = previous_callable;
-        let return_borrow = self
-            .type_is_move_type(return_ty)
+        let region = crate::types::ByteRegionKind::from_resolved(&self.types.resolved(return_ty));
+        let return_borrow = (self.type_is_move_type(return_ty) || region.is_some())
             .then(|| {
                 crate::ownership::function_return_borrow_with_calls(
                     function,
                     crate::ownership::return_borrow_parameters(params.iter().map(|param| {
                         (
-                            !param.take && self.type_is_move_type(param.ty),
+                            self.parameter_can_supply_return_borrow(param.ty, param.take),
                             self.type_is_symbolic(param.ty),
                         )
                     })),
                     &mut |_| crate::ownership::ReturnBorrowLookup::Unresolved,
                 )
             })
-            .flatten();
+            .flatten()
+            .map(|borrow| Self::region_return_borrow(region, borrow));
 
         FunctionInfo {
             declaration: function.span,
@@ -6275,40 +6947,18 @@ impl<'program> Checker<'program> {
         (Span::new(previous.span.end, entry.span.end), applicability)
     }
 
-    fn type_implements_error(&self, ty: TypeId) -> bool {
-        match self.types.kind(ty) {
-            TypeKind::Error => true,
-            TypeKind::TypeParameter(parameter) => self
-                .type_parameter_scopes
-                .iter()
-                .rev()
-                .find_map(|scope| scope.get(parameter))
-                .is_some_and(|constraints| {
-                    constraints.iter().any(|constraint| {
-                        constraint.name == "Error"
-                            || self.interface_declares_ancestor(
-                                &constraint.name,
-                                "Error",
-                                &mut HashSet::new(),
-                            )
-                    })
-                }),
-            TypeKind::Interface(interface) => {
-                self.interface_declares_ancestor(&interface.name, "Error", &mut HashSet::new())
-            }
-            TypeKind::Class(class) => {
-                self.class_implements_builtin(&class.name, BuiltinInterface::Error)
-            }
-            _ => false,
-        }
+    fn type_implements_error(&mut self, ty: TypeId) -> bool {
+        self.type_implements_builtin(ty, BuiltinInterface::Error)
     }
 
-    fn is_error_interface_receiver(&self, ty: TypeId) -> bool {
-        match self.types.kind(ty) {
-            TypeKind::Error | TypeKind::Interface(_) => self.type_implements_error(ty),
-            TypeKind::Nullable(inner) => self.is_error_interface_receiver(*inner),
-            TypeKind::SharedHandle(kind, payload) if Self::shared_handle_forwards(*kind) => {
-                self.is_error_interface_receiver(*payload)
+    fn is_error_interface_receiver(&mut self, ty: TypeId) -> bool {
+        match self.types.kind(ty).clone() {
+            TypeKind::Error | TypeKind::Interface(_) | TypeKind::TypeParameter(_) => {
+                self.type_implements_error(ty)
+            }
+            TypeKind::Nullable(inner) => self.is_error_interface_receiver(inner),
+            TypeKind::SharedHandle(kind, payload) if Self::shared_handle_forwards(kind) => {
+                self.is_error_interface_receiver(payload)
             }
             _ => false,
         }
@@ -6475,9 +7125,27 @@ impl<'program> Checker<'program> {
         )
     }
 
+    fn parameter_can_supply_return_borrow(&self, ty: TypeId, take: bool) -> bool {
+        (!take && self.type_is_move_type(ty))
+            || crate::types::ByteRegionKind::from_resolved(&self.types.resolved(ty)).is_some()
+    }
+
+    fn region_return_borrow(
+        region: Option<crate::types::ByteRegionKind>,
+        borrow: ReturnBorrow,
+    ) -> ReturnBorrow {
+        region.map_or(borrow, |kind| ReturnBorrow {
+            source: borrow.source,
+            kind: ReturnBorrowKind::Retained,
+            writable: kind.is_writable(),
+            lifetime: borrow.lifetime,
+        })
+    }
+
     fn infer_return_borrow_signatures(&mut self, checked_bodies: bool) {
+        let constructor_parameters = self.retained_constructor_parameters();
         let callables = self
-            .program
+            .callable_body_program()
             .items
             .iter()
             .flat_map(|item| match item {
@@ -6533,13 +7201,16 @@ impl<'program> Checker<'program> {
             HashMap::new()
         };
 
-        for _ in 0..callables.len().max(1) {
+        for _ in 0..(callables.len() + self.composition.callable_templates.len()).max(1) {
             let mut changed = false;
             for (function, declaring_class, owner_type_parameters) in &callables {
                 let Some(signature) = self.function_signatures.get(&function.span).cloned() else {
                     continue;
                 };
-                if !self.type_is_move_type(signature.return_ty) {
+                let region = crate::types::ByteRegionKind::from_resolved(
+                    &self.types.resolved(signature.return_ty),
+                );
+                if !self.type_is_move_type(signature.return_ty) && region.is_none() {
                     continue;
                 }
                 let mut scopes = ScopeStack::new();
@@ -6555,7 +7226,7 @@ impl<'program> Checker<'program> {
                         ReceiverAccess::Unavailable
                     } else if function.name == "__construct" {
                         ReceiverAccess::ConstructionRoot
-                    } else if function.writable_this {
+                    } else if function.has_writable_receiver() {
                         ReceiverAccess::Writable
                     } else {
                         ReceiverAccess::Readonly
@@ -6564,7 +7235,7 @@ impl<'program> Checker<'program> {
                 let borrowed_parameters = crate::ownership::return_borrow_parameters(
                     signature.params.iter().map(|param| {
                         (
-                            !param.take && self.type_is_move_type(param.ty),
+                            self.parameter_can_supply_return_borrow(param.ty, param.take),
                             self.type_is_symbolic(param.ty),
                         )
                     }),
@@ -6578,6 +7249,8 @@ impl<'program> Checker<'program> {
                     .push(owner_type_parameters.clone());
                 self.type_parameter_scopes
                     .push(type_parameter_scope(&function.type_params));
+                let condition_scope_depth = self.nominal_condition_scopes.len();
+                self.assume_callable_condition(function.span);
                 let calls = if checked_bodies {
                     self.checked_return_borrow_calls(function, &scopes, method_context.as_ref())
                 } else {
@@ -6603,7 +7276,12 @@ impl<'program> Checker<'program> {
                         &mut |call| self.call_return_borrow(call, &scopes, method_context.as_ref()),
                     )
                 };
-                let inferred = match crate::ownership::returned_closure_provenance(
+                let source_lifetimes = self.returned_closure_source_lifetimes();
+                // Owned carrier contents use retained-storage contracts; views
+                // and returned callbacks retain an inferred result-borrow contract.
+                let retains_result =
+                    region.is_some() || self.non_null_function_type(signature.return_ty).is_some();
+                let inferred = match crate::ownership::returned_retained_provenance(
                     function,
                     &self.closures,
                     &self.binding_resolution,
@@ -6613,23 +7291,272 @@ impl<'program> Checker<'program> {
                             .copied()
                             .unwrap_or(crate::ownership::ReturnBorrowLookup::Unresolved)
                     },
+                    &|ty| source_lifetimes.get(ty).copied(),
+                    &|expr| {
+                        self.returned_closure_constructor_sources(expr, &constructor_parameters)
+                    },
                 ) {
-                    Some(crate::ownership::ReturnedClosureProvenance::Retained(borrow)) => {
+                    Some(crate::ownership::ReturnedClosureProvenance::Retained(borrow))
+                        if retains_result =>
+                    {
                         Some(borrow)
                     }
                     _ => inferred,
                 };
+                let inferred = inferred.map(|borrow| Self::region_return_borrow(region, borrow));
                 self.type_parameter_scopes.truncate(type_scope_depth);
+                self.nominal_condition_scopes
+                    .truncate(condition_scope_depth);
                 self.current_lexical_owner = previous_owner;
                 if inferred != signature.return_borrow {
                     self.set_return_borrow(function, declaring_class.as_deref(), inferred);
                     changed = true;
                 }
             }
+            changed |= self.project_composed_return_borrows();
             if !changed {
                 break;
             }
         }
+    }
+
+    fn returned_closure_source_lifetimes(&mut self) -> HashMap<ResolvedType, RetainedLifetime> {
+        let source_types = self
+            .binding_resolution
+            .declarations_by_id
+            .values()
+            .filter_map(|declaration| declaration.source_type.clone())
+            .chain(
+                self.closures
+                    .values()
+                    .flat_map(|closure| &closure.captures)
+                    .map(|capture| capture.source_type.clone()),
+            )
+            .collect::<HashSet<_>>();
+        let sources = self.retained_source_types();
+        source_types
+            .into_iter()
+            .filter_map(|source| sources.lifetime(&source).map(|lifetime| (source, lifetime)))
+            .collect()
+    }
+
+    fn retained_source_types(&mut self) -> crate::ownership::SourceTypes {
+        match &self.retained_source_seed {
+            Some(sources) => sources.clone(),
+            None => self.discover_retained_source_types(),
+        }
+    }
+
+    fn discover_retained_source_types(&mut self) -> crate::ownership::SourceTypes {
+        let mut classes = self
+            .classes
+            .iter()
+            .map(|(name, class)| {
+                (
+                    ClassType::new(
+                        name.clone(),
+                        class
+                            .type_params
+                            .iter()
+                            .map(|parameter| ResolvedType::TypeParameter(parameter.name.clone()))
+                            .collect(),
+                    ),
+                    class
+                        .properties
+                        .values()
+                        .any(|property| property.borrowed_source.is_some()),
+                    class
+                        .properties
+                        .values()
+                        .filter(|property| {
+                            property.hooks.as_ref().is_none_or(|hooks| {
+                                hooks.storage
+                                    == Some(crate::property_hooks::PropertyHookStorage::Backed)
+                            })
+                        })
+                        .map(|property| self.types.resolved(property.ty))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for instance in self.class_instantiations.clone() {
+            let Some(class) = self.classes.get(&instance.name) else {
+                continue;
+            };
+            let properties = class
+                .properties
+                .values()
+                .filter(|property| {
+                    property.hooks.as_ref().is_none_or(|hooks| {
+                        hooks.storage == Some(crate::property_hooks::PropertyHookStorage::Backed)
+                    })
+                })
+                .map(|property| property.ty)
+                .collect::<Vec<_>>();
+            let borrowed = class
+                .properties
+                .values()
+                .any(|property| property.borrowed_source.is_some());
+            let substitutions = self
+                .class_type_substitutions(&instance)
+                .into_iter()
+                .map(|(name, ty)| (name, self.types.resolved(ty)))
+                .collect();
+            let properties = properties
+                .into_iter()
+                .map(|ty| {
+                    crate::types::substitute_resolved_type(&self.types.resolved(ty), &substitutions)
+                })
+                .collect();
+            classes.push((
+                ClassType::new(
+                    instance.name,
+                    instance
+                        .arguments
+                        .iter()
+                        .map(|argument| self.types.resolved(*argument))
+                        .collect(),
+                ),
+                borrowed,
+                properties,
+            ));
+        }
+        let enums = self
+            .enum_instances
+            .values()
+            .map(|definition| {
+                (
+                    definition
+                        .source_type
+                        .map_arguments(|argument| self.types.resolved(*argument)),
+                    definition
+                        .cases
+                        .iter()
+                        .flat_map(|case| &case.payload)
+                        .map(|field| self.types.resolved(field.ty))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        crate::ownership::SourceTypes::new(&classes, &enums, &self.contracts)
+    }
+
+    fn owned_parameter_source_lifetime(&mut self, ty: TypeId) -> Option<RetainedLifetime> {
+        if self.type_is_symbolic(ty) {
+            Some(RetainedLifetime::Cleanup)
+        } else {
+            let ty = self.types.resolved(ty);
+            self.retained_source_types().lifetime(&ty)
+        }
+    }
+
+    fn specialized_return_borrow_lifetime(
+        &mut self,
+        kind: ReturnBorrowKind,
+        lifetime: RetainedLifetime,
+        return_ty: TypeId,
+        owned_source: Option<TypeId>,
+    ) -> Option<RetainedLifetime> {
+        if !kind.applies_to_move_type(self.type_is_move_type(return_ty)) {
+            return None;
+        }
+        if kind == ReturnBorrowKind::Retained {
+            if let Some(source) = owned_source {
+                return self.owned_parameter_source_lifetime(source);
+            }
+        }
+        Some(lifetime)
+    }
+
+    fn specialize_return_borrow(
+        &mut self,
+        borrow: Option<ReturnBorrow>,
+        parameters: &[ParamInfo],
+        return_ty: TypeId,
+    ) -> Option<ReturnBorrow> {
+        let region = crate::types::ByteRegionKind::from_resolved(&self.types.resolved(return_ty));
+        let mut borrow = Self::region_return_borrow(region, borrow?);
+        if borrow.kind == ReturnBorrowKind::Value {
+            if let BorrowSource::Parameter(index) = borrow.source {
+                if !self.type_is_move_type(parameters.get(index)?.ty) {
+                    return None;
+                }
+            }
+        }
+        let source = match borrow.source {
+            BorrowSource::Parameter(index) if parameters[index].take => Some(parameters[index].ty),
+            _ => None,
+        };
+        borrow.lifetime = self.specialized_return_borrow_lifetime(
+            borrow.kind,
+            borrow.lifetime,
+            return_ty,
+            source,
+        )?;
+        Some(borrow)
+    }
+
+    fn retained_constructor_parameters(&self) -> HashMap<Span, Vec<usize>> {
+        self.program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(&class.members),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|member| match member {
+                ClassMember::Method(method) if method.name == "__construct" => Some((
+                    method.span,
+                    method
+                        .params
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, parameter)| {
+                            parameter.borrow_span.is_some().then_some(index)
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn returned_closure_constructor_sources(
+        &self,
+        expression: &Expr,
+        constructor_parameters: &HashMap<Span, Vec<usize>>,
+    ) -> Option<Vec<usize>> {
+        let Expr::New { args, span, .. } = expression else {
+            return None;
+        };
+        let Some(target) = self.method_call_targets.get(span) else {
+            let ResolvedType::Class(class) = self.expression_types.get(span)? else {
+                return None;
+            };
+            return (!self
+                .classes
+                .get(&class.name)?
+                .methods
+                .contains_key("__construct"))
+            .then(Vec::new);
+        };
+        let CallableTarget::Method { method_name, .. } = self.call_targets.get(span)? else {
+            return None;
+        };
+        if method_name != "__construct" {
+            return None;
+        }
+        let parameters = constructor_parameters.get(&target.declaration)?;
+        let signature = self.function_signatures.get(&target.declaration)?;
+        let mut arguments = parameters
+            .iter()
+            .map(|parameter| {
+                Self::argument_index_bound_to_parameter(&signature.params, args, *parameter)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        arguments.sort_unstable();
+        Some(arguments)
     }
 
     fn return_borrow_graph(
@@ -6658,6 +7585,13 @@ impl<'program> Checker<'program> {
         let mut calls = HashMap::new();
         if let Some(body) = function.body.as_block() {
             crate::ast::visit::block(body, &mut |expression| {
+                if self.owned_copy_interface_erasure(expression.span(), Clone::clone) {
+                    calls.insert(
+                        expression.span(),
+                        crate::ownership::ReturnBorrowLookup::OwnedValue,
+                    );
+                    return;
+                }
                 // A checked property with no accessor plan is a stored-field
                 // projection (including an accessor's own backing field).
                 // Resolving it again without its body scope could overwrite
@@ -6686,6 +7620,44 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> crate::ownership::ReturnBorrowLookup {
         use crate::ownership::ReturnBorrowLookup;
+        if self.owned_copy_interface_erasure(call.span(), Clone::clone) {
+            return ReturnBorrowLookup::OwnedValue;
+        }
+        if let Some((instance, declaration)) = self.return_call_instance(call, Clone::clone) {
+            if let Some(borrow) = self.specialized_return_borrow_seed.get(&instance) {
+                if let Some(signature) = self.function_signatures.get(&declaration) {
+                    return Self::bind_call_return_borrow(call, *borrow, &signature.params);
+                }
+            }
+        }
+        if let Some(borrow) = self.authored_call_return_borrow(call) {
+            return borrow;
+        }
+        if let Expr::MethodCall { object, method, .. } = call {
+            let receiver_type = self
+                .expression_types
+                .get(&object.span())
+                .cloned()
+                .or_else(|| {
+                    let Expr::Variable { name, .. } = object.as_ref() else {
+                        return None;
+                    };
+                    scopes
+                        .lookup(name)
+                        .map(|binding| self.types.resolved(binding.ty))
+                });
+            if let Some(kind) = receiver_type
+                .as_ref()
+                .and_then(|ty| crate::types::ByteRegionKind::method_result(ty, method))
+            {
+                return ReturnBorrowLookup::Resolved(Some(ReturnBorrow {
+                    source: BorrowSource::Receiver,
+                    kind: ReturnBorrowKind::Retained,
+                    writable: kind.is_writable(),
+                    lifetime: RetainedLifetime::LastUse,
+                }));
+            }
+        }
         if let Some(call) = self.callable_value_calls.get(&call.span()) {
             let ResolvedType::Function(function) = &call.function_type else {
                 return ReturnBorrowLookup::Unresolved;
@@ -6702,6 +7674,7 @@ impl<'program> Checker<'program> {
                             source: BorrowSource::Parameter(argument_index),
                             writable: returned.writable,
                             kind: returned.kind,
+                            lifetime: returned.lifetime,
                         },
                         argument_index,
                     }
@@ -6799,6 +7772,7 @@ impl<'program> Checker<'program> {
                         source: BorrowSource::Receiver,
                         writable: false,
                         kind: ReturnBorrowKind::Value,
+                        lifetime: RetainedLifetime::LastUse,
                     }));
                 }
                 if let Some(interface) = self.interface_receiver(object_ty) {
@@ -6904,11 +7878,14 @@ impl<'program> Checker<'program> {
             let has_default = param.default.is_some();
 
             if let Some(span) = param.borrow_span {
-                if !param.constructor_role.is_promoted() || param.take || param.writable {
+                if function.name != "__construct"
+                    || !param.constructor_role.is_promoted()
+                    || param.take
+                {
                     self.diagnostics.push(Diagnostic::new(
-                        "E0761", "`borrow` requires a readonly promoted iterator source parameter", span,
+                        "E0761", "`borrow` requires a promoted parameter that does not take ownership", span,
                     ).with_title("Invalid Retained Source Parameter")
-                        .with_explanation("A retained source stays owned by its caller; it cannot also be taken, made writable, or declared constructor-only."));
+                        .with_explanation("A retained source stays owned by its caller and must be bound to a promoted field."));
                 }
             }
 
@@ -7002,360 +7979,15 @@ impl<'program> Checker<'program> {
                     declaring_class,
                 )
             })
-            .unwrap_or_else(|| self.types.unknown())
-    }
-
-    fn infer_unannotated_move_return_signatures(&mut self) {
-        let max_iterations = self.move_return_inference_signature_count();
-
-        for _ in 0..max_iterations {
-            let mut changed = false;
-
-            for item in &self.program.items {
-                match item {
-                    Item::Function(function) => {
-                        changed |= self.update_function_move_return_signature(function);
-                    }
-                    Item::Class(class_decl) => {
-                        for member in &class_decl.members {
-                            let ClassMember::Method(method) = member else {
-                                continue;
-                            };
-                            changed |=
-                                self.update_method_move_return_signature(&class_decl.name, method);
-                        }
-                    }
-                    Item::Enum(_)
-                    | Item::Interface(_)
-                    | Item::Trait(_)
-                    | Item::Constant(_)
-                    | Item::Statement(_) => {}
+            .unwrap_or_else(|| {
+                if declaring_class.is_some()
+                    && LifecycleMethod::from_method_name(&function.name).is_some()
+                {
+                    self.types.intern(TypeKind::Void)
+                } else {
+                    self.types.unknown()
                 }
-            }
-
-            if !changed {
-                break;
-            }
-        }
-    }
-
-    fn move_return_inference_signature_count(&self) -> usize {
-        self.program
-            .items
-            .iter()
-            .map(|item| match item {
-                Item::Function(function) if function.return_type.is_none() => 1,
-                Item::Class(class_decl) => class_decl
-                    .members
-                    .iter()
-                    .filter(|member| match member {
-                        ClassMember::Method(method) => {
-                            method.return_type.is_none()
-                                && LifecycleMethod::from_method_name(&method.name).is_none()
-                        }
-                        ClassMember::Property(_)
-                        | ClassMember::Constant(_)
-                        | ClassMember::Uses(_) => false,
-                    })
-                    .count(),
-                _ => 0,
             })
-            .sum::<usize>()
-            .max(1)
-    }
-
-    fn update_function_move_return_signature(&mut self, function: &FunctionDecl) -> bool {
-        if function.return_type.is_some() {
-            return false;
-        }
-
-        let Some(signature) = self.function_signatures.get(&function.span).cloned() else {
-            return false;
-        };
-        let inferred = self.infer_unannotated_move_return_type(function, &signature.params, None);
-
-        if !self.type_is_move_type(inferred) || signature.return_ty == inferred {
-            return false;
-        }
-
-        if let Some(signature) = self.function_signatures.get_mut(&function.span) {
-            signature.return_ty = inferred;
-        }
-        if let Some(function_info) = self.functions.get_mut(&function.name) {
-            function_info.return_ty = inferred;
-        }
-        true
-    }
-
-    fn update_method_move_return_signature(
-        &mut self,
-        class_name: &str,
-        method: &FunctionDecl,
-    ) -> bool {
-        if method.return_type.is_some() || LifecycleMethod::from_method_name(&method.name).is_some()
-        {
-            return false;
-        }
-
-        let Some(signature) = self.function_signatures.get(&method.span).cloned() else {
-            return false;
-        };
-        let method_context = MethodContext {
-            class_name: class_name.to_string(),
-            receiver_access: if method.name == "__construct" {
-                ReceiverAccess::ConstructionRoot
-            } else if method.writable_this {
-                ReceiverAccess::Writable
-            } else {
-                ReceiverAccess::Readonly
-            },
-        };
-        let inferred = self.infer_unannotated_move_return_type(
-            method,
-            &signature.params,
-            Some(&method_context),
-        );
-
-        if !self.type_is_move_type(inferred) || signature.return_ty == inferred {
-            return false;
-        }
-
-        if let Some(signature) = self.function_signatures.get_mut(&method.span) {
-            signature.return_ty = inferred;
-        }
-        if let Some(method_info) = self
-            .classes
-            .get_mut(class_name)
-            .and_then(|class_info| class_info.methods.get_mut(&method.name))
-        {
-            method_info.return_ty = inferred;
-        }
-        true
-    }
-
-    fn infer_unannotated_move_return_type(
-        &mut self,
-        function: &FunctionDecl,
-        params: &[ParamInfo],
-        method_context: Option<&MethodContext>,
-    ) -> TypeId {
-        let mut scopes = ScopeStack::new();
-        for param in params {
-            let _ = scopes.declare(
-                param.name.clone(),
-                Binding::unresolved(false, param.ty, param.ty, None, None),
-            );
-        }
-
-        function
-            .body
-            .as_block()
-            .and_then(|body| self.infer_move_return_from_block(body, &mut scopes, method_context))
-            .unwrap_or_else(|| self.types.unknown())
-    }
-
-    fn infer_move_return_from_statements(
-        &mut self,
-        statements: &[Stmt],
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<TypeId> {
-        let mut inferred = None;
-
-        for statement in statements {
-            let statement_ty =
-                self.infer_move_return_from_statement(statement, scopes, method_context);
-            inferred = self.merge_optional_inferred_return_types(inferred, statement_ty);
-
-            if !crate::return_analysis::statement_falls_through(statement) {
-                break;
-            }
-        }
-
-        inferred
-    }
-
-    fn infer_move_return_from_statement(
-        &mut self,
-        statement: &Stmt,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<TypeId> {
-        match statement {
-            Stmt::VarDecl(decl) => {
-                let ty = self.infer_local_declaration_type(
-                    decl.ty.as_ref(),
-                    &decl.initializer,
-                    scopes,
-                    method_context,
-                );
-                for binding in &decl.bindings {
-                    let _ = scopes.declare(
-                        binding.name.clone(),
-                        Binding::unresolved(decl.writable, ty, ty, None, None),
-                    );
-                }
-                None
-            }
-            Stmt::Assignment(assignment) => {
-                self.infer_move_return_from_assignment(assignment, scopes, method_context);
-                None
-            }
-            Stmt::Return {
-                expr: Some(expr), ..
-            } => Some(self.infer_expr_type(expr, scopes, method_context)),
-            Stmt::If(if_stmt) => {
-                self.infer_move_return_from_if_statement(if_stmt, scopes, method_context)
-            }
-            Stmt::While(while_stmt) => {
-                self.infer_move_return_from_block(&while_stmt.body, scopes, method_context)
-            }
-            Stmt::For(for_stmt) => {
-                scopes.push();
-                if let Some(initializer) = &for_stmt.initializer {
-                    self.infer_move_return_from_for_initializer(
-                        initializer,
-                        scopes,
-                        method_context,
-                    );
-                }
-                let result =
-                    self.infer_move_return_from_block(&for_stmt.body, scopes, method_context);
-                if let Some(increment) = &for_stmt.increment {
-                    self.infer_move_return_from_for_increment(increment, scopes, method_context);
-                }
-                scopes.pop();
-                result
-            }
-            Stmt::Foreach(foreach) => {
-                self.infer_move_return_from_foreach(foreach, scopes, method_context)
-            }
-            _ => None,
-        }
-    }
-
-    fn infer_move_return_from_if_statement(
-        &mut self,
-        if_stmt: &IfStmt,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<TypeId> {
-        let incoming_scopes = scopes.clone();
-        let mut falling_through_scopes = Vec::new();
-
-        let mut then_scopes = incoming_scopes.clone();
-        let mut inferred = self.infer_move_return_from_block(
-            &if_stmt.then_block,
-            &mut then_scopes,
-            method_context,
-        );
-        if crate::return_analysis::block_falls_through(&if_stmt.then_block) {
-            falling_through_scopes.push(then_scopes);
-        }
-
-        if let Some(branch) = &if_stmt.else_branch {
-            let mut else_scopes = incoming_scopes;
-            let branch_ty =
-                self.infer_move_return_from_else_branch(branch, &mut else_scopes, method_context);
-            inferred = self.merge_optional_inferred_return_types(inferred, branch_ty);
-            if crate::return_analysis::else_branch_falls_through(branch) {
-                falling_through_scopes.push(else_scopes);
-            }
-        } else {
-            falling_through_scopes.push(incoming_scopes);
-        }
-
-        scopes.replace_types_from_branches(&falling_through_scopes, |left, right| {
-            self.merge_inferred_binding_type(left, right)
-        });
-
-        inferred
-    }
-    fn infer_move_return_from_block(
-        &mut self,
-        block: &Block,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<TypeId> {
-        scopes.push();
-        let inferred =
-            self.infer_move_return_from_statements(&block.statements, scopes, method_context);
-        scopes.pop();
-        inferred
-    }
-
-    fn infer_move_return_from_else_branch(
-        &mut self,
-        branch: &ElseBranch,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<TypeId> {
-        match branch {
-            ElseBranch::If(if_stmt) => self.infer_move_return_from_statement(
-                &Stmt::If((**if_stmt).clone()),
-                scopes,
-                method_context,
-            ),
-            ElseBranch::Block(block) => {
-                self.infer_move_return_from_block(block, scopes, method_context)
-            }
-        }
-    }
-
-    fn infer_move_return_from_for_initializer(
-        &mut self,
-        initializer: &ForInitializer,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        match initializer {
-            ForInitializer::VarDecl(decl) => {
-                let ty = self.infer_local_declaration_type(
-                    decl.ty.as_ref(),
-                    &decl.initializer,
-                    scopes,
-                    method_context,
-                );
-                for binding in &decl.bindings {
-                    let _ = scopes.declare(
-                        binding.name.clone(),
-                        Binding::unresolved(decl.writable, ty, ty, None, None),
-                    );
-                }
-            }
-            ForInitializer::Assignment(assignment) => {
-                self.infer_move_return_from_assignment(assignment, scopes, method_context);
-            }
-        }
-    }
-
-    fn infer_move_return_from_for_increment(
-        &mut self,
-        increment: &ForIncrement,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        if let ForIncrement::Assignment(assignment) = increment {
-            self.infer_move_return_from_assignment(assignment, scopes, method_context);
-        }
-    }
-
-    fn infer_move_return_from_assignment(
-        &mut self,
-        assignment: &Assignment,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        if !matches!(assignment.op, AssignOp::Assign) {
-            return;
-        }
-
-        if let Some(name) = Self::assignment_target_variable_name(&assignment.target) {
-            let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
-            if let Some(binding) = scopes.lookup_mut(name) {
-                binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
-            }
-        }
     }
 
     fn assignment_target_variable_name(target: &Expr) -> Option<&str> {
@@ -7364,63 +7996,6 @@ impl<'program> Checker<'program> {
             Expr::Variable { name, .. } => Some(name),
             _ => None,
         }
-    }
-
-    fn infer_move_return_from_foreach(
-        &mut self,
-        foreach: &ForeachStmt,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<TypeId> {
-        scopes.push();
-        let (inferred_first, inferred_value) =
-            self.infer_foreach_binding_types(foreach, scopes, method_context);
-        if let Some(first_binding) = &foreach.first_binding {
-            let ty = first_binding
-                .ty
-                .as_ref()
-                .map(|ty| self.resolve_type_ref_for_return_inference(ty))
-                .unwrap_or(inferred_first);
-            let _ = scopes.declare(
-                first_binding.name.clone(),
-                Binding::unresolved(false, ty, ty, None, None),
-            );
-        }
-
-        let value_ty = foreach
-            .value_binding
-            .ty
-            .as_ref()
-            .map(|ty| self.resolve_type_ref_for_return_inference(ty))
-            .unwrap_or(inferred_value);
-        let _ = scopes.declare(
-            foreach.value_binding.name.clone(),
-            Binding::unresolved(false, value_ty, value_ty, None, None),
-        );
-
-        let inferred = self.infer_move_return_from_statements(
-            &foreach.body.statements,
-            scopes,
-            method_context,
-        );
-        scopes.pop();
-        inferred
-    }
-
-    fn merge_optional_inferred_return_types(
-        &mut self,
-        current: Option<TypeId>,
-        next: Option<TypeId>,
-    ) -> Option<TypeId> {
-        let next = next?;
-        if matches!(self.types.kind(next), TypeKind::Unknown) {
-            return current;
-        }
-        Some(match current {
-            Some(current) if matches!(self.types.kind(current), TypeKind::Unknown) => next,
-            Some(current) => self.merge_inferred_return_types(current, next),
-            None => next,
-        })
     }
 
     fn merge_inferred_return_types(&mut self, left: TypeId, right: TypeId) -> TypeId {
@@ -7453,41 +8028,6 @@ impl<'program> Checker<'program> {
             }
             _ => self.types.intern(TypeKind::Mixed),
         }
-    }
-
-    fn infer_local_declaration_type(
-        &mut self,
-        annotation: Option<&TypeRef>,
-        initializer: &Expr,
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> TypeId {
-        let initializer_ty = self.infer_expr_type(initializer, scopes, method_context);
-        annotation.map_or(initializer_ty, |ty| {
-            self.resolve_type_ref_for_return_inference(ty)
-        })
-    }
-
-    fn merge_inferred_binding_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
-        if self.type_contains_mixed(current) {
-            self.merge_inferred_return_types(current, next)
-        } else {
-            next
-        }
-    }
-
-    fn infer_foreach_binding_types(
-        &mut self,
-        foreach: &ForeachStmt,
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> (TypeId, TypeId) {
-        let plan = self.infer_foreach_type_plan(foreach, scopes, method_context);
-        (
-            plan.first_binding_type
-                .unwrap_or_else(|| self.types.unknown()),
-            plan.value_binding_type,
-        )
     }
 
     fn infer_foreach_type_plan(
@@ -7662,79 +8202,6 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
-        if let Some(grouped) = &ty.grouped {
-            let mut inner = grouped.inner.clone();
-            inner.nullable |= ty.nullable;
-            return self.resolve_type_ref_for_return_inference(&inner);
-        }
-        if ty.nullable {
-            let mut inner = ty.clone();
-            inner.nullable = false;
-            let inner = self.resolve_type_ref_for_return_inference(&inner);
-            return if matches!(self.types.kind(inner), TypeKind::Unknown | TypeKind::Void) {
-                self.types.unknown()
-            } else {
-                self.types.intern(TypeKind::Nullable(inner))
-            };
-        }
-        if ty.arguments.is_empty() {
-            if let Some(integer) = IntegerType::from_source_name(&ty.name) {
-                return self.types.intern(TypeKind::Integer(integer));
-            }
-            if let Some(float) = FloatType::from_source_name(&ty.name) {
-                return self.types.intern(TypeKind::Float(float));
-            }
-        }
-        match ty.name.as_str() {
-            "void" if ty.arguments.is_empty() => self.types.intern(TypeKind::Void),
-            "string" if ty.arguments.is_empty() => self.types.intern(TypeKind::String),
-            "bool" if ty.arguments.is_empty() => self.types.intern(TypeKind::Bool),
-            "mixed" if ty.arguments.is_empty() => self.types.intern(TypeKind::Mixed),
-            "Error" if ty.arguments.is_empty() => self.types.intern(TypeKind::Error),
-            "[]" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
-                let element =
-                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
-                self.types.intern(TypeKind::TypedArray(element))
-            }
-            "List" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
-                let element =
-                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
-                self.types.intern(TypeKind::List(element))
-            }
-            "Dictionary" if ty.type_argument_count() == 2 && !ty.has_value_arguments() => {
-                let key = self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
-                let value =
-                    self.resolve_type_ref_for_return_inference(ty.type_argument(1).unwrap());
-                self.types.intern(TypeKind::Dictionary(key, value))
-            }
-            "Set" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
-                let element =
-                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
-                self.types.intern(TypeKind::Set(element))
-            }
-            name if self.interface_declaration(name).is_some() && !ty.has_value_arguments() => {
-                let arguments = ty
-                    .type_arguments()
-                    .map(|argument| self.resolve_type_ref_for_return_inference(argument))
-                    .collect();
-                self.types
-                    .intern(TypeKind::Interface(crate::types::InterfaceType::new(
-                        name, arguments,
-                    )))
-            }
-            name if self.classes.contains_key(name) && !ty.has_value_arguments() => {
-                let arguments = ty
-                    .type_arguments()
-                    .map(|argument| self.resolve_type_ref_for_return_inference(argument))
-                    .collect();
-                self.types
-                    .intern(TypeKind::Class(ClassType::new(name, arguments)))
-            }
-            _ => self.types.unknown(),
-        }
-    }
-
     fn check_class(&mut self, class_decl: &ClassDecl) {
         self.type_parameter_scopes
             .push(type_parameter_scope(&class_decl.type_params));
@@ -7748,6 +8215,22 @@ impl<'program> Checker<'program> {
                     );
                     if property.is_static {
                         if let Some(initializer) = &property.initializer {
+                            let key = crate::const_eval::ConstKey::Static {
+                                class_name: class_decl.name.clone(),
+                                name: property.name.clone(),
+                            };
+                            if let Some(value) = self
+                                .const_evaluation
+                                .values
+                                .get(&key)
+                                .map(|decl| decl.value.clone())
+                            {
+                                self.admit_constant_enum_applications(
+                                    &value,
+                                    initializer.span(),
+                                    Some(&class_decl.name),
+                                );
+                            }
                             self.check_nonthrowing_initializer(
                                 initializer,
                                 Some(&property.ty),
@@ -7801,7 +8284,9 @@ impl<'program> Checker<'program> {
                         ReceiverAccess::Unavailable
                     } else if method.name == "__construct" {
                         ReceiverAccess::ConstructionRoot
-                    } else if method.writable_this && lifecycle.is_none() {
+                    } else if method.has_writable_receiver()
+                        && !matches!(lifecycle, Some(LifecycleMethod::Constructor))
+                    {
                         ReceiverAccess::Writable
                     } else {
                         ReceiverAccess::Readonly
@@ -7817,6 +8302,21 @@ impl<'program> Checker<'program> {
         constant: &crate::ast::ConstDecl,
         class_name: Option<&str>,
     ) {
+        let key = match class_name {
+            Some(class_name) => crate::const_eval::ConstKey::Class {
+                class_name: class_name.to_string(),
+                name: constant.name.clone(),
+            },
+            None => crate::const_eval::ConstKey::TopLevel(constant.name.clone()),
+        };
+        if let Some(value) = self
+            .const_evaluation
+            .values
+            .get(&key)
+            .map(|decl| decl.value.clone())
+        {
+            self.admit_constant_enum_applications(&value, constant.initializer.span(), class_name);
+        }
         self.check_nonthrowing_initializer(
             &constant.initializer,
             constant.ty.as_ref(),
@@ -7877,9 +8377,7 @@ impl<'program> Checker<'program> {
             .get(class_name)
             .and_then(|class_info| class_info.properties.get(&property.name))
             .map(|property| property.ty)
-            .unwrap_or_else(|| {
-                self.resolve_type_ref_with_class(&property.ty, property.span, Some(class_name))
-            });
+            .unwrap_or_else(|| self.resolve_property_type(property, class_name, property.span));
         self.record_expected_expression_type(initializer, target_ty);
         self.effect_scopes.push(CheckedEffectSet::default());
         self.check_expr(initializer, &scopes, Some(&initializer_context));
@@ -7943,13 +8441,13 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        let ty = self.resolve_type_ref_with_class(&property.ty, property.span, Some(class_name));
+        let ty = self.resolve_property_type(property, class_name, property.span);
         info.properties.insert(
             property.name.clone(),
             PropertyInfo {
                 access: property.access,
                 writable: property.writable,
-                borrowed_source: false,
+                borrowed_source: None,
                 ty,
                 init_state: if property.initializer.is_some() {
                     PropertyInitState::HasInitializer
@@ -7981,8 +8479,17 @@ impl<'program> Checker<'program> {
         ) {
             return;
         }
-        let ty = self.resolve_type_ref_with_class(&property.ty, property.span, Some(class_name));
-        if self.type_is_move_type(ty) {
+        let ty = self.resolve_property_type(property, class_name, property.span);
+        let hooks = crate::property_hooks::declaration_facts(
+            property,
+            crate::property_hooks::PropertyHookContext::Class,
+        )
+        .map(|facts| facts.symbols());
+        if self.type_is_move_type(ty)
+            && !hooks.as_ref().is_some_and(|hooks| {
+                hooks.storage == Some(crate::property_hooks::PropertyHookStorage::Computed)
+            })
+        {
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0486",
@@ -8004,6 +8511,7 @@ impl<'program> Checker<'program> {
                 access: property.access,
                 writable: property.writable,
                 ty,
+                hooks,
             },
         );
     }
@@ -8028,7 +8536,7 @@ impl<'program> Checker<'program> {
             name: constant.name.clone(),
         };
         let ty = if let Some(value) = self.const_evaluation.values.get(&key) {
-            self.const_type_id(value.ty)
+            self.const_type_id(value.ty.clone())
         } else {
             let ty_ref = constant.ty.clone().unwrap_or_else(TypeRef::unknown);
             self.resolve_type_ref_with_class(&ty_ref, constant.span, Some(class_name))
@@ -8061,8 +8569,11 @@ impl<'program> Checker<'program> {
                     .constructor_role
                     .promoted_access()
                     .expect("only promoted parameters declare properties"),
-                writable: param.writable,
-                borrowed_source: param.borrow_span.is_some(),
+                writable: param.writable && param.borrow_span.is_none(),
+                borrowed_source: crate::types::RetainedFieldAccess::promoted(
+                    param.borrow_span.is_some(),
+                    param.writable,
+                ),
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
                 declaration_span: param.span,
@@ -8214,9 +8725,15 @@ impl<'program> Checker<'program> {
     }
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
-        let Some(body) = function.body.as_block() else {
+        let body = function.body.as_block();
+        if body.is_none()
+            && function
+                .params
+                .iter()
+                .all(|parameter| parameter.default.is_none())
+        {
             return;
-        };
+        }
         let previous_callable = self.current_callable.replace(function.span);
         let previous_owner = std::mem::replace(
             &mut self.current_lexical_owner,
@@ -8229,17 +8746,24 @@ impl<'program> Checker<'program> {
             .push(type_parameter_scope(&function.type_params));
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
+        let condition_scope_depth = self.nominal_condition_scopes.len();
+        self.assume_callable_condition(function.span);
         for param in &function.params {
-            if let Some(span) = param.borrow_span {
-                let iterator = method_context.as_ref().is_some_and(|context| {
-                    let ty = self.symbolic_class_type(&context.class_name);
-                    self.public_iterator_element(ty).is_some()
-                });
-                if function.name != "__construct" || !iterator {
-                    self.diagnostics.push(Diagnostic::new(
-                        "E0761", "retained source parameters are valid only in Iterator constructors", span,
-                    ).with_title("Invalid Retained Source Parameter")
-                        .with_explanation("Decision 0134 scopes retained readonly source access to iterator carriers, not general borrowed fields."));
+            if param.borrow_span.is_some()
+                && function.name == "__construct"
+                && param.constructor_role.is_promoted()
+                && !param.take
+            {
+                if let Some(default) = &param.default {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0761",
+                            "a scoped retained source parameter cannot have a default",
+                            param.default_span.unwrap_or_else(|| default.span()),
+                        )
+                        .with_title("Retained Source Requires a Caller Place")
+                        .with_explanation("Every construction must supply a source place whose lifetime can be checked."),
+                    );
                 }
             }
         }
@@ -8257,27 +8781,13 @@ impl<'program> Checker<'program> {
                 ),
                 function.span.at(function.span.start, function.span.start),
                 BindingKind::MethodReceiver,
-                if context.receiver_access.is_writable() {
+                if function.consuming_this {
+                    BindingOwnership::Owned
+                } else if context.receiver_access.is_writable() {
                     BindingOwnership::WritableBorrow
                 } else {
                     BindingOwnership::ReadonlyBorrow
                 },
-            );
-        }
-        if function.return_type.is_none()
-            && LifecycleMethod::from_method_name(&function.name).is_none()
-            && function.throws.is_some()
-        {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0617",
-                    format!("function `{}` must declare its return type", function.name),
-                    function.span,
-                )
-                .with_title("Function Return Type Is Required")
-                .with_help(
-                    "write an explicit return type, including `: void` when no value is returned",
-                ),
             );
         }
         let mut body_effects = CheckedEffectSet::default();
@@ -8372,37 +8882,43 @@ impl<'program> Checker<'program> {
             })
         });
 
-        self.check_block(
-            body,
-            &mut scopes,
-            method_context.as_ref(),
-            constructor_init_context.as_mut(),
-            Some(&return_context),
-            0,
-        );
-        self.check_missing_final_return(function, &return_context);
-        let body_effects = self.effect_scopes.pop().expect("callable effect scope");
-        self.callable_observed_checked_effects.insert(
-            function.span,
-            body_effects
-                .ordered
-                .iter()
-                .map(|effect| self.types.resolved(*effect))
-                .collect(),
-        );
-        if function.throws.is_none()
-            && (self.is_accepted_program_entrypoint(function)
-                || self.test_semantics.is_generated_function(function.span))
-        {
-            self.set_inferred_entrypoint_effects(function, &body_effects);
-        } else {
-            self.check_callable_effect_contract(
-                function,
-                &signature.checked_effects,
-                &body_effects,
+        if let Some(body) = body {
+            self.check_block(
+                body,
+                &mut scopes,
+                method_context.as_ref(),
+                constructor_init_context.as_mut(),
+                Some(&return_context),
+                0,
             );
+            self.check_missing_final_return(function, &return_context);
+        }
+        let body_effects = self.effect_scopes.pop().expect("callable effect scope");
+        if body.is_some() {
+            self.callable_observed_checked_effects.insert(
+                function.span,
+                body_effects
+                    .ordered
+                    .iter()
+                    .map(|effect| self.types.resolved(*effect))
+                    .collect(),
+            );
+            if function.throws.is_none()
+                && (self.is_accepted_program_entrypoint(function)
+                    || self.test_semantics.is_generated_function(function.span))
+            {
+                self.set_inferred_entrypoint_effects(function, &body_effects);
+            } else {
+                self.check_callable_effect_contract(
+                    function,
+                    &signature.checked_effects,
+                    &body_effects,
+                );
+            }
         }
         self.type_parameter_scopes.pop();
+        self.nominal_condition_scopes
+            .truncate(condition_scope_depth);
         self.current_callable = previous_callable;
         self.current_lexical_owner = previous_owner;
     }
@@ -8549,7 +9065,7 @@ impl<'program> Checker<'program> {
                 return true;
             }
             if let TypeKind::Interface(interface) = self.types.kind(*candidate).clone() {
-                if self.type_has_declared_interface(effect, &interface, &mut HashSet::new()) {
+                if self.type_has_declared_interface(effect, &interface) {
                     return true;
                 }
             }
@@ -8641,6 +9157,47 @@ impl<'program> Checker<'program> {
     }
 
     fn record_callable_dependency(&mut self, callee: Span) {
+        self.record_effect_dependency(callable_contracts::EffectDependency::Exact(callee));
+    }
+
+    fn record_method_effect_dependency(&mut self, method: &MethodInfo, direct: bool) {
+        let target = if direct || method.virtual_root.is_none() {
+            callable_contracts::EffectDependency::Exact(method.declaration)
+        } else {
+            callable_contracts::EffectDependency::Virtual(method.declaration)
+        };
+        self.record_effect_dependency(target);
+    }
+
+    fn record_exact_receiver_dispatch(&mut self, object: &Expr, method: &MethodInfo, span: Span) {
+        let mut object = object;
+        while let Expr::Grouped { expr, .. } = object {
+            object = expr;
+        }
+        let lifecycle_this = matches!(object, Expr::This { .. })
+            && self.active_closures.is_empty()
+            && self.current_callable.is_some_and(|callable| {
+                self.classes.values().any(|class| {
+                    class.methods.iter().any(|(name, candidate)| {
+                        candidate.declaration == callable
+                            && matches!(name.as_str(), "__construct" | "__destruct")
+                    })
+                })
+            });
+        let mut receiver = self.expression_types.get(&object.span());
+        while let Some(ResolvedType::Nullable(inner) | ResolvedType::SharedHandle(_, inner)) =
+            receiver
+        {
+            receiver = Some(inner);
+        }
+        let closed = matches!(receiver, Some(ResolvedType::Class(class))
+            if self.classes.get(&class.name).is_some_and(|class| !class.is_open));
+        if lifecycle_this || closed {
+            self.exact_method_calls.insert((span, method.declaration));
+        }
+    }
+
+    fn record_effect_dependency(&mut self, callee: callable_contracts::EffectDependency) {
         let Some(caller) = self.current_callable else {
             return;
         };
@@ -8714,27 +9271,23 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        let nullable_copy_enum = match &kind {
+        let nullable_copy_value = match &kind {
             TypeKind::Nullable(inner) => {
-                matches!(self.types.kind(*inner), TypeKind::Enum(_))
-                    && !self.type_is_move_type(*inner)
+                let supported = match self.types.kind(*inner) {
+                    TypeKind::Integer(_)
+                    | TypeKind::Float(_)
+                    | TypeKind::Bool
+                    | TypeKind::Enum(_) => true,
+                    TypeKind::Class(class) => class.inline_copy_type().is_some(),
+                    _ => false,
+                };
+                supported && !self.type_is_move_type(*inner)
             }
             _ => false,
         };
-        let compiler_known_nullable_scalar = method_context.is_some_and(|context| {
-            matches!(
-                context.class_name.as_str(),
-                crate::compiler_known_io::IO_ERROR | crate::compiler_known_io::INVALID_UTF8_ERROR
-            ) && matches!(default, Expr::Null { .. })
-                && matches!(
-                    &kind,
-                    TypeKind::Nullable(inner)
-                        if matches!(self.types.kind(*inner), TypeKind::Integer(_))
-                )
-        });
 
         if let TypeKind::Nullable(inner) = &kind {
-            if !nullable_copy_enum && !compiler_known_nullable_scalar {
+            if !nullable_copy_value {
                 let message = if matches!(self.types.kind(*inner), TypeKind::String) {
                     "default values for nullable string parameters are not yet supported"
                 } else {
@@ -8755,8 +9308,7 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if !nullable_copy_enum
-            && !compiler_known_nullable_scalar
+        if !nullable_copy_value
             && !matches!(
                 &kind,
                 TypeKind::Integer(_)
@@ -8789,6 +9341,9 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        if !self.admit_constant_enum_applications(&value, default.span(), declaring_class) {
+            return;
+        }
         self.parameter_defaults.insert(
             crate::const_eval::ParameterDefaultKey {
                 function: function.span,
@@ -9544,11 +10099,15 @@ impl<'program> Checker<'program> {
             let (title, help) = match self.types.kind(error_type) {
                 TypeKind::Class(class) => (
                     "Class Must Explicitly Implement Error",
-                    format!("declare `class {} implements Error` and provide its required readonly `string $message` property", class.name),
+                    format!(
+                        "declare `class {} implements Error` and provide its required readonly `string $message` property",
+                        class.name
+                    ),
                 ),
                 _ => (
                     "Throw Requires An Error Value",
-                    "throw an owned instance of a class that explicitly implements `Error`".to_string(),
+                    "throw an owned instance of a class that explicitly implements `Error`"
+                        .to_string(),
                 ),
             };
             self.diagnostics.push(
@@ -10161,6 +10720,14 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        // The checked writable place, not a backend's reconstruction of the
+        // declaration, determines the width of an increment operation.
+        self.expression_types
+            .insert(target_span, self.types.resolved(place.ty));
+        if let TypeKind::Integer(integer) = self.types.kind(place.ty) {
+            self.integer_expression_types.insert(target_span, *integer);
+        }
+
         if !matches!(
             self.types.kind(place.ty),
             TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Unknown
@@ -10613,6 +11180,11 @@ impl<'program> Checker<'program> {
     }
 
     fn check_closure_return_capture(&mut self, expr: &Expr, expected: TypeId, scopes: &ScopeStack) {
+        // Nonowning region carriers are validated with their retained storage
+        // provenance, including helper calls and copied captures.
+        if crate::types::ByteRegionKind::from_resolved(&self.types.resolved(expected)).is_some() {
+            return;
+        }
         if self.active_closures.is_empty() || !self.type_is_move_type(expected) {
             return;
         }
@@ -10665,6 +11237,7 @@ impl<'program> Checker<'program> {
     }
 
     fn record_expected_expression_type(&mut self, expr: &Expr, expected: TypeId) {
+        self.defer_formed_type_conformances(expected);
         self.record_collection_construction_type(expr, expected);
         let span = expr.span();
         self.contextual_expression_types.insert(span, expected);
@@ -11532,15 +12105,14 @@ impl<'program> Checker<'program> {
             | TypeKind::SharedHandle(_, _)
             | TypeKind::Unknown => true,
             TypeKind::Enum(enum_type) => self
-                .enums
-                .values()
-                .find(|definition| definition.id == enum_type.id)
+                .enum_definition(enum_type)
                 .is_none_or(|definition| definition.capabilities.equality),
             TypeKind::TypeParameter(parameter) => {
                 self.type_parameter_has_constraint(parameter, "Equatable")
             }
             TypeKind::Void
             | TypeKind::Nullable(_)
+            | TypeKind::ByteRegion(_)
             | TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
@@ -11957,6 +12529,90 @@ impl<'program> Checker<'program> {
         self.check_expr_with_range_context(expr, scopes, method_context, false);
     }
 
+    /// `take $this->field` moves a stored owned field out of a consumed
+    /// receiver (Decision 0110, Owned-Field Extraction).
+    fn check_property_take(
+        &mut self,
+        expr: &Expr,
+        object: &Expr,
+        property: &str,
+        take: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let span = take.merge(expr.span());
+        let mut reject = |message: String, help: &str| {
+            self.diagnostics.push(
+                Diagnostic::new("E0780", message, span)
+                    .with_title("Field Cannot Be Taken")
+                    .with_help(help.to_string()),
+            );
+        };
+        let consumed = matches!(Self::ungroup_expr(object), Expr::This { .. })
+            && scopes
+                .lookup("this")
+                .is_some_and(|binding| binding.ownership == BindingOwnership::Owned);
+        let Some(context) = method_context.filter(|_| consumed) else {
+            reject(
+                "`take` moves a field only out of the receiver of a `consuming function`"
+                    .to_string(),
+                "declare the method as `consuming function` and take from `$this`",
+            );
+            return;
+        };
+        if self
+            .classes
+            .get(&context.class_name)
+            .is_some_and(|info| info.is_open)
+        {
+            reject(
+                format!(
+                    "class `{}` is open, and a subclass may declare `__destruct`",
+                    context.class_name
+                ),
+                "take fields only in a final class",
+            );
+            return;
+        }
+        // The extraction consumes the receiver, so its own destructor does not
+        // run. An ancestor's destructor belongs to another author and still
+        // rejects the take.
+        let mut class = Some(context.class_name.clone());
+        let mut stored = None;
+        while let Some(name) = class {
+            let Some(info) = self.classes.get(&name) else {
+                break;
+            };
+            if name != context.class_name && info.methods.contains_key("__destruct") {
+                reject(
+                    format!("ancestor class `{name}` declares `__destruct`, which a field take would skip"),
+                    "take fields only in a class whose ancestors have no destructor",
+                );
+                return;
+            }
+            if stored.is_none() {
+                stored = info.properties.get(property).cloned();
+            }
+            class = info.parent.as_ref().map(|parent| parent.name.clone());
+        }
+        let Some(stored) = stored else {
+            return;
+        };
+        if stored.borrowed_source.is_some() {
+            reject(
+                format!("retained field `${property}` is borrowed from the caller, not owned by this object"),
+                "a retained source stays with its owner; return the wrapper instead",
+            );
+        } else if stored.hooks.as_ref().is_some_and(|hooks| {
+            hooks.storage == Some(crate::property_hooks::PropertyHookStorage::Computed)
+        }) {
+            reject(
+                format!("computed property `${property}` has no stored value to take"),
+                "take a stored field",
+            );
+        }
+    }
+
     fn check_expr_with_range_context(
         &mut self,
         expr: &Expr,
@@ -12053,8 +12709,22 @@ impl<'program> Checker<'program> {
                 property,
                 member_span,
                 null_safe,
+                take_span,
                 span,
             } => {
+                if let Some(take) = take_span.filter(|_| !*null_safe) {
+                    self.check_property_take(expr, object, property, take, scopes, method_context);
+                } else if let Some(take) = take_span {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0780",
+                            "a null-safe property access cannot be taken",
+                            take.merge(*span),
+                        )
+                        .with_title("Field Cannot Be Taken")
+                        .with_help("take from `$this->field`"),
+                    );
+                }
                 self.check_expr(object, scopes, method_context);
                 self.record_member_receiver_access(object, scopes, method_context);
                 self.check_mixed_operation(object, "property access", scopes, method_context);
@@ -12182,6 +12852,7 @@ impl<'program> Checker<'program> {
                 ) && !self.check_collection_method_call(CollectionMethodCall {
                     object,
                     method,
+                    null_safe: *null_safe,
                     args,
                     member_span: *member_span,
                     argument_list_span: *argument_list_span,
@@ -12438,6 +13109,11 @@ impl<'program> Checker<'program> {
             }
             return;
         }
+        // A rejected explicit capture is not missing. Its primary
+        // diagnostic owns the correction, rather than a duplicate insertion.
+        if active.authored_captures.contains_key(&binding.id) {
+            return;
+        }
         let missing = active
             .missing
             .entry(binding.id)
@@ -12518,6 +13194,7 @@ impl<'program> Checker<'program> {
             property: member.to_string(),
             member_span,
             null_safe: false,
+            take_span: None,
             span: object.span().merge(member_span),
         };
         if null_safe {
@@ -12622,6 +13299,7 @@ impl<'program> Checker<'program> {
         } else {
             for (index, (argument, parameter)) in args.iter().zip(&function.parameters).enumerate()
             {
+                self.record_expected_expression_type(&argument.value, parameter.ty);
                 let actual = self.infer_expr_type(&argument.value, scopes, method_context);
                 if !self.is_expr_assignable(parameter.ty, &argument.value, scopes, method_context)
                     && !self.is_assignable(parameter.ty, actual)
@@ -12649,7 +13327,9 @@ impl<'program> Checker<'program> {
                             scopes,
                             CaptureRequirement::Writable,
                         );
-                        if !self.is_writable_object_path(&argument.value, scopes, method_context) {
+                        if self.storage_path_access(&argument.value, scopes, method_context)
+                            != ObjectPathAccess::Writable
+                        {
                             self.diagnostics.push(
                                 Diagnostic::new(
                                     "E0651",
@@ -12774,7 +13454,10 @@ impl<'program> Checker<'program> {
                         .return_borrow
                         .is_none_or(|borrow| borrow.kind == ReturnBorrowKind::Retained)
                 }),
-            Expr::This { .. } | Expr::Index { .. } => false,
+            Expr::This { .. } => scopes
+                .lookup("this")
+                .is_some_and(|binding| binding.ownership == BindingOwnership::Owned),
+            Expr::Index { .. } => false,
             _ => true,
         }
     }
@@ -12830,9 +13513,13 @@ impl<'program> Checker<'program> {
 
         if let Some(clause) = &closure.captures {
             for capture in &clause.captures {
+                let source = outer_scopes.lookup(&capture.name).cloned();
                 if parameter_names.contains(capture.name.as_str())
                     || own_locals.contains_key(capture.name.as_str())
                 {
+                    if let Some(source) = &source {
+                        seen_sources.entry(source.id).or_insert(capture.span);
+                    }
                     let related = closure
                         .parameters
                         .iter()
@@ -12856,7 +13543,6 @@ impl<'program> Checker<'program> {
                     continue;
                 }
 
-                let source = outer_scopes.lookup(&capture.name).cloned();
                 let Some(source) = source else {
                     if let Some(initializer) = self
                         .initializing_bindings
@@ -12904,10 +13590,11 @@ impl<'program> Checker<'program> {
                     continue;
                 }
                 if source.kind == BindingKind::MethodReceiver
+                    && source.ownership != BindingOwnership::Owned
                     && capture.mode == ClosureCaptureMode::Take
                 {
                     self.diagnostics.push(
-                        Diagnostic::new("E0644", "`$this` cannot be captured with `take`", capture.span)
+                        Diagnostic::new("E0644", "a borrowed `$this` cannot be captured with `take`", capture.span)
                             .with_title("Method Receiver Cannot Be Taken")
                             .with_help("Capture `$this` readonly, or use `writable $this` in a writable method."),
                     );
@@ -13043,6 +13730,7 @@ impl<'program> Checker<'program> {
             id: closure_id,
             captures,
             capture_by_environment,
+            authored_captures: seen_sources,
             missing: HashMap::new(),
         });
         let receiver_capture = closure_scopes.lookup("this").cloned().filter(|binding| {
@@ -13083,6 +13771,11 @@ impl<'program> Checker<'program> {
                 .map(|function| function.return_type)
         });
 
+        // Closure bodies own their returns, loops, and finalizers independently
+        // of the expression that creates the closure.
+        let enclosing_whens = std::mem::take(&mut self.when_contexts);
+        let enclosing_finalizers = std::mem::take(&mut self.finalizer_boundaries);
+        let enclosing_loop_depth = std::mem::replace(&mut self.active_loop_depth, 0);
         self.effect_scopes.push(CheckedEffectSet::default());
         let inferred_return = match &closure.body {
             ClosureBody::Expression { expression, .. } => {
@@ -13153,6 +13846,9 @@ impl<'program> Checker<'program> {
                 inferred
             }
         };
+        self.when_contexts = enclosing_whens;
+        self.finalizer_boundaries = enclosing_finalizers;
+        self.active_loop_depth = enclosing_loop_depth;
         let inferred_effects = self.effect_scopes.pop().expect("closure effect scope");
         let mut active = self.active_closures.pop().expect("active closure");
 
@@ -13189,12 +13885,28 @@ impl<'program> Checker<'program> {
             .collect::<Vec<_>>();
         normalized_effects.sort_by_key(|effect| self.types.display(*effect));
         normalized_effects.dedup();
-        let return_borrow = self
-            .type_is_move_type(inferred_return)
+        let region =
+            crate::types::ByteRegionKind::from_resolved(&self.types.resolved(inferred_return));
+        let return_borrow = (self.type_is_move_type(inferred_return) || region.is_some())
             .then(|| {
-                self.infer_closure_return_borrow(closure, &closure_scopes, closure_method_context)
+                self.infer_closure_return_borrow(
+                    closure,
+                    inferred_return,
+                    &closure_scopes,
+                    closure_method_context,
+                )
             })
-            .flatten();
+            .flatten()
+            .map(|borrow| FunctionReturnBorrow {
+                source: borrow.source,
+                kind: if region.is_some() {
+                    ReturnBorrowKind::Retained
+                } else {
+                    borrow.kind
+                },
+                writable: region.map_or(borrow.writable, crate::types::ByteRegionKind::is_writable),
+                lifetime: borrow.lifetime,
+            });
         let semantic = SemanticFunctionType {
             invocation_mode,
             parameters,
@@ -13250,43 +13962,10 @@ impl<'program> Checker<'program> {
     fn infer_closure_return_borrow(
         &mut self,
         closure: &ClosureExpression,
+        return_type: TypeId,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<FunctionReturnBorrow> {
-        let body = match &closure.body {
-            ClosureBody::Expression { expression, .. } => Block {
-                statements: vec![Stmt::Return {
-                    expr: Some((**expression).clone()),
-                    span: expression.span(),
-                }],
-                span: closure.span,
-            },
-            ClosureBody::Block(block) => block.clone(),
-        };
-        let parameters = closure
-            .parameters
-            .iter()
-            .map(|parameter| Param {
-                borrow_span: None,
-                constructor_role: ConstructorParameterRole::Ordinary,
-                role_and_mode_prefix_span: parameter.type_span,
-                take: parameter.take,
-                take_span: parameter.take_span,
-                writable: parameter.writable,
-                writable_span: parameter.writable_span,
-                ownership_modifier_insert: parameter.type_span,
-                ty: parameter.ty.clone(),
-                type_span: parameter.type_span,
-                name: parameter.name.clone(),
-                name_span: parameter.name_span,
-                default: None,
-                default_span: None,
-                // Closure parameters use their name span as the canonical
-                // declaration key. Preserve it in this inference-only adapter
-                // so the shared dataflow seeds the actual checked binding.
-                span: parameter.name_span,
-            })
-            .collect();
         let mut seen_type_parameters = HashSet::new();
         let type_params = self
             .type_parameter_scopes
@@ -13300,38 +13979,14 @@ impl<'program> Checker<'program> {
                 span: closure.span,
             })
             .collect();
-        let function = FunctionDecl {
-            access: MemberAccess::External,
-            access_span: None,
-            is_open: false,
-            open_span: None,
-            is_override: false,
-            override_span: None,
-            writable_this: false,
-            writable_span: None,
-            is_static: true,
-            static_span: None,
-            name: "<closure>".to_string(),
-            name_span: closure.keyword_span,
-            type_params,
-            params: parameters,
-            return_type: closure
-                .return_type
-                .as_ref()
-                .map(|return_type| return_type.ty.clone()),
-            throws: None,
-            body: crate::ast::FunctionBody::Block(body),
-            syntax: Box::new(crate::ast::FunctionSyntax::synthetic(closure.span)),
-            modifier_prefix_span: closure.span,
-            span: closure.span,
-        };
+        let function = crate::ownership::closure_borrow_function(closure, type_params);
         let borrowed_parameters = crate::ownership::return_borrow_parameters(
             closure.parameters.iter().map(|parameter| {
                 scopes
                     .lookup(&parameter.name)
                     .map_or((false, false), |binding| {
                         (
-                            !parameter.take && self.type_is_move_type(binding.ty),
+                            self.parameter_can_supply_return_borrow(binding.ty, parameter.take),
                             self.type_is_symbolic(binding.ty),
                         )
                     })
@@ -13351,7 +14006,14 @@ impl<'program> Checker<'program> {
             &self.binding_resolution,
             &graph,
         );
-        let borrow = match crate::ownership::returned_closure_provenance(
+        let source_lifetimes = self.returned_closure_source_lifetimes();
+        let constructor_parameters = self.retained_constructor_parameters();
+        // Unlike named interface methods, inferred callable types carry their
+        // argument-source relationship. Preserve ordinary borrowed leaf returns.
+        let preserves_value_borrow = inferred
+            .is_some_and(|borrow| borrow.kind == ReturnBorrowKind::Value)
+            && self.non_null_function_type(return_type).is_none();
+        let provenance = crate::ownership::returned_retained_provenance(
             &function,
             &self.closures,
             &self.binding_resolution,
@@ -13361,8 +14023,15 @@ impl<'program> Checker<'program> {
                     .copied()
                     .unwrap_or(crate::ownership::ReturnBorrowLookup::Unresolved)
             },
-        ) {
-            Some(crate::ownership::ReturnedClosureProvenance::Retained(borrow)) => Some(borrow),
+            &|ty| source_lifetimes.get(ty).copied(),
+            &|expr| self.returned_closure_constructor_sources(expr, &constructor_parameters),
+        );
+        let borrow = match provenance {
+            Some(crate::ownership::ReturnedClosureProvenance::Retained(borrow))
+                if !preserves_value_borrow =>
+            {
+                Some(borrow)
+            }
             _ => inferred,
         }?;
         match borrow.source {
@@ -13370,6 +14039,7 @@ impl<'program> Checker<'program> {
                 source: FunctionBorrowSource::Parameter(index),
                 writable: borrow.writable,
                 kind: borrow.kind,
+                lifetime: borrow.lifetime,
             }),
             BorrowSource::Receiver => None,
         }
@@ -13690,22 +14360,47 @@ impl<'program> Checker<'program> {
         checked_effects.sort_by_key(|effect| self.types.display(*effect));
         checked_effects.dedup();
 
+        let region = crate::types::ByteRegionKind::from_resolved(&self.types.resolved(return_type));
+        let owned_return_type = match self.types.kind(return_type) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => return_type,
+        };
         let borrowed_parameters = parameters
             .iter()
             .enumerate()
-            .filter(|(_, parameter)| {
-                parameter.ownership_mode != FunctionTypeParameterMode::Take
-                    && parameter.ty == return_type
-                    && self.type_is_move_type(parameter.ty)
+            .filter_map(|(index, parameter)| {
+                let take = parameter.ownership_mode == FunctionTypeParameterMode::Take;
+                if region.is_none()
+                    && parameter.ty != return_type
+                    && !(take && parameter.ty == owned_return_type)
+                {
+                    return None;
+                }
+                let lifetime = if region.is_none() && take {
+                    self.owned_parameter_source_lifetime(parameter.ty)?
+                } else {
+                    if !self.parameter_can_supply_return_borrow(parameter.ty, take) {
+                        return None;
+                    }
+                    RetainedLifetime::LastUse
+                };
+                Some(FunctionReturnBorrow {
+                    source: FunctionBorrowSource::Parameter(index),
+                    writable: region.map_or(
+                        !take && parameter.ownership_mode == FunctionTypeParameterMode::Writable,
+                        crate::types::ByteRegionKind::is_writable,
+                    ),
+                    kind: if region.is_some() || take {
+                        ReturnBorrowKind::Retained
+                    } else {
+                        ReturnBorrowKind::Value
+                    },
+                    lifetime,
+                })
             })
-            .map(|(index, parameter)| (index, parameter.ownership_mode))
             .collect::<Vec<_>>();
         let return_borrow = match borrowed_parameters.as_slice() {
-            [(index, mode)] => Some(FunctionReturnBorrow {
-                source: FunctionBorrowSource::Parameter(*index),
-                writable: *mode == FunctionTypeParameterMode::Writable,
-                kind: ReturnBorrowKind::Value,
-            }),
+            [borrow] => Some(*borrow),
             _ => None,
         };
         let semantic = SemanticFunctionType {
@@ -14116,7 +14811,17 @@ impl<'program> Checker<'program> {
         {
             return Err(FunctionTypeMismatch::CheckedEffects);
         }
-        if expected.return_borrow != actual.return_borrow {
+        if !match (expected.return_borrow, actual.return_borrow) {
+            (None, None) => true,
+            (Some(expected), None) if expected.kind == ReturnBorrowKind::Retained => true,
+            (Some(expected), Some(actual)) => {
+                expected.source == actual.source
+                    && expected.kind == actual.kind
+                    && expected.writable == actual.writable
+                    && expected.lifetime.accepts(actual.lifetime)
+            }
+            _ => false,
+        } {
             return Err(FunctionTypeMismatch::ReturnBorrow);
         }
         Ok(())
@@ -14381,7 +15086,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         bindings: &mut Vec<MatchBindingSemanticInfo>,
         seen_default: &mut bool,
-        seen_enum_cases: &mut HashSet<EnumCaseId>,
+        seen_enum_cases: &mut HashSet<crate::enums::EnumCaseSource>,
         seen_constants: &mut Vec<crate::const_eval::ConstValue>,
         seen_types: &mut HashSet<ResolvedType>,
         seen_null: &mut bool,
@@ -14442,9 +15147,8 @@ impl<'program> Checker<'program> {
                     self.incompatible_match_pattern("enum case", scrutinee_ty, pattern_span);
                     *shape_valid = false;
                     return ResolvedMatchPattern::EnumCase {
-                        enum_id: EnumId(usize::MAX),
-                        case_id: EnumCaseId {
-                            enum_id: EnumId(usize::MAX),
+                        case_id: crate::enums::EnumCaseSource {
+                            declaration: EnumId(usize::MAX),
                             index: usize::MAX,
                         },
                     };
@@ -14463,12 +15167,16 @@ impl<'program> Checker<'program> {
                     );
                     *shape_valid = false;
                 }
-                let Some(definition) = self.enums.get(&scrutinee_enum.name).cloned() else {
+                let Some(definition) = self
+                    .enums
+                    .get(&scrutinee_enum.name)
+                    .filter(|definition| definition.source_type.id == scrutinee_enum.id)
+                    .cloned()
+                else {
                     *shape_valid = false;
                     return ResolvedMatchPattern::EnumCase {
-                        enum_id: scrutinee_enum.id,
-                        case_id: EnumCaseId {
-                            enum_id: scrutinee_enum.id,
+                        case_id: crate::enums::EnumCaseSource {
+                            declaration: scrutinee_enum.id,
                             index: usize::MAX,
                         },
                     };
@@ -14481,15 +15189,26 @@ impl<'program> Checker<'program> {
                     ));
                     *shape_valid = false;
                     return ResolvedMatchPattern::EnumCase {
-                        enum_id: definition.id,
-                        case_id: EnumCaseId {
-                            enum_id: definition.id,
+                        case_id: crate::enums::EnumCaseSource {
+                            declaration: definition.source_type.id,
                             index: usize::MAX,
                         },
                     };
                 };
-                let case_definition = &definition.cases[case_index];
-                if seen_enum_cases.contains(&case_definition.id) {
+                let Some(payload) = self.enum_case_payload(&scrutinee_enum, case_index) else {
+                    *shape_valid = false;
+                    return ResolvedMatchPattern::EnumCase {
+                        case_id: crate::enums::EnumCaseSource {
+                            declaration: scrutinee_enum.id,
+                            index: case_index,
+                        },
+                    };
+                };
+                let source_case = crate::enums::EnumCaseSource {
+                    declaration: definition.source_type.id,
+                    index: case_index,
+                };
+                if seen_enum_cases.contains(&source_case) {
                     self.duplicate_match_pattern(
                         &format!(
                             "match arm for `{}::{case}` is unreachable after an earlier unguarded arm",
@@ -14499,17 +15218,17 @@ impl<'program> Checker<'program> {
                     );
                     *shape_valid = false;
                 } else if covers_pattern {
-                    seen_enum_cases.insert(case_definition.id);
+                    seen_enum_cases.insert(source_case);
                 }
                 if let Some(authored_bindings) = authored_bindings {
-                    if authored_bindings.len() != case_definition.payload.len() {
+                    if authored_bindings.len() != payload.len() {
                         self.diagnostics.push(
                             Diagnostic::new(
                                 "E0590",
                                 format!(
                                     "case `{}::{case}` has {} payload field(s), but this pattern binds {}",
                                     definition.name,
-                                    case_definition.payload.len(),
+                                    payload.len(),
                                     authored_bindings.len()
                                 ),
                                 pattern_span,
@@ -14519,9 +15238,7 @@ impl<'program> Checker<'program> {
                         *shape_valid = false;
                     }
                     let mut names = HashSet::new();
-                    for (binding, field) in
-                        authored_bindings.iter().zip(case_definition.payload.iter())
-                    {
+                    for (binding, field) in authored_bindings.iter().zip(payload.iter()) {
                         if !names.insert(binding.name.clone()) {
                             self.diagnostics.push(
                                 Diagnostic::new(
@@ -14560,8 +15277,7 @@ impl<'program> Checker<'program> {
                     }
                 }
                 ResolvedMatchPattern::EnumCase {
-                    enum_id: definition.id,
-                    case_id: case_definition.id,
+                    case_id: source_case,
                 }
             }
             MatchPattern::TypeBinding { ty, binding, .. } => {
@@ -14703,7 +15419,7 @@ impl<'program> Checker<'program> {
         &self,
         scrutinee_ty: TypeId,
         has_null: bool,
-        enum_cases: &HashSet<EnumCaseId>,
+        enum_cases: &HashSet<crate::enums::EnumCaseSource>,
         constants: &[crate::const_eval::ConstValue],
         exact_types: &HashSet<ResolvedType>,
     ) -> Vec<String> {
@@ -14717,7 +15433,12 @@ impl<'program> Checker<'program> {
                     definition
                         .cases
                         .iter()
-                        .filter(|case| !enum_cases.contains(&case.id))
+                        .filter(|case| {
+                            !enum_cases.contains(&crate::enums::EnumCaseSource {
+                                declaration: definition.source_type.id,
+                                index: case.id.index,
+                            })
+                        })
                         .map(|case| format!("{}::{}", definition.name, case.name))
                         .collect::<Vec<_>>()
                 })
@@ -14866,7 +15587,7 @@ impl<'program> Checker<'program> {
                 .const_evaluation
                 .enum_cases
                 .get(&(class_name.clone(), member.clone()))
-                .copied()
+                .cloned()
                 .map(crate::const_eval::ConstValue::Enum)
                 .or_else(|| {
                     let class_name = self
@@ -14897,28 +15618,12 @@ impl<'program> Checker<'program> {
             crate::const_eval::ConstValue::String(_) => self.types.intern(TypeKind::String),
             crate::const_eval::ConstValue::Bool(_) => self.types.intern(TypeKind::Bool),
             crate::const_eval::ConstValue::Null => self.types.intern(TypeKind::Null),
-            crate::const_eval::ConstValue::Enum(value) => {
-                let enum_id = value.enum_id;
-                let name = self
-                    .enums
-                    .values()
-                    .find(|definition| definition.id == enum_id)
-                    .map(|definition| definition.name.clone())
-                    .unwrap_or_default();
-                self.types
-                    .intern(TypeKind::Enum(crate::enums::EnumType { id: enum_id, name }))
-            }
-            crate::const_eval::ConstValue::PayloadEnum(value) => {
-                let enum_id = value.enum_id;
-                let name = self
-                    .enums
-                    .values()
-                    .find(|definition| definition.id == enum_id)
-                    .map(|definition| definition.name.clone())
-                    .unwrap_or_default();
-                self.types
-                    .intern(TypeKind::Enum(crate::enums::EnumType { id: enum_id, name }))
-            }
+            crate::const_eval::ConstValue::Enum(value) => self
+                .types
+                .intern_resolved(&ResolvedType::Enum(value.enum_type.clone())),
+            crate::const_eval::ConstValue::PayloadEnum(value) => self
+                .types
+                .intern_resolved(&ResolvedType::Enum(value.value.enum_type.clone())),
         }
     }
 
@@ -15580,14 +16285,21 @@ impl<'program> Checker<'program> {
             ));
             return;
         }
-        match (&left_kind, &right_kind) {
-            (TypeKind::Enum(left), TypeKind::Enum(right)) if left.id != right.id => {
+        let enum_operand_kind = |kind| match kind {
+            TypeKind::Nullable(inner) => self.types.kind(inner).clone(),
+            kind => kind,
+        };
+        let left_enum_kind = enum_operand_kind(left_kind);
+        let right_enum_kind = enum_operand_kind(right_kind);
+        match (&left_enum_kind, &right_enum_kind) {
+            (TypeKind::Enum(left), TypeKind::Enum(right)) if left != right => {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0579",
                         format!(
                             "different enum types `{}` and `{}` cannot be compared",
-                            left.name, right.name
+                            self.types.display(left_ty),
+                            self.types.display(right_ty)
                         ),
                         span,
                     )
@@ -15595,11 +16307,9 @@ impl<'program> Checker<'program> {
                 );
                 return;
             }
-            (TypeKind::Enum(left), TypeKind::Enum(right)) if left.id == right.id => {
+            (TypeKind::Enum(left), TypeKind::Enum(right)) if left == right => {
                 if let Some(definition) = self
-                    .enums
-                    .values()
-                    .find(|definition| definition.id == left.id)
+                    .enum_definition(left)
                     .filter(|definition| !definition.capabilities.equality)
                 {
                     let unavailable = definition.cases.iter().find_map(|case| {
@@ -15608,9 +16318,11 @@ impl<'program> Checker<'program> {
                                 &self.types,
                                 field.ty,
                                 &self
-                                    .enums
+                                    .enum_instances
                                     .values()
-                                    .map(|definition| (definition.id, definition.capabilities))
+                                    .map(|definition| {
+                                        (definition.source_type.clone(), definition.capabilities)
+                                    })
                                     .collect(),
                             )
                             .equality)
@@ -15641,10 +16353,11 @@ impl<'program> Checker<'program> {
                     );
                     return;
                 }
+                return;
             }
             (TypeKind::Enum(enum_type), _) | (_, TypeKind::Enum(enum_type))
                 if !matches!(
-                    (&left_kind, &right_kind),
+                    (&left_enum_kind, &right_enum_kind),
                     (TypeKind::Enum(_), TypeKind::Enum(_))
                 ) =>
             {
@@ -15739,7 +16452,7 @@ impl<'program> Checker<'program> {
         matches!(self.types.kind(ty), TypeKind::Bool | TypeKind::Unknown)
     }
 
-    fn is_display_convertible_type(&self, ty: TypeId) -> bool {
+    fn is_display_convertible_type(&mut self, ty: TypeId) -> bool {
         matches!(
             self.display_conversion_kind(ty),
             DisplayConversionKind::Primitive
@@ -15748,31 +16461,24 @@ impl<'program> Checker<'program> {
         )
     }
 
-    fn display_conversion_kind(&self, ty: TypeId) -> DisplayConversionKind {
+    fn display_conversion_kind(&mut self, ty: TypeId) -> DisplayConversionKind {
         match self.types.kind(ty) {
             TypeKind::String | TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool => {
                 DisplayConversionKind::Primitive
             }
-            TypeKind::Class(class) => {
-                if self.class_implements_builtin(&class.name, BuiltinInterface::Displayable) {
+            TypeKind::Class(_) => {
+                if self.type_implements_builtin(ty, BuiltinInterface::Displayable) {
                     DisplayConversionKind::Displayable
                 } else {
                     DisplayConversionKind::NonDisplayableClass
                 }
             }
-            TypeKind::Interface(interface)
-                if self.interface_declares_ancestor(
-                    &interface.name,
-                    "Displayable",
-                    &mut HashSet::new(),
-                ) =>
-            {
-                DisplayConversionKind::Displayable
-            }
-            TypeKind::TypeParameter(parameter)
-                if self.type_parameter_has_constraint(parameter, "Displayable") =>
-            {
-                DisplayConversionKind::Displayable
+            TypeKind::Interface(_) | TypeKind::TypeParameter(_) => {
+                if self.type_implements_builtin(ty, BuiltinInterface::Displayable) {
+                    DisplayConversionKind::Displayable
+                } else {
+                    DisplayConversionKind::Excluded
+                }
             }
             TypeKind::Unknown => DisplayConversionKind::Recovery,
             _ => DisplayConversionKind::Excluded,
@@ -16037,13 +16743,14 @@ impl<'program> Checker<'program> {
     fn type_is_move_type(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
+            TypeKind::ByteRegion(kind) => kind.is_writable(),
+            // Copy requires checked capabilities for this exact application.
+            // An unmaterialized generic application retains conservative ownership.
             TypeKind::Enum(enum_type) => self
-                .enums
-                .values()
-                .find(|definition| definition.id == enum_type.id)
-                .is_some_and(|definition| !definition.capabilities.copy),
-            TypeKind::Class(_)
-            | TypeKind::Interface(_)
+                .enum_definition(enum_type)
+                .is_none_or(|definition| !definition.capabilities.copy),
+            TypeKind::Class(class) => class.inline_copy_type().is_none(),
+            TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
             | TypeKind::Function(_)
@@ -16083,6 +16790,10 @@ impl<'program> Checker<'program> {
                 self.type_is_symbolic(*key) || self.type_is_symbolic(*value)
             }
             TypeKind::Class(class) | TypeKind::Interface(class) => class
+                .arguments
+                .iter()
+                .any(|argument| self.type_is_symbolic(*argument)),
+            TypeKind::Enum(enum_type) => enum_type
                 .arguments
                 .iter()
                 .any(|argument| self.type_is_symbolic(*argument)),
@@ -16167,7 +16878,8 @@ impl<'program> Checker<'program> {
         ) {
             (TypeKind::InterfaceSelf(_), TypeKind::InterfaceSelf(_)) => true,
             (TypeKind::Interface(target), _) => {
-                self.type_has_declared_interface(value, &target, &mut HashSet::new())
+                !self.primitive_interface_erasure_is_forbidden(value)
+                    && self.type_has_declared_interface(value, &target)
             }
             (TypeKind::Class(target), TypeKind::Class(value)) => {
                 self.class_is_subtype(&value, &target)
@@ -16180,33 +16892,12 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn class_implements_builtin(&self, class_name: &str, interface: BuiltinInterface) -> bool {
-        let mut current = Some(class_name);
-        let mut visited = HashSet::new();
-        while let Some(name) = current {
-            if !visited.insert(name) {
-                return false;
-            }
-            let interface_name = match interface {
-                BuiltinInterface::Displayable => "Displayable",
-                BuiltinInterface::Error => "Error",
-            };
-            if self.program.items.iter().any(|item| {
-                matches!(item, Item::Class(declaration)
-                    if declaration.name == name
-                        && declaration.implements.iter().any(|implemented| self.interface_declares_ancestor(&implemented.name, interface_name, &mut HashSet::new())))
-            }) {
-                return true;
-            }
-            let Some(class) = self.classes.get(name) else {
-                return false;
-            };
-            if class.implements(interface) {
-                return true;
-            }
-            current = class.parent.as_ref().map(|parent| parent.name.as_str());
-        }
-        false
+    fn type_implements_builtin(&mut self, ty: TypeId, interface: BuiltinInterface) -> bool {
+        let name = match interface {
+            BuiltinInterface::Displayable => "Displayable",
+            BuiltinInterface::Error => "Error",
+        };
+        self.type_has_declared_interface(ty, &crate::types::InterfaceType::new(name, Vec::new()))
     }
 
     fn lookup_inherited_member(
@@ -16264,7 +16955,13 @@ impl<'program> Checker<'program> {
             return true;
         }
 
-        self.report_override_contract_mismatch(class_name, method, inherited_class, inherited);
+        self.report_override_contract_mismatch(
+            class_name,
+            method,
+            inherited_class,
+            inherited,
+            &failures,
+        );
         false
     }
 
@@ -16293,11 +16990,15 @@ impl<'program> Checker<'program> {
                     continue;
                 };
                 let inherited = self.specialize_method_for_class(&inherited, &owner);
-                if self
-                    .method_contract_failures(method, &inherited)
-                    .contains(&ContractMismatch::ReturnProvenance)
-                {
-                    self.report_override_contract_mismatch(&class_name, method, &owner, &inherited);
+                let failures = self.method_contract_failures(method, &inherited);
+                if failures.contains(&ContractMismatch::ReturnProvenance) {
+                    self.report_override_contract_mismatch(
+                        &class_name,
+                        method,
+                        &owner,
+                        &inherited,
+                        &failures,
+                    );
                 }
             }
         }
@@ -16309,20 +17010,33 @@ impl<'program> Checker<'program> {
         method: &MethodInfo,
         inherited_class: &ClassType<TypeId>,
         inherited: &MethodInfo,
+        failures: &[ContractMismatch],
     ) {
-        self.diagnostics.push(
-            Diagnostic::new(
+        let condition = failures
+            .contains(&ContractMismatch::Availability)
+            .then(|| {
+                self.contracts
+                    .callable_conditions
+                    .get(&method.declaration)
+                    .and_then(|owner| self.contracts.conditions.get(owner))
+            })
+            .flatten();
+        let mut diagnostic = Diagnostic::new(
                 "E0729",
                 format!(
                     "override on `{class_name}` does not preserve the contract of `{}'s` open method",
                     inherited_class.name
                 ),
-                method.declaration,
+                condition.map_or(method.declaration, |condition| condition.clause),
             )
             .with_title("Override Contract Does Not Match")
             .with_related(inherited.declaration, "the inherited open contract is declared here")
-            .with_help("match parameter names, types, ownership, generic arity, receiver access, defaults, return, and checked effects"),
-        );
+            .with_help("match parameter names, types, ownership, generic arity, receiver access, defaults, return, checked effects, and availability");
+        if condition.is_some() {
+            diagnostic = diagnostic.with_related(method.declaration, "the overriding method is declared here")
+                .with_explanation("The override must remain available wherever the inherited method is available.");
+        }
+        self.diagnostics.push(diagnostic);
     }
 
     fn substitute_type_id(
@@ -16344,6 +17058,18 @@ impl<'program> Checker<'program> {
         register_instances: bool,
     ) -> TypeId {
         match self.types.kind(ty).clone() {
+            TypeKind::Enum(enum_type) => {
+                let enum_type = enum_type.map_arguments(|argument| {
+                    self.substitute_type_impl(*argument, substitutions, register_instances)
+                });
+                if register_instances {
+                    self.record_nominal_instantiation(
+                        instantiation::NominalInstance::Enum(enum_type.clone()),
+                        None,
+                    );
+                }
+                self.types.intern(TypeKind::Enum(enum_type))
+            }
             TypeKind::Interface(interface) => {
                 let arguments = interface
                     .arguments
@@ -16408,7 +17134,12 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::SharedHandle(kind, payload))
             }
             TypeKind::Function(function) => {
-                let function = SemanticFunctionType {
+                let return_type = self.substitute_type_impl(
+                    function.return_type,
+                    substitutions,
+                    register_instances,
+                );
+                let mut function = SemanticFunctionType {
                     invocation_mode: function.invocation_mode,
                     parameters: function
                         .parameters
@@ -16422,11 +17153,7 @@ impl<'program> Checker<'program> {
                             ),
                         })
                         .collect(),
-                    return_type: self.substitute_type_impl(
-                        function.return_type,
-                        substitutions,
-                        register_instances,
-                    ),
+                    return_type,
                     checked_effects: function
                         .checked_effects
                         .into_iter()
@@ -16436,6 +17163,28 @@ impl<'program> Checker<'program> {
                         .collect(),
                     return_borrow: function.return_borrow,
                 };
+                function.return_borrow = function.return_borrow.and_then(|mut borrow| {
+                    let FunctionBorrowSource::Parameter(index) = borrow.source;
+                    let source = &function.parameters[index];
+                    if let Some(region) = crate::types::ByteRegionKind::from_resolved(
+                        &self.types.resolved(return_type),
+                    ) {
+                        borrow.kind = ReturnBorrowKind::Retained;
+                        borrow.writable = region.is_writable();
+                    }
+                    if borrow.kind == ReturnBorrowKind::Value && !self.type_is_move_type(source.ty)
+                    {
+                        return None;
+                    }
+                    borrow.lifetime = self.specialized_return_borrow_lifetime(
+                        borrow.kind,
+                        borrow.lifetime,
+                        return_type,
+                        (source.ownership_mode == FunctionTypeParameterMode::Take)
+                            .then_some(source.ty),
+                    )?;
+                    Some(borrow)
+                });
                 self.types.intern(TypeKind::Function(function))
             }
             TypeKind::Class(class) => {
@@ -16447,13 +17196,12 @@ impl<'program> Checker<'program> {
                     })
                     .collect();
                 let class = ClassType::new(class.name, arguments);
-                if register_instances
-                    && !class
-                        .arguments
-                        .iter()
-                        .any(|argument| self.type_is_symbolic(*argument))
-                {
-                    self.class_instantiations.insert(class.clone());
+                if register_instances && self.nominal_identity_depth == 0 {
+                    let caller = self.nominal_proof_context();
+                    self.defer_class_conformance_check(class.clone(), &caller);
+                }
+                if register_instances {
+                    self.record_class_instantiation(class.clone(), None);
                 }
                 self.types.intern(TypeKind::Class(class))
             }
@@ -16776,6 +17524,7 @@ impl<'program> Checker<'program> {
                 null_safe,
                 member_span,
                 span,
+                ..
             } => {
                 if *null_safe {
                     self.diagnostics.push(
@@ -16969,6 +17718,8 @@ impl<'program> Checker<'program> {
                         }
                     }
                     if !matches!(constructor_init_decision, ConstructorInitDecision::Rejected) {
+                        self.expression_types
+                            .insert(target.span(), self.types.resolved(property_info.ty));
                         let kind = if constructor_context
                             && matches!(op, AssignOp::Assign)
                             && property_info.init_state == PropertyInitState::Uninitialized
@@ -17542,6 +18293,7 @@ impl<'program> Checker<'program> {
         if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
             if let Some(declared) = self.trait_method(&owner, method) {
                 self.record_contract_member_reference(member_span, vec![declared.declaration]);
+                self.record_trait_method_target(&owner, method, declared.declaration, span);
                 self.check_declared_contract_method(
                     declared,
                     object,
@@ -17605,7 +18357,10 @@ impl<'program> Checker<'program> {
                 && args.is_empty()
                 && self.type_parameter_has_constraint(&parameter, "Displayable")
             {
+                // MIR lowers this call as the display conversion of its
+                // receiver, so it records that conversion's facts and effects.
                 self.constrained_display_calls.insert(span);
+                self.record_display_conversion(object, object_ty);
                 return;
             }
             match self.constrained_requirement(&parameter, method, span) {
@@ -17671,6 +18426,18 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        self.method_receiver_types.insert(
+            span,
+            ResolvedType::Class(ClassType::new(
+                class_type.name.clone(),
+                class_type
+                    .arguments
+                    .iter()
+                    .map(|argument| self.types.resolved(*argument))
+                    .collect(),
+            )),
+        );
+
         let class_type_id = self.types.intern(TypeKind::Class(declaring_class.clone()));
         let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
             unreachable!("interned class type must resolve as a class");
@@ -17684,7 +18451,12 @@ impl<'program> Checker<'program> {
                 direct_parent: false,
             },
         );
-        self.record_callable_dependency(method_info.declaration);
+        self.record_exact_receiver_dispatch(object, &method_info, span);
+        self.record_method_effect_dependency(
+            &method_info,
+            self.exact_method_calls
+                .contains(&(span, method_info.declaration)),
+        );
         if method_info.is_static {
             self.diagnostics.push(Diagnostic::new(
                 "E0487",
@@ -17724,6 +18496,13 @@ impl<'program> Checker<'program> {
             }
         }
 
+        if method_info
+            .receiver_mode
+            .is_some_and(ReceiverMode::is_consuming)
+        {
+            self.record_capture_requirement_for_expr(object, scopes, CaptureRequirement::Take);
+        }
+
         let method_info = self.instantiate_generic_method_call(
             &format!("method `{class_name}::{method}`"),
             &method_info,
@@ -17742,7 +18521,12 @@ impl<'program> Checker<'program> {
             method_context,
         );
         if self.diagnostics.len() == diagnostics_before {
-            self.record_checked_effects(method_info.checked_effects, span);
+            let target = self
+                .call_targets
+                .get(&span)
+                .expect("checked instance call has a selected target")
+                .clone();
+            self.record_selected_contract_effects(&target, &method_info, span);
         }
     }
 
@@ -18084,7 +18868,11 @@ impl<'program> Checker<'program> {
             return;
         }
         if class_name == "Bytes" {
-            if access.member != "fromArray" {
+            let intrinsic = crate::byte_intrinsics::member(&ResolvedType::Bytes, access.member)
+                .filter(|member| {
+                    member.kind == crate::byte_intrinsics::ByteMemberKind::StaticMethod
+                });
+            let Some(intrinsic) = intrinsic else {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
                     "E0524",
                     format!(
@@ -18094,28 +18882,19 @@ impl<'program> Checker<'program> {
                     access.span,
                 ));
                 return;
-            }
-            if self.reject_named_arguments("Bytes::fromArray", args) {
+            };
+            let name = format!("Bytes::{}", intrinsic.name);
+            if !intrinsic.accepts_named_arguments && self.reject_named_arguments(&name, args) {
                 return;
             }
-            if args.len() != 1 {
-                self.report_argument_count_mismatch(
-                    "Bytes::fromArray",
-                    1,
-                    1,
-                    args.len(),
-                    access.span,
-                );
-                return;
-            }
-            let uint8 = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
-            let expected = self.types.intern(TypeKind::TypedArray(uint8));
-            self.check_expr_assignable(
-                expected,
-                &args[0].value,
+            let parameters = intrinsic.parameter_info(&mut self.types);
+            self.check_call_arguments(
+                &name,
+                &parameters,
+                args,
+                access.span,
                 scopes,
                 method_context,
-                AssignmentDestination::Type,
             );
             return;
         }
@@ -18207,6 +18986,12 @@ impl<'program> Checker<'program> {
                     access.member_span,
                     vec![declared.declaration],
                 );
+                self.record_trait_method_target(
+                    class_name,
+                    access.member,
+                    declared.declaration,
+                    access.span,
+                );
                 let method = self.instantiate_generic_method_call(
                     access.member,
                     &declared,
@@ -18223,7 +19008,12 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                self.record_checked_effects(method.checked_effects, access.span);
+                let target = self
+                    .call_targets
+                    .get(&access.span)
+                    .expect("trait static call records its target")
+                    .clone();
+                self.record_selected_contract_effects(&target, &method, access.span);
             }
             return;
         }
@@ -18252,6 +19042,10 @@ impl<'program> Checker<'program> {
         };
 
         let parent_qualified = matches!(access.qualifier, StaticQualifier::Parent);
+        if parent_qualified {
+            self.exact_method_calls
+                .insert((access.span, method_info.declaration));
+        }
         let target_class_id = self.types.intern(TypeKind::Class(declaring_class.clone()));
         let ResolvedType::Class(resolved_target_class) = self.types.resolved(target_class_id)
         else {
@@ -18266,7 +19060,7 @@ impl<'program> Checker<'program> {
                 direct_parent: parent_qualified,
             },
         );
-        self.record_callable_dependency(method_info.declaration);
+        self.record_method_effect_dependency(&method_info, parent_qualified);
         if !(parent_qualified && access.member == "__construct")
             && self.check_direct_lifecycle_method_call(
                 &declaring_class.name,
@@ -18287,6 +19081,16 @@ impl<'program> Checker<'program> {
                 access.span,
             ));
             return;
+        }
+
+        if parent_qualified
+            && method_info
+                .receiver_mode
+                .is_some_and(ReceiverMode::is_consuming)
+        {
+            if let Some(receiver) = scopes.lookup("this").cloned() {
+                self.record_binding_use(&receiver, access.qualifier_span, CaptureRequirement::Take);
+            }
         }
 
         if matches!(method_info.access, MemberAccess::Internal)
@@ -18317,7 +19121,12 @@ impl<'program> Checker<'program> {
             method_context,
         );
         if self.diagnostics.len() == diagnostics_before {
-            self.record_checked_effects(method_info.checked_effects, access.span);
+            let target = self
+                .call_targets
+                .get(&access.span)
+                .expect("checked static call has a selected target")
+                .clone();
+            self.record_selected_contract_effects(&target, &method_info, access.span);
         }
     }
 
@@ -18432,7 +19241,24 @@ impl<'program> Checker<'program> {
             self.check_enum_case_member(&definition, access);
             return;
         }
-        self.check_resolved_static_member(access, class_name, method_context);
+        if let Some((owner, StaticMemberInfo::Property(property))) =
+            self.check_resolved_static_member(access, class_name, method_context)
+        {
+            if let Some(method) = self.static_property_accessor_method(
+                &property,
+                &owner,
+                crate::ast::PropertyHookKind::Get,
+            ) {
+                let declaring_type = self.types.intern(TypeKind::Class(owner));
+                self.record_accessor_call_facts(
+                    access.member,
+                    crate::ast::PropertyHookKind::Get,
+                    &method,
+                    declaring_type,
+                    access.span,
+                );
+            }
+        }
     }
 
     fn check_enum_case_member(&mut self, definition: &EnumDefinition, access: StaticAccess<'_>) {
@@ -18479,11 +19305,12 @@ impl<'program> Checker<'program> {
         }
         self.enum_case_values.insert(
             access.span,
-            EnumValue {
-                enum_id: definition.id,
-                case_id: case.id,
+            crate::enums::EnumCaseSource {
+                declaration: definition.source_type.id,
+                index,
             },
         );
+        self.begin_enum_construction(definition, &case.name, access.span, HashMap::new());
     }
 
     fn check_enum_case_call(
@@ -18518,7 +19345,7 @@ impl<'program> Checker<'program> {
         };
         let case = &definition.cases[index];
         if !case.payload.is_empty() {
-            let params = case
+            let mut params = case
                 .payload
                 .iter()
                 .map(|field| ParamInfo {
@@ -18529,6 +19356,24 @@ impl<'program> Checker<'program> {
                     has_default: false,
                 })
                 .collect::<Vec<_>>();
+            if !definition.type_params.is_empty() {
+                let bindings = self.infer_generic_argument_bindings(
+                    &format!("payload case `{}::{}`", definition.name, case.name),
+                    &params,
+                    args,
+                    scopes,
+                    method_context,
+                    &HashMap::new(),
+                );
+                self.begin_enum_construction(definition, &case.name, access.span, bindings);
+                let bindings = self.pending_enum_constructions[&access.span]
+                    .bindings
+                    .clone();
+                for param in &mut params {
+                    param.ty = self.substitute_type(param.ty, &bindings);
+                    param.take = self.type_is_move_type(param.ty);
+                }
+            }
             self.check_call_arguments(
                 &format!("payload case `{}::{}`", definition.name, case.name),
                 &params,
@@ -18537,7 +19382,13 @@ impl<'program> Checker<'program> {
                 scopes,
                 method_context,
             );
-            self.enum_case_constructions.insert(access.span, case.id);
+            self.enum_case_constructions.insert(
+                access.span,
+                crate::enums::EnumCaseSource {
+                    declaration: definition.source_type.id,
+                    index,
+                },
+            );
             return;
         }
         let parentheses = Span::new(access.member_span.end, access.span.end);
@@ -18694,6 +19545,8 @@ impl<'program> Checker<'program> {
                 if let Some(class) =
                     self.static_access_class_type(access.qualifier, name, method_context)
                 {
+                    self.record_class_member_lookup(class.clone(), access.qualifier_span);
+                    self.record_class_member_lookup(class.clone(), access.span);
                     let receiver = ClassType::new(
                         class.name,
                         class
@@ -19129,16 +19982,22 @@ impl<'program> Checker<'program> {
             function.declaration,
             &HashMap::new(),
         );
+        let return_ty = self.substitute_type(function.return_ty, &bindings);
+        let params = function
+            .params
+            .iter()
+            .map(|param| self.substitute_param_info(param, &bindings))
+            .collect::<Vec<_>>();
+        let borrow = self
+            .return_borrow_for_instance(function.declaration, &bindings)
+            .unwrap_or(function.return_borrow);
+        let return_borrow = self.specialize_return_borrow(borrow, &params, return_ty);
         let specialized = FunctionInfo {
             declaration: function.declaration,
             type_params: function.type_params.clone(),
-            params: function
-                .params
-                .iter()
-                .map(|param| self.substitute_param_info(param, &bindings))
-                .collect(),
-            return_ty: self.substitute_type(function.return_ty, &bindings),
-            return_borrow: function.return_borrow,
+            params,
+            return_ty,
+            return_borrow,
             checked_effects: function
                 .checked_effects
                 .iter()
@@ -19162,20 +20021,33 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> MethodInfo {
         if method.type_params.is_empty() {
+            self.defer_callable_availability(method, &method.enclosing_type_bindings, span);
             return method.clone();
         }
+        let template = self.method_signature_template(method);
         let bindings = self.infer_generic_call_bindings(
             callee,
-            &method.type_params,
-            &method.params,
+            &template.type_params,
+            &template.params,
             args,
             span,
             scopes,
             method_context,
-            method.return_ty,
+            template.return_ty,
             method.declaration,
             &method.enclosing_type_bindings,
         );
+        let return_ty = self.substitute_type(template.return_ty, &bindings);
+        self.defer_callable_availability(method, &bindings, span);
+        let params = template
+            .params
+            .iter()
+            .map(|param| self.substitute_param_info(param, &bindings))
+            .collect::<Vec<_>>();
+        let borrow = self
+            .return_borrow_for_instance(method.declaration, &bindings)
+            .unwrap_or(method.return_borrow);
+        let return_borrow = self.specialize_return_borrow(borrow, &params, return_ty);
         let specialized = MethodInfo {
             declaration: method.declaration,
             is_open: method.is_open,
@@ -19183,17 +20055,13 @@ impl<'program> Checker<'program> {
             virtual_root: method.virtual_root,
             access: method.access,
             receiver_mode: method.receiver_mode,
-            return_borrow: method.return_borrow,
+            return_borrow,
             is_static: method.is_static,
             enclosing_type_bindings: method.enclosing_type_bindings.clone(),
             type_params: method.type_params.clone(),
-            params: method
-                .params
-                .iter()
-                .map(|param| self.substitute_param_info(param, &bindings))
-                .collect(),
-            return_ty: self.substitute_type(method.return_ty, &bindings),
-            checked_effects: method
+            params,
+            return_ty,
+            checked_effects: template
                 .checked_effects
                 .iter()
                 .map(|effect| self.substitute_type(*effect, &bindings))
@@ -19218,6 +20086,39 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         return_ty: TypeId,
         declaration: Span,
+        initial_bindings: &HashMap<String, TypeId>,
+    ) -> HashMap<String, TypeId> {
+        let bindings = self.infer_generic_argument_bindings(
+            callee,
+            params,
+            args,
+            scopes,
+            method_context,
+            initial_bindings,
+        );
+        self.pending_generic_calls.insert(
+            span,
+            PendingGenericCall {
+                declaration,
+                inference: GenericInference {
+                    callee: callee.to_string(),
+                    type_params: type_params.to_vec(),
+                    bindings: bindings.clone(),
+                    return_ty,
+                },
+            },
+        );
+        self.publish_generic_specialization(span);
+        bindings
+    }
+
+    fn infer_generic_argument_bindings(
+        &mut self,
+        callee: &str,
+        params: &[ParamInfo],
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
         initial_bindings: &HashMap<String, TypeId>,
     ) -> HashMap<String, TypeId> {
         let param_names = params
@@ -19246,21 +20147,10 @@ impl<'program> Checker<'program> {
                 actual,
                 args[arg_index].value.span(),
                 &mut bindings,
+                false,
             );
         }
 
-        let key = span;
-        self.pending_generic_calls.insert(
-            key,
-            PendingGenericCall {
-                callee: callee.to_string(),
-                declaration,
-                type_params: type_params.to_vec(),
-                bindings: bindings.clone(),
-                return_ty,
-            },
-        );
-        self.publish_generic_specialization(key);
         bindings
     }
 
@@ -19271,152 +20161,18 @@ impl<'program> Checker<'program> {
         actual: TypeId,
         span: Span,
         bindings: &mut HashMap<String, TypeId>,
+        from_context: bool,
     ) {
-        match (
-            self.types.kind(pattern).clone(),
-            self.types.kind(actual).clone(),
-        ) {
-            (TypeKind::TypeParameter(name), TypeKind::Null) => {
-                let message = format!(
-                    "cannot infer type parameter `{name}` of {callee} from `null`; `null` requires a nullable expected type"
-                );
-                if !self.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == "E0538"
-                        && diagnostic.span == span
-                        && diagnostic.message == message
-                }) {
-                    self.diagnostics
-                        .push(Diagnostic::new("E0538", message, span).with_help(
-                            "pass a value with a concrete type or use a nullable parameter shape",
-                        ));
-                }
-                let unknown = self.types.unknown();
-                bindings.entry(name).or_insert(unknown);
-            }
-            (TypeKind::TypeParameter(name), TypeKind::Void) => {
-                let message = format!(
-                    "cannot infer type parameter `{name}` of {callee} from a `void` expression"
-                );
-                if !self.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == "E0538"
-                        && diagnostic.span == span
-                        && diagnostic.message == message
-                }) {
-                    self.diagnostics.push(
-                        Diagnostic::new("E0538", message, span)
-                            .with_help("pass an expression that produces a value"),
-                    );
-                }
-                let unknown = self.types.unknown();
-                bindings.entry(name).or_insert(unknown);
-            }
-            (TypeKind::TypeParameter(name), TypeKind::Unknown | TypeKind::EmptyCollection) => {
-                let _ = name;
-            }
-            (TypeKind::TypeParameter(name), _) => {
-                if let Some(previous) = bindings.get(&name).copied() {
-                    if previous != actual {
-                        self.diagnostics.push(
-                            Diagnostic::new(
-                                "E0532",
-                                format!(
-                                    "type parameter `{name}` of {callee} was inferred as both `{}` and `{}`",
-                                    self.types.display(previous),
-                                    self.types.display(actual)
-                                ),
-                                span,
-                            )
-                            .with_help(
-                                "pass arguments whose corresponding generic types are identical",
-                            ),
-                        );
-                    }
-                } else {
-                    bindings.insert(name, actual);
-                }
-            }
-            (TypeKind::Nullable(pattern), TypeKind::Nullable(actual)) => {
-                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
-            }
-            (TypeKind::Nullable(pattern), TypeKind::Null) => {
-                let _ = pattern;
-            }
-            (TypeKind::Nullable(pattern), _) => {
-                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
-            }
-            (TypeKind::TypedArray(pattern), TypeKind::TypedArray(actual))
-            | (TypeKind::List(pattern), TypeKind::List(actual))
-            | (TypeKind::Set(pattern), TypeKind::Set(actual))
-            | (TypeKind::SortedSet(pattern), TypeKind::SortedSet(actual))
-            | (TypeKind::PriorityQueue(pattern), TypeKind::PriorityQueue(actual))
-            | (TypeKind::Deque(pattern), TypeKind::Deque(actual)) => {
-                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
-            }
-            // A shared handle unifies with the same handle kind, through its payload:
-            // `SharedReference<T>` against `SharedReference<Node>` binds `T = Node`.
-            // The kinds must match, so unification never crosses the family boundary.
-            (
-                TypeKind::SharedHandle(pattern_kind, pattern),
-                TypeKind::SharedHandle(actual_kind, actual),
-            ) if pattern_kind == actual_kind => {
-                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
-            }
-            (
-                TypeKind::Dictionary(pattern_key, pattern_value),
-                TypeKind::Dictionary(actual_key, actual_value),
-            )
-            | (
-                TypeKind::SortedDictionary(pattern_key, pattern_value),
-                TypeKind::SortedDictionary(actual_key, actual_value),
-            ) => {
-                self.infer_type_parameter_bindings(callee, pattern_key, actual_key, span, bindings);
-                self.infer_type_parameter_bindings(
-                    callee,
-                    pattern_value,
-                    actual_value,
-                    span,
-                    bindings,
-                );
-            }
-            (TypeKind::Class(pattern), TypeKind::Class(actual))
-            | (TypeKind::Interface(pattern), TypeKind::Interface(actual))
-                if pattern.name == actual.name
-                    && pattern.arguments.len() == actual.arguments.len() =>
-            {
-                for (pattern, actual) in pattern.arguments.into_iter().zip(actual.arguments) {
-                    self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
-                }
-            }
-            (TypeKind::Function(pattern), TypeKind::Function(actual))
-                if pattern.invocation_mode == actual.invocation_mode
-                    && pattern.parameters.len() == actual.parameters.len()
-                    && pattern.parameters.iter().zip(&actual.parameters).all(
-                        |(pattern, actual)| pattern.ownership_mode == actual.ownership_mode,
-                    )
-                    && pattern.checked_effects.len() == actual.checked_effects.len() =>
-            {
-                for (pattern, actual) in pattern.parameters.into_iter().zip(actual.parameters) {
-                    self.infer_type_parameter_bindings(
-                        callee, pattern.ty, actual.ty, span, bindings,
-                    );
-                }
-                self.infer_type_parameter_bindings(
-                    callee,
-                    pattern.return_type,
-                    actual.return_type,
-                    span,
-                    bindings,
-                );
-                for (pattern, actual) in pattern
-                    .checked_effects
-                    .into_iter()
-                    .zip(actual.checked_effects)
-                {
-                    self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
-                }
-            }
-            _ => {}
-        }
+        crate::generic_inference::infer_type_parameter_bindings(
+            &mut self.types,
+            &mut self.diagnostics,
+            callee,
+            pattern,
+            actual,
+            span,
+            bindings,
+            from_context,
+        );
     }
 
     fn substitute_param_info(
@@ -19437,6 +20193,7 @@ impl<'program> Checker<'program> {
         let Some(pending) = self.pending_generic_calls.get(&key) else {
             return;
         };
+        let pending = &pending.inference;
         let Some(arguments) = pending
             .type_params
             .iter()
@@ -19463,6 +20220,9 @@ impl<'program> Checker<'program> {
             self.complete_generic_call_from_expected(expr, expected);
             return;
         }
+        if self.complete_enum_construction_from_expected(expr.span(), expected) {
+            return;
+        }
         let key = match expr {
             Expr::FunctionCall { span, .. }
             | Expr::MethodCall { span, .. }
@@ -19472,7 +20232,11 @@ impl<'program> Checker<'program> {
         let Some(pending) = self.pending_generic_calls.get(key).cloned() else {
             return;
         };
+        let pending = pending.inference;
         let mut bindings = pending.bindings;
+        // Context fills unresolved parameters; argument-inferred types retain
+        // their identity and use ordinary assignment compatibility afterwards.
+        let result = pending.return_ty;
         let return_ty = if matches!(
             expr,
             Expr::MethodCall {
@@ -19481,10 +20245,9 @@ impl<'program> Checker<'program> {
             }
         ) {
             // Context describes the lifted call, not the method's unlifted result.
-            let result = self.substitute_type(pending.return_ty, &bindings);
             self.null_safe_result_type(result, true)
         } else {
-            pending.return_ty
+            result
         };
         self.infer_type_parameter_bindings(
             &pending.callee,
@@ -19492,9 +20255,10 @@ impl<'program> Checker<'program> {
             expected,
             expr.span(),
             &mut bindings,
+            true,
         );
         if let Some(call) = self.pending_generic_calls.get_mut(key) {
-            call.bindings = bindings;
+            call.inference.bindings = bindings;
         }
         self.publish_generic_specialization(*key);
     }
@@ -19504,6 +20268,7 @@ impl<'program> Checker<'program> {
         let Some(pending) = self.pending_generic_calls.get(&key).cloned() else {
             return fallback;
         };
+        let pending = pending.inference;
         if pending
             .type_params
             .iter()
@@ -19515,7 +20280,12 @@ impl<'program> Checker<'program> {
     }
 
     fn report_unresolved_generic_calls(&mut self) {
-        let mut calls = self.pending_generic_calls.iter().collect::<Vec<_>>();
+        let mut calls = self
+            .pending_generic_calls
+            .iter()
+            .map(|(span, call)| (span, &call.inference))
+            .chain(self.pending_enum_constructions.iter())
+            .collect::<Vec<_>>();
         calls.sort_by_key(|(span, _)| **span);
         for (span, pending) in calls {
             let missing_names = pending
@@ -19528,7 +20298,12 @@ impl<'program> Checker<'program> {
             }
             let missing = missing_names
                 .iter()
-                .map(|param| format!("`{}`", param.name))
+                .map(|param| {
+                    format!(
+                        "`{}`",
+                        crate::trait_composition::authored_type_parameter_name(&param.name)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let plural = if missing_names.len() == 1 { "" } else { "s" };
@@ -19581,6 +20356,12 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let got = self.infer_expr_type(arg, scopes, method_context);
+        if param.take
+            && crate::compiler_known_stream::contains_call_scoped_request(&self.types.resolved(got))
+        {
+            self.report_call_scoped_request(arg.span(), "be transferred to an owning parameter");
+            return;
+        }
         let parameter_is_class_like = self.type_is_class_or_nullable_class(param.ty);
 
         if self.is_expr_assignable(param.ty, arg, scopes, method_context)
@@ -19635,23 +20416,22 @@ impl<'program> Checker<'program> {
             TypeKind::Nullable(inner) if matches!(self.types.kind(*inner), TypeKind::Mixed)
         );
         if (matches!(self.types.kind(target), TypeKind::Mixed) || nullable_target)
-            && !matches!(self.types.kind(value), TypeKind::Mixed | TypeKind::Unknown)
-            && !(nullable_target && matches!(self.types.kind(value), TypeKind::Null))
+            && !matches!(self.types.kind(value), TypeKind::Unknown)
         {
-            self.mixed_box_plans.insert(
-                value_expr.span(),
-                MixedBoxPlan {
-                    source_type: self.types.resolved(value),
-                    nullable_target,
-                },
-            );
+            let plan = MixedBoxPlan {
+                source_type: self.types.resolved(value),
+                nullable_target,
+            };
+            if plan.requires_boxing() {
+                self.mixed_box_plans.insert(value_expr.span(), plan);
+            }
         }
     }
 
     fn type_is_class_or_nullable_class(&self, ty: TypeId) -> bool {
         match *self.types.kind(ty) {
-            TypeKind::Class(_) => true,
-            TypeKind::Nullable(inner) => matches!(self.types.kind(inner), TypeKind::Class(_)),
+            TypeKind::Class(ref class) => class.inline_copy_type().is_none(),
+            TypeKind::Nullable(inner) => self.type_is_class_or_nullable_class(inner),
             _ => false,
         }
     }
@@ -19709,6 +20489,9 @@ impl<'program> Checker<'program> {
         self.member_receiver_access.insert(object.span(), access);
         let receiver = self.infer_expr_type(object, scopes, method_context);
         self.record_constrained_receiver(receiver, object.span());
+        if let Some(class) = self.class_member_receiver(receiver) {
+            self.record_class_member_lookup(class, object.span());
+        }
     }
 
     fn object_path_access(
@@ -19718,15 +20501,30 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> ObjectPathAccess {
         let ty = self.infer_expr_type(expr, scopes, method_context);
-        if let TypeKind::SharedHandle(kind, _) = self.types.kind(ty) {
-            return if *kind == SharedHandleKind::WritableSharedReferenceAccess {
+        if crate::types::ByteRegionKind::from_resolved(&self.types.resolved(ty))
+            == Some(crate::types::ByteRegionKind::Readonly)
+        {
+            return ObjectPathAccess::Readonly;
+        }
+        self.storage_path_access(expr, scopes, method_context)
+    }
+
+    fn storage_path_access(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> ObjectPathAccess {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if let Some((kind, _)) = self.shared_handle_type(ty, true) {
+            return if kind == SharedHandleKind::WritableSharedReferenceAccess {
                 ObjectPathAccess::Writable
             } else {
                 ObjectPathAccess::Readonly
             };
         }
         let access = match expr {
-            Expr::Grouped { expr, .. } => self.object_path_access(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } => self.storage_path_access(expr, scopes, method_context),
             Expr::New { .. } => ObjectPathAccess::Writable,
             Expr::Variable { name, .. } => {
                 scopes
@@ -19750,18 +20548,8 @@ impl<'program> Checker<'program> {
             Expr::PropertyAccess {
                 object, property, ..
             } => {
-                if let Some(method) = self.property_getter(expr, scopes, method_context) {
-                    let writable = self.call_result_is_writable(
-                        CallSite {
-                            return_ty: method.return_ty,
-                            return_borrow: method.return_borrow,
-                            params: &method.params,
-                            args: &[],
-                        },
-                        Some(object),
-                        scopes,
-                        method_context,
-                    );
+                if self.property_getter(expr, scopes, method_context).is_some() {
+                    let writable = self.call_result_is_writable(expr, ty, scopes, method_context);
                     if writable {
                         self.writable_object_paths.insert(expr.span());
                     }
@@ -19770,9 +20558,6 @@ impl<'program> Checker<'program> {
                     } else {
                         ObjectPathAccess::Readonly
                     };
-                }
-                if !Self::is_property_write_object_path(object) {
-                    return ObjectPathAccess::Readonly;
                 }
                 let parent_access = self.object_path_access(object, scopes, method_context);
                 if parent_access == ObjectPathAccess::Readonly {
@@ -19784,10 +20569,9 @@ impl<'program> Checker<'program> {
                         self.trait_property(&owner, property)
                             .is_some_and(|property| property.writable)
                     } else {
-                        self.expr_class_name(object, scopes, method_context)
-                            .and_then(|class| self.classes.get(&class))
-                            .and_then(|class| class.properties.get(property))
-                            .is_some_and(|property| property.writable)
+                        self.expr_class_type(object, scopes, method_context)
+                            .and_then(|class| self.lookup_instance_property(&class, property))
+                            .is_some_and(|(_, property)| property.permits_write_through())
                     };
                 if writable {
                     ObjectPathAccess::Writable
@@ -19798,97 +20582,43 @@ impl<'program> Checker<'program> {
             Expr::Index { collection, .. } => {
                 self.object_path_access(collection, scopes, method_context)
             }
-            Expr::FunctionCall {
-                name, args, span, ..
-            } => {
-                if self.functions.get(name).cloned().is_some_and(|function| {
-                    let return_ty = self.generic_call_result_type(*span, function.return_ty);
-                    self.call_result_is_writable(
-                        CallSite {
-                            return_ty,
-                            return_borrow: function.return_borrow,
-                            params: &function.params,
-                            args,
-                        },
-                        None,
-                        scopes,
-                        method_context,
-                    )
-                }) {
-                    ObjectPathAccess::Writable
-                } else {
-                    ObjectPathAccess::Readonly
-                }
-            }
-            Expr::MethodCall {
-                object,
-                method,
-                args,
-                span,
-                ..
-            } => {
-                let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
-                    return ObjectPathAccess::Readonly;
-                };
-                let Some(method_info) = self
-                    .classes
-                    .get(&class_type.name)
-                    .and_then(|class_info| class_info.methods.get(method))
-                    .cloned()
-                else {
-                    return ObjectPathAccess::Readonly;
-                };
-                let method_info = self.specialize_method_for_class(&method_info, &class_type);
-                let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
-                if self.call_result_is_writable(
-                    CallSite {
-                        return_ty,
-                        return_borrow: method_info.return_borrow,
-                        params: &method_info.params,
-                        args,
-                    },
-                    Some(object),
-                    scopes,
-                    method_context,
-                ) {
-                    ObjectPathAccess::Writable
-                } else {
-                    ObjectPathAccess::Readonly
-                }
-            }
-            Expr::StaticCall {
+            Expr::StaticMember {
                 qualifier,
-                method,
-                args,
+                member,
                 span,
                 ..
             } => {
-                let class_name = match qualifier {
-                    StaticQualifier::Class(name) => Some(name.as_str()),
-                    StaticQualifier::SelfType => {
-                        method_context.map(|context| context.class_name.as_str())
-                    }
-                    StaticQualifier::Parent | StaticQualifier::InvalidStatic => None,
-                };
-                let Some(method_info) = class_name
-                    .and_then(|class| self.classes.get(class))
-                    .and_then(|class| class.methods.get(method))
+                let class = self
+                    .static_member_targets
+                    .get(span)
                     .cloned()
-                else {
-                    return ObjectPathAccess::Readonly;
-                };
-                let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
-                if self.call_result_is_writable(
-                    CallSite {
-                        return_ty,
-                        return_borrow: method_info.return_borrow,
-                        params: &method_info.params,
-                        args,
-                    },
-                    None,
-                    scopes,
-                    method_context,
-                ) {
+                    .map(|class| {
+                        ClassType::new(
+                            class.name,
+                            class
+                                .arguments
+                                .iter()
+                                .map(|ty| self.types.intern_resolved(ty))
+                                .collect(),
+                        )
+                    })
+                    .or_else(|| {
+                        let name = self.static_qualifier_class_name(qualifier, method_context)?;
+                        self.static_access_class_type(qualifier, &name, method_context)
+                    });
+                if class.and_then(|class| self.lookup_static_member(&class, member))
+                    .is_some_and(|(_, member)| matches!(member, StaticMemberInfo::Property(property) if property.writable))
+                {
+                    ObjectPathAccess::Writable
+                } else {
+                    ObjectPathAccess::Readonly
+                }
+            }
+            Expr::FunctionCall { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::CallableCall { .. } => {
+                if self.call_result_is_writable(expr, ty, scopes, method_context) {
                     ObjectPathAccess::Writable
                 } else {
                     ObjectPathAccess::Readonly
@@ -19943,52 +20673,43 @@ impl<'program> Checker<'program> {
 
     fn call_result_is_writable(
         &mut self,
-        callee: CallSite<'_>,
-        receiver: Option<&Expr>,
+        call: &Expr,
+        return_ty: TypeId,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        let CallSite {
-            return_ty,
-            return_borrow,
-            params,
-            args,
-        } = callee;
-        if !self.type_is_class_or_nullable_class(return_ty) {
+        use crate::ownership::ReturnBorrowLookup;
+        if !self.type_is_move_type(return_ty) {
             return false;
         }
-        let Some(return_borrow) = return_borrow else {
-            return true;
-        };
-        if !return_borrow.writable {
-            return false;
-        }
-        match return_borrow.source {
-            BorrowSource::Receiver => receiver.is_some_and(|receiver| {
-                self.is_writable_object_path(receiver, scopes, method_context)
-            }),
-            BorrowSource::Parameter(index) => {
-                // The borrow annotation refers to a parameter position; resolve
-                // the argument that binds to it (named binding may reorder or
-                // skip), then check that source expression's writability.
-                Self::argument_bound_to_parameter(params, args, index).is_some_and(|argument| {
+        match self.call_return_borrow(call, scopes, method_context) {
+            ReturnBorrowLookup::OwnedValue | ReturnBorrowLookup::Resolved(None) => true,
+            ReturnBorrowLookup::Resolved(Some(borrow)) if borrow.writable => match call {
+                Expr::MethodCall { object, .. } | Expr::PropertyAccess { object, .. }
+                    if borrow.source == BorrowSource::Receiver =>
+                {
+                    self.is_writable_object_path(object, scopes, method_context)
+                }
+                _ => false,
+            },
+            ReturnBorrowLookup::ResolvedArgument {
+                borrow,
+                argument_index,
+            } if borrow.writable => {
+                let args = match call {
+                    Expr::FunctionCall { args, .. }
+                    | Expr::MethodCall { args, .. }
+                    | Expr::StaticCall { args, .. }
+                    | Expr::CallableCall { args, .. } => args,
+                    _ => return false,
+                };
+                args.get(argument_index).is_some_and(|argument| {
+                    let argument = &argument.value;
                     self.is_writable_object_path(argument, scopes, method_context)
                 })
             }
+            _ => false,
         }
-    }
-
-    /// Resolve the source-order argument expression bound to parameter
-    /// `param_index` under named-argument binding (decision 0098). Returns `None`
-    /// when the parameter was omitted (its default applies) or the binding could
-    /// not resolve it.
-    fn argument_bound_to_parameter<'a>(
-        params: &[ParamInfo],
-        args: &'a [Argument],
-        param_index: usize,
-    ) -> Option<&'a Expr> {
-        Self::argument_index_bound_to_parameter(params, args, param_index)
-            .map(|arg_index| &args[arg_index].value)
     }
 
     fn argument_index_bound_to_parameter(
@@ -20210,10 +20931,18 @@ impl<'program> Checker<'program> {
     fn can_access_internal_member(
         &self,
         declaring_class: &str,
-        _use_span: Span,
+        use_span: Span,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        // A compiler-owned standard source is one unit: its classes cooperate
+        // through internal members (file lock methods construct the guards)
+        // that authored code still cannot reach.
         method_context.is_some_and(|context| context.class_name == declaring_class)
+            || (use_span.source.is_compiler_owned()
+                && self
+                    .classes
+                    .get(declaring_class)
+                    .is_some_and(|class| class.declaration.source == use_span.source))
     }
 
     fn type_parameter_has_constraint(&self, parameter: &str, required: &str) -> bool {
@@ -20228,6 +20957,9 @@ impl<'program> Checker<'program> {
                 constraints
                     .iter()
                     .any(|constraint| constraint.name == required)
+            }) || self.nominal_condition_scopes.iter().flatten().any(|step| {
+                matches!(self.types.kind(step.query.subject), TypeKind::TypeParameter(name) if name == parameter)
+                    && self.interface_declares_ancestor(&step.query.interface.name, required, &mut HashSet::new())
             })
     }
 
@@ -20300,6 +21032,11 @@ impl<'program> Checker<'program> {
                 .type_argument(0)
                 .and_then(|argument| self.resolve_constraint_operand_type(argument))
                 == Some(operand)
+        }) || self.nominal_condition_scopes.iter().flatten().any(|step| {
+            matches!(self.types.kind(step.query.subject), TypeKind::TypeParameter(name) if name == parameter)
+                && step.query.interface.name == constraint_name
+                && (matches!(self.types.kind(operand), TypeKind::TypeParameter(other) if other == parameter)
+                    || step.query.interface.arguments == [operand])
         })
     }
 
@@ -20333,7 +21070,18 @@ impl<'program> Checker<'program> {
     }
 
     fn const_type_id(&mut self, ty: crate::const_eval::ConstType) -> TypeId {
+        if let crate::const_eval::ConstType::NullableInlineNominal(ty) = &ty {
+            return self.resolve_type_ref(ty, Span::default());
+        }
         let kind = match ty {
+            crate::const_eval::ConstType::NullableInlineNominal(_) => unreachable!(),
+            crate::const_eval::ConstType::Inline(ty) => {
+                TypeKind::Class(ClassType::new(ty.name().to_string(), Vec::new()))
+            }
+            crate::const_eval::ConstType::NullableInline(ty) => {
+                let inner = self.const_type_id(crate::const_eval::ConstType::Inline(ty));
+                TypeKind::Nullable(inner)
+            }
             crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
             crate::const_eval::ConstType::NullableInteger(ty) => {
                 let inner = self.types.intern(TypeKind::Integer(ty));
@@ -20350,21 +21098,11 @@ impl<'program> Checker<'program> {
                 let inner = self.types.intern(TypeKind::Bool);
                 TypeKind::Nullable(inner)
             }
-            crate::const_eval::ConstType::Enum(enum_id) => TypeKind::Enum(
-                self.enums
-                    .values()
-                    .find(|definition| definition.id == enum_id)
-                    .map(|definition| crate::enums::EnumType {
-                        id: definition.id,
-                        name: definition.name.clone(),
-                    })
-                    .unwrap_or_else(|| crate::enums::EnumType {
-                        id: enum_id,
-                        name: format!("enum#{}", enum_id.0),
-                    }),
-            ),
-            crate::const_eval::ConstType::NullableEnum(enum_id) => {
-                let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(enum_id));
+            crate::const_eval::ConstType::Enum(ty) => {
+                return self.types.intern_resolved(&ResolvedType::Enum(ty));
+            }
+            crate::const_eval::ConstType::NullableEnum(ty) => {
+                let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(ty));
                 TypeKind::Nullable(enum_type)
             }
             crate::const_eval::ConstType::Null => TypeKind::Null,
@@ -20449,6 +21187,7 @@ impl<'program> Checker<'program> {
                 declaring_class,
             );
             return match self.types.kind(inner) {
+                TypeKind::Unknown => inner,
                 TypeKind::Integer(_)
                 | TypeKind::Float(_)
                 | TypeKind::String
@@ -20464,6 +21203,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::TraitSelf(_)
                 | TypeKind::SharedHandle(_, _)
                 | TypeKind::Bytes
+                | TypeKind::ByteRegion(_)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -20475,7 +21215,6 @@ impl<'program> Checker<'program> {
                 TypeKind::Void
                 | TypeKind::Null
                 | TypeKind::Nullable(_)
-                | TypeKind::Unknown
                 | TypeKind::Heterogeneous
                 | TypeKind::EmptyCollection => self.reject_type_ref_with_help(
                     ty,
@@ -20492,6 +21231,9 @@ impl<'program> Checker<'program> {
 
         if let Some(float) = FloatType::from_source_name(&ty.name) {
             return self.resolve_zero_arg_type(ty, span, TypeKind::Float(float));
+        }
+        if let Some(kind) = crate::types::ByteRegionKind::from_source_name(&ty.name) {
+            return self.resolve_zero_arg_type(ty, span, TypeKind::ByteRegion(kind));
         }
         if ty.arguments.is_empty()
             && self
@@ -20571,7 +21313,8 @@ impl<'program> Checker<'program> {
                 "`resource` is reserved for PHP interop through the future Phase I bridge and is not a Doria value type",
             ),
             name if self.enums.contains_key(name) => {
-                if !self.expect_type_arg_count(ty, 0, span) {
+                let definition = self.enums.get(name).expect("enum existence checked").clone();
+                if !self.expect_type_arg_count(ty, definition.type_params.len(), span) {
                     for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(
                             arg,
@@ -20582,11 +21325,18 @@ impl<'program> Checker<'program> {
                     }
                     return self.types.unknown();
                 }
-                let definition = self.enums.get(name).expect("enum existence checked");
-                self.types.intern(TypeKind::Enum(EnumType::new(
-                    definition.id,
-                    definition.name.clone(),
-                )))
+                let arguments = ty
+                    .type_arguments()
+                    .map(|argument| self.resolve_type_ref_in_position(
+                        argument, span, TypePosition::Value, declaring_class,
+                    ))
+                    .collect::<Vec<_>>();
+                if !self.check_nominal_type_constraints(name, &definition.type_params, &arguments, span) {
+                    return self.types.unknown();
+                }
+                let enumeration = EnumType::with_arguments(definition.source_type.id, name, arguments);
+                self.record_nominal_instantiation(instantiation::NominalInstance::Enum(enumeration.clone()), declaring_class);
+                self.types.intern(TypeKind::Enum(enumeration))
             }
             "uint" => self.reject_type_ref_with_help(
                 ty,
@@ -20753,7 +21503,9 @@ impl<'program> Checker<'program> {
                 if !self.expect_type_arg_count(ty, declaration.type_params.len(), span) { return self.types.unknown(); }
                 let arguments = ty.type_arguments().map(|argument| self.resolve_type_ref_in_position(argument, span, TypePosition::Value, declaring_class)).collect::<Vec<_>>();
                 let parameters = declaration.type_params.iter().map(|parameter| TypeParamInfo { name: parameter.name.clone(), constraints: parameter.constraints.clone() }).collect::<Vec<_>>();
-                self.check_class_type_constraints(name, &parameters, &arguments, span);
+                if !self.check_nominal_type_constraints(name, &parameters, &arguments, span) {
+                    return self.types.unknown();
+                }
                 self.types.intern(TypeKind::Interface(crate::types::InterfaceType::new(name, arguments)))
             }
             name if self.trait_declaration(name).is_some() => self.reject_type_ref(ty, span, "E0750", "a trait is a composition declaration, not a value type"),
@@ -20780,28 +21532,11 @@ impl<'program> Checker<'program> {
                         )
                     })
                     .collect::<Vec<_>>();
-                self.check_class_type_constraints(name, &type_params, &arguments, span);
-                let class = ClassType::new(name, arguments);
-                if class
-                    .arguments
-                    .iter()
-                    .any(|argument| self.type_is_symbolic(*argument))
-                {
-                    if let Some(owner) = declaring_class {
-                        self.class_instantiation_templates
-                            .entry(owner.to_string())
-                            .or_default()
-                            .insert(class.clone());
-                    }
-                    if let Some(callable) = self.current_callable {
-                        self.callable_class_instantiation_templates
-                            .entry(callable)
-                            .or_default()
-                            .insert(class.clone());
-                    }
-                } else {
-                    self.class_instantiations.insert(class.clone());
+                if !self.check_nominal_type_constraints(name, &type_params, &arguments, span) {
+                    return self.types.unknown();
                 }
+                let class = ClassType::new(name, arguments);
+                self.record_class_instantiation(class.clone(), declaring_class);
                 self.types.intern(TypeKind::Class(class))
             }
             name => {
@@ -20844,6 +21579,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage23_hashable_type(&mut self, ty: TypeId, span: Span, role: &str) {
+        if self.nominal_identity_depth > 0 {
+            return;
+        }
         if self.select_core_operation(
             ty,
             crate::compiler_known_contracts::CoreValueOperation::Hash,
@@ -21051,6 +21789,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage26_comparable_type(&mut self, ty: TypeId, span: Span, role: &str) {
+        if self.nominal_identity_depth > 0 {
+            return;
+        }
         if self.select_core_operation(
             ty,
             crate::compiler_known_contracts::CoreValueOperation::Compare,
@@ -21168,46 +21909,34 @@ impl<'program> Checker<'program> {
         false
     }
 
-    fn check_class_type_constraints(
+    fn check_nominal_type_constraints(
         &mut self,
-        class_name: &str,
+        name: &str,
         params: &[TypeParamInfo],
         arguments: &[TypeId],
         span: Span,
-    ) {
-        let identity = (class_name.to_string(), arguments.to_vec());
-        if !self.checking_type_constraints.insert(identity.clone()) {
-            return;
+    ) -> bool {
+        if self.nominal_identity_depth > 0 {
+            return true;
         }
-        let bindings = params
-            .iter()
-            .zip(arguments)
-            .map(|(param, argument)| (param.name.clone(), *argument))
-            .collect::<HashMap<_, _>>();
-        for (param, argument) in params.iter().zip(arguments) {
-            for constraint in &param.constraints {
-                if self.type_is_symbolic(*argument) {
-                    continue;
-                }
-                if self.constraint_accepts_type_argument(constraint, *argument, &bindings, span) {
-                    continue;
-                }
-                let message = format!(
-                    "type argument `{}` for `{class_name}<...>` does not satisfy required constraint `{}`",
-                    self.types.display(*argument),
-                    constraint
-                );
-                if !self.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == "E0535"
-                        && diagnostic.span == span
-                        && diagnostic.message == message
-                }) {
-                    self.diagnostics
-                        .push(Diagnostic::new("E0535", message, span));
-                }
-            }
+        let identity = (name.to_string(), arguments.to_vec());
+        if !self.checking_type_constraints.insert(identity.clone()) {
+            return true;
+        }
+        let mut caller = self.nominal_proof_context();
+        let valid = self.nominal_arguments_well_formed(
+            name,
+            params,
+            arguments,
+            span,
+            &mut caller,
+            &mut HashSet::new(),
+        );
+        if valid && self.classes.contains_key(name) {
+            self.defer_class_conformance_check(ClassType::new(name, arguments.to_vec()), &caller);
         }
         self.checking_type_constraints.remove(&identity);
+        valid
     }
 
     fn check_concrete_class_constraints(&mut self, class: &ClassType<TypeId>, span: Span) {
@@ -21216,7 +21945,7 @@ impl<'program> Checker<'program> {
             .get(&class.name)
             .map(|info| info.type_params.clone())
             .unwrap_or_default();
-        self.check_class_type_constraints(&class.name, &params, &class.arguments, span);
+        self.check_nominal_type_constraints(&class.name, &params, &class.arguments, span);
     }
 
     fn check_generic_type_constraints(
@@ -21231,9 +21960,7 @@ impl<'program> Checker<'program> {
                 continue;
             };
             for constraint in &param.constraints {
-                if self.type_is_symbolic(argument)
-                    || self.constraint_accepts_type_argument(constraint, argument, bindings, span)
-                {
+                if self.constraint_accepts_type_argument(constraint, argument, bindings, span) {
                     continue;
                 }
                 let message = format!(
@@ -21259,66 +21986,19 @@ impl<'program> Checker<'program> {
         bindings: &HashMap<String, TypeId>,
         span: Span,
     ) -> bool {
-        if self.interface_declaration(&constraint.name).is_some()
-            && (!self.is_core_interface(&constraint.name)
-                || !self.type_satisfies_compiler_constraint(argument, &constraint.name))
-        {
-            self.type_parameter_scopes.push(
-                bindings
-                    .keys()
-                    .map(|name| (name.clone(), Vec::new()))
-                    .collect(),
-            );
-            let target = if self.is_core_interface(&constraint.name)
-                && matches!(constraint.name.as_str(), "Comparable" | "Equatable")
-                && constraint.arguments.is_empty()
-            {
-                Some(crate::types::InterfaceType::new(
-                    &constraint.name,
-                    vec![argument],
-                ))
-            } else {
-                self.resolve_interface_edge(constraint, span)
-            };
-            self.type_parameter_scopes.pop();
-            return target.is_some_and(|mut target| {
-                target.arguments = target
-                    .arguments
-                    .iter()
-                    .map(|ty| self.substitute_type_id(*ty, bindings))
-                    .collect();
-                self.type_has_declared_interface(argument, &target, &mut HashSet::new())
-            });
-        }
-        if !self.type_satisfies_compiler_constraint(argument, &constraint.name) {
-            return false;
-        }
-        if constraint.arguments.is_empty() {
-            return true;
-        }
-        if !matches!(constraint.name.as_str(), "Equatable" | "Comparable")
-            || constraint.has_value_arguments()
-            || constraint.type_argument_count() != 1
-        {
-            return false;
-        }
-
-        let scope = bindings
-            .keys()
-            .map(|name| (name.clone(), Vec::new()))
-            .collect::<HashMap<_, _>>();
-        self.type_parameter_scopes.push(scope);
-        let required = self.resolve_type_ref_in_position(
-            constraint.type_argument(0).unwrap(),
-            span,
-            TypePosition::Value,
+        let mut caller = self.nominal_proof_context();
+        self.argument_bound_holds(
+            constraint,
+            argument,
+            bindings,
             None,
-        );
-        self.type_parameter_scopes.pop();
-        self.substitute_type_id(required, bindings) == argument
+            span,
+            &mut caller,
+            &mut HashSet::new(),
+        )
     }
 
-    fn type_satisfies_compiler_constraint(&self, ty: TypeId, constraint: &str) -> bool {
+    fn primitive_satisfies_compiler_constraint(&self, ty: TypeId, constraint: &str) -> bool {
         match constraint {
             "Equatable" => matches!(
                 self.types.kind(ty),
@@ -21332,17 +22012,14 @@ impl<'program> Checker<'program> {
                 self.types.kind(ty),
                 TypeKind::Integer(_) | TypeKind::Bool | TypeKind::String | TypeKind::Unknown
             ),
-            "Displayable" => match self.types.kind(ty) {
+            "Displayable" => matches!(
+                self.types.kind(ty),
                 TypeKind::Integer(_)
-                | TypeKind::Float(_)
-                | TypeKind::Bool
-                | TypeKind::String
-                | TypeKind::Unknown => true,
-                TypeKind::Class(class) => {
-                    self.class_implements_builtin(&class.name, BuiltinInterface::Displayable)
-                }
-                _ => false,
-            },
+                    | TypeKind::Float(_)
+                    | TypeKind::Bool
+                    | TypeKind::String
+                    | TypeKind::Unknown
+            ),
             _ => false,
         }
     }
@@ -21803,16 +22480,21 @@ impl<'program> Checker<'program> {
     }
 
     fn check_repeat_element_eligibility(&mut self, element: TypeId, span: Span) -> bool {
-        if !self.type_is_move_type(element)
-            && !matches!(
-                self.types.kind(element),
-                TypeKind::Bool
-                    | TypeKind::Integer(_)
-                    | TypeKind::Float(_)
-                    | TypeKind::String
-                    | TypeKind::Unknown
-            )
-        {
+        let scalar_copy = |ty| match self.types.kind(ty) {
+            TypeKind::Bool
+            | TypeKind::Integer(_)
+            | TypeKind::Float(_)
+            | TypeKind::Enum(_)
+            | TypeKind::Unknown => true,
+            TypeKind::Class(class) => class.inline_copy_type().is_some(),
+            _ => false,
+        };
+        let supported_copy = match self.types.kind(element) {
+            TypeKind::String => true,
+            TypeKind::Nullable(inner) => scalar_copy(*inner),
+            _ => scalar_copy(element),
+        };
+        if !self.type_is_move_type(element) && !supported_copy {
             self.diagnostics.push(Diagnostic::unsupported_stage(
                 "E0528",
                 format!("sequence fill for `{}` is not yet supported by the Decision 0102 fill representation", self.types.display(element)),
@@ -21979,9 +22661,7 @@ impl<'program> Checker<'program> {
             (TypeKind::Class(target), TypeKind::Class(value)) => {
                 self.class_is_subtype(&value, &target)
             }
-            (TypeKind::Interface(target), _) => {
-                self.type_has_declared_interface(value, &target, &mut HashSet::new())
-            }
+            (TypeKind::Interface(target), _) => self.type_has_declared_interface(value, &target),
             (TypeKind::Function(target), TypeKind::Function(value)) => {
                 self.function_type_compatibility(&target, &value).is_ok()
             }
@@ -22048,6 +22728,7 @@ impl<'program> Checker<'program> {
         }
         self.expression_types
             .insert(expr.span(), self.types.resolved(ty));
+        self.defer_formed_type_conformances(ty);
         ty
     }
 
@@ -22157,7 +22838,11 @@ impl<'program> Checker<'program> {
             }
             Expr::Identifier { name, .. } => {
                 let key = crate::const_eval::ConstKey::TopLevel(name.clone());
-                let ty = self.const_evaluation.values.get(&key).map(|value| value.ty);
+                let ty = self
+                    .const_evaluation
+                    .values
+                    .get(&key)
+                    .map(|value| value.ty.clone());
                 ty.map(|ty| self.const_type_id(ty))
                     .unwrap_or_else(|| self.types.unknown())
             }
@@ -22362,10 +23047,10 @@ impl<'program> Checker<'program> {
                     return self.types.unknown();
                 };
                 if let Some(definition) = self.enums.get(&class_name) {
-                    return self.types.intern(TypeKind::Enum(EnumType::new(
-                        definition.id,
-                        definition.name.clone(),
-                    )));
+                    let template = self
+                        .types
+                        .intern(TypeKind::Enum(definition.source_type.clone()));
+                    return self.enum_construction_type(*span, template);
                 }
                 if class_name == "Int" && method == "toFloat" {
                     return self.types.intern(TypeKind::Float(FloatType::Float64));
@@ -22453,8 +23138,16 @@ impl<'program> Checker<'program> {
                         .map(|(_, return_ty)| return_ty)
                         .unwrap_or_else(|| self.types.unknown());
                 }
-                if class_name == "Bytes" && method == "fromArray" {
-                    return self.types.intern(TypeKind::Bytes);
+                if class_name == "Bytes" {
+                    if let Some(intrinsic) =
+                        crate::byte_intrinsics::member(&ResolvedType::Bytes, method).filter(
+                            |member| {
+                                member.kind == crate::byte_intrinsics::ByteMemberKind::StaticMethod
+                            },
+                        )
+                    {
+                        return self.types.intern_resolved(&intrinsic.return_type);
+                    }
                 }
                 let target = self.call_targets.get(span).and_then(|target| match target {
                     CallableTarget::Method { class_type, .. } => Some(class_type.clone()),
@@ -22501,10 +23194,10 @@ impl<'program> Checker<'program> {
                 };
                 if let Some(definition) = self.enums.get(&class_name) {
                     if definition.case_by_name.contains_key(member) {
-                        return self.types.intern(TypeKind::Enum(EnumType::new(
-                            definition.id,
-                            definition.name.clone(),
-                        )));
+                        let template = self
+                            .types
+                            .intern(TypeKind::Enum(definition.source_type.clone()));
+                        return self.enum_construction_type(*span, template);
                     }
                     return self.types.unknown();
                 }
@@ -22533,7 +23226,11 @@ impl<'program> Checker<'program> {
                         class_name,
                         name: member.clone(),
                     };
-                    let ty = self.const_evaluation.values.get(&key).map(|value| value.ty);
+                    let ty = self
+                        .const_evaluation
+                        .values
+                        .get(&key)
+                        .map(|value| value.ty.clone());
                     ty.map(|ty| self.const_type_id(ty))
                         .unwrap_or_else(|| self.types.unknown())
                 })
@@ -22576,13 +23273,17 @@ impl<'program> Checker<'program> {
                 collection_ty = payload;
             }
         }
+        if let Some(index) =
+            crate::byte_intrinsics::member(&self.types.resolved(collection_ty), "[]")
+        {
+            return Some((
+                self.types.intern_resolved(&index.parameters[0].ty),
+                self.types.intern_resolved(&index.return_type),
+            ));
+        }
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         match self.types.kind(collection_ty).clone() {
             TypeKind::TypedArray(value) | TypeKind::List(value) => Some((int, value)),
-            TypeKind::Bytes => {
-                let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
-                Some((int, byte))
-            }
             TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
                 Some((key, value))
             }
@@ -22700,15 +23401,18 @@ impl<'program> Checker<'program> {
         } else {
             forwarded_nullable_access
         };
+        if let Some(intrinsic) = crate::byte_intrinsics::member(&self.types.resolved(ty), property)
+            .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Property)
+        {
+            let result = self.types.intern_resolved(&intrinsic.return_type);
+            return Some(self.null_safe_result_type(result, null_safe && nullable_access));
+        }
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let bool_ty = self.types.intern(TypeKind::Bool);
         let result = match (self.types.kind(ty), property) {
             (TypeKind::Enum(enum_type), "value") => {
-                let definition = self
-                    .enums
-                    .values()
-                    .find(|definition| definition.id == enum_type.id)?;
-                definition.backing_type.map(|backing| match backing {
+                let backing_type = self.enum_definition(enum_type)?.backing_type;
+                backing_type.map(|backing| match backing {
                     EnumBackingType::Int => int,
                     EnumBackingType::String => self.types.intern(TypeKind::String),
                 })
@@ -22718,7 +23422,6 @@ impl<'program> Checker<'program> {
             (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
             (TypeKind::String, "graphemes" | "codePoints") => Some(self.types.unknown()),
             (TypeKind::TypedArray(_), "length") => Some(int),
-            (TypeKind::Bytes, "length") => Some(int),
             (
                 TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -22754,6 +23457,7 @@ impl<'program> Checker<'program> {
                 TypeKind::String
                 | TypeKind::Error
                 | TypeKind::Bytes
+                | TypeKind::ByteRegion(_)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -23023,7 +23727,9 @@ impl<'program> Checker<'program> {
 
     /// `shared new T(...)` requires an ordinary class payload.
     fn check_shared_new_payload(&mut self, class_type: &crate::types::TypeRef, span: Span) -> bool {
-        if class_type.name == "self" || class_type.as_class_name().is_some() {
+        if crate::inline_value::InlineValueKind::for_name(&class_type.name).is_none()
+            && (class_type.name == "self" || class_type.as_class_name().is_some())
+        {
             return true;
         }
         self.diagnostics.push(
@@ -23057,13 +23763,11 @@ impl<'program> Checker<'program> {
         if kind.family() != crate::types::SharedFamily::Readonly {
             return true;
         }
-        matches!(
-            self.types.kind(payload),
-            TypeKind::Class(_)
-                | TypeKind::Interface(_)
-                | TypeKind::TypeParameter(_)
-                | TypeKind::Unknown
-        )
+        match self.types.kind(payload) {
+            TypeKind::Class(class) => class.inline_copy_type().is_none(),
+            TypeKind::Interface(_) | TypeKind::TypeParameter(_) | TypeKind::Unknown => true,
+            _ => false,
+        }
     }
 
     fn check_specialized_shared_payloads(&mut self, ty: TypeId, span: Span) {
@@ -23172,10 +23876,21 @@ impl<'program> Checker<'program> {
         let ty = self.infer_expr_type(object, scopes, method_context);
         let nullable_access = self
             .forwarded_access_payload(ty)
-            .is_some_and(|(_, nullable)| nullable);
+            .is_some_and(|(_, nullable)| nullable)
+            || matches!(self.types.kind(ty), TypeKind::Nullable(_));
         let ty = self.forwarded_access_payload_type(ty);
+        let ty = match self.types.kind(ty) {
+            TypeKind::Nullable(inner) if null_safe => *inner,
+            _ => ty,
+        };
         let void = self.types.intern(TypeKind::Void);
         let bool_ty = self.types.intern(TypeKind::Bool);
+        if let Some(intrinsic) = crate::byte_intrinsics::member(&self.types.resolved(ty), method)
+            .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Method)
+        {
+            let result = self.types.intern_resolved(&intrinsic.return_type);
+            return Some(self.null_safe_result_type(result, null_safe && nullable_access));
+        }
         let result = match (self.types.kind(ty).clone(), method) {
             (TypeKind::List(_), "add" | "insertAt")
             | (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "set")
@@ -23223,10 +23938,6 @@ impl<'program> Checker<'program> {
             | (TypeKind::Deque(value), "popFront" | "popBack") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
-            (TypeKind::Bytes, "toArray") => {
-                let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
-                Some(self.types.intern(TypeKind::TypedArray(byte)))
-            }
             (
                 TypeKind::Bytes
                 | TypeKind::TypedArray(_)
@@ -23263,10 +23974,7 @@ impl<'program> Checker<'program> {
         let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() else {
             return false;
         };
-        let definition = self
-            .enums
-            .values()
-            .find(|definition| definition.id == enum_type.id);
+        let definition = self.enum_definition(&enum_type);
         let backed = definition.is_some_and(|definition| definition.backing_type.is_some());
         if method != "value" {
             let payload_field = definition.is_some_and(|definition| {
@@ -23488,10 +24196,7 @@ impl<'program> Checker<'program> {
             _ => ty,
         };
         if let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() {
-            let definition = self
-                .enums
-                .values()
-                .find(|definition| definition.id == enum_type.id);
+            let definition = self.enum_definition(&enum_type);
             if property == "value" && definition.is_some_and(|value| value.backing_type.is_some()) {
                 return;
             }
@@ -23531,7 +24236,7 @@ impl<'program> Checker<'program> {
         }
         if matches!(self.types.kind(ty), TypeKind::String) {
             match property {
-                "length" | "byteLength" | "isEmpty" | "bytes" => {}
+                "length" | "byteLength" | "isEmpty" | "bytes" | "byteRegion" => {}
                 "graphemes" | "codePoints" => self.diagnostics.push(
                     Diagnostic::unsupported_stage(
                         "E0304",
@@ -23541,7 +24246,7 @@ impl<'program> Checker<'program> {
                         span,
                     )
                     .with_help(
-                        "use the executable `length`, `byteLength`, `isEmpty`, or `bytes` property",
+                        "use the executable `length`, `byteLength`, `isEmpty`, `bytes`, or `byteRegion` property",
                     ),
                 ),
                 _ => self.diagnostics.push(
@@ -23551,7 +24256,7 @@ impl<'program> Checker<'program> {
                         span,
                     )
                     .with_help(
-                        "String intrinsic properties are `length`, `byteLength`, `isEmpty`, and `bytes`",
+                        "String intrinsic properties are `length`, `byteLength`, `isEmpty`, `bytes`, and `byteRegion`",
                     ),
                 ),
             }
@@ -23584,7 +24289,6 @@ impl<'program> Checker<'program> {
         let supported = matches!(
             (self.types.kind(ty), property),
             (TypeKind::TypedArray(_), "length")
-                | (TypeKind::Bytes, "length")
                 | (
                     TypeKind::List(_)
                         | TypeKind::Dictionary(_, _)
@@ -23611,7 +24315,8 @@ impl<'program> Checker<'program> {
                 )
                 | (TypeKind::PriorityQueue(_), "peek")
                 | (TypeKind::Deque(_), "peekFront" | "peekBack")
-        );
+        ) || crate::byte_intrinsics::member(&self.types.resolved(ty), property)
+            .is_some_and(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Property);
         if matches!(
             (self.types.kind(ty), property),
             (
@@ -23667,6 +24372,7 @@ impl<'program> Checker<'program> {
         let CollectionMethodCall {
             object,
             method,
+            null_safe,
             args,
             member_span,
             argument_list_span,
@@ -23676,10 +24382,15 @@ impl<'program> Checker<'program> {
         } = call;
         let ty = self.infer_expr_type(object, scopes, method_context);
         let ty = self.forwarded_access_payload_type(ty);
+        let ty = match self.types.kind(ty) {
+            TypeKind::Nullable(inner) if null_safe => *inner,
+            _ => ty,
+        };
         let kind = self.types.kind(ty).clone();
         let is_collection = matches!(
             kind,
             TypeKind::Bytes
+                | TypeKind::ByteRegion(_)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -23733,6 +24444,31 @@ impl<'program> Checker<'program> {
                 }
                 return true;
             }
+        }
+        if let Some(intrinsic) = crate::byte_intrinsics::member(&self.types.resolved(ty), method)
+            .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Method)
+        {
+            let name = format!("byte method `{method}`");
+            if !intrinsic.accepts_named_arguments && self.reject_named_arguments(&name, args) {
+                return true;
+            }
+            let parameters = intrinsic.parameter_info(&mut self.types);
+            self.check_call_arguments(&name, &parameters, args, span, scopes, method_context);
+            if intrinsic.receiver_mode == Some(ReceiverMode::Writable) {
+                self.record_capture_requirement_for_expr(
+                    object,
+                    scopes,
+                    CaptureRequirement::Writable,
+                );
+                if !self.is_writable_object_path(object, scopes, method_context) {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0201",
+                        "cannot borrow a writable byte region through a readonly value",
+                        object.span(),
+                    ));
+                }
+            }
+            return true;
         }
         if self.reject_named_arguments(&format!("collection method `{method}`"), args) {
             return true;
@@ -23859,7 +24595,6 @@ impl<'program> Checker<'program> {
                 | TypeKind::Deque(_),
                 "clear",
             ) => (vec![], true),
-            (TypeKind::Bytes, "toArray") => (vec![], false),
             (TypeKind::Bytes, _) => {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
                     "E0524",
@@ -24666,10 +25401,10 @@ impl<'program> Checker<'program> {
             (TypeKind::Mixed | TypeKind::Unknown, _) => true,
             (TypeKind::Interface(_), TypeKind::Interface(_)) => true,
             (TypeKind::Interface(interface), TypeKind::Class(_)) => {
-                self.type_has_declared_interface(tested, &interface, &mut HashSet::new())
+                self.type_has_declared_interface(tested, &interface)
             }
             (TypeKind::Class(class), TypeKind::Interface(interface)) => {
-                self.type_has_declared_interface(value, &interface, &mut HashSet::new())
+                self.type_has_declared_interface(value, &interface)
                     || self
                         .classes
                         .get(&class.name)
@@ -24805,16 +25540,6 @@ impl<'program> Checker<'program> {
         self.class_type(ty)
     }
 
-    fn expr_class_name(
-        &mut self,
-        expr: &Expr,
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<String> {
-        self.expr_class_type(expr, scopes, method_context)
-            .map(|class| class.name)
-    }
-
     fn flow_narrowed_type(
         &mut self,
         declared_ty: TypeId,
@@ -24875,14 +25600,17 @@ impl<'program> Checker<'program> {
                     self.types.kind(*inner),
                     TypeKind::Class(_)
                         | TypeKind::Interface(_)
+                        | TypeKind::TypeParameter(_)
                         | TypeKind::Error
                         | TypeKind::SharedHandle(_, _)
+                        | TypeKind::Bytes
+                        | TypeKind::ByteRegion(_)
                 ) || (operation == "property access"
                     && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
                 if !member_receiver {
                     self.diagnostics.push(Diagnostic::new(
                         "E0507",
-                        format!("{operation} requires a class value"),
+                        format!("{operation} requires a value with members"),
                         object.span(),
                     ));
                 } else if !null_safe {
@@ -24900,10 +25628,10 @@ impl<'program> Checker<'program> {
             _ if null_safe => self.diagnostics.push(
                 Diagnostic::new(
                     "E0507",
-                    "null-safe access requires a nullable class or shared-reference receiver",
+                    "null-safe access requires a nullable receiver with members",
                     object.span(),
                 )
-                .with_help("use `->` after the value has been narrowed to a non-null class"),
+                .with_help("use `->` after the value has been narrowed to a non-null value"),
             ),
             _ => {}
         }

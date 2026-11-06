@@ -2,6 +2,122 @@ use doriac::ast::{ClassMember, Expr, Item, Stmt};
 use doriac::semantics::{analyze_program_for_ide, CallableTarget};
 
 #[test]
+fn member_surfaces_preserve_retained_loans_for_copy_regions() {
+    use doriac::symbols::{BorrowSource, ReturnBorrow};
+    use doriac::types::{ClassType, IntegerType, ResolvedType, RetainedLifetime, ReturnBorrowKind};
+
+    let source = r#"
+use Doria\Std\Io\ByteRegion;
+class Storage {
+    Bytes $bytes = Bytes::allocate(1);
+    function region(): ByteRegion { return $this->bytes->getRegion(0, 1); }
+    function optional(): ?ByteRegion { return $this->bytes->getRegion(0, 1); }
+    ByteRegion $view { get => $this->bytes->getRegion(0, 1); }
+    ?ByteRegion $optionalView { get => $this->bytes->getRegion(0, 1); }
+}
+class Snapshot<T> {
+    function __construct(take T $stored) {}
+    function value(): T { return $this->stored; }
+    T $item { borrowed get => $this->stored; }
+}
+function inspect(Snapshot<int> $snapshot): void {}
+"#;
+    let (_, analysis) = doriac::analyze_source_for_ide("member-loans.doria", source).unwrap();
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let storage = analysis
+        .info
+        .class_member_surface(&ClassType::new("Storage", Vec::new()))
+        .unwrap();
+    let expected = Some(ReturnBorrow {
+        source: BorrowSource::Receiver,
+        writable: false,
+        kind: ReturnBorrowKind::Retained,
+        lifetime: RetainedLifetime::LastUse,
+    });
+    for name in ["region", "optional", "view", "optionalView"] {
+        let member = storage
+            .members
+            .iter()
+            .find(|member| member.name == name)
+            .unwrap();
+        let borrow = member.hooks.as_ref().map_or(member.return_borrow, |hooks| {
+            hooks.getter.as_ref().unwrap().return_borrow
+        });
+        assert_eq!(borrow, expected, "{member:?}");
+    }
+    let snapshot = analysis
+        .info
+        .class_member_surfaces
+        .iter()
+        .find(|surface| {
+            surface.receiver.name == "Snapshot"
+                && surface.receiver.arguments == [ResolvedType::Integer(IntegerType::Int64)]
+        })
+        .unwrap();
+    for name in ["value", "item"] {
+        let member = snapshot
+            .members
+            .iter()
+            .find(|member| member.name == name)
+            .unwrap();
+        assert!(member.return_borrow.is_none(), "{member:?}");
+        if let Some(hooks) = &member.hooks {
+            assert!(
+                hooks.getter.as_ref().unwrap().return_borrow.is_none(),
+                "{member:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn transfer_group_member_surface_keeps_nullable_completed_region_loan() {
+    use doriac::compiler_known_stream::{READ_TRANSFER_KEY, TRANSFER_GROUP};
+    use doriac::symbols::{BorrowSource, ReturnBorrow};
+    use doriac::types::{ClassType, RetainedLifetime, ReturnBorrowKind};
+
+    for (prefix, group, key) in [
+        (String::new(), TRANSFER_GROUP, READ_TRANSFER_KEY),
+        (
+            format!("use {TRANSFER_GROUP} as Group; use {READ_TRANSFER_KEY} as Key;"),
+            "Group",
+            "Key",
+        ),
+    ] {
+        let source = format!("{prefix} function inspect({group} $group, {key} $key): void {{}}");
+        let (_, analysis) =
+            doriac::analyze_source_for_ide("completed-region-loan.doria", &source).unwrap();
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{:?}",
+            analysis.diagnostics
+        );
+        let member = analysis
+            .info
+            .class_member_surface(&ClassType::new(TRANSFER_GROUP, Vec::new()))
+            .unwrap()
+            .members
+            .iter()
+            .find(|member| member.name == "getReadRegion")
+            .unwrap();
+        assert_eq!(
+            member.return_borrow,
+            Some(ReturnBorrow {
+                source: BorrowSource::Receiver,
+                writable: false,
+                kind: ReturnBorrowKind::Retained,
+                lifetime: RetainedLifetime::LastUse,
+            }),
+            "{member:?}"
+        );
+    }
+}
+
+#[test]
 fn constrained_member_surfaces_keep_lexical_bounds_and_substituted_contracts() {
     use doriac::ast::PropertyHookKind::Get;
     use doriac::source::Span;
@@ -100,7 +216,7 @@ function inspect<T implements {constraints}>(T $receiver): int {{ return $receiv
         assert_eq!(surface.requirements.len(), 2, "{surface:?}");
         for requirement in &surface.requirements {
             assert!(matches!(requirement.name.as_str(), "read" | "value"));
-            assert!(!requirement.writable_receiver);
+            assert!(!requirement.receiver_mode.is_writable());
             assert_eq!(requirement.origins.len(), 2);
         }
     }
@@ -374,4 +490,204 @@ open class Generic<T> {}
     assert!(analysis.info.method_call_targets.values().any(|target| {
         target.declaration == leaf && target.virtual_root == Some(root) && !target.direct_parent
     }));
+}
+#[test]
+fn inherited_generic_member_surfaces_bind_owner_and_method_types_separately() {
+    use doriac::types::{ClassType, ResolvedType};
+    let source = r#"
+open class Parent<T> {
+    function first<U>(T $owner, U $value): T { return $owner; }
+    function second<U>(T $owner, U $value): U { return $value; }
+}
+open class Middle<U> extends Parent<List<U>> {}
+class Child<V> extends Middle<V> {}
+function main(): void { let $value = new Child<string>(); }
+"#;
+    let (_, analysis) = doriac::analyze_source_for_ide("member-identities.doria", source).unwrap();
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let surface = analysis
+        .info
+        .class_member_surface(&ClassType::new("Child", vec![ResolvedType::String]))
+        .unwrap();
+    let owner = ResolvedType::List(Box::new(ResolvedType::String));
+    let method = ResolvedType::TypeParameter("U".to_string());
+    for (name, result) in [("first", owner.clone()), ("second", method.clone())] {
+        let member = surface
+            .members
+            .iter()
+            .find(|member| member.name == name)
+            .unwrap();
+        let signature = member.signature.as_ref().unwrap();
+        assert_eq!(signature.parameters[0].r#type, owner);
+        assert_eq!(signature.parameters[1].r#type, method);
+        assert_eq!(signature.return_type, result);
+        assert_eq!(member.generic_parameters[0].name, "U");
+    }
+}
+
+#[test]
+fn conditional_member_availability_is_scoped_to_each_receiver_occurrence() {
+    use doriac::semantics::composition::MemberAvailability;
+    let declarations = r#"
+interface Ready {}
+class Yes implements Ready {}
+class No {}
+trait Reading<T> {
+    function read(): int where (T implements Ready) { return 1; }
+    int $state where (T implements Ready) { get => 1; }
+}
+open class Adapter<T> {
+    uses Reading<T> { Reading<T>::read as inspect; }
+    function probe(): int { return 0; }
+}
+class Child<T> extends Adapter<T> {}
+"#;
+    let callers = r#"
+function proved<T implements Ready>(Child<T> $proved): int { return $proved->probe(); }
+function unproved<T>(Child<T> $unproved): int { return $unproved->probe(); }
+function yes(Child<Yes> $yes): int { return $yes->probe(); }
+function no(Child<No> $no): int { return $no->probe(); }
+"#;
+    for source in [
+        format!("{declarations}{callers}"),
+        format!("{callers}{declarations}"),
+    ] {
+        let (_, analysis) =
+            doriac::analyze_source_for_ide("scoped-members.doria", &source).unwrap();
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{source}: {:?}",
+            analysis.diagnostics
+        );
+        for (name, expected) in [
+            ("proved", MemberAvailability::Proved),
+            ("unproved", MemberAvailability::Unproved),
+            ("yes", MemberAvailability::Proved),
+            ("no", MemberAvailability::Unproved),
+        ] {
+            let offset = source.find(&format!("${name}->")).unwrap();
+            let (span, facts) = analysis
+                .info
+                .class_member_availability
+                .iter()
+                .find(|(span, _)| span.start == offset && span.end == offset + name.len() + 1)
+                .unwrap();
+            for member in ["read", "inspect", "state"] {
+                assert_eq!(
+                    analysis
+                        .info
+                        .class_member_availability_at(&facts.receiver, member, *span),
+                    Some(expected),
+                    "{name}::{member}"
+                );
+            }
+            assert_eq!(
+                analysis
+                    .info
+                    .class_member_availability_at(&facts.receiver, "probe", *span),
+                Some(MemberAvailability::Proved)
+            );
+            // Declaration inventories remain stable even when a caller cannot select a member.
+            assert!(analysis
+                .info
+                .class_member_surface(&facts.receiver)
+                .unwrap()
+                .members
+                .iter()
+                .any(|member| member.name == "inspect"));
+        }
+    }
+}
+
+#[test]
+fn static_member_availability_uses_the_callers_guard_without_leaking_it() {
+    use doriac::semantics::composition::MemberAvailability;
+    let source = r#"
+interface Ready {}
+class Adapter<T> {
+    static function guarded(): int where (T implements Ready) { return 1; }
+    static int $state where (T implements Ready) { get => 1; }
+    static function probe(): int { return 0; }
+    function proved(): int where (T implements Ready) { return self::probe(); }
+    function unproved(): int { return self::probe(); }
+}
+"#;
+    let (_, analysis) =
+        doriac::analyze_source_for_ide("static-scoped-members.doria", source).unwrap();
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for (offset, expected) in source
+        .match_indices("self::probe")
+        .map(|(offset, _)| offset)
+        .zip([MemberAvailability::Proved, MemberAvailability::Unproved])
+    {
+        let (span, facts) = analysis
+            .info
+            .class_member_availability
+            .iter()
+            .find(|(span, _)| span.start == offset && span.end == offset + 4)
+            .unwrap();
+        for name in ["guarded", "state"] {
+            assert_eq!(
+                analysis
+                    .info
+                    .class_member_availability_at(&facts.receiver, name, *span),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            analysis.info.static_receiver_types.get(span),
+            Some(&facts.receiver),
+            "static receiver context must survive without executable admission"
+        );
+    }
+}
+
+#[test]
+fn member_lookup_keeps_unselected_method_arguments_distinct_from_caller_names() {
+    use doriac::semantics::composition::MemberAvailability;
+    let source = r#"
+interface Ready {}
+class No {}
+class Adapter<T> {
+    function generic<U>(): int where (U implements Ready) { return 1; }
+    function bounded<U implements Ready>(): int where (U implements Ready) { return 1; }
+    function both<U>(): int where (T implements Ready, U implements Ready) { return 1; }
+    function probe(): int { return 0; }
+}
+function inspect<U implements Ready>(Adapter<No> $value): int { return $value->probe(); }
+"#;
+    let (_, analysis) =
+        doriac::analyze_source_for_ide("method-argument-members.doria", source).unwrap();
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let offset = source.find("$value->").unwrap();
+    let (span, facts) = analysis
+        .info
+        .class_member_availability
+        .iter()
+        .find(|(span, _)| span.start == offset && span.end == offset + 6)
+        .unwrap();
+    for (name, expected) in [
+        ("generic", MemberAvailability::RequiresTypeArguments),
+        ("bounded", MemberAvailability::Proved),
+        ("both", MemberAvailability::Unproved),
+    ] {
+        assert_eq!(
+            analysis
+                .info
+                .class_member_availability_at(&facts.receiver, name, *span),
+            Some(expected)
+        );
+    }
 }

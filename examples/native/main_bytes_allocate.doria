@@ -1,0 +1,18 @@
+function relay(take Bytes $value): Bytes { return $value; }
+function main(): void {
+    let $empty = Bytes::allocate(0);
+    writable Bytes $first = Bytes::allocate(length: 8);
+    writable Bytes $second = relay(Bytes::allocate(8));
+    foreach (0..<8 as int $index) {
+        if ($first[$index] != 0 || $second[$index] != 0) { echo "unexpected nonzero\n"; }
+    }
+    echo "lengths {$empty->length} {$first->length} {$second->length}\n";
+    $first[0] = 128;
+    $first[7] = 255;
+    $second[0] = 7;
+    echo "independent {$first[0]} {$first[7]} {$second[0]} {$second[7]}\n";
+    writable uint8[] $source = [42, 255];
+    let $copied = Bytes::fromArray($source);
+    $source[0] = 9;
+    echo "fromArray {$copied[0]} {$copied[1]} {$source[0]}\n";
+}

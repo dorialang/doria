@@ -32,6 +32,20 @@ scalar parameters:
 - `float`, `float32`, and `float64`;
 - `bool`.
 
+Stage 36a removes the old compiler-known-I/O-class exception for nullable
+integer defaults. Nullable Copy integers, floats, booleans, and Copy enums use
+the same constant evaluator and caller-side splice as their nonnullable values.
+Both `null` and a type-correct present constant are supported; `null` never means
+zero. This applies to authored functions, methods, static methods, and constructors,
+including writable Copy parameters and named omissions. No callee-side presence
+flags or error-class-specific permission is added. Nullable strings and move/take
+defaults retain the separate temporary boundaries below.
+
+Compiler-known inline Copy values also accept a `null` default through this
+same mechanism. An absent CancellationToken owns no shared-state claim; an
+absent Deadline requires no clock sampling. Intrinsic declarations fold their
+defaults before MIR just as authored bodies do.
+
 Default expressions use the Stage 20 constant-evaluation tier. They may use its
 accepted literals, operators, conversions, and references to accessible class or
 top-level constants. Runtime calls, object construction, mutable state, I/O, and
@@ -155,6 +169,8 @@ tests, the language specification, status documentation, and the master plan.
   checking.
 - The temporary E0498 message that rejected every string default without
   distinguishing readonly borrowing from writable or consuming parameters.
+- The I/O-class-only exception for nullable integer defaults, and the blanket
+  temporary rejection of nullable Copy-scalar defaults in ordinary code.
 
 ## Post-Stage-34 Constructor-Role Amendment
 

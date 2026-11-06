@@ -1,0 +1,80 @@
+enum Packet { case Number(int $value); case Pair(int $left, int $right); case Empty; }
+enum CallbackResultRoute { case Direct; case Generic; case Nested; case Combined; case Nullable; case Stored; }
+
+function make(int $value): Packet { return Packet::Number($value); }
+function number(Packet $value): int {
+    return match ($value) {
+        Packet::Number($number) => $number,
+        Packet::Pair($left, $right) => $left + $right,
+        Packet::Empty => -1,
+    };
+}
+function forward<T>(T $value, function(T): Packet $callback): Packet { return $callback($value); }
+function resultCallback(): function(int): Packet { return fn(int $value) => make($value); }
+function combineCallback(): function(Packet): Packet { return fn(Packet $value) => $value; }
+
+function hot(int $iterations, CallbackResultRoute $route): int {
+    let $callback = resultCallback();
+    let $combined = combineCallback();
+    let $optional = function(int $value, bool $present): ?Packet {
+        if ($present) { return make($value); }
+        return null;
+    };
+    List<function(int): Packet> $stored = [fn(int $value) => make($value)];
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        let $value = match ($route) {
+            CallbackResultRoute::Direct => $callback($index),
+            CallbackResultRoute::Generic => forward($index, $callback),
+            CallbackResultRoute::Nested => $callback(number($callback($index))),
+            CallbackResultRoute::Combined => $combined($callback($index)),
+            CallbackResultRoute::Nullable => $optional($index, true) ?? Packet::Empty,
+            CallbackResultRoute::Stored => $stored[0]($index),
+        };
+        $sum += number($value);
+        $index++;
+    }
+    return $sum;
+}
+
+class Cleanup { static writable int $last = -1; }
+function lastCleanup(): int { return Cleanup::last; }
+class Token {
+    function __construct(int $value) {}
+    function __destruct() {
+        let $noise = make(999);
+        Cleanup::last = $this->value;
+        try { echo "drop " . $this->value . ";"; } catch (Error) {}
+    }
+}
+class Failure implements Error { function __construct(string $message) {} }
+
+function onceCallback(int $value): function once(): Packet {
+    let $token = new Token($value);
+    return function(): Packet with (take $token) { return make($token->value); };
+}
+
+function main(): void {
+    echo hot(4, CallbackResultRoute::Direct) . ";" . hot(4, CallbackResultRoute::Generic) . ";" .
+        hot(4, CallbackResultRoute::Nested) . ";" . hot(4, CallbackResultRoute::Combined) . ";" .
+        hot(4, CallbackResultRoute::Nullable) . ";" . hot(4, CallbackResultRoute::Stored) . ";";
+    let $once = onceCallback(10);
+    let $value = $once();
+    echo number($value) . ";";
+    let $emptyToken = new Token(11);
+    function once(): ?Packet $empty = function(): ?Packet with (take $emptyToken) {
+        let $noise = make($emptyToken->value);
+        return null;
+    };
+    let $absent = $empty();
+    if ($absent == null) { echo "null;"; }
+    let $failedToken = new Token(12);
+    function once(): Packet throws Failure $failed = function(): Packet with (take $failedToken) {
+        let $noise = make($failedToken->value);
+        throw new Failure("callback");
+    };
+    let writable $saved = make(13);
+    try { $saved = $failed(); }
+    catch (Failure) { echo "caught;" . number($saved) . ";"; }
+}

@@ -1,0 +1,28 @@
+enum Optional<T> { case Some(T $value); case Empty; }
+
+class Drops {
+    static writable int $count = 0;
+}
+
+class Token {
+    function __construct(int $id) {}
+    function __destruct(): void { Drops::count++; }
+}
+
+class Bag {
+    function __construct(string $name, take Optional<Token> $token, int $size, take Token $kept) {}
+    consuming function intoName(): string { return take $this->name; }
+    consuming function intoToken(): Optional<Token> { return take $this->token; }
+    consuming function intoSize(): int { return take $this->size; }
+}
+
+function main(): void {
+    let $first = new Bag("alpha", Optional::Some(new Token(1)), 3, new Token(2));
+    echo $first->intoName() . ";" . Drops::count . ";";
+    let $second = new Bag("beta", Optional::Some(new Token(3)), 4, new Token(4));
+    let $token = $second->intoToken();
+    echo Drops::count . ";";
+    echo match ($token) { Optional::Some($t) => $t->id, Optional::Empty => 0, } . ";";
+    let $third = new Bag("gamma", Optional::Empty, 5, new Token(5));
+    echo $third->intoSize() . ";" . Drops::count . "\n";
+}

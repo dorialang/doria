@@ -1,5 +1,12 @@
 #![no_std]
 
+pub mod source_excerpt;
+
+/// Cancellation remains requested even when a native waiter cannot be notified.
+/// All execution engines use this message for the Concurrency-owned error.
+pub const CANCELLATION_NOTIFICATION_FAILURE_MESSAGE: &str =
+    "cancellation was requested, but a waiter could not be notified";
+
 /// Every stable compiler-owned diagnostic identity.
 ///
 /// This crate is the single catalogue authority shared by the compiler and
@@ -7,51 +14,52 @@
 /// needed by standalone executables; they are not a second catalogue.
 pub const DIAGNOSTIC_CODES: &[&str] = &[
     "B0001", "B0002", "B0003", "B1301", "B1901", "B2001", "B2301", "B2401", "B2501", "B2601",
-    "B2901", "B2902", "E0101", "E0102", "E0103", "E0201", "E0202", "E0203", "E0204", "E0300",
-    "E0303", "E0304", "E0305", "E0306", "E0307", "E0308", "E0309", "E0310", "E0401", "E0402",
-    "E0403", "E0404", "E0405", "E0406", "E0407", "E0408", "E0409", "E0410", "E0411", "E0412",
-    "E0413", "E0414", "E0415", "E0416", "E0417", "E0419", "E0420", "E0421", "E0422", "E0423",
-    "E0424", "E0425", "E0426", "E0430", "E0431", "E0432", "E0433", "E0434", "E0435", "E0436",
-    "E0440", "E0441", "E0442", "E0443", "E0444", "E0445", "E0450", "E0451", "E0452", "E0453",
-    "E0454", "E0455", "E0456", "E0457", "E0461", "E0462", "E0463", "E0464", "E0465", "E0466",
-    "E0467", "E0468", "E0470", "E0471", "E0472", "E0473", "E0474", "E0475", "E0476", "E0477",
-    "E0478", "E0479", "E0480", "E0481", "E0482", "E0483", "E0484", "E0485", "E0486", "E0487",
-    "E0488", "E0489", "E0490", "E0491", "E0492", "E0493", "E0494", "E0495", "E0496", "E0497",
-    "E0498", "E0500", "E0501", "E0502", "E0503", "E0504", "E0505", "E0506", "E0507", "E0508",
-    "E0509", "E0510", "E0511", "E0512", "E0513", "E0515", "E0516", "E0517", "E0518", "E0519",
-    "E0520", "E0521", "E0522", "E0523", "E0524", "E0525", "E0526", "E0527", "E0528", "E0529",
-    "E0530", "E0531", "E0532", "E0533", "E0534", "E0535", "E0536", "E0537", "E0538", "E0539",
-    "E0540", "E0541", "E0542", "E0543", "E0544", "E0545", "E0546", "E0547", "E0548", "E0549",
-    "E0550", "E0551", "E0552", "E0553", "E0554", "E0555", "E0556", "E0557", "E0558", "E0559",
-    "E0560", "E0561", "E0562", "E0563", "E0564", "E0565", "E0566", "E0567", "E0568", "E0569",
-    "E0570", "E0571", "E0572", "E0573", "E0574", "E0575", "E0576", "E0577", "E0578", "E0579",
-    "E0580", "E0581", "E0582", "E0583", "E0584", "E0585", "E0586", "E0587", "E0588", "E0589",
-    "E0590", "E0591", "E0592", "E0593", "E0594", "E0595", "E0596", "E0597", "E0598", "E0599",
-    "E0600", "E0601", "E0602", "E0603", "E0604", "E0605", "E0606", "E0607", "E0608", "E0609",
-    "E0610", "E0611", "E0612", "E0613", "E0614", "E0615", "E0616", "E0617", "E0618", "E0619",
-    "E0620", "E0621", "E0622", "E0623", "E0624", "E0625", "E0626", "E0627", "E0628", "E0629",
-    "E0630", "E0631", "E0632", "E0633", "E0634", "E0635", "E0636", "E0637", "E0640", "E0641",
-    "E0642", "E0643", "E0644", "E0645", "E0646", "E0647", "E0648", "E0649", "E0650", "E0651",
-    "E0652", "E0653", "E0654", "E0655", "E0656", "E0657", "E0658", "E0659", "E0660", "E0661",
-    "E0662", "E0663", "E0664", "E0665", "E0666", "E0667", "E0668", "E0669", "E0670", "E0671",
-    "E0672", "E0673", "E0674", "E0675", "E0676", "E0677", "E0678", "E0679", "E0680", "E0681",
-    "E0682", "E0683", "E0684", "E0685", "E0686", "E0687", "E0688", "E0689", "E0690", "E0691",
-    "E0692", "E0693", "E0694", "E0695", "E0696", "E0697", "E0698", "E0699", "E0700", "E0701",
-    "E0702", "E0703", "E0704", "E0705", "E0706", "E0707", "E0708", "E0709", "E0710", "E0711",
-    "E0712", "E0713", "E0714", "E0715", "E0716", "E0717", "E0718", "E0719", "E0720", "E0721",
-    "E0722", "E0723", "E0724", "E0725", "E0726", "E0727", "E0728", "E0729", "E0730", "E0731",
-    "E0732", "E0733", "E0734", "E0735", "E0736", "E0737", "E0738", "E0739", "E0740", "E0741",
-    "E0742", "E0743", "E0744", "E0745", "E0746", "E0747", "E0748", "E0749", "E0750", "E0751",
-    "E0752", "E0753", "E0754", "E0755", "E0756", "E0757", "E0758", "E0759", "E0760", "E0761",
-    "E0762", "E0763", "E0764", "E0765", "E0766", "E0767", "E0768", "E0769", "E0770", "I0001",
-    "I1101", "I1301", "I1302", "I1401", "I2001", "I2002", "I2003", "I2201", "I2401", "I2601",
-    "I2701", "I2702", "I2801", "I2802", "I2803", "I2901", "I3001", "I3002", "I7101", "L0001",
-    "L0002", "M1101", "M1102", "P0001", "P0002", "P0017", "P0018", "P0019", "P0020", "P0021",
-    "P1000", "P1001", "P1101", "P1102", "P1103", "P1104", "P1105", "P1106", "P1107", "P1108",
-    "P1109", "P1110", "P1111", "P1201", "P1202", "P1203", "P1204", "P1205", "P1206", "P1301",
-    "P1302", "P1310", "P1311", "P1312", "P1313", "P1320", "P1321", "P1322", "P1401", "P1402",
-    "P1403", "P1404", "P1405", "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504",
-    "P1505", "P1601", "R1000", "R1001",
+    "B2901", "B2902", "B3601", "B3602", "B3603", "B3604", "E0101", "E0102", "E0103", "E0201",
+    "E0202", "E0203", "E0204", "E0300", "E0303", "E0304", "E0305", "E0306", "E0307", "E0308",
+    "E0309", "E0310", "E0401", "E0402", "E0403", "E0404", "E0405", "E0406", "E0407", "E0408",
+    "E0409", "E0410", "E0411", "E0412", "E0413", "E0414", "E0415", "E0416", "E0417", "E0419",
+    "E0420", "E0421", "E0422", "E0423", "E0424", "E0425", "E0426", "E0430", "E0431", "E0432",
+    "E0433", "E0434", "E0435", "E0436", "E0440", "E0441", "E0442", "E0443", "E0444", "E0445",
+    "E0450", "E0451", "E0452", "E0453", "E0454", "E0455", "E0456", "E0457", "E0461", "E0462",
+    "E0463", "E0464", "E0465", "E0466", "E0467", "E0468", "E0470", "E0471", "E0472", "E0473",
+    "E0474", "E0475", "E0476", "E0477", "E0478", "E0479", "E0480", "E0481", "E0482", "E0483",
+    "E0484", "E0485", "E0486", "E0487", "E0488", "E0489", "E0490", "E0491", "E0492", "E0493",
+    "E0494", "E0495", "E0496", "E0497", "E0498", "E0500", "E0501", "E0502", "E0503", "E0504",
+    "E0505", "E0506", "E0507", "E0508", "E0509", "E0510", "E0511", "E0512", "E0513", "E0515",
+    "E0516", "E0517", "E0518", "E0519", "E0520", "E0521", "E0522", "E0523", "E0524", "E0525",
+    "E0526", "E0527", "E0528", "E0529", "E0530", "E0531", "E0532", "E0533", "E0534", "E0535",
+    "E0536", "E0537", "E0538", "E0539", "E0540", "E0541", "E0542", "E0543", "E0544", "E0545",
+    "E0546", "E0547", "E0548", "E0549", "E0550", "E0551", "E0552", "E0553", "E0554", "E0555",
+    "E0556", "E0557", "E0558", "E0559", "E0560", "E0561", "E0562", "E0563", "E0564", "E0565",
+    "E0566", "E0567", "E0568", "E0569", "E0570", "E0571", "E0572", "E0573", "E0574", "E0575",
+    "E0576", "E0577", "E0578", "E0579", "E0580", "E0581", "E0582", "E0583", "E0584", "E0585",
+    "E0586", "E0587", "E0588", "E0589", "E0590", "E0591", "E0592", "E0593", "E0594", "E0595",
+    "E0596", "E0597", "E0598", "E0599", "E0600", "E0601", "E0602", "E0603", "E0604", "E0605",
+    "E0606", "E0607", "E0608", "E0609", "E0610", "E0611", "E0612", "E0613", "E0614", "E0615",
+    "E0616", "E0617", "E0618", "E0619", "E0620", "E0621", "E0622", "E0623", "E0624", "E0625",
+    "E0626", "E0627", "E0628", "E0629", "E0630", "E0631", "E0632", "E0633", "E0634", "E0635",
+    "E0636", "E0637", "E0640", "E0641", "E0642", "E0643", "E0644", "E0645", "E0646", "E0647",
+    "E0648", "E0649", "E0650", "E0651", "E0652", "E0653", "E0654", "E0655", "E0656", "E0657",
+    "E0658", "E0659", "E0660", "E0661", "E0662", "E0663", "E0664", "E0665", "E0666", "E0667",
+    "E0668", "E0669", "E0670", "E0671", "E0672", "E0673", "E0674", "E0675", "E0676", "E0677",
+    "E0678", "E0679", "E0680", "E0681", "E0682", "E0683", "E0684", "E0685", "E0686", "E0687",
+    "E0688", "E0689", "E0690", "E0691", "E0692", "E0693", "E0694", "E0695", "E0696", "E0697",
+    "E0698", "E0699", "E0700", "E0701", "E0702", "E0703", "E0704", "E0705", "E0706", "E0707",
+    "E0708", "E0709", "E0710", "E0711", "E0712", "E0713", "E0714", "E0715", "E0716", "E0717",
+    "E0718", "E0719", "E0720", "E0721", "E0722", "E0723", "E0724", "E0725", "E0726", "E0727",
+    "E0728", "E0729", "E0730", "E0731", "E0732", "E0733", "E0734", "E0735", "E0736", "E0737",
+    "E0738", "E0739", "E0740", "E0741", "E0742", "E0743", "E0744", "E0745", "E0746", "E0747",
+    "E0748", "E0749", "E0750", "E0751", "E0752", "E0753", "E0754", "E0755", "E0756", "E0757",
+    "E0758", "E0759", "E0760", "E0761", "E0762", "E0763", "E0764", "E0765", "E0766", "E0767",
+    "E0768", "E0769", "E0770", "E0771", "E0772", "E0773", "E0774", "E0775", "E0776", "E0777",
+    "E0778", "E0779", "E0780", "I0001", "I1101", "I1301", "I1302", "I1401", "I2001", "I2002",
+    "I2003", "I2201", "I2401", "I2601", "I2701", "I2702", "I2801", "I2802", "I2803", "I2901",
+    "I3001", "I3002", "I7101", "L0001", "L0002", "M1101", "M1102", "P0001", "P0002", "P0017",
+    "P0018", "P0019", "P0020", "P0021", "P1000", "P1001", "P1101", "P1102", "P1103", "P1104",
+    "P1105", "P1106", "P1107", "P1108", "P1109", "P1110", "P1111", "P1201", "P1202", "P1203",
+    "P1204", "P1205", "P1206", "P1301", "P1302", "P1303", "P1304", "P1310", "P1311", "P1312",
+    "P1313", "P1320", "P1321", "P1322", "P1401", "P1402", "P1403", "P1404", "P1405", "P1406",
+    "P1407", "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601", "R1000", "R1001",
 ];
 
 /// Presentation context for untrusted runtime-message text.
@@ -102,22 +110,75 @@ pub fn write_terminal_safe_runtime_text(
 /// The compiler, freestanding runtime, and compatibility backends all consume
 /// this model so the public Doria message cannot drift between execution paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum IoMessageOperation {
     Open,
     Read,
     Write,
     Append,
     Flush,
+    Close,
+    Register,
+    Unregister,
+    Wait,
+    Configure,
+    Access,
+    Seek,
+    SynchronizeData,
+    SynchronizeMetadata,
+    Resize,
+    Lock,
+    Unlock,
+    Spawn,
+    Terminate,
 }
 
 impl IoMessageOperation {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 19] = [
         Self::Open,
         Self::Read,
         Self::Write,
         Self::Append,
         Self::Flush,
+        Self::Close,
+        Self::Register,
+        Self::Unregister,
+        Self::Wait,
+        Self::Configure,
+        Self::Access,
+        Self::Seek,
+        Self::SynchronizeData,
+        Self::SynchronizeMetadata,
+        Self::Resize,
+        Self::Lock,
+        Self::Unlock,
+        Self::Spawn,
+        Self::Terminate,
     ];
+
+    pub const fn case_name(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Read => "Read",
+            Self::Write => "Write",
+            Self::Append => "Append",
+            Self::Flush => "Flush",
+            Self::Close => "Close",
+            Self::Register => "Register",
+            Self::Unregister => "Unregister",
+            Self::Wait => "Wait",
+            Self::Configure => "Configure",
+            Self::Access => "Access",
+            Self::Seek => "Seek",
+            Self::SynchronizeData => "SynchronizeData",
+            Self::SynchronizeMetadata => "SynchronizeMetadata",
+            Self::Resize => "Resize",
+            Self::Lock => "Lock",
+            Self::Unlock => "Unlock",
+            Self::Spawn => "Spawn",
+            Self::Terminate => "Terminate",
+        }
+    }
 
     pub const fn word(self) -> &'static str {
         match self {
@@ -126,6 +187,20 @@ impl IoMessageOperation {
             Self::Write => "write",
             Self::Append => "append",
             Self::Flush => "flush",
+            Self::Close => "close",
+            Self::Register => "register",
+            Self::Unregister => "unregister",
+            Self::Wait => "wait for",
+            Self::Configure => "configure",
+            Self::Access => "access",
+            Self::Seek => "seek",
+            Self::SynchronizeData => "synchronize data for",
+            Self::SynchronizeMetadata => "synchronize data and metadata for",
+            Self::Resize => "resize",
+            Self::Lock => "lock",
+            Self::Unlock => "unlock",
+            Self::Spawn => "spawn",
+            Self::Terminate => "terminate",
         }
     }
 }
@@ -174,12 +249,22 @@ pub enum IoMessageTarget<'a> {
     StandardInput,
     StandardOutput,
     StandardError,
+    ReadinessSet,
+    TransferPlan,
+    TransferGroup,
+    /// A child process, named by the program actually launched.
+    Process(&'a [u8]),
+    ProcessInput(&'a [u8]),
+    ProcessOutput(&'a [u8]),
+    ProcessErrors(&'a [u8]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Utf8MessageSource<'a> {
     File(&'a [u8]),
     StandardInput,
+    /// A text adapter over a byte stream with no path of its own.
+    Stream,
 }
 
 pub const IO_ERROR_MESSAGE_PREFIX: &str = "failed to ";
@@ -187,8 +272,17 @@ pub const IO_ERROR_MESSAGE_SEPARATOR: &str = ": ";
 pub const IO_FILE_MESSAGE_PREFIX: &str = "file `";
 pub const IO_FILE_MESSAGE_SUFFIX: &str = "`";
 pub const IO_STANDARD_INPUT_NAME: &str = "standard input";
+pub const IO_STREAM_NAME: &str = "stream";
 pub const IO_STANDARD_OUTPUT_NAME: &str = "standard output";
 pub const IO_STANDARD_ERROR_NAME: &str = "standard error";
+pub const IO_READINESS_SET_NAME: &str = "readiness set";
+pub const IO_TRANSFER_PLAN_NAME: &str = "transfer plan";
+pub const IO_TRANSFER_GROUP_NAME: &str = "transfer group";
+pub const IO_PROCESS_MESSAGE_PREFIX: &str = "process `";
+pub const IO_PROCESS_MESSAGE_SUFFIX: &str = "`";
+pub const IO_PROCESS_INPUT_SUFFIX: &str = "` input";
+pub const IO_PROCESS_OUTPUT_SUFFIX: &str = "` output";
+pub const IO_PROCESS_ERRORS_SUFFIX: &str = "` error output";
 pub const INVALID_UTF8_MESSAGE_PREFIX: &str = "invalid UTF-8 in ";
 
 pub fn visit_io_error_message_parts(
@@ -217,6 +311,7 @@ pub fn visit_invalid_utf8_message_parts(
             write(IO_FILE_MESSAGE_SUFFIX.as_bytes());
         }
         Utf8MessageSource::StandardInput => write(IO_STANDARD_INPUT_NAME.as_bytes()),
+        Utf8MessageSource::Stream => write(IO_STREAM_NAME.as_bytes()),
     }
 }
 
@@ -230,6 +325,178 @@ fn visit_io_target_parts(target: IoMessageTarget<'_>, write: &mut impl FnMut(&[u
         IoMessageTarget::StandardInput => write(IO_STANDARD_INPUT_NAME.as_bytes()),
         IoMessageTarget::StandardOutput => write(IO_STANDARD_OUTPUT_NAME.as_bytes()),
         IoMessageTarget::StandardError => write(IO_STANDARD_ERROR_NAME.as_bytes()),
+        IoMessageTarget::ReadinessSet => write(IO_READINESS_SET_NAME.as_bytes()),
+        IoMessageTarget::TransferPlan => write(IO_TRANSFER_PLAN_NAME.as_bytes()),
+        IoMessageTarget::TransferGroup => write(IO_TRANSFER_GROUP_NAME.as_bytes()),
+        IoMessageTarget::Process(program)
+        | IoMessageTarget::ProcessInput(program)
+        | IoMessageTarget::ProcessOutput(program)
+        | IoMessageTarget::ProcessErrors(program) => {
+            write(IO_PROCESS_MESSAGE_PREFIX.as_bytes());
+            write(program);
+            write(
+                match target {
+                    IoMessageTarget::ProcessInput(_) => IO_PROCESS_INPUT_SUFFIX,
+                    IoMessageTarget::ProcessOutput(_) => IO_PROCESS_OUTPUT_SUFFIX,
+                    IoMessageTarget::ProcessErrors(_) => IO_PROCESS_ERRORS_SUFFIX,
+                    _ => IO_PROCESS_MESSAGE_SUFFIX,
+                }
+                .as_bytes(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod io_vocabulary_tests {
+    use super::*;
+
+    #[test]
+    fn operation_tags_and_case_names_are_one_append_only_inventory() {
+        let expected = [
+            "Open",
+            "Read",
+            "Write",
+            "Append",
+            "Flush",
+            "Close",
+            "Register",
+            "Unregister",
+            "Wait",
+            "Configure",
+            "Access",
+            "Seek",
+            "SynchronizeData",
+            "SynchronizeMetadata",
+            "Resize",
+            "Lock",
+            "Unlock",
+            "Spawn",
+            "Terminate",
+        ];
+        for (tag, (operation, name)) in IoMessageOperation::ALL
+            .into_iter()
+            .zip(expected)
+            .enumerate()
+        {
+            assert_eq!(operation as usize, tag);
+            assert_eq!(operation.case_name(), name);
+        }
+    }
+
+    #[test]
+    fn readiness_messages_use_the_shared_nontransfer_target() {
+        for (operation, expected) in [
+            (
+                IoMessageOperation::Register,
+                "failed to register readiness set: unsupported",
+            ),
+            (
+                IoMessageOperation::Unregister,
+                "failed to unregister readiness set: unsupported",
+            ),
+            (
+                IoMessageOperation::Wait,
+                "failed to wait for readiness set: unsupported",
+            ),
+            (
+                IoMessageOperation::Access,
+                "failed to access readiness set: unsupported",
+            ),
+        ] {
+            let mut offset = 0;
+            visit_io_error_message_parts(
+                operation,
+                IoMessageTarget::ReadinessSet,
+                IoMessageReason::Unsupported,
+                |part| {
+                    assert_eq!(part, &expected.as_bytes()[offset..offset + part.len()]);
+                    offset += part.len();
+                },
+            );
+            assert_eq!(offset, expected.len());
+        }
+    }
+
+    #[test]
+    fn process_messages_name_the_program_and_its_pipe() {
+        for (operation, target, expected) in [
+            (
+                IoMessageOperation::Spawn,
+                IoMessageTarget::Process(b"/bin/ls"),
+                "failed to spawn process `/bin/ls`: not found",
+            ),
+            (
+                IoMessageOperation::Write,
+                IoMessageTarget::ProcessInput(b"cat"),
+                "failed to write process `cat` input: not found",
+            ),
+            (
+                IoMessageOperation::Read,
+                IoMessageTarget::ProcessOutput(b"cat"),
+                "failed to read process `cat` output: not found",
+            ),
+            (
+                IoMessageOperation::Read,
+                IoMessageTarget::ProcessErrors(b"cat"),
+                "failed to read process `cat` error output: not found",
+            ),
+            (
+                IoMessageOperation::Terminate,
+                IoMessageTarget::Process(b"cat"),
+                "failed to terminate process `cat`: not found",
+            ),
+        ] {
+            // no_std: compare part by part against the expected bytes.
+            let mut offset = 0;
+            visit_io_error_message_parts(operation, target, IoMessageReason::NotFound, |part| {
+                assert_eq!(part, &expected.as_bytes()[offset..offset + part.len()]);
+                offset += part.len();
+            });
+            assert_eq!(offset, expected.len());
+        }
+    }
+
+    #[test]
+    fn transfer_plan_setup_uses_the_shared_configuration_vocabulary() {
+        let expected = b"failed to configure transfer plan: resource exhausted";
+        let mut offset = 0;
+        visit_io_error_message_parts(
+            IoMessageOperation::Configure,
+            IoMessageTarget::TransferPlan,
+            IoMessageReason::ResourceExhausted,
+            |part| {
+                assert_eq!(part, &expected[offset..offset + part.len()]);
+                offset += part.len();
+            },
+        );
+        assert_eq!(offset, expected.len());
+    }
+
+    #[test]
+    fn transfer_group_access_and_configuration_name_the_group_owner() {
+        for (operation, expected) in [
+            (
+                IoMessageOperation::Access,
+                "failed to access transfer group: invalid input",
+            ),
+            (
+                IoMessageOperation::Configure,
+                "failed to configure transfer group: invalid input",
+            ),
+        ] {
+            let mut offset = 0;
+            visit_io_error_message_parts(
+                operation,
+                IoMessageTarget::TransferGroup,
+                IoMessageReason::InvalidInput,
+                |part| {
+                    assert_eq!(part, &expected.as_bytes()[offset..offset + part.len()]);
+                    offset += part.len();
+                },
+            );
+            assert_eq!(offset, expected.len());
+        }
     }
 }
 
@@ -278,7 +545,12 @@ pub const STRING_PADDING_PADDING_LENGTH_FACT: &str = "paddingGraphemeLength";
 pub const INDEX_FACT: &str = "index";
 pub const INDEXED_LENGTH_FACT: &str = "length";
 pub const COLLECTION_FILL_COUNT_FACT: &str = "count";
+pub const BYTE_BUFFER_LENGTH_FACT: &str = "length";
+pub const BYTE_REGION_OFFSET_FACT: &str = "offset";
+pub const BYTE_REGION_REQUESTED_LENGTH_FACT: &str = "requestedLength";
 pub const STRING_PADDING_OPERATIONS: &[&str] = &["padStart", "padEnd"];
+pub const IO_TRANSFERRED_BYTE_COUNT_FACT: &str = "transferredByteCount";
+pub const IO_TRANSFERRED_BYTE_COUNT_HEADING: &str = "Transferred Byte Count";
 pub const ASSERTION_MATCHER_FACT: &str = "matcher";
 pub const ASSERTION_NEGATED_FACT: &str = "negated";
 pub const ASSERTION_ACTUAL_PRESENT_FACT: &str = "actualPresent";
@@ -515,7 +787,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         title: "Byte Index Is Out Of Bounds",
         domain: "bytes",
         primary_label: "Invalid Byte Index",
-        explanation: "The byte index is outside the valid range of this Bytes value.",
+        explanation: "The byte index is outside the valid range of this byte buffer or region.",
         process_status: 101,
         fact_names: &[INDEX_FACT, INDEXED_LENGTH_FACT],
     },
@@ -527,6 +799,28 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         explanation: "The runtime could not allocate storage for the requested byte buffer.",
         process_status: 101,
         fact_names: &[],
+    },
+    RuntimeCatalogueEntry {
+        code: "P1303",
+        title: "Byte Buffer Length Cannot Be Negative",
+        domain: "bytes",
+        primary_label: "Negative Byte Length",
+        explanation: "A byte buffer length describes how many bytes to allocate and therefore cannot be negative.",
+        process_status: 101,
+        fact_names: &[BYTE_BUFFER_LENGTH_FACT],
+    },
+    RuntimeCatalogueEntry {
+        code: "P1304",
+        title: "Byte Region Is Out Of Bounds",
+        domain: "bytes",
+        primary_label: "Invalid Byte Region",
+        explanation: "The offset and requested length must be nonnegative and fit within the source byte buffer or region.",
+        process_status: 101,
+        fact_names: &[
+            BYTE_REGION_OFFSET_FACT,
+            BYTE_REGION_REQUESTED_LENGTH_FACT,
+            BYTE_BUFFER_LENGTH_FACT,
+        ],
     },
     RuntimeCatalogueEntry {
         code: "P1310",

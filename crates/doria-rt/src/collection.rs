@@ -541,11 +541,47 @@ pub unsafe fn fill_word(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn fill_value(
+    frame: *const DrStackFrameV2,
+    value: *const u8,
+    count: usize,
+    fixed: bool,
+    value_size: usize,
+    value_alignment: usize,
+    aggregate: bool,
+    nullable: bool,
+) -> *mut DrCollectionV1 {
+    let result = if aggregate {
+        new_aggregate(
+            frame,
+            count,
+            false,
+            true,
+            value_size,
+            value_alignment,
+            KIND_LEGACY,
+            0,
+        )
+    } else {
+        let width = u8::try_from(value_size)
+            .unwrap_or_else(|_| collection_panic_with_frame(frame, b"P1001"));
+        new_with_frame(frame, count, false, true, width)
+    };
+    for index in 0..count {
+        ptr::copy_nonoverlapping(value, value_address(result, index), value_size);
+    }
+    (*result).fixed = u8::from(fixed);
+    (*result).value_nullable = u8::from(nullable);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn construction_capacity(
     frame: *const DrStackFrameV2,
     count: usize,
     fixed: bool,
     value_width: u8,
+    value_alignment: u8,
     aggregate: bool,
     keyed: bool,
     kind: u8,
@@ -558,7 +594,7 @@ pub unsafe fn construction_capacity(
             keyed,
             true,
             usize::from(value_width),
-            mem::align_of::<u64>(),
+            usize::from(value_alignment),
             kind,
             comparator,
         )
@@ -1038,6 +1074,36 @@ pub unsafe fn from_copy(
     key_kind: u8,
     value_kind: u8,
 ) -> *mut DrCollectionV1 {
+    if (*source).aggregate != 0 {
+        let result = new_aggregate(
+            ptr::null(),
+            (*source).length,
+            keyed,
+            false,
+            (*source).value_size,
+            (*source).value_alignment,
+            kind,
+            comparator,
+        );
+        (*result).value_nullable = (*source).value_nullable;
+        for index in 0..(*source).length {
+            let destination = aggregate_push_slot(result);
+            ptr::copy_nonoverlapping(
+                value_address(source, index),
+                destination,
+                (*source).value_size,
+            );
+            if keyed {
+                let mut key = *(*source).keys.add(index);
+                if key_kind == COMPARE_STRING {
+                    key = crate::dr_v1_string_retain(key as *mut DrStringV1) as u64;
+                }
+                *(*result).keys.add(index) = key;
+            }
+        }
+        finalize_stage26(result);
+        return result;
+    }
     let result = new_stage26((*source).length, keyed, value_width, kind, comparator);
     (*result).value_nullable = (*source).value_nullable;
     for index in 0..(*source).length {
@@ -2519,6 +2585,75 @@ mod tests {
     }
 
     #[test]
+    fn scalar_storage_fills_and_preserving_conversions_copy_every_byte() {
+        unsafe {
+            for fixed in [false, true] {
+                for count in [0, 1, 3, 1000] {
+                    for seed in [[0_u128, 0], [1, u128::MAX - 17]] {
+                        let filled = fill_value(
+                            ptr::null(),
+                            seed.as_ptr().cast(),
+                            count,
+                            fixed,
+                            mem::size_of_val(&seed),
+                            mem::align_of_val(&seed),
+                            true,
+                            true,
+                        );
+                        assert_eq!((*filled).length, count);
+                        assert_eq!((*filled).value_alignment, 16);
+                        let copy = from_copy(filled, KIND_DEQUE, 0, false, 32, 0, 0);
+                        free(filled);
+                        for index in 0..count {
+                            assert_eq!(value_address(copy, index).cast::<[u128; 2]>().read(), seed);
+                        }
+                        free(copy);
+                    }
+                }
+            }
+            for seed in [[0_u64, 0], [1, u64::MAX - 41]] {
+                let filled = fill_value(
+                    ptr::null(),
+                    seed.as_ptr().cast(),
+                    3,
+                    false,
+                    mem::size_of_val(&seed),
+                    mem::align_of_val(&seed),
+                    false,
+                    true,
+                );
+                assert_eq!(read_present(filled, 2), seed[0] != 0);
+                assert_eq!(read_value(filled, 2), seed[1]);
+                free(filled);
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_construction_capacity_preserves_exact_size_and_alignment() {
+        unsafe {
+            let collection =
+                construction_capacity(ptr::null(), 3, true, 32, 16, true, false, KIND_LEGACY, 0);
+            assert_eq!((*collection).value_size, 32);
+            assert_eq!((*collection).value_stride, 32);
+            assert_eq!((*collection).value_alignment, 16);
+            for index in 0..3_u128 {
+                let slot = aggregate_push_slot(collection);
+                assert_eq!((slot as usize) % 16, 0);
+                slot.cast::<[u128; 2]>().write([index, u128::MAX - index]);
+            }
+            finalize_stage26(collection);
+            for index in 0..3 {
+                assert_eq!(
+                    value_address(collection, index).cast::<[u128; 2]>().read(),
+                    [index as u128, u128::MAX - index as u128],
+                );
+            }
+            free(collection);
+        }
+    }
+
+    #[test]
     fn detached_cleanup_isolates_destructor_refills() {
         unsafe {
             let collection = new(0, false, false, 8);
@@ -2619,6 +2754,7 @@ mod tests {
                     3,
                     fixed,
                     16,
+                    8,
                     false,
                     false,
                     KIND_LEGACY,
@@ -2642,6 +2778,7 @@ mod tests {
                 1,
                 true,
                 16,
+                8,
                 true,
                 false,
                 KIND_LEGACY,

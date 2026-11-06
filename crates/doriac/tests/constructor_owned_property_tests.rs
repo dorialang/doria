@@ -1,5 +1,8 @@
 use doriac::mir;
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
 
@@ -170,16 +173,24 @@ class Application
     }
 }
 "#,
-        r#"
-class Application
-{
-    writable Counter $counter = new Counter();
-    function __destruct() { $this->counter->add(1); }
-}
-"#,
     ] {
         assert_diagnostic(&format!("{declarations}{body}"), "E0203");
     }
+    // A destructor has writable access to the dying object (decision log
+    // entry 42), so it may mutate its fields.
+    doriac::check_source(
+        "destructor-writes.doria",
+        format!(
+            r#"{declarations}
+class Application
+{{
+    writable Counter $counter = new Counter();
+    function __destruct() {{ $this->counter->add(1); }}
+}}
+"#
+        ),
+    )
+    .expect("destructors may mutate the dying object");
     assert_diagnostic(
         &format!(
             r#"{declarations}
