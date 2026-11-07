@@ -15,54 +15,14 @@ pub(crate) type NativeHandle = usize;
 /// Call on the issuing helper for pending work, not the driving thread.
 #[cfg(windows)]
 pub(crate) fn require_synchronous_device(handle: NativeHandle) -> Result<(), Failure> {
-    #[repr(C)]
-    struct IoStatus {
-        status: usize,
-        information: usize,
-    }
-    type Query = unsafe extern "system" fn(
-        NativeHandle,
-        *mut IoStatus,
-        *mut core::ffi::c_void,
-        u32,
-        u32,
-    ) -> i32;
-    type ErrorCode = unsafe extern "system" fn(i32) -> u32;
-    use crate::win32::{GetConsoleMode, GetModuleHandleW, GetProcAddress};
+    use crate::win32::{query_information_file, GetConsoleMode};
     let mut mode = 0u32;
     if unsafe { GetConsoleMode(handle, &mut mode) } != 0 {
         return Ok(());
     }
-    const NTDLL: &[u16] = &[110, 116, 100, 108, 108, 46, 100, 108, 108, 0];
-    unsafe {
-        // Already process-loaded; never add module ownership or a private
-        // native link dependency to standalone compiler clients.
-        let module = GetModuleHandleW(NTDLL.as_ptr());
-        if module.is_null() {
-            return Err(last_failure());
-        }
-        let query = GetProcAddress(module, c"NtQueryInformationFile".as_ptr().cast());
-        if query.is_null() {
-            return Err(last_failure());
-        }
-        let error = GetProcAddress(module, c"RtlNtStatusToDosError".as_ptr().cast());
-        if error.is_null() {
-            return Err(last_failure());
-        }
-        let query: Query = core::mem::transmute(query);
-        let error: ErrorCode = core::mem::transmute(error);
-        let mut status = IoStatus {
-            status: 0,
-            information: 0,
-        };
-        // FileModeInformation(16) reports actual CreateOptions, independent of
-        // disk/pipe classification. The query contract returns final status.
-        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntqueryinformationfile
-        let code = query(handle, &mut status, (&mut mode as *mut u32).cast(), 4, 16);
-        if code != 0 {
-            return Err(Failure::from_system_code(error(code).into()));
-        }
-    }
+    // FileModeInformation(16) reports actual CreateOptions, independent of
+    // disk/pipe classification. The query contract returns final status.
+    unsafe { query_information_file(handle, (&mut mode as *mut u32).cast(), 4, 16)? };
     if mode & 0x30 != 0 {
         Ok(())
     } else {

@@ -100,8 +100,10 @@ fn shared_cursor_complete_adapter_orders_read_write_read_without_hot_allocations
         for index in 0..3 {
             assert_eq!(group.next(ptr::null()).unwrap().index, index);
         }
-        assert_eq!(group.completed(0).unwrap(), b"abc");
-        assert_eq!(group.completed(2).unwrap(), b"fg");
+        // The fixture's read callback uppercases what it returns: "abc" at
+        // cursor 0, then "fg" after the write moved the shared cursor to 5.
+        assert_eq!(group.completed(0).unwrap(), b"ABC");
+        assert_eq!(group.completed(2).unwrap(), b"FG");
         assert!(group.next(ptr::null()).is_none());
         drop(group);
     });

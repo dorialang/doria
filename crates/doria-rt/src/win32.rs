@@ -21,6 +21,8 @@ use core::marker::{PhantomData, PhantomPinned};
 
 #[cfg(windows)]
 use crate::native_handle::NativeHandle;
+#[cfg(windows)]
+use crate::platform_io::{last_failure, Failure};
 
 /// `OVERLAPPED`. While a request is pending the kernel writes `internal` (its
 /// NTSTATUS) and `internal_high` (the byte count), so both are `UnsafeCell`
@@ -575,4 +577,71 @@ pub(crate) unsafe fn sleep_condition_variable(
         SetLastError(ERROR_TIMEOUT);
     }
     result
+}
+
+/// `IO_STATUS_BLOCK`.
+#[cfg(windows)]
+#[repr(C)]
+struct IoStatusBlock {
+    status: usize,
+    information: usize,
+}
+
+/// `NtQueryInformationFile`, resolved from the already loaded ntdll so the
+/// runtime adds no module ownership or link dependency. A failing NTSTATUS is
+/// mapped to its Win32 error with `RtlNtStatusToDosError`.
+/// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntqueryinformationfile
+///
+/// # Safety
+/// `handle` is live, and `information` is writable for `length` bytes of the
+/// structure `class` names.
+#[cfg(windows)]
+pub(crate) unsafe fn query_information_file(
+    handle: NativeHandle,
+    information: *mut c_void,
+    length: u32,
+    class: u32,
+) -> Result<(), Failure> {
+    type Query =
+        unsafe extern "system" fn(NativeHandle, *mut IoStatusBlock, *mut c_void, u32, u32) -> i32;
+    type ErrorCode = unsafe extern "system" fn(i32) -> u32;
+    const NTDLL: &[u16] = &[110, 116, 100, 108, 108, 46, 100, 108, 108, 0];
+    let module = GetModuleHandleW(NTDLL.as_ptr());
+    if module.is_null() {
+        return Err(last_failure());
+    }
+    let query = GetProcAddress(module, c"NtQueryInformationFile".as_ptr().cast());
+    if query.is_null() {
+        return Err(last_failure());
+    }
+    let error = GetProcAddress(module, c"RtlNtStatusToDosError".as_ptr().cast());
+    if error.is_null() {
+        return Err(last_failure());
+    }
+    let query: Query = core::mem::transmute(query);
+    let error: ErrorCode = core::mem::transmute(error);
+    let mut status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let code = query(handle, &mut status, information, length, class);
+    if code != 0 {
+        return Err(Failure::from_system_code(error(code).into()));
+    }
+    Ok(())
+}
+
+/// The free space in this pipe end's outbound buffer:
+/// `FILE_PIPE_LOCAL_INFORMATION::WriteQuotaAvailable` (`FilePipeLocalInformation`, 24).
+///
+/// # Safety
+/// `handle` is a live pipe handle.
+#[cfg(windows)]
+pub(crate) unsafe fn pipe_write_quota_available(handle: NativeHandle) -> Result<u32, Failure> {
+    // NamedPipeType, NamedPipeConfiguration, MaximumInstances, CurrentInstances,
+    // InboundQuota, ReadDataAvailable, OutboundQuota, WriteQuotaAvailable,
+    // NamedPipeState, NamedPipeEnd: ten ULONGs.
+    let mut information = [0u32; 10];
+    query_information_file(handle, information.as_mut_ptr().cast(), 40, 24)?;
+    Ok(information[7])
 }

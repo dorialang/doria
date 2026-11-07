@@ -1635,3 +1635,74 @@ even though the next test aborted the binary.
   synchronous handle, a blocking `ReadFile`, `std` locks, channels and thread
   joins) are bounded only by the 15-minute step limit. libtest's "running for
   over 60 seconds" lines name the tests stuck there.
+
+### The three Windows defects CI on `e214f49` named (2026-11-07)
+
+Run 42416608800 printed each failure as it happened. The `.CRT$XCU`
+reporter ran.
+
+**1. A large nonblocking pipe write never progressed (runtime defect, fixed).**
+`windows_nonblocking_pipe_exposes_backpressure_and_resumes_without_replay`
+failed `accepted > 0` (byte_io.rs:823). Its first write offered up to 16,384
+bytes to an empty `PIPE_NOWAIT` byte pipe with a 4,096-byte quota, and
+`WriteFile` returned success with zero bytes. So on that platform a
+nonblocking pipe write is all or nothing against the free outbound quota, not
+the partial write the `WriteFile` page describes. The runtime's Windows
+`write` turned that zero into `WouldBlock`, so a request larger than the free
+quota could never make progress, even on an empty pipe.
+
+The synchronous write path (`byte_io::platform::write_at`) owns the contract
+"`Accepted(1..=len)` or `WouldBlock` with progress possible". It now handles
+the zero case on a pipe by reading the end's free outbound quota
+(`FILE_PIPE_LOCAL_INFORMATION::WriteQuotaAvailable`, through
+`NtQueryInformationFile`) and retrying once with exactly that many bytes. Zero
+free quota stays real backpressure. A failed query is returned as a failure,
+not guessed. `win32::query_information_file` is now the one owner of the
+ntdll query; `native_handle::require_synchronous_device` uses it instead of
+its own copy of the lookup.
+
+Other Windows write paths: the completion drivers (`native.rs`,
+`broker/driver.rs`) use overlapped `PIPE_WAIT` handles, whose writes pend
+until space exists. Device, file and child-process writes reach pipes through
+this same `write`, so the fix covers them.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Retry once with the free quota (chosen) | Exact progress whenever any space is free; one query only on the zero-progress path | One ntdll query per blocked pipe write |
+| Cap every pipe write at the pipe's buffer size (`GetNamedPipeInfo`) | No ntdll | Still writes nothing whenever the pipe is partly full and the request exceeds the free space |
+| Keep `WouldBlock` | No change | A request larger than the free quota can never progress |
+
+**2. The shared-cursor adapter test expected untransformed bytes (test defect, fixed).**
+`shared_cursor_complete_adapter_orders_read_write_read_without_hot_allocations`
+got `[65, 66, 67]` ("ABC") where it expected "abc" (adapter/tests.rs:103).
+The fixture's read callback uppercases every byte it returns
+(adapter/tests.rs:215), and the sibling tests expect uppercase ("UV", "AB",
+"C"). "ABC" is the file's first three bytes read at cursor 0, before the
+write, so the shared cursor and the ordering were correct. The expectations
+are now "ABC" and "FG". The second read still checks that the write moved
+the cursor to 5.
+
+**3. `peer_closure_projects_read_eof_without_finishing_an_unrelated_pending_read` hung (open).**
+The bounded wait aborted after 120,000 ms waiting for a completion packet on
+the broker port. The 5-second deadline budget bounds the group's own waits,
+so the unbounded wait was an `INFINITE` one: the broker drain
+(`driver.rs`, `wait(self.group, INFINITE, ...)`) or a no-budget wait. Reading
+established these facts:
+
+- A synchronously failed overlapped submission (`ReadFile` on a server end
+  whose client closed returns `ERROR_BROKEN_PIPE`) queues no packet. The
+  broker records it with `Registry::rejected`, and the generic group finishes
+  that slot with the failure.
+- A rejected route has `packet = false` and no terminal, so
+  `Registry::query` returns `None` forever. Any later drain of that slot
+  would wait for a packet that cannot come.
+- The completion sets never call `SetFileCompletionNotificationModes`, so a
+  synchronous success still queues a packet. That path is consistent.
+
+Whether some path drains or waits on the rejected slot is not established.
+So no change is made for it.
+
+**Open:** the hang's exact path. The next step is to show whether
+`NativeGroup` drop or `next()` drains a slot whose submission was rejected.
+The hang report would identify it directly if it also named the slot's route
+state.

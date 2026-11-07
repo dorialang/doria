@@ -294,7 +294,9 @@ mod platform {
     use core::ptr;
 
     use super::*;
-    use crate::win32::{GetFileType, GetLastError, Overlapped, ReadFile, WriteFile};
+    use crate::win32::{
+        pipe_write_quota_available, GetFileType, GetLastError, Overlapped, ReadFile, WriteFile,
+    };
 
     pub(super) unsafe fn read(
         handle: NativeHandle,
@@ -367,7 +369,24 @@ mod platform {
         {
             return Err(failed_windows_transfer(GetLastError(), count, requested));
         }
-        // Nonblocking byte pipes accept only available capacity, including zero.
+        // A nonblocking (PIPE_NOWAIT) pipe writes nothing when the request is
+        // larger than the free outbound quota, even into an empty pipe, so a
+        // large write would report WouldBlock forever. Retry once with exactly
+        // the free quota; zero free quota is real backpressure.
+        if count == 0 && requested > 0 && GetFileType(handle) == 3 {
+            let available = (pipe_write_quota_available(handle)? as usize).min(requested);
+            if available > 0
+                && WriteFile(
+                    handle,
+                    source.cast(),
+                    available as u32,
+                    &mut count,
+                    operation,
+                ) == 0
+            {
+                return Err(failed_windows_transfer(GetLastError(), count, available));
+            }
+        }
         if count == 0 && GetFileType(handle) == 3 {
             Ok(WriteProgress::WouldBlock(
                 Failure::other().with_transferred_byte_count(Some(0)),
