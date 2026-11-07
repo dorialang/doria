@@ -40,14 +40,16 @@ unsafe extern "C" fn prepare(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let adapter = TestObject::<Adapter>::in_callback((*context).object);
-    if let Some(driver) = adapter.driver {
-        assert_eq!(std::thread::current().id(), driver);
-    }
-    adapter.prepares += 1;
-    assert_eq!(length, 2);
-    dr_v1_pending_request_configure_standard(request, 0, adapter.storage.as_mut_ptr(), length);
-    0
+    crate::test_callback::guard(|| {
+        let adapter = TestObject::<Adapter>::in_callback((*context).object);
+        if let Some(driver) = adapter.driver {
+            assert_eq!(std::thread::current().id(), driver);
+        }
+        adapter.prepares += 1;
+        assert_eq!(length, 2);
+        dr_v1_pending_request_configure_standard(request, 0, adapter.storage.as_mut_ptr(), length);
+        0
+    })
 }
 
 unsafe extern "C" fn complete(
@@ -59,49 +61,51 @@ unsafe extern "C" fn complete(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let adapter = TestObject::<Adapter>::in_callback((*context).object);
-    if let Some(driver) = adapter.driver {
-        assert_eq!(std::thread::current().id(), driver);
-    }
-    adapter.completes += 1;
-    adapter.submitted = pending_callback_facts(request).1;
-    let (mut tag, mut count) = (0, 0);
-    let (mut message, mut path) = (ptr::null_mut(), ptr::null_mut());
-    let (mut code, mut transferred, mut meta) = (0, 0, 0);
-    let returned = dr_v1_checked_pending_request_outcome(
-        frame,
-        request,
-        &mut tag,
-        &mut count,
-        &mut message,
-        &mut path,
-        &mut code,
-        &mut transferred,
-        &mut meta,
-    );
-    if returned == 4 {
-        assert_eq!(adapter.submitted, 0);
-        assert!(message.is_null() && path.is_null());
-        adapter.observed = 4;
-        return 0;
-    }
-    assert_eq!(returned, 0);
-    assert!(message.is_null() && path.is_null());
-    assert!(count <= length);
-    adapter.observed = tag;
-    if tag == 0 {
-        // Actual buffered input still passes through the COMPLETE adapter,
-        // including its staged region and transformation, before publication.
-        for index in 0..count {
-            destination.add(index).write(adapter.storage[index] ^ 0xff);
+    crate::test_callback::guard(|| {
+        let adapter = TestObject::<Adapter>::in_callback((*context).object);
+        if let Some(driver) = adapter.driver {
+            assert_eq!(std::thread::current().id(), driver);
         }
-    }
-    *outcome = DrAdapterOutcomeV1 {
-        count,
-        tag: tag as u8,
-        has_count: u8::from(tag == 0),
-    };
-    0
+        adapter.completes += 1;
+        adapter.submitted = pending_callback_facts(request).1;
+        let (mut tag, mut count) = (0, 0);
+        let (mut message, mut path) = (ptr::null_mut(), ptr::null_mut());
+        let (mut code, mut transferred, mut meta) = (0, 0, 0);
+        let returned = dr_v1_checked_pending_request_outcome(
+            frame,
+            request,
+            &mut tag,
+            &mut count,
+            &mut message,
+            &mut path,
+            &mut code,
+            &mut transferred,
+            &mut meta,
+        );
+        if returned == 4 {
+            assert_eq!(adapter.submitted, 0);
+            assert!(message.is_null() && path.is_null());
+            adapter.observed = 4;
+            return 0;
+        }
+        assert_eq!(returned, 0);
+        assert!(message.is_null() && path.is_null());
+        assert!(count <= length);
+        adapter.observed = tag;
+        if tag == 0 {
+            // Actual buffered input still passes through the COMPLETE adapter,
+            // including its staged region and transformation, before publication.
+            for index in 0..count {
+                destination.add(index).write(adapter.storage[index] ^ 0xff);
+            }
+        }
+        *outcome = DrAdapterOutcomeV1 {
+            count,
+            tag: tag as u8,
+            has_count: u8::from(tag == 0),
+        };
+        0
+    })
 }
 
 #[test]

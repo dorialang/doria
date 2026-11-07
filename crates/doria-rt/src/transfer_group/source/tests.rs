@@ -389,25 +389,29 @@ unsafe extern "C" fn resolve(
     context: *mut DrAdapterContextV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let getter = TestObject::<Getter>::in_callback((*receiver).object);
-    assert_eq!(receiver, getter.expected_home);
-    assert_eq!(frame, getter.expected_frame);
-    getter.calls += 1;
-    if let Some(owned) = getter.error.take() {
-        error.write(owned.into_carrier());
-        return 1;
-    }
-    source.write(getter.source);
-    context.write(DrAdapterContextV1 {
-        object: (*receiver).object.cast(),
-        descriptor: (*receiver).vtable.cast(),
-    });
-    0
+    crate::test_callback::guard(|| {
+        let getter = TestObject::<Getter>::in_callback((*receiver).object);
+        assert_eq!(receiver, getter.expected_home);
+        assert_eq!(frame, getter.expected_frame);
+        getter.calls += 1;
+        if let Some(owned) = getter.error.take() {
+            error.write(owned.into_carrier());
+            return 1;
+        }
+        source.write(getter.source);
+        context.write(DrAdapterContextV1 {
+            object: (*receiver).object.cast(),
+            descriptor: (*receiver).vtable.cast(),
+        });
+        0
+    })
 }
 
 unsafe extern "C" fn drop_error(_: *const DrStackFrameV2, object: *mut u8) {
-    let counter = Box::from_raw(object.cast::<Rc<Cell<usize>>>());
-    counter.set(counter.get() + 1);
+    crate::test_callback::guard(|| {
+        let counter = Box::from_raw(object.cast::<Rc<Cell<usize>>>());
+        counter.set(counter.get() + 1);
+    })
 }
 
 fn descriptor() -> DrInterfaceVtableV1 {

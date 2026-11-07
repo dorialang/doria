@@ -282,6 +282,8 @@ jobs:
           php scripts/check_build_artifact_policy.php
           php scripts/test_rust_toolchain_authority.php
           php scripts/check_rust_toolchain_authority.php
+          php scripts/test_test_callback_guards.php
+          php scripts/check_test_callback_guards.php
 
       - name: Check documentation authority
         run: php scripts/check_docs_authority.php

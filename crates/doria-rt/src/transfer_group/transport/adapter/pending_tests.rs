@@ -57,14 +57,16 @@ unsafe extern "C" fn prepare(
     _: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = TestObject::<Context>::in_callback((*context).object);
-    context.prepares += 1;
-    if let Some(owned) = context.error.take() {
-        error.write(owned.into_carrier());
-        return 1;
-    }
-    dr_v1_pending_request_configure_native(view, context.endpoint, data, length);
-    0
+    crate::test_callback::guard(|| {
+        let context = TestObject::<Context>::in_callback((*context).object);
+        context.prepares += 1;
+        if let Some(owned) = context.error.take() {
+            error.write(owned.into_carrier());
+            return 1;
+        }
+        dr_v1_pending_request_configure_native(view, context.endpoint, data, length);
+        0
+    })
 }
 
 unsafe extern "C" fn complete(
@@ -76,41 +78,43 @@ unsafe extern "C" fn complete(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
-    let context = TestObject::<Context>::in_callback((*context).object);
-    context.completes += 1;
-    context.completion_frame = frame as usize;
-    context.last_native_tag = tag;
-    assert_eq!((*selected).endpoint, context.endpoint);
-    assert_eq!((*selected).data, data);
-    assert_eq!((*selected).length, length);
-    assert!(immediate.is_null());
-    if tag == 4 {
-        assert_eq!(submitted, 0);
-        assert_eq!((*native).has_system_code, 0);
-        assert_eq!((*native).has_transferred_byte_count, 0);
-        context.cleaned += 1;
-    } else if tag == 0 {
-        assert_eq!((tag, submitted), (0, 1));
-        let count = (*native).value as usize;
-        for byte in core::slice::from_raw_parts_mut(data, count) {
-            *byte = byte.to_ascii_uppercase();
+    crate::test_callback::guard(|| {
+        let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
+        let context = TestObject::<Context>::in_callback((*context).object);
+        context.completes += 1;
+        context.completion_frame = frame as usize;
+        context.last_native_tag = tag;
+        assert_eq!((*selected).endpoint, context.endpoint);
+        assert_eq!((*selected).data, data);
+        assert_eq!((*selected).length, length);
+        assert!(immediate.is_null());
+        if tag == 4 {
+            assert_eq!(submitted, 0);
+            assert_eq!((*native).has_system_code, 0);
+            assert_eq!((*native).has_transferred_byte_count, 0);
+            context.cleaned += 1;
+        } else if tag == 0 {
+            assert_eq!((tag, submitted), (0, 1));
+            let count = (*native).value as usize;
+            for byte in core::slice::from_raw_parts_mut(data, count) {
+                *byte = byte.to_ascii_uppercase();
+            }
+            outcome.write(DrAdapterOutcomeV1 {
+                tag: 0,
+                count,
+                has_count: 1,
+            });
+        } else {
+            assert!(matches!(tag, 1 | 2));
+            assert_eq!(submitted, 1);
+            outcome.write(DrAdapterOutcomeV1 {
+                tag,
+                count: 0,
+                has_count: 0,
+            });
         }
-        outcome.write(DrAdapterOutcomeV1 {
-            tag: 0,
-            count,
-            has_count: 1,
-        });
-    } else {
-        assert!(matches!(tag, 1 | 2));
-        assert_eq!(submitted, 1);
-        outcome.write(DrAdapterOutcomeV1 {
-            tag,
-            count: 0,
-            has_count: 0,
-        });
-    }
-    0
+        0
+    })
 }
 
 fn leaf() -> (Box<OwnedHandle>, UnixStream) {
@@ -500,8 +504,10 @@ fn pending_fetch_timeout_defers_completion_until_teardown_drains_once() {
 }
 
 unsafe extern "C" fn drop_progress_error(_: *const DrStackFrameV2, object: *mut u8) {
-    let payload = Box::from_raw(object.cast::<ProgressError>());
-    payload.drops.set(payload.drops.get() + 1);
+    crate::test_callback::guard(|| {
+        let payload = Box::from_raw(object.cast::<ProgressError>());
+        payload.drops.set(payload.drops.get() + 1);
+    })
 }
 
 unsafe extern "C" fn complete_with_original_error(
@@ -513,19 +519,21 @@ unsafe extern "C" fn complete_with_original_error(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    complete(frame, context, view, data, length, outcome, error);
-    let Some(owned) = (*(*context).object.cast::<Context>()).error.take() else {
-        return 0;
-    };
-    let carrier = owned.into_carrier();
-    let progress = (*carrier.object.cast::<ProgressError>()).progress;
-    *outcome = DrAdapterOutcomeV1::default();
-    if let Some(count) = progress.and_then(|count| usize::try_from(count).ok()) {
-        (*outcome).count = count;
-        (*outcome).has_count = 1;
-    }
-    error.write(carrier);
-    1
+    crate::test_callback::guard(|| {
+        complete(frame, context, view, data, length, outcome, error);
+        let Some(owned) = (*(*context).object.cast::<Context>()).error.take() else {
+            return 0;
+        };
+        let carrier = owned.into_carrier();
+        let progress = (*carrier.object.cast::<ProgressError>()).progress;
+        *outcome = DrAdapterOutcomeV1::default();
+        if let Some(count) = progress.and_then(|count| usize::try_from(count).ok()) {
+            (*outcome).count = count;
+            (*outcome).has_count = 1;
+        }
+        error.write(carrier);
+        1
+    })
 }
 
 #[test]

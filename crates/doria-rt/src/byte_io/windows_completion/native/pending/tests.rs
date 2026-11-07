@@ -169,10 +169,12 @@ unsafe extern "C" fn duplex_prepare_read(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = TestObject::<DuplexContext>::in_callback((*context).object);
-    context.prepares += 1;
-    dr_v1_pending_request_configure_native(view, context.endpoint, data, length);
-    0
+    crate::test_callback::guard(|| {
+        let context = TestObject::<DuplexContext>::in_callback((*context).object);
+        context.prepares += 1;
+        dr_v1_pending_request_configure_native(view, context.endpoint, data, length);
+        0
+    })
 }
 
 unsafe extern "C" fn duplex_prepare_write(
@@ -184,15 +186,17 @@ unsafe extern "C" fn duplex_prepare_write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    duplex_prepare_read(
-        frame,
-        context,
-        view,
-        data.cast_mut(),
-        length,
-        outcome,
-        error,
-    )
+    crate::test_callback::guard(|| {
+        duplex_prepare_read(
+            frame,
+            context,
+            view,
+            data.cast_mut(),
+            length,
+            outcome,
+            error,
+        )
+    })
 }
 
 unsafe extern "C" fn duplex_complete_read(
@@ -204,19 +208,21 @@ unsafe extern "C" fn duplex_complete_read(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = TestObject::<DuplexContext>::in_callback((*context).object);
-    context.completes += 1;
-    let (tag, submitted, status, selected, _) = pending_callback_facts(view);
-    assert_eq!((*selected).endpoint, context.endpoint);
-    assert_eq!((*selected).data, data);
-    assert_eq!((*selected).length, length);
-    assert_eq!((tag, submitted), (0, 1));
-    outcome.write(DrAdapterOutcomeV1 {
-        tag,
-        count: (*status).value as usize,
-        has_count: 1,
-    });
-    0
+    crate::test_callback::guard(|| {
+        let context = TestObject::<DuplexContext>::in_callback((*context).object);
+        context.completes += 1;
+        let (tag, submitted, status, selected, _) = pending_callback_facts(view);
+        assert_eq!((*selected).endpoint, context.endpoint);
+        assert_eq!((*selected).data, data);
+        assert_eq!((*selected).length, length);
+        assert_eq!((tag, submitted), (0, 1));
+        outcome.write(DrAdapterOutcomeV1 {
+            tag,
+            count: (*status).value as usize,
+            has_count: 1,
+        });
+        0
+    })
 }
 
 unsafe extern "C" fn duplex_complete_write(
@@ -228,15 +234,17 @@ unsafe extern "C" fn duplex_complete_write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    duplex_complete_read(
-        frame,
-        context,
-        view,
-        data.cast_mut(),
-        length,
-        outcome,
-        error,
-    )
+    crate::test_callback::guard(|| {
+        duplex_complete_read(
+            frame,
+            context,
+            view,
+            data.cast_mut(),
+            length,
+            outcome,
+            error,
+        )
+    })
 }
 
 #[test]
@@ -454,7 +462,7 @@ unsafe extern "C" fn prepare_read(
     _: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    prepare_view(frame, context, view, caller, length, error, true)
+    crate::test_callback::guard(|| prepare_view(frame, context, view, caller, length, error, true))
 }
 
 unsafe fn prepare_view(
@@ -485,15 +493,17 @@ unsafe extern "C" fn prepare_write(
     _: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    prepare_view(
-        frame,
-        context,
-        view,
-        caller.cast_mut(),
-        length,
-        error,
-        false,
-    )
+    crate::test_callback::guard(|| {
+        prepare_view(
+            frame,
+            context,
+            view,
+            caller.cast_mut(),
+            length,
+            error,
+            false,
+        )
+    })
 }
 
 struct CompleteCall {
@@ -595,19 +605,21 @@ unsafe extern "C" fn complete_read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let (tag, submitted, native, selected, _) = pending_callback_facts(view);
-    complete(CompleteCall {
-        frame,
-        context,
-        caller,
-        bound,
-        tag,
-        submitted,
-        native,
-        selected,
-        outcome,
-        error,
-        reading: true,
+    crate::test_callback::guard(|| {
+        let (tag, submitted, native, selected, _) = pending_callback_facts(view);
+        complete(CompleteCall {
+            frame,
+            context,
+            caller,
+            bound,
+            tag,
+            submitted,
+            native,
+            selected,
+            outcome,
+            error,
+            reading: true,
+        })
     })
 }
 
@@ -620,19 +632,21 @@ unsafe extern "C" fn complete_write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let (tag, submitted, native, selected, _) = pending_callback_facts(view);
-    complete(CompleteCall {
-        frame,
-        context,
-        caller: caller.cast_mut(),
-        bound,
-        tag,
-        submitted,
-        native,
-        selected,
-        outcome,
-        error,
-        reading: false,
+    crate::test_callback::guard(|| {
+        let (tag, submitted, native, selected, _) = pending_callback_facts(view);
+        complete(CompleteCall {
+            frame,
+            context,
+            caller: caller.cast_mut(),
+            bound,
+            tag,
+            submitted,
+            native,
+            selected,
+            outcome,
+            error,
+            reading: false,
+        })
     })
 }
 
@@ -1027,8 +1041,10 @@ struct ErrorPayload {
 }
 
 unsafe extern "C" fn drop_error(_: *const DrStackFrameV2, object: *mut u8) {
-    let payload = Box::from_raw(object.cast::<ErrorPayload>());
-    payload.drops.fetch_add(1, Ordering::Relaxed);
+    crate::test_callback::guard(|| {
+        let payload = Box::from_raw(object.cast::<ErrorPayload>());
+        payload.drops.fetch_add(1, Ordering::Relaxed);
+    })
 }
 
 fn descriptor() -> DrInterfaceVtableV1 {

@@ -222,18 +222,22 @@ unsafe extern "C" fn fail_controlled_preparation(
     _: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    *error = (*observed_stream(context))
-        .completion_error
-        .take()
-        .unwrap()
-        .into_carrier();
-    1
+    crate::test_callback::guard(|| {
+        *error = (*observed_stream(context))
+            .completion_error
+            .take()
+            .unwrap()
+            .into_carrier();
+        1
+    })
 }
 
 #[test]
 fn controlled_setup_failure_preserves_original_error_and_releases_group_state() {
     unsafe extern "C" fn drop_error(_: *const DrStackFrameV2, object: *mut u8) {
-        drop(Box::from_raw(object.cast::<usize>()));
+        crate::test_callback::guard(|| {
+            drop(Box::from_raw(object.cast::<usize>()));
+        })
     }
     unsafe {
         let fixture = Fixture::new();
@@ -378,9 +382,11 @@ unsafe extern "C" fn prepare_ready<const TAG: u8>(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    (*observed_stream(context)).pending = true;
-    dr_v1_pending_request_complete(view, TAG, if TAG == 0 { length } else { 0 });
-    0
+    crate::test_callback::guard(|| {
+        (*observed_stream(context)).pending = true;
+        dr_v1_pending_request_complete(view, TAG, if TAG == 0 { length } else { 0 });
+        0
+    })
 }
 
 unsafe extern "C" fn prepare_ready_write<const TAG: u8>(
@@ -392,15 +398,17 @@ unsafe extern "C" fn prepare_ready_write<const TAG: u8>(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    prepare_ready::<TAG>(
-        frame,
-        context,
-        view,
-        data.cast_mut(),
-        length,
-        outcome,
-        error,
-    )
+    crate::test_callback::guard(|| {
+        prepare_ready::<TAG>(
+            frame,
+            context,
+            view,
+            data.cast_mut(),
+            length,
+            outcome,
+            error,
+        )
+    })
 }
 
 unsafe extern "C" fn complete_ready<const ABSENT: bool>(
@@ -412,24 +420,26 @@ unsafe extern "C" fn complete_ready<const ABSENT: bool>(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *observed_stream(context);
-    stream.pending = false;
-    if let Some(original) = stream.completion_error.take() {
-        *error = original.into_carrier();
-        *outcome = DrAdapterOutcomeV1 {
-            tag: 0,
-            has_count: 1,
-            count: 1,
-        };
-        return 1;
-    }
-    if ABSENT {
-        return 4;
-    }
-    let (_, _, _, _, immediate) = pending_callback_facts(view);
-    assert!(!immediate.is_null());
-    *outcome = *immediate;
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *observed_stream(context);
+        stream.pending = false;
+        if let Some(original) = stream.completion_error.take() {
+            *error = original.into_carrier();
+            *outcome = DrAdapterOutcomeV1 {
+                tag: 0,
+                has_count: 1,
+                count: 1,
+            };
+            return 1;
+        }
+        if ABSENT {
+            return 4;
+        }
+        let (_, _, _, _, immediate) = pending_callback_facts(view);
+        assert!(!immediate.is_null());
+        *outcome = *immediate;
+        0
+    })
 }
 
 unsafe extern "C" fn complete_ready_write<const ABSENT: bool>(
@@ -441,15 +451,17 @@ unsafe extern "C" fn complete_ready_write<const ABSENT: bool>(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    complete_ready::<ABSENT>(
-        frame,
-        context,
-        view,
-        data.cast_mut(),
-        length,
-        outcome,
-        error,
-    )
+    crate::test_callback::guard(|| {
+        complete_ready::<ABSENT>(
+            frame,
+            context,
+            view,
+            data.cast_mut(),
+            length,
+            outcome,
+            error,
+        )
+    })
 }
 
 unsafe fn start_ready<const ABSENT: bool>(
@@ -623,8 +635,10 @@ fn checked_fetch_moves_the_original_error_once_without_reallocation_or_reconstru
         progress: i64,
     }
     unsafe extern "C" fn drop_original(_: *const DrStackFrameV2, object: *mut u8) {
-        let error = Box::from_raw(object.cast::<OriginalError<'_>>());
-        error.dropped.set(error.dropped.get() + 1);
+        crate::test_callback::guard(|| {
+            let error = Box::from_raw(object.cast::<OriginalError<'_>>());
+            error.dropped.set(error.dropped.get() + 1);
+        })
     }
     unsafe {
         let fixture = Fixture::new();
@@ -743,23 +757,25 @@ unsafe extern "C" fn deferred_read(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *observed_stream(context);
-    stream.calls += 1;
-    if stream.pending {
-        *outcome = DrAdapterOutcomeV1 {
-            tag: 1,
-            ..DrAdapterOutcomeV1::default()
-        };
-    } else {
-        assert!(length > 0);
-        *data = b'k';
-        *outcome = DrAdapterOutcomeV1 {
-            tag: 0,
-            count: 1,
-            has_count: 1,
-        };
-    }
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *observed_stream(context);
+        stream.calls += 1;
+        if stream.pending {
+            *outcome = DrAdapterOutcomeV1 {
+                tag: 1,
+                ..DrAdapterOutcomeV1::default()
+            };
+        } else {
+            assert!(length > 0);
+            *data = b'k';
+            *outcome = DrAdapterOutcomeV1 {
+                tag: 0,
+                count: 1,
+                has_count: 1,
+            };
+        }
+        0
+    })
 }
 
 #[test]

@@ -1468,3 +1468,93 @@ message, and the abort discards it, which is why the log names no test. The
 test undefined behavior fixed in the previous section ran assertions inside
 exactly such callbacks, so CI on `42a7ad5` shows whether the abort survived
 that fix.
+
+### Windows test abort: the test binary exported the runtime's CRT replacements (2026-11-07)
+
+CI on `42a7ad5` (run 42404305965) passed the `doria-rt` release tests on
+ubuntu and macOS. Windows aborted again with `0xc0000409` after the same
+eight `byte_io::tests`.
+
+**Cause:** the abort comes from the link, not from a test. This corrects the
+reading at the end of the previous section, which blamed a panic inside a
+non-unwinding function. The evidence:
+
+1. The `standalone-windows-support` feature is on by default. CI's test build
+   compiles it into the harness (`--test --cfg feature="standalone-windows-support"`
+   in the job log).
+2. Under that feature `lib.rs` exported `#[no_mangle]` replacements for CRT
+   symbols: `memcpy`, `memmove`, `memcmp`, `memset`, `strlen`, `wcslen`,
+   `_fltused`, `__chkstk`, and a `__CxxFrameHandler3` that always returns
+   `ExceptionContinueSearch`. The harness's own objects defined them, so they
+   won over the CRT's. `llvm-nm` on a Windows object of the harness at `5bb163c`
+   shows `T __CxxFrameHandler3`, `T memcpy` and `R _fltused`.
+3. MSVC Rust uses `__CxxFrameHandler3` as the personality of every
+   `catch_unwind`. A probe object shows `U __CxxFrameHandler3` for a plain
+   `catch_unwind`. With the stub, no catch frame catches: libtest's per-test
+   catch and the tests' own `catch_unwind` both fail, and the first panic of
+   any kind aborts the binary through `__fastfail`.
+4. At `dd2fbc5`, `doria-rt` used neither `catch_unwind` nor `should_panic`.
+   At `5e72056` it used them 17 times. Two of those tests sit in
+   `byte_io::windows_completion`, the module that starts right after
+   `byte_io::tests`:
+   `native::broker::sync::tests::rust_host_unwind_releases_guard_without_poisoning_cell`
+   and `tests::cleanup_is_armed_before_submit_and_drains_during_host_unwind`.
+   The stub was latent until 36a added the first test that catches a panic
+   on Windows.
+
+`windows_nonblocking_pipe_exposes_backpressure_and_resumes_without_replay` was
+only in flight when another thread aborted. Nothing points at it.
+
+**Chosen:** the runtime exports its CRT replacements only where the CRT is
+absent: the freestanding build, `all(not(test), panic = "abort")`. That is the
+same condition that makes the crate `no_std`.
+
+- `_fltused` and the `__chkstk` assembly carry that condition.
+- The functions keep `#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]`.
+  In every build that links `std` they stay ordinary Rust functions, so
+  `no_crt_memory_support_symbols_preserve_bytes_and_overlap` still tests them.
+- After the change the harness object has `U __CxxFrameHandler3`, `U _fltused`
+  and `U __chkstk`. The freestanding release object still exports all nine
+  symbols.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Export only from the freestanding build (chosen) | One owner condition, the crate's own `no_std` predicate; every `std` build gets the CRT's handler, memory routines and stack probe; the replacements stay testable | Three `cfg` forms to keep aligned (item gate, `cfg_attr`, asm gate) |
+| Turn the feature off in CI's test command | One workflow line | Leaves the trap for every local and future `cargo test` on Windows; the feature's default stays wrong for the crate's own harness |
+| Drop only the `__CxxFrameHandler3` stub from tests | Fixes this abort | Leaves the harness running the runtime's byte-loop `memcpy` and its own `__chkstk` in place of the CRT's |
+
+### Test callbacks that panic
+
+Fixing the link makes test-body failures ordinary named failures on Windows.
+A panic inside a test callback still aborts on every platform. The runtime
+calls these callbacks through `extern "C"` or `extern "system"`, which cannot
+unwind. libtest's capture then loses the test name, location and message.
+`doria-rt` has 74 such test callbacks (adapter, stream, drop, entry and thread
+callbacks), 21 of them with assertions.
+
+**Chosen:** `crate::test_callback::guard` wraps every test callback body.
+
+- A panic inside it is reported straight to the process's standard error,
+  past libtest's capture, naming the thread (libtest names it after the
+  test), the location and the message. Then the process aborts.
+- A chained panic hook writes the report only while a guarded body is
+  running, so tests that expect panics keep their captured output.
+- `scripts/check_test_callback_guards.php` fails any test-code `extern "C"` or
+  `extern "system"` function whose body does not start with the guard.
+  `scripts/test_test_callback_guards.php` covers it in 6 cases. CI's guardrail
+  step and `validate_work_unit.php` run both.
+- A probe harness confirmed the report: `thread 'tests::zz_callback_contract_fails' ... panicked at probe.rs:69:9: assertion ... failed`,
+  status 134, and the earlier tests reported `ok`.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Report past the capture, then abort (chosen) | Names the test, line and message on every platform and thread; never returns an invented status into a runtime whose calling contract just failed while it holds raw pointers into the fixture | The run still stops at the first callback failure |
+| Catch, record, return a fallback status, re-raise on the test thread | Later tests keep running | Each of the 74 callbacks needs an honest fallback for its contract (status, outcome slot, ownership of a dropped stream); libtest has no end-of-test hook, so re-raising needs a scope in every test or a checkpoint the test may never reach, and a test could pass with a recorded failure |
+| `extern "C-unwind"` callbacks | Panics reach the test normally | The descriptors' pointer types are `extern "C"`, and unwinding through the abort-only runtime would skip its cleanup invariants |
+| Leave as is | No change | A failed callback assertion loses its test, line and message |
+
+**Open:**
+
+- Windows tests still need a Windows run.
+- The fix is verified at the object level and by the native release and
+  debug suites, but no Windows machine here can execute the harness.

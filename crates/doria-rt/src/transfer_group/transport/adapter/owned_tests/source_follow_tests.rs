@@ -142,7 +142,9 @@ struct SwitchingStream {
 }
 
 unsafe extern "C" fn drop_switching(_: *const DrStackFrameV2, object: *mut u8) {
-    drop(Box::from_raw(object.cast::<SwitchingStream>()));
+    crate::test_callback::guard(|| {
+        drop(Box::from_raw(object.cast::<SwitchingStream>()));
+    })
 }
 
 fn switching_descriptor() -> DrInterfaceVtableV1 {
@@ -160,25 +162,27 @@ unsafe extern "C" fn resolve_switching(
     context_out: *mut DrAdapterContextV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *(*home).object.cast::<SwitchingStream>();
-    if stream.home.is_null() {
-        stream.home = home;
-    }
-    assert_eq!(
-        home, stream.home,
-        "resolver must borrow the actual retained carrier home"
-    );
-    stream.resolutions += 1;
-    if let Some(owned) = stream.getter_error.take() {
-        *error = owned.into_carrier();
-        return 1;
-    }
-    *source_out = stream.file.source();
-    *context_out = DrAdapterContextV1 {
-        object: (*home).object.cast(),
-        descriptor: (*home).vtable.cast(),
-    };
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *(*home).object.cast::<SwitchingStream>();
+        if stream.home.is_null() {
+            stream.home = home;
+        }
+        assert_eq!(
+            home, stream.home,
+            "resolver must borrow the actual retained carrier home"
+        );
+        stream.resolutions += 1;
+        if let Some(owned) = stream.getter_error.take() {
+            *error = owned.into_carrier();
+            return 1;
+        }
+        *source_out = stream.file.source();
+        *context_out = DrAdapterContextV1 {
+            object: (*home).object.cast(),
+            descriptor: (*home).vtable.cast(),
+        };
+        0
+    })
 }
 
 unsafe extern "C" fn prepare_switching(
@@ -190,40 +194,42 @@ unsafe extern "C" fn prepare_switching(
     _: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *(*context).object.cast::<SwitchingStream>();
-    let replacing = stream.replacement.is_some();
-    if let Some(replacement) = stream.replacement.take() {
-        let old = mem::replace(&mut stream.file, replacement);
-        let ((), closes) = with_close_probe(|| drop(old));
-        assert_eq!(closes, 0, "selected use must survive wrapper destruction");
-    }
-    let mut fields = CheckedFields::empty();
-    let ((tag, allocations), closes) = with_close_probe(|| {
-        crate::probe_runtime_allocations(|| {
-            dr_v1_checked_pending_request_configure_file(
-                frame,
-                view,
-                stream.file.object,
-                ptr::null(),
-                data,
-                length,
-                error,
-                &mut fields.message,
-                &mut fields.path,
-                &mut fields.system_code,
-                &mut fields.transferred,
-                &mut fields.meta,
-            )
-        })
-    });
-    assert_eq!((tag, allocations), (0, 0));
-    assert_eq!(
-        closes,
-        usize::from(replacing),
-        "unsubmitted old selection retires once after fresh configuration"
-    );
-    fields.assert_success();
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *(*context).object.cast::<SwitchingStream>();
+        let replacing = stream.replacement.is_some();
+        if let Some(replacement) = stream.replacement.take() {
+            let old = mem::replace(&mut stream.file, replacement);
+            let ((), closes) = with_close_probe(|| drop(old));
+            assert_eq!(closes, 0, "selected use must survive wrapper destruction");
+        }
+        let mut fields = CheckedFields::empty();
+        let ((tag, allocations), closes) = with_close_probe(|| {
+            crate::probe_runtime_allocations(|| {
+                dr_v1_checked_pending_request_configure_file(
+                    frame,
+                    view,
+                    stream.file.object,
+                    ptr::null(),
+                    data,
+                    length,
+                    error,
+                    &mut fields.message,
+                    &mut fields.path,
+                    &mut fields.system_code,
+                    &mut fields.transferred,
+                    &mut fields.meta,
+                )
+            })
+        });
+        assert_eq!((tag, allocations), (0, 0));
+        assert_eq!(
+            closes,
+            usize::from(replacing),
+            "unsubmitted old selection retires once after fresh configuration"
+        );
+        fields.assert_success();
+        0
+    })
 }
 
 unsafe extern "C" fn complete_switching(
@@ -235,19 +241,21 @@ unsafe extern "C" fn complete_switching(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *(*context).object.cast::<SwitchingStream>();
-    stream.completions += 1;
-    let (tag, _, native, _, _) = pending_callback_facts(view);
-    if tag == 4 {
-        return 4;
-    }
-    assert_eq!(tag, 0);
-    *outcome = DrAdapterOutcomeV1 {
-        count: (*native).value as usize,
-        tag,
-        has_count: 1,
-    };
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *(*context).object.cast::<SwitchingStream>();
+        stream.completions += 1;
+        let (tag, _, native, _, _) = pending_callback_facts(view);
+        if tag == 4 {
+            return 4;
+        }
+        assert_eq!(tag, 0);
+        *outcome = DrAdapterOutcomeV1 {
+            count: (*native).value as usize,
+            tag,
+            has_count: 1,
+        };
+        0
+    })
 }
 
 unsafe fn exercise_switching(replace_during_prepare: bool) {
@@ -382,24 +390,26 @@ unsafe extern "C" fn read_switching(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *(*context).object.cast::<SwitchingStream>();
-    stream.sync_calls += 1;
-    if let Some(replacement) = stream.replacement.take() {
-        let old = mem::replace(&mut stream.file, replacement);
-        let ((), closes) = with_close_probe(|| drop(old));
-        assert_eq!(closes, 0, "current callback retains its old selected use");
-        (*outcome).tag = 1;
-        return 0;
-    }
-    let mut status = DrIoStatusV1::default();
-    let tag = dr_v1_file_object_read(stream.file.object, data, length, &mut status);
-    assert!(matches!(tag, 0 | 2));
-    *outcome = DrAdapterOutcomeV1 {
-        tag,
-        count: status.value as usize,
-        has_count: u8::from(tag == 0),
-    };
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *(*context).object.cast::<SwitchingStream>();
+        stream.sync_calls += 1;
+        if let Some(replacement) = stream.replacement.take() {
+            let old = mem::replace(&mut stream.file, replacement);
+            let ((), closes) = with_close_probe(|| drop(old));
+            assert_eq!(closes, 0, "current callback retains its old selected use");
+            (*outcome).tag = 1;
+            return 0;
+        }
+        let mut status = DrIoStatusV1::default();
+        let tag = dr_v1_file_object_read(stream.file.object, data, length, &mut status);
+        assert!(matches!(tag, 0 | 2));
+        *outcome = DrAdapterOutcomeV1 {
+            tag,
+            count: status.value as usize,
+            has_count: u8::from(tag == 0),
+        };
+        0
+    })
 }
 
 unsafe fn exercise_synchronous_switching(replace_during_retry: bool) {
@@ -530,9 +540,11 @@ struct GetterFailure {
 }
 
 unsafe extern "C" fn drop_getter_failure(_: *const DrStackFrameV2, object: *mut u8) {
-    let error = Box::from_raw(object.cast::<GetterFailure>());
-    crate::dr_v1_string_release(error.message);
-    error.drops.set(error.drops.get() + 1);
+    crate::test_callback::guard(|| {
+        let error = Box::from_raw(object.cast::<GetterFailure>());
+        crate::dr_v1_string_release(error.message);
+        error.drops.set(error.drops.get() + 1);
+    })
 }
 
 #[test]

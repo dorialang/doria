@@ -41,10 +41,12 @@ unsafe extern "C" fn prepare_write(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let writer = TestObject::<Writer>::in_callback((*context).object);
-    assert_eq!(std::thread::current().id(), writer.driver);
-    dr_v1_pending_request_configure_standard(request, writer.stream, data.cast_mut(), length);
-    0
+    crate::test_callback::guard(|| {
+        let writer = TestObject::<Writer>::in_callback((*context).object);
+        assert_eq!(std::thread::current().id(), writer.driver);
+        dr_v1_pending_request_configure_standard(request, writer.stream, data.cast_mut(), length);
+        0
+    })
 }
 
 unsafe extern "C" fn complete_write(
@@ -56,24 +58,26 @@ unsafe extern "C" fn complete_write(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let writer = TestObject::<Writer>::in_callback((*context).object);
-    assert_eq!(std::thread::current().id(), writer.driver);
-    writer.completions += 1;
-    let (tag, submitted, native, region, _) = pending_callback_facts(request);
-    assert_eq!(submitted, 1);
-    assert_eq!(
-        (*region).data,
-        data.cast_mut(),
-        "original retained source, no copy"
-    );
-    assert_eq!((*region).length, length);
-    assert_eq!(tag, 0);
-    *outcome = DrAdapterOutcomeV1 {
-        tag: 0,
-        count: (*native).value as usize,
-        has_count: 1,
-    };
-    0
+    crate::test_callback::guard(|| {
+        let writer = TestObject::<Writer>::in_callback((*context).object);
+        assert_eq!(std::thread::current().id(), writer.driver);
+        writer.completions += 1;
+        let (tag, submitted, native, region, _) = pending_callback_facts(request);
+        assert_eq!(submitted, 1);
+        assert_eq!(
+            (*region).data,
+            data.cast_mut(),
+            "original retained source, no copy"
+        );
+        assert_eq!((*region).length, length);
+        assert_eq!(tag, 0);
+        *outcome = DrAdapterOutcomeV1 {
+            tag: 0,
+            count: (*native).value as usize,
+            has_count: 1,
+        };
+        0
+    })
 }
 
 fn selection(index: usize) -> FixedSlice<usize> {

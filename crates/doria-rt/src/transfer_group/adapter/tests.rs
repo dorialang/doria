@@ -31,8 +31,10 @@ struct ErrorPayload {
 }
 
 unsafe extern "C" fn drop_error(_: *const DrStackFrameV2, object: *mut u8) {
-    let object = Box::from_raw(object.cast::<ErrorPayload>());
-    object.drops.set(object.drops.get() + 1);
+    crate::test_callback::guard(|| {
+        let object = Box::from_raw(object.cast::<ErrorPayload>());
+        object.drops.set(object.drops.get() + 1);
+    })
 }
 
 fn descriptor() -> crate::DrInterfaceVtableV1 {
@@ -138,7 +140,7 @@ unsafe extern "C" fn read_callback(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    callback(frame, context, outcome, error)
+    crate::test_callback::guard(|| callback(frame, context, outcome, error))
 }
 
 unsafe extern "C" fn write_callback(
@@ -149,7 +151,7 @@ unsafe extern "C" fn write_callback(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    callback(frame, context, outcome, error)
+    crate::test_callback::guard(|| callback(frame, context, outcome, error))
 }
 
 #[test]

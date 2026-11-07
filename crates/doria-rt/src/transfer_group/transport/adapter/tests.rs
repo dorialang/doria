@@ -22,33 +22,35 @@ unsafe extern "C" fn transformed_read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = TestObject::<Metered>::in_callback((*context).object);
-    context.calls += 1;
-    context.frame = frame;
-    *outcome = DrAdapterOutcomeV1::default();
-    if let Some(owned) = context.error.take() {
-        (*outcome).count = 1;
-        (*outcome).has_count = 1;
-        *error = owned.into_carrier();
-        return 1;
-    }
-    if context.zero_data || context.calls == 3 {
-        (*outcome).tag = 0;
-        (*outcome).has_count = 1;
-        return 0;
-    }
-    let mut status = DrIoStatusV1::default();
-    let tag = dr_v1_file_read(context.file, data, length.min(2), &mut status);
-    assert!(tag == 0 || tag == 2, "fixture file transfer must succeed");
-    (*outcome).tag = tag;
-    if tag == 0 {
-        (*outcome).count = status.value as usize;
-        (*outcome).has_count = 1;
-        for byte in core::slice::from_raw_parts_mut(data, status.value as usize) {
-            *byte = byte.to_ascii_uppercase();
+    crate::test_callback::guard(|| {
+        let context = TestObject::<Metered>::in_callback((*context).object);
+        context.calls += 1;
+        context.frame = frame;
+        *outcome = DrAdapterOutcomeV1::default();
+        if let Some(owned) = context.error.take() {
+            (*outcome).count = 1;
+            (*outcome).has_count = 1;
+            *error = owned.into_carrier();
+            return 1;
         }
-    }
-    0
+        if context.zero_data || context.calls == 3 {
+            (*outcome).tag = 0;
+            (*outcome).has_count = 1;
+            return 0;
+        }
+        let mut status = DrIoStatusV1::default();
+        let tag = dr_v1_file_read(context.file, data, length.min(2), &mut status);
+        assert!(tag == 0 || tag == 2, "fixture file transfer must succeed");
+        (*outcome).tag = tag;
+        if tag == 0 {
+            (*outcome).count = status.value as usize;
+            (*outcome).has_count = 1;
+            for byte in core::slice::from_raw_parts_mut(data, status.value as usize) {
+                *byte = byte.to_ascii_uppercase();
+            }
+        }
+        0
+    })
 }
 
 unsafe extern "C" fn transformed_write(
@@ -59,8 +61,10 @@ unsafe extern "C" fn transformed_write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    assert!((*(*context).object.cast::<Metered>()).error.is_some());
-    transformed_read(frame, context, data.cast_mut(), length, outcome, error)
+    crate::test_callback::guard(|| {
+        assert!((*(*context).object.cast::<Metered>()).error.is_some());
+        transformed_read(frame, context, data.cast_mut(), length, outcome, error)
+    })
 }
 
 pub(super) unsafe fn observed(
@@ -713,9 +717,11 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
             progress: Option<i64>,
         }
         unsafe extern "C" fn drop_error(frame: *const DrStackFrameV2, object: *mut u8) {
-            let payload = Box::from_raw(object.cast::<ErrorPayload<'_>>());
-            payload.drops.set(payload.drops.get() + 1);
-            payload.dropped_frame.set(frame as usize);
+            crate::test_callback::guard(|| {
+                let payload = Box::from_raw(object.cast::<ErrorPayload<'_>>());
+                payload.drops.set(payload.drops.get() + 1);
+                payload.dropped_frame.set(frame as usize);
+            })
         }
         let descriptor = crate::DrInterfaceVtableV1 {
             type_name: crate::IO_ERROR_TYPE.as_ptr(),
@@ -1112,13 +1118,15 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         _: *mut DrAdapterOutcomeV1,
         _: *mut DrInterfaceCarrierV1,
     ) -> u8 {
-        let context = TestObject::<Context>::in_callback((*context).object);
-        context.prepares += 1;
-        observe(view, context, true);
-        if !context.missing {
-            dr_v1_pending_request_configure_file(view, context.file, data, length);
-        }
-        0
+        crate::test_callback::guard(|| {
+            let context = TestObject::<Context>::in_callback((*context).object);
+            context.prepares += 1;
+            observe(view, context, true);
+            if !context.missing {
+                dr_v1_pending_request_configure_file(view, context.file, data, length);
+            }
+            0
+        })
     }
     unsafe extern "C" fn prepare_write(
         frame: *const DrStackFrameV2,
@@ -1129,15 +1137,17 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         progress: *mut DrAdapterOutcomeV1,
         error: *mut DrInterfaceCarrierV1,
     ) -> u8 {
-        prepare_read(
-            frame,
-            context,
-            view,
-            data.cast_mut(),
-            length,
-            progress,
-            error,
-        )
+        crate::test_callback::guard(|| {
+            prepare_read(
+                frame,
+                context,
+                view,
+                data.cast_mut(),
+                length,
+                progress,
+                error,
+            )
+        })
     }
     unsafe extern "C" fn complete_read(
         _: *const DrStackFrameV2,
@@ -1148,18 +1158,20 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         outcome: *mut DrAdapterOutcomeV1,
         _: *mut DrInterfaceCarrierV1,
     ) -> u8 {
-        let context = TestObject::<Context>::in_callback((*context).object);
-        context.completes += 1;
-        let (result, tag, count) = observe(view, context, false);
-        if result == 4 {
-            return 4;
-        }
-        *outcome = DrAdapterOutcomeV1 {
-            tag: tag as u8,
-            count,
-            has_count: u8::from(tag == 0),
-        };
-        0
+        crate::test_callback::guard(|| {
+            let context = TestObject::<Context>::in_callback((*context).object);
+            context.completes += 1;
+            let (result, tag, count) = observe(view, context, false);
+            if result == 4 {
+                return 4;
+            }
+            *outcome = DrAdapterOutcomeV1 {
+                tag: tag as u8,
+                count,
+                has_count: u8::from(tag == 0),
+            };
+            0
+        })
     }
     unsafe extern "C" fn complete_write(
         frame: *const DrStackFrameV2,
@@ -1170,15 +1182,17 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         outcome: *mut DrAdapterOutcomeV1,
         error: *mut DrInterfaceCarrierV1,
     ) -> u8 {
-        complete_read(
-            frame,
-            context,
-            view,
-            data.cast_mut(),
-            length,
-            outcome,
-            error,
-        )
+        crate::test_callback::guard(|| {
+            complete_read(
+                frame,
+                context,
+                view,
+                data.cast_mut(),
+                length,
+                outcome,
+                error,
+            )
+        })
     }
     struct Fixture(std::path::PathBuf);
     impl Drop for Fixture {

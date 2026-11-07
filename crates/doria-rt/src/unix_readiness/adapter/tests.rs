@@ -135,8 +135,10 @@ unsafe extern "C" fn read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    TestObject::<Script>::in_callback((*context).object)
-        .attempt(frame, data, length, true, outcome, error)
+    crate::test_callback::guard(|| {
+        TestObject::<Script>::in_callback((*context).object)
+            .attempt(frame, data, length, true, outcome, error)
+    })
 }
 
 unsafe extern "C" fn write(
@@ -147,14 +149,16 @@ unsafe extern "C" fn write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    TestObject::<Script>::in_callback((*context).object).attempt(
-        frame,
-        data.cast_mut(),
-        length,
-        false,
-        outcome,
-        error,
-    )
+    crate::test_callback::guard(|| {
+        TestObject::<Script>::in_callback((*context).object).attempt(
+            frame,
+            data.cast_mut(),
+            length,
+            false,
+            outcome,
+            error,
+        )
+    })
 }
 
 fn frame() -> DrStackFrameV2 {
@@ -498,13 +502,15 @@ struct ExactError {
 }
 
 unsafe extern "C" fn drop_error(frame: *const DrStackFrameV2, object: *mut u8) {
-    assert!(
-        frame.is_null(),
-        "owned terminal retained a stale call frame"
-    );
-    let error = Box::from_raw(object.cast::<ExactError>());
-    assert_eq!(error.identity, 0x1234);
-    (*error.drops).fetch_add(1, Ordering::SeqCst);
+    crate::test_callback::guard(|| {
+        assert!(
+            frame.is_null(),
+            "owned terminal retained a stale call frame"
+        );
+        let error = Box::from_raw(object.cast::<ExactError>());
+        assert_eq!(error.identity, 0x1234);
+        (*error.drops).fetch_add(1, Ordering::SeqCst);
+    })
 }
 
 const ERROR_DESCRIPTOR: DrInterfaceVtableV1 = DrInterfaceVtableV1 {

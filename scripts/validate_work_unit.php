@@ -191,6 +191,8 @@ function default_commands(string $root, string $target): array
         command(['php', 'scripts/check_build_artifact_policy.php'], $target),
         command(['php', 'scripts/test_rust_toolchain_authority.php'], $target),
         command(['php', 'scripts/check_rust_toolchain_authority.php'], $target),
+        command(['php', 'scripts/test_test_callback_guards.php'], $target),
+        command(['php', 'scripts/check_test_callback_guards.php'], $target),
         command(['php', 'scripts/check_docs_authority.php'], $target),
         command(['php', 'scripts/check_diagnostic_style.php'], $target),
         command(['php', 'scripts/check_panic_catalogue.php'], $target),

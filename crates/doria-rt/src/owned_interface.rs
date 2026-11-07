@@ -84,9 +84,11 @@ mod tests {
     fn zero_payload_preserves_one_cleanup_claim_across_transfer_and_drop() {
         static DROPS: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "C" fn release(frame: *const crate::DrStackFrameV2, payload: *mut u8) {
-            assert!(frame.is_null());
-            assert!(payload.is_null());
-            DROPS.fetch_add(1, Ordering::Relaxed);
+            crate::test_callback::guard(|| {
+                assert!(frame.is_null());
+                assert!(payload.is_null());
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            })
         }
         let descriptor = crate::DrInterfaceVtableV1 {
             type_name: b"Fixture\\Inline".as_ptr(),

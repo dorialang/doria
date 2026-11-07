@@ -43,8 +43,10 @@ impl Drop for Stream {
 }
 
 unsafe extern "C" fn drop_stream(frame: *const DrStackFrameV2, object: *mut u8) {
-    assert_eq!(frame, (*object.cast::<Stream>()).expected_drop_frame);
-    drop(Box::from_raw(object.cast::<Stream>()));
+    crate::test_callback::guard(|| {
+        assert_eq!(frame, (*object.cast::<Stream>()).expected_drop_frame);
+        drop(Box::from_raw(object.cast::<Stream>()));
+    })
 }
 
 fn descriptor() -> DrInterfaceVtableV1 {
@@ -79,25 +81,27 @@ unsafe extern "C" fn read(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *observed_stream(context);
-    stream.calls += 1;
-    let mut status = DrIoStatusV1::default();
-    let tag = dr_v1_file_read(
-        ptr::from_mut(&mut stream.file).cast(),
-        data,
-        length,
-        &mut status,
-    );
-    assert!(matches!(tag, 0 | 2));
-    *outcome = DrAdapterOutcomeV1 {
-        tag,
-        count: status.value as usize,
-        has_count: u8::from(tag == 0),
-    };
-    for byte in core::slice::from_raw_parts_mut(data, status.value as usize) {
-        *byte = byte.to_ascii_uppercase();
-    }
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *observed_stream(context);
+        stream.calls += 1;
+        let mut status = DrIoStatusV1::default();
+        let tag = dr_v1_file_read(
+            ptr::from_mut(&mut stream.file).cast(),
+            data,
+            length,
+            &mut status,
+        );
+        assert!(matches!(tag, 0 | 2));
+        *outcome = DrAdapterOutcomeV1 {
+            tag,
+            count: status.value as usize,
+            has_count: u8::from(tag == 0),
+        };
+        for byte in core::slice::from_raw_parts_mut(data, status.value as usize) {
+            *byte = byte.to_ascii_uppercase();
+        }
+        0
+    })
 }
 
 unsafe extern "C" fn prepare(
@@ -109,18 +113,20 @@ unsafe extern "C" fn prepare(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *observed_stream(context);
-    stream.calls += 1;
-    stream.pending = true;
-    // This fixture owns a raw OwnedFile, not a compiler File payload. Select
-    // its actual native owner without assuming the public FileObject layout.
-    dr_v1_pending_request_configure_native(
-        view,
-        ptr::from_mut(&mut stream.file).cast(),
-        data,
-        length,
-    );
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *observed_stream(context);
+        stream.calls += 1;
+        stream.pending = true;
+        // This fixture owns a raw OwnedFile, not a compiler File payload. Select
+        // its actual native owner without assuming the public FileObject layout.
+        dr_v1_pending_request_configure_native(
+            view,
+            ptr::from_mut(&mut stream.file).cast(),
+            data,
+            length,
+        );
+        0
+    })
 }
 
 unsafe extern "C" fn complete(
@@ -132,21 +138,23 @@ unsafe extern "C" fn complete(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    (*observed_stream(context)).pending = false;
-    let (tag, _, native, _, _) = pending_callback_facts(view);
-    if tag == 4 {
-        return 4;
-    }
-    assert!(matches!(tag, 0 | 2));
-    *outcome = DrAdapterOutcomeV1 {
-        tag,
-        count: (*native).value as usize,
-        has_count: u8::from(tag == 0),
-    };
-    for byte in core::slice::from_raw_parts_mut(data, (*native).value as usize) {
-        *byte = byte.to_ascii_uppercase();
-    }
-    0
+    crate::test_callback::guard(|| {
+        (*observed_stream(context)).pending = false;
+        let (tag, _, native, _, _) = pending_callback_facts(view);
+        if tag == 4 {
+            return 4;
+        }
+        assert!(matches!(tag, 0 | 2));
+        *outcome = DrAdapterOutcomeV1 {
+            tag,
+            count: (*native).value as usize,
+            has_count: u8::from(tag == 0),
+        };
+        for byte in core::slice::from_raw_parts_mut(data, (*native).value as usize) {
+            *byte = byte.to_ascii_uppercase();
+        }
+        0
+    })
 }
 
 struct Fixture {
@@ -323,13 +331,15 @@ unsafe extern "C" fn resolve_source(
     context_out: *mut DrAdapterContextV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = (*home).object.cast::<Stream>();
-    *source_out = source(&*home);
-    *context_out = DrAdapterContextV1 {
-        object: stream.cast(),
-        descriptor: (*stream).expected_descriptor,
-    };
-    0
+    crate::test_callback::guard(|| {
+        let stream = (*home).object.cast::<Stream>();
+        *source_out = source(&*home);
+        *context_out = DrAdapterContextV1 {
+            object: stream.cast(),
+            descriptor: (*stream).expected_descriptor,
+        };
+        0
+    })
 }
 
 unsafe fn remove(set: *mut c_void, key: &PlanKey, value: &mut DrInterfaceCarrierV1) -> u8 {
@@ -346,16 +356,18 @@ unsafe extern "C" fn prepare_buffered_write(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *observed_stream(context);
-    stream.calls += 1;
-    if length == stream.written.len() {
-        stream
-            .written
-            .copy_from_slice(core::slice::from_raw_parts(data, length));
-    }
-    stream.pending = true;
-    dr_v1_pending_request_complete(view, 0, length);
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *observed_stream(context);
+        stream.calls += 1;
+        if length == stream.written.len() {
+            stream
+                .written
+                .copy_from_slice(core::slice::from_raw_parts(data, length));
+        }
+        stream.pending = true;
+        dr_v1_pending_request_complete(view, 0, length);
+        0
+    })
 }
 
 unsafe extern "C" fn complete_buffered_write(
@@ -367,14 +379,16 @@ unsafe extern "C" fn complete_buffered_write(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    (*observed_stream(context)).pending = false;
-    let (tag, _, _, _, immediate) = pending_callback_facts(view);
-    if tag == 4 {
-        return 4;
-    }
-    assert!(!immediate.is_null());
-    *outcome = *immediate;
-    0
+    crate::test_callback::guard(|| {
+        (*observed_stream(context)).pending = false;
+        let (tag, _, _, _, immediate) = pending_callback_facts(view);
+        if tag == 4 {
+            return 4;
+        }
+        assert!(!immediate.is_null());
+        *outcome = *immediate;
+        0
+    })
 }
 
 unsafe extern "C" fn buffered_write(
@@ -385,18 +399,20 @@ unsafe extern "C" fn buffered_write(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let stream = &mut *observed_stream(context);
-    stream.calls += 1;
-    assert_eq!(length, stream.written.len());
-    stream
-        .written
-        .copy_from_slice(core::slice::from_raw_parts(data, length));
-    *outcome = DrAdapterOutcomeV1 {
-        tag: 0,
-        count: length,
-        has_count: 1,
-    };
-    0
+    crate::test_callback::guard(|| {
+        let stream = &mut *observed_stream(context);
+        stream.calls += 1;
+        assert_eq!(length, stream.written.len());
+        stream
+            .written
+            .copy_from_slice(core::slice::from_raw_parts(data, length));
+        *outcome = DrAdapterOutcomeV1 {
+            tag: 0,
+            count: length,
+            has_count: 1,
+        };
+        0
+    })
 }
 
 // Ordinary interface prefix followed by typed dispatch slots. The callback
@@ -422,9 +438,11 @@ macro_rules! erased_callback {
             outcome: *mut DrAdapterOutcomeV1,
             error: *mut DrInterfaceCarrierV1,
         ) -> u8 {
+ crate::test_callback::guard(|| {
             let table = &*(*context).descriptor.cast::<ErasedDispatchTable>();
             (table.$slot)(frame, context, $($argument,)+ outcome, error)
-        }
+        })
+}
     };
 }
 

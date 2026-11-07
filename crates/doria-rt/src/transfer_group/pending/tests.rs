@@ -60,8 +60,10 @@ struct ErrorPayload {
 }
 
 unsafe extern "C" fn drop_error(_: *const DrStackFrameV2, object: *mut u8) {
-    let payload = Box::from_raw(object.cast::<ErrorPayload>());
-    payload.drops.set(payload.drops.get() + 1);
+    crate::test_callback::guard(|| {
+        let payload = Box::from_raw(object.cast::<ErrorPayload>());
+        payload.drops.set(payload.drops.get() + 1);
+    })
 }
 
 fn error_descriptor() -> crate::DrInterfaceVtableV1 {
@@ -228,7 +230,9 @@ unsafe extern "C" fn prepare_read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    prepare_view(frame, context, view, caller, length, outcome, error)
+    crate::test_callback::guard(|| {
+        prepare_view(frame, context, view, caller, length, outcome, error)
+    })
 }
 
 unsafe fn prepare_view(
@@ -286,15 +290,17 @@ unsafe extern "C" fn prepare_write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    prepare_view(
-        frame,
-        context,
-        view,
-        caller.cast_mut(),
-        length,
-        outcome,
-        error,
-    )
+    crate::test_callback::guard(|| {
+        prepare_view(
+            frame,
+            context,
+            view,
+            caller.cast_mut(),
+            length,
+            outcome,
+            error,
+        )
+    })
 }
 
 struct CompleteCall {
@@ -400,19 +406,21 @@ unsafe extern "C" fn complete_read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
-    complete(CompleteCall {
-        frame,
-        context,
-        caller,
-        length,
-        tag,
-        submitted,
-        native,
-        selected,
-        immediate,
-        outcome,
-        error,
+    crate::test_callback::guard(|| {
+        let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
+        complete(CompleteCall {
+            frame,
+            context,
+            caller,
+            length,
+            tag,
+            submitted,
+            native,
+            selected,
+            immediate,
+            outcome,
+            error,
+        })
     })
 }
 
@@ -425,19 +433,21 @@ unsafe extern "C" fn complete_write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
-    complete(CompleteCall {
-        frame,
-        context,
-        caller: caller.cast_mut(),
-        length,
-        tag,
-        submitted,
-        native,
-        selected,
-        immediate,
-        outcome,
-        error,
+    crate::test_callback::guard(|| {
+        let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
+        complete(CompleteCall {
+            frame,
+            context,
+            caller: caller.cast_mut(),
+            length,
+            tag,
+            submitted,
+            native,
+            selected,
+            immediate,
+            outcome,
+            error,
+        })
     })
 }
 

@@ -198,42 +198,44 @@ unsafe extern "C" fn read(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = TestObject::<Metered>::in_callback((*context).object);
-    context.reads += 1;
-    context.pointer = data as usize;
-    context.frame = frame;
-    *outcome = DrAdapterOutcomeV1::default();
-    match context
-        .file
-        .read(core::slice::from_raw_parts_mut(data, length))
-    {
-        Ok(ReadProgress::Data(count)) => {
-            (*outcome).count = count;
-            (*outcome).has_count = 1;
-            for byte in core::slice::from_raw_parts_mut(data, count) {
-                *byte = byte.to_ascii_uppercase();
+    crate::test_callback::guard(|| {
+        let context = TestObject::<Metered>::in_callback((*context).object);
+        context.reads += 1;
+        context.pointer = data as usize;
+        context.frame = frame;
+        *outcome = DrAdapterOutcomeV1::default();
+        match context
+            .file
+            .read(core::slice::from_raw_parts_mut(data, length))
+        {
+            Ok(ReadProgress::Data(count)) => {
+                (*outcome).count = count;
+                (*outcome).has_count = 1;
+                for byte in core::slice::from_raw_parts_mut(data, count) {
+                    *byte = byte.to_ascii_uppercase();
+                }
+            }
+            Ok(ReadProgress::EndOfStream) => (*outcome).tag = 2,
+            Ok(ReadProgress::WouldBlock(_)) => (*outcome).tag = 1,
+            Err(failure) => {
+                // Fixture failures remain observable outside C, without unwinding
+                // through its callback ABI or turning an unexpected fault into pass.
+                context.native_failure = Some(failure);
+                (*outcome).tag = 3;
             }
         }
-        Ok(ReadProgress::EndOfStream) => (*outcome).tag = 2,
-        Ok(ReadProgress::WouldBlock(_)) => (*outcome).tag = 1,
-        Err(failure) => {
-            // Fixture failures remain observable outside C, without unwinding
-            // through its callback ABI or turning an unexpected fault into pass.
-            context.native_failure = Some(failure);
-            (*outcome).tag = 3;
+        if !context.cancel.is_null() {
+            let (mut reason, mut code, mut has_code) = (0, 0, 0);
+            let status = cancellation::dr_v1_cancellation_request(
+                context.cancel,
+                &mut reason,
+                &mut code,
+                &mut has_code,
+            );
+            context.cancel_failure = Some(status);
         }
-    }
-    if !context.cancel.is_null() {
-        let (mut reason, mut code, mut has_code) = (0, 0, 0);
-        let status = cancellation::dr_v1_cancellation_request(
-            context.cancel,
-            &mut reason,
-            &mut code,
-            &mut has_code,
-        );
-        context.cancel_failure = Some(status);
-    }
-    0
+        0
+    })
 }
 
 unsafe extern "C" fn write(
@@ -244,26 +246,28 @@ unsafe extern "C" fn write(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = TestObject::<Metered>::in_callback((*context).object);
-    context.writes += 1;
-    context.pointer = data as usize;
-    context.frame = frame;
-    *outcome = DrAdapterOutcomeV1::default();
-    match context
-        .file
-        .write(core::slice::from_raw_parts(data, length))
-    {
-        Ok(WriteProgress::Accepted(count)) => {
-            (*outcome).count = count;
-            (*outcome).has_count = 1;
+    crate::test_callback::guard(|| {
+        let context = TestObject::<Metered>::in_callback((*context).object);
+        context.writes += 1;
+        context.pointer = data as usize;
+        context.frame = frame;
+        *outcome = DrAdapterOutcomeV1::default();
+        match context
+            .file
+            .write(core::slice::from_raw_parts(data, length))
+        {
+            Ok(WriteProgress::Accepted(count)) => {
+                (*outcome).count = count;
+                (*outcome).has_count = 1;
+            }
+            Ok(WriteProgress::WouldBlock(_)) => (*outcome).tag = 1,
+            Err(failure) => {
+                context.native_failure = Some(failure);
+                (*outcome).tag = 1;
+            }
         }
-        Ok(WriteProgress::WouldBlock(_)) => (*outcome).tag = 1,
-        Err(failure) => {
-            context.native_failure = Some(failure);
-            (*outcome).tag = 1;
-        }
-    }
-    0
+        0
+    })
 }
 
 fn selection(indices: &[usize]) -> FixedSlice<usize> {

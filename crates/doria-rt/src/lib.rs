@@ -32,6 +32,8 @@ mod owned_interface;
 mod platform_io;
 mod process;
 mod string_ops;
+#[cfg(test)]
+mod test_callback;
 mod transfer_group;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_readiness;
@@ -4653,9 +4655,21 @@ use win32::GetEnvironmentVariableA;
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
 // memory operations, string scans, and floating-point use to these support symbols. The runtime
-// owns the small subset they require. Hosted Rust binaries link the CRT and disable this feature
-// through their dependency declaration so both providers can never define the same symbol.
-#[cfg(all(windows, feature = "standalone-windows-support"))]
+// owns the small subset they require, and only where the CRT is absent: the freestanding build,
+// `all(not(test), panic = "abort")`, the same condition that makes the crate `no_std`. Every other
+// build of this crate links `std` and therefore the CRT, whose definitions must win; that includes
+// the crate's own test harness, which has the feature on by default. Exporting the replacements
+// there overrode the CRT inside the test executable, and the `__CxxFrameHandler3` stub disabled
+// every `catch_unwind` on MSVC. Hosted Rust binaries that depend on the freestanding build link the
+// CRT too, and disable this feature through their dependency declaration so both providers can
+// never define the same symbol. In builds that link the CRT the functions below stay ordinary Rust
+// functions, so the harness can still test them.
+#[cfg(all(
+    windows,
+    feature = "standalone-windows-support",
+    not(test),
+    panic = "abort"
+))]
 #[no_mangle]
 pub static _fltused: i32 = 0;
 
@@ -4666,7 +4680,9 @@ pub static _fltused: i32 = 0;
     windows,
     target_env = "msvc",
     target_arch = "x86_64",
-    feature = "standalone-windows-support"
+    feature = "standalone-windows-support",
+    not(test),
+    panic = "abort"
 ))]
 core::arch::global_asm!(
     r#"
@@ -4701,7 +4717,7 @@ __chkstk:
 ///
 /// `source` and `destination` must be valid for `count` bytes and must not overlap.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memcpy(
     destination: *mut c_void,
     source: *const c_void,
@@ -4722,7 +4738,7 @@ pub unsafe extern "C" fn memcpy(
 ///
 /// `source` and `destination` must be valid for `count` bytes.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memmove(
     destination: *mut c_void,
     source: *const c_void,
@@ -4755,7 +4771,7 @@ pub unsafe extern "C" fn memmove(
 ///
 /// `left` and `right` must both be valid for reads of `count` bytes.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count: usize) -> i32 {
     let left = left.cast::<u8>();
     let right = right.cast::<u8>();
@@ -4775,7 +4791,7 @@ pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count
 ///
 /// `value` must point to a readable null-terminated byte string.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn strlen(value: *const core::ffi::c_char) -> usize {
     let mut length = 0;
     while ptr::read_volatile(value.add(length)) != 0 {
@@ -4790,7 +4806,7 @@ pub unsafe extern "C" fn strlen(value: *const core::ffi::c_char) -> usize {
 ///
 /// `value` must point to a readable null-terminated UTF-16 code-unit sequence.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn wcslen(value: *const u16) -> usize {
     let mut length = 0;
     // Prevent the optimizer from replacing this support implementation with itself.
@@ -4807,12 +4823,17 @@ pub unsafe extern "C" fn wcslen(value: *const u16) -> usize {
 /// deliberately links without the CRT. Returning `ExceptionContinueSearch` preserves the
 /// abort-only boundary if an unrelated structured exception reaches this metadata.
 ///
+/// MSVC Rust uses this handler as the personality of every `catch_unwind`, so a binary that
+/// can unwind must get the CRT's real one. That is why it is exported only from the
+/// freestanding build: in the test harness this stub made every caught panic abort the process.
+///
 /// # Safety
 ///
 /// This function may only be entered by the Windows exception dispatcher with its four native
 /// dispatcher pointers. Doria code must never call it directly.
 #[cfg(all(windows, target_env = "msvc", feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
+#[allow(non_snake_case)] // The MSVC ABI names this handler.
 pub unsafe extern "C" fn __CxxFrameHandler3(
     _exception_record: *mut c_void,
     _establisher_frame: *mut c_void,
@@ -4829,7 +4850,7 @@ pub unsafe extern "C" fn __CxxFrameHandler3(
 ///
 /// `destination` must be valid for writes of `count` bytes.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usize) -> *mut c_void {
     let destination_bytes = destination.cast::<u8>();
     for index in 0..count {
@@ -4859,23 +4880,27 @@ mod tests {
 
     #[test]
     fn argument_free_successful_entry_uses_no_runtime_allocations() {
-        unsafe extern "C" fn main_void(_frame: *const DrStackFrameV2) {}
+        unsafe extern "C" fn main_void(_frame: *const DrStackFrameV2) {
+            crate::test_callback::guard(|| {})
+        }
         unsafe extern "C" fn main_int(_frame: *const DrStackFrameV2) -> i64 {
-            7
+            crate::test_callback::guard(|| 7)
         }
         unsafe extern "C" fn checked_void(
             _frame: *const DrStackFrameV2,
             _error: *mut DrInterfaceCarrierV1,
         ) -> u8 {
-            0
+            crate::test_callback::guard(|| 0)
         }
         unsafe extern "C" fn checked_int(
             _frame: *const DrStackFrameV2,
             value: *mut i64,
             _error: *mut DrInterfaceCarrierV1,
         ) -> u8 {
-            *value = 7;
-            0
+            crate::test_callback::guard(|| {
+                *value = 7;
+                0
+            })
         }
         let (statuses, allocations) = probe_runtime_allocations(|| unsafe {
             [
@@ -4908,7 +4933,9 @@ mod tests {
             present: usize,
             value: i64,
         }
-        unsafe extern "C" fn unused_drop(_frame: *const DrStackFrameV2, _object: *mut u8) {}
+        unsafe extern "C" fn unused_drop(_frame: *const DrStackFrameV2, _object: *mut u8) {
+            crate::test_callback::guard(|| {})
+        }
         let mut value = Progress {
             present: 0,
             value: 2048,
@@ -5006,8 +5033,10 @@ mod tests {
         _current_frame: *const DrStackFrameV2,
         payload: *mut u8,
     ) {
-        SHARED_PAYLOAD_DROPS.set(SHARED_PAYLOAD_DROPS.get() + 1);
-        dr_v1_class_free(payload);
+        crate::test_callback::guard(|| {
+            SHARED_PAYLOAD_DROPS.set(SHARED_PAYLOAD_DROPS.get() + 1);
+            dr_v1_class_free(payload);
+        })
     }
 
     unsafe fn bytes(string: *const DrStringV1) -> &'static [u8] {
