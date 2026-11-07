@@ -45,9 +45,9 @@ fn assert_cancellation_execution(source: &str, expected: &str) {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.exit_status, 0);
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let artifact =
         doriac::compile_source("cancellation-source.doria", source, BackendTarget::Php).unwrap();
     assert!(matches!(
@@ -444,9 +444,9 @@ fn cancellation_error_preserves_owned_checked_transport_across_backends() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let artifact =
         doriac::compile_source("cancellation-error.doria", SOURCE, BackendTarget::Php).unwrap();
     assert!(!matches!(

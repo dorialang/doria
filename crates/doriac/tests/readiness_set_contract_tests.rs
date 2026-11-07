@@ -317,9 +317,9 @@ function main(): void {{}}
         );
         let program = doriac::lower_source_to_mir("unissued-readiness-key.doria", &source).unwrap();
         doriac::mir_validation::validate_program(&program).unwrap();
-        native_execution::assert_native_execution(&program, NativeProfile::Fast, "");
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(&program, NativeProfile::Release, "");
+        for &profile in NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, "");
+        }
         doriac::compile_source("unissued-readiness-key.doria", &source, BackendTarget::Php)
             .unwrap();
     }
@@ -776,9 +776,9 @@ fn construction_and_owned_cleanup_preserve_backend_parity() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 
     let artifact = doriac::compile_source(
         "readiness-set-construction.doria",

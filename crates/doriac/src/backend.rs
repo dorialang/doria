@@ -163,6 +163,25 @@ pub enum NativeProfile {
 }
 
 impl NativeProfile {
+    /// Every native profile this doriac build compiles, in a fixed order.
+    /// `Release` lowers through LLVM, which exists only with the
+    /// `llvm-backend` feature; without it `codegen_native` rejects the
+    /// profile with a rebuild hint. Code that runs a program on each native
+    /// profile iterates this list instead of re-deriving the feature itself.
+    pub const AVAILABLE: &'static [Self] = &[
+        Self::Fast,
+        #[cfg(feature = "llvm-backend")]
+        Self::Release,
+    ];
+
+    /// Whether this doriac build compiles `self`; agrees with [`Self::AVAILABLE`].
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::Fast => true,
+            Self::Release => cfg!(feature = "llvm-backend"),
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Fast => "fast",

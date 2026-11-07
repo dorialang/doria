@@ -140,9 +140,9 @@ function main(): void {{
     assert_eq!(result.stdout, expected.as_bytes());
     assert!(result.stderr.is_empty());
     assert_eq!(result.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(&source, expected);
 
     let concrete = program
@@ -296,9 +296,9 @@ function main(): void {{
         observed.trace.file_opens,
         observed.trace.file_close_attempts
     );
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(&source, expected);
 }
 
@@ -392,9 +392,9 @@ function main(): void throws CancellationError {{
         observed.trace.file_opens,
         observed.trace.file_close_attempts
     );
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(&source, expected);
     assert_eq!(
         std::fs::read(directory.path().join("conditional-output")).unwrap(),
@@ -493,9 +493,9 @@ function main(): void {{
         observed.trace.file_opens,
         observed.trace.file_close_attempts
     );
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(&source, expected);
     for (name, contents) in [("conditional-first", b"c"), ("conditional-second", b"d")] {
         assert_eq!(
@@ -516,9 +516,9 @@ fn finish_outcomes_specialize_ownership_cleanup_and_copy_per_application() {
     assert_eq!(result.stdout, expected.as_bytes());
     assert!(result.stderr.is_empty());
     assert_eq!(result.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(FINISH_OUTCOMES, expected);
 
     // One specialization per application; Copy only when every payload is Copy.
@@ -566,9 +566,9 @@ fn assert_every_backend(source: &str, expected: &str) {
     assert_eq!(result.stdout, expected.as_bytes());
     assert!(result.stderr.is_empty());
     assert_eq!(result.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 }
 
@@ -1132,10 +1132,7 @@ function main(): void {
     assert_cranelift_functions_do_not_allocate(&program, &["copyRegularFile"]);
     #[cfg(feature = "llvm-backend")]
     assert_llvm_functions_do_not_allocate(&program, &["copyRegularFile"]);
-    for profile in [NativeProfile::Fast, NativeProfile::Release] {
-        if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
-            continue;
-        }
+    for &profile in NativeProfile::AVAILABLE {
         let directory = native_execution::ExecutionDirectory::new();
         std::fs::write(directory.path().join("input.bin"), &input).unwrap();
         let result =
@@ -1177,9 +1174,9 @@ fn file_resize_executes_with_zero_growth_independent_cursors_and_append_semantic
     assert!(interpreted.output.stderr.is_empty());
     assert_eq!(interpreted.files["resize.bin"], b"abX\n");
     assert_eq!(interpreted.trace.file_close_attempts, 3);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(source, expected);
     assert_eq!(
         std::fs::read(directory.path().join("resize.bin")).unwrap(),
@@ -1356,9 +1353,9 @@ fn file_synchronization_executes_with_void_results_and_preserves_file_state() {
     assert!(interpreted.output.stderr.is_empty());
     assert_eq!(interpreted.files["synchronize.bin"], b"abcZ\n");
     assert_eq!(interpreted.trace.file_close_attempts, 2);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(source, expected);
     assert_eq!(
         std::fs::read(directory.path().join("synchronize.bin")).unwrap(),
@@ -1579,10 +1576,7 @@ fn seek_and_readonly_inspection_execute_across_profiles_with_original_errors() {
     assert!(interpreted.output.stderr.is_empty());
     assert_eq!(interpreted.files["seek.bin"], b"abcdef\0\0Z!");
     assert_eq!(interpreted.trace.file_close_attempts, 3);
-    for profile in [NativeProfile::Fast, NativeProfile::Release] {
-        if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
-            continue;
-        }
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&program, profile, expected);
     }
     let directory = assert_php_execution(source, expected);
@@ -1635,9 +1629,9 @@ function main(): void {
     assert!(interpreted.output.stderr.is_empty());
     assert_eq!(interpreted.files["fresh.bin"], b"abcd");
     assert_eq!(interpreted.trace.file_close_attempts, 2);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(source, expected);
     assert_eq!(
         std::fs::read(directory.path().join("fresh.bin")).unwrap(),
@@ -1820,9 +1814,9 @@ function main(): void {
     assert_eq!(result.stdout, expected.as_bytes());
     assert!(result.stderr.is_empty());
     assert_eq!(result.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 }
 
@@ -1838,9 +1832,9 @@ fn readiness_sources_forward_ordinary_loans_without_adapter_bypass_or_extra_owne
     assert_eq!(result.trace.file_reads, 2);
     assert_eq!(result.trace.file_close_attempts, 2);
     assert_eq!(result.files["ready.txt"], b"abc\n");
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(READINESS_SOURCE, expected);
     let getters = program
         .functions
@@ -1992,9 +1986,9 @@ fn owned_writable_files_preserve_cursors_append_and_erased_dispatch() {
     assert_eq!(result.trace.file_reads, 6);
     assert_eq!(result.trace.file_writes, 6);
     assert_eq!(result.trace.file_close_attempts, 6);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_cranelift_functions_do_not_allocate(&program, &["writeErased"]);
     #[cfg(feature = "llvm-backend")]
     assert_llvm_functions_do_not_allocate(&program, &["writeErased"]);
@@ -2088,9 +2082,9 @@ catch (IoError) {{ echo "absent\n"; }}
     assert_eq!(result.trace.file_opens, opens);
     assert_eq!(result.trace.file_writes, opens);
     assert_eq!(result.trace.file_close_attempts, opens);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, &expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, &expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, &expected);
+    }
     let php = assert_php_execution(&source, &expected);
     for (path, contents) in files {
         assert_eq!(std::fs::read(php.path().join(path)).unwrap(), contents);
@@ -2261,9 +2255,9 @@ function main(): void {
     assert_eq!(result.output.exit_status, 0);
     assert_eq!(result.trace.file_opens, 1);
     assert_eq!(result.trace.file_close_attempts, 1);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 }
 
@@ -2439,9 +2433,9 @@ fn owned_readable_files_reuse_regions_and_ordinary_checked_calls() {
     assert_eq!(interpreted.trace.file_opens, 2);
     assert_eq!(interpreted.trace.file_reads, 4);
     assert_eq!(interpreted.trace.file_close_attempts, 2);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(source, expected);
     assert_eq!(
         std::fs::read(directory.path().join("stream-read.txt")).unwrap(),
@@ -2461,9 +2455,9 @@ fn nullable_files_and_owning_containers_preserve_one_close_obligation() {
     assert_eq!(interpreted.output.exit_status, 0);
     assert_eq!(interpreted.trace.file_opens, 4);
     assert_eq!(interpreted.trace.file_close_attempts, 4);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let directory = assert_php_execution(source, expected);
     assert_eq!(
         std::fs::read(directory.path().join("stream-owned.txt")).unwrap(),
@@ -2759,9 +2753,9 @@ fn readiness_errors_extend_the_existing_family_without_changing_prior_tags() {
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 
     let exhaustive = include_str!("../../../examples/native/main_stream_close_error.doria");
@@ -2882,9 +2876,9 @@ function main(): void {
         assert_eq!(interpreted.stdout, expected.as_bytes());
         assert!(interpreted.stderr.is_empty());
         assert_eq!(interpreted.exit_status, 0);
-        native_execution::assert_native_execution(&program, NativeProfile::Fast, &expected);
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(&program, NativeProfile::Release, &expected);
+        for &profile in NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, &expected);
+        }
         assert_php_execution(&fixture, &expected);
     }
     let missing = source
@@ -2938,9 +2932,9 @@ function main(): void {
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 
     let exhaustive_target = r#"
@@ -3012,9 +3006,9 @@ fn close_reuses_canonical_io_error_and_preserves_existing_operation_tags() {
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 
     let source = source.replace("        IoOperation::Close => \"close\",", "");
@@ -3062,9 +3056,9 @@ fn file_creation_choices_use_ordinary_namespaced_copy_enum_contracts() {
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 
     assert!(doriac::check_source(
@@ -3184,9 +3178,9 @@ fn concrete_and_erased_streams_reuse_regions_and_preserve_every_outcome() {
     assert_eq!(interpreted.stdout, EXPECTED.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, EXPECTED);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, EXPECTED);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, EXPECTED);
+    }
     assert_php_execution(SOURCE, EXPECTED);
     assert_cranelift_functions_do_not_allocate(&program, &["forwardRead", "forwardWrite"]);
     #[cfg(feature = "llvm-backend")]
@@ -3288,9 +3282,9 @@ function main(): void {
     for path in ["concrete.bin", "erased.bin"] {
         assert_eq!(interpreted.files[path], [65, 0, 255, 10].repeat(32));
     }
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 
     let concrete = program
@@ -3365,9 +3359,9 @@ fn caller_owned_offset_preserves_partial_writes_and_retries_without_copying_suff
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_cranelift_functions_do_not_allocate(&program, &["writeNextPart"]);
     #[cfg(feature = "llvm-backend")]
     assert_llvm_functions_do_not_allocate(&program, &["writeNextPart"]);
@@ -3385,9 +3379,9 @@ fn owned_registration_transfers_returns_and_drops_erased_streams_once() {
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 }
 
@@ -3405,9 +3399,9 @@ fn typed_registration_returns_complete_file_owners_and_cleans_up_rejected_values
     assert_eq!(result.trace.file_opens, 5);
     assert_eq!(result.trace.file_reads, 3);
     assert_eq!(result.trace.file_close_attempts, 5);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     // This ordinary generic control is not the public native-backed readiness set.
     let diagnostics = doriac::compile_source_to_php("typed-registration.doria", source)
         .expect_err("PHP retains its array-backed Dictionary method boundary");
@@ -3431,9 +3425,9 @@ fn readiness_access_borrows_original_concrete_and_erased_streams() {
     assert_eq!(result.trace.file_opens, 2);
     assert_eq!(result.trace.file_reads, 3);
     assert_eq!(result.trace.file_close_attempts, 2);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 }
 
@@ -3504,9 +3498,9 @@ fn owned_stream_temporaries_preserve_exclusive_access_and_statement_cleanup() {
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(source, expected);
 }
 
@@ -3585,9 +3579,9 @@ function main(): void {{
         assert_eq!(interpreted.stdout, b"7", "{ty}");
         assert!(interpreted.stderr.is_empty(), "{ty}");
         assert_eq!(interpreted.exit_status, 0, "{ty}");
-        native_execution::assert_native_execution(&program, NativeProfile::Fast, "7");
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(&program, NativeProfile::Release, "7");
+        for &profile in NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, "7");
+        }
 
         for readonly in [
             source.replace("internal writable", "internal"),
@@ -3657,9 +3651,9 @@ function main(): void {{
             assert_eq!(interpreted.stdout, b"7", "{call}");
             assert!(interpreted.stderr.is_empty(), "{call}");
             assert_eq!(interpreted.exit_status, 0, "{call}");
-            native_execution::assert_native_execution(&program, NativeProfile::Fast, "7");
-            #[cfg(feature = "llvm-backend")]
-            native_execution::assert_native_execution(&program, NativeProfile::Release, "7");
+            for &profile in NativeProfile::AVAILABLE {
+                native_execution::assert_native_execution(&program, profile, "7");
+            }
 
             for readonly in [
             source.replace("internal writable", "internal"),

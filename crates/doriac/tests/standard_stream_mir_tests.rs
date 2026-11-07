@@ -198,10 +198,7 @@ fn assert_standard_parity(program: &mir::Program, input: &[u8], stdout: &[u8], s
     assert_eq!(result.output.exit_status, 0, "{result:?}");
     assert_eq!(result.output.stdout, stdout, "{result:?}");
     assert_eq!(result.output.stderr, stderr, "{result:?}");
-    for profile in [NativeProfile::Fast, NativeProfile::Release] {
-        if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
-            continue;
-        }
+    for &profile in NativeProfile::AVAILABLE {
         let result = native_execution::execute_native_with_input(program, profile, Some(input));
         assert_eq!(result.status.code(), Some(0), "{profile:?}: {result:?}");
         assert_eq!(result.stdout, stdout, "{profile:?}: {result:?}");
@@ -1476,10 +1473,7 @@ fn standard_transfers_share_intrinsic_cursor_and_preserve_binary_eof_empty_and_r
         assert_eq!(interpreted.output.exit_status, 0, "{interpreted:?}");
         assert_eq!(interpreted.output.stdout, expected_stdout);
         assert_eq!(interpreted.output.stderr, expected_stderr);
-        for profile in [NativeProfile::Fast, NativeProfile::Release] {
-            if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
-                continue;
-            }
+        for &profile in NativeProfile::AVAILABLE {
             let output = native_execution::execute_native_with_input(
                 &program,
                 profile,

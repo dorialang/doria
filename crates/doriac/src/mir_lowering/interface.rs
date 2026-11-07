@@ -1263,11 +1263,7 @@ mod tests {
             fs,
             process::{Command, Stdio},
         };
-        #[cfg(not(feature = "llvm-backend"))]
-        let profiles = [NativeProfile::Fast];
-        #[cfg(feature = "llvm-backend")]
-        let profiles = [NativeProfile::Fast, NativeProfile::Release];
-        for profile in profiles {
+        for &profile in NativeProfile::AVAILABLE {
             let bytes = crate::codegen_native::generate_executable(program, profile).unwrap();
             let directory = test_directory();
             let executable = directory.join(if cfg!(windows) {

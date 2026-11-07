@@ -23,17 +23,6 @@ fn lower(source: &str) -> doriac::mir::Program {
     })
 }
 
-fn profiles() -> Vec<NativeProfile> {
-    #[cfg(feature = "llvm-backend")]
-    {
-        vec![NativeProfile::Fast, NativeProfile::Release]
-    }
-    #[cfg(not(feature = "llvm-backend"))]
-    {
-        vec![NativeProfile::Fast]
-    }
-}
-
 #[test]
 fn nullable_region_callback_replacements_keep_original_slots() {
     for (declaration, access, observation) in [
@@ -174,7 +163,7 @@ fn executes(body: &str, stdout: &str) {
     assert_eq!(output.stdout, stdout.as_bytes(), "{source}");
     assert_eq!(output.stderr, b"", "{source}");
     assert_eq!(output.exit_status, 0);
-    for profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&mir, profile, stdout);
     }
     if let Some(output) = php(&source) {
@@ -638,7 +627,7 @@ function main(): void {
     assert_eq!(output.stdout, b"true:false;false:true;");
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    for profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&mir, profile, "true:false;false:true;");
     }
     let errors = doriac::compile_source_to_php(PATH, &source).unwrap_err();
@@ -1023,7 +1012,7 @@ function main(): void {{
             assert_eq!(fact.name, name);
             assert_eq!(fact.value, value);
         }
-        for profile in profiles() {
+        for &profile in NativeProfile::AVAILABLE {
             let native = native_execution::execute_native(&mir, profile);
             assert_eq!(native.status.code(), Some(101));
             assert_eq!(native.stdout, output.stdout);
@@ -1063,7 +1052,7 @@ function main(): void {
     let output = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert_eq!(output.stdout, expected.as_bytes(), "{source}");
     assert_eq!(output.exit_status, 0);
-    for profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&mir, profile, expected);
     }
     // PHP has no string intrinsic properties yet, exactly as for `bytes`.

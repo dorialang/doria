@@ -267,9 +267,9 @@ fn native_group_setup_and_cleanup_preserve_the_original_file_and_buffer() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.exit_status, 0);
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]
@@ -305,9 +305,9 @@ fn native_failed_setup_uses_configure_group_and_releases_all_loans() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.exit_status, 0);
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]
@@ -919,9 +919,9 @@ fn native_group_setup_preserves_an_adapters_original_checked_error() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.exit_status, 0);
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]
@@ -1001,9 +1001,9 @@ fn assert_group_parity(source: String, expected: &str) {
         observed.trace.file_opens,
         observed.trace.file_close_attempts
     );
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     assert_php_execution(&source, expected);
 }
 
@@ -1029,17 +1029,9 @@ function main(): void {
     let program = doriac::lower_source_to_mir("nullable-copy-result.doria", source).unwrap();
     let output = doriac::mir_interpreter::interpret(&program).unwrap();
     assert_eq!(output.stdout, b"nullable result cleared\n");
-    native_execution::assert_native_execution(
-        &program,
-        NativeProfile::Fast,
-        "nullable result cleared\n",
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        NativeProfile::Release,
-        "nullable result cleared\n",
-    );
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, "nullable result cleared\n");
+    }
     let mut forged = program.clone();
     let function = forged
         .functions

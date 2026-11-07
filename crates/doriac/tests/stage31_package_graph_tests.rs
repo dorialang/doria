@@ -230,11 +230,7 @@ function relay(int $depth): void {
     assert_eq!(output.status.code(), Some(101), "{output:?}");
     assert_eq!(output.stdout, expected.stdout);
     assert_eq!(output.stderr, expected.stderr);
-    let mut profiles = vec![doriac::backend::NativeProfile::Fast];
-    if cfg!(feature = "llvm-backend") {
-        profiles.push(doriac::backend::NativeProfile::Release);
-    }
-    for profile in profiles {
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
         let output = panic_native_execution::execute_native(&mir, profile);
         assert_eq!(output.status.code(), Some(101), "{profile:?}: {output:?}");
         assert_eq!(output.stdout, expected.stdout, "{profile:?}");
@@ -1706,21 +1702,18 @@ fn multi_source_graph_emits_through_all_enabled_backends_without_runtime_include
     );
     let graph = load_compilation_graph(&document, &provider).expect("valid graph");
 
-    let native = doriac::compile_compilation_graph(&graph).expect("Cranelift graph emission");
-    assert!(matches!(
-        native,
-        doriac::backend::BackendOutput::Executable { .. }
-    ));
-
-    #[cfg(feature = "llvm-backend")]
-    {
-        let mut llvm_graph = graph.clone();
-        llvm_graph.build_plan.compiler.native_profile = Some(BuildNativeProfile::Release);
-        let llvm = doriac::compile_compilation_graph(&llvm_graph).expect("LLVM graph emission");
-        assert!(matches!(
-            llvm,
-            doriac::backend::BackendOutput::Executable { .. }
-        ));
+    for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+        if !profile.native().is_available() {
+            continue;
+        }
+        let mut profile_graph = graph.clone();
+        profile_graph.build_plan.compiler.native_profile = Some(profile);
+        let native = doriac::compile_compilation_graph(&profile_graph)
+            .unwrap_or_else(|error| panic!("{profile:?} graph emission: {error:?}"));
+        assert!(
+            matches!(native, doriac::backend::BackendOutput::Executable { .. }),
+            "{profile:?}"
+        );
     }
 
     let mut php_graph = graph;

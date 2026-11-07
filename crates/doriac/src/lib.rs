@@ -633,11 +633,8 @@ pub(crate) fn compilation_graph_options(
     ) {
         (build_plan::CompilerTarget::Debug, _) => CompileOptions::new(BackendTarget::Debug),
         (build_plan::CompilerTarget::Php, _) => CompileOptions::new(BackendTarget::Php),
-        (build_plan::CompilerTarget::Native, Some(build_plan::BuildNativeProfile::Fast)) => {
-            CompileOptions::native(backend::NativeProfile::Fast)
-        }
-        (build_plan::CompilerTarget::Native, Some(build_plan::BuildNativeProfile::Release)) => {
-            CompileOptions::native(backend::NativeProfile::Release)
+        (build_plan::CompilerTarget::Native, Some(profile)) => {
+            CompileOptions::native(profile.native())
         }
         (build_plan::CompilerTarget::Native, None) => {
             unreachable!("validated native plan has a profile")

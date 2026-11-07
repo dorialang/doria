@@ -32,14 +32,7 @@ fn assert_mir_execution(mir: &doriac::mir::Program, stdout: &str) {
         .unwrap_or_else(|error| panic!("LLVM: {error:?}\n{mir}"))
         .is_empty());
 
-    #[cfg(not(feature = "llvm-backend"))]
-    let profiles = [doriac::backend::NativeProfile::Fast];
-    #[cfg(feature = "llvm-backend")]
-    let profiles = [
-        doriac::backend::NativeProfile::Fast,
-        doriac::backend::NativeProfile::Release,
-    ];
-    for profile in profiles {
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(mir, profile, stdout);
     }
 }

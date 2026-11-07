@@ -19,17 +19,6 @@ const NEGATIVE_PATH: &str = "examples/native/main_bytes_allocate_negative.doria"
 const NEGATIVE: &str = include_str!("../../../examples/native/main_bytes_allocate_negative.doria");
 const SIMPLE: &str = "function main(): void { let $bytes = Bytes::allocate(4); }";
 
-fn profiles() -> Vec<NativeProfile> {
-    #[cfg(feature = "llvm-backend")]
-    {
-        vec![NativeProfile::Fast, NativeProfile::Release]
-    }
-    #[cfg(not(feature = "llvm-backend"))]
-    {
-        vec![NativeProfile::Fast]
-    }
-}
-
 fn lower(path: &str, source: &str) -> doriac::mir::Program {
     doriac::lower_source_to_mir(path, source)
         .unwrap_or_else(|diagnostics| panic!("{source}\n{diagnostics:#?}"))
@@ -42,7 +31,7 @@ fn assert_execution(source: &str, stdout: &str) {
     assert_eq!(output.stderr, b"");
     assert_eq!(output.exit_status, 0);
     assert!(output.runtime_diagnostic.is_none());
-    for profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&mir, profile, stdout);
     }
     let Some(output) = execute_php(
@@ -218,7 +207,7 @@ fn negative_length_is_a_signed_catalogued_panic_and_runs_no_cleanup() {
         ),
         "{facts:?}"
     );
-    for profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         let native = native_execution::execute_native(&mir, profile);
         assert_eq!(native.status.code(), Some(101), "{profile:?}: {native:?}");
         assert_eq!(
@@ -247,7 +236,7 @@ function main(): void { let $bytes = Bytes::allocate(requested()); }
     let start = source.rfind("requested()").unwrap();
     assert_eq!(diagnostic.span.start, start);
     assert_eq!(diagnostic.span.end, start + "requested()".len());
-    for profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         let native = native_execution::execute_native(&mir, profile);
         assert_eq!(native.status.code(), Some(101), "{profile:?}: {native:?}");
         assert_eq!(native.stdout, output.stdout);
@@ -564,7 +553,7 @@ function main(): void {{
             doria_diagnostic_catalogue::INDEXED_LENGTH_FACT
         );
         assert_eq!(facts[1].value, RuntimeFactValue::Unsigned(2));
-        for profile in profiles() {
+        for &profile in NativeProfile::AVAILABLE {
             let native = native_execution::execute_native(&mir, profile);
             assert_eq!(native.status.code(), Some(101), "{profile:?}: {native:?}");
             assert_eq!(native.stdout, output.stdout);

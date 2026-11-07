@@ -33,17 +33,9 @@ fn assert_php_dispatch_output(
 
 fn assert_native_dispatch_output(program: &hir::Program, expected: &str) {
     let native = crate::mir_lowering::lower_program(program).unwrap();
-    crate::native_execution::assert_native_execution(
-        &native,
-        crate::backend::NativeProfile::Fast,
-        expected,
-    );
-    #[cfg(feature = "llvm-backend")]
-    crate::native_execution::assert_native_execution(
-        &native,
-        crate::backend::NativeProfile::Release,
-        expected,
-    );
+    for &profile in crate::backend::NativeProfile::AVAILABLE {
+        crate::native_execution::assert_native_execution(&native, profile, expected);
+    }
 }
 
 fn checked_hir(text: &str) -> hir::Program {

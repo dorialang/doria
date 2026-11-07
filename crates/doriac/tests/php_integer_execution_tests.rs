@@ -48,9 +48,9 @@ fn assert_native_parity(source: &str, expected: &str) {
     let interpreted = doriac::mir_interpreter::interpret(&program).unwrap();
     assert_eq!(interpreted.exit_status, 0);
     assert_eq!(interpreted.stdout, expected.as_bytes());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]

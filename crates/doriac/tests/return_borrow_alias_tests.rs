@@ -541,17 +541,9 @@ fn assert_borrow_execution(source: &str, expected: &str) {
     assert_eq!(output.exit_status, 0);
     assert_eq!(output.stderr, b"");
     assert_eq!(output.stdout, expected.as_bytes(), "{source}");
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Fast,
-        expected,
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Release,
-        expected,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let php = doriac::codegen_php::generate(&hir, Some(&program)).unwrap();
     let script = format!(
         "{}\n__DoriaFunction_6d61696e();",

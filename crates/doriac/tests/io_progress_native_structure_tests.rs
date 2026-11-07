@@ -252,17 +252,6 @@ fn llvm_error_progress_metadata_preserves_all_interface_headers() {
     assert!(ir.contains("checked.io.transferred-count"));
 }
 
-fn profiles() -> &'static [NativeProfile] {
-    #[cfg(feature = "llvm-backend")]
-    {
-        &[NativeProfile::Fast, NativeProfile::Release]
-    }
-    #[cfg(not(feature = "llvm-backend"))]
-    {
-        &[NativeProfile::Fast]
-    }
-}
-
 struct NativeProgram {
     directory: PathBuf,
     executable: PathBuf,
@@ -424,7 +413,7 @@ fn native_escaping_io_errors_preserve_optional_signed_progress_and_v3_compatibil
         let source =
             escaping_io_source(&count.map_or_else(|| "null".to_owned(), |value| value.to_string()));
         let program = doriac::lower_source_to_mir("io-progress-escape.doria", &source).unwrap();
-        for &profile in profiles() {
+        for &profile in NativeProfile::AVAILABLE {
             let native = NativeProgram::new(&program, profile);
             let result = native.run(Some("v3"), None, Some("v5"));
             assert_eq!(result.status.code(), Some(70), "{profile:?}: {result:?}");
@@ -461,7 +450,7 @@ fn native_failed_progress_publication_keeps_human_facts_and_does_not_fall_back_t
         let source =
             escaping_io_source(&count.map_or_else(|| "null".to_owned(), |value| value.to_string()));
         let program = doriac::lower_source_to_mir("io-progress-fallback.doria", &source).unwrap();
-        for &profile in profiles() {
+        for &profile in NativeProfile::AVAILABLE {
             let native = NativeProgram::new(&program, profile);
             let result = native.run(Some("v3"), None, Some("missing/v5"));
             assert_eq!(result.status.code(), Some(70), "{profile:?}: {result:?}");
@@ -497,7 +486,7 @@ class Failure implements Error {
 function main(): void { throw new Failure("user failed", 2048); }
 "#;
     let program = doriac::lower_source_to_mir("non-io-progress.doria", source).unwrap();
-    for &profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         let native = NativeProgram::new(&program, profile);
         let result = native.run(None, None, Some("v5"));
         assert_eq!(result.status.code(), Some(70), "{profile:?}: {result:?}");
@@ -519,7 +508,7 @@ use Doria\Std\Test\fail;
 function main(): void { fail("assertion failed"); }
 "#,
     );
-    for &profile in profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         let native = NativeProgram::new(&program, profile);
         let result = native.run(Some("v3"), Some("v4"), Some("v5"));
         assert_eq!(result.status.code(), Some(70), "{profile:?}: {result:?}");

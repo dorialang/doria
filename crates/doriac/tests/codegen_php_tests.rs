@@ -71,10 +71,7 @@ fn copy_parameter_values_and_writable_callback_borrows_match_native() {
         assert_eq!(expected.exit_status, 0);
         assert!(expected.stderr.is_empty());
         assert_php_artifact_main(name, source, stdout);
-        for profile in [NativeProfile::Fast]
-            .into_iter()
-            .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-        {
+        for &profile in NativeProfile::AVAILABLE {
             let actual = native_execution::execute_native(&mir, profile);
             assert_eq!(
                 actual.status.code(),
@@ -99,10 +96,7 @@ fn once_callable_argument_failure_releases_owned_environment_before_catch() {
     assert_eq!(interpreted.exit_status, 0);
     assert!(interpreted.stderr.is_empty());
     let mut observations = vec![("interpreter".to_string(), interpreted.stdout)];
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let actual = native_execution::execute_native(&mir, profile);
         assert_eq!(actual.status.code(), Some(0), "{actual:?}");
         assert!(actual.stderr.is_empty(), "{actual:?}");
@@ -126,10 +120,7 @@ fn pending_once_calls_release_operands_before_catch_and_transfer_only_at_invocat
     assert_eq!(interpreted.exit_status, 0);
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.stdout, stdout);
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let actual = native_execution::execute_native(&mir, profile);
         assert_eq!(actual.status.code(), Some(0), "{profile:?}: {actual:?}");
         assert!(actual.stderr.is_empty(), "{profile:?}: {actual:?}");
@@ -164,10 +155,7 @@ fn managed_copy_parameter_replacement_matches_native() {
     let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert!(expected.runtime_diagnostic.is_none(), "{expected:?}");
     assert_eq!(expected.stdout, stdout);
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let actual = native_execution::execute_native(&mir, profile);
         assert_eq!(
             actual.status.code(),
@@ -239,10 +227,7 @@ function main(): void { exercise(); echo State::log; }
         let php = doriac::compile_source_to_php("empty-constructors.doria", &source).unwrap();
         assert!(!php_function_body(&php, "exercise").contains("->fromSource("));
         assert_php_main_execution(&php, &expected.stdout, expected.exit_status);
-        for profile in [NativeProfile::Fast]
-            .into_iter()
-            .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-        {
+        for &profile in NativeProfile::AVAILABLE {
             let output = native_execution::execute_native(&mir, profile);
             assert_eq!(
                 output.status.code(),
@@ -330,10 +315,7 @@ function main(): void { exercise(); echo "|"; echo State::log; echo "\n"; }
     assert!(php_function_body(&php, "iterate").contains("unset($__doria_receiver_home_"));
     assert!(!php.contains("__doria_drop_value($__doria_receiver_home_"));
     assert_php_main_execution(&php, &expected.stdout, expected.exit_status);
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let output = native_execution::execute_native(&mir, profile);
         assert_eq!(
             output.status.code(),
@@ -400,10 +382,7 @@ function main(): void {
     assert!(expected.stderr.is_empty());
     let php = doriac::compile_source_to_php("foreach-properties.doria", source).unwrap();
     assert_php_main_execution(&php, &expected.stdout, expected.exit_status);
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let output = native_execution::execute_native(&mir, profile);
         assert_eq!(
             output.status.code(),
@@ -2320,10 +2299,7 @@ fn php_backend_normalizes_defaulted_cell_parameters_without_leaking_transport() 
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(run.stdout, expected.stdout);
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let actual = native_execution::execute_native(&mir, profile);
         assert_eq!(
             actual.status.code(),
@@ -5307,10 +5283,7 @@ function main(): void {
     }
     let expected = b"42:42:7:true:1:0:dropKey1:done";
     let mir = assert_initializer_php_parity(path, source, &php, expected);
-    for profile in [NativeProfile::Fast]
-        .into_iter()
-        .chain(cfg!(feature = "llvm-backend").then_some(NativeProfile::Release))
-    {
+    for &profile in NativeProfile::AVAILABLE {
         let output = native_execution::execute_native(&mir, profile);
         assert_eq!(output.status.code(), Some(0), "{profile:?}: {output:?}");
         assert_eq!(output.stdout, expected, "{profile:?}: {output:?}");

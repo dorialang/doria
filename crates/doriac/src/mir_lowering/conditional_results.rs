@@ -7,9 +7,9 @@ fn assert_native_output(source: &str, expected: &str) {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(output.exit_status, 0);
     assert!(output.runtime_diagnostic.is_none(), "{output:?}");
-    crate::native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    crate::native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        crate::native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]

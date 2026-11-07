@@ -463,9 +463,9 @@ fn assert_backend_parity(name: &str, source: &str, expected: &str) {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.exit_status, 0);
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let artifact = doriac::compile_source(name, source, BackendTarget::Php).unwrap();
     let directory = native_execution::ExecutionDirectory::new();
     let path = directory.path().join("key.php");
@@ -686,9 +686,9 @@ function stored(): ?RegistrationKey<ReadableFile> {
         doriac::mir_interpreter::interpret(&program).unwrap().stdout,
         expected_stdout.as_bytes()
     );
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected_stdout);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected_stdout);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected_stdout);
+    }
 }
 
 #[test]

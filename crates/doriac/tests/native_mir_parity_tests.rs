@@ -70,10 +70,7 @@ function main(): void
     )
     .unwrap();
     fixture.assert_expected(name, &interpreted);
-    for profile in [NativeProfile::Fast, NativeProfile::Release] {
-        if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
-            continue;
-        }
+    for &profile in NativeProfile::AVAILABLE {
         let backend = match profile {
             NativeProfile::Fast => "Cranelift",
             NativeProfile::Release => "LLVM",
@@ -218,37 +215,13 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
         });
         fixture.assert_expected(&relative_path, &interpreted);
 
-        let fast = compile_and_run(
-            &mir,
-            NativeProfile::Fast,
-            &relative_path,
-            "Cranelift",
-            &fixture,
-        );
-        assert_matches_interpreter(
-            &relative_path,
-            "Cranelift fast",
-            NativeProfile::Fast,
-            &interpreted,
-            &fast,
-        );
-
-        #[cfg(feature = "llvm-backend")]
-        {
-            let release = compile_and_run(
-                &mir,
-                NativeProfile::Release,
-                &relative_path,
-                "LLVM",
-                &fixture,
-            );
-            assert_matches_interpreter(
-                &relative_path,
-                "LLVM release",
-                NativeProfile::Release,
-                &interpreted,
-                &release,
-            );
+        for &profile in NativeProfile::AVAILABLE {
+            let (backend, label) = match profile {
+                NativeProfile::Fast => ("Cranelift", "Cranelift fast"),
+                NativeProfile::Release => ("LLVM", "LLVM release"),
+            };
+            let native = compile_and_run(&mir, profile, &relative_path, backend, &fixture);
+            assert_matches_interpreter(&relative_path, label, profile, &interpreted, &native);
         }
     }
 }
@@ -302,7 +275,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_native_closures() {
         fixture.assert_expected(&name, &interpreted);
 
         for profile in native_closure_profiles(&fixture_root) {
-            if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.is_available() {
                 continue;
             }
             let backend = match profile {
@@ -371,9 +344,9 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
             "{name} fixture must exceed a typical pipe buffer"
         );
 
-        assert_closed_output_pipe(&mir, NativeProfile::Fast, name, closed_stream, stdin);
-        #[cfg(feature = "llvm-backend")]
-        assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream, stdin);
+        for &profile in NativeProfile::AVAILABLE {
+            assert_closed_output_pipe(&mir, profile, name, closed_stream, stdin);
+        }
     }
 }
 
@@ -393,21 +366,15 @@ fn prompted_read_line_exits_cleanly_when_stdout_closes_before_stdin() {
         BROKEN_PIPE_READ_LINE_PROMPT,
     )
     .expect("prompted read_line broken-pipe fixture should lower");
-    assert_closed_output_pipe(
-        &mir,
-        NativeProfile::Fast,
-        "read-line-prompt",
-        ClosedStream::Stdout,
-        b"must not be read\n",
-    );
-    #[cfg(feature = "llvm-backend")]
-    assert_closed_output_pipe(
-        &mir,
-        NativeProfile::Release,
-        "read-line-prompt",
-        ClosedStream::Stdout,
-        b"must not be read\n",
-    );
+    for &profile in NativeProfile::AVAILABLE {
+        assert_closed_output_pipe(
+            &mir,
+            profile,
+            "read-line-prompt",
+            ClosedStream::Stdout,
+            b"must not be read\n",
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -943,12 +910,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     let mir = doriac::lower_source_to_mir("prompt-timing.doria", source)
         .expect("prompted read_line should lower");
 
-    #[cfg(feature = "llvm-backend")]
-    let profiles = vec![NativeProfile::Fast, NativeProfile::Release];
-    #[cfg(not(feature = "llvm-backend"))]
-    let profiles = vec![NativeProfile::Fast];
-
-    for profile in profiles {
+    for &profile in NativeProfile::AVAILABLE {
         let backend = match profile {
             NativeProfile::Fast => "Cranelift",
             NativeProfile::Release => "LLVM",
@@ -1162,16 +1124,11 @@ fn native_profiles_keep_loop_body_stack_use_constant() {
         ),
     ];
 
-    #[cfg(feature = "llvm-backend")]
-    let profiles = [NativeProfile::Fast, NativeProfile::Release];
-    #[cfg(not(feature = "llvm-backend"))]
-    let profiles = [NativeProfile::Fast];
-
     for (name, source, expected) in cases {
         let mir = doriac::lower_source_to_mir(format!("{name}.doria"), source)
             .unwrap_or_else(|error| panic!("stack-growth fixture {name} should lower: {error:?}"));
 
-        for profile in profiles {
+        for &profile in NativeProfile::AVAILABLE {
             let backend = match profile {
                 NativeProfile::Fast => "Cranelift fast",
                 NativeProfile::Release => "LLVM release",

@@ -39,17 +39,9 @@ fn execute(source: &str) -> InterpreterIoOutput {
     .unwrap();
     assert_eq!(output.output.exit_status, 0, "{output:#?}");
     assert!(output.output.stderr.is_empty(), "{output:#?}");
-    assert_native_matches(
-        &program,
-        &output.output,
-        doriac::backend::NativeProfile::Fast,
-    );
-    #[cfg(feature = "llvm-backend")]
-    assert_native_matches(
-        &program,
-        &output.output,
-        doriac::backend::NativeProfile::Release,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        assert_native_matches(&program, &output.output, profile);
+    }
     assert_php_matches(source, &output.output);
     output
 }
@@ -351,17 +343,9 @@ function main(): void throws IoError {
     .unwrap();
     assert_eq!(output.output.exit_status, 70);
     assert_eq!(output.output.stdout, b"drop second\ndrop first\n");
-    assert_native_matches(
-        &program,
-        &output.output,
-        doriac::backend::NativeProfile::Fast,
-    );
-    #[cfg(feature = "llvm-backend")]
-    assert_native_matches(
-        &program,
-        &output.output,
-        doriac::backend::NativeProfile::Release,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        assert_native_matches(&program, &output.output, profile);
+    }
     assert_php_matches(source, &output.output);
     let diagnostic = String::from_utf8(output.output.stderr).unwrap();
     assert!(
@@ -409,17 +393,13 @@ function main(): void {{ finish(); }}
         for name in ["PanicOnDrop::__destruct", "finish", "main"] {
             assert!(diagnostic.contains(name), "{diagnostic}");
         }
+        for &profile in doriac::backend::NativeProfile::AVAILABLE {
         assert_native_matches(
-            &program,
-            &output.output,
-            doriac::backend::NativeProfile::Fast,
-        );
-        #[cfg(feature = "llvm-backend")]
-        assert_native_matches(
-            &program,
-            &output.output,
-            doriac::backend::NativeProfile::Release,
-        );
+                &program,
+                &output.output,
+                profile,
+            );
+        }
         assert_php_matches(&source, &output.output);
     }
 }

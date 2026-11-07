@@ -60,17 +60,9 @@ function main(): void {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.stderr, b"");
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Fast,
-        expected,
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Release,
-        expected,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]
@@ -109,17 +101,9 @@ function main(): void {
         assert_eq!(output.stdout, expected.as_bytes());
         assert_eq!(output.stderr, b"");
         assert_eq!(output.exit_status, 0);
-        native_execution::assert_native_execution(
-            &program,
-            doriac::backend::NativeProfile::Fast,
-            expected,
-        );
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(
-            &program,
-            doriac::backend::NativeProfile::Release,
-            expected,
-        );
+        for &profile in doriac::backend::NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, expected);
+        }
         let artifact = doriac::compile_source(
             "static-enum-places.doria",
             &source,
@@ -183,17 +167,9 @@ function main(): void {
         assert_eq!(output.stdout, stdout.as_bytes());
         assert_eq!(output.stderr, b"");
         assert_eq!(output.exit_status, 0);
-        native_execution::assert_native_execution(
-            &program,
-            doriac::backend::NativeProfile::Fast,
-            stdout,
-        );
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(
-            &program,
-            doriac::backend::NativeProfile::Release,
-            stdout,
-        );
+        for &profile in doriac::backend::NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, stdout);
+        }
     }
 }
 
@@ -340,17 +316,9 @@ fn assert_enum_execution(path: &str, source: &str, expected: &str) {
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Fast,
-        expected,
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Release,
-        expected,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let artifact =
         doriac::compile_source(path, source, doriac::backend::BackendTarget::Php).unwrap();
     let directory = native_execution::ExecutionDirectory::new();

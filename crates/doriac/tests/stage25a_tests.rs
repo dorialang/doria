@@ -830,17 +830,9 @@ fn nullable_shared_factory_results_preserve_payload_access_capabilities() {
         assert_eq!(output.stdout, b"0\n-1\n0\n", "{kind}");
         assert_eq!(output.stderr, b"", "{kind}");
         assert_eq!(output.exit_status, 0, "{kind}");
-        native_execution::assert_native_execution(
-            &program,
-            doriac::backend::NativeProfile::Fast,
-            "0\n-1\n0\n",
-        );
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(
-            &program,
-            doriac::backend::NativeProfile::Release,
-            "0\n-1\n0\n",
-        );
+        for &profile in doriac::backend::NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, "0\n-1\n0\n");
+        }
 
         let mutation = format!(
             "{prefix}\nfunction main(): void {{ make(true)?->rename(); make(false)?->rename(); }}"

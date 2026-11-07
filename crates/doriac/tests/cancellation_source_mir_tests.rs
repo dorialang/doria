@@ -290,9 +290,9 @@ fn token_factory_returns_an_independent_copy_claim_that_outlives_its_source() {
     assert_eq!(output.exit_status, 0);
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, "");
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, "");
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, "");
+    }
 }
 
 #[test]
@@ -378,9 +378,9 @@ fn cancellation_request_publishes_shared_state_and_is_idempotent_across_native_p
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]
@@ -620,15 +620,7 @@ fn source_factory_and_returned_owner_execute_and_retire_across_native_profiles()
     assert_eq!(output.exit_status, 0);
     assert_eq!(output.stdout, b"source factories retired\n");
     assert!(output.stderr.is_empty());
-    native_execution::assert_native_execution(
-        &program,
-        NativeProfile::Fast,
-        "source factories retired\n",
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        NativeProfile::Release,
-        "source factories retired\n",
-    );
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, "source factories retired\n");
+    }
 }

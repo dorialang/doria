@@ -140,17 +140,9 @@ fn durable_nullable_removal_retains_values_until_reverse_cleanup() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert_eq!(output.stderr, b"");
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Fast,
-        expected,
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Release,
-        expected,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
 }
 
 #[test]

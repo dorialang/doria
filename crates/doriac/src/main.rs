@@ -2437,11 +2437,7 @@ function main(): void { Dictionary<Key, int> $values = [new Key() => argument()]
                 assert_eq!(output.status.code(), Some(101), "{source}\n{output:?}");
                 assert_eq!(output.stdout, expected.stdout, "{source}");
                 assert_eq!(output.stderr, expected.stderr, "{source}");
-                let mut profiles = vec![NativeProfile::Fast];
-                if cfg!(feature = "llvm-backend") {
-                    profiles.push(NativeProfile::Release);
-                }
-                for profile in profiles {
+                for &profile in NativeProfile::AVAILABLE {
                     let output = crate::panic_native_execution::execute_native(&mir, profile);
                     assert_eq!(
                         output.status.code(),

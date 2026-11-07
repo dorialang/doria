@@ -224,17 +224,9 @@ fn assert_linked_native_execution(program: &doriac::mir::Program, stdout: &str) 
     assert!(!doriac::codegen_llvm::lower_mir_to_object(program)
         .expect("validated MIR should lower through LLVM")
         .is_empty());
-    native_execution::assert_native_execution(
-        program,
-        doriac::backend::NativeProfile::Fast,
-        stdout,
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        program,
-        doriac::backend::NativeProfile::Release,
-        stdout,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(program, profile, stdout);
+    }
 }
 
 #[test]

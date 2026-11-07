@@ -502,13 +502,9 @@ function main(): void {
     assert_eq!(output.stdout, b"owner7");
     assert_eq!(output.exit_status, 0);
     assert_eq!(output.stderr, b"");
-    native_execution::assert_native_execution(&mir, doriac::backend::NativeProfile::Fast, "owner7");
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &mir,
-        doriac::backend::NativeProfile::Release,
-        "owner7",
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, "owner7");
+    }
     let php = doriac::compile_source_to_php("inherited-generic-identities.doria", source).unwrap();
     let body = format!(
         "{}\n__DoriaFunction_6d61696e();",
@@ -547,9 +543,9 @@ function main(): void {
     assert_eq!(interpreted.exit_status, 0);
     assert_eq!(interpreted.stderr, b"");
     assert_eq!(interpreted.stdout, b"22");
-    native_execution::assert_native_execution(&mir, doriac::backend::NativeProfile::Fast, "22");
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&mir, doriac::backend::NativeProfile::Release, "22");
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, "22");
+    }
     let php =
         doriac::compile_source_to_php("generic-virtual-owner-families.doria", source).unwrap();
     let body = format!(

@@ -35,12 +35,7 @@ pub fn assert_execution(source: &str, mode: &str, control: &str, injected: &str)
     assert!(build.status.success(), "{build:?}");
     assert!(build.stdout.is_empty(), "{build:?}");
     assert!(build.stderr.is_empty(), "{build:?}");
-    let profiles = [
-        NativeProfile::Fast,
-        #[cfg(feature = "llvm-backend")]
-        NativeProfile::Release,
-    ];
-    for profile in profiles {
+    for &profile in NativeProfile::AVAILABLE {
         let output =
             native_execution::execute_native_in_directory(&program, profile, &[], &directory);
         assert_eq!(output.status.code(), Some(0), "{profile:?}: {output:?}");

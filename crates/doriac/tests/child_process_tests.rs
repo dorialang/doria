@@ -244,17 +244,6 @@ function main(): void {{
     assert_eq!(observed.trace.cleanups, ["Terminate", "Detach", "Wait"]);
 }
 
-fn native_profiles() -> Vec<NativeProfile> {
-    #[cfg(feature = "llvm-backend")]
-    {
-        vec![NativeProfile::Fast, NativeProfile::Release]
-    }
-    #[cfg(not(feature = "llvm-backend"))]
-    {
-        vec![NativeProfile::Fast]
-    }
-}
-
 /// Real children through /bin/sh on Unix hosts.
 #[cfg(unix)]
 #[test]
@@ -320,7 +309,7 @@ function main(): void {{
     );
     let program = lower(&source);
     let expected = "exited 3|out|err\n10/10|truncated\nhi:unset:/\ncat 3|exited 0\nid|timed out|signaled 9\nfailed to spawn process `doria-no-such-program`: not found\n";
-    for profile in native_profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&program, profile, expected);
     }
     assert_php_execution(&source, expected);
@@ -384,7 +373,7 @@ function main(): void {{
     );
     let program = lower(&source);
     let expected = "failed to write process `cat` input: closed|write\nexited 0\nfailed to spawn process `/bin/sh`: invalid input\ncdef\ndone\n";
-    for profile in native_profiles() {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&program, profile, expected);
     }
     assert_php_execution(&source, expected);

@@ -83,19 +83,9 @@ fn assert_native_output(program: &doriac::mir::Program, expected: &str, source: 
     assert_eq!(result.stdout, expected.as_bytes(), "{source}");
     assert_eq!(result.stderr, b"", "{source}");
     assert_eq!(result.exit_status, 0, "{source}");
-    assert_native_profile(
-        program,
-        doriac::backend::NativeProfile::Fast,
-        expected,
-        source,
-    );
-    #[cfg(feature = "llvm-backend")]
-    assert_native_profile(
-        program,
-        doriac::backend::NativeProfile::Release,
-        expected,
-        source,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        assert_native_profile(program, profile, expected, source);
+    }
 }
 
 fn assert_execution(source: &str, expected: &str) {

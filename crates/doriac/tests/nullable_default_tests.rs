@@ -12,9 +12,9 @@ fn assert_native_execution(source: &str, expected: &str) {
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&mir, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&mir, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, expected);
+    }
 }
 
 fn assert_execution(source: &str, expected: &str) {

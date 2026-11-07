@@ -364,7 +364,7 @@ fn assert_behavioral_output(source: &str, expected_stdout: &[u8], include_php: b
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(
@@ -473,7 +473,7 @@ fn assert_behavioral_failure_on_every_enabled_backend(source: &str, expected_fac
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(
@@ -567,7 +567,7 @@ fn assert_behavioral_panic_on_every_enabled_backend(source: &str) {
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(
@@ -1292,35 +1292,25 @@ it("dispatches", function (): void {
         .output()
         .is_ok()
     {
-        let native = doriac::compile_compilation_graph(&dispatcher_graph(
-            source,
-            &dispatcher,
-            CompilerTarget::Native,
-            Some(BuildNativeProfile::Fast),
-        ))
-        .expect("Cranelift dispatcher");
-        let output = run_emitted(native);
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(output.stdout, b"behavioral\n");
-        assert!(
-            output.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        #[cfg(feature = "llvm-backend")]
-        {
-            let llvm = doriac::compile_compilation_graph(&dispatcher_graph(
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if !profile.native().is_available() {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
                 source,
                 &dispatcher,
                 CompilerTarget::Native,
-                Some(BuildNativeProfile::Release),
+                Some(profile),
             ))
-            .expect("LLVM dispatcher");
-            let output = run_emitted(llvm);
-            assert_eq!(output.status.code(), Some(0));
-            assert_eq!(output.stdout, b"behavioral\n");
-            assert!(output.stderr.is_empty());
+            .unwrap_or_else(|error| panic!("{profile:?} dispatcher: {error:?}"));
+            let output = run_emitted(native);
+            assert_eq!(output.status.code(), Some(0), "{profile:?}");
+            assert_eq!(output.stdout, b"behavioral\n", "{profile:?}");
+            assert!(
+                output.stderr.is_empty(),
+                "{profile:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -2287,30 +2277,20 @@ it("reports", function (): void {
         .output()
         .is_ok()
     {
-        let native = doriac::compile_compilation_graph(&dispatcher_graph(
-            source,
-            &dispatcher,
-            CompilerTarget::Native,
-            Some(BuildNativeProfile::Fast),
-        ))
-        .expect("Cranelift dispatcher");
-        let (output, payload) = run_emitted_with_assertion_outcome(native);
-        assert_eq!(output.status.code(), Some(70));
-        assert!(output.stderr.is_empty());
-        assert_v4(&payload);
-
-        #[cfg(feature = "llvm-backend")]
-        {
-            let llvm = doriac::compile_compilation_graph(&dispatcher_graph(
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if !profile.native().is_available() {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
                 source,
                 &dispatcher,
                 CompilerTarget::Native,
-                Some(BuildNativeProfile::Release),
+                Some(profile),
             ))
-            .expect("LLVM dispatcher");
-            let (output, payload) = run_emitted_with_assertion_outcome(llvm);
-            assert_eq!(output.status.code(), Some(70));
-            assert!(output.stderr.is_empty());
+            .unwrap_or_else(|error| panic!("{profile:?} dispatcher: {error:?}"));
+            let (output, payload) = run_emitted_with_assertion_outcome(native);
+            assert_eq!(output.status.code(), Some(70), "{profile:?}");
+            assert!(output.stderr.is_empty(), "{profile:?}");
             assert_v4(&payload);
         }
     }
@@ -2423,7 +2403,7 @@ it("unicode difference", function (): void {
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(

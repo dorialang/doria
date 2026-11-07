@@ -132,17 +132,9 @@ function main(): void
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
     assert!(output.runtime_diagnostic.is_none());
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Fast,
-        "4;8;done;",
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Release,
-        "4;8;done;",
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, "4;8;done;");
+    }
 }
 
 #[test]

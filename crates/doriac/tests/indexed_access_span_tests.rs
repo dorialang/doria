@@ -99,16 +99,11 @@ fn assert_panic(source: &str, expected: ExpectedPanic<'_>) {
         }
         None => assert!(outcome.facts.is_empty()),
     }
-    let native = native_execution::execute_native(&mir, NativeProfile::Fast);
-    assert_eq!(native.status.code(), Some(101), "{native:?}");
-    assert_eq!(native.stdout, output.stdout);
-    assert_eq!(native.stderr, output.stderr);
-    #[cfg(feature = "llvm-backend")]
-    {
-        let native = native_execution::execute_native(&mir, NativeProfile::Release);
-        assert_eq!(native.status.code(), Some(101), "{native:?}");
-        assert_eq!(native.stdout, output.stdout);
-        assert_eq!(native.stderr, output.stderr);
+    for &profile in NativeProfile::AVAILABLE {
+        let native = native_execution::execute_native(&mir, profile);
+        assert_eq!(native.status.code(), Some(101), "{profile:?}: {native:?}");
+        assert_eq!(native.stdout, output.stdout, "{profile:?}");
+        assert_eq!(native.stderr, output.stderr, "{profile:?}");
     }
     if expected.php {
         assert_php_panic(source, expected, &output.stderr);
@@ -672,13 +667,9 @@ function main(): void {
     doriac::mir_validation::validate_program(&mir).unwrap();
     let result = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert_eq!(result.stdout, b"set\n");
-    native_execution::assert_native_execution(&mir, doriac::backend::NativeProfile::Fast, "set\n");
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &mir,
-        doriac::backend::NativeProfile::Release,
-        "set\n",
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, "set\n");
+    }
 }
 
 #[test]
@@ -885,9 +876,9 @@ fn assert_success(source: &str, stdout: &str, php: bool) {
     assert_eq!(output.stdout, stdout.as_bytes());
     assert_eq!(output.stderr, b"");
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&mir, NativeProfile::Fast, stdout);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&mir, NativeProfile::Release, stdout);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, stdout);
+    }
     if !php {
         return;
     }

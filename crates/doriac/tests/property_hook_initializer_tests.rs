@@ -33,13 +33,9 @@ fn assert_complete_initializer_execution(source: &str, stdout: &str) -> doriac::
     assert_eq!(result.stderr, b"");
     assert_eq!(result.exit_status, 0);
     assert!(result.runtime_diagnostic.is_none());
-    native_execution::assert_native_execution(&mir, doriac::backend::NativeProfile::Fast, stdout);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &mir,
-        doriac::backend::NativeProfile::Release,
-        stdout,
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, stdout);
+    }
 
     let php = doriac::compile_source_to_php("property-hook-initializers.doria", source)
         .unwrap_or_else(|diagnostics| panic!("{source}\n{diagnostics:#?}"));

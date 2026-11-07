@@ -215,9 +215,9 @@ fn completion_copy_and_matching_preserve_keys_nullable_outcomes_and_wait_states(
     assert_eq!(interpreted.stdout, expected.as_bytes());
     assert!(interpreted.stderr.is_empty());
     assert_eq!(interpreted.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, &expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, &expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, &expected);
+    }
     let artifact =
         doriac::compile_source("completion-transport.doria", &source, BackendTarget::Php).unwrap();
     let directory = native_execution::ExecutionDirectory::new();
@@ -326,9 +326,9 @@ fn write_and_mixed_plans_retain_shared_sources_without_performing_io() {
     assert_eq!(output.output.exit_status, 0);
     assert_eq!((output.trace.file_reads, output.trace.file_writes), (0, 0));
     assert_eq!(output.files.get("input").unwrap(), b"unchanged\n");
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, WRITE_EXPECTED);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, WRITE_EXPECTED);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, WRITE_EXPECTED);
+    }
     let artifact =
         doriac::compile_source("write-plan.doria", WRITE_SOURCE, BackendTarget::Php).unwrap();
     let directory = native_execution::ExecutionDirectory::new();
@@ -443,9 +443,9 @@ fn unstarted_setup_and_consuming_failure_match_interpreter_and_both_native_profi
     assert_eq!(interpreted.trace.file_reads, 0);
     assert_eq!(interpreted.trace.file_writes, 0);
     assert_eq!(interpreted.files.get("input").unwrap(), b"unread bytes\n");
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, EXPECTED);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, EXPECTED);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, EXPECTED);
+    }
 }
 
 #[test]
@@ -651,9 +651,9 @@ fn plan_loans_survive_an_indirect_creator() {
     assert_eq!(output.stdout, EXPECTED.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, EXPECTED);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, EXPECTED);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, EXPECTED);
+    }
     let invalid = source.replace(
         "let $replacement = $plan->andReadFrom",
         "$first[0] = 1; let $replacement = $plan->andReadFrom",

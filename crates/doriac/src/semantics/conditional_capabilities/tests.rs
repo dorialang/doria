@@ -155,11 +155,7 @@ fn assert_checked_execution(name: &str, source: &str, status: i32) {
     assert!(output.stdout.is_empty(), "{name}: {output:?}");
     assert!(output.stderr.is_empty(), "{name}: {output:?}");
     assert!(output.runtime_diagnostic.is_none(), "{name}: {output:?}");
-    for profile in [
-        crate::backend::NativeProfile::Fast,
-        #[cfg(feature = "llvm-backend")]
-        crate::backend::NativeProfile::Release,
-    ] {
+    for &profile in crate::backend::NativeProfile::AVAILABLE {
         let output = crate::native_execution::execute_native(&mir, profile);
         assert_eq!(
             output.status.code(),
@@ -503,11 +499,7 @@ function main(): int {{
         assert!(output.stderr.is_empty());
         assert_eq!(output.exit_status, 85);
         assert!(output.runtime_diagnostic.is_none());
-        for profile in [
-            crate::backend::NativeProfile::Fast,
-            #[cfg(feature = "llvm-backend")]
-            crate::backend::NativeProfile::Release,
-        ] {
+        for &profile in crate::backend::NativeProfile::AVAILABLE {
             let output = crate::native_execution::execute_native(&mir, profile);
             assert_eq!(output.status.code(), Some(85), "{profile:?}: {output:?}");
             assert!(output.stdout.is_empty(), "{profile:?}: {output:?}");

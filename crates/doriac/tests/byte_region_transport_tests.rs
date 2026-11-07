@@ -23,11 +23,7 @@ fn executes(body: &str, stdout: &str) {
     assert_eq!(result.exit_status, 0, "{source}");
     assert!(result.runtime_diagnostic.is_none());
 
-    #[cfg(not(feature = "llvm-backend"))]
-    let profiles = [NativeProfile::Fast];
-    #[cfg(feature = "llvm-backend")]
-    let profiles = [NativeProfile::Fast, NativeProfile::Release];
-    for profile in profiles {
+    for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&mir, profile, stdout);
     }
 

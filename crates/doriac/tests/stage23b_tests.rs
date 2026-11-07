@@ -71,14 +71,7 @@ function main(List<string> $args): {result_type} {{
                     .is_empty(),
                 checked
             );
-            #[cfg(not(feature = "llvm-backend"))]
-            let profiles = [doriac::backend::NativeProfile::Fast];
-            #[cfg(feature = "llvm-backend")]
-            let profiles = [
-                doriac::backend::NativeProfile::Fast,
-                doriac::backend::NativeProfile::Release,
-            ];
-            for profile in profiles {
+            for &profile in doriac::backend::NativeProfile::AVAILABLE {
                 native_execution::assert_native_execution(&program, profile, "0");
                 let output = native_execution::execute_native_with_args(
                     &program,

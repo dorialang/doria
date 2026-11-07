@@ -226,9 +226,9 @@ fn assert_backend_parity_with_runtime(
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let artifact = doriac::compile_source(name, source, BackendTarget::Php).unwrap();
     assert_eq!(
         matches!(
@@ -374,9 +374,9 @@ fn time_error_preserves_owned_failure_facts_across_all_backends() {
     assert_eq!(output.stdout, expected.as_bytes());
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
-    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
     let artifact = doriac::compile_source("time-error.doria", SOURCE, BackendTarget::Php).unwrap();
     let directory = native_execution::ExecutionDirectory::new();
     let path = directory.path().join("main.php");
@@ -746,17 +746,9 @@ fn inline_time_copy_transport_preserves_zero_and_full_width_in_all_native_profil
         assert_eq!(output.stdout, b"copy preserved\n", "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
         assert_eq!(output.exit_status, 0);
-        native_execution::assert_native_execution(
-            &program,
-            NativeProfile::Fast,
-            "copy preserved\n",
-        );
-        #[cfg(feature = "llvm-backend")]
-        native_execution::assert_native_execution(
-            &program,
-            NativeProfile::Release,
-            "copy preserved\n",
-        );
+        for &profile in NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, "copy preserved\n");
+        }
         assert!(
             program
                 .functions

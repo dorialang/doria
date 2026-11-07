@@ -1469,6 +1469,52 @@ test undefined behavior fixed in the previous section ran assertions inside
 exactly such callbacks, so CI on `42a7ad5` shows whether the abort survived
 that fix.
 
+### Native profiles get one owner (2026-11-07)
+
+CI's `rust` job (run 42404305965) runs
+`cargo clippy --workspace --all-targets -- -D warnings` with default features.
+It stopped on `single_element_loop` in
+`semantics/conditional_capabilities/tests.rs`: `for profile in [Fast,
+#[cfg(feature = "llvm-backend")] Release]` has one element without the
+feature. The cause was ownership. Tests in about 50 doriac files decided for
+themselves which native profiles this build compiles, in seven spellings:
+
+- `cfg`'d array elements;
+- `cfg`/`not(cfg)` pairs of `let profiles`;
+- local `profiles()` and `native_profiles()` helpers in four files;
+- `.chain(cfg!(…).then_some(Release))`;
+- `if profile == Release && !cfg!(…) { continue; }` over a fixed list;
+- `if cfg!(…) { profiles.push(Release) }`;
+- a Fast statement followed by its `#[cfg]` Release twin, 86 times.
+
+The vet missed it because its one clippy run used
+`--features doriac/llvm-backend`. `scripts/validate_work_unit.php` already
+runs the default-feature workspace clippy that CI runs.
+
+**Chosen:** `NativeProfile::AVAILABLE` in `backend.rs` lists the profiles this
+build compiles, and `NativeProfile::is_available` answers for one profile.
+`BuildNativeProfile::native` maps a build plan's profile to its backend
+profile, and `compilation_graph_options` now uses it instead of a second
+match. Every test that runs a program on each native profile iterates
+`AVAILABLE`. A test that walks build-plan profiles skips one whose
+`native()` is unavailable. The `cfg` gates that remain guard code that needs
+LLVM itself:
+
+- `codegen_llvm` IR and object inspection;
+- the LLVM-only tests (`llvm_*`, the release-report and devirtualization
+  tests, the CLI's enabled and disabled release tests);
+- `codegen_native`'s release lowering and the CLI's `backends` list.
+
+`constrained_ambient_effect_tests.rs` keeps its two `#[cfg]` Release
+statements until the catch-reachability work there lands.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `NativeProfile::AVAILABLE` and `is_available` (chosen) | The backend states once what the build compiles; tests cannot drift from it; default-feature clippy has nothing feature-shaped to flag | Touches about 50 test files; a loop replaces some straight-line Fast and Release calls |
+| Fix the two flagged loops | Smallest diff | Leaves 80-odd re-derivations; the next default-feature build finds the next one the same late way |
+| `#[allow(clippy::single_element_loop)]` | One line per loop | Hides the duplicated ownership rather than removing it |
+| A shared test helper only | Shorter call sites | Test-only; the build plan and production code would still re-derive availability |
+
 ### Windows test abort: the test binary exported the runtime's CRT replacements (2026-11-07)
 
 CI on `42a7ad5` (run 42404305965) passed the `doria-rt` release tests on

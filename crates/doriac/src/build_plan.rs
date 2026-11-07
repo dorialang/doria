@@ -131,6 +131,17 @@ pub enum BuildNativeProfile {
     Release,
 }
 
+impl BuildNativeProfile {
+    /// The backend profile a build plan's `nativeProfile` selects. Whether this
+    /// doriac build compiles it is `NativeProfile::is_available`.
+    pub const fn native(self) -> crate::backend::NativeProfile {
+        match self {
+            Self::Fast => crate::backend::NativeProfile::Fast,
+            Self::Release => crate::backend::NativeProfile::Release,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildPlanDocument {
     pub path: String,
