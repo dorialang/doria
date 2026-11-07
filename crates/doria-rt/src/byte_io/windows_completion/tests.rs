@@ -645,3 +645,21 @@ fn one_owner_reuses_resources_only_after_terminal_completion() {
     );
     assert_finished(&state);
 }
+
+#[test]
+fn overlapped_submission_verdict_is_the_return_value_and_last_error_only() {
+    let mut consulted = false;
+    assert_eq!(
+        issued(1, || {
+            consulted = true;
+            0
+        }),
+        Issued::Completed
+    );
+    assert!(!consulted, "a TRUE return carries no error to read");
+    assert_eq!(issued(0, || IO_PENDING), Issued::Pending);
+    // ERROR_BROKEN_PIPE after the peer closed and ERROR_HANDLE_EOF are
+    // synchronous failures with no packet, whatever OVERLAPPED.Internal holds.
+    assert_eq!(issued(0, || 109), Issued::Failed(109));
+    assert_eq!(issued(0, || 38), Issued::Failed(38));
+}

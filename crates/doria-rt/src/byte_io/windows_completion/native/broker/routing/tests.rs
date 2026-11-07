@@ -253,13 +253,20 @@ fn rejected_submission_has_no_packet_and_early_packet_cannot_be_rejected() {
             Err(Failure::invalid_input())
         );
         assert_eq!(
-            model.registry.rejected(route),
+            model.registry.rejected(route, Failure::other()),
             Err(Failure::invalid_input())
         );
         model.registry.arm(route).unwrap();
-        model.registry.rejected(route).unwrap();
+        // A synchronously failed submission (ReadFile FALSE with
+        // ERROR_BROKEN_PIPE) queues no packet. Its terminal is the rejection
+        // itself, so a drain that queries this route ends at once instead of
+        // waiting for a packet that cannot come. Before this was recorded, the
+        // route stayed terminal-less forever, the state that hung Windows CI.
+        let broken = Failure::from_system_code(109);
+        model.registry.rejected(route, broken).unwrap();
         assert!(!model.registry.active(route));
-        assert_eq!(model.registry.query(route), None);
+        assert_eq!(model.registry.query(route), Some(Err(broken)));
+        assert_eq!(model.registry.query(route), Some(Err(broken)));
         assert_eq!(
             model.registry.publish(model.key(0), REQUESTS[0], Ok(0)),
             Err(Failure::invalid_input())
@@ -270,7 +277,7 @@ fn rejected_submission_has_no_packet_and_early_packet_cannot_be_rejected() {
             Err(Failure::other().with_transferred_byte_count(Some(2))),
         );
         assert_eq!(
-            model.registry.rejected(route),
+            model.registry.rejected(route, Failure::other()),
             Err(Failure::invalid_input())
         );
         assert!(model.registry.active(route));
@@ -318,7 +325,7 @@ fn wrong_key_address_or_duplicate_packet_does_not_mutate_live_route() {
             Err(Failure::invalid_input())
         );
         assert_eq!(
-            model.registry.rejected(route),
+            model.registry.rejected(route, Failure::other()),
             Err(Failure::invalid_input())
         );
     }
@@ -514,7 +521,7 @@ fn duplicate_registration_and_unregistered_pointers_are_rejected_without_derefer
             Err(Failure::invalid_input())
         );
         assert_eq!(
-            model.registry.rejected(unknown_route),
+            model.registry.rejected(unknown_route, Failure::other()),
             Err(Failure::invalid_input())
         );
         assert_eq!(model.registry.query(unknown_route), None);

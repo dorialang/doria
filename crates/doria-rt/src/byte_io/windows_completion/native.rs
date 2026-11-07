@@ -16,7 +16,6 @@ use crate::win32::{
     GetOverlappedResult, ReadFile, WriteFile, INFINITE,
 };
 
-const IO_PENDING: u32 = 997;
 const IO_INCOMPLETE: u32 = 996;
 const STATUS_PENDING: usize = 0x103;
 
@@ -113,16 +112,10 @@ unsafe impl Driver for WindowsDriver {
                 request.cast(),
             ),
         };
-        if success != 0 {
-            Submission::Complete
-        } else {
-            let code = GetLastError();
-            if code == IO_PENDING || ptr::read_volatile((*request).internal.get()) == STATUS_PENDING
-            {
-                Submission::Pending
-            } else {
-                Submission::Failed(Failure::from_system_code(code.into()))
-            }
+        match issued(success, || GetLastError()) {
+            Issued::Completed => Submission::Complete,
+            Issued::Pending => Submission::Pending,
+            Issued::Failed(code) => Submission::Failed(Failure::from_system_code(code.into())),
         }
     }
 

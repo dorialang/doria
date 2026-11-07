@@ -393,7 +393,18 @@ impl Registry {
 
     /// # Safety
     /// Obey the module contract. A rejected transfer must produce no packet.
-    pub(super) unsafe fn rejected(&mut self, node: *mut Route) -> Result<(), Failure> {
+    ///
+    /// Every armed submission ends with exactly one terminal: a published
+    /// packet for an accepted transfer, or here, the synchronous failure of a
+    /// rejected one. Recording it lets every terminal wait (`query`, the
+    /// broker's drain predicate) observe the rejection instead of waiting for a
+    /// packet that cannot come. The group already received this failure from
+    /// submission, so it is not counted as unreported.
+    pub(super) unsafe fn rejected(
+        &mut self,
+        node: *mut Route,
+        failure: Failure,
+    ) -> Result<(), Failure> {
         if !unsafe { self.contains_route(node) } {
             return Err(Failure::invalid_input());
         }
@@ -403,6 +414,7 @@ impl Registry {
         }
         state.submitting = false;
         state.packet = false;
+        state.terminal = Some(Err(failure));
         Ok(())
     }
 

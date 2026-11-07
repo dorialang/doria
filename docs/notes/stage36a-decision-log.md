@@ -1706,3 +1706,70 @@ So no change is made for it.
 `NativeGroup` drop or `next()` drains a slot whose submission was rejected.
 The hang report would identify it directly if it also named the slot's route
 state.
+
+### The broker hang: a synchronous failure recorded as in flight (2026-11-08)
+
+`peer_closure_projects_read_eof_without_finishing_an_unrelated_pending_read`
+hung for 120 s in the broker drain on `e214f49`.
+
+**Cause (proven by documented semantics, reproduced at the registry level on
+macOS).** Both completion drivers decided "pending" if `ReadFile` or
+`WriteFile` returned `FALSE` and `OVERLAPPED.Internal` read `STATUS_PENDING`,
+even when the error was not `ERROR_IO_PENDING`. That field is not a verdict:
+
+- The `OVERLAPPED` documentation says the system sets `Internal` to
+  `STATUS_PENDING` when the request is issued. A synchronous failure leaves
+  it there.
+- `HasOverlappedIoCompleted`, which reads it, is documented as meaningful only
+  after `ERROR_IO_PENDING`.
+- The documented verdict is the return value plus `GetLastError`.
+
+In the test, the read on the server end whose client had closed failed at
+once with `ERROR_BROKEN_PIPE`. It queued no packet, but the broker recorded it
+as accepted. When the test's 5-second deadline passed, the group cancelled it,
+and `CancelIoEx` had no request to cancel. The drain then waited forever for a
+packet that could not come. A second gap made the same state possible even
+with a truthful verdict: `Registry::rejected` left the route without a
+terminal, so `query` returned `None` forever for a rejected submission.
+
+**Chosen:** the registry route owns "every submission yields exactly one
+terminal", and the verdict has one owner.
+
+- `windows_completion::issued` classifies a call from its return value and
+  `GetLastError` only. It takes no `Internal` argument, so the field cannot be
+  consulted. `TRUE` means completed synchronously, which still queues one
+  packet because no completion-skip mode is set. `ERROR_IO_PENDING` means
+  pending. Any other error is a failure with no packet. The event driver and
+  the broker driver both use it.
+- `Registry::rejected(route, failure)` records the synchronous failure as the
+  route's terminal, so `query` and the broker's drain predicate end at once.
+  The group already received the failure from submission, so it is not
+  counted as unreported. The broker driver also rewrites the rejected request
+  to idle, since the kernel never took it.
+- The drain asks the registry first. It returns the recorded terminal, or
+  `None` when the route has no submission in flight. It waits only while an
+  accepted submission's packet is still outstanding.
+- macOS-runnable tests. The registry model test now asserts that a rejected
+  route reports its failure; before this change it asserted the terminal-less
+  state that hung. `overlapped_submission_verdict_is_the_return_value_and_last_error_only`
+  covers the classifier.
+
+**Other waits with no budget, audited against the same invariant:**
+
+- The broker group wait (`wait_any`, INFINITE without a budget) wakes on
+  unreported routes. With a truthful verdict every accepted route publishes
+  one packet, and rejected slots finish at submission.
+- The event driver's drain and its unbudgeted wait run only after an
+  `ERROR_IO_PENDING` verdict, whose event is always set.
+- File locking waits only after `ERROR_IO_PENDING`.
+- Process and helper-thread waits are not completion waits.
+
+The post-pending uses of `Internal` stay. `result()` treats
+`GetOverlappedResult` failing while the kernel still owns the request as
+pending, which is the documented use.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Verdict from the return value only, plus the registry recording each rejection's terminal (chosen) | Fixes the false acceptance at its one owner; any future wait on a rejected route ends instead of hanging; the classifier's signature forbids reading `Internal` | Touches both drivers and the registry contract |
+| Drop only the `Internal` clause in the broker | Smallest change | Leaves the event driver's identical clause, and rejected routes still have no terminal for any wait that reaches them |
+| Bound the drain | No semantic change | Releasing storage on a timeout is unsound while the kernel may own it, and it hides the false acceptance |

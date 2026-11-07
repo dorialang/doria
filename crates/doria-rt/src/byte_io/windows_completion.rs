@@ -25,6 +25,46 @@ mod tests;
 #[path = "windows_completion/native/broker/routing.rs"]
 mod routing_model;
 
+/// `ERROR_IO_PENDING`: an overlapped request was issued and will complete
+/// later, through its event or one completion packet.
+const IO_PENDING: u32 = 997;
+
+/// The documented verdict of an overlapped `ReadFile` or `WriteFile` call.
+///
+/// The return value and `GetLastError` are the only verdict. `TRUE` means the
+/// transfer completed synchronously; without a completion-skip mode, which no
+/// driver sets, a port-associated handle still receives its one packet.
+/// `FALSE` with `ERROR_IO_PENDING` means it was issued and will complete later.
+/// Any other error is a synchronous failure: the kernel never took the
+/// request, so no packet is queued and no event is set.
+///
+/// `OVERLAPPED.Internal` is deliberately not an input. `ReadFile` sets it to
+/// `STATUS_PENDING` before the I/O manager sees the request, and a synchronous
+/// failure leaves it there. Reading it as a verdict recorded a failed request
+/// as in flight, so its cancel and drain waited for a packet that never came.
+/// `HasOverlappedIoCompleted` is documented as meaningful only after
+/// `ERROR_IO_PENDING`.
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
+/// https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-overlapped
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Issued {
+    Completed,
+    Pending,
+    Failed(u32),
+}
+
+/// Classifies an overlapped transfer call. `last_error` is read only when the
+/// call returned `FALSE`, before any other API can overwrite it.
+fn issued(returned: i32, last_error: impl FnOnce() -> u32) -> Issued {
+    if returned != 0 {
+        return Issued::Completed;
+    }
+    match last_error() {
+        IO_PENDING => Issued::Pending,
+        code => Issued::Failed(code),
+    }
+}
+
 fn request_length(length: usize) -> u32 {
     length.min(u32::MAX as usize) as u32
 }

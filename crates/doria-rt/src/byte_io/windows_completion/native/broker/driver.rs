@@ -976,15 +976,16 @@ unsafe impl GroupDriver for Dispatcher<'_> {
                 request.cast(),
             ),
         };
-        let code = if success == 0 { GetLastError() } else { 0 };
-        let accepted = success != 0
-            || code == IO_PENDING
-            || ptr::read_volatile((*request).internal.get()) == STATUS_PENDING;
+        // Synchronous success still queues this handle's one packet; only a
+        // synchronous failure queues none (see `issued`).
+        let rejection = match issued(success, || GetLastError()) {
+            Issued::Completed | Issued::Pending => None,
+            Issued::Failed(code) => Some(Failure::from_system_code(code.into())),
+        };
         let mut routing = self.broker.routing().lock();
-        let finalized = if accepted {
-            routing.registry.accepted(route)
-        } else {
-            routing.registry.rejected(route)
+        let finalized = match rejection {
+            None => routing.registry.accepted(route),
+            Some(failure) => routing.registry.rejected(route, failure),
         };
         if finalized.is_err() {
             crate::runtime_invariant_panic();
@@ -992,10 +993,14 @@ unsafe impl GroupDriver for Dispatcher<'_> {
         // An early packet was hidden until this finalization. Wake protected
         // followers now, without a second native notification or allocation.
         self.broker.routing().wake_all();
-        if accepted {
-            Submission::Pending
-        } else {
-            Submission::Failed(Failure::from_system_code(code.into()))
+        match rejection {
+            None => Submission::Pending,
+            Some(failure) => {
+                // The kernel never took this request; it is idle and ours again.
+                // Rewrite it so its Internal no longer reads STATUS_PENDING.
+                request.write(Overlapped::new(ptr::null_mut()));
+                Submission::Failed(failure)
+            }
         }
     }
 
@@ -1092,8 +1097,18 @@ unsafe impl GroupDriver for Dispatcher<'_> {
         }
         let route = self.route(index);
         loop {
-            if let Some(result) = self.broker.routing().lock().registry.query(route) {
-                return Some(result);
+            {
+                let mut routing = self.broker.routing().lock();
+                // The registry owns each submission's one terminal: a published
+                // packet, or the synchronous failure `rejected` recorded.
+                if let Some(result) = routing.registry.query(route) {
+                    return Some(result);
+                }
+                // Only an accepted, unpublished submission has a packet coming.
+                // A slot that was never armed has nothing to drain.
+                if !routing.registry.active(route) {
+                    return None;
+                }
             }
             if self
                 .broker
