@@ -2,14 +2,13 @@
 //! in a pinned call scope; a transfer group retains all participating buffer
 //! loans and stable reusable slots until every completion packet is retired.
 
-use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::marker::PhantomPinned;
 use core::pin::Pin;
 use doria_diagnostic_catalogue::IoMessageOperation;
 
 use crate::platform_io::Failure;
 use crate::transfer_group::{Awaited, Buffer, Control, Query, Stop, Submission, Wait, Wake};
+use crate::win32::Overlapped;
 
 #[cfg(windows)]
 mod native;
@@ -25,29 +24,6 @@ mod tests;
 #[cfg(all(test, not(windows)))]
 #[path = "windows_completion/native/broker/routing.rs"]
 mod routing_model;
-
-#[repr(C)]
-pub(crate) struct Overlapped {
-    internal: UnsafeCell<usize>,
-    internal_high: UnsafeCell<usize>,
-    offset: u32,
-    offset_high: u32,
-    event: *mut c_void,
-    pinned: PhantomPinned,
-}
-
-impl Overlapped {
-    fn new(event: *mut c_void) -> Self {
-        Self {
-            internal: UnsafeCell::new(0),
-            internal_high: UnsafeCell::new(0),
-            offset: 0,
-            offset_high: 0,
-            event,
-            pinned: PhantomPinned,
-        }
-    }
-}
 
 fn request_length(length: usize) -> u32 {
     length.min(u32::MAX as usize) as u32

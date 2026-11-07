@@ -28,11 +28,7 @@ pub(crate) fn require_synchronous_device(handle: NativeHandle) -> Result<(), Fai
         u32,
     ) -> i32;
     type ErrorCode = unsafe extern "system" fn(i32) -> u32;
-    unsafe extern "system" {
-        fn GetConsoleMode(handle: NativeHandle, mode: *mut u32) -> i32;
-        fn GetModuleHandleW(name: *const u16) -> NativeHandle;
-        fn GetProcAddress(module: NativeHandle, name: *const u8) -> *mut core::ffi::c_void;
-    }
+    use crate::win32::{GetConsoleMode, GetModuleHandleW, GetProcAddress};
     let mut mode = 0u32;
     if unsafe { GetConsoleMode(handle, &mut mode) } != 0 {
         return Ok(());
@@ -98,17 +94,7 @@ pub(crate) fn is_regular_file(handle: NativeHandle) -> Result<bool, Failure> {
         delete_pending: u8,
         directory: u8,
     }
-    unsafe extern "system" {
-        fn GetFileType(handle: NativeHandle) -> u32;
-        fn SetLastError(code: u32);
-        fn GetLastError() -> u32;
-        fn GetFileInformationByHandleEx(
-            handle: NativeHandle,
-            class: i32,
-            information: *mut core::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
+    use crate::win32::{GetFileInformationByHandleEx, GetFileType, GetLastError, SetLastError};
     const FILE_TYPE_UNKNOWN: u32 = 0;
     const FILE_TYPE_DISK: u32 = 1;
     const FILE_STANDARD_INFO: i32 = 1;
@@ -494,9 +480,7 @@ unsafe fn close(handle: NativeHandle) -> Result<(), Failure> {
 unsafe fn close(handle: NativeHandle) -> Result<(), Failure> {
     #[cfg(test)]
     record_close();
-    unsafe extern "system" {
-        fn CloseHandle(handle: NativeHandle) -> i32;
-    }
+    use crate::win32::CloseHandle;
     if CloseHandle(handle) != 0 {
         Ok(())
     } else {
@@ -720,15 +704,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_device_and_pipe_metadata_are_not_regular_files() {
-        unsafe extern "system" {
-            fn CreatePipe(
-                read: *mut super::NativeHandle,
-                write: *mut super::NativeHandle,
-                attributes: *mut core::ffi::c_void,
-                size: u32,
-            ) -> i32;
-            fn SetLastError(code: u32);
-        }
+        use crate::win32::{CreatePipe, SetLastError};
         let device = std::fs::File::open("NUL").unwrap();
         // A previous unrelated failure must not classify a valid device as an
         // invalid endpoint. Non-disk handles never reach FileStandardInfo.
@@ -837,24 +813,7 @@ mod tests {
     fn owned_handle_closes_explicitly_and_at_scope_exit() {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-        use super::NativeHandle;
-        unsafe extern "system" {
-            fn CreatePipe(
-                read: *mut NativeHandle,
-                write: *mut NativeHandle,
-                attributes: *mut core::ffi::c_void,
-                size: u32,
-            ) -> i32;
-            fn PeekNamedPipe(
-                pipe: NativeHandle,
-                buffer: *mut core::ffi::c_void,
-                length: u32,
-                read: *mut u32,
-                available: *mut u32,
-                remaining: *mut u32,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
+        use crate::win32::{CreatePipe, GetLastError, PeekNamedPipe};
 
         for explicit in [false, true] {
             unsafe {

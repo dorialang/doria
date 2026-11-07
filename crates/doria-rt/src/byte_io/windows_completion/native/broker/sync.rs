@@ -1,27 +1,17 @@
 //! Pinned, allocation-free Windows synchronization for the shared broker.
 
 use core::cell::UnsafeCell;
-use core::ffi::c_void;
 use core::marker::{PhantomData, PhantomPinned};
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use core::ptr;
 
 use crate::platform_io::{last_failure, Failure};
+use crate::win32::{
+    AcquireSRWLockExclusive, ConditionVariable as NativeCondition, ReleaseSRWLockExclusive,
+    SleepConditionVariableSRW, SrwLock as NativeLock, WakeAllConditionVariable,
+};
 
 const ERROR_TIMEOUT: i64 = 1460;
-
-// Windows SDK RTL_SRWLOCK/RTL_CONDITION_VARIABLE each contain one opaque
-// pointer, with an all-zero static initializer. Only native APIs mutate it.
-#[repr(C)]
-struct NativeLock {
-    pointer: *mut c_void,
-}
-
-#[repr(C)]
-struct NativeCondition {
-    pointer: *mut c_void,
-}
 
 /// Pins the native synchronization storage, not the protected value.
 /// Exclusive acquisition is nonrecursive and provides no fairness guarantee.
@@ -44,12 +34,8 @@ unsafe impl<T: Send> Sync for SyncCell<T> {}
 impl<T> SyncCell<T> {
     pub(super) const fn new(value: T) -> Self {
         Self {
-            lock: UnsafeCell::new(NativeLock {
-                pointer: ptr::null_mut(),
-            }),
-            condition: UnsafeCell::new(NativeCondition {
-                pointer: ptr::null_mut(),
-            }),
+            lock: UnsafeCell::new(NativeLock::new()),
+            condition: UnsafeCell::new(NativeCondition::new()),
             value: UnsafeCell::new(value),
             guards: UnsafeCell::new(0),
             _pin: PhantomPinned,
@@ -147,18 +133,6 @@ impl<T> Drop for Guard<'_, T> {
             ReleaseSRWLockExclusive(self.cell.lock.get());
         }
     }
-}
-
-unsafe extern "system" {
-    fn AcquireSRWLockExclusive(lock: *mut NativeLock);
-    fn ReleaseSRWLockExclusive(lock: *mut NativeLock);
-    fn SleepConditionVariableSRW(
-        condition: *mut NativeCondition,
-        lock: *mut NativeLock,
-        milliseconds: u32,
-        flags: u32,
-    ) -> i32;
-    fn WakeAllConditionVariable(condition: *mut NativeCondition);
 }
 
 #[cfg(test)]

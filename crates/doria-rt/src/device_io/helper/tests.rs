@@ -50,14 +50,7 @@ fn pipe() -> (OwnedHandle, OwnedHandle) {
     }
     #[cfg(windows)]
     unsafe {
-        unsafe extern "system" {
-            fn CreatePipe(
-                read: *mut NativeHandle,
-                write: *mut NativeHandle,
-                attributes: *mut core::ffi::c_void,
-                size: u32,
-            ) -> i32;
-        }
+        use crate::win32::CreatePipe;
         let (mut read, mut write) = (ptr::null_mut(), ptr::null_mut());
         assert_ne!(CreatePipe(&mut read, &mut write, ptr::null_mut(), 0), 0);
         assert!(crate::native_handle::require_synchronous_device(read).is_ok());

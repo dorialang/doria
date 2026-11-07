@@ -713,33 +713,6 @@ fn actual_pending_write_completes_after_peer_drains_exact_borrowed_bytes() {
     });
 }
 
-unsafe extern "system" {
-    fn GetHandleInformation(handle: NativeHandle, flags: *mut u32) -> i32;
-    fn CreateNamedPipeW(
-        name: *const u16,
-        access: u32,
-        mode: u32,
-        instances: u32,
-        output: u32,
-        input: u32,
-        timeout: u32,
-        attributes: *mut c_void,
-    ) -> NativeHandle;
-    fn ConnectNamedPipe(handle: NativeHandle, request: *mut c_void) -> i32;
-    fn CreateFileW(
-        name: *const u16,
-        access: u32,
-        sharing: u32,
-        attributes: *mut c_void,
-        creation: u32,
-        flags: u32,
-        template: NativeHandle,
-    ) -> NativeHandle;
-    fn GetNamedPipeInfo(
-        handle: NativeHandle,
-        flags: *mut u32,
-        output: *mut u32,
-        input: *mut u32,
-        instances: *mut u32,
-    ) -> i32;
-}
+use crate::win32::{
+    ConnectNamedPipe, CreateFileW, CreateNamedPipeW, GetHandleInformation, GetNamedPipeInfo,
+};

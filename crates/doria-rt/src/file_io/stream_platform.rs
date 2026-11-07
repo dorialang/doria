@@ -35,14 +35,7 @@ pub(super) fn seek(handle: NativeHandle, offset: i64, origin: SeekOrigin) -> Res
 
 #[cfg(windows)]
 pub(super) fn seek(handle: NativeHandle, offset: i64, origin: SeekOrigin) -> Result<u64, Failure> {
-    unsafe extern "system" {
-        fn SetFilePointerEx(
-            handle: NativeHandle,
-            offset: i64,
-            position: *mut i64,
-            origin: u32,
-        ) -> i32;
-    }
+    use crate::win32::SetFilePointerEx;
     let origin = match origin {
         SeekOrigin::Start => 0,
         SeekOrigin::Current => 1,
@@ -81,14 +74,7 @@ pub(super) fn set_length(handle: NativeHandle, length: i64) -> Result<(), Failur
     struct FileEndOfFileInfo {
         end_of_file: i64,
     }
-    unsafe extern "system" {
-        fn SetFileInformationByHandle(
-            handle: NativeHandle,
-            class: u32,
-            information: *mut core::ffi::c_void,
-            length: u32,
-        ) -> i32;
-    }
+    use crate::win32::SetFileInformationByHandle;
     let mut information = FileEndOfFileInfo {
         end_of_file: length,
     };
@@ -143,9 +129,7 @@ pub(super) fn sync(handle: NativeHandle, _metadata: bool) -> Result<(), Failure>
 
 #[cfg(windows)]
 pub(super) fn sync(handle: NativeHandle, _metadata: bool) -> Result<(), Failure> {
-    unsafe extern "system" {
-        fn FlushFileBuffers(handle: NativeHandle) -> i32;
-    }
+    use crate::win32::FlushFileBuffers;
     // Win32's documented primitive provides the stronger full-file sync.
     if unsafe { FlushFileBuffers(handle) } != 0 {
         Ok(())

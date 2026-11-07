@@ -186,41 +186,14 @@ fn platform_unlock(handle: NativeHandle) -> Result<(), Failure> {
     }
 }
 
+// Every lock covers the whole file: a request at offset zero for the maximum
+// length.
 #[cfg(windows)]
-#[repr(C)]
-struct LockRequest {
-    internal: usize,
-    internal_high: usize,
-    offset: u32,
-    offset_high: u32,
-    event: NativeHandle,
-}
-
-#[cfg(windows)]
-impl LockRequest {
-    fn whole_file() -> Self {
-        Self {
-            internal: 0,
-            internal_high: 0,
-            offset: 0,
-            offset_high: 0,
-            event: core::ptr::null_mut(),
-        }
-    }
-}
+use crate::win32::Overlapped;
 
 #[cfg(windows)]
 fn platform_try_lock(handle: NativeHandle, mode: LockMode) -> Result<bool, Failure> {
-    unsafe extern "system" {
-        fn LockFileEx(
-            handle: NativeHandle,
-            flags: u32,
-            reserved: u32,
-            length_low: u32,
-            length_high: u32,
-            request: *mut LockRequest,
-        ) -> i32;
-    }
+    use crate::win32::LockFileEx;
     const FAIL_IMMEDIATELY: u32 = 1;
     const EXCLUSIVE_LOCK: u32 = 2;
     const LOCK_VIOLATION: i64 = 33;
@@ -229,7 +202,7 @@ fn platform_try_lock(handle: NativeHandle, mode: LockMode) -> Result<bool, Failu
             LockMode::Shared => 0,
             LockMode::Exclusive => EXCLUSIVE_LOCK,
         };
-    let mut request = LockRequest::whole_file();
+    let mut request = Overlapped::new(core::ptr::null_mut());
     // FAIL_IMMEDIATELY keeps this request synchronous even on an overlapped
     // handle, so the kernel retains no pointer to this stack request.
     // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
@@ -246,31 +219,9 @@ fn platform_try_lock(handle: NativeHandle, mode: LockMode) -> Result<bool, Failu
 
 #[cfg(windows)]
 fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
-    unsafe extern "system" {
-        fn LockFileEx(
-            handle: NativeHandle,
-            flags: u32,
-            reserved: u32,
-            length_low: u32,
-            length_high: u32,
-            request: *mut LockRequest,
-        ) -> i32;
-        fn CreateEventW(
-            attributes: *mut core::ffi::c_void,
-            manual_reset: i32,
-            initial_state: i32,
-            name: *const u16,
-        ) -> NativeHandle;
-        fn WaitForSingleObject(handle: NativeHandle, milliseconds: u32) -> u32;
-        // The shared declaration's opaque request type (windows_completion).
-        fn GetOverlappedResult(
-            handle: NativeHandle,
-            request: *mut core::ffi::c_void,
-            transferred: *mut u32,
-            wait: i32,
-        ) -> i32;
-        fn CloseHandle(handle: NativeHandle) -> i32;
-    }
+    use crate::win32::{
+        CloseHandle, CreateEventW, GetOverlappedResult, LockFileEx, WaitForSingleObject,
+    };
     const EXCLUSIVE_LOCK: u32 = 2;
     const IO_PENDING: i64 = 997;
     const INFINITE: u32 = u32::MAX;
@@ -278,7 +229,7 @@ fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
         LockMode::Shared => 0,
         LockMode::Exclusive => EXCLUSIVE_LOCK,
     };
-    let event = unsafe { CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+    let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
     if event.is_null() {
         return Err(crate::platform_io::last_failure());
     }
@@ -287,8 +238,7 @@ fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
     // associated with; this function waits for it before the request leaves
     // the stack.
     // https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus
-    let mut request = LockRequest::whole_file();
-    request.event = (event as usize | 1) as NativeHandle;
+    let mut request = Overlapped::new((event as usize | 1) as NativeHandle);
     let result = if unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut request) } != 0 {
         Ok(())
     } else {
@@ -296,7 +246,7 @@ fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
         if failure.system_code == Some(IO_PENDING) {
             let mut transferred = 0;
             unsafe { WaitForSingleObject(event, INFINITE) };
-            let pending = core::ptr::addr_of_mut!(request).cast();
+            let pending = core::ptr::addr_of_mut!(request);
             if unsafe { GetOverlappedResult(handle, pending, &mut transferred, 0) } != 0 {
                 Ok(())
             } else {
@@ -312,16 +262,8 @@ fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
 
 #[cfg(windows)]
 fn platform_unlock(handle: NativeHandle) -> Result<(), Failure> {
-    unsafe extern "system" {
-        fn UnlockFileEx(
-            handle: NativeHandle,
-            reserved: u32,
-            length_low: u32,
-            length_high: u32,
-            request: *mut LockRequest,
-        ) -> i32;
-    }
-    let mut request = LockRequest::whole_file();
+    use crate::win32::UnlockFileEx;
+    let mut request = Overlapped::new(core::ptr::null_mut());
     if unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut request) } != 0 {
         Ok(())
     } else {

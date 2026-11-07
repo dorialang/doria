@@ -8,6 +8,13 @@ use core::{ffi::c_void, mem, ptr};
 use super::Request;
 use crate::native_handle::{NativeHandle, OwnedHandle};
 use crate::platform_io::{last_failure, Failure};
+use crate::win32::{
+    CloseHandle, CreatePipe, CreateProcessW, CreateThread, DeleteProcThreadAttributeList,
+    FreeEnvironmentStringsW, GetEnvironmentStringsW, GetEnvironmentVariableW, GetExitCodeProcess,
+    GetFileAttributesW, GetLastError, InitializeProcThreadAttributeList, ProcessInformation,
+    ReadFile, SecurityAttributes, SetHandleInformation, StartupInfoEx, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
+};
 use crate::DrStackFrameV2;
 
 pub(super) const SHELL: &[u8] = b"cmd.exe";
@@ -27,112 +34,6 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 const ERROR_BROKEN_PIPE: u32 = 109;
 const ERROR_FILE_NOT_FOUND: i64 = 2;
-
-#[repr(C)]
-struct SecurityAttributes {
-    length: u32,
-    descriptor: *mut c_void,
-    inherit: i32,
-}
-
-#[repr(C)]
-struct StartupInfo {
-    cb: u32,
-    reserved: *mut u16,
-    desktop: *mut u16,
-    title: *mut u16,
-    x: u32,
-    y: u32,
-    x_size: u32,
-    y_size: u32,
-    x_count_chars: u32,
-    y_count_chars: u32,
-    fill_attribute: u32,
-    flags: u32,
-    show_window: u16,
-    reserved2_count: u16,
-    reserved2: *mut u8,
-    input: Handle,
-    output: Handle,
-    error: Handle,
-}
-
-#[repr(C)]
-struct StartupInfoEx {
-    startup: StartupInfo,
-    attributes: *mut c_void,
-}
-
-#[repr(C)]
-struct ProcessInformation {
-    process: Handle,
-    thread: Handle,
-    process_id: u32,
-    thread_id: u32,
-}
-
-unsafe extern "system" {
-    fn CreatePipe(
-        read: *mut Handle,
-        write: *mut Handle,
-        attributes: *const SecurityAttributes,
-        size: u32,
-    ) -> i32;
-    fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
-    fn CreateProcessW(
-        application: *const u16,
-        command_line: *mut u16,
-        process_attributes: *const SecurityAttributes,
-        thread_attributes: *const SecurityAttributes,
-        inherit: i32,
-        flags: u32,
-        environment: *const c_void,
-        directory: *const u16,
-        startup: *const StartupInfo,
-        information: *mut ProcessInformation,
-    ) -> i32;
-    fn InitializeProcThreadAttributeList(
-        list: *mut c_void,
-        count: u32,
-        flags: u32,
-        size: *mut usize,
-    ) -> i32;
-    fn UpdateProcThreadAttribute(
-        list: *mut c_void,
-        flags: u32,
-        attribute: usize,
-        value: *const c_void,
-        size: usize,
-        previous: *mut c_void,
-        returned: *mut usize,
-    ) -> i32;
-    fn DeleteProcThreadAttributeList(list: *mut c_void);
-    fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
-    fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
-    fn TerminateProcess(process: Handle, code: u32) -> i32;
-    fn CloseHandle(handle: Handle) -> i32;
-    fn GetEnvironmentStringsW() -> *mut u16;
-    fn FreeEnvironmentStringsW(block: *mut u16) -> i32;
-    fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
-    fn GetFileAttributesW(path: *const u16) -> u32;
-    fn ReadFile(
-        file: Handle,
-        buffer: *mut c_void,
-        length: u32,
-        read: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
-    // Matches device_io::helper's declaration of the same import.
-    fn CreateThread(
-        attributes: *mut c_void,
-        stack: usize,
-        start: extern "system" fn(*mut c_void) -> u32,
-        parameter: *mut c_void,
-        flags: u32,
-        id: *mut u32,
-    ) -> Handle;
-    fn GetLastError() -> u32;
-}
 
 pub(crate) struct Process {
     handle: Handle,

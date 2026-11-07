@@ -17,9 +17,7 @@ pub(super) fn length(handle: NativeHandle) -> Result<u64, Failure> {
 
 #[cfg(windows)]
 pub(super) fn length(handle: NativeHandle) -> Result<u64, Failure> {
-    unsafe extern "system" {
-        fn GetFileSizeEx(handle: NativeHandle, length: *mut i64) -> i32;
-    }
+    use crate::win32::GetFileSizeEx;
     let mut length = 0;
     if unsafe { GetFileSizeEx(handle, &mut length) } == 0 {
         Err(crate::platform_io::last_failure())

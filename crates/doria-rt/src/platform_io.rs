@@ -91,9 +91,7 @@ pub(crate) fn last_system_code() -> i64 {
 
 #[cfg(windows)]
 pub(crate) fn last_system_code() -> i64 {
-    unsafe extern "system" {
-        fn GetLastError() -> u32;
-    }
+    use crate::win32::GetLastError;
     unsafe { i64::from(GetLastError()) }
 }
 

@@ -47,11 +47,7 @@ fn process_entropy() -> u64 {
     }
     #[cfg(windows)]
     unsafe {
-        #[link(name = "bcrypt")]
-        unsafe extern "system" {
-            fn BCryptGenRandom(algorithm: *mut u8, buffer: *mut u8, length: u32, flags: u32)
-                -> i32;
-        }
+        use crate::win32::BCryptGenRandom;
         if BCryptGenRandom(ptr::null_mut(), (&mut seed as *mut u64).cast(), 8, 2) < 0 {
             collection_panic(b"P1001");
         }

@@ -479,14 +479,7 @@ fn registered_append_owner_keeps_cursor_and_dispatches_empty_adapter_call() {
 
 #[test]
 fn non_disk_and_wrong_direction_reject_before_io_and_callback_cancellation_stops_later_slot() {
-    unsafe extern "system" {
-        fn CreatePipe(
-            read: *mut NativeHandle,
-            write: *mut NativeHandle,
-            security: *mut c_void,
-            size: u32,
-        ) -> i32;
-    }
+    use crate::win32::CreatePipe;
     let fixture_a = Fixture::new(b"ab");
     let fixture_b = Fixture::new(b"cd");
     let a = Metered::new(fixture_a.open(false));

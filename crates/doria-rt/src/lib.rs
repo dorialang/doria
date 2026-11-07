@@ -37,6 +37,8 @@ mod transfer_group;
 mod unix_readiness;
 mod utf8_stream;
 mod wait_budget;
+#[cfg(any(windows, test))]
+mod win32;
 
 use device_io::{StandardStream, WriteOutcome};
 
@@ -4647,10 +4649,7 @@ extern "C" {
 }
 
 #[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetEnvironmentVariableA(name: *const u8, buffer: *mut u8, size: u32) -> u32;
-}
+use win32::GetEnvironmentVariableA;
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
 // memory operations, string scans, and floating-point use to these support symbols. The runtime
@@ -4840,12 +4839,7 @@ pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usi
 }
 
 #[cfg(windows)]
-extern "system" {
-    fn GetProcessHeap() -> *mut c_void;
-    fn HeapAlloc(heap: *mut c_void, flags: u32, byte_length: usize) -> *mut c_void;
-    fn HeapFree(heap: *mut c_void, flags: u32, memory: *mut c_void) -> i32;
-    fn ExitProcess(status: u32) -> !;
-}
+use win32::{ExitProcess, GetProcessHeap, HeapAlloc, HeapFree};
 
 #[cfg(all(not(test), panic = "abort"))]
 #[panic_handler]

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use core::ffi::c_void;
+
 use super::*;
 
 const TEST_WAIT: Duration = Duration::from_secs(5);
@@ -48,8 +50,8 @@ fn native_storage_has_sdk_pointer_layout_and_zero_initializer() {
         core::mem::align_of::<*mut c_void>()
     );
     let cell = SyncCell::new(());
-    assert!(unsafe { (*cell.lock.get()).pointer }.is_null());
-    assert!(unsafe { (*cell.condition.get()).pointer }.is_null());
+    assert!(unsafe { NativeLock::is_initial(cell.lock.get()) });
+    assert!(unsafe { NativeCondition::is_initial(cell.condition.get()) });
 }
 
 #[test]

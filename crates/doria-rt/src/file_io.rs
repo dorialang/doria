@@ -351,18 +351,7 @@ pub(crate) unsafe fn remove_file(_path: &[u8]) -> Result<(), FileError> {
 }
 
 #[cfg(windows)]
-extern "system" {
-    fn CreateFileW(
-        name: *const u16,
-        access: u32,
-        share: u32,
-        security: *mut c_void,
-        creation: u32,
-        attributes: u32,
-        template: *mut c_void,
-    ) -> *mut c_void;
-    fn DeleteFileW(name: *const u16) -> i32;
-}
+use crate::win32::{CreateFileW, DeleteFileW};
 
 #[cfg(test)]
 mod tests {

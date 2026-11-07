@@ -162,19 +162,16 @@ mod wake_lock {
         }
     }
 
-    // SDK RTL_SRWLOCK is one PVOID member; RTL_SRWLOCK_INIT is {0}.
-    // Its opaque storage is managed exclusively by the SRW API below.
+    // SRWLOCK and CONDITION_VARIABLE are opaque words that only the SRW API
+    // below reads or writes.
     #[cfg(windows)]
-    #[repr(C)]
-    struct NativeLock {
-        pointer: *mut core::ffi::c_void,
-    }
+    type NativeLock = crate::win32::SrwLock;
 
     #[cfg(windows)]
-    type NativeCondition = NativeLock;
+    type NativeCondition = crate::win32::ConditionVariable;
     #[cfg(windows)]
     const fn condition_new() -> NativeCondition {
-        native_new()
+        NativeCondition::new()
     }
     #[cfg(windows)]
     unsafe fn condition_wait(condition: *mut NativeCondition, lock: *mut NativeLock) {
@@ -191,9 +188,7 @@ mod wake_lock {
 
     #[cfg(windows)]
     const fn native_new() -> NativeLock {
-        NativeLock {
-            pointer: core::ptr::null_mut(),
-        }
+        NativeLock::new()
     }
 
     #[cfg(windows)]
@@ -211,17 +206,10 @@ mod wake_lock {
     unsafe fn native_destroy(_: *mut NativeLock) {}
 
     #[cfg(windows)]
-    unsafe extern "system" {
-        fn AcquireSRWLockExclusive(lock: *mut NativeLock);
-        fn ReleaseSRWLockExclusive(lock: *mut NativeLock);
-        fn SleepConditionVariableSRW(
-            condition: *mut NativeCondition,
-            lock: *mut NativeLock,
-            timeout: u32,
-            flags: u32,
-        ) -> i32;
-        fn WakeAllConditionVariable(condition: *mut NativeCondition);
-    }
+    use crate::win32::{
+        AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SleepConditionVariableSRW,
+        WakeAllConditionVariable,
+    };
 
     #[cfg(test)]
     mod tests {
@@ -557,7 +545,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use core::ffi::c_void;
+    use crate::win32::{CreateEventW, SetEvent};
     use core::ptr;
 
     pub(super) fn create() -> Result<usize, Failure> {
@@ -577,21 +565,9 @@ mod platform {
         }
     }
 
-    unsafe extern "system" {
-        fn CreateEventW(
-            attributes: *mut c_void,
-            manual_reset: i32,
-            initial_state: i32,
-            name: *const u16,
-        ) -> NativeHandle;
-        fn SetEvent(handle: NativeHandle) -> i32;
-    }
-
     #[cfg(test)]
     pub(super) fn wait_for_test(signal: usize, milliseconds: u32) -> Result<bool, Failure> {
-        unsafe extern "system" {
-            fn WaitForSingleObject(handle: NativeHandle, milliseconds: u32) -> u32;
-        }
+        use crate::win32::WaitForSingleObject;
         match unsafe { WaitForSingleObject(native_handle(signal), milliseconds) } {
             0 => Ok(true),
             258 => Ok(false),

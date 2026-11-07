@@ -1413,3 +1413,58 @@ Two Windows failures are outside this change:
   declare it with `*mut c_void`. doria-rt has no single owner for Win32
   bindings: 24 files hold 44 separate `extern "system"` blocks.
   Giving `CreatePipe`, and the bindings like it, one declaration is the fix.
+
+### Win32 bindings get one owner (2026-11-07)
+
+Windows clippy failed on `clashing_extern_declarations`. Two declarations of
+one foreign symbol bind to the same function, so when they disagree they
+describe one call two ways. The lint caught one instance, `CreatePipe`. The
+cause was ownership: 24 files declared their own Win32 imports in 44 blocks.
+`GetLastError` appeared 8 times, `WaitForSingleObject` 5 and `CreatePipe` 6.
+Three modules each defined `OVERLAPPED` (`windows_completion::Overlapped`,
+a local struct in `byte_io` `append` and `locking::LockRequest`), and two
+defined `SRWLOCK` and `CONDITION_VARIABLE`.
+
+**Chosen:** `crates/doria-rt/src/win32.rs` declares each Win32 import the
+runtime and its tests call once, with SDK parameter types:
+
+- `_In_` structures are `*const`, buffers and out-parameters `*mut`, handles
+  `NativeHandle`.
+- The structures those signatures name live there too: `Overlapped`,
+  `SecurityAttributes`, `SrwLock`, `ConditionVariable`, `StartupInfo`,
+  `StartupInfoEx`, `ProcessInformation` and the `ThreadStart` entry type.
+- Every runtime and test module imports from it. No `extern "system"`
+  import block remains elsewhere in `doria-rt`.
+- Each binding carries its users' `cfg`, so `dead_code` still reports an
+  unused binding. The seven called only from tests are `#[cfg(test)]`.
+- `Overlapped` keeps `UnsafeCell` for the kernel-written words and stays
+  `!Unpin`. It uses `PhantomData<PhantomPinned>` because `PhantomPinned`
+  itself trips `improper_ctypes` once the type appears in extern signatures.
+- `SrwLock` and `ConditionVariable` keep their word private. A test-only
+  `is_initial` replaces the broker sync test's direct field read.
+
+doriac's three Windows imports (`CompareStringOrdinal`,
+`GetFileInformationByHandle`, `MoveFileExW` in `main.rs`) are each declared
+once, and doria-time's are separate crates' own. Neither crate needs a
+change.
+
+| Option | Pros | Cons |
+|---|---|---|
+| One owner module (chosen) | One signature per import, so drift cannot recur; one definition of each shared Win32 structure; the compiler checks every caller against it | A cross-cutting change to 24 files; bindings carry `cfg` gates that mirror their callers |
+| Align `CreatePipe`'s signatures only | Smallest diff | Leaves the 44 private copies to drift again; the next clash is found the same late way |
+| `#[allow(clashing_extern_declarations)]` | One line | Hides a real ABI ambiguity rather than removing it |
+| The `windows-sys` crate | Generated, complete SDK bindings | A new dependency, which needs Andrew, the network and a lock change; much larger than the 64 imports used |
+
+On the Windows test abort: no binding changed its ABI. Every old declaration
+already had the SDK arity and register-compatible parameter types. The
+single `CreatePipe` mismatch was `*const` against `*mut`, which is
+ABI-identical. So the binding drift does not explain
+`STATUS_STACK_BUFFER_OVERRUN`.
+
+A runtime panic exits with status 101 (`ExitProcess`), not `0xc0000409`. So
+the abort is a Rust panic inside a non-unwinding `extern "C"` function,
+either a `dr_v1_*` entry point or a test callback. libtest captures the panic
+message, and the abort discards it, which is why the log names no test. The
+test undefined behavior fixed in the previous section ran assertions inside
+exactly such callbacks, so CI on `42a7ad5` shows whether the abort survived
+that fix.

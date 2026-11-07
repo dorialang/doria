@@ -320,10 +320,7 @@ fn require_file(origin: crate::native_handle::PhysicalOrigin) -> Result<(), Fail
 }
 
 fn validate_source(source: NativeHandle) -> Result<(), Failure> {
-    unsafe extern "system" {
-        fn GetFileType(handle: NativeHandle) -> u32;
-        fn GetLastError() -> u32;
-    }
+    use crate::win32::{GetFileType, GetLastError};
     // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletype
     // UNKNOWN with a last error is a checked handle failure, not a disk default.
     match unsafe { GetFileType(source) } {

@@ -786,25 +786,7 @@ extern "C" {
 }
 
 #[cfg(windows)]
-extern "system" {
-    fn GetStdHandle(standard_handle: u32) -> *mut c_void;
-    fn GetLastError() -> u32;
-    fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
-    fn ReadConsoleW(
-        handle: *mut c_void,
-        buffer: *mut c_void,
-        characters: u32,
-        read: *mut u32,
-        input_control: *mut c_void,
-    ) -> i32;
-    fn WriteConsoleW(
-        handle: *mut c_void,
-        buffer: *const c_void,
-        characters: u32,
-        written: *mut u32,
-        reserved: *mut c_void,
-    ) -> i32;
-}
+use crate::win32::{GetConsoleMode, GetLastError, GetStdHandle, ReadConsoleW, WriteConsoleW};
 
 #[cfg(test)]
 mod tests {

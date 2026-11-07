@@ -160,10 +160,7 @@ fn inherited_alias_child() {
         #[cfg(unix)]
         assert_eq!(libc::dup2(1, 2), 2);
         #[cfg(windows)]
-        unsafe extern "system" {
-            fn GetStdHandle(which: u32) -> crate::native_handle::NativeHandle;
-            fn SetStdHandle(which: u32, handle: crate::native_handle::NativeHandle) -> i32;
-        }
+        use crate::win32::{GetStdHandle, SetStdHandle};
         #[cfg(windows)]
         let control = GetStdHandle(-12i32 as u32);
         #[cfg(windows)]

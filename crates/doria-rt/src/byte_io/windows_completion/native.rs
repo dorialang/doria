@@ -11,6 +11,10 @@ use crate::native_handle::{NativeHandle, OwnedHandle};
 use crate::platform_io::{last_failure, Reason};
 use crate::transfer_group::DrCompletionStatusV1;
 use crate::wait_budget::{self, DrWaitBudgetV1};
+use crate::win32::{
+    CancelIoEx, CreateEventW, GetLastError, GetOverlappedResult, ReadFile, WaitForMultipleObjects,
+    WaitForSingleObject, WriteFile,
+};
 
 const INFINITE: u32 = u32::MAX;
 const IO_PENDING: u32 = 997;
@@ -441,42 +445,4 @@ pub unsafe extern "C" fn dr_v1_windows_pipe_close(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_windows_pipe_drop(owner: *mut c_void) {
     ptr::drop_in_place(owner.cast::<Pipe<WindowsDriver>>());
-}
-
-unsafe extern "system" {
-    fn CreateEventW(
-        attributes: *mut c_void,
-        manual_reset: i32,
-        initial_state: i32,
-        name: *const u16,
-    ) -> NativeHandle;
-    fn ReadFile(
-        handle: NativeHandle,
-        buffer: *mut c_void,
-        length: u32,
-        count: *mut u32,
-        request: *mut c_void,
-    ) -> i32;
-    fn WriteFile(
-        handle: NativeHandle,
-        buffer: *const c_void,
-        length: u32,
-        count: *mut u32,
-        request: *mut c_void,
-    ) -> i32;
-    fn GetOverlappedResult(
-        handle: NativeHandle,
-        request: *mut c_void,
-        count: *mut u32,
-        wait: i32,
-    ) -> i32;
-    fn CancelIoEx(handle: NativeHandle, request: *mut c_void) -> i32;
-    fn WaitForMultipleObjects(
-        count: u32,
-        handles: *const NativeHandle,
-        all: i32,
-        timeout: u32,
-    ) -> u32;
-    fn WaitForSingleObject(handle: NativeHandle, timeout: u32) -> u32;
-    fn GetLastError() -> u32;
 }

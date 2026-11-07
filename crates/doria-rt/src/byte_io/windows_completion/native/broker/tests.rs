@@ -1184,10 +1184,7 @@ fn broker_is_lazy_shared_by_stream_owners_and_released_after_last_owner() {
     assert_eq!(lifecycle_snapshot(), (0, 0));
 }
 
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn SetEvent(event: NativeHandle) -> i32;
-}
+use crate::win32::SetEvent;
 
 #[test]
 fn reversed_noncontiguous_subset_preserves_native_slots_and_unused_stream_data() {

@@ -1,5 +1,3 @@
-use core::ffi::c_void;
-
 pub(crate) use crate::native_handle::NativeHandle;
 use crate::platform_io::Failure;
 
@@ -180,6 +178,7 @@ pub(crate) fn write_all_with_wait<E>(
 
 #[cfg(unix)]
 mod platform {
+    use core::ffi::c_void;
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
@@ -295,6 +294,7 @@ mod platform {
     use core::ptr;
 
     use super::*;
+    use crate::win32::{GetFileType, GetLastError, Overlapped, ReadFile, WriteFile};
 
     pub(super) unsafe fn read(
         handle: NativeHandle,
@@ -342,32 +342,18 @@ mod platform {
         source: *const u8,
         length: usize,
     ) -> Result<WriteProgress, Failure> {
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset: u32,
-            offset_high: u32,
-            event: *mut c_void,
-        }
-        let mut operation = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset: u32::MAX,
-            offset_high: u32::MAX,
-            event: ptr::null_mut(),
-        };
+        let mut operation = Overlapped::at(u64::MAX, ptr::null_mut());
         // Win32 explicitly supports this EOF offset on synchronous handles.
         // WriteFile completes and updates the file pointer before returning;
         // neither the stack operation nor caller region escapes this call.
-        write_at(handle, source, length, (&raw mut operation).cast())
+        write_at(handle, source, length, &raw mut operation)
     }
 
     unsafe fn write_at(
         handle: NativeHandle,
         source: *const u8,
         length: usize,
-        operation: *mut c_void,
+        operation: *mut Overlapped,
     ) -> Result<WriteProgress, Failure> {
         let mut count = 0;
         let requested = length.min(u32::MAX as usize);
@@ -389,25 +375,6 @@ mod platform {
         } else {
             Ok(WriteProgress::Accepted(count as usize))
         }
-    }
-
-    unsafe extern "system" {
-        fn GetLastError() -> u32;
-        fn GetFileType(handle: *mut c_void) -> u32;
-        fn ReadFile(
-            handle: *mut c_void,
-            destination: *mut c_void,
-            capacity: u32,
-            count: *mut u32,
-            overlapped: *mut c_void,
-        ) -> i32;
-        fn WriteFile(
-            handle: *mut c_void,
-            source: *const c_void,
-            length: u32,
-            count: *mut u32,
-            overlapped: *mut c_void,
-        ) -> i32;
     }
 }
 
@@ -744,25 +711,13 @@ mod tests {
     fn windows_pipe_distinguishes_empty_requests_data_and_closed_writer_eof() {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-        unsafe extern "system" {
-            fn CreatePipe(
-                read: *mut NativeHandle,
-                write: *mut NativeHandle,
-                attributes: *mut c_void,
-                size: u32,
-            ) -> i32;
-        }
+        use crate::win32::CreatePipe;
 
         unsafe {
             let mut read_handle = core::ptr::null_mut();
             let mut write_handle = core::ptr::null_mut();
             assert_ne!(
-                CreatePipe(
-                    &mut read_handle,
-                    &mut write_handle,
-                    core::ptr::null_mut(),
-                    0
-                ),
+                CreatePipe(&mut read_handle, &mut write_handle, core::ptr::null(), 0),
                 0
             );
             let reader = OwnedHandle::from_raw_handle(read_handle);
@@ -794,25 +749,7 @@ mod tests {
     fn windows_nonblocking_pipe_exposes_backpressure_and_resumes_without_replay() {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-        unsafe extern "system" {
-            fn CreateNamedPipeW(
-                name: *const u16,
-                access: u32,
-                mode: u32,
-                instances: u32,
-                output_size: u32,
-                input_size: u32,
-                timeout: u32,
-                attributes: *mut c_void,
-            ) -> NativeHandle;
-            fn ConnectNamedPipe(pipe: NativeHandle, overlapped: *mut c_void) -> i32;
-            fn SetNamedPipeHandleState(
-                pipe: NativeHandle,
-                mode: *const u32,
-                collection_count: *const u32,
-                collection_timeout: *const u32,
-            ) -> i32;
-        }
+        use crate::win32::{ConnectNamedPipe, CreateNamedPipeW, SetNamedPipeHandleState};
 
         let name = format!(
             r"\\.\pipe\doria-byte-io-backpressure-{}",

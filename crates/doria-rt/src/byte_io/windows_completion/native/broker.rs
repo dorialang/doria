@@ -421,24 +421,4 @@ impl Drop for AttachedStream {
     }
 }
 
-unsafe extern "system" {
-    fn CreateIoCompletionPort(
-        handle: NativeHandle,
-        port: NativeHandle,
-        key: usize,
-        concurrency: u32,
-    ) -> NativeHandle;
-    fn GetQueuedCompletionStatus(
-        port: NativeHandle,
-        count: *mut u32,
-        key: *mut usize,
-        request: *mut *mut c_void,
-        timeout: u32,
-    ) -> i32;
-    fn PostQueuedCompletionStatus(
-        port: NativeHandle,
-        count: u32,
-        key: usize,
-        request: *mut c_void,
-    ) -> i32;
-}
+use crate::win32::{CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus};

@@ -140,10 +140,7 @@ fn typed_creation_modes_preserve_or_replace_exact_file_contents() {
 #[cfg(any(unix, windows))]
 fn every_accepted_file_open_request_creates_a_noninheritable_owner() {
     #[cfg(windows)]
-    unsafe extern "system" {
-        fn GetHandleInformation(handle: crate::native_handle::NativeHandle, flags: *mut u32)
-            -> i32;
-    }
+    use crate::win32::GetHandleInformation;
     #[cfg(windows)]
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
 

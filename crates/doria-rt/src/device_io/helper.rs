@@ -365,16 +365,5 @@ mod platform {
         }
         0
     }
-    unsafe extern "system" {
-        fn CreateThread(
-            attributes: *mut core::ffi::c_void,
-            stack: usize,
-            start: extern "system" fn(*mut core::ffi::c_void) -> u32,
-            context: *mut core::ffi::c_void,
-            flags: u32,
-            id: *mut u32,
-        ) -> NativeHandle;
-        fn CancelSynchronousIo(thread: NativeHandle) -> i32;
-        fn WaitForSingleObject(handle: NativeHandle, timeout: u32) -> u32;
-    }
+    use crate::win32::{CancelSynchronousIo, CreateThread, WaitForSingleObject};
 }
