@@ -20,7 +20,7 @@ doria-diagnostic-catalogue = { path = "../doria-diagnostic-catalogue" }
 doria-time = { path = "../doria-time" }
 doria-unicode = { path = "../doria-unicode" }
 ryu.workspace = true
-unicode-width = { version = "=0.2.2", default-features = false, features = ["cjk", "no_std"] }
+unicode-width = { version = "=0.2.3", default-features = false, features = ["cjk", "no_std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "=0.2.186", default-features = false }
