@@ -34,6 +34,8 @@ mod process;
 mod string_ops;
 #[cfg(test)]
 mod test_callback;
+#[cfg(test)]
+mod test_report;
 mod transfer_group;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_readiness;

@@ -539,7 +539,7 @@ mod tests {
         crate::with_runtime_allocation_failure(0, || {});
         let source = Claim::new();
         assert!(!source.cancelled());
-        let panic = std::panic::catch_unwind(|| {
+        let panic = crate::test_report::expect_panic(|| {
             crate::with_runtime_allocation_failure(0, || panic!("test probe reset"));
         });
         assert!(panic.is_err());

@@ -7,8 +7,8 @@ use core::pin::Pin;
 
 use crate::platform_io::{last_failure, Failure};
 use crate::win32::{
-    AcquireSRWLockExclusive, ConditionVariable as NativeCondition, ReleaseSRWLockExclusive,
-    SleepConditionVariableSRW, SrwLock as NativeLock, WakeAllConditionVariable,
+    sleep_condition_variable, AcquireSRWLockExclusive, ConditionVariable as NativeCondition,
+    ReleaseSRWLockExclusive, SrwLock as NativeLock, WakeAllConditionVariable,
 };
 
 const ERROR_TIMEOUT: i64 = 1460;
@@ -88,11 +88,11 @@ impl<T> Guard<'_, T> {
     /// protected predicate must be checked again after either result.
     pub(super) fn wait(&mut self, milliseconds: u32) -> Result<bool, Failure> {
         let success = unsafe {
-            SleepConditionVariableSRW(
+            sleep_condition_variable(
                 self.cell.condition.get(),
                 self.cell.lock.get(),
                 milliseconds,
-                0,
+                "another group's broker pump to publish this group's completion",
             )
         };
         if success != 0 {

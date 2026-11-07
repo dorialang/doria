@@ -767,7 +767,7 @@ impl TestEvent {
     }
 
     fn wait(&self) -> bool {
-        unsafe { WaitForSingleObject(self.0.get(), 5000) == 0 }
+        unsafe { wait_for_single_object(self.0.get(), 5000, "a test event") == 0 }
     }
 }
 

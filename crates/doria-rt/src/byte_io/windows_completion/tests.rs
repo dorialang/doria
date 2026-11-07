@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use super::*;
@@ -567,7 +567,7 @@ fn cleanup_is_armed_before_submit_and_drains_during_host_unwind() {
         }
         let mut pipe = Pipe { driver };
         let mut bytes = BorrowedStorage::new(&state);
-        assert!(catch_unwind(AssertUnwindSafe(|| {
+        assert!(crate::test_report::expect_panic(AssertUnwindSafe(|| {
             pipe.transfer(
                 Buffer::Read(&mut bytes.bytes),
                 &mut ScriptControl::new(steps),

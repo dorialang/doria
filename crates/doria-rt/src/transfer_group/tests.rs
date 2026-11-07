@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use super::*;
@@ -511,7 +511,7 @@ fn consuming_fixed_storage_unwind_never_redrops_moved_values() {
             })
             .unwrap();
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = crate::test_report::expect_panic(std::panic::AssertUnwindSafe(|| {
         let mut values = storage.into_iter();
         drop(values.next().unwrap());
         drop(values.next_back().unwrap());
@@ -951,7 +951,7 @@ fn armed_group_cleanup_covers_later_submission_query_wait_and_control_host_unwin
             2 => driver.unwind_wait = true,
             _ => {}
         }
-        assert!(catch_unwind(AssertUnwindSafe(|| {
+        assert!(crate::test_report::expect_panic(AssertUnwindSafe(|| {
             let buffers = BufferList::from_iter(
                 [
                     Buffer::Read(&mut first.bytes),

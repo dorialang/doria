@@ -9,11 +9,11 @@ use super::Request;
 use crate::native_handle::{NativeHandle, OwnedHandle};
 use crate::platform_io::{last_failure, Failure};
 use crate::win32::{
-    CloseHandle, CreatePipe, CreateProcessW, CreateThread, DeleteProcThreadAttributeList,
-    FreeEnvironmentStringsW, GetEnvironmentStringsW, GetEnvironmentVariableW, GetExitCodeProcess,
-    GetFileAttributesW, GetLastError, InitializeProcThreadAttributeList, ProcessInformation,
-    ReadFile, SecurityAttributes, SetHandleInformation, StartupInfoEx, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    wait_for_single_object, CloseHandle, CreatePipe, CreateProcessW, CreateThread,
+    DeleteProcThreadAttributeList, FreeEnvironmentStringsW, GetEnvironmentStringsW,
+    GetEnvironmentVariableW, GetExitCodeProcess, GetFileAttributesW, GetLastError,
+    InitializeProcThreadAttributeList, ProcessInformation, ReadFile, SecurityAttributes,
+    SetHandleInformation, StartupInfoEx, TerminateProcess, UpdateProcThreadAttribute, INFINITE,
 };
 use crate::DrStackFrameV2;
 
@@ -21,7 +21,6 @@ pub(super) const SHELL: &[u8] = b"cmd.exe";
 
 type Handle = *mut c_void;
 
-const INFINITE: u32 = 0xFFFF_FFFF;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 const STILL_ACTIVE: u32 = 259;
@@ -59,7 +58,8 @@ unsafe fn exit_code(process: &Process) -> Result<u32, Failure> {
 }
 
 pub(super) unsafe fn wait(process: &mut Process) -> Result<i64, Failure> {
-    if WaitForSingleObject(process.handle, INFINITE) != WAIT_OBJECT_0 {
+    if wait_for_single_object(process.handle, INFINITE, "a child process to exit") != WAIT_OBJECT_0
+    {
         return Err(last_failure());
     }
     Ok(i64::from(exit_code(process)?))
@@ -80,7 +80,7 @@ pub(super) unsafe fn wait_until(
             3 => 0,
             _ => milliseconds as u32,
         };
-        match WaitForSingleObject(process.handle, timeout) {
+        match wait_for_single_object(process.handle, timeout, "a child process to exit") {
             WAIT_OBJECT_0 => return Ok(Some(i64::from(exit_code(process)?))),
             WAIT_TIMEOUT if kind == 3 || kind == 0 => return Ok(None),
             WAIT_TIMEOUT => continue,
@@ -168,7 +168,11 @@ pub(super) unsafe fn drain<'a>(
     };
     let output_failure = handles[0].and_then(|handle| read_to_end(handle, output));
     if let Some(thread) = thread {
-        WaitForSingleObject(thread, INFINITE);
+        wait_for_single_object(
+            thread,
+            INFINITE,
+            "the child's error-output drain thread to exit",
+        );
         CloseHandle(thread);
     }
     if let Some(failure) = output_failure {

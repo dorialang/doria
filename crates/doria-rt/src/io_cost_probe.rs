@@ -63,7 +63,7 @@ fn nested_intervals_and_unwind_preserve_scoped_counts() {
             record(Operation::SignalCreate);
         });
         assert_eq!(inner, [0, 1, 1, 1, 1, 1]);
-        assert!(std::panic::catch_unwind(|| measure(|| {
+        assert!(crate::test_report::expect_panic(|| measure(|| {
             record(Operation::ClockRead);
             panic!("probe cleanup");
         }))
@@ -76,7 +76,9 @@ fn nested_intervals_and_unwind_preserve_scoped_counts() {
         );
     });
     assert_eq!(total, [2, 1, 1, 1, 1, 1]);
-    assert!(std::panic::catch_unwind(|| measure(|| panic!("outer probe cleanup"))).is_err());
+    assert!(
+        crate::test_report::expect_panic(|| measure(|| panic!("outer probe cleanup"))).is_err()
+    );
     assert_eq!(measure(|| ()).1, [0; COUNT]);
 }
 

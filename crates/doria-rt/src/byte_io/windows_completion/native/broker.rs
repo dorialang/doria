@@ -235,7 +235,14 @@ impl Broker {
     fn receive(&self, timeout: u32) -> Result<Wake, Failure> {
         let (mut count, mut key, mut request) = (0, 0, ptr::null_mut());
         let success = unsafe {
-            GetQueuedCompletionStatus(self.port.get(), &mut count, &mut key, &mut request, timeout)
+            get_queued_completion_status(
+                self.port.get(),
+                &mut count,
+                &mut key,
+                &mut request,
+                timeout,
+                "a completion packet on the shared broker port",
+            )
         };
         // Capture GetLastError before acquiring a native lock or any other API.
         let code = if success == 0 {
@@ -421,4 +428,6 @@ impl Drop for AttachedStream {
     }
 }
 
-use crate::win32::{CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus};
+use crate::win32::{
+    get_queued_completion_status, CreateIoCompletionPort, PostQueuedCompletionStatus,
+};

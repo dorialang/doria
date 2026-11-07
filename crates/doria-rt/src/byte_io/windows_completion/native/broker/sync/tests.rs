@@ -2,7 +2,7 @@
 
 #![cfg(windows)]
 
-use std::panic::{self, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -167,7 +167,7 @@ fn zero_timeout_returns_false_with_exclusive_guard_reacquired() {
 #[test]
 fn rust_host_unwind_releases_guard_without_poisoning_cell() {
     let cell = Arc::pin(SyncCell::new(0usize));
-    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+    assert!(crate::test_report::expect_panic(AssertUnwindSafe(|| {
         let mut guard = cell.as_ref().lock();
         *guard = 41;
         panic!("test-only Rust host unwind");

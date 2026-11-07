@@ -2,7 +2,7 @@ use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use core::{mem, ptr};
 use std::cell::Cell;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use super::*;
@@ -682,10 +682,12 @@ fn shared_group_dispatches_empty_adapters_and_clears_frames_even_on_host_unwind(
         &frame as *const _ as usize
     );
     assert_eq!(observed_frame.get(), 0);
-    assert!(catch_unwind(AssertUnwindSafe(|| unsafe {
-        group.with_call_frame(&frame, |_| panic!("test-only host unwind"));
-    }))
-    .is_err());
+    assert!(
+        crate::test_report::expect_panic(AssertUnwindSafe(|| unsafe {
+            group.with_call_frame(&frame, |_| panic!("test-only host unwind"));
+        }))
+        .is_err()
+    );
     assert_eq!(observed_frame.get(), 0);
 }
 

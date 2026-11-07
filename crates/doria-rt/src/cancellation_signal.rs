@@ -175,7 +175,9 @@ mod wake_lock {
     }
     #[cfg(windows)]
     unsafe fn condition_wait(condition: *mut NativeCondition, lock: *mut NativeLock) {
-        if SleepConditionVariableSRW(condition, lock, u32::MAX, 0) == 0 {
+        if sleep_condition_variable(condition, lock, INFINITE, "a cancellation signal to be set")
+            == 0
+        {
             crate::runtime_invariant_panic();
         }
     }
@@ -207,15 +209,15 @@ mod wake_lock {
 
     #[cfg(windows)]
     use crate::win32::{
-        AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SleepConditionVariableSRW,
-        WakeAllConditionVariable,
+        sleep_condition_variable, AcquireSRWLockExclusive, ReleaseSRWLockExclusive,
+        WakeAllConditionVariable, INFINITE,
     };
 
     #[cfg(test)]
     mod tests {
         use super::*;
         use core::sync::atomic::AtomicUsize;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::panic::AssertUnwindSafe;
 
         #[test]
         fn guarded_native_lock_serializes_contending_threads() {
@@ -239,7 +241,7 @@ mod wake_lock {
         #[test]
         fn guard_unlocks_during_host_unwinding_without_poisoning() {
             let lock = core::pin::pin!(WakeLock::new());
-            assert!(catch_unwind(AssertUnwindSafe(|| {
+            assert!(crate::test_report::expect_panic(AssertUnwindSafe(|| {
                 let _guard = lock.as_ref().lock();
                 panic!("test-only unwind while holding native wake lock");
             }))
@@ -567,8 +569,10 @@ mod platform {
 
     #[cfg(test)]
     pub(super) fn wait_for_test(signal: usize, milliseconds: u32) -> Result<bool, Failure> {
-        use crate::win32::WaitForSingleObject;
-        match unsafe { WaitForSingleObject(native_handle(signal), milliseconds) } {
+        use crate::win32::wait_for_single_object;
+        match unsafe {
+            wait_for_single_object(native_handle(signal), milliseconds, "a cancellation signal")
+        } {
             0 => Ok(true),
             258 => Ok(false),
             _ => Err(crate::platform_io::last_failure()),

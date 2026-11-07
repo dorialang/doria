@@ -1558,3 +1558,80 @@ callbacks), 21 of them with assertions.
 - Windows tests still need a Windows run.
 - The fix is verified at the object level and by the native release and
   debug suites, but no Windows machine here can execute the harness.
+
+### Windows CI reports what happened (2026-11-07)
+
+CI on `5470711` (push run 42407455781, cancelled after 70 minutes) ran the
+Windows `doria-rt` tests: 38 passed and 2 failed, then 4 were still "running"
+when the run was cancelled.
+
+- **Failed:** `byte_io::tests::windows_nonblocking_pipe_exposes_backpressure_and_resumes_without_replay`
+  and `byte_io::windows_completion::native::adapter::tests::shared_cursor_complete_adapter_orders_read_write_read_without_hot_allocations`.
+- **Running:** `broker::driver::legacy_tests::peer_closure_projects_read_eof_without_finishing_an_unrelated_pending_read`,
+  `broker::driver::legacy_tests::pre_requested_cancellation_submits_nothing_and_old_value_wake_does_not_cancel_reuse`,
+  `broker::tests::borrowed_membership_growth_and_holes_preserve_unaffected_native_registrations`
+  and `broker::tests::borrowed_native_set_rejection_remove_and_drop_never_consume_stream_owner`.
+
+No failure message reached the log: libtest prints them only after the last
+test ends.
+
+**What reading the code establishes.** All four "running" tests take
+`TEST_BROKER_LOCK` first: `TEST_BROKER_LOCK.lock()` in `port/tests.rs`, and
+`serial()` in `broker/tests.rs`. So one of them hung while holding the lock,
+and the other three were queued on it. Which one hung, and why, needs the
+next run's report. The two failures need their messages too. Their likely
+spots are Windows-specific facts these tests assume: how much a
+`PIPE_NOWAIT` byte pipe accepts when one write is larger than its 4096-byte
+quota, and which error a nonblocking server read returns after the client
+closes. None of these causes is proven, so no test or runtime behavior
+changes for them here.
+
+**Chosen:** make the run report everything, by mechanism.
+
+1. **Report a failure when it happens.** `crate::test_report` installs a
+   panic hook as the test binary starts (`.CRT$XCU` on MSVC, `.init_array`
+   on Linux, `__mod_init_func` on Apple). It writes every panic at once to
+   the process's stderr, past libtest's capture, with the thread (= test)
+   name, the location and the message. libtest's summary is unchanged. The
+   12 places where a test panics on purpose now call
+   `crate::test_report::expect_panic` instead of `catch_unwind`, which keeps
+   their panics quiet. The callback guard reports through the same hook.
+2. **No test waits forever.** `win32.rs` now owns the four Windows waits
+   (`WaitForSingleObject`, `WaitForMultipleObjects`,
+   `GetQueuedCompletionStatus`, `SleepConditionVariableSRW`). The raw imports
+   are private, and every runtime and test caller passes what it waits for.
+   In test builds an `INFINITE` wait is bounded at
+   `TEST_WAIT_LIMIT_MILLISECONDS` (2 minutes). Running out reports the test
+   and what it waited for, then aborts; unwinding could release storage the
+   kernel still writes. Release builds keep `INFINITE`. The three files that
+   each defined their own `INFINITE` now import the owner's.
+3. **CI cannot hang for six hours.** Every job has `timeout-minutes` (30, 90
+   and 120), and both `doria-rt` test steps have 15.
+   `scripts/check_ci_timeouts.php` fails any workflow job without one. CI's
+   guardrail step and `validate_work_unit.php` run it.
+
+A probe harness built from these modules on macOS printed the failing
+assertion of its first test as soon as it ran, with no lazy install call,
+even though the next test aborted the binary.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Startup panic hook with declared expected panics (chosen) | Every failure's message reaches the log even if the run later hangs, aborts or is cancelled; local runs stay quiet for intended panics; no CI flag to forget | Platform loader sections for a test-only initializer; a new expected panic should use `expect_panic`, or it prints once more |
+| `RUST_TEST_NOCAPTURE=1` on the CI test steps | libtest's own switch, no code | A CI flag the local vet doesn't share; every test's output interleaves, and intended panics print as if they failed |
+| Leave capture on and rely on the summary | No change | A hang or abort discards every message, as on `5470711` |
+
+| Option | Pros | Cons |
+|---|---|---|
+| Test builds bound `INFINITE` in the owner of the waits (chosen) | Every wait, in runtime and test code, gets the contract from one place; the private imports make a raw unbounded wait impossible to write | A test-build-only path in runtime code; a legitimately slow wait over 2 minutes would abort a test |
+| Per-test deadlines | Local to each test | Can't reach the runtime's internal drains, where the kernel owns the request, and has to be remembered in every test |
+| Only a CI step timeout | One line | A hang still kills the run with no name or reason |
+
+**Open:**
+
+- The hung test and the two failures' causes wait for the next Windows run.
+  It will print each failure as it happens, and any hang as a named
+  two-minute wait report.
+- Blocking calls that are not one of the four waits (`ConnectNamedPipe` on a
+  synchronous handle, a blocking `ReadFile`, `std` locks, channels and thread
+  joins) are bounded only by the 15-minute step limit. libtest's "running for
+  over 60 seconds" lines name the tests stuck there.

@@ -220,11 +220,11 @@ fn platform_try_lock(handle: NativeHandle, mode: LockMode) -> Result<bool, Failu
 #[cfg(windows)]
 fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
     use crate::win32::{
-        CloseHandle, CreateEventW, GetOverlappedResult, LockFileEx, WaitForSingleObject,
+        wait_for_single_object, CloseHandle, CreateEventW, GetOverlappedResult, LockFileEx,
+        INFINITE,
     };
     const EXCLUSIVE_LOCK: u32 = 2;
     const IO_PENDING: i64 = 997;
-    const INFINITE: u32 = u32::MAX;
     let flags = match mode {
         LockMode::Shared => 0,
         LockMode::Exclusive => EXCLUSIVE_LOCK,
@@ -245,7 +245,7 @@ fn platform_lock(handle: NativeHandle, mode: LockMode) -> Result<(), Failure> {
         let failure = crate::platform_io::last_failure();
         if failure.system_code == Some(IO_PENDING) {
             let mut transferred = 0;
-            unsafe { WaitForSingleObject(event, INFINITE) };
+            unsafe { wait_for_single_object(event, INFINITE, "a pending file lock to be granted") };
             let pending = core::ptr::addr_of_mut!(request);
             if unsafe { GetOverlappedResult(handle, pending, &mut transferred, 0) } != 0 {
                 Ok(())

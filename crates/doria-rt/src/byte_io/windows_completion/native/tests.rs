@@ -70,7 +70,12 @@ impl Drop for Connection<'_, '_> {
                     {
                         break;
                     }
-                    if WaitForSingleObject((*request).event, INFINITE) != 0 {
+                    if wait_for_single_object(
+                        (*request).event,
+                        INFINITE,
+                        "a test request's completion event",
+                    ) != 0
+                    {
                         crate::runtime_invariant_panic();
                     }
                 }
@@ -151,7 +156,11 @@ pub(super) fn connected_pair() -> (StdHandle, StdHandle) {
         let client = StdHandle::from_raw_handle(raw);
         if pending {
             assert_eq!(
-                WaitForSingleObject(event.as_raw_handle(), 5000),
+                wait_for_single_object(
+                    event.as_raw_handle(),
+                    5000,
+                    "a named-pipe connection event"
+                ),
                 0,
                 "named-pipe connection did not complete"
             );
@@ -492,7 +501,7 @@ fn wait_control_retains_shared_claim_and_never_resets_cancellation_signal() {
         }))
     );
     assert_eq!(
-        unsafe { WaitForSingleObject(signal as NativeHandle, 0) },
+        unsafe { wait_for_single_object(signal as NativeHandle, 0, "a cancellation signal") },
         258
     );
     requester.request();
@@ -500,7 +509,10 @@ fn wait_control_retains_shared_claim_and_never_resets_cancellation_signal() {
     for _ in 0..4 {
         assert_eq!(control.next_wait(), Ok(Err(Stop::Cancellation)));
         assert_eq!(control.cancellation_signal(), Some(signal));
-        assert_eq!(unsafe { WaitForSingleObject(signal as NativeHandle, 0) }, 0);
+        assert_eq!(
+            unsafe { wait_for_single_object(signal as NativeHandle, 0, "a cancellation signal") },
+            0
+        );
     }
     // Only the control's retained claim now owns the signal. No use follows drop.
 }

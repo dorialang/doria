@@ -12,11 +12,10 @@ use crate::platform_io::{last_failure, Reason};
 use crate::transfer_group::DrCompletionStatusV1;
 use crate::wait_budget::{self, DrWaitBudgetV1};
 use crate::win32::{
-    CancelIoEx, CreateEventW, GetLastError, GetOverlappedResult, ReadFile, WaitForMultipleObjects,
-    WaitForSingleObject, WriteFile,
+    wait_for_multiple_objects, wait_for_single_object, CancelIoEx, CreateEventW, GetLastError,
+    GetOverlappedResult, ReadFile, WriteFile, INFINITE,
 };
 
-const INFINITE: u32 = u32::MAX;
 const IO_PENDING: u32 = 997;
 const IO_INCOMPLETE: u32 = 996;
 const STATUS_PENDING: usize = 0x103;
@@ -137,7 +136,15 @@ unsafe impl Driver for WindowsDriver {
             cancellation.unwrap_or(0) as NativeHandle,
         ];
         let count = if cancellation.is_some() { 2 } else { 1 };
-        match unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, timeout) } {
+        match unsafe {
+            wait_for_multiple_objects(
+                count,
+                handles.as_ptr(),
+                0,
+                timeout,
+                "an event-driver request's completion event or its cancellation signal",
+            )
+        } {
             0 => Ok(Wake::Completion),
             1 if count == 2 => Ok(Wake::Cancellation),
             258 => Ok(Wake::Timeout),
@@ -163,7 +170,12 @@ unsafe impl Driver for WindowsDriver {
                     // This owned manual-reset event cannot be closed by another
                     // caller. A failed wait on it is a broken runtime invariant,
                     // not permission to release an outstanding kernel request.
-                    if WaitForSingleObject(self.completion.get(), INFINITE) != 0 {
+                    if wait_for_single_object(
+                        self.completion.get(),
+                        INFINITE,
+                        "a cancelled event-driver request to finish",
+                    ) != 0
+                    {
                         crate::runtime_invariant_panic();
                     }
                 }

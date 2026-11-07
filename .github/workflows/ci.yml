@@ -22,6 +22,9 @@ jobs:
   parser-fuzz:
     name: parser-fuzz
     runs-on: ubuntu-latest
+    # Every job has a bound (scripts/check_ci_timeouts.php), so a hang cannot
+    # hold a runner for GitHub's six-hour default.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -54,6 +57,7 @@ jobs:
   rust:
     name: rust
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -284,6 +288,7 @@ jobs:
           php scripts/check_rust_toolchain_authority.php
           php scripts/test_test_callback_guards.php
           php scripts/check_test_callback_guards.php
+          php scripts/check_ci_timeouts.php
 
       - name: Check documentation authority
         run: php scripts/check_docs_authority.php
@@ -341,6 +346,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     env:
       DORIA_LLVM_VERSION: 18
 
@@ -458,10 +464,15 @@ jobs:
         shell: bash
         run: cargo build -p doria-rt --release --locked --verbose
 
+      # A test-build wait gives up after two minutes and names its test
+      # (win32::TEST_WAIT_LIMIT_MILLISECONDS); the step bound catches anything
+      # else that stalls.
       - name: Run tier-1 Stage 17 runtime I/O tests
+        timeout-minutes: 15
         run: cargo test -p doria-rt --release --locked --verbose
 
       - name: Run tier-1 hosted shared runtime tests
+        timeout-minutes: 15
         run: |
           cargo clippy -p doria-rt --all-targets --no-default-features --features hosted-shared-runtime --locked -- -D warnings
           cargo test -p doria-rt --release --no-default-features --features hosted-shared-runtime --locked --verbose

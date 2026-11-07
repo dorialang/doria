@@ -283,8 +283,10 @@ unsafe extern "system" {
         name: *const u16,
     ) -> NativeHandle;
     pub(crate) fn SetEvent(event: NativeHandle) -> i32;
-    pub(crate) fn WaitForSingleObject(handle: NativeHandle, milliseconds: u32) -> u32;
-    pub(crate) fn WaitForMultipleObjects(
+    // The four waits stay private: callers use the wrappers below, which own
+    // the test contract for waits that would otherwise never end.
+    fn WaitForSingleObject(handle: NativeHandle, milliseconds: u32) -> u32;
+    fn WaitForMultipleObjects(
         count: u32,
         handles: *const NativeHandle,
         wait_all: i32,
@@ -296,7 +298,7 @@ unsafe extern "system" {
         key: usize,
         concurrency: u32,
     ) -> NativeHandle;
-    pub(crate) fn GetQueuedCompletionStatus(
+    fn GetQueuedCompletionStatus(
         port: NativeHandle,
         transferred: *mut u32,
         key: *mut usize,
@@ -313,7 +315,7 @@ unsafe extern "system" {
     // Slim reader/writer locks and condition variables.
     pub(crate) fn AcquireSRWLockExclusive(lock: *mut SrwLock);
     pub(crate) fn ReleaseSRWLockExclusive(lock: *mut SrwLock);
-    pub(crate) fn SleepConditionVariableSRW(
+    fn SleepConditionVariableSRW(
         condition: *mut ConditionVariable,
         lock: *mut SrwLock,
         milliseconds: u32,
@@ -439,4 +441,138 @@ unsafe extern "system" {
         length: u32,
         flags: u32,
     ) -> i32;
+}
+
+/// Win32 `INFINITE`: wait until the object is signaled.
+#[cfg(windows)]
+pub(crate) const INFINITE: u32 = u32::MAX;
+
+/// `WAIT_TIMEOUT`, as `WaitForSingleObject` and `WaitForMultipleObjects`
+/// return it and as `GetQueuedCompletionStatus` reports it.
+#[cfg(windows)]
+const WAIT_TIMEOUT: u32 = 258;
+
+/// `ERROR_TIMEOUT`, as `SleepConditionVariableSRW` reports it.
+#[cfg(windows)]
+const ERROR_TIMEOUT: u32 = 1460;
+
+/// The longest any wait may last in a test build.
+///
+/// The runtime waits forever in exactly the places where releasing early would
+/// be unsound: draining a cancelled request whose buffer the kernel still
+/// borrows, a group with no deadline, a child process or helper thread. In a
+/// test, a wait that never ends is a hang. CI then reports only that the test
+/// "has been running for over 60 seconds", with no assertion and no other
+/// test's result. So in test builds an `INFINITE` wait is bounded, and running
+/// out of it reports the test and what it waited for, then aborts. Unwinding
+/// instead would release storage the kernel may still write. Release builds
+/// keep `INFINITE`.
+#[cfg(all(windows, test))]
+pub(crate) const TEST_WAIT_LIMIT_MILLISECONDS: u32 = 120_000;
+
+#[cfg(windows)]
+fn native_timeout(milliseconds: u32) -> u32 {
+    #[cfg(test)]
+    if milliseconds == INFINITE {
+        return TEST_WAIT_LIMIT_MILLISECONDS;
+    }
+    milliseconds
+}
+
+/// A bounded wait timed out. If the caller asked to wait forever, the test
+/// hung: report it and abort. Otherwise the timeout is the caller's result.
+#[cfg(windows)]
+fn timed_out(milliseconds: u32, waiting_for: &str) {
+    #[cfg(test)]
+    if milliseconds == INFINITE {
+        crate::test_report::wait_expired(waiting_for, TEST_WAIT_LIMIT_MILLISECONDS);
+    }
+    let _ = (milliseconds, waiting_for);
+}
+
+/// `WaitForSingleObject`. `waiting_for` names the event for a test-build hang
+/// report.
+///
+/// # Safety
+/// `handle` is a live waitable handle.
+#[cfg(windows)]
+pub(crate) unsafe fn wait_for_single_object(
+    handle: NativeHandle,
+    milliseconds: u32,
+    waiting_for: &str,
+) -> u32 {
+    let result = WaitForSingleObject(handle, native_timeout(milliseconds));
+    if result == WAIT_TIMEOUT {
+        timed_out(milliseconds, waiting_for);
+    }
+    result
+}
+
+/// `WaitForMultipleObjects`. `waiting_for` names the events for a test-build
+/// hang report.
+///
+/// # Safety
+/// `handles` points to `count` live waitable handles.
+#[cfg(windows)]
+pub(crate) unsafe fn wait_for_multiple_objects(
+    count: u32,
+    handles: *const NativeHandle,
+    wait_all: i32,
+    milliseconds: u32,
+    waiting_for: &str,
+) -> u32 {
+    let result = WaitForMultipleObjects(count, handles, wait_all, native_timeout(milliseconds));
+    if result == WAIT_TIMEOUT {
+        timed_out(milliseconds, waiting_for);
+    }
+    result
+}
+
+/// `GetQueuedCompletionStatus`. `waiting_for` names the packet for a
+/// test-build hang report.
+///
+/// # Safety
+/// `port` is a live completion port and the out-parameters are writable.
+#[cfg(windows)]
+pub(crate) unsafe fn get_queued_completion_status(
+    port: NativeHandle,
+    transferred: *mut u32,
+    key: *mut usize,
+    overlapped: *mut *mut Overlapped,
+    milliseconds: u32,
+    waiting_for: &str,
+) -> i32 {
+    let result = GetQueuedCompletionStatus(
+        port,
+        transferred,
+        key,
+        overlapped,
+        native_timeout(milliseconds),
+    );
+    if result == 0 && (*overlapped).is_null() && GetLastError() == WAIT_TIMEOUT {
+        timed_out(milliseconds, waiting_for);
+        // The report may have called other APIs; keep the caller's error.
+        SetLastError(WAIT_TIMEOUT);
+    }
+    result
+}
+
+/// `SleepConditionVariableSRW` in exclusive mode. `waiting_for` names the
+/// predicate for a test-build hang report.
+///
+/// # Safety
+/// The calling thread holds `lock` exclusively and `condition` is live.
+#[cfg(windows)]
+pub(crate) unsafe fn sleep_condition_variable(
+    condition: *mut ConditionVariable,
+    lock: *mut SrwLock,
+    milliseconds: u32,
+    waiting_for: &str,
+) -> i32 {
+    let result = SleepConditionVariableSRW(condition, lock, native_timeout(milliseconds), 0);
+    if result == 0 && GetLastError() == ERROR_TIMEOUT {
+        timed_out(milliseconds, waiting_for);
+        SetLastError(ERROR_TIMEOUT);
+    }
+    result
 }

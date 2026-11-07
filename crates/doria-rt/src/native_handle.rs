@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn nested_close_probe_unwind_preserves_outer_counting() {
         let ((), outer) = super::with_close_probe(|| {
-            let failure = std::panic::catch_unwind(|| {
+            let failure = crate::test_report::expect_panic(|| {
                 super::with_close_probe(|| {
                     super::record_close();
                     panic!("fixture nested probe unwind");
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn outer_close_probe_unwind_restores_unobserved_state() {
-        let failure = std::panic::catch_unwind(|| {
+        let failure = crate::test_report::expect_panic(|| {
             super::with_close_probe(|| {
                 super::record_close();
                 panic!("fixture outer probe unwind");
@@ -739,7 +739,7 @@ mod tests {
         use std::os::fd::IntoRawFd;
         #[cfg(windows)]
         use std::os::windows::io::IntoRawHandle;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::panic::AssertUnwindSafe;
 
         let path = std::env::temp_dir().join(format!("doria-close-probe-{}", std::process::id()));
         for operation in 0..4 {
@@ -773,7 +773,7 @@ mod tests {
                 }
                 2 => drop(owner),
                 _ => {
-                    assert!(catch_unwind(AssertUnwindSafe(|| {
+                    assert!(crate::test_report::expect_panic(AssertUnwindSafe(|| {
                         let _owner = owner;
                         panic!("test-only host unwind");
                     }))

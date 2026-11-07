@@ -352,7 +352,10 @@ mod platform {
             }
         }
         pub(super) fn join(self) {
-            if unsafe { WaitForSingleObject(self.0.get(), u32::MAX) } != 0 {
+            if unsafe {
+                wait_for_single_object(self.0.get(), INFINITE, "the device helper thread to exit")
+            } != 0
+            {
                 unsafe {
                     crate::runtime_invariant_panic();
                 }
@@ -365,5 +368,5 @@ mod platform {
         }
         0
     }
-    use crate::win32::{CancelSynchronousIo, CreateThread, WaitForSingleObject};
+    use crate::win32::{wait_for_single_object, CancelSynchronousIo, CreateThread, INFINITE};
 }
