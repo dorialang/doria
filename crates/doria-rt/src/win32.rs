@@ -658,6 +658,19 @@ pub(crate) unsafe fn pipe_write_quota_available(handle: NativeHandle) -> Result<
 #[cfg(windows)]
 pub(crate) struct KernelObject(NativeHandle);
 
+#[cfg(all(windows, test))]
+std::thread_local! {
+    static KERNEL_OBJECT_CLOSES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Counts this thread's private kernel-object closes over a scoped interval,
+/// apart from device and stream closes. It is the lifecycle evidence for an
+/// object such as the shared port, which closes with its last claim.
+#[cfg(all(windows, test))]
+pub(crate) fn with_kernel_object_close_probe<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    crate::native_handle::measure_closes(&KERNEL_OBJECT_CLOSES, operation)
+}
+
 #[cfg(windows)]
 impl KernelObject {
     /// # Safety
@@ -674,6 +687,8 @@ impl KernelObject {
     pub(crate) fn close(self) -> Result<(), Failure> {
         let handle = self.0;
         core::mem::forget(self);
+        #[cfg(test)]
+        crate::native_handle::record_close_in(&KERNEL_OBJECT_CLOSES);
         if unsafe { CloseHandle(handle) } != 0 {
             Ok(())
         } else {
@@ -685,6 +700,8 @@ impl KernelObject {
 #[cfg(windows)]
 impl Drop for KernelObject {
     fn drop(&mut self) {
+        #[cfg(test)]
+        crate::native_handle::record_close_in(&KERNEL_OBJECT_CLOSES);
         // As for a device handle, a failed close is not retried.
         let _ = unsafe { CloseHandle(self.0) };
     }

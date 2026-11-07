@@ -460,9 +460,19 @@ std::thread_local! {
     static CLOSE_ATTEMPTS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// A thread's close counter: `None` outside every probe.
+#[cfg(test)]
+pub(crate) type CloseCounter = std::thread::LocalKey<std::cell::Cell<Option<usize>>>;
+
 #[cfg(test)]
 fn record_close() {
-    CLOSE_ATTEMPTS.with(|count| {
+    record_close_in(&CLOSE_ATTEMPTS);
+}
+
+/// Counts one close in `counter` if a probe on this thread is measuring it.
+#[cfg(test)]
+pub(crate) fn record_close_in(counter: &'static CloseCounter) {
+    counter.with(|count| {
         if let Some(value) = count.get() {
             count.set(Some(value + 1));
         }
@@ -470,29 +480,43 @@ fn record_close() {
 }
 
 #[cfg(test)]
-/// Counts this thread's close attempts over a scoped interval. A callback can
-/// measure a nested interval without resetting its caller's inclusive total.
+/// Counts this thread's device and stream close attempts over a scoped
+/// interval. A callback can measure a nested interval without resetting its
+/// caller's inclusive total. The runtime's private kernel objects (threads,
+/// events, the completion port) have their own probe,
+/// `win32::with_kernel_object_close_probe`.
 pub(crate) fn with_close_probe<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    measure_closes(&CLOSE_ATTEMPTS, operation)
+}
+
+/// Measures the closes `counter` records during `operation`, nesting like
+/// `with_close_probe`.
+#[cfg(test)]
+pub(crate) fn measure_closes<R>(
+    counter: &'static CloseCounter,
+    operation: impl FnOnce() -> R,
+) -> (R, usize) {
     struct Probe {
         outermost: bool,
+        counter: &'static CloseCounter,
     }
     impl Drop for Probe {
         fn drop(&mut self) {
             if self.outermost {
-                CLOSE_ATTEMPTS.with(|count| count.set(None));
+                self.counter.with(|count| count.set(None));
             }
         }
     }
-    let (baseline, outermost) = CLOSE_ATTEMPTS.with(|count| match count.get() {
+    let (baseline, outermost) = counter.with(|count| match count.get() {
         Some(value) => (value, false),
         None => {
             count.set(Some(0));
             (0, true)
         }
     });
-    let probe = Probe { outermost };
+    let probe = Probe { outermost, counter };
     let result = operation();
-    let count = CLOSE_ATTEMPTS.with(|count| count.get().unwrap() - baseline);
+    let count = counter.with(|count| count.get().unwrap() - baseline);
     drop(probe);
     (result, count)
 }

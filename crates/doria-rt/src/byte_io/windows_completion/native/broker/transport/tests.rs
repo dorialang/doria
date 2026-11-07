@@ -566,9 +566,11 @@ fn private_abi_regroups_streams_and_reuses_original_completed_regions() {
     let ((tag, status), closes_a) = crate::native_handle::with_close_probe(|| released_a.close());
     assert_eq!((tag, closes_a), (0, 1));
     clear_io(&status);
-    let ((), closes_b) = crate::native_handle::with_close_probe(|| drop(released_b));
-    // The shared port is a private kernel object, not a stream close.
+    let (((), closes_b), port_closes) = crate::win32::with_kernel_object_close_probe(|| {
+        crate::native_handle::with_close_probe(|| drop(released_b))
+    });
     assert_eq!(closes_b, 1, "the last inline stream closes once");
+    assert_eq!(port_closes, 1, "the last claim closes the shared port once");
 }
 
 #[test]
@@ -673,10 +675,13 @@ fn private_abi_rejects_before_io_and_distinguishes_zero_data_from_pipe_eof() {
     );
     drop(group);
     assert_eq!(&bytes[..5], b"valid");
-    let ((), closes) = crate::native_handle::with_close_probe(|| drop(set));
+    let (((), closes), port_closes) = crate::win32::with_kernel_object_close_probe(|| {
+        crate::native_handle::with_close_probe(|| drop(set))
+    });
+    assert_eq!(closes, 1, "shared set drop closes its stream once");
     assert_eq!(
-        closes, 2,
-        "shared set drop closes stream and last broker once"
+        port_closes, 1,
+        "and the last claim closes the shared port once"
     );
 
     let (server, peer) = connected_pair();

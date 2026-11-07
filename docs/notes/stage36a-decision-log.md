@@ -1867,3 +1867,50 @@ Only `lib.rs` has hosted-only code, so nothing further applies there.
 | A private kernel-object owner outside stream accounting (chosen) | One meaning for the close probe; a test's count no longer depends on who drops the last broker claim or whether a helper ran | Three tests' port counts change |
 | Expect the port close in the three pending tests | No runtime change | Exact counts then depend on other claimants; helper threads and events would also need counting; the probe mixes two contracts |
 | Pin the broker in the test lock | Deterministic counts | Hides the lifecycle the broker tests verify, and leaves device and kernel objects in one owner type |
+
+### Close accounting after `KernelObject`, by enumeration (2026-11-08)
+
+CI on `f1ead7c` (run 42425778020): 604 passed, 2 failed. Both failures were
+close counts that still included kernel objects:
+`private_abi_rejects_before_io_and_distinguishes_zero_data_from_pipe_eof`
+counted the port, and
+`private_abi_loopback_reuses_event_and_storage_without_replaying_bytes`
+counted two cached events. The previous fix updated three tests from
+memory. This one enumerated the probe sites, and replaced the three tests'
+dropped port evidence with direct evidence.
+
+**Enumeration.** `with_close_probe` has 191 call sites in 27 files. The 131
+in the 19 files that build for Windows were checked against the contract:
+the probe counts device and stream closes only.
+
+- `KernelObject` holds only three Windows objects: the device helper's
+  thread, the event driver's completion event and the broker's port.
+- Only the `byte_io/windows_completion` tests (42 sites) and
+  `device_io/pending_tests.rs` (1 site) can release one inside a probe.
+- The file, locking, cancellation and transfer-group paths hold none. File
+  locks close their events with `CloseHandle` directly. Cancellation signals
+  stay device handles.
+- In the 43 sites, every count of 0 was already a stream-only claim, and every
+  stream count of 1 or 3 is unchanged. Five sites expected a kernel-object
+  close inside the count:
+  - `broker/tests.rs`, the last stream, which releases the port;
+  - `broker/transport/tests.rs`, two sites: the last released stream, and the
+    shared set drop;
+  - `port/tests.rs`, the set drop;
+  - `native/tests.rs`, the two cached events.
+- The hosted-shared-runtime step runs the same tests with other features. No
+  test is conditional on that feature, so the same sites cover it.
+
+**Chosen:** a kernel object's release has its own evidence.
+`win32::with_kernel_object_close_probe` counts `KernelObject` closes. It
+uses the same nested measurement as `with_close_probe`, now shared through
+`native_handle::measure_closes` and `record_close_in`. The five sites
+measure both counts at once: stream closes as before, plus "the last claim
+closes the shared port once" or "two cached completion events close once".
+The broker test also keeps its `lifecycle_snapshot` check.
+
+| Option | Pros | Cons |
+|---|---|---|
+| A separate kernel-object probe, measured alongside the stream probe (chosen) | Each test still proves exactly what it meant to prove (port with its last claim, events closed once), in the owner's own accounting | Two counters to read in five tests |
+| Only lower the counts | Smallest edit | Loses the evidence that the port and events close exactly once |
+| Count kernel objects in the stream probe again | Original numbers | Reintroduces the contradiction `f1ead7c` removed |

@@ -454,35 +454,38 @@ fn private_abi_loopback_reuses_event_and_storage_without_replaying_bytes() {
         0
     );
     assert_eq!(status.transfer.value, 0);
-    let (_, closes) = crate::native_handle::with_close_probe(|| {
-        server.close();
-        let fresh_budget = budget(2, 5_000_000_000);
-        let mut byte = [0x55];
-        assert_eq!(
-            unsafe {
-                dr_v1_windows_pipe_read(
-                    client.raw(),
-                    byte.as_mut_ptr(),
-                    byte.len(),
-                    &fresh_budget,
-                    ptr::null_mut(),
-                    (&raw mut status).cast(),
-                )
-            },
-            2
-        );
-        assert_eq!(byte, [0x55]);
-        assert_eq!(
-            (status.stop, status.transfer.has_transferred_byte_count),
-            (0, 0)
-        );
-        client.close();
-        drop(server);
-        drop(client);
+    let ((_, closes), events) = crate::win32::with_kernel_object_close_probe(|| {
+        crate::native_handle::with_close_probe(|| {
+            server.close();
+            let fresh_budget = budget(2, 5_000_000_000);
+            let mut byte = [0x55];
+            assert_eq!(
+                unsafe {
+                    dr_v1_windows_pipe_read(
+                        client.raw(),
+                        byte.as_mut_ptr(),
+                        byte.len(),
+                        &fresh_budget,
+                        ptr::null_mut(),
+                        (&raw mut status).cast(),
+                    )
+                },
+                2
+            );
+            assert_eq!(byte, [0x55]);
+            assert_eq!(
+                (status.stop, status.transfer.has_transferred_byte_count),
+                (0, 0)
+            );
+            client.close();
+            drop(server);
+            drop(client);
+        })
     });
+    assert_eq!(closes, 2, "two data handles close once");
     assert_eq!(
-        closes, 4,
-        "two data handles and two cached events close once"
+        events, 2,
+        "and their two cached completion events close once"
     );
 }
 
