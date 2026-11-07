@@ -64,7 +64,7 @@ struct Routing {
 }
 
 struct Broker {
-    port: OwnedHandle,
+    port: KernelObject,
     routing: SyncCell<Routing>,
     notice: NotificationLatch,
     allocation: *mut u8,
@@ -147,7 +147,7 @@ impl Broker {
         if handle.is_null() {
             return Err(last_failure());
         }
-        let port = unsafe { OwnedHandle::from_raw(handle) };
+        let port = unsafe { KernelObject::from_raw(handle) };
         let layout = Layout::new::<Self>();
         let bytes = layout
             .size()
@@ -429,5 +429,5 @@ impl Drop for AttachedStream {
 }
 
 use crate::win32::{
-    get_queued_completion_status, CreateIoCompletionPort, PostQueuedCompletionStatus,
+    get_queued_completion_status, CreateIoCompletionPort, KernelObject, PostQueuedCompletionStatus,
 };

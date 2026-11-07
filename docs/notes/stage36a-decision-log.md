@@ -1773,3 +1773,51 @@ pending, which is the documented use.
 | Verdict from the return value only, plus the registry recording each rejection's terminal (chosen) | Fixes the false acceptance at its one owner; any future wait on a rejected route ends instead of hanging; the classifier's signature forbids reading `Internal` | Touches both drivers and the registry contract |
 | Drop only the `Internal` clause in the broker | Smallest change | Leaves the event driver's identical clause, and rejected routes still have no terminal for any wait that reaches them |
 | Bound the drain | No semantic change | Releasing storage on a timeout is unsound while the kernel may own it, and it hides the false acceptance |
+
+### Windows CI on `80d62c9`: four failures (2026-11-08)
+
+Run 42424122794 finished the Windows `doria-rt` suite with no hang and no
+abort: 602 passed and 4 failed. Neither failure below comes from
+`80d62c9`. Plan append never touches the registry, and the close counts
+involve no rejected route.
+
+**1. `private_plan_abi_drop_and_setup_rejection_leave_pipe_payload_unread` (test defect, proven by reading).**
+It asserted that `dr_v1_transfer_plan_append` rejects the plan's own key.
+The shared plan contract accepts a repeated key: `Plan::accepts_key` checks
+only that keys share one owner, and `transport/plan/tests.rs` states and
+tests that "a repeated key and a null, empty region are valid
+configuration". Several operations on one stream in one group are the
+design: the shared-cursor adapter test runs three on one key. The test now
+rejects only a key from another set, and asserts that a repeated key is
+accepted with both loans intact.
+
+**2-4. Three pending-set tests saw one close at `drop(set)` (ownership defect, fixed in the runtime; proven by reading).**
+`regular_file_leaves_preserve_cursors_append_empty_eof_and_sole_close`,
+`file_preparation_cancellation_does_no_io_and_completion_keeps_original_error`
+and `actual_nonregular_file_is_rejected_before_callbacks_or_native_transfer`
+all failed `closes == 0` after `drop(set)`. A file-only pending set holds
+the process's only broker claim: its contexts own no attached stream, and the
+tests serialize on `TEST_BROKER_LOCK`. So dropping the set closes the shared
+completion port, and the port was an `OwnedHandle`. That type is documented
+as the owner of a device handle, and every close it makes counts in
+`with_close_probe`. The same was true of the device helper's thread handle
+and the event driver's completion event.
+
+Meanwhile three other tests counted the port as a stream close ("last stream
+and broker port close once"). The two expectations contradicted each other,
+and both depended on which unrelated owner released the last claim.
+
+**Chosen:** `win32::KernelObject` owns the runtime's private kernel objects:
+the helper thread, the completion event and the completion port. It closes
+with `CloseHandle` and outside the stream close accounting.
+`with_close_probe` therefore measures one thing, the device/stream close
+contract. The three port-counting tests now count stream closes only, and
+`lifecycle_snapshot` still proves the port is released with its last claim.
+The hosted-shared-runtime step runs these same tests with other features.
+Only `lib.rs` has hosted-only code, so nothing further applies there.
+
+| Option | Pros | Cons |
+|---|---|---|
+| A private kernel-object owner outside stream accounting (chosen) | One meaning for the close probe; a test's count no longer depends on who drops the last broker claim or whether a helper ran | Three tests' port counts change |
+| Expect the port close in the three pending tests | No runtime change | Exact counts then depend on other claimants; helper threads and events would also need counting; the probe mixes two contracts |
+| Pin the broker in the test lock | Deterministic counts | Hides the lifecycle the broker tests verify, and leaves device and kernel objects in one owner type |

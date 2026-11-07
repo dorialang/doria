@@ -1175,11 +1175,14 @@ fn broker_is_lazy_shared_by_stream_owners_and_released_after_last_owner() {
     assert_eq!(lifecycle_snapshot(), (identity_a.2, 1));
     assert_eq!(last.identity_for_test(), identity_b);
     let ((), last_closes) = crate::native_handle::with_close_probe(|| drop(last));
-    assert_eq!(last_closes, 2, "last stream and broker port close once");
+    // The shared port is a private kernel object, not a stream: the release
+    // of the last claim is proven by the lifecycle snapshot below, not counted
+    // as a stream close.
+    assert_eq!(last_closes, 1, "the last stream closes once");
     assert_eq!(
         first_closes + last_closes,
-        3,
-        "two valid stream owners and the last broker port each close once"
+        2,
+        "two valid stream owners each close once"
     );
     assert_eq!(lifecycle_snapshot(), (0, 0));
 }

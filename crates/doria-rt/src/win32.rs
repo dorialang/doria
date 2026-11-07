@@ -645,3 +645,47 @@ pub(crate) unsafe fn pipe_write_quota_available(handle: NativeHandle) -> Result<
     query_information_file(handle, information.as_mut_ptr().cast(), 40, 24)?;
     Ok(information[7])
 }
+
+/// Owns one private kernel object the runtime created for itself: a helper
+/// thread, a completion event or the shared completion port.
+///
+/// It is deliberately not an `OwnedHandle`, which owns a caller's device or
+/// stream. The stream close contract ("this set closes no stream; the sole
+/// owner closes it once") is what `with_close_probe` measures, and a private
+/// object's lifetime is not part of it. A thread joined at shutdown, or the
+/// process-wide port closed when its last claim drops, would otherwise count
+/// as a stream close in whichever unrelated owner happened to release it.
+#[cfg(windows)]
+pub(crate) struct KernelObject(NativeHandle);
+
+#[cfg(windows)]
+impl KernelObject {
+    /// # Safety
+    /// `handle` is a valid kernel object handle that this owner alone closes.
+    pub(crate) unsafe fn from_raw(handle: NativeHandle) -> Self {
+        Self(handle)
+    }
+
+    pub(crate) fn get(&self) -> NativeHandle {
+        self.0
+    }
+
+    /// Closes the object now and reports a failure. A close is never retried.
+    pub(crate) fn close(self) -> Result<(), Failure> {
+        let handle = self.0;
+        core::mem::forget(self);
+        if unsafe { CloseHandle(handle) } != 0 {
+            Ok(())
+        } else {
+            Err(last_failure())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KernelObject {
+    fn drop(&mut self) {
+        // As for a device handle, a failed close is not retried.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}

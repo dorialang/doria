@@ -567,10 +567,8 @@ fn private_abi_regroups_streams_and_reuses_original_completed_regions() {
     assert_eq!((tag, closes_a), (0, 1));
     clear_io(&status);
     let ((), closes_b) = crate::native_handle::with_close_probe(|| drop(released_b));
-    assert_eq!(
-        closes_b, 2,
-        "last inline stream and broker port each close once"
-    );
+    // The shared port is a private kernel object, not a stream close.
+    assert_eq!(closes_b, 1, "the last inline stream closes once");
 }
 
 #[test]
@@ -863,17 +861,24 @@ fn private_plan_abi_drop_and_setup_rejection_leave_pipe_payload_unread() {
     drop(plan);
     assert_eq!(bytes, [0x55; 8]);
 
-    for rejected_key in [key, foreign_key] {
-        let plan = unsafe { AbiPlan::new(&key, &read(address, 8)) };
-        let ((rejected, status), allocations) = crate::probe_runtime_allocations(|| unsafe {
-            plan.append(&rejected_key, &read(incoming_address, 8))
-        });
-        assert!(rejected.0.is_null());
-        assert_eq!(allocations, 0);
-        invalid_io(&status);
-        assert_eq!(bytes, [0x55; 8]);
-        assert_eq!(incoming, [0x66; 8]);
-    }
+    // A repeated key is valid plan configuration (transport/plan/tests.rs);
+    // a key issued by another set is not, and must leave every loan intact.
+    let plan = unsafe { AbiPlan::new(&key, &read(address, 8)) };
+    let ((rejected, status), allocations) = crate::probe_runtime_allocations(|| unsafe {
+        plan.append(&foreign_key, &read(incoming_address, 8))
+    });
+    assert!(rejected.0.is_null());
+    assert_eq!(allocations, 0);
+    invalid_io(&status);
+    assert_eq!(bytes, [0x55; 8]);
+    assert_eq!(incoming, [0x66; 8]);
+    let plan = unsafe { AbiPlan::new(&key, &read(address, 8)) };
+    let (repeated, status) = unsafe { plan.append(&key, &read(incoming_address, 8)) };
+    assert!(!repeated.0.is_null());
+    clear_io(&status);
+    drop(repeated);
+    assert_eq!(bytes, [0x55; 8]);
+    assert_eq!(incoming, [0x66; 8]);
     for malformed in [
         DrTransferBufferV1 {
             data: incoming_address,
@@ -899,8 +904,8 @@ fn private_plan_abi_drop_and_setup_rejection_leave_pipe_payload_unread() {
         invalid_io(&status);
         let plan = unsafe { AbiPlan::new(&key, &read(address, 8)) };
         let ((rejected, status), allocations) = crate::probe_runtime_allocations(|| unsafe {
-            // A distinct issued key keeps duplicate rejection from masking
-            // the malformed incoming descriptor check.
+            // A distinct issued key from the same set isolates the malformed
+            // incoming descriptor check from the key checks.
             plan.append(&sibling_key, &malformed)
         });
         assert!(rejected.0.is_null());

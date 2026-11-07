@@ -13,7 +13,7 @@ use crate::transfer_group::DrCompletionStatusV1;
 use crate::wait_budget::{self, DrWaitBudgetV1};
 use crate::win32::{
     wait_for_multiple_objects, wait_for_single_object, CancelIoEx, CreateEventW, GetLastError,
-    GetOverlappedResult, ReadFile, WriteFile, INFINITE,
+    GetOverlappedResult, KernelObject, ReadFile, WriteFile, INFINITE,
 };
 
 const IO_INCOMPLETE: u32 = 996;
@@ -33,7 +33,7 @@ mod tests;
 
 struct WindowsDriver {
     handle: OwnedHandle,
-    completion: OwnedHandle,
+    completion: KernelObject,
 }
 
 impl WindowsDriver {
@@ -48,7 +48,7 @@ impl WindowsDriver {
         } else {
             Ok(Self {
                 handle,
-                completion: OwnedHandle::from_raw(event),
+                completion: KernelObject::from_raw(event),
             })
         }
     }

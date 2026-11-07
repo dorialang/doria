@@ -320,8 +320,8 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use crate::native_handle::OwnedHandle;
-    pub(super) struct Thread(OwnedHandle);
+    use crate::win32::KernelObject;
+    pub(super) struct Thread(KernelObject);
     impl Thread {
         pub(super) unsafe fn start(context: *const core::ffi::c_void) -> Result<Self, Failure> {
             let handle = CreateThread(
@@ -335,7 +335,7 @@ mod platform {
             if handle.is_null() {
                 Err(crate::platform_io::last_failure())
             } else {
-                Ok(Self(OwnedHandle::from_raw(handle)))
+                Ok(Self(KernelObject::from_raw(handle)))
             }
         }
         pub(super) fn cancel(&self) -> Result<(), Failure> {
