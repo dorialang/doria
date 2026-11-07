@@ -1293,3 +1293,123 @@ unchanged. Andrew should confirm this wording.
 | Reconcile item 3 with Stage 40a and checkpoint 40b (chosen) | The plan states one sequence; the later commit's scheduling holds; the use-case order is unchanged | Rewords an approved sequence without a card |
 | Leave item 3 as written | The approved text is untouched | §2.1 and Phase I contradict §13 on when networking and the first OSINT work land |
 | Let `dd2fbc5`'s product order replace §13 | Follows the newest commit literally | `dd2fbc5` kept the old order only because it never saw the 2026-10-12 change |
+
+## CI on `5e72056` (2026-11-07)
+
+The first CI run on pushed develop (run 42397207626) failed in two places.
+Clippy rejected three `fetch_update` calls in `doria-rt`, which Rust 1.99
+deprecates. The `doria-rt` library tests failed twice, on both ubuntu and
+macOS:
+
+- `device_io::pending_tests::standard_buffered_input_preserves_complete_adapter_transformation_and_eof_on_native_hosts`
+  read the counters `(1, 1, 0, 2)` where `(3, 3, 0, 2)` was expected.
+- `transfer_group::transport::adapter::tests::pending_tests::pending_file_ffi_preserves_typed_eof_reuse_identity_and_sole_close`
+  read `(2, 0, 0)` where `(2, 0, 2)` was expected.
+
+Both causes are older than these tests' first CI run:
+
+- `rust-toolchain.toml` said `channel = "stable"`, and the workflows installed
+  `dtolnay/rust-toolchain@stable`. CI therefore compiled with 1.99.1, while
+  every local vet compiled with 1.98.1.
+- The two tests had undefined behavior, which 1.99's optimizer acted on (see
+  "Test adapter objects" below).
+
+### Toolchain pin version
+
+**Chosen:** pin `rust-toolchain.toml` to `1.98.1`, the exact release every
+36a vet, the language-server run and the Website suite used. Moving to 1.99 is
+a later, deliberate upgrade. It changes this one line, migrates
+`fetch_update` to `try_update` (`cancellation.rs:148`,
+`transfer_group/plan.rs:30`, `transfer_group/transport.rs:294`) and reruns the
+vet.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `1.98.1` (chosen) | CI checks the compiler the evidence was produced with; installed locally, so no download or cache rebuild (the pinned and `stable` 1.98.1 toolchains report identical `rustc -vV`) | One release behind current stable until the upgrade |
+| `1.99.1` | Current stable; the deprecations are fixed now | Needs a toolchain download (Andrew's permission) and a full re-vet on the cache volume at 22.7 of 25 GB; the close evidence no longer matches the CI compiler |
+| Keep `stable` | No pin to maintain | The defect class stays: every Rust release can break CI, or let it pass, without the local vet seeing it |
+
+### One source for the CI toolchain
+
+**Chosen:** every workflow job that runs cargo installs the file's release with
+`rustup toolchain install --no-self-update` and names no toolchain.
+`scripts/check_rust_toolchain_authority.php`, run in CI's guardrail step and by
+`validate_work_unit.php`, rejects these: a floating channel, a
+`dtolnay/rust-toolchain@<non-nightly>` step, a `toolchain:` input, a named
+`rustup toolchain install`, `rustup default|update|override`, `cargo +<non-nightly>`,
+and a cargo job with no pinned install. `scripts/test_rust_toolchain_authority.php`
+covers each case. Parser fuzzing is the one named exception: it installs the pin
+and also nightly, which only `cargo +nightly fuzz` uses. The same class fix
+covers the other repositories:
+
+- `doria-language-server` gains its own `rust-toolchain.toml` (`1.98.1`) and a
+  copy of the check, which its CI's `scripts/check_*.php` loop runs.
+- The Website's CI installs and builds from inside the pinned compiler
+  checkout, so the compiler repository's file decides the Rust release. A Pest
+  test pins that shape. The Website therefore takes 1.98.1 once its pin moves
+  past this commit; at `5e72056` that checkout still says `stable`.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `rustup toolchain install` from the file, plus a check (chosen) | One authority; a new workflow cannot drift without failing the check | A small line-based workflow scanner, not a YAML parser |
+| Keep the action and pass `toolchain: 1.98.1` | Familiar action | The release lives in two places and drifts the next time only one is edited |
+| Rely on rustup auto-installing the override | No workflow step | Depends on the rustup version's auto-install policy; components are not guaranteed |
+
+### Test adapter objects
+
+The runtime treats `DrAdapterContextV1::object` as opaque. It passes the word
+back to the author's callbacks, which take `&mut` to the object. The failing
+tests, and every similar fixture in `doria-rt`, cast `&mut local` or `self` to
+that word. Then, while the runtime held the word, they read the local's fields
+by name, often inside `probe_runtime_allocations` closures that capture those
+fields by shared reference. The callbacks' writes overlapped those references.
+That is undefined behavior, and the optimizer returned stale counts for it.
+
+**Chosen:** `transfer_group::adapter::test_object::TestObject<T>`, a test-only
+owner. It gives each object one heap home that is addressed only by its raw
+pointer, the same way compiled Doria code holds an adapter object and the
+owned-stream fixtures already held theirs (they passed on 1.99). Tests read
+and write through raw places, `(*object.as_ptr()).field`. Each access covers
+only the field it names, and no reference outlives the expression. Callbacks
+borrow through `TestObject::in_callback` for one call. Converted:
+
+- `device_io` pending and alias tests;
+- `transfer_group` adapter, pending, source and transport adapter (plain and
+  pending) tests;
+- `unix_readiness` adapter and pending tests, including the file and standard
+  submodules;
+- both Windows completion fixtures, checked by type only.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `TestObject` with raw-place access (chosen) | One owner and one access rule for every fixture; matches how compiled code and the passing owned fixtures hold objects; field-precise, so pointers the runtime holds into other fields stay valid | `(*x.as_ptr()).field` is noisier than `x.field`; the discipline is "no reference across a runtime call", not a type-level guarantee |
+| `Cell`/`RefCell` fields, with callbacks taking `&T` | The type system forbids plain writes through the shared word | Rewrites every fixture struct and callback body; staged storage needs `Cell<[u8; N]>` pointers |
+| Closure accessors `read(\|s\| …)` / `write(\|s\| …)` | No reference can escape the closure | `write` reborrows the whole object, invalidating pointers the runtime holds into other fields (Stacked Borrows); tried and replaced |
+| Fix only the two failing tests | Smallest diff | The same overlap stays in every other fixture, waiting for the next optimizer |
+
+The non-test runtime does not have this shape. `transfer_group/pending.rs` and
+`pending/host.rs` hand callbacks raw pointers (the request view, the driver)
+and touch that state only through those pointers or after the call returns.
+Callbacks still take a whole-object `&mut` for their call, as before. Proving
+the runtime and fixtures sound under Stacked or Tree Borrows needs Miri, which
+is not installed, and installing it needs Andrew's permission for the download.
+
+### Open on Windows after this change
+
+Two Windows failures are outside this change:
+
+- **The `doria-rt` test binary aborts.** In run 42397207626 the Windows job's
+  release `doria-rt` tests stopped with `STATUS_STACK_BUFFER_OVERRUN`
+  (`0xc0000409`) after 8 of 605 tests. That status is how Windows reports a
+  Rust abort, for example a panic inside an `extern "C"` callback. The log
+  names no test.
+  `byte_io::tests::windows_nonblocking_pipe_exposes_backpressure_and_resumes_without_replay`
+  never reported, although the test after it alphabetically did. It is new in
+  `5e72056`, so it is the first suspect. Identifying it needs a Windows run with
+  `cargo test -p doria-rt --release --lib -- --test-threads=1`.
+- **Windows clippy fails.** `cargo clippy -p doria-rt --all-targets --target x86_64-pc-windows-msvc -- -D warnings`
+  stops on `clashing_extern_declarations`. `process/windows.rs` declares Win32
+  `CreatePipe` with `*const SecurityAttributes`, while five other modules
+  declare it with `*mut c_void`. doria-rt has no single owner for Win32
+  bindings: 24 files hold 44 separate `extern "system"` blocks.
+  Giving `CreatePipe`, and the bindings like it, one declaration is the fix.

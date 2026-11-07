@@ -1,5 +1,6 @@
 //! Real aliased inherited stdout/stderr, with independent live transfer groups.
 use super::*;
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use crate::transfer_group::TerminalOutcome;
 
@@ -10,19 +11,19 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(stream: u8) -> Self {
-        Self {
+    fn new(stream: u8) -> TestObject<Self> {
+        TestObject::new(Self {
             stream,
             driver: std::thread::current().id(),
             completions: 0,
-        }
+        })
     }
-    fn adapter(&mut self) -> DrPendingTransferAdapterV1 {
+}
+
+impl TestObject<Writer> {
+    fn adapter(&self) -> DrPendingTransferAdapterV1 {
         DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: ptr::from_mut(self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             prepare_read: None,
             complete_read: None,
             prepare_write: Some(prepare_write),
@@ -40,7 +41,7 @@ unsafe extern "C" fn prepare_write(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let writer = &*(*context).object.cast::<Writer>();
+    let writer = TestObject::<Writer>::in_callback((*context).object);
     assert_eq!(std::thread::current().id(), writer.driver);
     dr_v1_pending_request_configure_standard(request, writer.stream, data.cast_mut(), length);
     0
@@ -55,7 +56,7 @@ unsafe extern "C" fn complete_write(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let writer = &mut *(*context).object.cast::<Writer>();
+    let writer = TestObject::<Writer>::in_callback((*context).object);
     assert_eq!(std::thread::current().id(), writer.driver);
     writer.completions += 1;
     let (tag, submitted, native, region, _) = pending_callback_facts(request);
@@ -175,9 +176,9 @@ fn inherited_alias_child() {
         let out = standard_device(StandardStream::Stdout);
         let err = standard_device(StandardStream::Stderr);
         let starts = super::super::helper::starts_for_test();
-        let mut out_writer = Writer::new(1);
-        let mut idle_alias = Writer::new(2);
-        let mut err_writer = Writer::new(2);
+        let out_writer = Writer::new(1);
+        let idle_alias = Writer::new(2);
+        let err_writer = Writer::new(2);
         let mut out_set = PendingSet::new(ptr::null_mut()).unwrap();
         let mut err_set = PendingSet::new(ptr::null_mut()).unwrap();
         let out_index = out_set
@@ -262,9 +263,9 @@ fn inherited_alias_child() {
         drop(err_group);
         assert_eq!(
             (
-                out_writer.completions,
-                err_writer.completions,
-                idle_alias.completions
+                (*out_writer.as_ptr()).completions,
+                (*err_writer.as_ptr()).completions,
+                (*idle_alias.as_ptr()).completions
             ),
             (1, 1, 0)
         );

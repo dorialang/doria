@@ -1,4 +1,5 @@
 use super::*;
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use crate::transfer_group::adapter::DrAdapterOutcomeV1;
 use crate::{DrInterfaceCarrierV1, DrInterfaceVtableV1};
@@ -36,8 +37,8 @@ struct Script {
 }
 
 impl Script {
-    fn new(actions: &'static [Action]) -> Self {
-        Self {
+    fn new(actions: &'static [Action]) -> TestObject<Self> {
+        TestObject::new(Self {
             actions,
             calls: [Call::default(); 16],
             count: 0,
@@ -45,20 +46,21 @@ impl Script {
             error: ptr::null_mut(),
             error_descriptor: &ERROR_DESCRIPTOR,
             progress: None,
-        }
+        })
     }
+}
 
-    fn descriptor(&mut self) -> DrTransferAdapterV1 {
+impl TestObject<Script> {
+    fn descriptor(&self) -> DrTransferAdapterV1 {
         DrTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             read: Some(read),
             write: Some(write),
         }
     }
+}
 
+impl Script {
     unsafe fn attempt(
         &mut self,
         frame: *const DrStackFrameV2,
@@ -133,7 +135,8 @@ unsafe extern "C" fn read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    (*(*context).object.cast::<Script>()).attempt(frame, data, length, true, outcome, error)
+    TestObject::<Script>::in_callback((*context).object)
+        .attempt(frame, data, length, true, outcome, error)
 }
 
 unsafe extern "C" fn write(
@@ -144,7 +147,7 @@ unsafe extern "C" fn write(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    (*(*context).object.cast::<Script>()).attempt(
+    TestObject::<Script>::in_callback((*context).object).attempt(
         frame,
         data.cast_mut(),
         length,
@@ -173,7 +176,7 @@ fn frame() -> DrStackFrameV2 {
 #[test]
 fn same_registration_dispatches_distinct_duplex_operations_through_complete_adapter() {
     let (source, _peer) = source();
-    let mut script = Script::new(&[Action::Data(b"abc"), Action::Accepted(3)]);
+    let script = Script::new(&[Action::Data(b"abc"), Action::Accepted(3)]);
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(9, source.as_raw_fd(), script.descriptor()).unwrap();
@@ -203,16 +206,21 @@ fn same_registration_dispatches_distinct_duplex_operations_through_complete_adap
     assert_eq!(seen, [true; 2]);
     drop(group);
     assert_eq!(&input, b"abc");
-    assert_eq!(script.count, 2);
-    assert!(script.calls[0].reading && !script.calls[1].reading);
-    assert_ne!(script.calls[0].data, script.calls[1].data);
+    assert_eq!(unsafe { (*script.as_ptr()).count }, 2);
+    assert!(
+        unsafe { (*script.as_ptr()).calls[0].reading }
+            && !unsafe { (*script.as_ptr()).calls[1].reading }
+    );
+    assert_ne!(unsafe { (*script.as_ptr()).calls[0].data }, unsafe {
+        (*script.as_ptr()).calls[1].data
+    });
     set.remove(9).unwrap();
 }
 
 #[test]
 fn competing_complete_adapter_reads_do_not_dispatch_the_queued_callback_early() {
     let (source, _peer) = source();
-    let mut script = Script::new(&[Action::Pending, Action::Data(b"abc"), Action::Data(b"def")]);
+    let script = Script::new(&[Action::Pending, Action::Data(b"abc"), Action::Data(b"def")]);
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(9, source.as_raw_fd(), script.descriptor()).unwrap();
@@ -225,7 +233,7 @@ fn competing_complete_adapter_reads_do_not_dispatch_the_queued_callback_early() 
         set.begin_selected(ptr::null(), buffers, &wait, selection(&[0, 0]))
             .unwrap()
     };
-    assert_eq!(script.count, 1);
+    assert_eq!(unsafe { (*script.as_ptr()).count }, 1);
     assert!(group.read_storage_mut(1).is_none());
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
         assert_eq!(group.next(ptr::null()).unwrap().index, 0);
@@ -236,7 +244,7 @@ fn competing_complete_adapter_reads_do_not_dispatch_the_queued_callback_early() 
         drop(group);
     });
     assert_eq!(allocations, 0);
-    assert_eq!(script.count, 3);
+    assert_eq!(unsafe { (*script.as_ptr()).count }, 3);
     set.remove(9).unwrap();
 }
 
@@ -281,9 +289,9 @@ fn reversed_subset_calls_complete_adapters_without_consuming_source_payloads_or_
     first_peer.write_all(b"watch-A").unwrap();
     unused_peer.write_all(b"unused").unwrap();
     last_peer.write_all(b"watch-C").unwrap();
-    let mut a = Script::new(&[Action::Pending, Action::Pending, Action::Data(b"adapter-A")]);
-    let mut b = Script::new(&[Action::Data(b"unused adapter")]);
-    let mut c = Script::new(&[Action::Pending, Action::Pending, Action::Data(b"C")]);
+    let a = Script::new(&[Action::Pending, Action::Pending, Action::Data(b"adapter-A")]);
+    let b = Script::new(&[Action::Data(b"unused adapter")]);
+    let c = Script::new(&[Action::Pending, Action::Pending, Action::Data(b"C")]);
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(10, first.as_raw_fd(), a.descriptor()).unwrap();
@@ -329,17 +337,26 @@ fn reversed_subset_calls_complete_adapters_without_consuming_source_payloads_or_
     assert_eq!(group.completed(1).unwrap().as_ptr(), pointers[1]);
     assert!(unsafe { group.next(&next_frame) }.is_none());
     drop(group);
-    assert_eq!(b.count, 0);
+    assert_eq!(unsafe { (*b.as_ptr()).count }, 0);
     for script in [&a, &c] {
-        assert_eq!(script.count, 3);
-        assert!(script.calls[..3].iter().all(|call| call.reading));
-        assert_eq!(script.calls[0].frame, &begin_frame as *const _ as usize);
-        assert!(script.calls[1..3]
-            .iter()
-            .all(|call| call.frame == &next_frame as *const _ as usize));
+        assert_eq!(unsafe { (*script.as_ptr()).count }, 3);
+        assert!(unsafe {
+            (&(*script.as_ptr()).calls)[..3]
+                .iter()
+                .all(|call| call.reading)
+        });
+        assert_eq!(
+            unsafe { (*script.as_ptr()).calls[0].frame },
+            &begin_frame as *const _ as usize
+        );
+        assert!(unsafe {
+            (&(*script.as_ptr()).calls)[1..3]
+                .iter()
+                .all(|call| call.frame == &next_frame as *const _ as usize)
+        });
     }
-    assert_eq!(a.calls[0].data, pointers[1] as usize);
-    assert_eq!(c.calls[0].data, pointers[0] as usize);
+    assert_eq!(unsafe { (*a.as_ptr()).calls[0].data }, pointers[1] as usize);
+    assert_eq!(unsafe { (*c.as_ptr()).calls[0].data }, pointers[0] as usize);
     assert_eq!([set.slots.raw(0), set.slots.raw(2)], requests);
     assert_eq!(set.watcher.handle().unwrap(), watcher);
     assert!(set.watcher.slots().iter().all(|slot| slot.interests == 0));
@@ -357,8 +374,8 @@ fn reversed_subset_calls_complete_adapters_without_consuming_source_payloads_or_
 #[test]
 fn partial_writes_reuse_the_original_suffix_and_request_without_hot_allocations() {
     let (writer, mut peer) = source();
-    let mut adapter = Script::new(&[Action::Accepted(2), Action::Accepted(3)]);
-    adapter.output = Some(writer.as_raw_fd());
+    let adapter = Script::new(&[Action::Accepted(2), Action::Accepted(3)]);
+    unsafe { (*adapter.as_ptr()).output = Some(writer.as_raw_fd()) };
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(7, writer.as_raw_fd(), adapter.descriptor())
@@ -393,13 +410,32 @@ fn partial_writes_reuse_the_original_suffix_and_request_without_hot_allocations(
     assert_eq!(allocations, 0);
     drop(group);
     assert_eq!(set.slots.raw(0), request);
-    assert_eq!(adapter.count, 2);
-    assert_eq!(adapter.calls[0].data, bytes.as_ptr() as usize);
-    assert_eq!(adapter.calls[1].data, unsafe { bytes.as_ptr().add(2) }
-        as usize);
-    assert_eq!((adapter.calls[0].length, adapter.calls[1].length), (5, 3));
-    assert_eq!(adapter.calls[0].frame, &initial_frame as *const _ as usize);
-    assert_eq!(adapter.calls[1].frame, &later_frame as *const _ as usize);
+    assert_eq!(unsafe { (*adapter.as_ptr()).count }, 2);
+    assert_eq!(
+        unsafe { (*adapter.as_ptr()).calls[0].data },
+        bytes.as_ptr() as usize
+    );
+    assert_eq!(
+        unsafe { (*adapter.as_ptr()).calls[1].data },
+        unsafe { bytes.as_ptr().add(2) } as usize
+    );
+    assert_eq!(
+        unsafe {
+            (
+                (*adapter.as_ptr()).calls[0].length,
+                (*adapter.as_ptr()).calls[1].length,
+            )
+        },
+        (5, 3)
+    );
+    assert_eq!(
+        unsafe { (*adapter.as_ptr()).calls[0].frame },
+        &initial_frame as *const _ as usize
+    );
+    assert_eq!(
+        unsafe { (*adapter.as_ptr()).calls[1].frame },
+        &later_frame as *const _ as usize
+    );
     let mut received = [0; 5];
     peer.read_exact(&mut received).unwrap();
     assert_eq!(&received, b"hello");
@@ -408,7 +444,7 @@ fn partial_writes_reuse_the_original_suffix_and_request_without_hot_allocations(
 #[test]
 fn zero_data_empty_dispatch_eof_and_timed_out_remain_distinct_adapter_outcomes() {
     let (source, _peer) = source();
-    let mut adapter = Script::new(&[
+    let adapter = Script::new(&[
         Action::Data(b""),
         Action::Data(b""),
         Action::EndOfStream,
@@ -452,8 +488,8 @@ fn zero_data_empty_dispatch_eof_and_timed_out_remain_distinct_adapter_outcomes()
     assert_eq!(group.stop(), None);
     assert_eq!(group.read_storage_mut(0).unwrap(), &[0xA5; 4]);
     drop(group);
-    assert_eq!(adapter.count, 4);
-    assert_eq!(adapter.calls[1].length, 0);
+    assert_eq!(unsafe { (*adapter.as_ptr()).count }, 4);
+    assert_eq!(unsafe { (*adapter.as_ptr()).calls[1].length }, 0);
 }
 
 struct ExactError {
@@ -498,15 +534,15 @@ fn error(drops: &AtomicUsize) -> *mut u8 {
 fn same_registration_failure_keeps_operation_identity_original_error_and_pending_sibling() {
     let (source, _peer) = source();
     let drops = AtomicUsize::new(0);
-    let mut script = Script::new(&[
+    let script = Script::new(&[
         Action::Pending,
         Action::Error,
         Action::Pending,
         Action::Data(b"abc"),
     ]);
     let original = error(&drops);
-    script.error = original;
-    let descriptor = script.error_descriptor;
+    unsafe { (*script.as_ptr()).error = original };
+    let descriptor = unsafe { (*script.as_ptr()).error_descriptor };
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(23, source.as_raw_fd(), script.descriptor())
@@ -555,10 +591,10 @@ fn same_registration_failure_keeps_operation_identity_original_error_and_pending
 fn checked_error_identity_progress_and_once_only_drop_survive_terminal_cache_and_move() {
     let (source, _peer) = source();
     let drops = AtomicUsize::new(0);
-    let mut adapter = Script::new(&[Action::Error, Action::Error]);
-    let descriptor = adapter.error_descriptor;
-    adapter.error = error(&drops);
-    adapter.progress = Some(2);
+    let adapter = Script::new(&[Action::Error, Action::Error]);
+    let descriptor = unsafe { (*adapter.as_ptr()).error_descriptor };
+    unsafe { (*adapter.as_ptr()).error = error(&drops) };
+    unsafe { (*adapter.as_ptr()).progress = Some(2) };
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(1, source.as_raw_fd(), adapter.descriptor())
@@ -577,10 +613,10 @@ fn checked_error_identity_progress_and_once_only_drop_survive_terminal_cache_and
     assert_eq!(&bytes[..2], &[0xEE; 2]);
     set.remove(1).unwrap();
     let object = error(&drops);
-    adapter.error = object;
-    adapter.progress = None;
-    assert_eq!(adapter.error, object);
-    assert_eq!(adapter.progress, None);
+    unsafe { (*adapter.as_ptr()).error = object };
+    unsafe { (*adapter.as_ptr()).progress = None };
+    assert_eq!(unsafe { (*adapter.as_ptr()).error }, object);
+    assert_eq!(unsafe { (*adapter.as_ptr()).progress }, None);
     unsafe {
         set.add(2, source.as_raw_fd(), adapter.descriptor())
             .unwrap()
@@ -613,7 +649,7 @@ fn cancellation_and_drop_retire_watches_without_callback_and_keep_external_sourc
     let (mut source, mut peer) = source();
     let cancellation = crate::cancellation::dr_v1_cancellation_new();
     assert!(!cancellation.is_null());
-    let mut adapter = Script::new(&[Action::Pending]);
+    let adapter = Script::new(&[Action::Pending]);
     let mut set = unsafe { AdapterSet::new(cancellation).unwrap() };
     unsafe {
         set.add(1, source.as_raw_fd(), adapter.descriptor())
@@ -644,7 +680,7 @@ fn cancellation_and_drop_retire_watches_without_callback_and_keep_external_sourc
     assert!(stopped.outcome.transfer.is_none());
     assert_eq!(stopped.outcome.stop, Some(Stop::Cancellation));
     drop(group);
-    assert_eq!(adapter.count, 1);
+    assert_eq!(unsafe { (*adapter.as_ptr()).count }, 1);
     assert_eq!(set.slots.raw(0), request);
     assert!(set.watcher.slots().iter().all(|slot| slot.interests == 0));
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
@@ -657,13 +693,17 @@ fn cancellation_and_drop_retire_watches_without_callback_and_keep_external_sourc
         .transfer
         .is_none());
     drop(group);
-    assert_eq!(adapter.count, 1, "persistent cancellation was reset");
+    assert_eq!(
+        unsafe { (*adapter.as_ptr()).count },
+        1,
+        "persistent cancellation was reset"
+    );
     drop(set);
     unsafe { crate::cancellation::dr_v1_cancellation_release(cancellation) };
     peer.write_all(b"live").unwrap();
     source.read_exact(&mut [0; 4]).unwrap();
 
-    let mut adapter = Script::new(&[Action::Pending, Action::Data(b"reuse")]);
+    let adapter = Script::new(&[Action::Pending, Action::Data(b"reuse")]);
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(7, source.as_raw_fd(), adapter.descriptor())
@@ -677,7 +717,7 @@ fn cancellation_and_drop_retire_watches_without_callback_and_keep_external_sourc
     };
     let (_, closes) = crate::native_handle::with_close_probe(|| drop(group));
     assert_eq!(closes, 0);
-    assert_eq!(adapter.count, 1);
+    assert_eq!(unsafe { (*adapter.as_ptr()).count }, 1);
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
     let mut group = unsafe {
         set.begin_selected(&current, buffers, &indefinite, selection(&[0]))
@@ -712,7 +752,7 @@ fn permanent_regular_file_readiness_spends_one_immediate_poll_without_raw_transf
         .unwrap();
     file.write_all(b"unconsumed").unwrap();
     file.seek(SeekFrom::Start(0)).unwrap();
-    let mut adapter = Script::new(&[Action::Pending]);
+    let adapter = Script::new(&[Action::Pending]);
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe { set.add(1, file.as_raw_fd(), adapter.descriptor()).unwrap() };
     let mut bytes = [0xCC; 4];
@@ -729,7 +769,11 @@ fn permanent_regular_file_readiness_spends_one_immediate_poll_without_raw_transf
     assert!(stopped.outcome.transfer.is_none());
     assert_eq!(stopped.outcome.stop, Some(Stop::BudgetExhausted));
     drop(group);
-    assert_eq!(adapter.count, 3, "immediate advisory readiness busy-polled");
+    assert_eq!(
+        unsafe { (*adapter.as_ptr()).count },
+        3,
+        "immediate advisory readiness busy-polled"
+    );
     assert_eq!(bytes, [0xCC; 4]);
     assert_eq!(set.watcher.immediate_count, 0);
     assert_eq!(file.stream_position().unwrap(), 0);
@@ -745,8 +789,8 @@ fn permanent_regular_file_readiness_spends_one_immediate_poll_without_raw_transf
 fn rejected_admission_and_later_callback_capability_never_transfer_or_close_sources() {
     let (mut first, mut first_peer) = source();
     let (mut second, mut second_peer) = source();
-    let mut a = Script::new(&[Action::Data(b"A")]);
-    let mut b = Script::new(&[Action::Data(b"B")]);
+    let a = Script::new(&[Action::Data(b"A")]);
+    let b = Script::new(&[Action::Data(b"B")]);
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe { set.add(10, first.as_raw_fd(), a.descriptor()).unwrap() };
     let mut read_only = b.descriptor();
@@ -782,7 +826,15 @@ fn rejected_admission_and_later_callback_capability_never_transfer_or_close_sour
     assert!(
         matches!(failure, SetupFailure::Platform(failure) if failure == Failure::invalid_input())
     );
-    assert_eq!((allocations, closes, a.count, b.count), (0, 0, 0, 0));
+    assert_eq!(
+        (
+            allocations,
+            closes,
+            unsafe { (*a.as_ptr()).count },
+            unsafe { (*b.as_ptr()).count }
+        ),
+        (0, 0, 0, 0)
+    );
     assert_eq!(set.slots.raw(0), request);
     assert!(set.watcher.slots().iter().all(|slot| slot.interests == 0));
     set.remove(20).unwrap();

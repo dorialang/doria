@@ -1,3 +1,4 @@
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use core::{mem, ptr};
 use std::cell::Cell;
@@ -82,8 +83,8 @@ struct Context {
 }
 
 impl Context {
-    fn new(tag: u8, count: usize) -> Self {
-        Self {
+    fn new(tag: u8, count: usize) -> TestObject<Self> {
+        TestObject::new(Self {
             calls: 0,
             tag,
             count,
@@ -91,15 +92,14 @@ impl Context {
             error: None,
             cancel: None,
             frame_address: 0,
-        }
+        })
     }
+}
 
-    fn adapter(&mut self) -> DrTransferAdapterV1 {
+impl TestObject<Context> {
+    fn adapter(&self) -> DrTransferAdapterV1 {
         DrTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             read: Some(read_callback),
             write: Some(write_callback),
         }
@@ -112,7 +112,7 @@ unsafe fn callback(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.calls += 1;
     context.frame_address = frame as usize; // observation, not a retained frame loan
     if let Some(cancel) = &context.cancel {
@@ -197,7 +197,7 @@ fn four_word_callback_layout_and_explicit_outcomes_preserve_zero_data_eof_and_ti
         ptr::addr_of!(outcome.has_count) as usize - ptr::addr_of!(outcome) as usize,
         mem::size_of::<usize>() + 1
     );
-    let mut context = Context::new(0, 0);
+    let context = Context::new(0, 0);
     let adapter = context.adapter();
     let mut bytes = [0_u8; 8];
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -205,17 +205,17 @@ fn four_word_callback_layout_and_explicit_outcomes_preserve_zero_data_eof_and_ti
             adapter.read(ptr::null(), bytes.as_mut_ptr(), 8),
             AdapterAttempt::Terminal(AdapterTerminal::Data(0))
         ));
-        context.tag = 2;
+        (*context.as_ptr()).tag = 2;
         assert!(matches!(
             adapter.read(ptr::null(), bytes.as_mut_ptr(), 8),
             AdapterAttempt::Terminal(AdapterTerminal::EndOfStream)
         ));
-        context.tag = 3;
+        (*context.as_ptr()).tag = 3;
         assert!(matches!(
             adapter.read(ptr::null(), bytes.as_mut_ptr(), 8),
             AdapterAttempt::Terminal(AdapterTerminal::TimedOut)
         ));
-        context.tag = 1;
+        (*context.as_ptr()).tag = 1;
         assert!(matches!(
             adapter.read(ptr::null(), bytes.as_mut_ptr(), 8),
             AdapterAttempt::Pending
@@ -224,15 +224,15 @@ fn four_word_callback_layout_and_explicit_outcomes_preserve_zero_data_eof_and_ti
             adapter.write(ptr::null(), bytes.as_ptr(), 8),
             AdapterAttempt::Pending
         ));
-        context.tag = 0;
-        context.count = 3;
+        (*context.as_ptr()).tag = 0;
+        (*context.as_ptr()).count = 3;
         assert!(matches!(
             adapter.write(ptr::null(), bytes.as_ptr(), 8),
             AdapterAttempt::Terminal(AdapterTerminal::Accepted(3))
         ));
     });
     assert_eq!(allocations, 0);
-    assert_eq!(context.calls, 6);
+    assert_eq!(unsafe { (*context.as_ptr()).calls }, 6);
 }
 
 #[test]
@@ -305,14 +305,16 @@ fn checked_callback_error_moves_original_carrier_and_optional_progress_exactly_o
     let descriptor = descriptor();
     for progress in [None, Some(0), Some(2)] {
         let drops = Rc::new(Cell::new(0));
-        let mut context = Context::new(0, 0);
-        context.error = Some(owned_error(
-            &descriptor,
-            &drops,
-            progress.map(|count| count as i64),
-        ));
-        let original = context.error.as_ref().unwrap().carrier().object;
-        context.progress = progress;
+        let context = Context::new(0, 0);
+        unsafe {
+            (*context.as_ptr()).error = Some(owned_error(
+                &descriptor,
+                &drops,
+                progress.map(|count| count as i64),
+            ))
+        };
+        let original = unsafe { (*context.as_ptr()).error.as_ref().unwrap().carrier().object };
+        unsafe { (*context.as_ptr()).progress = progress };
         let adapter = context.adapter();
         let mut bytes = [0_u8; 8];
         let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -350,7 +352,7 @@ fn checked_callback_error_moves_original_carrier_and_optional_progress_exactly_o
         });
         assert_eq!(allocations, 0);
         assert_eq!(drops.get(), 1);
-        assert!(context.error.is_none());
+        assert!(unsafe { (*context.as_ptr()).error.is_none() });
     }
 }
 
@@ -365,10 +367,13 @@ fn unusable_checked_progress_preserves_signed_error_and_withholds_prefix() {
             (i64::MAX, usize::try_from(i64::MAX).ok()),
         ] {
             let drops = Rc::new(Cell::new(0));
-            let mut context = Context::new(0, 0);
-            context.error = Some(owned_error(&descriptor, &drops, Some(original_progress)));
-            context.progress = projected;
-            let original = context.error.as_ref().unwrap().carrier().object;
+            let context = Context::new(0, 0);
+            unsafe {
+                (*context.as_ptr()).error =
+                    Some(owned_error(&descriptor, &drops, Some(original_progress)))
+            };
+            unsafe { (*context.as_ptr()).progress = projected };
+            let original = unsafe { (*context.as_ptr()).error.as_ref().unwrap().carrier().object };
             let adapter = context.adapter();
             let mut bytes = [0_u8; 8];
             let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -398,7 +403,7 @@ fn unusable_checked_progress_preserves_signed_error_and_withholds_prefix() {
             });
             assert_eq!(allocations, 0);
             assert_eq!(drops.get(), 1);
-            assert!(context.error.is_none());
+            assert!(unsafe { (*context.as_ptr()).error.is_none() });
         }
     }
 }
@@ -615,7 +620,10 @@ impl Control for Budget {
     }
 }
 
-fn driver(a: &mut Context, b: &mut Context) -> (Driver, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+fn driver(
+    a: &TestObject<Context>,
+    b: &TestObject<Context>,
+) -> (Driver, Rc<Cell<usize>>, Rc<Cell<usize>>) {
     let frame = Rc::new(Cell::new(0));
     let waits = Rc::new(Cell::new(0));
     (
@@ -632,9 +640,9 @@ fn driver(a: &mut Context, b: &mut Context) -> (Driver, Rc<Cell<usize>>, Rc<Cell
 
 #[test]
 fn shared_group_dispatches_empty_adapters_and_clears_frames_even_on_host_unwind() {
-    let mut a = Context::new(0, 0);
-    let mut b = Context::new(0, 0);
-    let (driver, observed_frame, _) = driver(&mut a, &mut b);
+    let a = Context::new(0, 0);
+    let b = Context::new(0, 0);
+    let (driver, observed_frame, _) = driver(&a, &b);
     let mut slots = RequestSlots::new(&[10], |_| Request::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Read(&mut [])].into_iter()).unwrap();
     let mut group = TransferGroup::begin(
@@ -647,7 +655,7 @@ fn shared_group_dispatches_empty_adapters_and_clears_frames_even_on_host_unwind(
         },
     )
     .unwrap();
-    assert_eq!(a.calls, 1);
+    assert_eq!(unsafe { (*a.as_ptr()).calls }, 1);
     assert_eq!(observed_frame.get(), 0);
     let frame: DrStackFrameV2 = unsafe { mem::zeroed() };
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -666,8 +674,11 @@ fn shared_group_dispatches_empty_adapters_and_clears_frames_even_on_host_unwind(
         ));
     });
     assert_eq!(allocations, 0);
-    assert_eq!(a.calls, 2);
-    assert_eq!(a.frame_address, &frame as *const _ as usize);
+    assert_eq!(unsafe { (*a.as_ptr()).calls }, 2);
+    assert_eq!(
+        unsafe { (*a.as_ptr()).frame_address },
+        &frame as *const _ as usize
+    );
     assert_eq!(observed_frame.get(), 0);
     assert!(catch_unwind(AssertUnwindSafe(|| unsafe {
         group.with_call_frame(&frame, |_| panic!("test-only host unwind"));
@@ -679,10 +690,10 @@ fn shared_group_dispatches_empty_adapters_and_clears_frames_even_on_host_unwind(
 #[test]
 fn earlier_adapter_cancellation_prevents_later_initial_dispatch() {
     let cancelled = Rc::new(Cell::new(false));
-    let mut a = Context::new(0, 1);
-    a.cancel = Some(Rc::clone(&cancelled));
-    let mut b = Context::new(0, 1);
-    let (driver, _, _) = driver(&mut a, &mut b);
+    let a = Context::new(0, 1);
+    unsafe { (*a.as_ptr()).cancel = Some(Rc::clone(&cancelled)) };
+    let b = Context::new(0, 1);
+    let (driver, _, _) = driver(&a, &b);
     let mut slots = RequestSlots::new(&[10, 20], |_| Request::new()).unwrap();
     let buffers =
         BufferList::from_iter([Buffer::Write(b"a"), Buffer::Write(b"b")].into_iter()).unwrap();
@@ -696,7 +707,10 @@ fn earlier_adapter_cancellation_prevents_later_initial_dispatch() {
         },
     )
     .unwrap();
-    assert_eq!((a.calls, b.calls), (1, 0));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).calls, (*b.as_ptr()).calls) },
+        (1, 0)
+    );
     let first = group.next().unwrap();
     assert!(matches!(
         first.outcome.transfer,
@@ -710,9 +724,9 @@ fn earlier_adapter_cancellation_prevents_later_initial_dispatch() {
 #[test]
 fn adapter_query_rechecks_stop_between_selected_callbacks() {
     let cancelled = Rc::new(Cell::new(false));
-    let mut a = Context::new(1, 0);
-    let mut b = Context::new(1, 0);
-    let (driver, _, _) = driver(&mut a, &mut b);
+    let a = Context::new(1, 0);
+    let b = Context::new(1, 0);
+    let (driver, _, _) = driver(&a, &b);
     let mut slots = RequestSlots::new(&[10, 20], |_| Request::new()).unwrap();
     let buffers =
         BufferList::from_iter([Buffer::Write(b"a"), Buffer::Write(b"b")].into_iter()).unwrap();
@@ -726,18 +740,24 @@ fn adapter_query_rechecks_stop_between_selected_callbacks() {
         },
     )
     .unwrap();
-    assert_eq!((a.calls, b.calls), (1, 1));
-    a.tag = 0;
-    a.count = 1;
-    a.cancel = Some(cancelled);
-    b.tag = 0;
-    b.count = 1;
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).calls, (*b.as_ptr()).calls) },
+        (1, 1)
+    );
+    unsafe { (*a.as_ptr()).tag = 0 };
+    unsafe { (*a.as_ptr()).count = 1 };
+    unsafe { (*a.as_ptr()).cancel = Some(cancelled) };
+    unsafe { (*b.as_ptr()).tag = 0 };
+    unsafe { (*b.as_ptr()).count = 1 };
     let first = group.next().unwrap();
     assert!(matches!(
         first.outcome.transfer,
         Some(AdapterTerminal::Accepted(1))
     ));
-    assert_eq!((a.calls, b.calls), (2, 1));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).calls, (*b.as_ptr()).calls) },
+        (2, 1)
+    );
     let second = group.next().unwrap();
     assert!(second.outcome.transfer.is_none());
     assert_eq!(second.outcome.stop, Some(Stop::Cancellation));
@@ -747,12 +767,12 @@ fn adapter_query_rechecks_stop_between_selected_callbacks() {
 fn empty_adapter_callback_preserves_its_original_checked_error() {
     let descriptor = descriptor();
     let drops = Rc::new(Cell::new(0));
-    let mut a = Context::new(0, 0);
-    a.error = Some(owned_error(&descriptor, &drops, Some(0)));
-    a.progress = Some(0);
-    let original = a.error.as_ref().unwrap().carrier().object;
-    let mut b = Context::new(0, 0);
-    let (driver, _, _) = driver(&mut a, &mut b);
+    let a = Context::new(0, 0);
+    unsafe { (*a.as_ptr()).error = Some(owned_error(&descriptor, &drops, Some(0))) };
+    unsafe { (*a.as_ptr()).progress = Some(0) };
+    let original = unsafe { (*a.as_ptr()).error.as_ref().unwrap().carrier().object };
+    let b = Context::new(0, 0);
+    let (driver, _, _) = driver(&a, &b);
     let mut slots = RequestSlots::new(&[10], |_| Request::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Write(b"")].into_iter()).unwrap();
     let mut group = TransferGroup::begin(
@@ -765,7 +785,7 @@ fn empty_adapter_callback_preserves_its_original_checked_error() {
         },
     )
     .unwrap();
-    assert_eq!(a.calls, 1);
+    assert_eq!(unsafe { (*a.as_ptr()).calls }, 1);
     let completion = group.next().unwrap();
     let Some(AdapterTerminal::CheckedError { error, progress }) = completion.outcome.transfer
     else {
@@ -780,9 +800,9 @@ fn empty_adapter_callback_preserves_its_original_checked_error() {
 
 #[test]
 fn immediate_adapter_poll_is_bounded_despite_permanently_ready_would_block() {
-    let mut a = Context::new(1, 0);
-    let mut b = Context::new(0, 0);
-    let (driver, _, waits) = driver(&mut a, &mut b);
+    let a = Context::new(1, 0);
+    let b = Context::new(0, 0);
+    let (driver, _, waits) = driver(&a, &b);
     let mut slots = RequestSlots::new(&[10], |_| Request::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Write(b"a")].into_iter()).unwrap();
     let mut group = TransferGroup::begin(
@@ -799,7 +819,7 @@ fn immediate_adapter_poll_is_bounded_despite_permanently_ready_would_block() {
     assert!(completion.outcome.transfer.is_none());
     assert_eq!(completion.outcome.stop, Some(Stop::BudgetExhausted));
     assert_eq!(waits.get(), 1);
-    assert_eq!(a.calls, 3); // initial attempt, pre-poll query, post-poll query
+    assert_eq!(unsafe { (*a.as_ptr()).calls }, 3); // initial attempt, pre-poll query, post-poll query
     assert_eq!(allocations, 0);
     assert!(group.next().is_none());
 }
@@ -808,10 +828,10 @@ fn immediate_adapter_poll_is_bounded_despite_permanently_ready_would_block() {
 fn shared_group_drop_releases_untaken_checked_errors_after_retiring_requests() {
     let descriptor = descriptor();
     let drops = Rc::new(Cell::new(0));
-    let mut a = Context::new(0, 0);
-    a.error = Some(owned_error(&descriptor, &drops, None));
-    let mut b = Context::new(1, 0);
-    let (driver, observed_frame, _) = driver(&mut a, &mut b);
+    let a = Context::new(0, 0);
+    unsafe { (*a.as_ptr()).error = Some(owned_error(&descriptor, &drops, None)) };
+    let b = Context::new(1, 0);
+    let (driver, observed_frame, _) = driver(&a, &b);
     let mut slots = RequestSlots::new(&[10, 20], |_| Request::new()).unwrap();
     let buffers =
         BufferList::from_iter([Buffer::Write(b"a"), Buffer::Write(b"b")].into_iter()).unwrap();
@@ -830,7 +850,10 @@ fn shared_group_drop_releases_untaken_checked_errors_after_retiring_requests() {
     unsafe { group.drop_in_frame(&cleanup) };
     assert_eq!(observed_frame.get(), 0);
     assert_eq!(drops.get(), 1);
-    assert_eq!((a.calls, b.calls), (1, 1));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).calls, (*b.as_ptr()).calls) },
+        (1, 1)
+    );
 }
 
 #[test]

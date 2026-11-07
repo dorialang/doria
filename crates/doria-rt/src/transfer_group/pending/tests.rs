@@ -1,3 +1,4 @@
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -130,8 +131,8 @@ struct Context {
 }
 
 impl Context {
-    fn new(index: usize, ledger: &Ledger) -> Box<Self> {
-        Box::new(Self {
+    fn new(index: usize, ledger: &Ledger) -> TestObject<Self> {
+        TestObject::new(Self {
             index,
             ledger: Rc::clone(ledger),
             prepares: 0,
@@ -150,13 +151,12 @@ impl Context {
             null_completion: false,
         })
     }
+}
 
-    fn adapter(&mut self) -> DrPendingTransferAdapterV1 {
+impl TestObject<Context> {
+    fn adapter(&self) -> DrPendingTransferAdapterV1 {
         DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             prepare_read: Some(prepare_read),
             prepare_write: Some(prepare_write),
             complete_read: Some(complete_read),
@@ -174,7 +174,7 @@ unsafe fn prepare(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.prepares += 1;
     record(
         &context.ledger,
@@ -325,7 +325,7 @@ unsafe fn complete(call: CompleteCall) -> u8 {
         outcome,
         error,
     } = call;
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     let native = &*native;
     let selected = &*selected;
     let immediate = immediate
@@ -709,7 +709,7 @@ impl Control for Budget {
     }
 }
 
-fn records(contexts: &mut [&mut Context]) -> FixedSlice<PendingState> {
+fn records(contexts: &[&TestObject<Context>]) -> FixedSlice<PendingState> {
     let mut records = FixedSlice::new(contexts.len()).unwrap();
     for context in contexts {
         records
@@ -773,7 +773,7 @@ fn six_word_pending_descriptor_and_four_word_sync_descriptor_preserve_direction_
         5 * mem::size_of::<usize>()
     );
     let events = ledger();
-    let mut context = Context::new(0, &events);
+    let context = Context::new(0, &events);
     let mut adapter = context.adapter();
     assert!(adapter.validate(true).is_ok() && adapter.validate(false).is_ok());
     adapter.complete_read = None;
@@ -794,12 +794,12 @@ fn queued_preparations_cancel_exactly_once_preserving_original_error_and_immedia
     let cancelled = Rc::new(Cell::new(false));
     let drops = Rc::new(Cell::new(0));
     let (error, original) = owned_error(&descriptor, &drops, None);
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    let mut c = Context::new(2, &events);
-    b.completion_error = Some(error);
-    c.immediate = Some((0, 1));
-    let mut states = records(&mut [&mut a, &mut b, &mut c]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    let c = Context::new(2, &events);
+    unsafe { (*b.as_ptr()).completion_error = Some(error) };
+    unsafe { (*c.as_ptr()).immediate = Some((0, 1)) };
+    let mut states = records(&[&a, &b, &c]);
     let mut slots = RequestSlots::new(&[10, 20, 30], |_| NativeRequest::new()).unwrap();
     let buffers = BufferList::from_iter(
         [
@@ -815,7 +815,16 @@ fn queued_preparations_cancel_exactly_once_preserving_original_error_and_immedia
     let mut group =
         TransferGroup::begin_prepared(&mut slots, buffers, driver, Budget::new(&cancelled))
             .unwrap();
-    assert_eq!((a.prepares, b.prepares, c.prepares), (1, 1, 1));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).prepares,
+                (*b.as_ptr()).prepares,
+                (*c.as_ptr()).prepares,
+            )
+        },
+        (1, 1, 1)
+    );
     let snapshot = events.borrow();
     assert_eq!(
         snapshot
@@ -860,7 +869,16 @@ fn queued_preparations_cancel_exactly_once_preserving_original_error_and_immedia
     });
     assert_eq!(allocations, 0);
     assert_eq!(drops.get(), 1);
-    assert_eq!((a.completes, b.completes, c.completes), (1, 1, 1));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).completes,
+                (*c.as_ptr()).completes,
+            )
+        },
+        (1, 1, 1)
+    );
     let snapshot = events.borrow();
     assert_eq!(
         snapshot
@@ -919,7 +937,16 @@ fn queued_preparations_cancel_exactly_once_preserving_original_error_and_immedia
         assert!(reused.next().is_none());
     });
     assert_eq!(allocations, 0);
-    assert_eq!((a.completes, b.completes, c.completes), (2, 2, 2));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).completes,
+                (*c.as_ptr()).completes,
+            )
+        },
+        (2, 2, 2)
+    );
 }
 
 #[test]
@@ -927,10 +954,10 @@ fn immediate_completed_prefix_is_available_before_fetch_and_retirement_runs_once
     for fetch in [false, true] {
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
-        let mut context = Context::new(0, &events);
-        context.immediate = Some((0, 0));
-        context.outer = Some((0, 2));
-        let mut states = records(&mut [&mut context]);
+        let context = Context::new(0, &events);
+        unsafe { (*context.as_ptr()).immediate = Some((0, 0)) };
+        unsafe { (*context.as_ptr()).outer = Some((0, 2)) };
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let mut bytes = [11, 12, 13];
         let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
@@ -944,7 +971,7 @@ fn immediate_completed_prefix_is_available_before_fetch_and_retirement_runs_once
             Budget::new(&Rc::new(Cell::new(false))),
         )
         .unwrap();
-        assert_eq!(context.completes, 1);
+        assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
         assert_eq!(group.completed(0), Some(&[11, 12][..]));
         if fetch {
             let completion = group.next().unwrap();
@@ -955,7 +982,7 @@ fn immediate_completed_prefix_is_available_before_fetch_and_retirement_runs_once
             assert!(group.next().is_none());
         }
         drop(group);
-        assert_eq!(context.completes, 1);
+        assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
         assert!(!events.borrow().iter().any(|event| matches!(
             event,
             Event::Submit(..)
@@ -975,10 +1002,10 @@ fn immediate_completion_error_keeps_its_exact_carrier_until_fetch_or_destruction
         let behavior = Rc::new(RefCell::new(Behavior::default()));
         let drops = Rc::new(Cell::new(0));
         let (error, original) = owned_error(&descriptor, &drops, None);
-        let mut context = Context::new(0, &events);
-        context.immediate = Some((0, 0));
-        context.completion_error = Some(error);
-        let mut states = records(&mut [&mut context]);
+        let context = Context::new(0, &events);
+        unsafe { (*context.as_ptr()).immediate = Some((0, 0)) };
+        unsafe { (*context.as_ptr()).completion_error = Some(error) };
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let mut bytes = [0];
         let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
@@ -992,7 +1019,7 @@ fn immediate_completion_error_keeps_its_exact_carrier_until_fetch_or_destruction
             Budget::new(&Rc::new(Cell::new(false))),
         )
         .unwrap();
-        assert_eq!(context.completes, 1);
+        assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
         assert_eq!(drops.get(), 0);
         assert_eq!(group.completed(0), None);
         if fetch {
@@ -1012,7 +1039,7 @@ fn immediate_completion_error_keeps_its_exact_carrier_until_fetch_or_destruction
             assert!(group.next().is_none());
         }
         drop(group);
-        assert_eq!(context.completes, 1);
+        assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
         assert_eq!(drops.get(), 1);
         assert!(!events.borrow().iter().any(|event| matches!(
             event,
@@ -1030,11 +1057,11 @@ fn batch_preparation_precedes_submission_and_immediate_outer_metering() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     behavior.borrow_mut().specs[0].submission = NativeSubmission::Complete;
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    b.immediate = Some((0, 0));
-    b.outer = Some((0, 3));
-    let mut states = records(&mut [&mut a, &mut b]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    unsafe { (*b.as_ptr()).immediate = Some((0, 0)) };
+    unsafe { (*b.as_ptr()).outer = Some((0, 3)) };
+    let mut states = records(&[&a, &b]);
     let mut slots = RequestSlots::new(&[10, 20], |_| NativeRequest::new()).unwrap();
     let buffers =
         BufferList::from_iter([Buffer::Write(b"abcd"), Buffer::Write(b"meter")].into_iter())
@@ -1061,7 +1088,14 @@ fn batch_preparation_precedes_submission_and_immediate_outer_metering() {
         ));
     }
     assert_eq!(
-        (a.prepares, b.prepares, a.completes, b.completes),
+        unsafe {
+            (
+                (*a.as_ptr()).prepares,
+                (*b.as_ptr()).prepares,
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).completes,
+            )
+        },
         (1, 1, 1, 1)
     );
     let snapshot = events.borrow();
@@ -1096,9 +1130,9 @@ fn preparation_checked_error_moves_exact_carrier_and_untaken_cleanup_runs_once()
         let behavior = Rc::new(RefCell::new(Behavior::default()));
         let drops = Rc::new(Cell::new(0));
         let (error, original) = owned_error(&descriptor, &drops, Some(-3));
-        let mut context = Context::new(0, &events);
-        context.preparation_error = Some(error);
-        let mut states = records(&mut [&mut context]);
+        let context = Context::new(0, &events);
+        unsafe { (*context.as_ptr()).preparation_error = Some(error) };
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
         let driver = unsafe {
@@ -1148,7 +1182,10 @@ fn preparation_checked_error_moves_exact_carrier_and_untaken_cleanup_runs_once()
             drop(failure);
         }
         assert_eq!(drops.get(), 1);
-        assert_eq!((context.prepares, context.completes), (1, 0));
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (1, 0)
+        );
         assert!(!events.borrow().iter().any(|event| matches!(
             event,
             Event::Submit(..) | Event::Retire(..) | Event::Complete { .. }
@@ -1161,17 +1198,17 @@ fn native_rejection_and_invalid_endpoint_finish_once_without_submission_claim() 
     for rejection in 0..3 {
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
-        let mut context = Context::new(0, &events);
+        let context = Context::new(0, &events);
         match rejection {
-            0 => context.selection = Selection::Invalid,
-            1 => context.endpoint = endpoint(1),
+            0 => unsafe { (*context.as_ptr()).selection = Selection::Invalid },
+            1 => unsafe { (*context.as_ptr()).endpoint = endpoint(1) },
             _ => {
                 behavior.borrow_mut().specs[0].submission = NativeSubmission::Rejected(
                     Failure::from_system_code(93).with_transferred_byte_count(Some(9)),
                 );
             }
         }
-        let mut states = records(&mut [&mut context]);
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
         let driver = unsafe {
@@ -1196,7 +1233,7 @@ fn native_rejection_and_invalid_endpoint_finish_once_without_submission_claim() 
                 matches!(setup, Err(SetupFailure::Preparation(AdapterTerminal::PlatformFailure(failure))) if failure == Failure::invalid_input())
             );
         }
-        assert_eq!(context.completes, 1);
+        assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
         let snapshot = events.borrow();
         let completed = snapshot
             .iter()
@@ -1263,8 +1300,8 @@ fn pending_query_retires_before_completion_and_reuses_stable_request_without_all
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     behavior.borrow_mut().release_on_wait = true;
-    let mut context = Context::new(0, &events);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    let mut states = records(&[&context]);
     let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
     let original = slots.raw(0) as usize;
     let buffers = BufferList::from_iter([Buffer::Write(b"abcdef")].into_iter()).unwrap();
@@ -1278,7 +1315,7 @@ fn pending_query_retires_before_completion_and_reuses_stable_request_without_all
         Budget::new(&Rc::new(Cell::new(false))),
     )
     .unwrap();
-    assert_eq!(context.completes, 0);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 0);
     let frame: DrStackFrameV2 = unsafe { mem::zeroed() };
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
         let first = group.with_call_frame(&frame, |group| group.next()).unwrap();
@@ -1298,7 +1335,10 @@ fn pending_query_retires_before_completion_and_reuses_stable_request_without_all
         assert_eq!(group.completed(0), Some(&b"cd"[..]));
     });
     assert_eq!(allocations, 0);
-    assert_eq!((context.prepares, context.completes), (2, 2));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (2, 2)
+    );
     assert_eq!(observed_frame.get(), 0);
     let snapshot = events.borrow();
     let waited = position(&snapshot, |event| *event == Event::Wait);
@@ -1331,8 +1371,8 @@ fn native_completion_winning_cancellation_is_not_suppressed_by_preflight() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     let cancelled = Rc::new(Cell::new(false));
-    let mut context = Context::new(0, &events);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    let mut states = records(&[&context]);
     let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
     let driver =
@@ -1348,7 +1388,10 @@ fn native_completion_winning_cancellation_is_not_suppressed_by_preflight() {
         Some(AdapterTerminal::Accepted(2))
     ));
     assert_eq!(completed.outcome.stop, None);
-    assert_eq!((context.prepares, context.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (1, 1)
+    );
     let snapshot = events.borrow();
     assert!(!snapshot
         .iter()
@@ -1374,11 +1417,11 @@ fn cancellation_failure_fans_out_before_drain_and_preserves_outer_error() {
     let drops = Rc::new(Cell::new(0));
     let (error, original) = owned_error(&descriptor, &drops, Some(1));
     let cancelled = Rc::new(Cell::new(false));
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    b.completion_error = Some(error);
-    b.error_prefix = Some(1);
-    let mut states = records(&mut [&mut a, &mut b]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    unsafe { (*b.as_ptr()).completion_error = Some(error) };
+    unsafe { (*b.as_ptr()).error_prefix = Some(1) };
+    let mut states = records(&[&a, &b]);
     let mut slots = RequestSlots::new(&[10, 20], |_| NativeRequest::new()).unwrap();
     let buffers =
         BufferList::from_iter([Buffer::Write(b"loan"), Buffer::Write(b"other")].into_iter())
@@ -1414,7 +1457,10 @@ fn cancellation_failure_fans_out_before_drain_and_preserves_outer_error() {
     );
     drop(unsafe { OwnedIoError::from_carrier(carrier) });
     assert_eq!(drops.get(), 1);
-    assert_eq!((a.completes, b.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).completes, (*b.as_ptr()).completes) },
+        (1, 1)
+    );
     let snapshot = events.borrow();
     assert_retirement_order(&snapshot, &[0, 1]);
     assert!(snapshot.iter().any(|event| matches!(
@@ -1441,9 +1487,9 @@ fn query_and_wait_failures_still_cancel_and_retire_every_native_request() {
         } else {
             behavior.borrow_mut().wait_failure = Some(failure);
         }
-        let mut a = Context::new(0, &events);
-        let mut b = Context::new(1, &events);
-        let mut states = records(&mut [&mut a, &mut b]);
+        let a = Context::new(0, &events);
+        let b = Context::new(1, &events);
+        let mut states = records(&[&a, &b]);
         let mut slots = RequestSlots::new(&[10, 20], |_| NativeRequest::new()).unwrap();
         let buffers =
             BufferList::from_iter([Buffer::Write(b"loan"), Buffer::Write(b"more")].into_iter())
@@ -1472,7 +1518,10 @@ fn query_and_wait_failures_still_cancel_and_retire_every_native_request() {
             ));
         }
         assert_eq!(observed_frame.get(), 0);
-        assert_eq!((a.completes, b.completes), (1, 1));
+        assert_eq!(
+            unsafe { ((*a.as_ptr()).completes, (*b.as_ptr()).completes) },
+            (1, 1)
+        );
         assert_retirement_order(&events.borrow(), &[0, 1]);
     }
 }
@@ -1483,13 +1532,13 @@ fn transformed_storage_retains_selected_provenance_and_original_completion_regio
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     behavior.borrow_mut().specs[0].submission = NativeSubmission::Complete;
     behavior.borrow_mut().specs[0].result = Ok(4);
-    let mut context = Context::new(0, &events);
-    context.selection = Selection::Storage;
-    context.transform = true;
-    let selected = context.storage.as_ptr() as usize;
+    let context = Context::new(0, &events);
+    unsafe { (*context.as_ptr()).selection = Selection::Storage };
+    unsafe { (*context.as_ptr()).transform = true };
+    let selected = unsafe { (*context.as_ptr()).storage.as_ptr() } as usize;
     let mut bytes = [0_u8; 6];
     let original = bytes.as_mut_ptr() as usize;
-    let mut states = records(&mut [&mut context]);
+    let mut states = records(&[&context]);
     let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
     let driver =
@@ -1524,7 +1573,10 @@ fn transformed_storage_retains_selected_provenance_and_original_completion_regio
     drop(snapshot);
     drop(group);
     assert_eq!(bytes, [244, 233, 222, 211, 0, 0]);
-    assert_eq!((context.prepares, context.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (1, 1)
+    );
 }
 
 #[test]
@@ -1533,13 +1585,13 @@ fn stopping_prepared_native_has_no_transfer_but_staged_immediate_completes_once(
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
         let cancelled = Rc::new(Cell::new(false));
-        let mut context = Context::new(0, &events);
-        context.cancel_on_prepare = Some(Rc::clone(&cancelled));
-        context.null_completion = !immediate;
+        let context = Context::new(0, &events);
+        unsafe { (*context.as_ptr()).cancel_on_prepare = Some(Rc::clone(&cancelled)) };
+        unsafe { (*context.as_ptr()).null_completion = !immediate };
         if immediate {
-            context.immediate = Some((1, 0));
+            unsafe { (*context.as_ptr()).immediate = Some((1, 0)) };
         }
-        let mut states = records(&mut [&mut context]);
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
         let driver = unsafe {
@@ -1555,7 +1607,7 @@ fn stopping_prepared_native_has_no_transfer_but_staged_immediate_completes_once(
                 completion.outcome.transfer,
                 Some(AdapterTerminal::WouldBlock)
             ));
-            assert_eq!(context.completes, 1);
+            assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
             assert!(events.borrow().iter().any(|event| matches!(
                 event,
                 Event::Complete {
@@ -1567,7 +1619,7 @@ fn stopping_prepared_native_has_no_transfer_but_staged_immediate_completes_once(
             )));
         } else {
             assert!(completion.outcome.transfer.is_none());
-            assert_eq!(context.completes, 1);
+            assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
             assert!(events.borrow().iter().any(|event| matches!(
                 event,
                 Event::Complete {
@@ -1586,7 +1638,7 @@ fn stopping_prepared_native_has_no_transfer_but_staged_immediate_completes_once(
         assert!(group.completed(0).is_none());
         assert!(group.next().is_none());
         drop(group);
-        assert_eq!(context.completes, 1);
+        assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
         let snapshot = events.borrow();
         assert!(!snapshot.iter().any(|event| matches!(
             event,
@@ -1605,13 +1657,13 @@ fn empty_requests_dispatch_once_and_would_block_is_a_terminal_fact() {
         let behavior = Rc::new(RefCell::new(Behavior::default()));
         behavior.borrow_mut().specs[0].submission = NativeSubmission::Complete;
         behavior.borrow_mut().specs[0].result = Ok(0);
-        let mut context = Context::new(0, &events);
+        let context = Context::new(0, &events);
         if immediate {
-            context.immediate = Some((1, 0));
+            unsafe { (*context.as_ptr()).immediate = Some((1, 0)) };
         } else {
-            context.selection = Selection::Empty;
+            unsafe { (*context.as_ptr()).selection = Selection::Empty };
         }
-        let mut states = records(&mut [&mut context]);
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let buffers = BufferList::from_iter([Buffer::Write(b"")].into_iter()).unwrap();
         let budget = Budget::new(&Rc::new(Cell::new(false)));
@@ -1636,7 +1688,10 @@ fn empty_requests_dispatch_once_and_would_block_is_a_terminal_fact() {
         }
         assert_eq!(completion.outcome.stop, None);
         assert_eq!(clock_calls.get(), 0);
-        assert_eq!((context.prepares, context.completes), (1, 1));
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (1, 1)
+        );
         assert!(group.next().is_none());
         assert!(!events
             .borrow()
@@ -1649,8 +1704,8 @@ fn empty_requests_dispatch_once_and_would_block_is_a_terminal_fact() {
 fn drop_drains_pending_with_null_frame_and_leaves_request_reusable() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
-    let mut context = Context::new(0, &events);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    let mut states = records(&[&context]);
     let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
     let original = slots.raw(0) as usize;
     let frame: DrStackFrameV2 = unsafe { mem::zeroed() };
@@ -1668,7 +1723,7 @@ fn drop_drains_pending_with_null_frame_and_leaves_request_reusable() {
     assert_eq!(observed_frame.get(), 0);
     let ((), allocations) = crate::probe_runtime_allocations(|| drop(group));
     assert_eq!(allocations, 0);
-    assert_eq!(context.completes, 1);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
     assert_retirement_order(&events.borrow(), &[0]);
     assert!(events.borrow().iter().any(|event| matches!(
         event,
@@ -1696,7 +1751,10 @@ fn drop_drains_pending_with_null_frame_and_leaves_request_reusable() {
         reused.next().unwrap().outcome.transfer,
         Some(AdapterTerminal::Accepted(2))
     ));
-    assert_eq!((context.prepares, context.completes), (2, 2));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (2, 2)
+    );
     drop(reused);
     assert_eq!(slots.raw(0) as usize, original);
 }
@@ -1706,11 +1764,11 @@ fn sparse_selection_rejects_holes_before_preparing_then_preserves_plan_order() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     behavior.borrow_mut().ready.fill(true);
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    let mut c = Context::new(2, &events);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    let c = Context::new(2, &events);
     let mut states = StableSlots::new().unwrap();
-    for context in [&mut *a, &mut *b, &mut *c] {
+    for context in [&a, &b, &c] {
         states
             .insert(PendingState::new(context.adapter()).unwrap())
             .unwrap();
@@ -1740,7 +1798,16 @@ fn sparse_selection_rejects_holes_before_preparing_then_preserves_plan_order() {
     assert!(rejected.is_err());
     drop(rejected);
     assert!(events.borrow().is_empty());
-    assert_eq!((a.prepares, b.prepares, c.prepares), (0, 0, 0));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).prepares,
+                (*b.as_ptr()).prepares,
+                (*c.as_ptr()).prepares,
+            )
+        },
+        (0, 0, 0)
+    );
     let mut selection = FixedSlice::new(2).unwrap();
     selection.push(2).unwrap();
     selection.push(0).unwrap();
@@ -1771,7 +1838,16 @@ fn sparse_selection_rejects_holes_before_preparing_then_preserves_plan_order() {
         second.outcome.transfer,
         Some(AdapterTerminal::Accepted(2))
     ));
-    assert_eq!((a.prepares, b.prepares, c.prepares), (1, 0, 1));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).prepares,
+                (*b.as_ptr()).prepares,
+                (*c.as_ptr()).prepares,
+            )
+        },
+        (1, 0, 1)
+    );
     assert!(events
         .borrow()
         .iter()
@@ -1788,11 +1864,11 @@ fn later_preparation_error_aborts_before_submission_cleans_earlier_success_and_a
     behavior.borrow_mut().ready.fill(true);
     let drops = Rc::new(Cell::new(0));
     let (error, original_error) = owned_error(&descriptor, &drops, Some(-3));
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    let mut c = Context::new(2, &events);
-    b.preparation_error = Some(error);
-    let mut states = records(&mut [&mut a, &mut b, &mut c]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    let c = Context::new(2, &events);
+    unsafe { (*b.as_ptr()).preparation_error = Some(error) };
+    let mut states = records(&[&a, &b, &c]);
     let mut slots = RequestSlots::new(&[10, 20, 30], |_| NativeRequest::new()).unwrap();
     let addresses = [
         slots.raw(0) as usize,
@@ -1831,8 +1907,26 @@ fn later_preparation_error_aborts_before_submission_cleans_earlier_success_and_a
         Some(-3)
     );
     assert_eq!(drops.get(), 0);
-    assert_eq!((a.prepares, b.prepares, c.prepares), (1, 1, 0));
-    assert_eq!((a.completes, b.completes, c.completes), (1, 0, 0));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).prepares,
+                (*b.as_ptr()).prepares,
+                (*c.as_ptr()).prepares,
+            )
+        },
+        (1, 1, 0)
+    );
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).completes,
+                (*c.as_ptr()).completes,
+            )
+        },
+        (1, 0, 0)
+    );
     let snapshot = events.borrow();
     assert!(!snapshot.iter().any(|event| matches!(
         event,
@@ -1897,7 +1991,16 @@ fn later_preparation_error_aborts_before_submission_cleans_earlier_success_and_a
         ],
         addresses
     );
-    assert_eq!((a.completes, b.completes, c.completes), (2, 1, 1));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).completes,
+                (*c.as_ptr()).completes,
+            )
+        },
+        (2, 1, 1)
+    );
     assert_eq!(drops.get(), 1);
 }
 
@@ -1906,11 +2009,11 @@ fn cancellation_between_preparations_cleans_each_success_without_native_submissi
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     let cancelled = Rc::new(Cell::new(false));
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    let mut c = Context::new(2, &events);
-    b.cancel_on_prepare = Some(Rc::clone(&cancelled));
-    let mut states = records(&mut [&mut a, &mut b, &mut c]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    let c = Context::new(2, &events);
+    unsafe { (*b.as_ptr()).cancel_on_prepare = Some(Rc::clone(&cancelled)) };
+    let mut states = records(&[&a, &b, &c]);
     let mut slots = RequestSlots::new(&[10, 20, 30], |_| NativeRequest::new()).unwrap();
     let addresses = [
         slots.raw(0) as usize,
@@ -1938,8 +2041,26 @@ fn cancellation_between_preparations_cleans_each_success_without_native_submissi
         assert_eq!(completion.outcome.cancellation_failure, None);
     }
     assert!(group.next().is_none());
-    assert_eq!((a.prepares, b.prepares, c.prepares), (1, 1, 0));
-    assert_eq!((a.completes, b.completes, c.completes), (1, 1, 0));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).prepares,
+                (*b.as_ptr()).prepares,
+                (*c.as_ptr()).prepares,
+            )
+        },
+        (1, 1, 0)
+    );
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).completes,
+                (*c.as_ptr()).completes,
+            )
+        },
+        (1, 1, 0)
+    );
     let snapshot = events.borrow();
     assert!(!snapshot.iter().any(|event| matches!(
         event,
@@ -1977,10 +2098,10 @@ fn unsubmitted_cleanup_checked_error_is_preserved_instead_of_no_transfer() {
     let drops = Rc::new(Cell::new(0));
     let (error, original) = owned_error(&descriptor, &drops, Some(-3));
     let cancelled = Rc::new(Cell::new(false));
-    let mut context = Context::new(0, &events);
-    context.cancel_on_prepare = Some(Rc::clone(&cancelled));
-    context.completion_error = Some(error);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    unsafe { (*context.as_ptr()).cancel_on_prepare = Some(Rc::clone(&cancelled)) };
+    unsafe { (*context.as_ptr()).completion_error = Some(error) };
+    let mut states = records(&[&context]);
     let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
     let driver =
@@ -2002,7 +2123,7 @@ fn unsubmitted_cleanup_checked_error_is_preserved_instead_of_no_transfer() {
         unsafe { (*carrier.object.cast::<ErrorPayload>()).progress },
         Some(-3)
     );
-    assert_eq!(context.completes, 1);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 1);
     assert!(events.borrow().iter().any(|event| matches!(
         event,
         Event::Complete {
@@ -2034,9 +2155,9 @@ fn post_prepare_resource_failure_preserves_original_checked_cleanup_error() {
     let drops = Rc::new(Cell::new(0));
     let (error, original) = owned_error(&descriptor, &drops, Some(-3));
     let cancelled = Rc::new(Cell::new(false));
-    let mut context = Context::new(0, &events);
-    context.completion_error = Some(error);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    unsafe { (*context.as_ptr()).completion_error = Some(error) };
+    let mut states = records(&[&context]);
     let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
     let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
     let driver =
@@ -2055,7 +2176,10 @@ fn post_prepare_resource_failure_preserves_original_checked_cleanup_error() {
         unsafe { (*error.carrier().object.cast::<ErrorPayload>()).progress },
         Some(-3)
     );
-    assert_eq!((context.prepares, context.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (1, 1)
+    );
     assert_eq!(drops.get(), 0);
     assert!(events.borrow().iter().any(|event| matches!(
         event,
@@ -2081,12 +2205,12 @@ fn request_missing_repeated_and_mixed_configuration_reject_before_io_and_clean_o
     for mode in 1..=4 {
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
-        let mut context = Context::new(0, &events);
-        context.configuration_test = mode;
+        let context = Context::new(0, &events);
+        unsafe { (*context.as_ptr()).configuration_test = mode };
         if mode == 4 {
-            context.immediate = Some((0, 0));
+            unsafe { (*context.as_ptr()).immediate = Some((0, 0)) };
         }
-        let mut states = records(&mut [&mut context]);
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
         let driver = unsafe {
@@ -2102,7 +2226,10 @@ fn request_missing_repeated_and_mixed_configuration_reject_before_io_and_clean_o
             matches!(result, Err(SetupFailure::Preparation(AdapterTerminal::PlatformFailure(failure)))
             if failure == Failure::invalid_input())
         );
-        assert_eq!((context.prepares, context.completes), (1, 1));
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (1, 1)
+        );
         let snapshot = events.borrow();
         assert!(!snapshot.iter().any(|event| matches!(
             event,
@@ -2136,12 +2263,12 @@ fn nullable_completion_cannot_silently_discard_an_actual_native_or_immediate_res
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
         behavior.borrow_mut().specs[0].submission = NativeSubmission::Complete;
-        let mut context = Context::new(0, &events);
-        context.null_completion = true;
+        let context = Context::new(0, &events);
+        unsafe { (*context.as_ptr()).null_completion = true };
         if immediate {
-            context.immediate = Some((0, 0));
+            unsafe { (*context.as_ptr()).immediate = Some((0, 0)) };
         }
-        let mut states = records(&mut [&mut context]);
+        let mut states = records(&[&context]);
         let mut slots = RequestSlots::new(&[10], |_| NativeRequest::new()).unwrap();
         let buffers = BufferList::from_iter([Buffer::Write(b"loan")].into_iter()).unwrap();
         let driver = unsafe {
@@ -2158,7 +2285,10 @@ fn nullable_completion_cannot_silently_discard_an_actual_native_or_immediate_res
             Some(AdapterTerminal::PlatformFailure(failure)) if failure == Failure::invalid_input()));
         assert!(group.next().is_none());
         drop(group);
-        assert_eq!((context.prepares, context.completes), (1, 1));
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (1, 1)
+        );
     }
 }
 
@@ -2225,7 +2355,7 @@ unsafe fn observe_request(view: &DrPendingRequestViewV1) -> RequestObservation {
 #[test]
 fn request_observation_keeps_absence_zero_eof_would_block_and_immediate_distinct_without_allocating(
 ) {
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     record.reading = true;
     for tag in [0, 1, 2, 4] {
@@ -2259,7 +2389,7 @@ fn request_observation_keeps_absence_zero_eof_would_block_and_immediate_distinct
 
 #[test]
 fn request_view_snapshots_completion_facts_without_retaining_native_output_slots() {
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     record.reading = true;
     record.bound = 8;
@@ -2309,12 +2439,15 @@ fn request_view_snapshots_completion_facts_without_retaining_native_output_slots
         assert_eq!((*native).failure(), Some(failure));
     });
     assert_eq!(allocations, 0);
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
 }
 
 #[test]
 fn preparation_reply_uses_shared_configuration_without_invoking_a_native_callback() {
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     let mut bytes = [0; 4];
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -2371,7 +2504,10 @@ fn preparation_reply_uses_shared_configuration_without_invoking_a_native_callbac
         }
     });
     assert_eq!(allocations, 0);
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
 }
 
 #[test]
@@ -2379,8 +2515,8 @@ fn ordinary_preparation_reply_uses_native_validation_without_callback_dispatch()
     for reading in [true, false] {
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
-        let mut context = Context::new(0, &events);
-        let mut states = records(&mut [&mut context]);
+        let context = Context::new(0, &events);
+        let mut states = records(&[&context]);
         let mut request = NativeRequest::new();
         let mut bytes = [0; 4];
         let caller = bytes.as_mut_ptr();
@@ -2446,7 +2582,10 @@ fn ordinary_preparation_reply_uses_native_validation_without_callback_dispatch()
             assert!((*driver.record(0)).validate_idle_source_update().is_ok());
         });
         assert_eq!(allocations, 0);
-        assert_eq!((context.prepares, context.completes), (0, 0));
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (0, 0)
+        );
         let events = events.borrow();
         assert_eq!(
             events
@@ -2474,8 +2613,8 @@ fn rejected_ordinary_preparation_retains_first_selection_until_original_cleanup_
     for mode in 0..4 {
         let events = ledger();
         let behavior = Rc::new(RefCell::new(Behavior::default()));
-        let mut context = Context::new(0, &events);
-        let mut states = records(&mut [&mut context]);
+        let context = Context::new(0, &events);
+        let mut states = records(&[&context]);
         let mut request = NativeRequest::new();
         let mut bytes = [0; 4];
         let caller = bytes.as_mut_ptr();
@@ -2569,7 +2708,10 @@ fn rejected_ordinary_preparation_retains_first_selection_until_original_cleanup_
         });
         assert_eq!(allocations, 0);
         assert_eq!(drops.get(), 1);
-        assert_eq!((context.prepares, context.completes), (0, 0));
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (0, 0)
+        );
         let events = events.borrow();
         assert_eq!(
             events
@@ -2595,8 +2737,8 @@ fn original_host_cleanup_error_wins_preparation_validation_without_native_carrie
 
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
-    let mut context = Context::new(0, &events);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    let mut states = records(&[&context]);
     let mut request = NativeRequest::new();
     let mut bytes = [0; 4];
     let mut buffer = Buffer::Read(&mut bytes);
@@ -2636,7 +2778,10 @@ fn original_host_cleanup_error_wins_preparation_validation_without_native_carrie
         assert!((*driver.record(0)).validate_idle_source_update().is_ok());
     });
     assert_eq!(allocations, 0);
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
     assert_eq!(
         events
             .borrow()
@@ -2655,8 +2800,8 @@ fn original_host_cleanup_error_wins_preparation_validation_without_native_carrie
 fn throwing_ordinary_preparation_preserves_original_error_and_never_completes() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
-    let mut context = Context::new(0, &events);
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    let mut states = records(&[&context]);
     let mut request = NativeRequest::new();
     let mut bytes = [0; 4];
     let mut buffer = Buffer::Read(&mut bytes);
@@ -2701,7 +2846,10 @@ fn throwing_ordinary_preparation_preserves_original_error_and_never_completes() 
     });
     assert_eq!(allocations, 0);
     assert_eq!(drops.get(), 1);
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
     let events = events.borrow();
     assert_eq!(
         events
@@ -2724,13 +2872,13 @@ fn throwing_ordinary_preparation_preserves_original_error_and_never_completes() 
 fn retired_query_retains_loans_until_host_reply_without_requerying_or_allocating() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
-    let mut context = Context::new(0, &events);
-    context.selection = Selection::Storage;
-    let mut states = records(&mut [&mut context]);
+    let context = Context::new(0, &events);
+    unsafe { (*context.as_ptr()).selection = Selection::Storage };
+    let mut states = records(&[&context]);
     let mut request = NativeRequest::new();
     let mut bytes = [0; 6];
     let caller = bytes.as_mut_ptr();
-    let selected = context.storage.as_mut_ptr();
+    let selected = unsafe { (*context.as_ptr()).storage.as_mut_ptr() };
     let mut buffer = Buffer::Read(&mut bytes);
     let mut driver =
         unsafe { PendingDriver::new(Native::new(&events, &behavior), &mut states, ptr::null()) };
@@ -2821,7 +2969,10 @@ fn retired_query_retains_loans_until_host_reply_without_requerying_or_allocating
             .count(),
         1
     );
-    assert_eq!((context.prepares, context.completes), (1, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (1, 0)
+    );
 }
 
 #[test]
@@ -2831,9 +2982,9 @@ fn retired_drain_accepts_owned_host_error_once_after_all_cancellation_without_al
     let (error, original) = owned_error(&descriptor, &drops, Some(3));
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    let mut states = records(&mut [&mut a, &mut b]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    let mut states = records(&[&a, &b]);
     let mut requests = [NativeRequest::new(), NativeRequest::new()];
     let mut driver =
         unsafe { PendingDriver::new(Native::new(&events, &behavior), &mut states, ptr::null()) };
@@ -2913,7 +3064,10 @@ fn retired_drain_accepts_owned_host_error_once_after_all_cancellation_without_al
             assert!(position(&snapshot, |event| *event == Event::Cancel(cancelled)) < retirement);
         }
     }
-    assert_eq!((a.completes, b.completes), (0, 1));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).completes, (*b.as_ptr()).completes) },
+        (0, 1)
+    );
 }
 
 #[test]
@@ -2922,9 +3076,9 @@ fn retired_unsubmitted_cleanup_keeps_absence_and_actual_zero_distinct_without_al
         for immediate in [None, Some((0, 0)), Some((1, 0))] {
             let events = ledger();
             let behavior = Rc::new(RefCell::new(Behavior::default()));
-            let mut context = Context::new(0, &events);
-            context.immediate = immediate;
-            let mut states = records(&mut [&mut context]);
+            let context = Context::new(0, &events);
+            unsafe { (*context.as_ptr()).immediate = immediate };
+            let mut states = records(&[&context]);
             let mut request = NativeRequest::new();
             let mut bytes = [0; 4];
             let mut buffer = if reading {
@@ -2980,7 +3134,10 @@ fn retired_unsubmitted_cleanup_keeps_absence_and_actual_zero_distinct_without_al
                     .count(),
                 1
             );
-            assert_eq!((context.prepares, context.completes), (1, 0));
+            assert_eq!(
+                unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+                (1, 0)
+            );
         }
     }
 }
@@ -2990,17 +3147,17 @@ fn retired_selected_storage_stays_exclusive_until_completion_returns() {
     let events = ledger();
     let behavior = Rc::new(RefCell::new(Behavior::default()));
     behavior.borrow_mut().ready[0] = true;
-    let mut a = Context::new(0, &events);
-    let mut b = Context::new(1, &events);
-    b.selection = Selection::Storage;
-    let mut states = records(&mut [&mut a, &mut b]);
+    let a = Context::new(0, &events);
+    let b = Context::new(1, &events);
+    unsafe { (*b.as_ptr()).selection = Selection::Storage };
+    let mut states = records(&[&a, &b]);
     let mut requests = [NativeRequest::new(), NativeRequest::new()];
     let mut second_bytes = [0; 4];
     let mut driver =
         unsafe { PendingDriver::new(Native::new(&events, &behavior), &mut states, ptr::null()) };
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
         {
-            let mut buffer = Buffer::Read(&mut b.storage[..4]);
+            let mut buffer = Buffer::Read(&mut (&mut (*b.as_ptr()).storage)[..4]);
             driver.reset_request(0, &mut requests[0]);
             assert!(driver
                 .prepare_request(0, &mut requests[0], &mut buffer)
@@ -3038,7 +3195,16 @@ fn retired_selected_storage_stays_exclusive_until_completion_returns() {
         ));
     });
     assert_eq!(allocations, 0);
-    assert_eq!((a.completes, b.prepares, b.completes), (1, 2, 2));
+    assert_eq!(
+        unsafe {
+            (
+                (*a.as_ptr()).completes,
+                (*b.as_ptr()).prepares,
+                (*b.as_ptr()).completes,
+            )
+        },
+        (1, 2, 2)
+    );
     assert_eq!(
         events
             .borrow()
@@ -3055,7 +3221,7 @@ fn retired_selected_storage_stays_exclusive_until_completion_returns() {
 
 #[test]
 fn completion_reply_keeps_absence_separate_from_native_and_immediate_results() {
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     record.bound = 4;
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -3110,14 +3276,17 @@ fn completion_reply_keeps_absence_separate_from_native_and_immediate_results() {
         }
     });
     assert_eq!(allocations, 0);
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
 }
 
 #[test]
 fn request_replies_move_original_checked_errors_once_with_bounded_prefixes() {
     let descriptor = error_descriptor();
     let drops = Rc::new(Cell::new(0));
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     record.bound = 4;
     for preparation in [true, false] {
@@ -3162,14 +3331,17 @@ fn request_replies_move_original_checked_errors_once_with_bounded_prefixes() {
         }
     }
     assert_eq!(drops.get(), 12);
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
 }
 
 #[test]
 fn checked_request_observation_preserves_actual_path_unknown_zero_and_partial_failure_facts() {
     unsafe {
         let path = crate::dr_v1_string_from_utf8(b"actual-origin.bin".as_ptr(), 17);
-        let mut context = Context::new(0, &ledger());
+        let context = Context::new(0, &ledger());
         let mut record = PendingState::new(context.adapter()).unwrap();
         record.reading = true;
         record.origin = Some(PhysicalOrigin::File {
@@ -3221,7 +3393,7 @@ fn standard_request_origin_preserves_device_target_without_a_file_owner_or_path(
             StandardStream::Stdout,
             StandardStream::Stderr,
         ] {
-            let mut context = Context::new(0, &ledger());
+            let context = Context::new(0, &ledger());
             let (mut record, origin) = PendingState::for_source(
                 context.adapter(),
                 standard_device(stream).source().value(),
@@ -3271,7 +3443,7 @@ fn request_view_layout_has_only_borrowed_words_and_configuration_never_overwrite
         mem::size_of::<DrPendingRequestViewV1>(),
         4 * mem::size_of::<usize>()
     );
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     record.bound = 4;
     record.phase = Phase::Preparing;
@@ -3293,7 +3465,7 @@ fn request_view_layout_has_only_borrowed_words_and_configuration_never_overwrite
 
 #[test]
 fn external_source_update_validation_rejects_every_live_phase_without_mutating_origin() {
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     let original = PhysicalOrigin::Standard(crate::device_io::StandardStream::Stdin);
     record.origin = Some(original);
@@ -3310,12 +3482,15 @@ fn external_source_update_validation_rejects_every_live_phase_without_mutating_o
             if failure.reason == crate::platform_io::Reason::InvalidInput));
         assert!(record.origin.unwrap().same_source(original));
     }
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
 }
 
 #[test]
 fn external_source_update_commit_is_infallible_after_idle_or_taken_validation() {
-    let mut context = Context::new(0, &ledger());
+    let context = Context::new(0, &ledger());
     let mut record = PendingState::new(context.adapter()).unwrap();
     let replacement = PhysicalOrigin::Standard(crate::device_io::StandardStream::Stdout);
     for phase in [Phase::Idle, Phase::Taken] {
@@ -3326,7 +3501,10 @@ fn external_source_update_commit_is_infallible_after_idle_or_taken_validation() 
         }
         assert!(record.origin.unwrap().same_source(replacement));
     }
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
 }
 
 #[test]
@@ -3361,7 +3539,7 @@ fn file_request_configuration_borrows_actual_payload_origin_accepts_empty_and_re
             0
         );
         {
-            let mut context = Context::new(0, &ledger());
+            let context = Context::new(0, &ledger());
             let references = (*path).references;
             let ((mut record, owner), allocations) = crate::probe_runtime_allocations(|| {
                 let home = dr_v1_file_object_readiness_source_home(payload);
@@ -3427,7 +3605,7 @@ fn file_request_configuration_borrows_actual_payload_origin_accepts_empty_and_re
             assert_eq!((observed.meta >> 16) & 0xff, 2);
         }
         {
-            let mut context = Context::new(0, &ledger());
+            let context = Context::new(0, &ledger());
             let mut raw = PendingState::new(context.adapter()).unwrap();
             raw.phase = Phase::Preparing;
             let mut view = DrPendingRequestViewV1::preparation(&mut raw);
@@ -3443,7 +3621,7 @@ fn file_request_configuration_borrows_actual_payload_origin_accepts_empty_and_re
             assert!(raw.configuration.is_none() && raw.origin.is_none());
         }
         {
-            let mut context = Context::new(0, &ledger());
+            let context = Context::new(0, &ledger());
             let owner = dr_v1_file_object_pending_endpoint(payload)
                 .cast::<crate::file_io::stream::OwnedFile>();
             let mut projection = mem::MaybeUninit::<ReadinessProjection>::uninit();
@@ -3478,7 +3656,7 @@ fn file_request_configuration_borrows_actual_payload_origin_accepts_empty_and_re
             assert_eq!(raw.origin.unwrap().file().unwrap().1.payload, owner.cast());
         }
         {
-            let mut context = Context::new(0, &ledger());
+            let context = Context::new(0, &ledger());
             let (mut record, _) =
                 PendingState::for_file_object(context.adapter(), payload).unwrap();
             record.phase = Phase::Preparing;

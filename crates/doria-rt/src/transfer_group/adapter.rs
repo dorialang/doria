@@ -11,6 +11,8 @@ use crate::{DrInterfaceCarrierV1, DrStackFrameV2};
 
 pub(crate) mod host_error;
 use host_error::OwnedHostError;
+#[cfg(test)]
+pub(crate) mod test_object;
 
 /// Success tags: read 0 Data, 1 WouldBlock, 2 EOF, 3 TimedOut; write 0 Accepted,
 /// 1 WouldBlock. On checked failure has_count/count describe only an optional

@@ -5,6 +5,7 @@ use crate::file_io::stream::transport::object::{
 };
 use crate::io_status::DrIoStatusV1;
 use crate::native_handle::with_close_probe;
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::{DrInterfaceVtableV1, DrStringV1};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -388,7 +389,7 @@ unsafe extern "C" fn resolve(
     context: *mut DrAdapterContextV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let getter = &mut *(*receiver).object.cast::<Getter>();
+    let getter = TestObject::<Getter>::in_callback((*receiver).object);
     assert_eq!(receiver, getter.expected_home);
     assert_eq!(frame, getter.expected_frame);
     getter.calls += 1;
@@ -431,7 +432,7 @@ fn native_resolution_uses_original_receiver_home_fresh_getter_and_original_error
     let first = FileFixture::new("getter-first");
     let second = FileFixture::new("getter-second");
     let descriptor = descriptor();
-    let mut getter = Box::new(Getter {
+    let getter = TestObject::new(Getter {
         source: first.source(),
         expected_home: ptr::null(),
         expected_frame: ptr::null(),
@@ -439,27 +440,27 @@ fn native_resolution_uses_original_receiver_home_fresh_getter_and_original_error
         error: None,
     });
     let receiver = Box::new(DrInterfaceCarrierV1 {
-        object: ptr::from_mut(&mut *getter).cast(),
+        object: getter.object().cast(),
         vtable: &descriptor,
     });
-    getter.expected_home = ptr::from_ref(&*receiver);
+    unsafe { (*getter.as_ptr()).expected_home = ptr::from_ref(&*receiver) };
     let binding = SourceBinding::new(SourceProvider::Native {
-        receiver_home: getter.expected_home,
+        receiver_home: unsafe { (*getter.as_ptr()).expected_home },
         resolve,
     });
     unsafe {
         assert!(
             matches!(binding.resolve(ptr::null(), Some(first.source())), Err(AdapterTerminal::PlatformFailure(f)) if f.reason == Reason::InvalidInput)
         );
-        assert_eq!(getter.calls, 0);
+        assert_eq!((*getter.as_ptr()).calls, 0);
         // All-zero frames are valid ABI records. Resolution must forward each
         // call's current home, not save the frame from the first getter.
         let frames: [DrStackFrameV2; 2] = core::mem::zeroed();
-        getter.expected_frame = ptr::from_ref(&frames[0]);
+        (*getter.as_ptr()).expected_frame = ptr::from_ref(&frames[0]);
         let ((a, b), allocations) = crate::probe_runtime_allocations(|| {
             let a = binding.resolve(ptr::from_ref(&frames[0]), None).unwrap();
-            getter.source = second.source();
-            getter.expected_frame = ptr::from_ref(&frames[1]);
+            (*getter.as_ptr()).source = second.source();
+            (*getter.as_ptr()).expected_frame = ptr::from_ref(&frames[1]);
             let b = binding.resolve(ptr::from_ref(&frames[1]), None).unwrap();
             (a, b)
         });
@@ -470,11 +471,11 @@ fn native_resolution_uses_original_receiver_home_fresh_getter_and_original_error
         assert_eq!(b.context().unwrap().descriptor, receiver.vtable.cast());
         let drops = Rc::new(Cell::new(0));
         let object = Box::into_raw(Box::new(Rc::clone(&drops))).cast();
-        getter.error = Some(OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
+        (*getter.as_ptr()).error = Some(OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
             object,
             vtable: &descriptor,
         }));
-        getter.expected_frame = ptr::null();
+        (*getter.as_ptr()).expected_frame = ptr::null();
         let terminal = match binding.resolve(ptr::null(), None) {
             Err(terminal) => terminal,
             Ok(_) => panic!("getter error was lost"),
@@ -488,7 +489,7 @@ fn native_resolution_uses_original_receiver_home_fresh_getter_and_original_error
         assert_eq!(drops.get(), 0);
         drop(error);
         assert_eq!(drops.get(), 1);
-        assert_eq!(getter.calls, 3);
+        assert_eq!((*getter.as_ptr()).calls, 3);
     }
 }
 
@@ -496,7 +497,7 @@ fn native_resolution_uses_original_receiver_home_fresh_getter_and_original_error
 fn unbind_never_reruns_getter_and_fixed_mode_rejects_external_substitution() {
     let file = FileFixture::new("unbind");
     let descriptor = descriptor();
-    let mut getter = Box::new(Getter {
+    let getter = TestObject::new(Getter {
         source: file.source(),
         expected_home: ptr::null(),
         expected_frame: ptr::null(),
@@ -504,12 +505,12 @@ fn unbind_never_reruns_getter_and_fixed_mode_rejects_external_substitution() {
         error: None,
     });
     let receiver = Box::new(DrInterfaceCarrierV1 {
-        object: ptr::from_mut(&mut *getter).cast(),
+        object: getter.object().cast(),
         vtable: &descriptor,
     });
-    getter.expected_home = ptr::from_ref(&*receiver);
+    unsafe { (*getter.as_ptr()).expected_home = ptr::from_ref(&*receiver) };
     let mut binding = SourceBinding::new(SourceProvider::Native {
-        receiver_home: getter.expected_home,
+        receiver_home: unsafe { (*getter.as_ptr()).expected_home },
         resolve,
     });
     let mut routes = SourceRoutes::new().unwrap();
@@ -521,11 +522,11 @@ fn unbind_never_reruns_getter_and_fixed_mode_rejects_external_substitution() {
             .rebind(&mut binding, resolved, |_, _, _, _| Ok(()))
             .unwrap();
         drop(routes.select(route).unwrap());
-        assert_eq!(getter.calls, 1);
-        getter.source = ptr::null();
+        assert_eq!((*getter.as_ptr()).calls, 1);
+        (*getter.as_ptr()).source = ptr::null();
         routes.unbind(&mut binding);
         routes.unbind(&mut binding);
-        assert_eq!(getter.calls, 1);
+        assert_eq!((*getter.as_ptr()).calls, 1);
         let fixed = SourceBinding::new(SourceProvider::Fixed(origin));
         assert!(fixed.resolve(ptr::null(), None).is_ok());
         assert!(

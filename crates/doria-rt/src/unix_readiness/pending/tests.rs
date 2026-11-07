@@ -1,4 +1,5 @@
 use super::*;
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use core::{mem, ptr};
 use std::cell::{Cell, RefCell};
@@ -84,8 +85,8 @@ struct Context {
 }
 
 impl Context {
-    fn new(index: usize, endpoint: *const c_void, log: &Rc<RefCell<Log>>) -> Box<Self> {
-        Box::new(Self {
+    fn new(index: usize, endpoint: *const c_void, log: &Rc<RefCell<Log>>) -> TestObject<Self> {
+        TestObject::new(Self {
             index,
             endpoint,
             log: Rc::clone(log),
@@ -99,13 +100,12 @@ impl Context {
             cancel_on_prepare: ptr::null_mut(),
         })
     }
+}
 
-    fn adapter(&mut self) -> DrPendingTransferAdapterV1 {
+impl TestObject<Context> {
+    fn adapter(&self) -> DrPendingTransferAdapterV1 {
         DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             prepare_read: Some(prepare_read),
             prepare_write: Some(prepare_write),
             complete_read: Some(complete_read),
@@ -123,7 +123,7 @@ unsafe fn prepare(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.log.borrow_mut().push(Call::Prepare {
         index: context.index,
         frame: frame as usize,
@@ -228,7 +228,7 @@ struct CompleteCall {
 }
 
 unsafe fn complete(call: CompleteCall, reading: bool) -> u8 {
-    let context = &mut *(*call.context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*call.context).object);
     let native = &*call.native;
     let selected = &*call.selected;
     let immediate = call.immediate.as_ref();
@@ -460,7 +460,7 @@ fn exact_error(
 fn same_registration_duplex_prepares_all_distinct_requests_and_completes_each_once() {
     let (owner, mut peer) = source();
     let log = Log::new();
-    let mut context = Context::new(0, owner.native_handle_home(), &log);
+    let context = Context::new(0, owner.native_handle_home(), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(19, owner.native_handle_home(), context.adapter())
@@ -523,7 +523,7 @@ fn same_registration_duplex_prepares_all_distinct_requests_and_completes_each_on
 fn competing_pending_reads_prepare_together_and_receive_plan_ordered_bytes() {
     let (owner, mut peer) = source();
     let log = Log::new();
-    let mut context = Context::new(0, owner.native_handle_home(), &log);
+    let context = Context::new(0, owner.native_handle_home(), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(19, owner.native_handle_home(), context.adapter())
@@ -572,8 +572,8 @@ fn competing_pending_reads_prepare_together_and_receive_plan_ordered_bytes() {
 fn repeated_registration_cannot_share_writable_selected_storage_and_cleans_all_preparations() {
     let (owner, _peer) = source();
     let log = Log::new();
-    let mut context = Context::new(0, owner.native_handle_home(), &log);
-    context.selected_length = Some(2);
+    let context = Context::new(0, owner.native_handle_home(), &log);
+    unsafe { (*context.as_ptr()).selected_length = Some(2) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(19, owner.native_handle_home(), context.adapter())
@@ -630,13 +630,13 @@ fn reversed_subset_uses_same_native_slots_and_transforms_selected_storage_withou
     let (unused, mut unused_peer) = source();
     let (writer, mut write_peer) = source();
     let log = Log::new();
-    let mut a_context = Context::new(0, a.native_handle_home(), &log);
-    a_context.selected_length = Some(3);
-    a_context.transform = true;
-    let mut unused_context = Context::new(1, unused.native_handle_home(), &log);
-    let mut writer_context = Context::new(2, writer.native_handle_home(), &log);
-    writer_context.selected_length = Some(3);
-    writer_context.storage[..3].copy_from_slice(b"one");
+    let a_context = Context::new(0, a.native_handle_home(), &log);
+    unsafe { (*a_context.as_ptr()).selected_length = Some(3) };
+    unsafe { (*a_context.as_ptr()).transform = true };
+    let unused_context = Context::new(1, unused.native_handle_home(), &log);
+    let writer_context = Context::new(2, writer.native_handle_home(), &log);
+    unsafe { (*writer_context.as_ptr()).selected_length = Some(3) };
+    unsafe { (&mut (*writer_context.as_ptr()).storage)[..3].copy_from_slice(b"one") };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(10, a.native_handle_home(), a_context.adapter())
@@ -648,7 +648,7 @@ fn reversed_subset_uses_same_native_slots_and_transforms_selected_storage_withou
     }
     let a_snapshot = set.native.as_mut().unwrap().pending_snapshot(0).unwrap();
     let write_snapshot = set.native.as_mut().unwrap().pending_snapshot(2).unwrap();
-    let selected_address = a_context.storage.as_ptr() as usize;
+    let selected_address = unsafe { (*a_context.as_ptr()).storage.as_ptr() } as usize;
     let begin_frame = frame();
     let next_frame = frame();
     let submit_frame = frame();
@@ -751,17 +751,21 @@ fn reversed_subset_uses_same_native_slots_and_transforms_selected_storage_withou
 fn immediate_prepare_still_completes_outer_adapter_and_empty_eof_and_zero_data_are_distinct() {
     let (owner, mut peer) = source();
     let log = Log::new();
-    let mut context = Context::new(0, owner.native_handle_home(), &log);
-    context.immediate = Some(DrAdapterOutcomeV1 {
-        count: 0,
-        tag: 0,
-        has_count: 0,
-    });
-    context.outer = Some(DrAdapterOutcomeV1 {
-        count: 0,
-        tag: 0,
-        has_count: 0,
-    });
+    let context = Context::new(0, owner.native_handle_home(), &log);
+    unsafe {
+        (*context.as_ptr()).immediate = Some(DrAdapterOutcomeV1 {
+            count: 0,
+            tag: 0,
+            has_count: 0,
+        })
+    };
+    unsafe {
+        (*context.as_ptr()).outer = Some(DrAdapterOutcomeV1 {
+            count: 0,
+            tag: 0,
+            has_count: 0,
+        })
+    };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(1, owner.native_handle_home(), context.adapter())
@@ -804,12 +808,14 @@ fn immediate_prepare_still_completes_outer_adapter_and_empty_eof_and_zero_data_a
             .count(),
         2
     );
-    context.immediate = Some(DrAdapterOutcomeV1 {
-        count: 0,
-        tag: 2,
-        has_count: 0,
-    });
-    context.outer = None;
+    unsafe {
+        (*context.as_ptr()).immediate = Some(DrAdapterOutcomeV1 {
+            count: 0,
+            tag: 2,
+            has_count: 0,
+        })
+    };
+    unsafe { (*context.as_ptr()).outer = None };
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
     let mut group = unsafe {
         set.begin_selected(&current, buffers, &poll, selection(&[0]))
@@ -840,9 +846,9 @@ fn foreign_handle_home_rejects_before_io_and_preserves_original_checked_error_id
     let (owner, mut peer) = source();
     let copied_handle = Box::new(owner.get());
     let log = Log::new();
-    let mut context = Context::new(0, ptr::from_ref(copied_handle.as_ref()).cast(), &log);
+    let context = Context::new(0, ptr::from_ref(copied_handle.as_ref()).cast(), &log);
     let (error, original) = exact_error(&descriptor, &drops);
-    context.failure_error = Some(error);
+    unsafe { (*context.as_ptr()).failure_error = Some(error) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(1, owner.native_handle_home(), context.adapter())
@@ -868,7 +874,7 @@ fn foreign_handle_home_rejects_before_io_and_preserves_original_checked_error_id
     assert_eq!(log.borrow().calls().len(), 2);
     assert!(matches!(log.borrow().calls()[1], Call::Complete {
         tag: 4, submitted: 0, progress: None, selected: (endpoint, data, 4), ..
-    } if endpoint == context.endpoint as usize && data == caller));
+    } if endpoint == unsafe { (*context.as_ptr()).endpoint } as usize && data == caller));
     assert_eq!(
         set.native.as_mut().unwrap().pending_snapshot(0).unwrap().2,
         0
@@ -895,12 +901,12 @@ fn later_preparation_error_submits_nothing_and_cleans_earlier_selected_storage_o
     let (first, mut first_peer) = source();
     let (second, mut second_peer) = source();
     let log = Log::new();
-    let mut first_context = Context::new(0, first.native_handle_home(), &log);
-    first_context.selected_length = Some(3);
-    let selected = first_context.storage.as_ptr() as usize;
-    let mut second_context = Context::new(1, second.native_handle_home(), &log);
+    let first_context = Context::new(0, first.native_handle_home(), &log);
+    unsafe { (*first_context.as_ptr()).selected_length = Some(3) };
+    let selected = unsafe { (*first_context.as_ptr()).storage.as_ptr() } as usize;
+    let second_context = Context::new(1, second.native_handle_home(), &log);
     let (error, original) = exact_error(&descriptor, &drops);
-    second_context.prepare_error = Some(error);
+    unsafe { (*second_context.as_ptr()).prepare_error = Some(error) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(1, first.native_handle_home(), first_context.adapter())
@@ -968,10 +974,10 @@ fn cancellation_before_submission_cleans_prepared_loan_without_io_or_invented_pr
     assert!(!cancellation.is_null());
     let (owner, mut peer) = source();
     let log = Log::new();
-    let mut context = Context::new(0, owner.native_handle_home(), &log);
-    context.selected_length = Some(3);
-    context.cancel_on_prepare = cancellation;
-    let selected = context.storage.as_ptr() as usize;
+    let context = Context::new(0, owner.native_handle_home(), &log);
+    unsafe { (*context.as_ptr()).selected_length = Some(3) };
+    unsafe { (*context.as_ptr()).cancel_on_prepare = cancellation };
+    let selected = unsafe { (*context.as_ptr()).storage.as_ptr() } as usize;
     let mut set = unsafe { PendingSet::new(cancellation).unwrap() };
     unsafe {
         set.add(1, owner.native_handle_home(), context.adapter())
@@ -1033,10 +1039,10 @@ fn native_cancellation_stops_read_retries_but_preserves_won_write_and_drop_clean
     let (reader, mut read_peer) = source();
     let (writer, mut write_peer) = source();
     let log = Log::new();
-    let mut read_context = Context::new(0, reader.native_handle_home(), &log);
+    let read_context = Context::new(0, reader.native_handle_home(), &log);
     let (error, original) = exact_error(&descriptor, &drops);
-    read_context.failure_error = Some(error);
-    let mut write_context = Context::new(1, writer.native_handle_home(), &log);
+    unsafe { (*read_context.as_ptr()).failure_error = Some(error) };
+    let write_context = Context::new(1, writer.native_handle_home(), &log);
     let mut set = unsafe { PendingSet::new(cancellation).unwrap() };
     unsafe {
         set.add(1, reader.native_handle_home(), read_context.adapter())
@@ -1152,9 +1158,9 @@ fn native_cancellation_stops_read_retries_but_preserves_won_write_and_drop_clean
     assert_eq!(drops.get(), 1);
 
     let log = Log::new();
-    let mut context = Context::new(0, reader.native_handle_home(), &log);
+    let context = Context::new(0, reader.native_handle_home(), &log);
     let (error, _) = exact_error(&descriptor, &drops);
-    context.failure_error = Some(error);
+    unsafe { (*context.as_ptr()).failure_error = Some(error) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(1, reader.native_handle_home(), context.adapter())
@@ -1213,8 +1219,8 @@ fn selected_capabilities_and_rejected_membership_never_prepare_transfer_or_claim
     let (a, mut a_peer) = source();
     let (b, mut b_peer) = source();
     let log = Log::new();
-    let mut a_context = Context::new(0, a.native_handle_home(), &log);
-    let mut b_context = Context::new(1, b.native_handle_home(), &log);
+    let a_context = Context::new(0, a.native_handle_home(), &log);
+    let b_context = Context::new(1, b.native_handle_home(), &log);
     let mut read_only = b_context.adapter();
     read_only.prepare_write = None;
     read_only.complete_write = None;

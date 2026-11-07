@@ -29,7 +29,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust nightly
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      # The one exception to rust-toolchain.toml: cargo-fuzz needs nightly
+      # sanitizers. Only `cargo +nightly fuzz` uses it.
+      - name: Install Rust nightly for cargo-fuzz
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Install pinned cargo-fuzz
@@ -56,10 +61,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
 
       - name: Install PHP for compatibility parity and repository guards
         uses: shivammathur/setup-php@v2
@@ -277,6 +280,8 @@ jobs:
             exit 1
           fi
           php scripts/check_build_artifact_policy.php
+          php scripts/test_rust_toolchain_authority.php
+          php scripts/check_rust_toolchain_authority.php
 
       - name: Check documentation authority
         run: php scripts/check_docs_authority.php
@@ -343,10 +348,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
 
       - name: Install PHP for compatibility parity
         uses: shivammathur/setup-php@v2

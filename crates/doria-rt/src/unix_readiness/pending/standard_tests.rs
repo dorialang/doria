@@ -9,7 +9,7 @@ fn repeated_standard_registration_uses_one_group_claim_with_distinct_request_rec
         let _input = device_io::TestInput::new(b"abcd", true);
         let device = device_io::standard_device(StandardStream::Stdin);
         let log = Log::new();
-        let mut context = Context::new(0, ptr::from_ref(device).cast(), &log);
+        let context = Context::new(0, ptr::from_ref(device).cast(), &log);
         let mut set = PendingSet::new(ptr::null_mut()).unwrap();
         let index = set
             .add_source(17, device.source().value(), context.adapter())
@@ -60,7 +60,7 @@ fn standard_queue_completes_through_adapter_once_without_native_submission_and_r
         let flags = libc::fcntl(handle, libc::F_GETFL);
         assert!(flags >= 0);
         let log = Log::new();
-        let mut context = Context::new(0, endpoint, &log);
+        let context = Context::new(0, endpoint, &log);
         let mut set = PendingSet::new(ptr::null_mut()).unwrap();
         let source = device.source().value();
         let index = set.add_source(7, source, context.adapter()).unwrap();
@@ -184,7 +184,7 @@ fn standard_preparation_rejection_releases_group_loan_and_does_not_consume_queue
         let log = Log::new();
         // A copied local handle cell is not a standard-device endpoint.
         let local = device_io::byte_handle(StandardStream::Stdin).unwrap();
-        let mut context = Context::new(0, ptr::from_ref(&local).cast(), &log);
+        let context = Context::new(0, ptr::from_ref(&local).cast(), &log);
         let mut set = PendingSet::new(ptr::null_mut()).unwrap();
         let index = set
             .add_source(1, device.source().value(), context.adapter())

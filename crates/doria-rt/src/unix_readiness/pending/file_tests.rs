@@ -64,7 +64,7 @@ fn one_file_shared_cursor_orders_read_write_read_and_reuse_through_complete_adap
     fs::write(&fixture.path, b"abcdefghi").unwrap();
     let mut file = fixture.open(FileAccess::ReadWrite, false);
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
+    let context = Context::new(0, endpoint(&mut file), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -133,10 +133,10 @@ fn owned_file_cursors_stay_independent_and_reusable_without_hot_allocations_or_e
     second.seek(4, SeekOrigin::Start).unwrap();
     let handles = [first.native_handle(), second.native_handle()];
     let log = Log::new();
-    let mut first_context = Context::new(0, endpoint(&mut first), &log);
-    first_context.selected_length = Some(2);
-    first_context.transform = true;
-    let mut second_context = Context::new(1, endpoint(&mut second), &log);
+    let first_context = Context::new(0, endpoint(&mut first), &log);
+    unsafe { (*first_context.as_ptr()).selected_length = Some(2) };
+    unsafe { (*first_context.as_ptr()).transform = true };
+    let second_context = Context::new(1, endpoint(&mut second), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(first.as_mut()), first_context.adapter())
@@ -238,7 +238,7 @@ fn owned_file_submission_preserves_append_and_empty_write_without_query_repeatin
     let mut file = fixture.open(FileAccess::ReadWrite, true);
     file.seek(0, SeekOrigin::Start).unwrap();
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
+    let context = Context::new(0, endpoint(&mut file), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -303,7 +303,7 @@ fn owned_file_empty_read_and_eof_are_distinct_and_cancellation_preserves_won_pro
     let cancellation = crate::cancellation::dr_v1_cancellation_new();
     assert!(!cancellation.is_null());
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
+    let context = Context::new(0, endpoint(&mut file), &log);
     let mut set = unsafe { PendingSet::new(cancellation).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -363,7 +363,7 @@ fn owned_file_empty_read_and_eof_are_distinct_and_cancellation_preserves_won_pro
     let cancellation = crate::cancellation::dr_v1_cancellation_new();
     assert!(!cancellation.is_null());
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
+    let context = Context::new(0, endpoint(&mut file), &log);
     let mut set = unsafe { PendingSet::new(cancellation).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -405,8 +405,8 @@ fn owned_file_zero_selected_region_is_data_not_eof_for_a_nonempty_outer_request(
     fs::write(&fixture.path, b"stay").unwrap();
     let mut file = fixture.open(FileAccess::Read, false);
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
-    context.selected_length = Some(0);
+    let context = Context::new(0, endpoint(&mut file), &log);
+    unsafe { (*context.as_ptr()).selected_length = Some(0) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -451,8 +451,8 @@ fn owned_file_failure_keeps_the_original_checked_carrier_and_actual_submission_f
     let drops = Rc::new(Cell::new(0));
     let (error, original) = exact_error(&descriptor, &drops);
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
-    context.failure_error = Some(error);
+    let context = Context::new(0, endpoint(&mut file), &log);
+    unsafe { (*context.as_ptr()).failure_error = Some(error) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -497,10 +497,10 @@ fn owned_file_before_submit_cancellation_completes_cleanup_without_touching_the_
     let cancellation = crate::cancellation::dr_v1_cancellation_new();
     assert!(!cancellation.is_null());
     let log = Log::new();
-    let mut context = Context::new(0, endpoint(&mut file), &log);
-    context.cancel_on_prepare = cancellation;
-    context.selected_length = Some(3);
-    let selected = context.storage.as_ptr() as usize;
+    let context = Context::new(0, endpoint(&mut file), &log);
+    unsafe { (*context.as_ptr()).cancel_on_prepare = cancellation };
+    unsafe { (*context.as_ptr()).selected_length = Some(3) };
+    let selected = unsafe { (*context.as_ptr()).storage.as_ptr() } as usize;
     let mut set = unsafe { PendingSet::new(cancellation).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -541,9 +541,9 @@ fn owned_file_and_nonblocking_stream_share_selected_requests_without_touching_un
     let mut unused_file = fixture.open(FileAccess::Read, false);
     let (stream, mut peer) = source();
     let log = Log::new();
-    let mut file_context = Context::new(0, endpoint(&mut file), &log);
-    let mut stream_context = Context::new(1, stream.native_handle_home(), &log);
-    let mut unused_context = Context::new(2, endpoint(&mut unused_file), &log);
+    let file_context = Context::new(0, endpoint(&mut file), &log);
+    let stream_context = Context::new(1, stream.native_handle_home(), &log);
+    let unused_context = Context::new(2, endpoint(&mut unused_file), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), file_context.adapter())
@@ -612,7 +612,7 @@ fn owned_file_rejects_scalar_readiness_as_prepared_endpoint_without_dereferencin
     // configured identity must reject it before any owner cast/dereference.
     let scalar = file.readiness_source().value();
     let log = Log::new();
-    let mut context = Context::new(0, scalar, &log);
+    let context = Context::new(0, scalar, &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add_file(1, ptr::from_mut(file.as_mut()), context.adapter())
@@ -653,14 +653,14 @@ fn nonregular_owned_file_devices_and_pipes_are_rejected_before_transfer_without_
     // auxiliary thread, nonblocking conversion, worker, or waiting open needed.
     let mut pipe = fifo_fixture.open(FileAccess::ReadWrite, false);
     let log = Log::new();
-    let mut device_context = Context::new(0, endpoint(&mut device), &log);
-    let mut pipe_context = Context::new(1, endpoint(&mut pipe), &log);
+    let device_context = Context::new(0, endpoint(&mut device), &log);
+    let pipe_context = Context::new(1, endpoint(&mut pipe), &log);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     let ((), allocations) = crate::probe_runtime_allocations(|| {
         let ((), closes) = crate::native_handle::with_close_probe(|| unsafe {
             for (key, file, context) in [
-                (1, ptr::from_mut(device.as_mut()), device_context.as_mut()),
-                (2, ptr::from_mut(pipe.as_mut()), pipe_context.as_mut()),
+                (1, ptr::from_mut(device.as_mut()), &device_context),
+                (2, ptr::from_mut(pipe.as_mut()), &pipe_context),
             ] {
                 let failure = set.add_file(key, file, context.adapter()).unwrap_err();
                 assert_eq!(failure.reason, crate::platform_io::Reason::Unsupported);

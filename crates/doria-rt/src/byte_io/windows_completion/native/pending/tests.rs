@@ -1,6 +1,7 @@
 //! Genuine Windows completion fixtures. Cross-compilation does not execute
 //! their kernel, packet-retirement, cancellation or ownership assertions.
 
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use core::{mem, ptr};
 use std::os::windows::io::{IntoRawHandle, OwnedHandle as StdHandle};
@@ -32,18 +33,15 @@ fn same_attachment_pending_duplex_uses_distinct_request_and_completion_records()
     let _serial = pending_test_lock();
     let (server, client) = connected_pair();
     let owner = Context::new(server, Selection::Caller);
-    let mut context = DuplexContext {
-        endpoint: owner.endpoint(),
+    let context = TestObject::new(DuplexContext {
+        endpoint: unsafe { owner.endpoint() },
         prepares: 0,
         completes: 0,
-    };
+    });
     let mut peer = peer(client);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
     let adapter = DrPendingTransferAdapterV1 {
-        context: DrAdapterContextV1 {
-            object: ptr::from_mut(&mut context).cast(),
-            descriptor: core::ptr::null(),
-        },
+        context: context.context(),
         prepare_read: Some(duplex_prepare_read),
         prepare_write: Some(duplex_prepare_write),
         complete_read: Some(duplex_complete_read),
@@ -61,7 +59,7 @@ fn same_attachment_pending_duplex_uses_distinct_request_and_completion_records()
         set.begin_selected(ptr::null(), buffers, &wait, selection([0, 0]))
             .unwrap()
     };
-    assert_eq!(context.prepares, 2);
+    assert_eq!(unsafe { (*context.as_ptr()).prepares }, 2);
     let mut output = [0; 4];
     assert_eq!(
         transfer(&mut peer, Buffer::Read(&mut output)),
@@ -86,7 +84,7 @@ fn same_attachment_pending_duplex_uses_distinct_request_and_completion_records()
     });
     assert_eq!(allocations, 0);
     assert_eq!(seen, [true; 2]);
-    assert_eq!(context.completes, 2);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 2);
     assert_eq!(group.completed(0).unwrap(), b"pong");
     drop(group);
     set.native.as_ref().unwrap().pending_assert_retired();
@@ -111,16 +109,13 @@ fn competing_pending_reads_prepare_all_and_assign_bytes_in_plan_order() {
     let _serial = pending_test_lock();
     let (server, client) = connected_pair();
     let owner = Context::new(server, Selection::Caller);
-    let mut context = DuplexContext {
-        endpoint: owner.endpoint(),
+    let context = TestObject::new(DuplexContext {
+        endpoint: unsafe { owner.endpoint() },
         prepares: 0,
         completes: 0,
-    };
+    });
     let adapter = DrPendingTransferAdapterV1 {
-        context: DrAdapterContextV1 {
-            object: ptr::from_mut(&mut context).cast(),
-            descriptor: core::ptr::null(),
-        },
+        context: context.context(),
         prepare_read: Some(duplex_prepare_read),
         prepare_write: Some(duplex_prepare_write),
         complete_read: Some(duplex_complete_read),
@@ -139,8 +134,8 @@ fn competing_pending_reads_prepare_all_and_assign_bytes_in_plan_order() {
         set.begin_selected(ptr::null(), buffers, &wait, selection([0; 2]))
             .unwrap()
     };
-    assert_eq!(context.prepares, 2);
-    assert_eq!(context.completes, 0);
+    assert_eq!(unsafe { (*context.as_ptr()).prepares }, 2);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 0);
     assert_eq!(
         transfer(&mut peer, Buffer::Write(b"abcdef")),
         Awaited::complete(Ok(6))
@@ -160,7 +155,7 @@ fn competing_pending_reads_prepare_all_and_assign_bytes_in_plan_order() {
         drop(group);
     });
     assert_eq!(allocations, 0);
-    assert_eq!(context.completes, 2);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 2);
     set.native.as_ref().unwrap().pending_assert_retired();
     set.remove(91).unwrap();
 }
@@ -174,7 +169,7 @@ unsafe extern "C" fn duplex_prepare_read(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<DuplexContext>();
+    let context = TestObject::<DuplexContext>::in_callback((*context).object);
     context.prepares += 1;
     dr_v1_pending_request_configure_native(view, context.endpoint, data, length);
     0
@@ -209,7 +204,7 @@ unsafe extern "C" fn duplex_complete_read(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<DuplexContext>();
+    let context = TestObject::<DuplexContext>::in_callback((*context).object);
     context.completes += 1;
     let (tag, submitted, status, selected, _) = pending_callback_facts(view);
     assert_eq!((*selected).endpoint, context.endpoint);
@@ -248,9 +243,9 @@ unsafe extern "C" fn duplex_complete_write(
 fn repeated_attachment_selected_scratch_conflict_cleans_each_request_without_submission() {
     let _serial = pending_test_lock();
     let (server, _client) = connected_pair();
-    let mut context = Context::new(server, Selection::Scratch);
+    let context = Context::new(server, Selection::Scratch);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()).unwrap() };
-    register(&mut set, 92, &mut context);
+    register(&mut set, 92, &context);
     let wait = budget(2, TEST_NANOSECONDS);
     let (mut first, mut second) = ([0xa5; 4], [0x5a; 4]);
     let buffers =
@@ -263,9 +258,17 @@ fn repeated_attachment_selected_scratch_conflict_cleans_each_request_without_sub
         matches!(failure, SetupFailure::Preparation(AdapterTerminal::PlatformFailure(failure))
         if failure == Failure::invalid_input())
     );
-    assert_eq!((context.prepares, context.completes), (2, 2));
-    assert_eq!((context.last.tag, context.last.submitted), (4, 0));
-    assert_eq!(context.metered, 0);
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (2, 2)
+    );
+    assert_eq!(
+        (unsafe { (*context.as_ptr()).last.tag }, unsafe {
+            (*context.as_ptr()).last.submitted
+        }),
+        (4, 0)
+    );
+    assert_eq!(unsafe { (*context.as_ptr()).metered }, 0);
     assert_eq!(first, [0xa5; 4]);
     assert_eq!(second, [0x5a; 4]);
     set.native.as_ref().unwrap().pending_assert_retired();
@@ -315,7 +318,7 @@ enum EndpointOwner {
 }
 
 impl Context {
-    fn new(handle: StdHandle, selection: Selection) -> Box<Self> {
+    fn new(handle: StdHandle, selection: Selection) -> TestObject<Self> {
         // The real fixture factory supplies idle overlapped byte pipes;
         // adoption establishes this sole owner's persistent association.
         let owner = EndpointOwner::Attached(unsafe {
@@ -324,12 +327,12 @@ impl Context {
         Self::with_owner(owner, selection)
     }
 
-    fn file(owner: OwnedFile, selection: Selection) -> Box<Self> {
+    fn file(owner: OwnedFile, selection: Selection) -> TestObject<Self> {
         Self::with_owner(EndpointOwner::File(owner), selection)
     }
 
-    fn with_owner(owner: EndpointOwner, selection: Selection) -> Box<Self> {
-        Box::new(Self {
+    fn with_owner(owner: EndpointOwner, selection: Selection) -> TestObject<Self> {
+        TestObject::new(Self {
             owner,
             selection,
             scratch: [0; 8],
@@ -352,24 +355,34 @@ impl Context {
             EndpointOwner::File(owner) => ptr::from_ref(owner).cast(),
         }
     }
+}
 
-    fn owned_file(&mut self) -> &mut OwnedFile {
-        match &mut self.owner {
-            EndpointOwner::File(owner) => owner,
-            EndpointOwner::Attached(_) => panic!("typed File leaf required"),
-        }
-    }
-
-    fn adapter(&mut self) -> DrPendingTransferAdapterV1 {
+impl TestObject<Context> {
+    fn adapter(&self) -> DrPendingTransferAdapterV1 {
         DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             prepare_read: Some(prepare_read),
             prepare_write: Some(prepare_write),
             complete_read: Some(complete_read),
             complete_write: Some(complete_write),
+        }
+    }
+
+    /// # Safety
+    /// No callback of this object is running.
+    unsafe fn endpoint(&self) -> *const c_void {
+        (*self.as_ptr()).endpoint()
+    }
+
+    /// The File leaf, addressed through this object for the runtime and the
+    /// test alike.
+    ///
+    /// # Safety
+    /// No callback of this object is running.
+    unsafe fn owned_file(&self) -> *mut OwnedFile {
+        match &mut (*self.as_ptr()).owner {
+            EndpointOwner::File(owner) => owner,
+            EndpointOwner::Attached(_) => panic!("typed File leaf required"),
         }
     }
 }
@@ -383,7 +396,7 @@ unsafe fn prepare(
     error: *mut DrInterfaceCarrierV1,
     reading: bool,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.prepares += 1;
     context.last_prepare_frame = frame as usize;
     context.last_prepare_caller = caller as usize;
@@ -511,7 +524,7 @@ unsafe fn complete(call: CompleteCall) -> u8 {
         error,
         reading,
     } = call;
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.completes += 1;
     context.last = Completed {
         frame: frame as usize,
@@ -623,25 +636,29 @@ unsafe extern "C" fn complete_write(
     })
 }
 
-fn register(set: &mut PendingSet, key: u64, context: &mut Context) -> usize {
-    let endpoint = context.endpoint();
-    let adapter = context.adapter();
-    let index = unsafe { set.add(key, endpoint, adapter) }.unwrap();
-    context.request = set.native.as_ref().unwrap().pending_snapshot(index).2;
-    index
+fn register(set: &mut PendingSet, key: u64, context: &TestObject<Context>) -> usize {
+    unsafe {
+        let endpoint = context.endpoint();
+        let adapter = context.adapter();
+        let index = set.add(key, endpoint, adapter).unwrap();
+        (*context.as_ptr()).request = set.native.as_ref().unwrap().pending_snapshot(index).2;
+        index
+    }
 }
 
-fn register_file(set: &mut PendingSet, key: u64, context: &mut Context) -> usize {
-    let file = match &mut context.owner {
-        EndpointOwner::File(owner) => owner as *mut OwnedFile,
-        EndpointOwner::Attached(_) => panic!("typed File registration required"),
-    };
-    let adapter = context.adapter();
-    let index = unsafe { set.add_file(key, file, adapter) }.unwrap();
-    let snapshot = set.native.as_ref().unwrap().pending_snapshot(index);
-    assert_eq!(snapshot.1, 0, "File leaf must have no IOCP association");
-    context.request = snapshot.2;
-    index
+fn register_file(set: &mut PendingSet, key: u64, context: &TestObject<Context>) -> usize {
+    unsafe {
+        let file = match &mut (*context.as_ptr()).owner {
+            EndpointOwner::File(owner) => owner as *mut OwnedFile,
+            EndpointOwner::Attached(_) => panic!("typed File registration required"),
+        };
+        let adapter = context.adapter();
+        let index = set.add_file(key, file, adapter).unwrap();
+        let snapshot = set.native.as_ref().unwrap().pending_snapshot(index);
+        assert_eq!(snapshot.1, 0, "File leaf must have no IOCP association");
+        (*context.as_ptr()).request = snapshot.2;
+        index
+    }
 }
 
 fn selection<const N: usize>(indices: [usize; N]) -> FixedSlice<usize> {
@@ -686,18 +703,18 @@ fn attached_subset_reuses_requests_and_finishes_through_complete_adapter() {
     let (server_a, client_a) = connected_pair();
     let (server_b, client_b) = connected_pair();
     let (server_c, client_c) = connected_pair();
-    let mut a = Context::new(server_a, Selection::Scratch);
-    let mut b = Context::new(server_b, Selection::Caller);
-    let mut c = Context::new(server_c, Selection::Scratch);
+    let a = Context::new(server_a, Selection::Scratch);
+    let b = Context::new(server_b, Selection::Caller);
+    let c = Context::new(server_c, Selection::Scratch);
     let mut peer_a = peer(client_a);
     let mut peer_b = peer(client_b);
     let mut peer_c = peer(client_c);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    assert_eq!(register(&mut set, 10, &mut a), 0);
+    assert_eq!(register(&mut set, 10, &a), 0);
     let stable_a = set.native.as_ref().unwrap().pending_snapshot(0);
     let state_a = set.records.raw(0).unwrap();
-    assert_eq!(register(&mut set, 20, &mut b), 1);
-    assert_eq!(register(&mut set, 30, &mut c), 2);
+    assert_eq!(register(&mut set, 20, &b), 1);
+    assert_eq!(register(&mut set, 30, &c), 2);
     assert_eq!(set.native.as_ref().unwrap().pending_snapshot(0), stable_a);
     assert_eq!(set.records.raw(0), Some(state_a));
     assert_eq!(
@@ -770,26 +787,59 @@ fn attached_subset_reuses_requests_and_finishes_through_complete_adapter() {
     drop(group);
     set.native.as_ref().unwrap().pending_assert_retired();
     assert_eq!(pending_native_dequeues() - before, 3);
-    assert_eq!((a.prepares, a.completes, a.metered), (2, 2, 4));
-    assert_eq!((c.prepares, c.completes, c.metered), (1, 1, 2));
-    assert_eq!((b.prepares, b.completes), (0, 0));
     assert_eq!(
-        a.last_prepare_frame,
+        (
+            unsafe { (*a.as_ptr()).prepares },
+            unsafe { (*a.as_ptr()).completes },
+            unsafe { (*a.as_ptr()).metered }
+        ),
+        (2, 2, 4)
+    );
+    assert_eq!(
+        (
+            unsafe { (*c.as_ptr()).prepares },
+            unsafe { (*c.as_ptr()).completes },
+            unsafe { (*c.as_ptr()).metered }
+        ),
+        (1, 1, 2)
+    );
+    assert_eq!(
+        unsafe { ((*b.as_ptr()).prepares, (*b.as_ptr()).completes) },
+        (0, 0)
+    );
+    assert_eq!(
+        unsafe { (*a.as_ptr()).last_prepare_frame },
         &submit_frame as *const DrStackFrameV2 as usize
     );
     assert_eq!(
-        c.last_prepare_frame,
+        unsafe { (*c.as_ptr()).last_prepare_frame },
         &begin_frame as *const DrStackFrameV2 as usize
     );
-    assert_eq!(a.last_prepare_caller, pointer_a + 1);
-    assert_eq!(c.last_prepare_caller, pointer_c);
-    assert_eq!(a.last.caller, pointer_a + 1);
-    assert_eq!(c.last.caller, pointer_c);
-    assert_eq!(a.last.selected, a.scratch.as_ptr() as usize);
-    assert_eq!(c.last.selected, c.scratch.as_ptr() as usize);
-    assert_eq!((a.last.submitted, c.last.submitted), (1, 1));
-    assert!(a.last.dequeue > before && c.last.dequeue > before);
-    assert!(!a.invalid && !b.invalid && !c.invalid);
+    assert_eq!(unsafe { (*a.as_ptr()).last_prepare_caller }, pointer_a + 1);
+    assert_eq!(unsafe { (*c.as_ptr()).last_prepare_caller }, pointer_c);
+    assert_eq!(unsafe { (*a.as_ptr()).last.caller }, pointer_a + 1);
+    assert_eq!(unsafe { (*c.as_ptr()).last.caller }, pointer_c);
+    assert_eq!(
+        unsafe { (*a.as_ptr()).last.selected },
+        unsafe { (*a.as_ptr()).scratch.as_ptr() } as usize
+    );
+    assert_eq!(
+        unsafe { (*c.as_ptr()).last.selected },
+        unsafe { (*c.as_ptr()).scratch.as_ptr() } as usize
+    );
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).last.submitted, (*c.as_ptr()).last.submitted) },
+        (1, 1)
+    );
+    assert!(
+        unsafe { (*a.as_ptr()).last.dequeue } > before
+            && unsafe { (*c.as_ptr()).last.dequeue } > before
+    );
+    assert!(
+        !unsafe { (*a.as_ptr()).invalid }
+            && !unsafe { (*b.as_ptr()).invalid }
+            && !unsafe { (*c.as_ptr()).invalid }
+    );
     assert_eq!(bytes_a[3], 0x77);
     let ((), closes) = with_close_probe(|| {
         set.remove(20).unwrap();
@@ -798,7 +848,7 @@ fn attached_subset_reuses_requests_and_finishes_through_complete_adapter() {
         assert_eq!(set.records.raw(0), Some(state_a));
     });
     assert_eq!(closes, 0);
-    assert_eq!(register(&mut set, 40, &mut b), 1);
+    assert_eq!(register(&mut set, 40, &b), 1);
     let mut untouched = [0; 9];
     let buffers = BufferList::from_iter([Buffer::Read(&mut untouched)].into_iter()).unwrap();
     let mut group = unsafe {
@@ -844,12 +894,22 @@ fn attached_subset_reuses_requests_and_finishes_through_complete_adapter() {
     assert_eq!(allocations, 0);
     drop(group);
     assert_eq!(pending_native_dequeues() - before, 1);
-    assert_eq!((a.prepares, a.completes, a.metered), (3, 3, 6));
+    assert_eq!(
+        (
+            unsafe { (*a.as_ptr()).prepares },
+            unsafe { (*a.as_ptr()).completes },
+            unsafe { (*a.as_ptr()).metered }
+        ),
+        (3, 3, 6)
+    );
     assert_eq!(set.native.as_ref().unwrap().pending_snapshot(0), stable_a);
     assert_eq!(&input, b"pq");
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
-    assert_eq!((b.prepares, b.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*b.as_ptr()).prepares, (*b.as_ptr()).completes) },
+        (1, 1)
+    );
 }
 
 #[test]
@@ -857,13 +917,13 @@ fn cancellation_and_drop_drain_each_native_packet_before_exactly_one_finish() {
     let _serial = pending_test_lock();
     let (server_a, client_a) = connected_pair();
     let (server_b, client_b) = connected_pair();
-    let mut a = Context::new(server_a, Selection::Caller);
-    let mut b = Context::new(server_b, Selection::Caller);
+    let a = Context::new(server_a, Selection::Caller);
+    let b = Context::new(server_b, Selection::Caller);
     let _peers = (peer(client_a), peer(client_b));
     let cancellation = TestClaim::new();
     let mut set = unsafe { PendingSet::new(cancellation.state()) }.unwrap();
-    register(&mut set, 10, &mut a);
-    register(&mut set, 20, &mut b);
+    register(&mut set, 10, &a);
+    register(&mut set, 20, &b);
     let identities = [
         set.native.as_ref().unwrap().pending_snapshot(0),
         set.native.as_ref().unwrap().pending_snapshot(1),
@@ -893,16 +953,23 @@ fn cancellation_and_drop_drain_each_native_packet_before_exactly_one_finish() {
     set.native.as_ref().unwrap().pending_assert_retired();
     assert_eq!(pending_native_dequeues() - before, 2);
     for context in [&a, &b] {
-        assert_eq!((context.prepares, context.completes), (1, 1));
         assert_eq!(
-            (context.last.tag, context.last.submitted, context.last.code),
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                unsafe { (*context.as_ptr()).last.tag },
+                unsafe { (*context.as_ptr()).last.submitted },
+                unsafe { (*context.as_ptr()).last.code }
+            ),
             (3, 1, Some(995))
         );
         assert_eq!(
-            context.last.frame,
+            unsafe { (*context.as_ptr()).last.frame },
             &current_frame as *const DrStackFrameV2 as usize
         );
-        assert!(!context.invalid);
+        assert!(!unsafe { (*context.as_ptr()).invalid });
     }
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
@@ -910,8 +977,8 @@ fn cancellation_and_drop_drain_each_native_packet_before_exactly_one_finish() {
     // Fresh set/cancellation context, same complete owners and native affinity.
     // Direct destruction must complete both operations with a null frame.
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    register(&mut set, 30, &mut a);
-    register(&mut set, 40, &mut b);
+    register(&mut set, 30, &a);
+    register(&mut set, 40, &b);
     for (index, identity) in identities.iter().enumerate() {
         assert_eq!(
             &set.native.as_ref().unwrap().pending_snapshot(index).0,
@@ -935,9 +1002,17 @@ fn cancellation_and_drop_drain_each_native_packet_before_exactly_one_finish() {
     set.native.as_ref().unwrap().pending_assert_retired();
     assert_eq!(pending_native_dequeues() - before, 2);
     for context in [&a, &b] {
-        assert_eq!((context.prepares, context.completes), (2, 2));
-        assert_eq!((context.last.frame, context.last.submitted), (0, 1));
-        assert!(!context.invalid);
+        assert_eq!(
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+            (2, 2)
+        );
+        assert_eq!(
+            (unsafe { (*context.as_ptr()).last.frame }, unsafe {
+                (*context.as_ptr()).last.submitted
+            }),
+            (0, 1)
+        );
+        assert!(!unsafe { (*context.as_ptr()).invalid });
     }
     assert_eq!(bytes_a, [0x77; 4]);
     assert_eq!(bytes_b, [0x88; 4]);
@@ -1046,13 +1121,16 @@ fn foreign_endpoint_malformed_region_and_preparation_error_reject_before_native_
     let drops = Arc::new(AtomicUsize::new(0));
     let (server, client) = connected_pair();
     let (foreign_server, foreign_client) = connected_pair();
-    let mut foreign = Context::new(foreign_server, Selection::Caller);
-    let mut context = Context::new(server, Selection::Foreign(foreign.endpoint()));
+    let foreign = Context::new(foreign_server, Selection::Caller);
+    let context = Context::new(
+        server,
+        Selection::Foreign(unsafe { (*foreign.as_ptr()).endpoint() }),
+    );
     let _peers = (peer(client), peer(foreign_client));
     let (owned, object) = error(&descriptor, &drops);
-    context.error = Some(owned);
+    unsafe { (*context.as_ptr()).error = Some(owned) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    register(&mut set, 10, &mut context);
+    register(&mut set, 10, &context);
     let wait = budget(2, TEST_NANOSECONDS);
     let current_frame = frame(b"rejected endpoint");
     let mut bytes = [0x77; 4];
@@ -1068,22 +1146,25 @@ fn foreign_endpoint_malformed_region_and_preparation_error_reject_before_native_
         _ => panic!("checked staging cleanup error did not fail begin"),
     }
     assert_eq!(pending_native_dequeues(), before);
-    assert_eq!((context.prepares, context.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (1, 1)
+    );
     assert_eq!(
         (
-            context.last.tag,
-            context.last.submitted,
-            context.last.reason
+            unsafe { (*context.as_ptr()).last.tag },
+            unsafe { (*context.as_ptr()).last.submitted },
+            unsafe { (*context.as_ptr()).last.reason }
         ),
         (4, 0, 0)
     );
-    assert_eq!(context.last.code, None);
+    assert_eq!(unsafe { (*context.as_ptr()).last.code }, None);
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     set.native.as_ref().unwrap().pending_assert_retired();
     set.remove(10).unwrap();
 
-    context.selection = Selection::NullData;
-    register(&mut set, 20, &mut context);
+    unsafe { (*context.as_ptr()).selection = Selection::NullData };
+    register(&mut set, 20, &context);
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
     let indices = selection([0]);
     let (result, allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -1093,16 +1174,19 @@ fn foreign_endpoint_malformed_region_and_preparation_error_reject_before_native_
     assert!(matches!(setup_error(result),
         SetupFailure::Preparation(AdapterTerminal::PlatformFailure(failure))
             if failure == Failure::invalid_input()));
-    assert_eq!((context.prepares, context.completes), (2, 2));
-    assert_eq!(context.last.submitted, 0);
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (2, 2)
+    );
+    assert_eq!(unsafe { (*context.as_ptr()).last.submitted }, 0);
     assert_eq!(pending_native_dequeues(), before);
     set.remove(20).unwrap();
 
-    context.selection = Selection::PreparationError;
+    unsafe { (*context.as_ptr()).selection = Selection::PreparationError };
     let (owned, object) = error(&descriptor, &drops);
-    context.error = Some(owned);
-    register(&mut set, 30, &mut context);
-    register(&mut set, 40, &mut foreign);
+    unsafe { (*context.as_ptr()).error = Some(owned) };
+    register(&mut set, 30, &context);
+    register(&mut set, 40, &foreign);
     let mut foreign_bytes = [0x55; 4];
     let buffers = BufferList::from_iter(
         [Buffer::Read(&mut foreign_bytes), Buffer::Read(&mut bytes)].into_iter(),
@@ -1117,21 +1201,27 @@ fn foreign_endpoint_malformed_region_and_preparation_error_reject_before_native_
         SetupFailure::Preparation(terminal) => assert_original(Some(terminal), object, &descriptor),
         _ => panic!("preparation throw did not fail begin"),
     }
-    assert_eq!((context.prepares, context.completes), (3, 2));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (3, 2)
+    );
     assert_eq!(pending_native_dequeues(), before);
     assert_eq!(drops.load(Ordering::Relaxed), 2);
-    assert_eq!((foreign.prepares, foreign.completes), (1, 1));
+    assert_eq!(
+        unsafe { ((*foreign.as_ptr()).prepares, (*foreign.as_ptr()).completes) },
+        (1, 1)
+    );
     assert_eq!(
         (
-            foreign.last.tag,
-            foreign.last.submitted,
-            foreign.last.reason
+            unsafe { (*foreign.as_ptr()).last.tag },
+            unsafe { (*foreign.as_ptr()).last.submitted },
+            unsafe { (*foreign.as_ptr()).last.reason }
         ),
         (4, 0, 0)
     );
-    assert_eq!(foreign.last.code, None);
+    assert_eq!(unsafe { (*foreign.as_ptr()).last.code }, None);
     assert_eq!(foreign_bytes, [0x55; 4]);
-    assert!(!context.invalid);
+    assert!(!unsafe { (*context.as_ptr()).invalid });
     assert_eq!(bytes, [0x77; 4]);
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
@@ -1145,10 +1235,10 @@ fn attached_endpoint_identity_rejects_other_owner_and_readiness_value_before_der
     let (server, client) = connected_pair();
     let (other_server, other_client) = connected_pair();
     let other = Context::new(other_server, Selection::Caller);
-    let mut context = Context::new(server, Selection::Caller);
+    let context = Context::new(server, Selection::Caller);
     let _peers = (peer(client), peer(other_client));
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    register(&mut set, 10, &mut context);
+    register(&mut set, 10, &context);
     let readiness = crate::native_handle::ReadinessSource::new(
         set.native.as_ref().unwrap().pending_snapshot(0).0 as crate::native_handle::NativeHandle,
     );
@@ -1156,13 +1246,13 @@ fn attached_endpoint_identity_rejects_other_owner_and_readiness_value_before_der
     let current_frame = frame(b"attached identity before typed cast");
     let mut bytes = [0x77; 3];
     let before = pending_native_dequeues();
-    for (position, endpoint) in [other.endpoint(), readiness.value()]
+    for (position, endpoint) in [unsafe { (*other.as_ptr()).endpoint() }, readiness.value()]
         .into_iter()
         .enumerate()
     {
-        context.selection = Selection::Foreign(endpoint);
+        unsafe { (*context.as_ptr()).selection = Selection::Foreign(endpoint) };
         let (owned, object) = error(&descriptor, &drops);
-        context.error = Some(owned);
+        unsafe { (*context.as_ptr()).error = Some(owned) };
         let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
         let indices = selection([0]);
         let (result, allocations) = crate::probe_runtime_allocations(|| unsafe {
@@ -1176,26 +1266,37 @@ fn attached_endpoint_identity_rejects_other_owner_and_readiness_value_before_der
             _ => panic!("rejected attached endpoint did not preserve checked cleanup"),
         }
         assert_eq!(
-            (context.prepares, context.completes),
+            unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
             (position + 1, position + 1)
         );
         assert_eq!(
             (
-                context.last.tag,
-                context.last.submitted,
-                context.last.reason
+                unsafe { (*context.as_ptr()).last.tag },
+                unsafe { (*context.as_ptr()).last.submitted },
+                unsafe { (*context.as_ptr()).last.reason }
             ),
             (4, 0, 0)
         );
-        assert_eq!((context.last.code, context.last.progress), (None, None));
-        assert_eq!(context.last.selected, bytes.as_ptr() as usize);
+        assert_eq!(
+            (unsafe { (*context.as_ptr()).last.code }, unsafe {
+                (*context.as_ptr()).last.progress
+            }),
+            (None, None)
+        );
+        assert_eq!(
+            unsafe { (*context.as_ptr()).last.selected },
+            bytes.as_ptr() as usize
+        );
         assert_eq!(bytes, [0x77; 3]);
         assert_eq!(pending_native_dequeues(), before);
         assert_eq!(drops.load(Ordering::Relaxed), position + 1);
         set.native.as_ref().unwrap().pending_assert_retired();
     }
-    assert_eq!((other.prepares, other.completes), (0, 0));
-    assert!(!context.invalid && !other.invalid);
+    assert_eq!(
+        unsafe { ((*other.as_ptr()).prepares, (*other.as_ptr()).completes) },
+        (0, 0)
+    );
+    assert!(!unsafe { (*context.as_ptr()).invalid } && !unsafe { (*other.as_ptr()).invalid });
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
 }
@@ -1250,16 +1351,13 @@ fn one_pending_file_cursor_orders_read_write_read_without_packets_or_hot_allocat
     let fixture = FileFixture::new(b"abcdefghi");
     let mut file = fixture.open(false);
     let endpoint = ptr::from_mut(&mut file).cast_const().cast();
-    let mut context = DuplexContext {
+    let context = TestObject::new(DuplexContext {
         endpoint,
         prepares: 0,
         completes: 0,
-    };
+    });
     let adapter = DrPendingTransferAdapterV1 {
-        context: DrAdapterContextV1 {
-            object: ptr::from_mut(&mut context).cast(),
-            descriptor: core::ptr::null(),
-        },
+        context: context.context(),
         prepare_read: Some(duplex_prepare_read),
         prepare_write: Some(duplex_prepare_write),
         complete_read: Some(duplex_complete_read),
@@ -1285,8 +1383,8 @@ fn one_pending_file_cursor_orders_read_write_read_without_packets_or_hot_allocat
         set.begin_selected(ptr::null(), buffers, &wait, selection([0; 3]))
             .unwrap()
     };
-    assert_eq!(context.prepares, 3);
-    assert_eq!(context.completes, 0);
+    assert_eq!(unsafe { (*context.as_ptr()).prepares }, 3);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 0);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"abcdefghi");
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
         for index in 0..3 {
@@ -1298,7 +1396,7 @@ fn one_pending_file_cursor_orders_read_write_read_without_packets_or_hot_allocat
         drop(group);
     });
     assert_eq!(allocations, 0);
-    assert_eq!(context.completes, 3);
+    assert_eq!(unsafe { (*context.as_ptr()).completes }, 3);
     assert_eq!(pending_native_dequeues(), before);
     assert_eq!(file.position().unwrap(), 7);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"abcXYfghi");
@@ -1310,16 +1408,16 @@ fn one_pending_file_cursor_orders_read_write_read_without_packets_or_hot_allocat
 fn regular_file_leaves_preserve_cursors_append_empty_eof_and_sole_close() {
     let _serial = pending_test_lock();
     let fixture = FileFixture::new(b"abcd");
-    let mut a = Context::file(fixture.open(false), Selection::Scratch);
-    let mut b = Context::file(fixture.open(false), Selection::Caller);
-    let mut append = Context::file(fixture.open(true), Selection::Scratch);
-    append.owned_file().seek(0, SeekOrigin::Start).unwrap();
+    let a = Context::file(fixture.open(false), Selection::Scratch);
+    let b = Context::file(fixture.open(false), Selection::Caller);
+    let append = Context::file(fixture.open(true), Selection::Scratch);
+    unsafe { (*append.owned_file()).seek(0, SeekOrigin::Start).unwrap() };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    assert_eq!(register_file(&mut set, 10, &mut a), 0);
+    assert_eq!(register_file(&mut set, 10, &a), 0);
     let identity = set.native.as_ref().unwrap().pending_snapshot(0);
     let state = set.records.raw(0).unwrap();
-    assert_eq!(register_file(&mut set, 20, &mut b), 1);
-    assert_eq!(register_file(&mut set, 30, &mut append), 2);
+    assert_eq!(register_file(&mut set, 20, &b), 1);
+    assert_eq!(register_file(&mut set, 30, &append), 2);
     assert_eq!(set.native.as_ref().unwrap().pending_snapshot(0), identity);
     assert_eq!(set.records.raw(0), Some(state));
     let wait = budget(2, TEST_NANOSECONDS);
@@ -1364,15 +1462,28 @@ fn regular_file_leaves_preserve_cursors_append_empty_eof_and_sole_close() {
     drop(group);
     assert_eq!(pending_native_dequeues(), before);
     set.native.as_ref().unwrap().pending_assert_retired();
-    assert_eq!(a.owned_file().position().unwrap(), 4);
-    assert_eq!(b.owned_file().position().unwrap(), 2);
-    assert_eq!(a.last.caller, caller_a);
-    assert_eq!(a.last.selected, a.scratch.as_ptr() as usize);
-    assert_eq!((a.prepares, a.completes, a.metered), (2, 2, 4));
-    assert_eq!((append.prepares, append.completes), (0, 0));
+    assert_eq!(unsafe { (*a.owned_file()).position().unwrap() }, 4);
+    assert_eq!(unsafe { (*b.owned_file()).position().unwrap() }, 2);
+    assert_eq!(unsafe { (*a.as_ptr()).last.caller }, caller_a);
+    assert_eq!(
+        unsafe { (*a.as_ptr()).last.selected },
+        unsafe { (*a.as_ptr()).scratch.as_ptr() } as usize
+    );
+    assert_eq!(
+        (
+            unsafe { (*a.as_ptr()).prepares },
+            unsafe { (*a.as_ptr()).completes },
+            unsafe { (*a.as_ptr()).metered }
+        ),
+        (2, 2, 4)
+    );
+    assert_eq!(
+        unsafe { ((*append.as_ptr()).prepares, (*append.as_ptr()).completes) },
+        (0, 0)
+    );
     let ((), closes) = with_close_probe(|| set.remove(10).unwrap());
     assert_eq!(closes, 0);
-    assert_eq!(register_file(&mut set, 40, &mut a), 0);
+    assert_eq!(register_file(&mut set, 40, &a), 0);
 
     // An empty read is Data(0), including at EOF. A following nonempty read
     // preserves the actual File EndOfStream fact instead of inventing an errno.
@@ -1398,9 +1509,12 @@ fn regular_file_leaves_preserve_cursors_append_empty_eof_and_sole_close() {
         Some(AdapterTerminal::Data(0))
     ));
     drop(group);
-    assert_eq!((a.last.tag, a.last.submitted), (0, 1));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).last.tag, (*a.as_ptr()).last.submitted) },
+        (0, 1)
+    );
     assert_eq!(eof_storage, [0x55; 2]);
-    assert_eq!(a.owned_file().position().unwrap(), 4);
+    assert_eq!(unsafe { (*a.owned_file()).position().unwrap() }, 4);
 
     let input = *b"xy";
     let buffers = BufferList::from_iter([Buffer::Write(&input)].into_iter()).unwrap();
@@ -1418,10 +1532,16 @@ fn regular_file_leaves_preserve_cursors_append_empty_eof_and_sole_close() {
     drop(group);
     assert_eq!(&input, b"xy");
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"abcdXY");
-    assert_eq!(append.owned_file().position().unwrap(), 6);
-    assert_eq!(append.last.selected, append.scratch.as_ptr() as usize);
+    assert_eq!(unsafe { (*append.owned_file()).position().unwrap() }, 6);
+    assert_eq!(unsafe { (*append.as_ptr()).last.selected }, unsafe {
+        (*append.as_ptr()).scratch.as_ptr()
+    } as usize);
     assert_eq!(pending_native_dequeues(), before);
-    assert!(!a.invalid && !b.invalid && !append.invalid);
+    assert!(
+        !unsafe { (*a.as_ptr()).invalid }
+            && !unsafe { (*b.as_ptr()).invalid }
+            && !unsafe { (*append.as_ptr()).invalid }
+    );
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
     let ((), closes) = with_close_probe(|| {
@@ -1438,11 +1558,11 @@ fn file_preparation_cancellation_does_no_io_and_completion_keeps_original_error(
     let descriptor = descriptor();
     let drops = Arc::new(AtomicUsize::new(0));
     let fixture = FileFixture::new(b"abc");
-    let mut context = Context::file(fixture.open(false), Selection::Caller);
+    let context = Context::file(fixture.open(false), Selection::Caller);
     let cancellation = TestClaim::new();
-    context.cancellation = cancellation.state();
+    unsafe { (*context.as_ptr()).cancellation = cancellation.state() };
     let mut set = unsafe { PendingSet::new(cancellation.state()) }.unwrap();
-    register_file(&mut set, 10, &mut context);
+    register_file(&mut set, 10, &context);
     let before = pending_native_dequeues();
     let wait = budget(2, TEST_NANOSECONDS);
     let current_frame = frame(b"cancel staged File");
@@ -1456,36 +1576,60 @@ fn file_preparation_cancellation_does_no_io_and_completion_keeps_original_error(
     assert_eq!(completion.outcome.stop, Some(Stop::Cancellation));
     assert!(completion.outcome.transfer.is_none());
     drop(group);
-    assert_eq!((context.prepares, context.completes), (1, 1));
-    assert_eq!((context.last.tag, context.last.submitted), (4, 0));
-    assert_eq!((context.last.reason, context.last.code), (0, None));
-    assert_eq!(context.owned_file().position().unwrap(), 0);
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (1, 1)
+    );
+    assert_eq!(
+        (unsafe { (*context.as_ptr()).last.tag }, unsafe {
+            (*context.as_ptr()).last.submitted
+        }),
+        (4, 0)
+    );
+    assert_eq!(
+        (unsafe { (*context.as_ptr()).last.reason }, unsafe {
+            (*context.as_ptr()).last.code
+        }),
+        (0, None)
+    );
+    assert_eq!(unsafe { (*context.owned_file()).position().unwrap() }, 0);
     assert_eq!(bytes, [0x77; 3]);
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
 
-    context.cancellation = ptr::null_mut();
+    unsafe { (*context.as_ptr()).cancellation = ptr::null_mut() };
     // The opaque readiness VALUE is not the typed complete File endpoint.
     // Reject it by identity before any cast/dereference or file submission.
-    context.selection = Selection::Foreign(context.owned_file().readiness_source().value());
+    unsafe {
+        (*context.as_ptr()).selection =
+            Selection::Foreign((*context.owned_file()).readiness_source().value());
+    }
     let mut rejected = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    register_file(&mut rejected, 20, &mut context);
+    register_file(&mut rejected, 20, &context);
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
     let result = unsafe { rejected.begin_selected(&current_frame, buffers, &wait, selection([0])) };
     assert!(matches!(setup_error(result),
         SetupFailure::Preparation(AdapterTerminal::PlatformFailure(failure))
             if failure == Failure::invalid_input()));
-    assert_eq!((context.prepares, context.completes), (2, 2));
-    assert_eq!((context.last.tag, context.last.submitted), (4, 0));
-    assert_eq!(context.owned_file().position().unwrap(), 0);
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (2, 2)
+    );
+    assert_eq!(
+        (unsafe { (*context.as_ptr()).last.tag }, unsafe {
+            (*context.as_ptr()).last.submitted
+        }),
+        (4, 0)
+    );
+    assert_eq!(unsafe { (*context.owned_file()).position().unwrap() }, 0);
     assert_eq!(bytes, [0x77; 3]);
     drop(rejected);
 
-    context.selection = Selection::Caller;
+    unsafe { (*context.as_ptr()).selection = Selection::Caller };
     let (owned, object) = error(&descriptor, &drops);
-    context.error = Some(owned);
+    unsafe { (*context.as_ptr()).error = Some(owned) };
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    register_file(&mut set, 20, &mut context);
+    register_file(&mut set, 20, &context);
     let buffers = BufferList::from_iter([Buffer::Read(&mut bytes)].into_iter()).unwrap();
     let mut group = unsafe {
         set.begin_selected(&current_frame, buffers, &wait, selection([0]))
@@ -1495,13 +1639,21 @@ fn file_preparation_cancellation_does_no_io_and_completion_keeps_original_error(
     assert_original(completion.outcome.transfer, object, &descriptor);
     assert!(unsafe { group.next(&current_frame) }.is_none());
     drop(group);
-    assert_eq!(context.owned_file().position().unwrap(), 3);
+    assert_eq!(unsafe { (*context.owned_file()).position().unwrap() }, 3);
     assert_eq!(bytes, *b"abc");
-    assert_eq!((context.prepares, context.completes), (3, 3));
-    assert_eq!((context.last.tag, context.last.submitted), (0, 1));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (3, 3)
+    );
+    assert_eq!(
+        (unsafe { (*context.as_ptr()).last.tag }, unsafe {
+            (*context.as_ptr()).last.submitted
+        }),
+        (0, 1)
+    );
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     assert_eq!(pending_native_dequeues(), before);
-    assert!(!context.invalid);
+    assert!(!unsafe { (*context.as_ptr()).invalid });
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
     let ((), closes) = with_close_probe(|| drop(context));
@@ -1512,19 +1664,19 @@ fn file_preparation_cancellation_does_no_io_and_completion_keeps_original_error(
 fn mixed_file_pipe_subset_preserves_idle_file_and_drains_only_real_pipe_packets() {
     let _serial = pending_test_lock();
     let fixture = FileFixture::new(b"abcd");
-    let mut file = Context::file(fixture.open(false), Selection::Caller);
-    let mut idle = Context::file(fixture.open(false), Selection::Caller);
+    let file = Context::file(fixture.open(false), Selection::Caller);
+    let idle = Context::file(fixture.open(false), Selection::Caller);
     let (server, client) = connected_pair();
-    let mut pipe = Context::new(server, Selection::Caller);
+    let pipe = Context::new(server, Selection::Caller);
     let mut peer = peer(client);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    register_file(&mut set, 10, &mut file);
-    register(&mut set, 20, &mut pipe);
+    register_file(&mut set, 10, &file);
+    register(&mut set, 20, &pipe);
     let identities = [
         set.native.as_ref().unwrap().pending_snapshot(0),
         set.native.as_ref().unwrap().pending_snapshot(1),
     ];
-    register_file(&mut set, 30, &mut idle);
+    register_file(&mut set, 30, &idle);
     assert_eq!(
         set.native.as_ref().unwrap().pending_snapshot(0),
         identities[0]
@@ -1568,10 +1720,13 @@ fn mixed_file_pipe_subset_preserves_idle_file_and_drains_only_real_pipe_packets(
     assert_eq!(pending_native_dequeues() - before, 1);
     assert_eq!(file_bytes, *b"ab");
     assert_eq!(pipe_bytes, *b"q");
-    assert_eq!((idle.prepares, idle.completes), (0, 0));
-    assert_eq!(idle.owned_file().position().unwrap(), 0);
+    assert_eq!(
+        unsafe { ((*idle.as_ptr()).prepares, (*idle.as_ptr()).completes) },
+        (0, 0)
+    );
+    assert_eq!(unsafe { (*idle.owned_file()).position().unwrap() }, 0);
     set.remove(30).unwrap();
-    assert_eq!(register_file(&mut set, 40, &mut idle), 2);
+    assert_eq!(register_file(&mut set, 40, &idle), 2);
     assert_eq!(
         set.native.as_ref().unwrap().pending_snapshot(0),
         identities[0]
@@ -1595,19 +1750,44 @@ fn mixed_file_pipe_subset_preserves_idle_file_and_drains_only_real_pipe_packets(
     drop(group);
     assert_eq!(pending_native_dequeues() - before, 1);
     assert_eq!(file_bytes, *b"cd");
-    assert_eq!((file.prepares, file.completes, file.metered), (2, 2, 4));
     assert_eq!(
-        (file.last.frame, file.last.tag, file.last.submitted),
+        (
+            unsafe { (*file.as_ptr()).prepares },
+            unsafe { (*file.as_ptr()).completes },
+            unsafe { (*file.as_ptr()).metered }
+        ),
+        (2, 2, 4)
+    );
+    assert_eq!(
+        (
+            unsafe { (*file.as_ptr()).last.frame },
+            unsafe { (*file.as_ptr()).last.tag },
+            unsafe { (*file.as_ptr()).last.submitted }
+        ),
         (0, 0, 1)
     );
-    assert_eq!((pipe.prepares, pipe.completes), (2, 2));
     assert_eq!(
-        (pipe.last.frame, pipe.last.tag, pipe.last.code),
+        unsafe { ((*pipe.as_ptr()).prepares, (*pipe.as_ptr()).completes) },
+        (2, 2)
+    );
+    assert_eq!(
+        (
+            unsafe { (*pipe.as_ptr()).last.frame },
+            unsafe { (*pipe.as_ptr()).last.tag },
+            unsafe { (*pipe.as_ptr()).last.code }
+        ),
         (0, 3, Some(995))
     );
-    assert_eq!((idle.prepares, idle.completes), (0, 0));
-    assert_eq!(idle.owned_file().position().unwrap(), 0);
-    assert!(!file.invalid && !pipe.invalid && !idle.invalid);
+    assert_eq!(
+        unsafe { ((*idle.as_ptr()).prepares, (*idle.as_ptr()).completes) },
+        (0, 0)
+    );
+    assert_eq!(unsafe { (*idle.owned_file()).position().unwrap() }, 0);
+    assert!(
+        !unsafe { (*file.as_ptr()).invalid }
+            && !unsafe { (*pipe.as_ptr()).invalid }
+            && !unsafe { (*idle.as_ptr()).invalid }
+    );
     set.native.as_ref().unwrap().pending_assert_retired();
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
@@ -1628,9 +1808,9 @@ fn actual_nonregular_file_is_rejected_before_callbacks_or_native_transfer() {
         },
     )
     .unwrap();
-    let mut context = Context::file(owner, Selection::Caller);
+    let context = Context::file(owner, Selection::Caller);
     let mut set = unsafe { PendingSet::new(ptr::null_mut()) }.unwrap();
-    let file = context.owned_file() as *mut OwnedFile;
+    let file = unsafe { context.owned_file() };
     let adapter = context.adapter();
     let before = pending_native_dequeues();
     let ((result, allocations), closes) = with_close_probe(|| {
@@ -1638,7 +1818,10 @@ fn actual_nonregular_file_is_rejected_before_callbacks_or_native_transfer() {
     });
     assert_eq!(result, Err(Failure::unsupported()));
     assert_eq!((allocations, closes), (0, 0));
-    assert_eq!((context.prepares, context.completes), (0, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).prepares, (*context.as_ptr()).completes) },
+        (0, 0)
+    );
     assert_eq!(set.key(0), None);
     assert_eq!(pending_native_dequeues(), before);
 
@@ -1651,8 +1834,8 @@ fn actual_nonregular_file_is_rejected_before_callbacks_or_native_transfer() {
         FileOpenRequest::READ,
     )
     .unwrap();
-    let mut readonly = Context::file(owner, Selection::Caller);
-    let index = register_file(&mut set, 20, &mut readonly);
+    let readonly = Context::file(owner, Selection::Caller);
+    let index = register_file(&mut set, 20, &readonly);
     let wait = budget(2, TEST_NANOSECONDS);
     let current_frame = frame(b"failed submitted File write");
     let input = *b"x";
@@ -1671,17 +1854,17 @@ fn actual_nonregular_file_is_rejected_before_callbacks_or_native_transfer() {
     drop(group);
     assert_eq!(
         (
-            readonly.last.tag,
-            readonly.last.submitted,
-            readonly.last.code
+            unsafe { (*readonly.as_ptr()).last.tag },
+            unsafe { (*readonly.as_ptr()).last.submitted },
+            unsafe { (*readonly.as_ptr()).last.code }
         ),
         (3, 1, Some(5))
     );
-    assert_eq!(readonly.last.progress, None);
-    assert_eq!(readonly.owned_file().position().unwrap(), 0);
+    assert_eq!(unsafe { (*readonly.as_ptr()).last.progress }, None);
+    assert_eq!(unsafe { (*readonly.owned_file()).position().unwrap() }, 0);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), b"abc");
     assert_eq!(pending_native_dequeues(), before);
-    assert!(!readonly.invalid);
+    assert!(!unsafe { (*readonly.as_ptr()).invalid });
     let ((), closes) = with_close_probe(|| drop(set));
     assert_eq!(closes, 0);
     let ((), closes) = with_close_probe(|| drop(context));

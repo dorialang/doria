@@ -2,6 +2,7 @@ use super::*;
 use crate::file_io::stream::transport::*;
 use crate::file_io::stream::OwnedFile;
 use crate::native_handle::with_close_probe;
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use std::fs;
 
@@ -21,7 +22,7 @@ unsafe extern "C" fn transformed_read(
     outcome: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Metered>();
+    let context = TestObject::<Metered>::in_callback((*context).object);
     context.calls += 1;
     context.frame = frame;
     *outcome = DrAdapterOutcomeV1::default();
@@ -417,18 +418,15 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
         let home = dr_v1_file_readiness_source_home(file_pointer);
         let source = *home.cast::<*const c_void>();
         assert_eq!(source, dr_v1_file_readiness_source(file_pointer));
-        let mut receiver = Metered {
+        let receiver = TestObject::new(Metered {
             file: file_pointer,
             calls: 0,
             frame: ptr::null(),
             zero_data: false,
             error: None,
-        };
+        });
         let adapter = DrTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (&mut receiver as *mut Metered).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: receiver.context(),
             read: Some(transformed_read),
             write: Some(transformed_write),
         };
@@ -446,7 +444,8 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
             0
         );
         assert_eq!(
-            receiver.calls, 0,
+            (*receiver.as_ptr()).calls,
+            0,
             "source admission must not transfer bytes"
         );
         let readonly_adapter = DrTransferAdapterV1 {
@@ -497,7 +496,7 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
         assert!(project_plan_begin(rejected, &mut setup_error, &mut status).is_null());
         assert_eq!(status.failure(), Some(Failure::invalid_input()));
         assert!(setup_error.object.is_null() && setup_error.vtable.is_null());
-        assert_eq!(receiver.calls, 0);
+        assert_eq!((*receiver.as_ptr()).calls, 0);
         assert_eq!(
             dr_v1_transfer_adapter_set_remove(
                 readonly_set,
@@ -568,7 +567,7 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
         assert_eq!(outcome.has_count, 1);
         assert_eq!(destination, [b'A', b'B', 0x55, 0x55]);
         assert_read_region(group, read_key, Some((destination.as_ptr(), 2)));
-        assert_eq!(receiver.calls, 1);
+        assert_eq!((*receiver.as_ptr()).calls, 1);
         for (key, reading, offset, length) in [
             (read_key, 0, 0, 4),
             (read_key, 2, 0, 4),
@@ -609,7 +608,7 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
             crate::transfer_group::transport::tests::assert_group_configuration_failure(&status);
             assert_read_region(group, read_key, Some((destination.as_ptr(), 2)));
             assert_eq!(observed(group), Some((read_key, true)));
-            assert_eq!(receiver.calls, 1);
+            assert_eq!((*receiver.as_ptr()).calls, 1);
         }
         for (key, reading, offset, length) in [
             (read_key, 0, 0, 4),
@@ -641,7 +640,7 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
             assert_checked_resubmit(group, key, reading, offset, length, false);
             assert_read_region(group, read_key, Some((destination.as_ptr(), 2)));
             assert_eq!(observed(group), Some((read_key, true)));
-            assert_eq!(receiver.calls, 1);
+            assert_eq!((*receiver.as_ptr()).calls, 1);
         }
         assert_checked_resubmit(group, read_key, 1, 1, 3, true);
         assert_read_region(group, read_key, None);
@@ -738,12 +737,12 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
                 dropped_frame: &dropped_frame,
                 progress: Some(1),
             }));
-            receiver.error = Some(crate::transfer_group::adapter::OwnedIoError::from_carrier(
-                DrInterfaceCarrierV1 {
+            (*receiver.as_ptr()).error = Some(
+                crate::transfer_group::adapter::OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
                     object: object.cast(),
                     vtable: &descriptor,
-                },
-            ));
+                }),
+            );
             let buffer = DrTransferBufferV1 {
                 reading: u8::from(reading),
                 ..buffer
@@ -847,12 +846,12 @@ fn adapter_ffi_dispatches_the_complete_receiver_and_never_claims_its_file() {
                 dropped_frame: &dropped_frame,
                 progress: None,
             }));
-            receiver.error = Some(crate::transfer_group::adapter::OwnedIoError::from_carrier(
-                DrInterfaceCarrierV1 {
+            (*receiver.as_ptr()).error = Some(
+                crate::transfer_group::adapter::OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
                     object: object.cast(),
                     vtable: &descriptor,
-                },
-            ));
+                }),
+            );
             let buffer = DrTransferBufferV1 {
                 reading: u8::from(reading),
                 ..buffer
@@ -1113,7 +1112,7 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         _: *mut DrAdapterOutcomeV1,
         _: *mut DrInterfaceCarrierV1,
     ) -> u8 {
-        let context = &mut *(*context).object.cast::<Context>();
+        let context = TestObject::<Context>::in_callback((*context).object);
         context.prepares += 1;
         observe(view, context, true);
         if !context.missing {
@@ -1149,7 +1148,7 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         outcome: *mut DrAdapterOutcomeV1,
         _: *mut DrInterfaceCarrierV1,
     ) -> u8 {
-        let context = &mut *(*context).object.cast::<Context>();
+        let context = TestObject::<Context>::in_callback((*context).object);
         context.completes += 1;
         let (result, tag, count) = observe(view, context, false);
         if result == 4 {
@@ -1210,19 +1209,16 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
         });
         assert_eq!(allocations, 0);
         assert_eq!((*path).references, references);
-        let mut context = Context {
+        let context = TestObject::new(Context {
             file,
             path,
             reading: true,
             missing: false,
             prepares: 0,
             completes: 0,
-        };
+        });
         let adapter = DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: ptr::from_mut(&mut context).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: context.context(),
             prepare_read: Some(prepare_read),
             prepare_write: Some(prepare_write),
             complete_read: Some(complete_read),
@@ -1242,7 +1238,10 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
             ),
             0
         );
-        assert_eq!((context.prepares, context.completes), (0, 0));
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (0, 0)
+        );
         assert_eq!((*path).references, references);
         let mut budget = mem::MaybeUninit::uninit();
         let (mut reason, mut code, mut has_code) = (0, 0, 0);
@@ -1268,9 +1267,9 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
             (true, true, true),
             (false, true, true),
         ] {
-            context.reading = reading;
-            context.missing = missing;
-            let prior = (context.prepares, context.completes);
+            (*context.as_ptr()).reading = reading;
+            (*context.as_ptr()).missing = missing;
+            let prior = ((*context.as_ptr()).prepares, (*context.as_ptr()).completes);
             let buffer = DrTransferBufferV1 {
                 data: ptr::null_mut(),
                 length: 0,
@@ -1324,7 +1323,7 @@ fn forwarded_file_source_admission_preserves_origin_before_read_write_and_missin
             }
             assert!(error.object.is_null() && error.vtable.is_null());
             assert_eq!(
-                (context.prepares, context.completes),
+                ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
                 (prior.0 + 1, prior.1 + 1)
             );
             assert_eq!((*path).references, references);

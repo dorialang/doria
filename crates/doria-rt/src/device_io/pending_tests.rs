@@ -1,5 +1,6 @@
 //! These run on each native host, rather than using a fake native owner for
 //! standard devices. Queue injection changes no process handle or close claim.
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use core::{ffi::c_void, mem::MaybeUninit, ptr};
 
@@ -39,7 +40,7 @@ unsafe extern "C" fn prepare(
     _: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let adapter = &mut *(*context).object.cast::<Adapter>();
+    let adapter = TestObject::<Adapter>::in_callback((*context).object);
     if let Some(driver) = adapter.driver {
         assert_eq!(std::thread::current().id(), driver);
     }
@@ -58,7 +59,7 @@ unsafe extern "C" fn complete(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let adapter = &mut *(*context).object.cast::<Adapter>();
+    let adapter = TestObject::<Adapter>::in_callback((*context).object);
     if let Some(driver) = adapter.driver {
         assert_eq!(std::thread::current().id(), driver);
     }
@@ -109,12 +110,9 @@ fn standard_buffered_input_preserves_complete_adapter_transformation_and_eof_on_
     unsafe {
         let _input = TestInput::new(b"\xff\0ab", true);
         let device = standard_device(StandardStream::Stdin);
-        let mut adapter = Adapter::default();
+        let adapter = TestObject::new(Adapter::default());
         let descriptor = DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: ptr::from_mut(&mut adapter).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: adapter.context(),
             prepare_read: Some(prepare),
             prepare_write: None,
             complete_read: Some(complete),
@@ -153,7 +151,11 @@ fn standard_buffered_input_preserves_complete_adapter_transformation_and_eof_on_
             ));
             assert_eq!(group.completed(0).unwrap(), b"\0\xff");
             assert_eq!(
-                (adapter.prepares, adapter.completes, adapter.submitted),
+                (
+                    (*adapter.as_ptr()).prepares,
+                    (*adapter.as_ptr()).completes,
+                    (*adapter.as_ptr()).submitted
+                ),
                 (1, 1, 0)
             );
             assert!(device.try_borrow().is_none());
@@ -170,10 +172,10 @@ fn standard_buffered_input_preserves_complete_adapter_transformation_and_eof_on_
             ));
             assert_eq!(
                 (
-                    adapter.prepares,
-                    adapter.completes,
-                    adapter.submitted,
-                    adapter.observed
+                    (*adapter.as_ptr()).prepares,
+                    (*adapter.as_ptr()).completes,
+                    (*adapter.as_ptr()).submitted,
+                    (*adapter.as_ptr()).observed
                 ),
                 (3, 3, 0, 2)
             );
@@ -203,15 +205,12 @@ fn helper_start_failure_is_readiness_registration_failure_and_completes_no_trans
     unsafe {
         let _input = TestInput::new(b"", false);
         let device = standard_device(StandardStream::Stdin);
-        let mut adapter = Adapter {
+        let adapter = TestObject::new(Adapter {
             driver: Some(std::thread::current().id()),
             ..Adapter::default()
-        };
+        });
         let descriptor = DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: ptr::from_mut(&mut adapter).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: adapter.context(),
             prepare_read: Some(prepare),
             prepare_write: None,
             complete_read: Some(complete),
@@ -246,10 +245,10 @@ fn helper_start_failure_is_readiness_registration_failure_and_completes_no_trans
         );
         assert_eq!(
             (
-                adapter.prepares,
-                adapter.completes,
-                adapter.submitted,
-                adapter.observed
+                (*adapter.as_ptr()).prepares,
+                (*adapter.as_ptr()).completes,
+                (*adapter.as_ptr()).submitted,
+                (*adapter.as_ptr()).observed
             ),
             (1, 1, 0, 4)
         );
@@ -257,7 +256,7 @@ fn helper_start_failure_is_readiness_registration_failure_and_completes_no_trans
         assert!(device.try_borrow().is_none());
         assert!(group.next(ptr::null()).is_none());
         drop(group);
-        assert_eq!(adapter.completes, 1);
+        assert_eq!((*adapter.as_ptr()).completes, 1);
         assert_eq!(bytes, [0xa5; 2]);
         assert!(device.try_borrow().is_some());
         set.remove(1).unwrap();
@@ -270,12 +269,9 @@ fn overlapping_standard_admission_is_checked_and_does_not_release_another_consum
     unsafe {
         let _input = TestInput::new(b"kept", true);
         let device = standard_device(StandardStream::Stdin);
-        let mut adapter = Adapter::default();
+        let adapter = TestObject::new(Adapter::default());
         let descriptor = DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: ptr::from_mut(&mut adapter).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: adapter.context(),
             prepare_read: Some(prepare),
             prepare_write: None,
             complete_read: Some(complete),
@@ -296,7 +292,10 @@ fn overlapping_standard_admission_is_checked_and_does_not_release_another_consum
             Err(crate::transfer_group::SetupFailure::Platform(failure))
             if failure.reason == crate::platform_io::Reason::InvalidInput)
         );
-        assert_eq!((adapter.prepares, adapter.completes), (0, 0));
+        assert_eq!(
+            ((*adapter.as_ptr()).prepares, (*adapter.as_ptr()).completes),
+            (0, 0)
+        );
         assert!(
             device.try_borrow().is_none(),
             "rollback may not release a foreign loan"
@@ -369,15 +368,12 @@ fn inherited_pending_child() {
     unsafe {
         let _input = TestInput::new(b"", false);
         let device = standard_device(StandardStream::Stdin);
-        let mut adapter = Adapter {
+        let adapter = TestObject::new(Adapter {
             driver: Some(std::thread::current().id()),
             ..Adapter::default()
-        };
+        });
         let descriptor = DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: ptr::from_mut(&mut adapter).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: adapter.context(),
             prepare_read: Some(prepare),
             prepare_write: None,
             complete_read: Some(complete),
@@ -432,7 +428,8 @@ fn inherited_pending_child() {
                     );
                 }
                 assert_eq!(
-                    adapter.completes, iteration,
+                    (*adapter.as_ptr()).completes,
+                    iteration,
                     "no worker-thread completion callback"
                 );
                 std::io::stderr().write_all(b"R").unwrap();
@@ -443,7 +440,7 @@ fn inherited_pending_child() {
                 assert_eq!(group.completed(0).unwrap(), expected);
             });
             assert_eq!(allocations, 0);
-            assert_eq!(adapter.submitted, 1);
+            assert_eq!((*adapter.as_ptr()).submitted, 1);
             assert_eq!(
                 super::helper::starts_for_test(),
                 starts + 1,
@@ -456,7 +453,10 @@ fn inherited_pending_child() {
                 assert_eq!(allocations, 0);
             }
         }
-        assert_eq!((adapter.prepares, adapter.completes), (2, 2));
+        assert_eq!(
+            ((*adapter.as_ptr()).prepares, (*adapter.as_ptr()).completes),
+            (2, 2)
+        );
         drop(group);
         assert!(device.try_borrow().is_some());
         set.remove(1).unwrap();

@@ -4,6 +4,7 @@ use crate::file_io::stream::{
     FileAccess, FileCreation, FileOpenRequest, FileSharing, OwnedFile, SeekOrigin,
 };
 use crate::native_handle::{with_close_probe, OwnedHandle};
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use crate::transfer_group::adapter::DrAdapterOutcomeV1;
 use crate::DrInterfaceCarrierV1;
@@ -30,8 +31,8 @@ fn readiness_handle(file: &OwnedFile) -> NativeHandle {
 #[test]
 fn same_registration_adapter_operations_do_not_share_terminal_facts_or_close_ownership() {
     let fixture = Fixture::new(b"abcd");
-    let mut context = Metered::new(fixture.open(false));
-    let source = readiness_handle(&context.file);
+    let context = Metered::new(fixture.open(false));
+    let source = readiness_handle(unsafe { &(*context.as_ptr()).file });
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(7, source, context.descriptor()).unwrap();
@@ -58,8 +59,11 @@ fn same_registration_adapter_operations_do_not_share_terminal_facts_or_close_own
     assert_eq!(seen, [true; 2]);
     let ((), closes) = with_close_probe(|| drop(group));
     assert_eq!(closes, 0);
-    assert_eq!((context.reads, context.writes), (1, 1));
-    assert_eq!(context.file.position().unwrap(), 2);
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).reads, (*context.as_ptr()).writes) },
+        (1, 1)
+    );
+    assert_eq!(unsafe { (*context.as_ptr()).file.position().unwrap() }, 2);
     let ((), closes) = with_close_probe(|| set.remove(7).unwrap());
     assert_eq!(closes, 0);
 }
@@ -67,8 +71,8 @@ fn same_registration_adapter_operations_do_not_share_terminal_facts_or_close_own
 #[test]
 fn shared_cursor_complete_adapter_orders_read_write_read_without_hot_allocations() {
     let fixture = Fixture::new(b"abcdefghi");
-    let mut context = Metered::new(fixture.open(false));
-    let source = readiness_handle(&context.file);
+    let context = Metered::new(fixture.open(false));
+    let source = readiness_handle(unsafe { &(*context.as_ptr()).file });
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()).unwrap() };
     unsafe {
         set.add(7, source, context.descriptor()).unwrap();
@@ -88,7 +92,10 @@ fn shared_cursor_complete_adapter_orders_read_write_read_without_hot_allocations
         set.begin_selected(ptr::null(), buffers, &wait, selection(&[0; 3]))
             .unwrap()
     };
-    assert_eq!((context.reads, context.writes), (1, 0));
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).reads, (*context.as_ptr()).writes) },
+        (1, 0)
+    );
     let ((), allocations) = crate::probe_runtime_allocations(|| unsafe {
         for index in 0..3 {
             assert_eq!(group.next(ptr::null()).unwrap().index, index);
@@ -99,8 +106,11 @@ fn shared_cursor_complete_adapter_orders_read_write_read_without_hot_allocations
         drop(group);
     });
     assert_eq!(allocations, 0);
-    assert_eq!((context.reads, context.writes), (2, 1));
-    assert_eq!(context.file.position().unwrap(), 7);
+    assert_eq!(
+        unsafe { ((*context.as_ptr()).reads, (*context.as_ptr()).writes) },
+        (2, 1)
+    );
+    assert_eq!(unsafe { (*context.as_ptr()).file.position().unwrap() }, 7);
     assert_eq!(fs::read(&fixture.path).unwrap(), b"abcXYfghi");
     set.remove(7).unwrap();
 }
@@ -156,8 +166,8 @@ struct Metered {
 }
 
 impl Metered {
-    fn new(file: OwnedFile) -> Self {
-        Self {
+    fn new(file: OwnedFile) -> TestObject<Self> {
+        TestObject::new(Self {
             file,
             reads: 0,
             writes: 0,
@@ -166,15 +176,14 @@ impl Metered {
             native_failure: None,
             cancel: ptr::null_mut(),
             cancel_failure: None,
-        }
+        })
     }
+}
 
-    fn descriptor(&mut self) -> DrTransferAdapterV1 {
+impl TestObject<Metered> {
+    fn descriptor(&self) -> DrTransferAdapterV1 {
         DrTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             read: Some(read),
             write: Some(write),
         }
@@ -189,7 +198,7 @@ unsafe extern "C" fn read(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Metered>();
+    let context = TestObject::<Metered>::in_callback((*context).object);
     context.reads += 1;
     context.pointer = data as usize;
     context.frame = frame;
@@ -235,7 +244,7 @@ unsafe extern "C" fn write(
     outcome: *mut DrAdapterOutcomeV1,
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Metered>();
+    let context = TestObject::<Metered>::in_callback((*context).object);
     context.writes += 1;
     context.pointer = data as usize;
     context.frame = frame;
@@ -305,21 +314,21 @@ fn regular_source_dispatches_adapter_subset_without_copy_or_close_claim() {
     let fixture_a = Fixture::new(b"abc");
     let fixture_b = Fixture::new(b"zz");
     let fixture_c = Fixture::new(b"uv");
-    let mut a = Box::new(Metered::new(fixture_a.open(false)));
-    let mut b = Box::new(Metered::new(fixture_b.open(false)));
-    let mut c = Box::new(Metered::new(fixture_c.open(false)));
+    let a = Metered::new(fixture_a.open(false));
+    let b = Metered::new(fixture_b.open(false));
+    let c = Metered::new(fixture_c.open(false));
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()) }.unwrap();
     assert_eq!(
-        unsafe { set.add(10, readiness_handle(&a.file), a.descriptor()) }.unwrap(),
+        unsafe { set.add(10, readiness_handle(&(*a.as_ptr()).file), a.descriptor()) }.unwrap(),
         0
     );
     let stable_a = set.slots.raw(0);
     assert_eq!(
-        unsafe { set.add(20, readiness_handle(&b.file), b.descriptor()) }.unwrap(),
+        unsafe { set.add(20, readiness_handle(&(*b.as_ptr()).file), b.descriptor()) }.unwrap(),
         1
     );
     assert_eq!(
-        unsafe { set.add(30, readiness_handle(&c.file), c.descriptor()) }.unwrap(),
+        unsafe { set.add(30, readiness_handle(&(*c.as_ptr()).file), c.descriptor()) }.unwrap(),
         2
     );
     assert_eq!(set.slots.raw(0), stable_a);
@@ -377,11 +386,30 @@ fn regular_source_dispatches_adapter_subset_without_copy_or_close_claim() {
         assert_eq!(group.stop(), None);
     });
     assert_eq!(allocations, 0);
-    assert_eq!((a.reads, b.reads, c.reads), (3, 0, 1));
-    assert_eq!((a.pointer, c.pointer), (pointer_a, pointer_c));
-    assert_eq!(a.frame, &next_frame as *const DrStackFrameV2);
-    assert_eq!(c.frame, &begin_frame as *const DrStackFrameV2);
-    assert!(a.native_failure.is_none() && c.native_failure.is_none());
+    assert_eq!(
+        (
+            unsafe { (*a.as_ptr()).reads },
+            unsafe { (*b.as_ptr()).reads },
+            unsafe { (*c.as_ptr()).reads }
+        ),
+        (3, 0, 1)
+    );
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).pointer, (*c.as_ptr()).pointer) },
+        (pointer_a, pointer_c)
+    );
+    assert_eq!(
+        unsafe { (*a.as_ptr()).frame },
+        &next_frame as *const DrStackFrameV2
+    );
+    assert_eq!(
+        unsafe { (*c.as_ptr()).frame },
+        &begin_frame as *const DrStackFrameV2
+    );
+    assert!(
+        unsafe { (*a.as_ptr()).native_failure.is_none() }
+            && unsafe { (*c.as_ptr()).native_failure.is_none() }
+    );
     let ((), closes) = with_close_probe(|| {
         set.remove(20).unwrap();
         assert_eq!(set.key(1), None);
@@ -393,26 +421,30 @@ fn regular_source_dispatches_adapter_subset_without_copy_or_close_claim() {
     });
     assert_eq!(closes, 0);
     let mut untouched = [0; 2];
-    assert_eq!(b.file.read(&mut untouched).unwrap(), ReadProgress::Data(2));
+    assert_eq!(
+        unsafe { (*b.as_ptr()).file.read(&mut untouched).unwrap() },
+        ReadProgress::Data(2)
+    );
     assert_eq!(&untouched, b"zz");
-    assert_eq!(a.file.position().unwrap(), 3);
+    assert_eq!(unsafe { (*a.as_ptr()).file.position().unwrap() }, 3);
     assert_eq!(bytes_a[2], 0x55);
 }
 
 #[test]
 fn registered_append_owner_keeps_cursor_and_dispatches_empty_adapter_call() {
     let fixture = Fixture::new(b"abc");
-    let mut first = Box::new(Metered::new(fixture.open(true)));
+    let first = Metered::new(fixture.open(true));
     let mut second = fixture.open(true);
-    first.file.seek(1, SeekOrigin::Start).unwrap();
+    unsafe { (*first.as_ptr()).file.seek(1, SeekOrigin::Start).unwrap() };
     let mut set = unsafe { AdapterSet::new(ptr::null_mut()) }.unwrap();
-    let (source, allocations) = crate::probe_runtime_allocations(|| readiness_handle(&first.file));
+    let (source, allocations) =
+        crate::probe_runtime_allocations(|| readiness_handle(unsafe { &(*first.as_ptr()).file }));
     assert_eq!(allocations, 0);
     unsafe { set.add(10, source, first.descriptor()) }.unwrap();
-    assert_eq!(first.file.position().unwrap(), 1);
+    assert_eq!(unsafe { (*first.as_ptr()).file.position().unwrap() }, 1);
     assert_eq!(second.write(b"X").unwrap(), WriteProgress::Accepted(1));
     assert_eq!(second.position().unwrap(), 4);
-    assert_eq!(first.file.position().unwrap(), 1);
+    assert_eq!(unsafe { (*first.as_ptr()).file.position().unwrap() }, 1);
     let input = *b"Y";
     let buffers =
         BufferList::<AdapterTerminal>::from_iter([Buffer::Write(&input)].into_iter()).unwrap();
@@ -431,13 +463,16 @@ fn registered_append_owner_keeps_cursor_and_dispatches_empty_adapter_call() {
             Some(AdapterTerminal::Accepted(0))
         ));
     }
-    assert_eq!(first.writes, 2);
-    assert!(first.native_failure.is_none());
-    assert_eq!(first.file.position().unwrap(), 5);
+    assert_eq!(unsafe { (*first.as_ptr()).writes }, 2);
+    assert!(unsafe { (*first.as_ptr()).native_failure.is_none() });
+    assert_eq!(unsafe { (*first.as_ptr()).file.position().unwrap() }, 5);
     assert_eq!(input, *b"Y");
     drop(set);
-    assert_eq!(first.file.write(b"Z").unwrap(), WriteProgress::Accepted(1));
-    assert_eq!(first.file.position().unwrap(), 6);
+    assert_eq!(
+        unsafe { (*first.as_ptr()).file.write(b"Z").unwrap() },
+        WriteProgress::Accepted(1)
+    );
+    assert_eq!(unsafe { (*first.as_ptr()).file.position().unwrap() }, 6);
     assert_eq!(second.position().unwrap(), 4);
     assert_eq!(fs::read(&fixture.path).unwrap(), b"abcXYZ");
 }
@@ -454,8 +489,8 @@ fn non_disk_and_wrong_direction_reject_before_io_and_callback_cancellation_stops
     }
     let fixture_a = Fixture::new(b"ab");
     let fixture_b = Fixture::new(b"cd");
-    let mut a = Box::new(Metered::new(fixture_a.open(false)));
-    let mut b = Box::new(Metered::new(fixture_b.open(false)));
+    let a = Metered::new(fixture_a.open(false));
+    let b = Metered::new(fixture_b.open(false));
     let state = cancellation::dr_v1_cancellation_new();
     assert!(!state.is_null());
     let _source_claim = CancellationClaim(state);
@@ -471,16 +506,16 @@ fn non_disk_and_wrong_direction_reject_before_io_and_callback_cancellation_stops
         crate::probe_runtime_allocations(|| unsafe { set.add(1, pipe_read.get(), a.descriptor()) });
     assert_eq!(rejected.err().unwrap().reason, Reason::Unsupported);
     assert_eq!(allocations, 0);
-    assert_eq!(a.reads, 0);
+    assert_eq!(unsafe { (*a.as_ptr()).reads }, 0);
     let (rejected, allocations) = crate::probe_runtime_allocations(|| unsafe {
         set.add(2, -1_isize as NativeHandle, a.descriptor())
     });
     assert_eq!(rejected.err().unwrap().system_code, Some(6));
     assert_eq!(allocations, 0);
-    unsafe { set.add(10, readiness_handle(&a.file), a.descriptor()) }.unwrap();
+    unsafe { set.add(10, readiness_handle(&(*a.as_ptr()).file), a.descriptor()) }.unwrap();
     let mut descriptor = b.descriptor();
     descriptor.read = None;
-    unsafe { set.add(20, readiness_handle(&b.file), descriptor) }.unwrap();
+    unsafe { set.add(20, readiness_handle(&(*b.as_ptr()).file), descriptor) }.unwrap();
     let mut bytes_a = [0x55; 2];
     let mut bytes_b = [0x55; 2];
     let buffers = BufferList::<AdapterTerminal>::from_iter(
@@ -502,12 +537,15 @@ fn non_disk_and_wrong_direction_reject_before_io_and_callback_cancellation_stops
         matches!(rejected.unwrap(), SetupFailure::Platform(failure) if failure.reason == Reason::InvalidInput)
     );
     assert_eq!(allocations, 0);
-    assert_eq!((a.reads, b.reads), (0, 0));
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).reads, (*b.as_ptr()).reads) },
+        (0, 0)
+    );
     assert_eq!(bytes_a, [0x55; 2]);
     assert_eq!(bytes_b, [0x55; 2]);
     set.remove(20).unwrap();
-    unsafe { set.add(30, readiness_handle(&b.file), b.descriptor()) }.unwrap();
-    a.cancel = state;
+    unsafe { set.add(30, readiness_handle(&(*b.as_ptr()).file), b.descriptor()) }.unwrap();
+    unsafe { (*a.as_ptr()).cancel = state };
     let buffers = BufferList::<AdapterTerminal>::from_iter(
         [Buffer::Read(&mut bytes_a), Buffer::Read(&mut bytes_b)].into_iter(),
     )
@@ -529,10 +567,13 @@ fn non_disk_and_wrong_direction_reject_before_io_and_callback_cancellation_stops
         assert!(group.next(ptr::null()).is_none());
         assert_eq!(group.stop(), Some(Stop::Cancellation));
     }
-    assert_eq!((a.reads, b.reads), (1, 0));
-    assert_eq!(a.cancel_failure, Some(0));
-    assert!(a.native_failure.is_none());
+    assert_eq!(
+        unsafe { ((*a.as_ptr()).reads, (*b.as_ptr()).reads) },
+        (1, 0)
+    );
+    assert_eq!(unsafe { (*a.as_ptr()).cancel_failure }, Some(0));
+    assert!(unsafe { (*a.as_ptr()).native_failure.is_none() });
     assert_eq!(&bytes_a, b"AB");
     assert_eq!(bytes_b, [0x55; 2]);
-    assert_eq!(b.file.position().unwrap(), 0);
+    assert_eq!(unsafe { (*b.as_ptr()).file.position().unwrap() }, 0);
 }

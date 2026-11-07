@@ -1,5 +1,6 @@
 use super::*;
 use crate::native_handle::OwnedHandle;
+use crate::transfer_group::adapter::test_object::TestObject;
 use crate::transfer_group::adapter::DrAdapterContextV1;
 use crate::transfer_group::adapter::OwnedIoError;
 use crate::transfer_group::pending::{
@@ -22,8 +23,8 @@ struct Context {
 }
 
 impl Context {
-    fn new(endpoint: *const c_void) -> Box<Self> {
-        Box::new(Self {
+    fn new(endpoint: *const c_void) -> TestObject<Self> {
+        TestObject::new(Self {
             endpoint,
             prepares: 0,
             completes: 0,
@@ -33,13 +34,12 @@ impl Context {
             error: None,
         })
     }
+}
 
-    fn adapter(&mut self) -> DrPendingTransferAdapterV1 {
+impl TestObject<Context> {
+    fn adapter(&self) -> DrPendingTransferAdapterV1 {
         DrPendingTransferAdapterV1 {
-            context: DrAdapterContextV1 {
-                object: (self as *mut Self).cast(),
-                descriptor: core::ptr::null(),
-            },
+            context: self.context(),
             prepare_read: Some(prepare),
             prepare_write: None,
             complete_read: Some(complete),
@@ -57,7 +57,7 @@ unsafe extern "C" fn prepare(
     _: *mut DrAdapterOutcomeV1,
     error: *mut DrInterfaceCarrierV1,
 ) -> u8 {
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.prepares += 1;
     if let Some(owned) = context.error.take() {
         error.write(owned.into_carrier());
@@ -77,7 +77,7 @@ unsafe extern "C" fn complete(
     _: *mut DrInterfaceCarrierV1,
 ) -> u8 {
     let (tag, submitted, native, selected, immediate) = pending_callback_facts(view);
-    let context = &mut *(*context).object.cast::<Context>();
+    let context = TestObject::<Context>::in_callback((*context).object);
     context.completes += 1;
     context.completion_frame = frame as usize;
     context.last_native_tag = tag;
@@ -143,14 +143,14 @@ unsafe fn budget_for(kind: u8, nanoseconds: u64) -> DrWaitBudgetV1 {
     value.assume_init()
 }
 
-unsafe fn add(set: *mut c_void, context: &mut Context) -> PlanKey {
+unsafe fn add(set: *mut c_void, context: &TestObject<Context>) -> PlanKey {
     let mut status = DrIoStatusV1::default();
     let mut key = PlanKey { owner: 0, value: 0 };
     let adapter = context.adapter();
     assert_eq!(
         dr_v1_pending_transfer_adapter_set_add(
             set,
-            context.endpoint,
+            (*context.as_ptr()).endpoint,
             &adapter,
             (&mut key as *mut PlanKey).cast(),
             &mut status
@@ -181,13 +181,16 @@ unsafe fn plan_for(key: &PlanKey, bytes: &mut [u8]) -> *mut c_void {
 fn pending_ffi_uses_shared_gate_completion_region_reuse_and_sole_leaf_close() {
     unsafe {
         let (leaf, mut peer) = leaf();
-        let mut context = Context::new(leaf.native_handle_home());
+        let context = Context::new(leaf.native_handle_home());
         let mut status = DrIoStatusV1::default();
         let set =
             dr_v1_pending_transfer_adapter_set_new(core::ptr::null(), ptr::null_mut(), &mut status);
         assert!(!set.is_null());
-        let key = add(set, &mut context);
-        assert_eq!((context.prepares, context.completes), (0, 0));
+        let key = add(set, &context);
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (0, 0)
+        );
         let mut error = crate::empty_error_carrier();
         let unsupported_write = DrTransferBufferV1 {
             data: ptr::null_mut(),
@@ -202,7 +205,10 @@ fn pending_ffi_uses_shared_gate_completion_region_reuse_and_sole_leaf_close() {
         );
         assert!(!invalid.is_null());
         super::tests::checked_begin(ptr::null(), set, invalid, &mut error, 1);
-        assert_eq!((context.prepares, context.completes), (0, 0));
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (0, 0)
+        );
         assert!(!(*set.cast::<AdapterSetOwner>()).active);
         let mut bytes = [0x55; 4];
         peer.write_all(b"ab").unwrap();
@@ -222,7 +228,10 @@ fn pending_ffi_uses_shared_gate_completion_region_reuse_and_sole_leaf_close() {
             &mut error,
             1,
         );
-        assert_eq!((context.prepares, context.completes), (1, 0));
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (1, 0)
+        );
         assert_eq!(rejected_bytes, [0x66; 4]);
         assert!(error.object.is_null() && error.vtable.is_null());
         let mut rejected = PlanKey { owner: 1, value: 2 };
@@ -271,7 +280,10 @@ fn pending_ffi_uses_shared_gate_completion_region_reuse_and_sole_leaf_close() {
         });
         assert_eq!((tag, allocations, outcome.count), (0, 0, 2));
         assert_eq!(bytes, [b'C', b'D', 0x55, 0x55]);
-        assert_eq!((context.prepares, context.completes), (2, 2));
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (2, 2)
+        );
         let (_, closes) = with_close_probe(|| {
             dr_v1_transfer_adapter_group_drop(ptr::null(), group);
             assert_eq!(
@@ -302,7 +314,7 @@ fn negative_fetch_budget_keeps_pending_transfer_live_for_a_later_wait() {
     for nanoseconds in [i64::MIN, -250_000_000, -1] {
         unsafe {
             let (leaf, mut peer) = leaf();
-            let mut context = Context::new(leaf.native_handle_home());
+            let context = Context::new(leaf.native_handle_home());
             let mut status = DrIoStatusV1::default();
             let set = dr_v1_pending_transfer_adapter_set_new(
                 core::ptr::null(),
@@ -310,7 +322,7 @@ fn negative_fetch_budget_keeps_pending_transfer_live_for_a_later_wait() {
                 &mut status,
             );
             assert!(!set.is_null());
-            let key = add(set, &mut context);
+            let key = add(set, &context);
             let lifetime = DrWaitBudgetV1::indefinite();
             let mut bytes = [0x55; 4];
             let mut error = crate::empty_error_carrier();
@@ -342,7 +354,11 @@ fn negative_fetch_budget_keeps_pending_transfer_live_for_a_later_wait() {
             assert_eq!((tag, allocations), (6, 0));
             assert!(error.object.is_null());
             assert_eq!(
-                (context.prepares, context.completes, context.cleaned),
+                (
+                    (*context.as_ptr()).prepares,
+                    (*context.as_ptr()).completes,
+                    (*context.as_ptr()).cleaned
+                ),
                 (1, 0, 0)
             );
             peer.write_all(b"ab").unwrap();
@@ -361,7 +377,11 @@ fn negative_fetch_budget_keeps_pending_transfer_live_for_a_later_wait() {
             );
             assert_eq!((returned, index, outcome.count), (key.value, 0, 2));
             assert_eq!(
-                (context.prepares, context.completes, context.cleaned),
+                (
+                    (*context.as_ptr()).prepares,
+                    (*context.as_ptr()).completes,
+                    (*context.as_ptr()).cleaned
+                ),
                 (1, 1, 0)
             );
             dr_v1_transfer_adapter_group_drop(ptr::null(), group);
@@ -381,12 +401,12 @@ fn pending_fetch_timeout_defers_completion_until_teardown_drains_once() {
         let acquisition = mem::zeroed::<DrStackFrameV2>();
         let cleanup = mem::zeroed::<DrStackFrameV2>();
         let (leaf, mut peer) = leaf();
-        let mut context = Context::new(leaf.native_handle_home());
+        let context = Context::new(leaf.native_handle_home());
         let mut status = DrIoStatusV1::default();
         let set =
             dr_v1_pending_transfer_adapter_set_new(core::ptr::null(), ptr::null_mut(), &mut status);
         assert!(!set.is_null());
-        let key = add(set, &mut context);
+        let key = add(set, &context);
         let lifetime = DrWaitBudgetV1::indefinite();
         let mut bytes = [0x55; 4];
         let mut error = crate::empty_error_carrier();
@@ -416,17 +436,24 @@ fn pending_fetch_timeout_defers_completion_until_teardown_drains_once() {
             6
         );
         assert_eq!(
-            (context.prepares, context.completes, context.cleaned),
+            (
+                (*context.as_ptr()).prepares,
+                (*context.as_ptr()).completes,
+                (*context.as_ptr()).cleaned
+            ),
             (1, 0, 0)
         );
         dr_v1_transfer_adapter_group_drop(&cleanup, group);
-        assert_eq!(context.completion_frame, ptr::from_ref(&cleanup) as usize);
+        assert_eq!(
+            (*context.as_ptr()).completion_frame,
+            ptr::from_ref(&cleanup) as usize
+        );
         assert_eq!(
             (
-                context.prepares,
-                context.completes,
-                context.cleaned,
-                context.last_native_tag
+                (*context.as_ptr()).prepares,
+                (*context.as_ptr()).completes,
+                (*context.as_ptr()).cleaned,
+                (*context.as_ptr()).last_native_tag
             ),
             (1, 1, 1, 4)
         );
@@ -456,7 +483,11 @@ fn pending_fetch_timeout_defers_completion_until_teardown_drains_once() {
         );
         assert_eq!((returned, index, outcome.count), (key.value, 0, 2));
         assert_eq!(
-            (context.prepares, context.completes, context.cleaned),
+            (
+                (*context.as_ptr()).prepares,
+                (*context.as_ptr()).completes,
+                (*context.as_ptr()).cleaned
+            ),
             (2, 2, 1)
         );
         dr_v1_transfer_adapter_group_drop(ptr::null(), group);
@@ -502,7 +533,7 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
     unsafe {
         for progress in [None, Some(0), Some(2), Some(-3)] {
             let (leaf, mut peer) = leaf();
-            let mut context = Context::new(leaf.native_handle_home());
+            let context = Context::new(leaf.native_handle_home());
             let mut status = DrIoStatusV1::default();
             let set = dr_v1_pending_transfer_adapter_set_new(
                 core::ptr::null(),
@@ -518,7 +549,7 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
             assert_eq!(
                 dr_v1_pending_transfer_adapter_set_add(
                     set,
-                    context.endpoint,
+                    (*context.as_ptr()).endpoint,
                     &adapter,
                     ptr::from_mut(&mut key).cast(),
                     &mut status
@@ -541,7 +572,10 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
                 &mut status,
             );
             assert!(!group.is_null());
-            assert_eq!((context.prepares, context.completes), (1, 0));
+            assert_eq!(
+                ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+                (1, 0)
+            );
             super::tests::assert_read_region(group, read_key, None);
             let (mut returned, mut index) = (999, 999);
             let mut outcome = DrAdapterOutcomeV1::default();
@@ -572,7 +606,11 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
                     (0, 0, 0, 0)
                 );
                 assert_eq!(
-                    (context.prepares, context.completes, context.cleaned),
+                    (
+                        (*context.as_ptr()).prepares,
+                        (*context.as_ptr()).completes,
+                        (*context.as_ptr()).cleaned
+                    ),
                     (1, 0, 0)
                 );
                 assert!(error.object.is_null());
@@ -602,7 +640,7 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
                 io_transferred_byte_count_offset: 0,
                 io_progress_magic: 0,
             };
-            context.error = Some(OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
+            (*context.as_ptr()).error = Some(OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
                 object: object.cast(),
                 vtable: &descriptor,
             }));
@@ -622,7 +660,11 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
             assert_eq!((tag, allocations), (1, 0));
             assert_eq!((returned, index), (key.value, 0));
             assert_eq!(
-                (context.prepares, context.completes, context.cleaned),
+                (
+                    (*context.as_ptr()).prepares,
+                    (*context.as_ptr()).completes,
+                    (*context.as_ptr()).cleaned
+                ),
                 (1, 1, 0)
             );
             assert_eq!(error.object, object.cast());
@@ -687,7 +729,11 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
                 );
                 super::tests::assert_checked_resubmit(group, key, reading, 0, 4, false);
                 assert_eq!(
-                    (context.prepares, context.completes, context.cleaned),
+                    (
+                        (*context.as_ptr()).prepares,
+                        (*context.as_ptr()).completes,
+                        (*context.as_ptr()).cleaned
+                    ),
                     (1, 1, 0)
                 );
                 assert_eq!(error.object, object.cast());
@@ -727,7 +773,10 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
                 ),
                 6
             );
-            assert_eq!((context.prepares, context.completes), (2, 1));
+            assert_eq!(
+                ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+                (2, 1)
+            );
             super::tests::assert_read_region(group, read_key, None);
             peer.write_all(b"cd").unwrap();
             assert_eq!(
@@ -749,7 +798,11 @@ fn pending_fetch_expiry_keeps_preparation_live_then_moves_original_error_once() 
             );
             super::tests::assert_read_region(group, read_key, Some((bytes[1..].as_ptr(), 2)));
             assert_eq!(
-                (context.prepares, context.completes, context.cleaned),
+                (
+                    (*context.as_ptr()).prepares,
+                    (*context.as_ptr()).completes,
+                    (*context.as_ptr()).cleaned
+                ),
                 (2, 2, 0)
             );
             dr_v1_transfer_adapter_group_drop(ptr::null(), group);
@@ -778,8 +831,8 @@ fn pending_ffi_failed_setup_preserves_original_error_and_releases_shared_active_
             let acquisition = mem::zeroed::<DrStackFrameV2>();
             let (first_leaf, mut first_peer) = leaf();
             let (second_leaf, mut second_peer) = leaf();
-            let mut first = Context::new(first_leaf.native_handle_home());
-            let mut second = Context::new(second_leaf.native_handle_home());
+            let first = Context::new(first_leaf.native_handle_home());
+            let second = Context::new(second_leaf.native_handle_home());
             let drops = Rc::new(Cell::new(0));
             let object = Box::into_raw(Box::new(ProgressError {
                 drops: Rc::clone(&drops),
@@ -800,7 +853,7 @@ fn pending_ffi_failed_setup_preserves_original_error_and_releases_shared_active_
                 io_transferred_byte_count_offset: 0,
                 io_progress_magic: 0,
             };
-            second.error = Some(OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
+            (*second.as_ptr()).error = Some(OwnedIoError::from_carrier(DrInterfaceCarrierV1 {
                 object,
                 vtable: &descriptor,
             }));
@@ -810,8 +863,8 @@ fn pending_ffi_failed_setup_preserves_original_error_and_releases_shared_active_
                 ptr::null_mut(),
                 &mut status,
             );
-            let a = add(set, &mut first);
-            let b = add(set, &mut second);
+            let a = add(set, &first);
+            let b = add(set, &second);
             first_peer.write_all(b"a").unwrap();
             second_peer.write_all(b"b").unwrap();
             let (mut a_bytes, mut b_bytes) = ([0; 1], [0; 1]);
@@ -859,9 +912,22 @@ fn pending_ffi_failed_setup_preserves_original_error_and_releases_shared_active_
             assert_eq!(error.vtable, &descriptor as *const _);
             assert_eq!((*object.cast::<ProgressError>()).progress, progress);
             assert_eq!((status.reason, status.has_system_code), (0, 0));
-            assert_eq!((first.prepares, first.completes, first.cleaned), (1, 1, 1));
-            assert_eq!(first.completion_frame, ptr::from_ref(&acquisition) as usize);
-            assert_eq!((second.prepares, second.completes), (1, 0));
+            assert_eq!(
+                (
+                    (*first.as_ptr()).prepares,
+                    (*first.as_ptr()).completes,
+                    (*first.as_ptr()).cleaned
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (*first.as_ptr()).completion_frame,
+                ptr::from_ref(&acquisition) as usize
+            );
+            assert_eq!(
+                ((*second.as_ptr()).prepares, (*second.as_ptr()).completes),
+                (1, 0)
+            );
             assert_eq!((a_bytes, b_bytes), ([0], [0]));
             // If either request had reached submission, these queued native bytes
             // would already have been consumed. No source-level substitute is used.
@@ -928,7 +994,7 @@ fn pending_file_ffi_preserves_typed_eof_reuse_identity_and_sole_close() {
     );
     unsafe {
         let endpoint = ptr::from_mut(file.as_mut()).cast::<c_void>();
-        let mut context = Context::new(endpoint);
+        let context = Context::new(endpoint);
         let adapter = context.adapter();
         let mut status = DrIoStatusV1::default();
         let set =
@@ -945,7 +1011,10 @@ fn pending_file_ffi_preserves_typed_eof_reuse_identity_and_sole_close() {
             ),
             0
         );
-        assert_eq!((context.prepares, context.completes), (0, 0));
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (0, 0)
+        );
         let mut duplicate = PlanKey { owner: 1, value: 2 };
         assert_eq!(
             dr_v1_pending_transfer_adapter_set_add_file(
@@ -987,7 +1056,11 @@ fn pending_file_ffi_preserves_typed_eof_reuse_identity_and_sole_close() {
                 0
             );
             assert_eq!(
-                (outcome.tag, outcome.count, context.last_native_tag),
+                (
+                    outcome.tag,
+                    outcome.count,
+                    (*context.as_ptr()).last_native_tag
+                ),
                 (0, 2, 0)
             );
             assert_eq!((returned, index), (key.value, 0));
@@ -1008,7 +1081,11 @@ fn pending_file_ffi_preserves_typed_eof_reuse_identity_and_sole_close() {
                 0
             );
             assert_eq!(
-                (outcome.tag, outcome.count, context.last_native_tag),
+                (
+                    outcome.tag,
+                    outcome.count,
+                    (*context.as_ptr()).last_native_tag
+                ),
                 (0, 0, 0)
             );
             assert_eq!(
@@ -1028,12 +1105,19 @@ fn pending_file_ffi_preserves_typed_eof_reuse_identity_and_sole_close() {
                 0
             );
             assert_eq!(
-                (outcome.tag, outcome.has_count, context.last_native_tag),
+                (
+                    outcome.tag,
+                    outcome.has_count,
+                    (*context.as_ptr()).last_native_tag
+                ),
                 (2, 0, 2)
             );
         });
         assert_eq!(allocations, 0);
-        assert_eq!((context.prepares, context.completes), (3, 3));
+        assert_eq!(
+            ((*context.as_ptr()).prepares, (*context.as_ptr()).completes),
+            (3, 3)
+        );
         let ((), closes) = with_close_probe(|| {
             dr_v1_transfer_adapter_group_drop(ptr::null(), group);
             assert_eq!(
