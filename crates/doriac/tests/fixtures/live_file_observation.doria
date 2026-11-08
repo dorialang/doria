@@ -1,0 +1,27 @@
+// A file's writer is still open when these read it. Public file owners share
+// with a live writer on every platform; `read_file` does not on Windows.
+function liveFileLength(string $path): int {
+    let $file = File::openRead($path);
+    return $file->getLength();
+}
+
+function liveFileHolds(string $path, Bytes $expected): bool {
+    let writable $file = File::openRead($path);
+    if ($file->getLength() != $expected->length) { return false; }
+    writable Bytes $actual = Bytes::allocate($expected->length);
+    writable int $filled = 0;
+    while ($filled < $expected->length) {
+        let $read = match ($file->read($actual->getWritableRegion($filled, $expected->length - $filled))) {
+            ReadOutcome::Data($count) => $count,
+            default => 0,
+        };
+        if ($read == 0) { return false; }
+        $filled += $read;
+    }
+    writable int $index = 0;
+    while ($index < $expected->length) {
+        if ($actual[$index] != $expected[$index]) { return false; }
+        $index += 1;
+    }
+    return true;
+}

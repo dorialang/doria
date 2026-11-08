@@ -1,3 +1,6 @@
+# Doria sources are LF in every checkout; tests read and edit them as text.
+*.doria text eol=lf
+
 # Compiler fixtures are byte-exact sources, inputs, and expected outputs.
 crates/doriac/tests/fixtures/** -text
 

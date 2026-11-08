@@ -86,7 +86,7 @@ function ownedWriter(): void throws IoError {
         if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(2)))) { panic("full buffer did not drain"); }
         if ($group->getNextCompletion(Wait::Immediate) != TransferWaitResult::Exhausted) { panic("completion repeated"); }
     }
-    if (read_file("buffered-output") != "abcd") { panic("drain wrote the wrong bytes"); }
+    if (!liveFileHolds("buffered-output", Bytes::fromArray([97, 98, 99, 100]))) { panic("drain wrote the wrong bytes"); }
     {
         let $plan = TransferPlan::writeTo($registration, $data->getRegion(6, 1))->andWriteTo($registration, $data->getRegion(7, 1));
         try {
@@ -105,7 +105,7 @@ function ownedWriter(): void throws IoError {
     if (!$closed) { panic("finish pending"); }
     // The rejected plan's first write was accepted into the buffer during
     // preparation; Decision 0110 keeps an immediate outcome after setup fails.
-    if (read_file("buffered-output") != "abcdefg") { panic("finish lost the buffered tail"); }
+    if (!liveFileHolds("buffered-output", Bytes::fromArray([97, 98, 99, 100, 101, 102, 103]))) { panic("finish lost the buffered tail"); }
     let writable $through = new BufferedWriter<WritableFile>(File::openWrite("through-output", FileCreation::CreateOrTruncate, FileWriteMode::Positioned), 4);
     let $second = $set->register($through);
     {

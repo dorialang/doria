@@ -6,6 +6,16 @@ use cranelift_object::object::{
 
 pub type FunctionReferences = BTreeMap<String, BTreeSet<String>>;
 
+/// The symbol a relocation refers to. Cranelift's COFF output reaches an
+/// external symbol through a `.refptr.` pointer cell; what the code references
+/// is the symbol behind it.
+pub fn relocation_target_name(name: &str) -> String {
+    name.strip_prefix(".refptr.")
+        .unwrap_or(name)
+        .trim_start_matches('_')
+        .to_owned()
+}
+
 pub fn authored_symbols(program: &doriac::mir::Program, names: &[&str]) -> Vec<String> {
     names
         .iter()
@@ -86,7 +96,7 @@ pub fn cranelift_references(program: &doriac::mir::Program) -> FunctionReference
         }) {
             if let RelocationTarget::Symbol(symbol) = relocation.target() {
                 let symbol = object.symbol_by_index(symbol).unwrap();
-                references.insert(symbol.name().unwrap().trim_start_matches('_').to_owned());
+                references.insert(relocation_target_name(symbol.name().unwrap()));
             } else if let RelocationTarget::Section(target) = relocation.target() {
                 if object.section_by_index(target).unwrap().kind() == SectionKind::Text {
                     references.insert(format!("unresolved text target at {offset:#x}"));

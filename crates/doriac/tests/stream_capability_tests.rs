@@ -28,6 +28,7 @@ const SOURCE: &str = include_str!("../../../examples/native/main_stream_capabili
 const EXPECTED: &str = include_str!("fixtures/native_io/main_stream_capabilities/expected_stdout");
 
 const CONDITIONAL_FORWARDER: &str = include_str!("fixtures/conditional_stream_forwarder.doria");
+const LIVE_FILE_OBSERVATION: &str = include_str!("fixtures/live_file_observation.doria");
 
 #[test]
 fn conditional_stream_forwarders_preserve_each_nominal_capability_tier() {
@@ -306,6 +307,7 @@ function main(): void {{
 fn conditional_stream_forwarders_execute_pending_writes_and_cancellation() {
     let source = format!(
         r#"{CONDITIONAL_FORWARDER}
+{LIVE_FILE_OBSERVATION}
 use Doria\Std\Io\{{File, WritableFile, FileCreation, FileWriteMode, ReadinessSet, TransferPlan,
     TransferWaitResult, TransferCompletion, Wait, IoOperation, IoTarget, IoErrorReason}};
 use Doria\Std\Concurrency\{{CancellationSource, CancellationToken, CancellationError}};
@@ -348,7 +350,7 @@ function main(): void throws CancellationError {{
         let writable $group = $set->begin($plan, cancellation: $stopped->token);
         if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, null))) {{ panic("pre-cancelled write fabricated progress"); }}
     }}
-    if (CancellingWriter::prepares != 0 || CancellingWriter::completes != 0 || read_file("conditional-output") != "") {{ panic("pre-cancelled write executed"); }}
+    if (CancellingWriter::prepares != 0 || CancellingWriter::completes != 0 || liveFileLength("conditional-output") != 0) {{ panic("pre-cancelled write executed"); }}
     {{
         let $plan = TransferPlan::writeTo($registration, $bytes->getRegion(0, 2));
         let $key = $plan->getWriteKey(0);
@@ -361,7 +363,7 @@ function main(): void throws CancellationError {{
                 || $error->reason != IoErrorReason::InvalidInput) {{ panic("wrong cancelled resubmission error"); }}
         }}
     }}
-    if (CancellingWriter::prepares != 1 || CancellingWriter::completes != 1 || read_file("conditional-output") != "") {{ panic("cancelled preparation did not retire exactly once"); }}
+    if (CancellingWriter::prepares != 1 || CancellingWriter::completes != 1 || liveFileLength("conditional-output") != 0) {{ panic("cancelled preparation did not retire exactly once"); }}
     {{
         let $plan = TransferPlan::writeTo($registration, $bytes->getRegion(0, 2));
         let $key = $plan->getWriteKey(0);
@@ -375,7 +377,7 @@ function main(): void throws CancellationError {{
     $bytes[0] = 99;
     let writable $returned = $set->unregister($registration);
     if ($returned->write($bytes->getRegion(0, 1)) != WriteOutcome::Accepted(1)
-        || read_file("conditional-output") != "abbc") {{ panic("write owner, position or buffer loan changed"); }}
+        || !liveFileHolds("conditional-output", Bytes::fromArray([97, 98, 98, 99]))) {{ panic("write owner, position or buffer loan changed"); }}
     echo "conditional write cancellation preserved\n";
 }}
 "#
@@ -406,6 +408,7 @@ function main(): void throws CancellationError {{
 fn conditional_stream_forwarders_retire_prepared_writes_after_setup_failure() {
     let source = format!(
         r#"{CONDITIONAL_FORWARDER}
+{LIVE_FILE_OBSERVATION}
 use Doria\Std\Io\{{File, WritableFile, FileCreation, FileWriteMode, ReadinessSet, TransferPlan,
     IoOperation, IoTarget, IoErrorReason}};
 class SetupWriter implements PendingWritableStream {{
@@ -459,7 +462,7 @@ function main(): void {{
         }}
     }}
     if (SetupWriter::prepares != 2 || SetupWriter::completes != 1 || SetupWriter::drops != 0
-        || read_file("conditional-first") != "" || read_file("conditional-second") != "") {{
+        || liveFileLength("conditional-first") != 0 || liveFileLength("conditional-second") != 0) {{
         panic("setup cleanup changed callbacks, owners or files");
     }}
     $a[0] = 99;
@@ -473,7 +476,7 @@ function main(): void {{
         if ($returned->write($b->getRegion(0, 1)) != WriteOutcome::Accepted(1)) {{ panic("second owner not reusable"); }}
     }}
     if (SetupWriter::prepares != 2 || SetupWriter::completes != 1 || SetupWriter::drops != 2
-        || read_file("conditional-first") != "c" || read_file("conditional-second") != "d") {{
+        || !liveFileHolds("conditional-first", Bytes::fromArray([99])) || !liveFileHolds("conditional-second", Bytes::fromArray([100]))) {{
         panic("setup failure retained loans, advanced positions or repeated cleanup");
     }}
     echo "conditional setup cleanup preserved\n";
@@ -573,7 +576,11 @@ fn assert_every_backend(source: &str, expected: &str) {
 }
 
 const BUFFERED_ADAPTERS: &str = include_str!("fixtures/buffered_adapters.doria");
-const BUFFERED_PENDING_ADAPTERS: &str = include_str!("fixtures/buffered_pending_adapters.doria");
+const BUFFERED_PENDING_ADAPTERS: &str = concat!(
+    include_str!("fixtures/buffered_pending_adapters.doria"),
+    "\n",
+    include_str!("fixtures/live_file_observation.doria"),
+);
 const FILE_LOCKS: &str = include_str!("fixtures/file_locks.doria");
 const LINE_READERS: &str = include_str!("fixtures/line_readers.doria");
 

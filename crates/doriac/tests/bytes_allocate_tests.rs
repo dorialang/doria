@@ -4,6 +4,10 @@ mod execution_directory;
 #[path = "common/native_execution.rs"]
 mod native_execution;
 
+#[allow(dead_code)]
+#[path = "common/native_structure.rs"]
+mod native_structure;
+
 #[path = "common/php_execution.rs"]
 mod php_execution;
 
@@ -352,7 +356,7 @@ fn allocation_lowers_directly_without_typed_array_or_copy_staging() {
         for (offset, relocation) in section.relocations() {
             if let RelocationTarget::Symbol(symbol) = relocation.target() {
                 let symbol = object.symbol_by_index(symbol).unwrap();
-                let name = symbol.name().unwrap().trim_start_matches('_').to_owned();
+                let name = native_structure::relocation_target_name(symbol.name().unwrap());
                 locations.push(format!(
                     "{}+{offset:#x} {:?}: {name}",
                     section.name().unwrap(),

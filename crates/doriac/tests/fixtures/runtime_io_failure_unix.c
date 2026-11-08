@@ -63,6 +63,20 @@ static const struct {
     {(const void *)&fail_monotonic_clock, (const void *)&clock_gettime}
 };
 #elif defined(__linux__)
+#if defined(RTLD_DEEPBIND)
+/* PHP before 8.5 loads extensions and FFI libraries with RTLD_DEEPBIND, which
+ * binds their imports to libc ahead of this library. Binding them normally
+ * keeps these replacements in front:
+ * https://github.com/php/php-src/blob/PHP-8.4/Zend/zend_portability.h
+ */
+void *dlopen(const char *path, int flags)
+{
+    void *(*original)(const char *, int) = dlsym(RTLD_NEXT, "dlopen");
+    if (original == NULL) { abort(); }
+    return original(path, flags & ~RTLD_DEEPBIND);
+}
+#endif
+
 ssize_t write(int descriptor, const void *bytes, size_t length)
 {
     uint64_t value = 0;

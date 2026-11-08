@@ -97,7 +97,8 @@ fn lower_development_source(source: &str) -> Program {
 
 fn assert_headers(program: &Program, bytes: &[u8]) {
     let object = cranelift_object::object::File::parse(bytes).unwrap();
-    let width = if object.is_64() { 8 } else { 4 };
+    // `is_64` is false for every COFF object, x86-64 included.
+    let width = usize::from(object.architecture().address_size().unwrap().bytes());
     let word = |bytes: &[u8], index: usize| {
         let mut value = [0_u8; 8];
         let raw = &bytes[index * width..(index + 1) * width];
