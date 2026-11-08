@@ -1176,7 +1176,7 @@ contract this entry chooses.
 | Exact per specialization | Each specialization's ABI and its callers' contracts use only what that specialization selects; matches Decision 0130's exact-direct rule and Decision 0139's no-reuse rule; also removes the core operations' over-approximation | Multi-day: a per-instance effect fixpoint, per-instance MIR signatures and effect-site overlays, and a PHP view; template diagnostics must still stay conservative |
 | Union of selected implementations | One contract per template, tighter than the complete set | A template's E0629 would depend on which callers exist; `go<Quiet>`'s ABI would depend on whether `go<Handle>` exists elsewhere |
 
-**Open, same class, not changed here:** callbacks already use a union over
+**Open, same class, not changed here (resolved by entry 52):** callbacks already use a union over
 the closures callers pass. So `function run(function(): int $cb)` with
 `catch (IoError)` compiles alone but fails with E0629 once a caller passes
 `fn() => 3`, which means a callee's validity depends on its callers. This is
@@ -1219,7 +1219,7 @@ receiver's display conversion. PHP now reads the same semantic fact
 New regressions: `trait_requirement_calls_carry_ambient_io_and_trait_bodies_keep_their_own`,
 and primitive receivers for `show` in the four-backend program.
 
-**Open, same class, not changed here:** the trait body now accepts a catch for
+**Open, same class, not changed here (resolved by entry 52):** the trait body now accepts a catch for
 ambient I/O around a requirement call, but a composed copy whose composer
 performs no I/O still reports E0629 (`Quiet` composing `Closing`). Before this
 entry the trait body rejected it for every composer. The composed check should
@@ -1293,6 +1293,145 @@ unchanged. Andrew should confirm this wording.
 | Reconcile item 3 with Stage 40a and checkpoint 40b (chosen) | The plan states one sequence; the later commit's scheduling holds; the use-case order is unchanged | Rewords an approved sequence without a card |
 | Leave item 3 as written | The approved text is untouched | §2.1 and Phase I contradict §13 on when networking and the first OSINT work land |
 | Let `dd2fbc5`'s product order replace §13 | Follows the newest commit literally | `dd2fbc5` kept the old order only because it never saw the 2026-10-12 change |
+
+### Close results (2026-11-07)
+
+- `doria` `5e72056`: origin/develop `dd2fbc5` plus the Stage 36a commit. The
+  vet7 re-vet and the language server (487/487) ran on build inputs
+  identical to it.
+- `doria-language-server` `339c997`: doriac pinned to `5e72056`, Cargo.lock
+  resolved from the local clone, canonical `cargo check` against the pin,
+  Tooling's CHANGELOG entry and PHP guards.
+- `doria-website` `adb3b5b`: compiler pin and v2026.3.1 API lock at
+  `5e72056` (the lock equals the SHA-256 of `docs/stdlib-reference.md` at
+  that commit); full Pest 347 passed against the compiler built from it,
+  including `ClosureCaptureContractTest` and `PlaygroundStageLadderTest`.
+- The installed `doriac` and `doria-lsp` report compiler `5e72056`. The
+  installed compiler built and ran one native program (fast profile) and two
+  PHP programs; the refresh runs no LLVM smoke. Its build target lived on
+  the cache volume under the guard and was removed after.
+
+None of the three is pushed. Until develop is pushed in `doria`, the two pins
+name a commit only this machine has, so `check_cross_repo_pins.php` reports
+them unreachable and CI cannot fetch the compiler.
+
+## Follow-ups to entry 51 (started 2026-11-07)
+
+### Order of the two follow-up sessions
+
+Andrew started both entry-51 follow-ups at once, in the same `doria`
+working tree. "Make catch reachability independent of callers" makes the
+authored body decide E0629. "Give each specialization its exact effect
+contract" narrows each specialization's ABI to what it selects. Both change
+the selected-implementation path in `semantics/contracts.rs`, the Decision
+0123 amendment, entry 51 and `constrained_ambient_effect_tests.rs`.
+
+- **Chosen: catch reachability first; exact contracts does read-only design
+  until it lands, then builds on its tree.**
+  - Pro: exact contracts assumes template diagnostics never depend on
+    callers, and this fixes that first.
+  - Pro: one cargo job at a time.
+  - Pro: no half-edited tree breaks the other session's build.
+  - Con: exact contracts finishes later.
+- Both at once in the one tree.
+  - Pro: fastest if they never touch the same lines.
+  - Con: they share functions and files; each uncommitted edit can break the
+    other's build and test results.
+  - Con: two cargo jobs break the one-job limit.
+- Exact contracts first.
+  - Con: it would keep diagnostics conservative on a caller-dependent base
+    and then have to redo that work.
+
+### 52. Catch reachability no longer depends on callers or composers (resolves entry 51's two open items)
+
+**Where E0629 is decided.** In one place, `check_try_statement` in
+`semantics.rs`, from the effect scope of the protected body. That scope had
+two consumers with different owners. Diagnostics (E0629, the destructor
+boundary E0631, and the nonthrowing initializers E0633-E0635) belong to the
+authored body. Transport (catch routing, uncovered effects, a callable's
+escaping profile, and so its ABI) belongs to the selected implementations.
+Two whole-program facts narrowed that one list:
+
+- the callback seed, the union of the closures callers pass
+  (`callable_contracts::Seeds::collect`, then `known_callback_targets`);
+- a composed trait copy's exact members.
+
+Neither defect belonged to a single pass. An ordinary program uses one
+checker for authored trait bodies and their composed copies, so `Quiet`'s
+copy reported E0629 in that same pass. A program with a `where` member runs
+an authored source pass, then an executable recheck once the source pass is
+clean. Both passes applied the callback seed. The fault was the shared list,
+so the fix splits it rather than silencing one pass.
+
+**Chosen: split each effect scope into authored reach and transport.**
+`CheckedEffectSet` now has `reach` beside `ordered`, and `reach` always
+contains `ordered`.
+
+- A function value's reach is its type's complete contract, Decision 0123's
+  one ambient-capable indirect convention. That holds for `$cb()`, a stored
+  callable, a local function value, a List algorithm callback, and a `toThrow`
+  inspector. The exception is a call that names a closure literal, as
+  `$list->map(fn(int $x) => $x * 2)` does: it reaches what that literal
+  reaches. Transport still follows the provenance seed.
+- A named call reaches its callee's authored reach through the new
+  `ambient_reach_seed`. That seed is refined in `Seeds` beside transport, with
+  discovery and escaping forms that mirror the transport ones.
+- Calls that select their implementation after checking keep the complete
+  set in both profiles, as entry 51 set them.
+- A composed copy has exact transport. Its authored member's reach is
+  projected onto it in every view (`project_composed_templates`). During the
+  executable recheck, an authored member that is not rechecked keeps its
+  seeded reach.
+- A catch inside a composed copy reports no E0629. The authored member's
+  check decides it once for every composer.
+- E0629, the destructor's E0631, and the nonthrowing initializer checks read
+  `reach`. Catch coverage, `try_uncovered_effects`, effect sites, MIR, and the
+  ABI read `ordered`. A catch that reach allows but narrowed transport can
+  never enter compiles to a route that is never taken.
+
+Effects on programs:
+
+- `function run(function(): int $cb): int { try { return $cb(); } catch (IoError) { return -1; } }`
+  compiles whatever its callers pass. So do `Closing::safe` under a quiet
+  composer and a caller's catch around `$quiet->closeAll()`.
+- `try { return relay(fn() => 6); } catch (IoError) {}` is accepted even
+  when every closure passed to `relay` is pure. Before, its E0629 depended on
+  what `relay`'s other callers passed.
+- A catch around a local function value (`function(): int $f = fn() => 4;`
+  then `$f()`) is accepted. This is a deliberate loosening, consistent with
+  erased interface values. A closure literal invoked in place keeps its E0629.
+- A destructor that invokes a stored callback must now catch both ambient
+  Errors, even if only pure closures are ever stored (E0631). Before, it
+  passed until some caller stored an I/O closure.
+- Transport, MIR, and the ABI are unchanged. `relay` keeps its ordinary ABI
+  when every closure passed to it is pure.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Split reach from transport (chosen) | One shared rule in every pass and program shape; transport and the existing ABI narrowing are kept; also fixes E0631 and initializers and callers of callback-taking functions | Callers of a function that forwards a function value see its complete contract even when their own closure is pure; a catch around a local function value is no longer E0629 |
+| Body-local provenance for function values | Keeps E0629 around `function(): int $f = fn() => 4; $f()` | Needs a second, isolated provenance solve per body that treats parameters, captures and stored fields as unknown, beside the shared solver |
+| Context-sensitive reach for named callees | `try { relay(fn() => 6) } catch (IoError)` would be E0629 again, from the caller's own closure | Per-call-site instantiation of callee effects, the machinery of the exact-contract follow-up; diagnostics would depend on callee bodies instantiated per caller |
+| Drop callback narrowing | One profile | Every callback-taking function pays checked transport, against the performance target |
+| Skip E0629 in the executable recheck only | Small | Ordinary programs have no recheck, so both defects stay; E0631 and initializers stay caller-dependent |
+
+**Open, same class, not changed:** under Decision 0130, the ambient profile of
+a virtual call on an open class is the union over reachable overrides. A
+caller's E0629 around `$base->m()` therefore changes when a subclass anywhere
+adds or removes I/O. Erased interface calls already use the complete
+contract, so the two dispatch forms disagree. Decision 0130 chose the union
+for profiles, so splitting its diagnostics from its slot ABI is a ruling for
+Andrew.
+
+Regressions in `constrained_ambient_effect_tests` cover ordinary and
+conditional programs on the interpreter, Cranelift, LLVM, and PHP:
+
+- `callers_and_composers_never_decide_catch_reachability_on_every_backend`
+- `narrowed_transport_keeps_callers_and_composers_off_the_catch_route`
+- `the_authored_body_still_rejects_catches_it_cannot_reach`
+- `destructors_judge_stored_callbacks_by_their_contract_not_by_what_is_stored`
+
+Decision 0123's amendment paragraph and one sentence in Decision 0134
+record the rule.
 
 ## CI on `5e72056` (2026-11-07)
 
@@ -2246,6 +2385,30 @@ interpreter, Cranelift and LLVM.
 | Infer the contract from known implementations | Callers get the tightest result | An interface's contract would depend on its implementers; an open world and separate compilation make that unknowable |
 | Keep rejecting | No rule change | Region-returning interfaces and traits stay inexpressible, a design limitation left in place |
 
+### PROMINENT: time allowance raised from 22 to 24 hours for the last vet (2026-11-08)
+
+The complete doriac vet of the open-class fix stopped with 5 s of the
+79,200 s allowance left. Library, binaries and batches 1-3 passed (565, 97,
+243 and 370 tests, 0 failed). Batches 4-7, the parity suite and its three
+shards, and both clippy runs did not start.
+
+About 5,000 s of the last hours were wasted, not spent on work. The vet
+script read the wrong log name, took every finished run for a guard stop, and
+reran build, lib and batches 1-3 five times each. The resume script reads
+the log `g.sh` writes and stops on a guard refusal instead of retrying.
+
+**Chosen:** add 2 hours (79,200 -> 86,400 s). vet7's equivalent of the
+unfinished steps took about 2,700 s; workspace clippy is new since `bab1070`.
+The rest covers one rerun if CI names another defect. The other limits stay:
+one job at a time, 3 GiB memory, the run cap, offline and locked, and the
+25 GB cache ceiling.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Raise by 2 hours (chosen) | Finishes the vet and leaves room for one CI-driven rerun | Andrew sees the raise only at review; part of it replaces time a script fault wasted |
+| Raise by exactly the unfinished steps (~1 hour) | Smallest raise | Any CI-named defect stops work again at the allowance |
+| Push without the rest of the vet and let CI run it | No local time | CI runs only part of the doriac suite on each runner, so a red CI would again be the first report of a defect; the vet gap this stage already named |
+
 ### CI hid failures on Windows and behind the first failing target (2026-11-08)
 
 CI on `f59169b` (run 42453796180) failed the `rust` and Ubuntu LLVM jobs, and
@@ -2306,3 +2469,854 @@ steps before this change.
 | One command plus a guard (chosen) | Every failure in one round; a false pass cannot return | One long command line |
 | Add `shell: bash` only | Smallest edit | Still stops at the first failing target |
 | A loop that records each exit code | Keeps one line per suite | Shell logic to maintain, on three operating systems |
+
+### Close results at the final pins (2026-11-08)
+
+These replace the pins in "Close results (2026-11-07)".
+
+- `doria` `1f68889`, on origin develop. Pull-request run 42467180271 passed
+  all five jobs, and its full Windows log has no failed test. Push run
+  42467178084 passed four. Its Windows job stopped at the LLVM download,
+  where GitHub's release host returned 504 on all five attempts, before any
+  test ran.
+- `doria-language-server` `9457785` (Stage 36a sync and pin) and `58585d1`
+  (Rust toolchain), on origin develop. Library 308, CLI 3 and protocol 176
+  tests pass against the pin; fmt, clippy, every PHP guard, the pin check and
+  63 VS Code grammar tests pass. Run 42473693225 passed all five jobs on its
+  second attempt. The first timed out downloading Gradle before any test ran.
+- `doria-website` `057152f` (content, compiler pin and API lock at `1f68889`)
+  and `13db4e4` (the playground compiler builds with its own Rust release),
+  on origin develop. Full Pest passed 348 tests (39,210 assertions) against
+  the compiler built at the pin, and the API reference sync check passes.
+  Run 42474559884 passed.
+- The installed `doriac` and `doria-lsp` were rebuilt from `1f68889` and
+  `58585d1` in a detached worktree, removed afterward.
+- The build cache was cleared before these builds, which would have crossed
+  the 25 GB ceiling: 21 GB of `llvm-backend` and the stale 662 MB `debug`.
+
+### Commit shape for the final pins (2026-11-08)
+
+**Chosen:** amend each repository's one unpushed Stage 36a commit to the final
+pin, and put the Rust toolchain and CI change in its own commit.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Amend for the pin, separate toolchain commit (chosen) | Each commit does one thing; the toolchain change can be reverted alone; no commit names a superseded compiler | Two commits in each repository |
+| Fold everything into the feature commit | One commit per repository | Hides a CI policy change under a feature subject |
+| Add a new commit for the pin | No amend | The first commit would name a compiler nobody should build |
+
+### Stage 36a is not delivered: the performance gate is unfinished (2026-11-08)
+
+The plan was to mark the stage Complete once CI was green in all three
+repositories. CI is green, but the stage's closure conditions are not met, so
+the status stays In progress.
+
+`docs/performance-and-benchmarking.md` section 10 names ten binding cases and
+requires correctness, structural baselines, provenance, commands and report
+schemas. Enumerated from `benchmarks/manifest.json`, `runtime/` and
+`diagnostic/` on 2026-11-08:
+
+| Case | State |
+|---|---|
+| Synchronous startup (`startup`) | Committed |
+| Large streaming file copy (`streaming_file_copy`) | Uncommitted in `benchmarks` since 2026-10-10 |
+| Repeated small writes (`repeated_small_writes`) | Uncommitted |
+| Concrete adapter chain (`stream_adapter_chain`) | Uncommitted |
+| Erased interface stream (`writable_stream_dispatch`) | Uncommitted |
+| Non-blocking pipe transfer | Does not exist |
+| Child stdout and stderr drainage | Does not exist |
+| Incremental UTF-8 line processing | Does not exist |
+| First-class versus intrinsic standard output | Does not exist |
+| Many stable readiness registrations | Does not exist |
+
+`benchmarks-revision.json` still names `621aa13` (2026-10-02), which has none
+of the four uncommitted cases. The uncommitted work has not been built against
+the current compiler.
+
+Controlled timing is not part of the gap. Section 10 records
+`Pending Available Runner` when no eligible runner exists, and says hardware
+availability must not block completion.
+
+The plan also lists the PHP byte-region address-view fix as proposed and not
+implemented, and nothing records it as done. It has to be checked against the
+code, then implemented or the plan corrected.
+
+**Chosen:** keep the stage In progress and build the gate before the two
+paused follow-up sessions.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Keep In progress and build the gate (chosen) | The status is true; the plan's closure conditions decide delivery | More build time; another raise to the time allowance |
+| Mark Complete and move the gate to Stage 43 | Closes the stage now | Section 10 says Stage 36a owns the first gate and Stage 43 only continues it |
+| Mark Complete and list the gate as a known gap | Closes the stage now | Complete would be false |
+
+These close notes stay unstaged on develop and land with the gate's commit. A
+docs-only commit would start two full CI runs for no code change.
+
+### PROMINENT: time allowance raised from 24 to 28 hours for the performance gate (2026-11-08)
+
+The closing vet, the re-pins and the toolchain refresh left about 1,500 s of
+the 86,400 s allowance. The gate's remaining work runs compilers and peers
+under the same guard.
+
+**Chosen:** add 4 hours (86,400 -> 100,800 s). The other limits stay: one job
+at a time, 3 GiB memory, the run cap, offline and locked, and the 25 GB cache
+ceiling.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Raise by 4 hours (chosen) | Covers five new cases, peers and one correction round | Andrew sees the raise only at review |
+| Raise by 1 hour | Smallest raise | Likely to stop mid-case and restart |
+| Run the gate outside the guard | No raise | Loses the memory limit and the record of time spent |
+
+### PHP byte-region address views, checked against the code (2026-11-08)
+
+The plan's item is still accurate at `1f68889`.
+`__doriaNativePointer` in `codegen_php/bytes.rs` caches the view at offset 0
+and returns a new `FFI::addr($this->values[$offset])` for every other offset,
+so repeated calls at a nonzero offset (a partial write's suffix, for example)
+allocate one CData object each. Hosted source replies read a pointer slot the
+same way.
+
+**Chosen:** implement the plan's shared base, capacity, offset and length
+bridge after the gate, in the same compiler round as the two follow-up
+sessions and the region-return elision.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Same compiler round as the follow-ups (chosen) | One vet, one CI round and one re-pin of the language server and website | The fix waits for the gate |
+| Fix it now, alone | Closes the item first | The compiler tree holds another session's uncommitted changes; adds a full vet, CI round and re-pin |
+| Cache a view per offset | Small change | The cache grows with the offsets used, and the native loan on pointer slots ends at each reply, so caching there is not allowed |
+
+### Performance gate: compiler identity for the bounded runs (2026-11-08)
+
+The runner checks that the selected `doriac` matches the Doria source identity,
+and the compiler tree here is dirty with another session's changes.
+
+**Chosen:** run with `DORIAC` set to the installed `1f68889` compiler and
+`DORIA_REPO` set to a throwaway clean clone of the same commit, removed after
+the runs.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Clean clone plus exact compiler (chosen) | Reports carry the true commit with no escape hatch; immune to edits in the working tree | One temporary clone |
+| `--allow-compiler-commit-mismatch` against the dirty tree | No clone | An investigative flag; reports show dirty provenance; the run aborts if the other session edits a file mid-run |
+| Provision a compiler from the dirty tree | No flag | Builds another session's uncommitted changes |
+| `git worktree add` | Cheap checkout | Adds worktree metadata to the shared repository |
+
+### Performance gate: `stream_adapter_chain` stopped on a compiler defect (2026-11-08)
+
+`doriac compile --build-plan` fails with B0001 "malformed MIR: enum references
+a missing source" for any program that reaches `File`. Reproduction: a
+one-source build plan whose source is `use Doria\Std\Io\File; function main():
+void { let $file = File::openRead("o"); echo "x\n"; }` fails on both native
+profiles; the same source compiled without a plan builds. The two-file build
+plan this diagnostic needs therefore cannot compile.
+
+**Chosen:** keep the case sources unchanged, record the failure and the
+reproduction, and leave the compiler for a compiler session.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Stop the case and report (chosen) | Honest evidence; no benchmark workaround hides the defect | One binding case stays unproven until the compiler is fixed |
+| Merge the workload and helpers into two single-file programs | The case builds today | Abandons the shared-workload design the case and its tests guarantee, and hides the build-plan defect |
+| Fix `mir_validation` or the graph source registration here | Closes the defect | Outside this gate's scope; the compiler tree holds another session's changes |
+
+### Performance gate: non-blocking pipe transfer stopped on a runtime defect (2026-11-08)
+
+The only pipes Doria exposes are child pipes, and the runtime creates them
+blocking; `ReadinessSet::begin` rejects them on Unix because
+`unix_readiness/transfer.rs` `validate_handle` requires `O_NONBLOCK` or a
+regular file. Reproduction: spawn `cat`, wrap `$child->getOutput()` in
+`BorrowedBufferedReader<ChildOutput>`, register it, and `begin` a
+one-read `TransferPlan`; the program exits 70 with "failed to configure
+transfer group: unsupported". `getInput` and `getOutput` also cannot be borrowed
+together (E0763), so one child's pipes cannot share a set.
+
+**Chosen:** do not add the case; report the defect. The case needs the runtime
+to give child pipes the nonblocking descriptors its pending tier requires.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Stop and report (chosen) | No false evidence; the defect is named with a reproduction | One binding case does not exist yet |
+| Read child output with blocking `read` and call it a pipe transfer | Case exists | Measures blocking I/O under a non-blocking name |
+| Replace the pipe with a regular file or userland stream | Runs today | Not a pipe; the name would mislead |
+| Fix `process/unix.rs` here | Closes it | Compiler repo is off limits for this gate |
+
+### Performance gate: child stdout/stderr drainage construct (2026-11-08)
+
+**Chosen:** `Child::collect($limit)`, the documented contract that drains both
+streams concurrently and bounds retention. The peers use `poll` on two
+nonblocking pipes in C and `Command::output` in Rust.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `collect` (chosen) | The contract the design names; proven natively by the compiler's flood test; bounded | Internal poll loop is not visible to the case |
+| Manual concurrent reads through a `ReadinessSet` | Exercises the pending tier | Blocked by the pipe defect above; the two getters also cannot be borrowed together |
+| Sequential reads of stdout then stderr | Simple | Deadlocks on a full pipe, which is the behaviour this case exists to prove absent |
+
+### Performance gate: Unix-only child and readiness cases (2026-11-08)
+
+`child_output_drainage` spawns `sh` and `cat`, and its C and Rust peers use
+Unix process APIs. `readiness_registrations` peers use `poll(2)`.
+
+**Chosen:** declare `supportedPlatforms: linux, macos` for those two cases and
+say why in their descriptions; the other new cases stay portable.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Unix-only for the two cases (chosen) | Honest about what exists; no unverified Windows peer | Windows evidence for them waits for Windows-specific children and peers |
+| Write Windows peers and children now | Broader coverage on paper | No Windows runner here to prove them; more unverified code |
+| Doria-only on Windows with no peers | Some Windows evidence | No runner here either, and a per-platform target split the manifest does not express |
+
+### Performance gate: read-only cases write one declared output (2026-11-08)
+
+The runtime fixture format requires at least one declared output file.
+
+**Chosen:** `utf8_line_processing` and `readiness_registrations` write a
+one-line summary to a declared `summary.txt`, checked by exact length and SHA256
+computed independently in `tests/run.php`; stdout stays a fixed word.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Declared summary output (chosen) | Uses the fixture mechanism unchanged; adds exact content evidence | Each case gains one incidental file write |
+| Relax the fixture rule to allow no outputs | Purer read-only cases | Harness, schema and existing tests change for a small benefit |
+| Keep the summary only on stdout | Simple | Needs per-profile expected files, and the fixture rule still demands outputs |
+
+### Performance gate: first-class versus intrinsic stdout control (2026-11-08)
+
+**Chosen:** a matched Doria-only diagnostic: the feature writes through
+`StandardStreams::output` with partial-write offsets, the control calls
+`write_stdout_bytes`, and only `writeChunk` differs. Output is checked against
+committed files, so the baseline stays at 8,192 iterations.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `write_stdout_bytes` control (chosen) | Same binary path as the feature, byte-for-byte output | Baseline is small because stdout is committed |
+| `echo` control | The everyday text path | Text formatting and buffering differ from the byte view, so the pair would not differ only in the view |
+| Comparative case with C and Rust peers | Peer numbers | The question is internal to Doria; a peer would not answer it |
+
+### Performance gate: readiness peers and registration source (2026-11-08)
+
+**Chosen:** regular-file registrations in Doria, with C and Rust peers that
+`poll(2)` the one descriptor before each one-byte read and reuse one array;
+Rust binds `poll` through `extern "C"` since std has none and no crates are
+available.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Poll peers with regular files (chosen) | Portable input, exact byte sums, real poll calls | Regular files are immediately ready, so this measures registration and completion cost rather than wake-up behaviour |
+| Plain `read` loop peers with no readiness | Simplest | Not a readiness baseline at all |
+| Pipes or sockets as registrations | Real wake-ups | Doria has no nonblocking pipe (defect above); sockets are outside Stage 36a |
+| Report it Doria-only with no peers | Avoids peer questions | Section 10 asks for a direct baseline where meaningful |
+
+### Performance gate: structural baseline scope and unavailable metrics (2026-11-08)
+
+Section 10 asks for deterministic structural baselines, and the harness's
+existing mechanism compares compiler-report counts exactly.
+
+**Chosen:** `matrices/stage36a.json` pins MIR, specialization, call-site and
+stack-allocation counts per Doria native target for the eight proven cases, and
+`baselines/stage36a.json` is captured as `candidate` because the benchmarks tree
+is uncommitted. Sizes are excluded as host-dependent. Reports add
+`metricAvailability.streamGate` with a reason for allocation counts, system
+calls, adapter copy bytes, cold startup and per-operation latency, never zero.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Structure counts, candidate baseline, explicit unavailable reasons (chosen) | Deterministic; honest about what is unmeasured; acceptance needs only a clean tree and `--accept` | Static structure does not itself prove allocation-freedom; that stays with the compiler's structural tests |
+| Include object and executable sizes | More detail | Differs across hosts, so a macOS capture would fail Linux comparisons |
+| Add a new runtime allocation counter | Direct evidence | Compiler and runtime are out of scope here |
+| Claim allocation-free results from structure counts | Closes the invariant on paper | False: static counts cannot observe runtime allocations |
+
+### Entry 52: verification scope and the virtual-call boundary (2026-11-08)
+
+Planning replaced the full vet with targeted tests and said to take the
+recommended option at every fork. Two forks followed.
+
+**Which targets count as touched.**
+
+- **Chosen: the 25 targets that exercise what entry 52 changed, plus a verdict
+  comparison.** The targets are `--lib`, the E0629-E0635 assertions, closures,
+  callbacks and List algorithms, trait and contract selection, the two-pass
+  conditional path, property hooks, virtual calls, `toThrow` and the std
+  destructors in `stream_capability_tests`. All 1469 tests passed. `doriac
+  check` over the 648 example and fixture programs gave the same accept or
+  reject verdict and error codes as the installed compiler.
+  - Pro: entry 52 changes which programs are accepted, not MIR, so the verdict
+    comparison covers the rejection risk across every program.
+  - Pro: frees the build slot for Planning's end-of-round vet.
+  - Con: `native_mir_parity_tests` did not run in this beat, although the
+    original brief named it. Planning's end-of-round vet covers it.
+- Also run the three parity shards now.
+  - Pro: meets the original brief literally.
+  - Con: about 25 minutes of the shared slot for a matrix the final vet repeats.
+- Run every `doriac` target.
+  - Con: Planning ruled that out for this round.
+
+One earlier run of `codegen_php_tests` stalled in
+`copy_parameter_values_and_writable_callback_borrows_match_native` until the
+1800 s cap. The test then passed alone in 117 s and in the full target (142/142
+in 90 s), with a stall watchdog armed. The cause is unknown and it has not
+recurred; the end-of-round vet will show whether it comes back.
+
+**Virtual calls on open classes keep Decision 0130's union for reach.**
+
+- **Chosen: leave them unchanged in this beat.**
+  - Pro: Decision 0130 accepted the union, and the brief named only callbacks
+    and composed copies.
+  - Pro: the reach and transport split makes a later change one line in
+    `record_selected_contract_effects`.
+  - Con: a caller's E0629 around `$base->m()` still changes when a subclass
+    anywhere adds or removes I/O, so entry 52's rule has this one exception.
+- Give virtual calls the complete contract for reach, as erased interface
+  calls already have.
+  - Pro: every call chosen elsewhere follows one rule.
+  - Con: a destructor calling an open method must then catch ambient I/O even
+    when no override performs any, and it reinterprets an accepted decision.
+
+## Exact per-specialization contracts (2026-11-08, follows entries 51 and 52)
+
+Entry 51 made every specialization share its template's conservative contract,
+so `go<Quiet>` carried a status branch and an Error slot per call for I/O it
+cannot perform. Each specialization's executable contract now carries only what
+it selects. Template diagnostics do not change: authored reach (entry 52)
+decides them, and this work touches only transport.
+
+Built on `e74c00e`. Semantic analysis owns the new facts in
+`semantics/executable_effects.rs`: for each callable instance, its contract, the
+effects of its sites and `try` statements, and the catches it can never enter.
+MIR reads them for signatures, try fallbacks and catch dispatch; PHP reads them
+for origin guards. Call-site transport still comes from the selected callee's
+signature, so a call to an effect-free selection is an ordinary call.
+
+Result: `go<Quiet>`, `logged<Quiet>` (catch and log), `rethrown<Quiet>`,
+`spin<Quiet>` (recursion), `same<Key>`, `render<Tag>` (display), `levelOf<Still>`
+(accessor), `Cell<Quiet>::close` and a non-generic `quietly()` that calls
+`go<Quiet>` have no checked effects. Their loud counterparts keep them.
+
+### Where the narrowing lives
+
+- **Chosen: a semantic per-instance view, computed by replaying checked effect
+  regions as a least fixpoint over the instance call graph.**
+  - Pro: semantics already owns effect facts, and both MIR and PHP read them.
+  - Pro: selection reuses the rules the backends use (`CallableTarget`,
+    `lookup_instance_method`, the generic call graph).
+  - Pro: recursion that never reaches an operation stays empty.
+  - Con: one more whole-program pass in every analysis.
+- A MIR nothrow pass, in the style of LLVM's attribute inference.
+  - Pro: sees exact callees.
+  - Con: PHP does not go through MIR, so it would need a second answer.
+  - Con: needs a dataflow over error locals and a rewrite of finalizer routing.
+- Re-check each specialization's body with substituted types.
+  - Pro: reuses the checker for everything.
+  - Con: the checker's span-keyed state would need saving and restoring per
+    instance, and a substituted body can type differently from the checked one.
+
+### How a site says where its effects come from
+
+- **Chosen: the checker records provenance where it records the effect**
+  (`record_call_effect_profiles`, and `record_effect_profiles` for operations).
+  - Pro: the code that decides the effect also names its source.
+  - Pro: a path that names no callee stays an operation with the template's
+    effects, so an unconverted path is less exact, never wrong. A contribution
+    that bypasses provenance is kept as checked.
+  - Con: touches each call-recording path.
+- Derive provenance afterwards from `call_targets` and the other span maps.
+  - Pro: no recording changes.
+  - Con: a call and a display of its result share a span, so the union at one
+    span cannot be split; dropping the wrong part would be a miscompile.
+
+Provenance is recorded only while a body is being checked. The instance walk
+re-selects core operations after checking and outside every scope, and that is
+exactly what this pass derives per specialization.
+
+### Which effects narrow
+
+- **Chosen: only automatic effects.** Required errors and written ambient
+  `throws` entries are authored contract, so a specialization keeps them and
+  its callers route them.
+  - Pro: matches non-generic functions, whose ABI follows their declaration.
+  - Con: a quiet selection under a declared `throws Boom` keeps one status
+    branch.
+- Also narrow required errors.
+  - Pro: more exact.
+  - Con: a declared contract would stop meaning what it says at the ABI, and
+    structural function identity depends on required effects.
+
+The first version looked up only what a body inferred, so a caller of a method
+declaring `throws IoError` believed the call was quiet and MIR had nowhere to
+route it (`conditional_stream_forwarders_execute_nested_concrete_and_erased_transfers`).
+Declared entries now seed the fixpoint.
+
+### Handlers a specialization cannot enter
+
+- **Chosen: not lowered.** A catch no protected effect can reach in this
+  specialization is left out of the dispatcher and its body is not lowered; its
+  own effects do not count.
+  - Pro: `catch (IoError) { echo ...; }` around a quiet selection costs nothing.
+  - Pro: a quiet specialization needs no error target at all.
+  - Con: MIR's try lowering reads two per-instance facts.
+- Lower every handler and count its effects.
+  - Pro: no MIR change.
+  - Con: any handler that logs keeps the contract, which is the common shape.
+
+An effect with no recorded coverage keeps the catch reachable and the effect
+uncovered, so unknowns stay conservative.
+
+### Not narrowed
+
+- **Virtual slots keep their family's union.** A slot is dispatch over a class
+  family, not a specialization choice, and the exact-direct body is narrowed
+  already.
+  - Con: a slot still carries effects only some overrides have. Open as a
+    possible refinement; it needs a per-instantiation family profile.
+- **Erased interface calls keep the complete set.** The implementer set is open.
+- **Specialized ownership analysis still uses the template's sites.** It sees
+  more error edges than the executable view, which is conservative.
+
+### Defect fixed in the same change: top-level statements next to `main`
+
+`echo "top"; function main(): void {}` panicked in MIR lowering ("checked source
+has a semantic propagation target"), and PHP stopped with a fatal
+class-not-found. Both predate this work.
+
+- MIR runs the entry source's top-level statements in `main`'s frame, but
+  `main`'s contract never included their automatic effects. They now join it
+  through the observed effects, in both reach and transport.
+- PHP emitted statements in program order, before classes it binds at run time.
+  It now emits every declaration first; statements still run before `main`.
+
+### Language-rule change for review
+
+None in source. The rule Decision 0123 records is new: a specialization's ABI
+follows what it selects. Source programs compile as before, apart from the two
+crash fixes above.
+
+### Verification (2026-11-08)
+
+macOS ARM64, Rust 1.98.1, `llvm-backend`, offline and locked, one job, under the
+3 GiB guard. Targeted only; Planning runs the round's full vet.
+
+- `constrained_ambient_effect_tests` 11/11, on the interpreter, Cranelift, LLVM
+  and PHP.
+- 31 targets, 1,823 passed, 0 failed. Lib 553; `checked_error_tests` 45;
+  `codegen_php_tests` 142; `mir_tests` 148; `mir_validation_tests` 125;
+  `cranelift_mir_tests` 29; `stream_capability_tests` 78;
+  `returned_closure_transport_tests` 78; the stage 30, 34, 35 and 36 targets; the
+  conditional-capability targets; `pending_stream_contract_tests`,
+  `standard_stream_mir_tests`, `child_process_tests`, `time_contract_tests`,
+  `native_testing_slice1_tests`, `consuming_receiver_tests` and the property-hook
+  targets.
+- `cargo clippy -p doriac --all-targets -D warnings` and `cargo fmt --check` are
+  clean. `check_docs_authority`, `check_ambient_io_and_fallible_finalizers`,
+  `check_inferred_main_effects`, `check_checked_error_foundation` and
+  `check_diagnostic_style` pass.
+- `doriac check` over all 673 tracked `.doria` files gives the same verdicts and
+  error codes as the installed compiler at `5e72056`.
+- The pass costs under 1 ms in a debug build: 0.66 ms of 0.28 s on
+  `main_stream_capabilities` (32 instances), 0.35 ms per analysis of 0.84 s on
+  `conditional_stream_forwarder` (71 instances). Measured with temporary
+  instrumentation, since removed.
+
+Not run: `native_mir_parity_tests`, the other `doriac` targets, the language
+server, Linux and Windows. No runtime benchmark was taken; the removed status
+branch and Error slot are shown by the MIR contracts, not by timing.
+
+## Child pipes in transfer groups (2026-11-08, amends entry 40)
+
+`ChildInput` and `ChildOutput` declared the pending and readiness tiers, but a
+transfer group refused them: a child pipe is a file object, and the runtime's
+pending path admits only regular files and standard devices. Spawning `cat`,
+wrapping `getOutput()` in `BorrowedBufferedReader<ChildOutput>` and beginning a
+plan exited 70 with "failed to configure transfer group: unsupported".
+
+Decision 0137 does not reach this case. It permits lazy helper threads for
+*inherited synchronous* standard devices, where mode control is unavailable.
+The parent's pipe ends are created by the runtime and are not inherited, so
+Decision 0110's readiness and completion paths apply directly.
+
+Why `getInput()` and `getOutput()` could not be held together: entry 40 made
+the pipe getters writable methods, and a method call borrows its whole
+receiver, so any live pipe loan kept `$child` in writable use (E0763). The
+runtime owner holds the three pipes as separate objects, so the conflict was
+the checker's model of the receiver, not a fact about the storage.
+
+### Parent's end mode
+
+| Option | Pros | Cons |
+|---|---|---|
+| Nonblocking (Unix) and overlapped (Windows) parent ends (chosen) | Uses the existing readiness and completion paths; no thread per pending transfer; matches Decision 0110 and Decision 0137's scope | Plain transfers need a wait in the runtime; Windows pipe creation changes |
+| Keep blocking ends and use Decision 0137 helpers | No change to plain transfers | Hidden threads for every pending pipe transfer on a device the runtime owns; 0137 explicitly limits helpers to inherited devices |
+| Blocking fd plus `poll` before each read | Keeps blocking mode | Unsafe for writes: a blocking write of more than the free space blocks after POLLOUT, defeating the group |
+
+Only the parent's ends change. On Unix the two ends of a pipe are separate open
+file descriptions, so `O_NONBLOCK` on the parent's end does not reach the
+child's standard handle. On Windows only the server end is overlapped.
+
+### Who owns the wait for a plain read or write
+
+| Option | Pros | Cons |
+|---|---|---|
+| `PipeEnd` in `byte_io`, called from `OwnedFile::read`/`write` (chosen) | One place; every caller of the file owner (native, PHP FFI, buffered adapters) keeps blocking semantics with no change | The owner stores a small pipe state value |
+| Wait in generated code after a `WouldBlock` | No runtime state | Duplicates the loop in every backend and leaks mode into programs |
+| Wait inside `dr_v1_file_object_read`/`write` | Near the FFI boundary | Misses the `OwnedFile` paths used by tests and future callers; splits the owner |
+
+### Plain write on a nonblocking pipe
+
+| Option | Pros | Cons |
+|---|---|---|
+| Wait until every byte is accepted; on a later failure report the accepted prefix and let the next write surface the failure (chosen) | Same as a blocking write: `Accepted(length)`, or a short count when the reader went away | A write can take as long as the child reads |
+| Return after the first accepted chunk | Simplest loop | Programs that treat a blocking write as complete would start seeing short writes |
+
+### Windows pipes and the completion port
+
+| Option | Pros | Cons |
+|---|---|---|
+| `CreateNamedPipeW` overlapped server end with a synchronous `CreateFileW` client end for the child (chosen) | Parent gets real completion; child keeps an ordinary inheritable handle; same shape as Rust's std | Pipe names and a uniqueness retry |
+| Keep `CreatePipe` and use helper threads | No pipe change | Synchronous handles cannot be overlapped; needs the Decision 0137 helper for a device the runtime owns |
+
+| Option | Pros | Cons |
+|---|---|---|
+| Lazy per-pipe association owned by the pipe end; the operation's route links when a pipe is selected (chosen) | Costs nothing until a pipe joins a set; association lives as long as the handle; reuses the broker, registry and packet path of attached streams | Route linking moves from group setup to selection |
+| Associate at spawn | Simpler lifecycle | Every child pays for a port it may never use, against Decision 0110's lazy association rule |
+| Wrap the pipe in `AttachedStream` at registration | Reuses that type outright | `AttachedStream` owns the handle and cannot sit beside the `OwnedFile` that must keep owning it |
+
+A plain transfer on an attached pipe uses a tagged event, so it adds no
+completion packet.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Keep the helper thread for the error-output drain and give each drain call its own wait (chosen) | Smallest change to `wait`/`collect`; the documented drain shape stays | Still one thread during `collect` on Windows |
+| Replace the drain with two overlapped reads and one wait | Removes the thread | A larger rewrite of a path that was not at fault, unverifiable here |
+
+### A half-closed input in a set
+
+The `readinessSource` getter panicked on a closed pipe because it required an
+open file. It now always returns the source, and registration reports `Closed`.
+A configuration failure on a pipe also names the pipe, not a file.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Getter returns the source; admission reports `Closed` (chosen) | No panic; the checked failure comes from the one admission path | The getter no longer proves the pipe is open |
+| Keep the check in the getter | Rejects earlier | A Rust panic for a condition the program can reach legally |
+
+### One child's input and output together
+
+| Option | Pros | Cons |
+|---|---|---|
+| Treat the three pipe getters as loans of three distinct owner slots, in the source checker and the MIR proof (chosen) | No surface change; the classic write-stdin/read-stdout case works on every backend; a second loan of the same pipe and `wait` while a pipe is lent are still rejected | The checkers learn one more compiler-known rule (narrow, one class) |
+| Add `getPipes(): ChildPipes`, one call returning several loans | Explicit | New public type; the property-loan rule of entry 40 makes its fields readonly loans, so it does not help without more language work |
+| Move the pipes out: `takeInput(): ChildInput` | Ownership is plain | Runtime "already taken" states, and the destruction order that prevents deadlock on a full pipe no longer holds |
+| Real stored properties on `Child` (`$child->input`) | Decision 0136 applies directly | Changes the settled spelling and the runtime-owned layout |
+| Name it a blocker | No compiler change | Leaves the main use of pending child pipes unavailable |
+
+The slot is a place identity only (Decision 0136's sibling-path rule), the same
+device `add_template_fields` uses for generic templates. It is never storage,
+and a contract that escapes a function widens back to the whole `Child`.
+
+### Verification (2026-11-08)
+
+macOS ARM64, Rust 1.98.1, `llvm-backend`, offline and locked, under the guard.
+Targeted only; the full vet belongs to the end of this compiler round.
+
+- `child_process_tests` 14/14, covering the interpreter, Cranelift, LLVM and PHP.
+- `stream_capability_tests` 78/78, `pending_stream_contract_tests` 16/16,
+  `mir_validation_tests` 125/125, `doriac` library 553/553, `doria-rt` library
+  643/643.
+- `cargo clippy -p doria-rt --all-targets -D warnings` is clean for
+  `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`, in the default and
+  `hosted-shared-runtime` feature sets, and on the macOS host.
+  `cargo clippy -p doriac --features llvm-backend --all-targets -D warnings` is
+  clean. `check_docs_authority` passes.
+
+Not run: Windows and Linux execution, so the overlapped pipe and completion-port
+path has been compiled and linted but never executed. `readiness_set_contract_tests`,
+`stage35_contract_tests`, `stage30b_semantics_tests` and `byte_region_tests` were
+refused by the guard's running-job check, which matched the text of a monitor
+command used during this work; they were not retried.
+
+### Region-returning requirements: implementation (2026-11-08)
+
+The rule recorded under "Found, not fixed: region-returning interface and trait
+requirements" is implemented. Interface methods and accessors and bodyless trait
+methods with a readonly or writable receiver elide a region or nullable-region
+return to a retained borrow of that receiver. An implementation holding the
+region in its receiver and one returning an independent region both conform.
+Callers keep the receiver borrowed whichever implementation runs. Decision 0134
+and `SPEC.md` state the rule. Doria has no `abstract` methods, so that case does
+not arise. `docs/stdlib-reference.md` is unaffected: no standard-library
+interface returns a region.
+
+**Where the rule lives.**
+
+| Option | Pros | Cons |
+|---|---|---|
+| `requirement_return_borrow` in `ownership.rs`, built from the body rule's `BorrowOrigins::contract` and `region_return_borrow`; the signature and inference passes both reach it through `declared_return_borrow` (chosen) | One elision rule for bodies and requirements; traits survive the inference pass that recomputes them | One more small helper on the checker |
+| Fill `return_borrow` while collecting interface and trait declarations | Smallest diff | A second copy of the rule, and the inference pass walks trait members and would overwrite it |
+
+**A readonly requirement returning a writable region.**
+
+| Option | Pros | Cons |
+|---|---|---|
+| Hold a shared loan of the receiver (chosen) | No new rejection; an implementation returning absence or independent storage conforms and runs | No implementation can return a writable region its receiver holds, which the body check already forbids |
+| Reject the declaration | Flags a requirement of little use | A new language rejection with no accepted authority behind it |
+| Keep the writable contract `region_return_borrow` computes | One rule with no adjustment | Promises exclusive access to a readonly receiver, which MIR validation rejects as an invalid return-borrow source |
+
+**What a call through a requirement retains.**
+
+| Option | Pros | Cons |
+|---|---|---|
+| The contract alone: the whole receiver, decided per call from the call's type (chosen) | Holds for implementations the program does not contain and for all-independent programs; a receiver seen through a requirement has no reachable fields, so nothing is lost | Region calls through a requirement do not consult the `dispatch` join |
+| The `dispatch` join, as other calls use | The existing path | Yields no loan when every implementation is independent, and its field paths can name classes this receiver is not, which MIR validation rejects |
+| Seed `dispatch` with a receiver source | Keeps one path | The seed belongs to the declaration, so it also binds specializations of a generic interface that return `int` |
+
+**Paths in an interface's dispatch join.** `interface Sized extends Viewing`
+failed MIR validation: the join for `view` named a field of an implementer of
+`Viewing` that no `Sized` value can be.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Clear receiver field paths when joining an interface requirement (chosen) | Fixed at the join, for every carrier a requirement returns; a generic `U` result keeps one shape across instances | None visible: nothing can reach a field of an opaque receiver |
+| Filter paths per static receiver interface at each call | Keeps paths | Needs the implementer set at every call, for a fact no caller can use |
+| Leave the join alone | No change | Valid programs stop at MIR validation |
+
+**Contracts on `T`.**
+
+| Option | Pros | Cons |
+|---|---|---|
+| Decide from the substituted return type for an interface's own `T`; leave a generic method's own `T` to its arguments (chosen) | Covers every region-carrying return the body rule covers; `Producing<ByteRegion>` and `Producing<int>` each get the right contract | A generic function forwarding `Producing<U>` shares one template summary across instances |
+| Only requirements written with a region type | Simplest | `Producing<ByteRegion>` stays inexpressible |
+| Treat a method's own `T` like an interface's | One rule | Moves a loan from the argument to the receiver and breaks `own<T>(take T $view): T` |
+
+**Plans of entries and generic instances.** An interface entry selecting an
+independent implementation, and an instance like `constrained<Absent>`, have a
+retained signature with nothing in their body behind it.
+
+| Option | Pros | Cons |
+|---|---|---|
+| The plan states the signature's source: `RetainedSourcesPlan::state_region_contract` (chosen) | One owner for entries and instances; MIR and the source checker agree on the contract | A plan can name a source its body does not use |
+| Narrow the MIR signature per instance | Smallest plans | The generic's contract would differ between source and MIR, per specialization |
+| Relax `byte_regions::return_contract` | One line | Accepts signatures no plan backs, which the check exists to reject |
+
+**Static and consuming requirements** keep no elided source. The decided rule
+says "with a receiver", a static requirement has none, and a consuming receiver
+dies with the call. Eliding a static requirement to one borrowed parameter was
+not chosen because it extends the decided rule; it stays open for Andrew.
+
+**Found, not fixed: callable-returning requirements.**
+`interface F { function make(): function(): int; }` cannot be implemented by a
+closure that captures `$this`; that fails with E0755. It is the same gap this
+rule closes for regions, but the decided rule names regions only, and eliding
+callable returns would bind every caller of such a requirement to its receiver.
+Andrew decides it separately.
+
+**Coverage.** `native_return_transport_tests` runs a receiver-held, a narrowed,
+an absent and a lent implementation, a nullable form, interface views, witnesses
+and constrained generics on the interpreter, Cranelift, LLVM and PHP. It also
+covers checked errors narrowed per specialization, generic interfaces, inherited
+and composed implementations and interface inheritance. `byte_region_tests`
+holds the negative cases, and `byte_region_mir_validation_tests` rejects an entry
+or a generic instance whose plan loses the contract.
+
+### Verification (2026-11-08)
+
+macOS ARM64, `llvm-backend`, offline and locked, under the guard. Targeted only;
+the full vet belongs to the end of this compiler round.
+
+- On the final code: `doriac` library 553/553, `native_return_transport_tests`
+  5/5, `byte_region_tests` 34/34, `byte_region_mir_validation_tests` 28/28,
+  `stage35_contract_tests` 56/56, `stage35_trait_tests` 17/17,
+  `conditional_capability_body_tests` 38/38, `_coherence_tests` 32/32,
+  `_composition_tests` 12/12, `_grammar_tests` 23/23.
+- Before the last mechanical cleanup (a helper's return type and formatting):
+  `stage35_runtime_tests` 46/46, `stage35_graph_tests` 6/6,
+  `byte_region_execution_tests` 32/32, `byte_region_transport_tests` 9/9,
+  `byte_region_native_structure_tests` 4/4, `mir_validation_tests` 125/125,
+  `mir_tests` 148/148, `returned_closure_transport_tests` 78/78,
+  `semantic_ide_tests` 12/12, `stream_capability_tests` 78/78,
+  `pending_stream_contract_tests` 16/16, `readiness_set_contract_tests` 70/70,
+  `stage36_property_hook_tests` 91/91, `writable_borrow_writeback_tests` 43/43,
+  `stage30b_semantics_tests` 32/32, `stage27_tests` 41/41, `stage21_tests` 89/89,
+  `registration_key_tests` 17/17, `consuming_receiver_tests` 29/29,
+  `transfer_plan_tests` 24/24, `transfer_group_tests` 35/35,
+  `pending_selected_storage_tests` 11/11.
+
+Not run: the full vet, the parity suite, clippy, and Linux and Windows execution.
+
+## PHP byte-range bridge (2026-11-08, closes the address-view item)
+
+PHP cannot form an interior address without allocating an FFI object, so each
+scalar transfer at a nonzero offset allocated one. Regions cached a view each,
+`copyFrom` and `copyWithin` allocated two per call and snapshotted overlapping
+ranges through a PHP string, and each hosted source reply read a pointer slot
+into a new object.
+
+**Chosen:** every PHP byte transfer names its range by the owner's one cached
+base, the owner's count, and an offset and length. `byte_region::host_range` is
+the one place that checks the range and forms the address; a range that leaves
+its owner is a P1001 runtime invariant. New `dr_v1_host_*` entries wrap file
+read and write, standard-stream transfer, transfer-plan new and append, and
+`copyFrom`/`copyWithin`. The two host-only pending configure entries change
+signature in place. `__DoriaBytes::__doriaNativePointer`,
+`__DoriaByteRegion::$nativePointer` and `__doriaNativeRegionPointer` are gone.
+The native backends' entry points are unchanged. Callers hold the owner as a
+strong local through the call, which the old `CData` argument did not do.
+
+The hosted group's record is now one `void *` cell. Native rewrites it for each
+handoff and the reply passes the cell, which reads its current value. Nothing
+holds it past the matching reply, so the loan rule that forbade caching stands.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Native range entries (chosen) | No shared mutable state; the runtime owns bounds and address; the plan's proposed shape | Seven new thin entries |
+| One reusable pointer cell, retargeted through an integer alias | No new entries | Hidden state shared across calls: a destructor running during result clearing could retarget it; forges pointers from integers |
+| Declare the data parameters as `uintptr_t` in the PHP cdef | No new entries, no allocation | The declaration misstates the prototype; bounds stay outside the runtime |
+| A native call that forms the pointer before each transfer | One new entry | Adds an FFI hop that costs more than the allocation it removes |
+| Cache a view per offset | Small | Rejected earlier: the cache grows with offsets used |
+| Leave plan configuration and bulk copies on `FFI::addr` | Fewer entries | Keeps a second owner of address formation for the same class of work |
+
+**Coverage.** Runtime unit tests check range limits, interior addresses and
+overlapping copies. A PHP test drives 1,000 file writes and reads at a nonzero
+offset through `writeFields` and `readFields`, plus copies in both overlap
+directions and between owners. Structural checks reject `FFI::addr` in the
+transfer bodies and any interior view in the generated program.
+
+### PROMINENT: time allowance raised from 28 to 36 hours for the closing vet (2026-11-08)
+
+The five-fix compiler round, the adapter-chain rerun and the release compiler
+left about 11,000 s of the 100,800 s allowance. The closing vet runs in guarded
+batches and has used more than that before, and any Linux or Windows correction
+round after CI needs its own rerun.
+
+**Chosen:** add 8 hours (100,800 -> 129,600 s). The other limits stay: one
+cargo job at a time, 3 GiB memory, the run cap, offline and locked, and the
+25 GB cache ceiling.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Raise by 8 hours (chosen) | Covers the vet, the benchmark cases and one correction round | Andrew was told in chat before it applied, but did not approve the amount |
+| Raise by 4 hours | Smaller | Likely to stop during a correction round and need a third raise |
+| Run the vet outside the guard | No raise | Loses the memory limit and the record of time spent |
+
+The guard allows one run per ledger at a time, so the closing vet takes 26,000 s
+of the 36 hours in its own ledger and the benchmark agent keeps the rest. The
+memory and cache limits apply to each, and only the vet runs cargo.
+
+### Performance gate: stream_adapter_chain and the pipe case rejoin the gate (2026-11-08)
+
+Commit `d176222` fixes the defects behind "`stream_adapter_chain` stopped on a
+compiler defect" and "non-blocking pipe transfer stopped on a runtime defect".
+Those two stops no longer apply: `stream_adapter_chain` verifies on all four
+variants at that commit, and the pipe case exists as
+`nonblocking_pipe_transfer`, with all ten binding cases in `matrices/stage36a.json`.
+The README's Stage 36a status block and the matrix description drop their blocked
+and excluded wording. The rest of those two entries stands as history.
+
+### Performance gate: who owns the child command (2026-11-08)
+
+`child_output_drainage` hardcoded `sh -c 'cat "$1"; cat "$1" >&2'` in all three
+targets, and the new pipe case needs an echoing child. `cat` and `sh` do not exist
+on a stock Windows machine, and `cmd.exe type` is not a byte-exact binary copy.
+The child is part of the workload, so the suite should own it, not each target.
+
+**Chosen:** one committed child program, `runtime/stream_child/stream_child.rs`,
+declared with a `childProgram` manifest field, built by the harness into the
+build root, and passed to every target through a `{childProgram}` argument token
+in the workload profile. The report records the source and artifact hashes and
+keeps the declared argument list; `runCommand` shows the resolved path. This
+replaces the child half of "Performance gate: Unix-only child and readiness cases".
+
+| Option | Pros | Cons |
+|---|---|---|
+| One suite-owned child program, path passed by token (chosen) | One owner; identical child for every target and platform; no per-case branches; hashes in the report | Adds a manifest field, a harness step and a schema entry; the case needs rustc even when only Doria targets run |
+| Per-platform shell strings (`sh` on Unix, `cmd.exe` on Windows) | No build step | Windows has no byte-exact shell copy, so the case would not match; two commands to keep identical |
+| PHP as the child | Always present with the harness | PHP startup and throughput dominate the measured interval, and the child cost would differ from any native child |
+| A per-case child beside each case | Local | Duplicates the source for each case; the same drift the shared child removes |
+
+### Performance gate: child program language (2026-11-08)
+
+**Chosen:** Rust, one source with no per-platform code, built with `rustc -O`.
+std's stdin, stdout and files move raw bytes on Linux, macOS and Windows, and
+the same `rustc` invocation builds it everywhere.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Rust (chosen) | One portable source; rustc is required for the Rust peers anyway; byte-exact stdio on all three platforms | Needs rustc on the machine |
+| C | Same | Needs `#ifdef` for binary stdio on Windows; the harness's `cc` is not guaranteed on Windows |
+| Doria | Dogfooding | A Doria defect would invalidate the C and Rust peers of the case |
+
+### Performance gate: Windows peer mechanism (2026-11-08)
+
+The three child and readiness cases are now declared `linux, macos, windows`. The
+Windows forms live in each peer's own source behind `#ifdef _WIN32` and
+`#[cfg(windows)]`, so the peer stays the owner of its OS calls.
+
+**Chosen:** overlapped named pipes and regular files on one I/O completion port,
+matching the mechanism `doria-rt` uses on Windows, for the C peers of all three
+cases and the Rust peers of the pipe and readiness cases; the Rust drainage peer
+keeps `Command::output`. Windows has no readiness API for regular files, so
+`readiness_registrations` issues each one-byte read at an explicit offset and
+waits for its completion. This replaces the other half of "Performance gate:
+Unix-only child and readiness cases"; the case stays a registration and completion
+measurement.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Overlapped handles and one completion port (chosen) | Real Win32 asynchronous I/O and the same mechanism the Doria runtime uses; no thread cost | Windows peers are longer; no Windows machine here to run them |
+| A reader thread per stream | Simple pipe code | A second, different concurrency model from the Doria runtime and the poll peers; adds thread cost to a stream measurement |
+| Leave `linux, macos` and skip Windows | No unverified code | The gate is defined as cross-platform; the Windows gap would stay open |
+
+### Performance gate: pipe transfer workload shape (2026-11-08)
+
+**Chosen:** the program keeps one 64 KiB seed in memory, sends it a profile-given
+number of rounds through one `TransferPlan`, and writes the echoed bytes to a
+file, 16 rounds for smoke (1 MiB) and 1024 rounds for baseline (64 MiB). The write
+and read adapters use capacity 1. A larger writer capacity is a usage trap: its
+pending path takes a short final write into the buffer and reports it accepted, so
+the last bytes never reach the child while the program waits for them. Capacity 1
+makes every transfer pass straight to the pipe. The peers use the same exact-count
+loop and close the child's input only after every byte has come back.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Seed repeated by rounds, capacity 1 adapters (chosen) | Bounded memory; isolates the pipe path; exact hash; no adapter buffering hides bytes | Short write size is fixed by the seed |
+| Stream the whole input file through the pipe | One file operation shape | Measures file reads as well as the pipe, and adds a second adapter to each direction |
+| Larger adapter capacity with an explicit flush after the loop | Exercises buffering | The flush would be a plain blocking write after the group ends, which can deadlock against a full child pipe, the exact case this benchmark exists to prove absent |
+
+### Performance gate: Windows evidence short of Windows (2026-11-08)
+
+No Windows machine is available, and CI cannot be used without a push. Wine 10.0
+is installed on this Mac and runs x86_64 Windows executables under Rosetta.
+
+**Chosen:** run the Windows paths under Wine, and say in each case's description
+and in the README that this is not Windows. The Rust peers and `stream_child` were
+linked as real `x86_64-pc-windows-msvc` executables with import libraries generated
+from Wine's DLLs and a minimal CRT stub. The C peers were compiled with Homebrew
+clang against scratch stand-ins for `windows.h` and the CRT headers, kept out of the
+repository, and linked the same way. All six executables produced the smoke hashes
+under Wine. The Doria programs were not compiled for Windows, because `doriac` here
+has no Windows target. `rustc --target x86_64-pc-windows-msvc --emit=metadata`
+also passes for all three Rust peers and `stream_child`.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Wine run of the peers, plainly labeled (chosen) | Runs the Win32 code paths and catches logic errors; no Windows-only claim | Not Windows; the C peers used stub headers, so a real `windows.h` compile is untested; Doria itself is not covered |
+| `--emit=metadata` only | Simple | Proves nothing about the C peers or about any peer's behaviour |
+| Commit a Windows CI job | Real Windows runs | Outside this gate's scope, and needs a push and a Windows runner |
+
+### Closing vet of the compiler round (2026-11-08)
+
+macOS ARM64, LLVM enabled, offline and locked, at `d176222` plus the vet tooling.
+6,156 tests passed and none failed or were ignored: every `doriac` target, the
+parity suite and its three shards, `doria-rt` in debug and release with both
+feature sets, and the diagnostic catalogue. Clippy with warnings denied passes
+for macOS, and for Linux and Windows across `doria-rt`, its hosted form and
+`doriac`. Formatting and the script checks pass. The earlier stall of
+`copy_parameter_values_and_writable_callback_borrows_match_native` did not recur.
+
+Two script checks failed on the first pass. `check_build_artifact_policy` read
+the suite list from its old file after the list moved to `vet_commands.php`,
+and now reads it there. `check_docs_authority` reports only that the sibling
+`benchmarks` checkout is ahead of the pin, which is expected until the pin moves.
+Linux and Windows have not executed this round; that is the next step.

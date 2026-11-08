@@ -13,8 +13,9 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
-- Stage 36a push, 2026-11-05 (committed locally on develop 2026-11-07, not
-  pushed). Decisions and their
+- Stage 36a push, 2026-11-05 (on origin develop since 2026-11-08; not
+  delivered until the compiler round's CI passes on Linux and Windows and the
+  benchmark pin moves). Decisions and their
   alternatives are in `docs/notes/stage36a-decision-log.md` (entries 1-51).
   Landed: PHP generic payload enums (class per specialization, exact `mixed`
   identity); `FinishOutcome<S, R>` / `BorrowedFinishOutcome<R>`; ordinary-class
@@ -144,10 +145,34 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   denied, fmt and the repository checks pass; `doria-rt` and the catalogue
   are unchanged since the final vet. Language server 487/487 against
   compiler identity `dev-7bc0fd8c…`.
-  Open in 36a: the language-server and Website compiler pins and the Website
-  API lock, which move to the 36a commit; the installed-tool refresh; the
-  push, which needs Andrew; Linux/Windows execution (not runnable on this
-  Mac).
+  Close, 2026-11-07: local develop commits `doria` `5e72056`,
+  `doria-language-server` `339c997` (doriac pin `5e72056`; canonical workspace
+  checks against it), `doria-website` `adb3b5b` (compiler pin and v2026.3.1
+  API lock at `5e72056`; full Pest 347 passed against the compiler built from
+  it). The installed `doriac` and `doria-lsp` were refreshed from those
+  commits and report compiler `5e72056`.
+  2026-11-07, after the close (uncommitted): catch reachability, the
+  destructor boundary and nonthrowing initializers read each body's authored
+  reach. Transport, MIR and the ABI keep the narrowed profile. The closures
+  callers pass and a composer's members no longer decide E0629 or E0631
+  (log entry 52; Decision 0123 amended; `constrained_ambient_effect_tests`
+  7/7 on the interpreter, Cranelift, LLVM and PHP).
+  Close, 2026-11-08: `doria` `1f68889`, `doria-language-server` `58585d1` and
+  `doria-website` `13db4e4` are on origin develop, with the pins and the API
+  lock at `1f68889`. CI is green in all three (log, "Close results at the
+  final pins"). The installed `doriac` and `doria-lsp` come from those commits.
+  Compiler round, 2026-11-08: catch reachability, enum source locations,
+  per-specialization effect contracts, child pipes in readiness sets,
+  region-returning requirements and the PHP byte-range bridge. The closing vet
+  on macOS ARM64 with LLVM passed 6,156 tests, parity shards, release-profile
+  runtime tests, and clippy for macOS, Linux and Windows.
+  Stream gate: all ten binding cases exist and verify at bounded size on macOS
+  at `d176222`; the structural baseline is accepted in `benchmarks`
+  (26 entries, all Pass). Timing stays Pending Available Runner.
+  Open in 36a: CI on Linux and Windows for this round, which has never executed
+  there; publishing the benchmark commits and moving the pin; re-pinning the
+  language server and website. Doria programs for the gate's cases have not
+  been compiled for Windows; their C and Rust peers have run only under Wine.
 
 - Scoped class borrowing contract (approved 2026-11-03; implementation open): extend Decision 0134's
   constructor promotion to ordinary classes with `borrow T $source` for
