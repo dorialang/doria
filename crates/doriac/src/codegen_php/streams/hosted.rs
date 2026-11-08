@@ -336,6 +336,7 @@ final class __DoriaHostedTransferGroup
     private readonly FFI\CData $terminal;
     private readonly FFI\CData $view;
     private readonly FFI\CData $record;
+    private readonly FFI\CData $recordAddress;
     private readonly FFI\CData $caller;
     private readonly FFI\CData $length;
     private readonly FFI\CData $reading;
@@ -368,7 +369,10 @@ final class __DoriaHostedTransferGroup
         $this->terminal = __doria_native_opaque_storage($layout[2], $layout[3]);
         $runtime->dr_v1_host_pending_view_layout(FFI::addr($layout[0]), FFI::addr($layout[1]));
         $this->view = __doria_native_opaque_storage($layout[0], $layout[1]);
-        $this->record = $runtime->new('void *[1]');
+        // One pointer cell, rewritten for each handoff. Passing the cell reads its
+        // current value without a view, and nothing keeps it past the matching reply.
+        $this->record = $runtime->new('void *');
+        $this->recordAddress = FFI::addr($this->record);
         $this->caller = $runtime->new('uint8_t *[1]');
         $this->length = $runtime->new('size_t[1]');
         $this->reading = $runtime->new('uint8_t[1]');
@@ -495,7 +499,7 @@ final class __DoriaHostedTransferGroup
             $this->errors->sweep();
             if ($code !== 8) { return $code; }
             $action = $runtime->dr_v1_host_transfer_group_action($this->native(), $this->index,
-                $this->record, $this->viewAddress, $this->caller, $this->length, $this->reading);
+                $this->recordAddress, $this->viewAddress, $this->caller, $this->length, $this->reading);
             if ($action === 0) { continue; } // A native poll may advance without host work.
             $index = $this->index[0];
             $operation = $this->operations[$index];
@@ -517,7 +521,7 @@ final class __DoriaHostedTransferGroup
                 $error = $this->terminalAddress;
             }
             if ($action === 1 || $action === 2) {
-                $reply = $runtime->dr_v1_host_pending_source_reply($this->record[0],
+                $reply = $runtime->dr_v1_host_pending_source_reply($this->record,
                     $error === null ? $source : null, $error);
             } elseif ($action === 3) {
                 $reply = $runtime->dr_v1_host_pending_prepare_reply($this->viewAddress, $error);
@@ -661,3 +665,12 @@ final class __DoriaHostedTransferGroup
     }
 }
 "#;
+
+#[cfg(test)]
+mod record_handoff_tests {
+    #[test]
+    fn a_handoff_passes_its_record_cell_without_forming_a_view() {
+        assert!(!super::RUNTIME.contains("$this->record[0]"));
+        assert!(super::RUNTIME.contains("dr_v1_host_pending_source_reply($this->record,"));
+    }
+}

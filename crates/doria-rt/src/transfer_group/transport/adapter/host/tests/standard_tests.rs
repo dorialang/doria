@@ -182,6 +182,8 @@ fn hosted_standard_configuration_rejects_wrong_devices_with_actual_target_and_no
                     standard_device(stream).source().value(),
                     calls.caller,
                     calls.length,
+                    0,
+                    calls.length,
                     &mut error,
                     &mut message,
                     &mut path,

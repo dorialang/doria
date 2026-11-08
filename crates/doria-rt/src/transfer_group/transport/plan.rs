@@ -277,6 +277,76 @@ pub unsafe extern "C" fn dr_v1_checked_transfer_plan_append(
     )
 }
 
+/// `dr_v1_checked_transfer_plan_new` for a PHP host, which names the buffer by range.
+/// # Safety
+/// As `dr_v1_checked_transfer_plan_new`, for the range `byte_region::host_range` forms.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_transfer_plan_new(
+    frame: *const DrStackFrameV2,
+    key: *const c_void,
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+    reading: u8,
+    result: *mut *mut c_void,
+    message: *mut *mut DrStringV1,
+    path: *mut *mut DrStringV1,
+    system_code: *mut i64,
+    transferred_byte_count: *mut usize,
+    meta: *mut u64,
+) -> u8 {
+    dr_v1_checked_transfer_plan_new(
+        frame,
+        key,
+        crate::byte_region::host_range(base, capacity, offset, length),
+        length,
+        reading,
+        result,
+        message,
+        path,
+        system_code,
+        transferred_byte_count,
+        meta,
+    )
+}
+
+/// `dr_v1_checked_transfer_plan_append` for a PHP host, which names the buffer by range.
+/// # Safety
+/// As `dr_v1_checked_transfer_plan_append`, for the range `byte_region::host_range` forms.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_transfer_plan_append(
+    frame: *const DrStackFrameV2,
+    plan: *mut c_void,
+    key: *const c_void,
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+    reading: u8,
+    result: *mut *mut c_void,
+    message: *mut *mut DrStringV1,
+    path: *mut *mut DrStringV1,
+    system_code: *mut i64,
+    transferred_byte_count: *mut usize,
+    meta: *mut u64,
+) -> u8 {
+    dr_v1_checked_transfer_plan_append(
+        frame,
+        plan,
+        key,
+        crate::byte_region::host_range(base, capacity, offset, length),
+        length,
+        reading,
+        result,
+        message,
+        path,
+        system_code,
+        transferred_byte_count,
+        meta,
+    )
+}
+
 unsafe fn checked_plan_result(
     frame: *const DrStackFrameV2,
     owner: *mut c_void,

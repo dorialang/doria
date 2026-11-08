@@ -13,6 +13,65 @@ fn checked_offset(source_length: usize, offset: i64, length: i64) -> Option<usiz
     (offset <= source_length && length <= source_length - offset).then_some(offset)
 }
 
+/// Where a range named by a PHP host starts, or `None` when it leaves its owner.
+fn host_range_start(
+    has_base: bool,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+) -> Option<usize> {
+    (has_base && offset <= capacity && length <= capacity - offset).then_some(offset)
+}
+
+/// Forms the address of a range a PHP host names by its owner's base, the
+/// owner's capacity, and an offset and length.
+///
+/// PHP cannot form an interior address without allocating an FFI object for
+/// each call. Its transfers therefore pass the owner's one cached base and
+/// plain integers, and this function checks the range and forms the address.
+/// An empty range has no address, which every transfer entry point permits.
+///
+/// # Safety
+/// `base` must be null or address live storage for `capacity` bytes. The
+/// generated code holds the owner, and its loan, for the whole native call.
+pub(crate) unsafe fn host_range(
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+) -> *mut u8 {
+    if length == 0 {
+        return core::ptr::null_mut();
+    }
+    match host_range_start(!base.is_null(), capacity, offset, length) {
+        Some(start) => base.add(start),
+        None => crate::runtime_invariant_panic(),
+    }
+}
+
+/// `copyFrom` and `copyWithin` for a PHP host, naming both ranges as
+/// `host_range` does. The ranges may overlap.
+///
+/// # Safety
+/// Each base must be null or address live storage for its capacity. The
+/// generated code holds both owners and their loans for this call.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_byte_range_copy(
+    destination: *mut u8,
+    destination_capacity: usize,
+    destination_offset: usize,
+    source: *const u8,
+    source_capacity: usize,
+    source_offset: usize,
+    count: usize,
+) {
+    if count != 0 {
+        let from = host_range(source.cast_mut(), source_capacity, source_offset, count);
+        let to = host_range(destination, destination_capacity, destination_offset, count);
+        core::ptr::copy(from.cast_const(), to, count);
+    }
+}
+
 /// Forms a bounded borrow without allocating storage or retaining the owner.
 /// The compiler carries the returned pointer together with the requested length.
 ///
@@ -187,6 +246,33 @@ unsafe fn region_panic(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_ranges_stay_inside_their_owner() {
+        use super::host_range_start as start;
+        assert_eq!(start(true, 8, 0, 8), Some(0));
+        assert_eq!(start(true, 8, 3, 5), Some(3));
+        assert_eq!(start(true, 8, 8, 1), None);
+        assert_eq!(start(true, 8, 3, 6), None);
+        assert_eq!(start(true, 8, usize::MAX, 1), None);
+        assert_eq!(start(true, 8, 1, usize::MAX), None);
+        assert_eq!(start(false, 8, 0, 1), None);
+    }
+
+    #[test]
+    fn host_ranges_form_interior_addresses_and_copy_overlaps() {
+        let mut bytes = *b"abcdef";
+        let base = bytes.as_mut_ptr();
+        unsafe {
+            assert_eq!(super::host_range(base, 6, 2, 3), base.add(2));
+            assert!(super::host_range(base, 6, 6, 0).is_null());
+            assert!(super::host_range(core::ptr::null_mut(), 0, 0, 0).is_null());
+            super::dr_v1_host_byte_range_copy(base, 6, 1, base.cast_const(), 6, 0, 5);
+        }
+        assert_eq!(&bytes, b"aabcde");
+        unsafe { super::dr_v1_host_byte_range_copy(base, 6, 0, base.cast_const(), 6, 1, 5) };
+        assert_eq!(&bytes, b"abcdee");
+    }
+
     use core::ptr;
 
     use super::*;

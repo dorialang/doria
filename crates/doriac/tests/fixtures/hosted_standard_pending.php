@@ -194,7 +194,7 @@ final class __TestStandardPending
         ++$this->preparations;
         $stream = $this->failure === 'device' ? 1 : $this->stream;
         $request->__doriaNativePendingRequest()->configureStandard($stream,
-            $region->__doriaNativePointer($this->stream === 0), count($region));
+            $region->__doriaNativeStorage($this->stream === 0), $region->__doriaRegionOffset(), count($region));
     }
 
     private function completedRequest(mixed $request, mixed $region): __DoriaPendingRequest
@@ -268,8 +268,10 @@ $begin = static function(__TestStandardPending $device, bool $usesHome,
     $system = $runtime->new('int64_t[1]');
     $transferred = $runtime->new('size_t[1]');
     $meta = $runtime->new('uint64_t[1]');
-    if ($runtime->dr_v1_checked_transfer_plan_new(null, $key, $region->__doriaNativePointer($reading),
-        count($region), (int) $reading, $plan, $message, $path, $system, $transferred, $meta) !== 0) {
+    $storage = $region->__doriaNativeStorage($reading);
+    if ($runtime->dr_v1_host_transfer_plan_new(null, $key, $storage->__doriaNativeBase(), count($storage),
+        $region->__doriaRegionOffset(), count($region), (int) $reading,
+        $plan, $message, $path, $system, $transferred, $meta) !== 0) {
         throw new LogicException('standard plan creation failed');
     }
     $flags = $device->dispatchFlags;
@@ -330,7 +332,7 @@ foreach ([0, 1, 2] as $stream) {
         if ($stream === 0) {
             $completed = $group->readRegion($key);
             if ($completed === null || count($completed) !== 3
-                || $completed->__doriaNativePointer(false)[0] !== 255) {
+                || $completed->__doriaNativeStorage(false)->get($completed->__doriaRegionOffset(), 0, 0, '') !== 255) {
                 throw new LogicException('completed region changed its original storage');
             }
             unset($completed);
@@ -356,7 +358,7 @@ foreach ([0, 1, 2] as $stream) {
             if ($stream === 0) {
                 $completed = $group->readRegion($seen);
                 if ($completed === null || count($completed) !== 0
-                    || $completed->__doriaNativePointer(false) !== null) {
+                    || $completed->__doriaNativeStorage(false) === null) {
                     throw new LogicException('empty completed region changed its storage');
                 }
                 unset($completed);

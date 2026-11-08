@@ -215,8 +215,10 @@ void dr_v1_file_object_layout(size_t *size, size_t *alignment);
 const void *dr_v1_file_object_readiness_source(const void *file);
 uint8_t dr_v1_file_object_open(DrStringV1 *path, uint8_t access,
     uint8_t creation, uint8_t append, void *file, DrIoStatusV1 *status);
-uint8_t dr_v1_file_object_read(void *file, uint8_t *destination, size_t capacity, DrIoStatusV1 *status);
-uint8_t dr_v1_file_object_write(void *file, const uint8_t *source, size_t length, DrIoStatusV1 *status);
+uint8_t dr_v1_host_file_object_read(void *file, uint8_t *base, size_t capacity, size_t offset, size_t length, DrIoStatusV1 *status);
+uint8_t dr_v1_host_file_object_write(void *file, const uint8_t *base, size_t capacity, size_t offset, size_t length, DrIoStatusV1 *status);
+void dr_v1_host_byte_range_copy(uint8_t *destination, size_t destination_capacity, size_t destination_offset,
+    const uint8_t *source, size_t source_capacity, size_t source_offset, size_t count);
 uint8_t dr_v1_file_object_close(void *file, DrIoStatusV1 *status);
 uint8_t dr_v1_file_object_control_int(void *file, uint8_t operation, int64_t offset, uint8_t origin, DrIoStatusV1 *status);
 void dr_v1_file_object_drop(const void *frame, void *file);
@@ -237,8 +239,8 @@ DrStringV1 *dr_v1_file_object_lock_path(const void *guard);
 uint8_t dr_v1_file_object_lock_release(void *guard, void **file, DrIoStatusV1 *status);
 void *dr_v1_file_object_lock_drop(void *guard);
 const void *dr_v1_standard_stream_readiness_source(uint8_t stream);
-uint8_t dr_v1_checked_standard_stream_io(const void *frame, uint8_t stream,
-    uint8_t operation, uint8_t *data, size_t length, uint64_t *result_tag,
+uint8_t dr_v1_host_standard_stream_io(const void *frame, uint8_t stream,
+    uint8_t operation, uint8_t *base, size_t capacity, size_t offset, size_t length, uint64_t *result_tag,
     size_t *result_value, DrStringV1 **message, DrStringV1 **error_path,
     int64_t *system_code, size_t *transferred, uint64_t *meta);
 void *dr_v1_readiness_set_new(const void *frame, DrIoStatusV1 *status);
@@ -289,10 +291,10 @@ uint8_t dr_v1_host_transfer_group_poll(const void *frame, void *owner, uint8_t *
 uint8_t dr_v1_host_transfer_group_action(const void *owner, size_t *index, void **record,
     void *view, uint8_t **caller, size_t *length, uint8_t *reading);
 uint8_t dr_v1_host_pending_request_configure_file(const void *frame, void *owner, void *view,
-    void *file, const void *fresh_source, uint8_t *data, size_t length, DrInterfaceCarrierV1 *error,
+    void *file, const void *fresh_source, uint8_t *base, size_t capacity, size_t offset, size_t length, DrInterfaceCarrierV1 *error,
     DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_host_pending_request_configure_standard(const void *frame, void *owner, void *view,
-    uint8_t stream, const void *fresh_source, uint8_t *data, size_t length, DrInterfaceCarrierV1 *error,
+    uint8_t stream, const void *fresh_source, uint8_t *base, size_t capacity, size_t offset, size_t length, DrInterfaceCarrierV1 *error,
     DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_host_transfer_group_read_region(const void *owner, const void *key,
     const uint8_t **data, size_t *length, DrIoStatusV1 *status);
@@ -301,11 +303,11 @@ void dr_v1_host_transfer_group_drop(const void *frame, void *owner);
 uint8_t dr_v1_checked_pending_request_outcome(const void *frame, const void *request,
     uint64_t *tag, size_t *count, DrStringV1 **message, DrStringV1 **path,
     int64_t *system_code, size_t *transferred, uint64_t *meta);
-uint8_t dr_v1_checked_transfer_plan_new(const void *frame, const void *key,
-    uint8_t *data, size_t length, uint8_t reading, void **result, DrStringV1 **message,
+uint8_t dr_v1_host_transfer_plan_new(const void *frame, const void *key,
+    uint8_t *base, size_t capacity, size_t offset, size_t length, uint8_t reading, void **result, DrStringV1 **message,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
-uint8_t dr_v1_checked_transfer_plan_append(const void *frame, void *plan, const void *key,
-    uint8_t *data, size_t length, uint8_t reading, void **result, DrStringV1 **message,
+uint8_t dr_v1_host_transfer_plan_append(const void *frame, void *plan, const void *key,
+    uint8_t *base, size_t capacity, size_t offset, size_t length, uint8_t reading, void **result, DrStringV1 **message,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 void dr_v1_transfer_plan_drop(void *plan);
 uint8_t dr_v1_checked_transfer_plan_key(const void *frame, const void *plan,

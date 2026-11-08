@@ -61,13 +61,16 @@ private static function __doriaConfigure(?FFI\CData $previous, array $operations
     $system = $runtime->new('int64_t[1]');
     $transferred = $runtime->new('size_t[1]');
     $meta = $runtime->new('uint64_t[1]');
-    $data = $region->__doriaNativePointer($reading);
+    $source = $region->__doriaNativeStorage($reading);
+    $base = $source->__doriaNativeBase();
+    $capacity = count($source);
+    $offset = $region->__doriaRegionOffset();
     $length = count($region);
     $code = $previous === null
-        ? $runtime->dr_v1_checked_transfer_plan_new(null, $key, $data, $length, (int) $reading,
-            $result, $message, $path, $system, $transferred, $meta)
-        : $runtime->dr_v1_checked_transfer_plan_append(null, $previous, $key, $data, $length, (int) $reading,
-            $result, $message, $path, $system, $transferred, $meta);
+        ? $runtime->dr_v1_host_transfer_plan_new(null, $key, $base, $capacity, $offset, $length,
+            (int) $reading, $result, $message, $path, $system, $transferred, $meta)
+        : $runtime->dr_v1_host_transfer_plan_append(null, $previous, $key, $base, $capacity, $offset, $length,
+            (int) $reading, $result, $message, $path, $system, $transferred, $meta);
     try {
         if ($code === 0) {
             $operations[] = [$identity, $region, $reading];
@@ -681,7 +684,7 @@ pub(super) fn emit_body(
             let [storage, offset, length] = region.region_parts().unwrap();
             let reading = intrinsic == FileFunction::PrepareRead;
             let body = if let Some(stream) = standard {
-                format!("{request}->__doriaNativePendingRequest()->configureStandard({}, __DoriaByteRegion::__doriaNativeRegionPointer({storage}, {offset}, {length}), {length});", stream.runtime_tag())
+                format!("{request}->__doriaNativePendingRequest()->configureStandard({}, __DoriaByteRegion::__doriaNativeSource({storage}), {offset}, {length});", stream.runtime_tag())
             } else {
                 format!("$this->__doriaFileOwner->prepareFields({request}->__doriaNativePendingRequest(), {storage}, {offset}, {length}, {});", if reading { "true" } else { "false" })
             };
@@ -1103,17 +1106,19 @@ final class __DoriaPendingRequest
 
     public function bind(FFI\CData $view): void { $this->view = $view; }
 
-    public function configureFile(FFI\CData $file, ?FFI\CData $data, int $length): void
+    public function configureFile(FFI\CData $file, __DoriaBytes $source, int $offset, int $length): void
     {
         $this->finishConfiguration($this->runtime->dr_v1_host_pending_request_configure_file(null,
-            $this->group, $this->view, $file, $this->freshSource(), $data, $length, $this->error,
+            $this->group, $this->view, $file, $this->freshSource(), $source->__doriaNativeBase(),
+            count($source), $offset, $length, $this->error,
             $this->message, $this->path, $this->system, $this->transferred, $this->meta));
     }
 
-    public function configureStandard(int $stream, ?FFI\CData $data, int $length): void
+    public function configureStandard(int $stream, __DoriaBytes $source, int $offset, int $length): void
     {
         $this->finishConfiguration($this->runtime->dr_v1_host_pending_request_configure_standard(null,
-            $this->group, $this->view, $stream, $this->freshSource(), $data, $length, $this->error,
+            $this->group, $this->view, $stream, $this->freshSource(), $source->__doriaNativeBase(),
+            count($source), $offset, $length, $this->error,
             $this->message, $this->path, $this->system, $this->transferred, $this->meta));
     }
 
@@ -1348,19 +1353,20 @@ final class __DoriaFileOwner
 
     public function readResult(__DoriaByteRegion $destination): void
     {
-        $this->readRange($destination->__doriaNativePointer(true), count($destination));
+        $this->readRange($destination->__doriaNativeStorage(true),
+            $destination->__doriaRegionOffset(), count($destination));
     }
 
     public function readFields(WeakReference $storage, int $offset, int $length): void
     {
-        $this->readRange(__DoriaByteRegion::__doriaNativeRegionPointer($storage, $offset, $length), $length);
+        $this->readRange(__DoriaByteRegion::__doriaNativeSource($storage), $offset, $length);
     }
 
-    private function readRange(?FFI\CData $data, int $length): void
+    private function readRange(__DoriaBytes $source, int $offset, int $length): void
     {
         __DoriaValueResult::clear();
-        $code = $this->runtime->dr_v1_file_object_read($this->native(),
-            $data, $length, $this->statusAddress);
+        $code = $this->runtime->dr_v1_host_file_object_read($this->native(),
+            $source->__doriaNativeBase(), count($source), $offset, $length, $this->statusAddress);
         match ($code) {
             0 => __DORIA_READ_DATA_RESULT__($this->status->value),
             1 => __DORIA_READ_BLOCK_RESULT__(),
@@ -1379,19 +1385,20 @@ final class __DoriaFileOwner
 
     public function writeResult(__DoriaByteRegion $source): void
     {
-        $this->writeRange($source->__doriaNativePointer(false), count($source));
+        $this->writeRange($source->__doriaNativeStorage(false),
+            $source->__doriaRegionOffset(), count($source));
     }
 
     public function writeFields(WeakReference $storage, int $offset, int $length): void
     {
-        $this->writeRange(__DoriaByteRegion::__doriaNativeRegionPointer($storage, $offset, $length), $length);
+        $this->writeRange(__DoriaByteRegion::__doriaNativeSource($storage), $offset, $length);
     }
 
-    private function writeRange(?FFI\CData $data, int $length): void
+    private function writeRange(__DoriaBytes $source, int $offset, int $length): void
     {
         __DoriaValueResult::clear();
-        $code = $this->runtime->dr_v1_file_object_write($this->native(),
-            $data, $length, $this->statusAddress);
+        $code = $this->runtime->dr_v1_host_file_object_write($this->native(),
+            $source->__doriaNativeBase(), count($source), $offset, $length, $this->statusAddress);
         match ($code) {
             0 => __DORIA_WRITE_DATA_RESULT__($this->status->value),
             1 => __DORIA_WRITE_BLOCK_RESULT__(),
@@ -1458,13 +1465,14 @@ final class __DoriaFileOwner
 
     public function prepare(__DoriaPendingRequest $request, __DoriaByteRegion $region, bool $reading): void
     {
-        $request->configureFile($this->native(), $region->__doriaNativePointer($reading), count($region));
+        $request->configureFile($this->native(), $region->__doriaNativeStorage($reading),
+            $region->__doriaRegionOffset(), count($region));
     }
 
     public function prepareFields(__DoriaPendingRequest $request, WeakReference $storage,
         int $offset, int $length, bool $reading): void
     {
-        $request->configureFile($this->native(), __DoriaByteRegion::__doriaNativeRegionPointer($storage, $offset, $length), $length);
+        $request->configureFile($this->native(), __DoriaByteRegion::__doriaNativeSource($storage), $offset, $length);
     }
 
     public function drop(): void
@@ -3118,6 +3126,11 @@ function main(): void {
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
             panic!("file address views require native storage");
         };
+        assert!(
+            !contents.contains("FFI::addr($this->values[$")
+                && !contents.contains("FFI::addr($source->values["),
+            "a byte operation formed an interior address view"
+        );
         contents.push_str(&format!(
             "\n$start = {}::Start;\n",
             php_type_symbol("Doria\\Std\\Io\\SeekOrigin"),
@@ -3128,7 +3141,8 @@ function addressCheck(bool $condition, string $message): void {
     if (!$condition) { throw new LogicException($message); }
 }
 $source = file(__FILE__);
-foreach (['native', 'readResult', 'writeResult', 'close', 'control', 'prepare', 'drop'] as $method) {
+foreach (['native', 'readResult', 'readFields', 'readRange', 'writeResult', 'writeFields', 'writeRange',
+    'close', 'control', 'prepare', 'prepareFields', 'drop'] as $method) {
     $reflection = new ReflectionMethod(__DoriaFileOwner::class, $method);
     $body = implode('', array_slice($source, $reflection->getStartLine() - 1,
         $reflection->getEndLine() - $reflection->getStartLine() + 1));
@@ -3163,6 +3177,28 @@ for ($iteration = 0; $iteration < 1000; ++$iteration) {
     addressCheck($addressProperty->getValue($first) === $address
         && $statusProperty->getValue($first) === $status, 'file address views were rebuilt');
 }
+$wide = __DoriaBytes::fromArray([7, 65, 66, 9], 0, 0, '');
+$storage = $wide->getRegion(0, 4, 0, 0, '')->__doriaRegionStorage();
+for ($iteration = 0; $iteration < 1000; ++$iteration) {
+    $first->seek(0, $start);
+    $first->writeFields($storage, 1, 2);
+    addressCheck(__DoriaValueResult::$tag === 0 && __DoriaValueResult::$field0 === 2, 'interior write lost progress');
+    $first->seek(0, $start);
+    $wide->set(1, 0, 0, 0, '');
+    $wide->set(2, 0, 0, 0, '');
+    $first->readFields($storage, 1, 2);
+    addressCheck(__DoriaValueResult::$tag === 0 && __DoriaValueResult::$field0 === 2, 'interior read lost progress');
+    addressCheck($wide->toArray() === [7, 65, 66, 9], 'interior transfer selected different bytes');
+}
+$copy = __DoriaBytes::fromArray([1, 2, 3, 4, 5, 6], 0, 0, '');
+$all = $copy->getWritableRegion(0, 6, 0, 0, '');
+$all->copyWithin(0, 5, 1, 0, 0, '');
+addressCheck($copy->toArray() === [1, 1, 2, 3, 4, 5], 'overlapping copy to a later offset');
+$all->copyWithin(1, 5, 0, 0, 0, '');
+addressCheck($copy->toArray() === [1, 2, 3, 4, 5, 5], 'overlapping copy to an earlier offset');
+$other = __DoriaBytes::fromArray([9, 8, 7], 0, 0, '');
+$copied = $copy->getWritableRegion(4, 2, 0, 0, '')->copyFrom($other->getRegion(1, 2, 0, 0, ''), 0, 0, '');
+addressCheck($copied === 2 && $copy->toArray() === [1, 2, 3, 4, 8, 7], 'copy between owners');
 try {
     $first->seek(-1, $start);
     throw new LogicException('invalid absolute seek succeeded');
@@ -3360,7 +3396,7 @@ $cell = $owner->__doriaBorrowCell(1, 0, 0, "");
 $cell->value = 88;
 $cell->value += 1;
 $cell->value += 1;
-$pointer = $owner->__doriaNativePointer(0, 3);
+$pointer = $owner->__doriaNativeBase();
 echo $pointer[1] . "\n";
 $pointer[1] = 91;
 echo $cell->value . "\n";
@@ -3380,7 +3416,7 @@ echo $cell->value . "\n";
     }
 
     #[test]
-    fn native_byte_pointer_homes_reuse_wrappers_without_retaining_buffer_owners() {
+    fn native_byte_bases_reuse_one_view_without_retaining_buffer_owners() {
         let mut php = compile(
             "native-byte-pointer-homes.doria",
             r#"
@@ -3406,37 +3442,34 @@ foreach ([false, true] as $adopted) {
     $region = $owner->getWritableRegion(1, 2, 0, 0, '');
     $nested = $region->getRegion(1, 1, 0, 0, '');
     $empty = $owner->getWritableRegion(4, 0, 0, 0, '');
-    $base = $owner->__doriaNativePointer(0, 4);
-    $pointer = $region->__doriaNativePointer(true);
-    $nestedPointer = $nested->__doriaNativePointer(false);
+    $base = $owner->__doriaNativeBase();
     for ($iteration = 0; $iteration < 100; ++$iteration) {
-        if ($base !== $owner->__doriaNativePointer(0, 3)
-            || $pointer !== $region->__doriaNativePointer(true)
-            || $pointer !== $region->__doriaNativePointer(false)
-            || $nestedPointer !== $nested->__doriaNativePointer(false)
-            || $empty->__doriaNativePointer(true) !== null) {
-            throw new LogicException('native pointer home was rebuilt');
+        if ($base !== $owner->__doriaNativeBase()
+            || $owner !== $region->__doriaNativeStorage(true)
+            || $owner !== $nested->__doriaNativeStorage(false)
+            || $owner !== $empty->__doriaNativeStorage(true)) {
+            throw new LogicException('native base was rebuilt');
         }
     }
     $owner->set(1, 88, 0, 0, '');
-    $pointer[1] = 90;
-    if ($pointer[0] !== 88 || $base[2] !== 90 || $nestedPointer[0] !== 90
-        || $owner->get(2, 0, 0, '') !== 90) {
-        throw new LogicException('cached native pointer selected the wrong storage');
+    $base[2] = 90;
+    if ($base[1] !== 88 || $owner->get(2, 0, 0, '') !== 90 || count($region) !== 2
+        || $region->__doriaRegionOffset() !== 1 || $nested->__doriaRegionOffset() !== 2) {
+        throw new LogicException('native base selected the wrong storage');
     }
     try {
-        $nested->__doriaNativePointer(true);
+        $nested->__doriaNativeStorage(true);
         throw new RuntimeException('cached readonly pointer was upgraded');
     } catch (LogicException $error) {
         if ($error->getMessage() !== 'MIR native transfer upgraded readonly access') { throw $error; }
     }
     unset($owner);
     if ($weak->get() !== null || $weakValues->get() !== null) {
-        throw new LogicException('cached native pointer retained its buffer');
+        throw new LogicException('native base retained its buffer');
     }
     foreach ([$region, $nested, $empty] as $expired) {
         try {
-            $expired->__doriaNativePointer(false);
+            $expired->__doriaNativeStorage(false);
             throw new RuntimeException('cached native pointer outlived its buffer');
         } catch (LogicException $error) {
             if ($error->getMessage() !== 'MIR byte region outlived its source') { throw $error; }
@@ -3445,8 +3478,8 @@ foreach ([false, true] as $adopted) {
 }
 $emptyOwner = __DoriaBytes::allocate(0, 0, 0, '');
 $emptyRegion = $emptyOwner->getWritableRegion(0, 0, 0, 0, '');
-if ($emptyRegion->__doriaNativePointer(true) !== null) {
-    throw new LogicException('empty storage exposed a native pointer');
+if ($emptyRegion->__doriaNativeStorage(true)->__doriaNativeBase() !== null) {
+    throw new LogicException('empty storage exposed a native base');
 }
 echo "pointer homes\n";
 "#,

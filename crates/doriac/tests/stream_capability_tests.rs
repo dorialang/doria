@@ -864,7 +864,7 @@ $isNull = static fn(?FFI\CData $value): bool => $value === null || FFI::isNull($
 $transfer = static function(int $stream, int $operation, ?FFI\CData $data, int $length) use
     ($runtime, $tag, $count, $message, $path, $code, $progress, $meta): int {
     $tag[0] = 99; $count[0] = 99; $code[0] = -99; $progress[0] = 99; $meta[0] = 99;
-    return $runtime->dr_v1_checked_standard_stream_io(null, $stream, $operation, $data, $length,
+    return $runtime->dr_v1_host_standard_stream_io(null, $stream, $operation, $data, $length, 0, $length,
         $tag, $count, $message, $path, $code, $progress, $meta);
 };
 $success = static function(int $expectedTag, int $expectedCount) use
@@ -1016,7 +1016,7 @@ try {
                     }
                     $fileLive = true;
                     $bytes = $runtime->new('uint8_t[8]');
-                    if ($runtime->dr_v1_file_object_read($fileHome, $bytes, 8, FFI::addr($status)) !== 0 ||
+                    if ($runtime->dr_v1_host_file_object_read($fileHome, $bytes, 8, 0, 8, FFI::addr($status)) !== 0 ||
                         $status->value !== 8 || FFI::string(FFI::addr($bytes[0]), 8) !== 'original') {
                         throw new LogicException('released original file is unusable');
                     }

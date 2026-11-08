@@ -269,6 +269,38 @@ pub unsafe extern "C" fn dr_v1_file_object_write(
     }
 }
 
+/// `dr_v1_file_object_read` for a PHP host, which names the destination by range.
+/// # Safety
+/// As `dr_v1_file_object_read`, for the range `byte_region::host_range` forms.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_file_object_read(
+    file: *mut c_void,
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+    status: *mut DrFileStatusV1,
+) -> u8 {
+    let destination = crate::byte_region::host_range(base, capacity, offset, length);
+    dr_v1_file_object_read(file, destination, length, status)
+}
+
+/// `dr_v1_file_object_write` for a PHP host, which names the source by range.
+/// # Safety
+/// As `dr_v1_file_object_write`, for the range `byte_region::host_range` forms.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_file_object_write(
+    file: *mut c_void,
+    base: *const u8,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+    status: *mut DrFileStatusV1,
+) -> u8 {
+    let source = crate::byte_region::host_range(base.cast_mut(), capacity, offset, length);
+    dr_v1_file_object_write(file, source, length, status)
+}
+
 /// Inspects an initialized opaque owner without acquiring exclusive file access.
 /// Tags: 4 position, 5 length. A retired native obligation reports Closed.
 /// # Safety

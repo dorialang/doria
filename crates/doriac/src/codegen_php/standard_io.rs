@@ -281,22 +281,22 @@ final class __DoriaNativeStandardIo
 
     public function transferResult(int $stream, bool $reading, __DoriaByteRegion $region): void
     {
-        $this->transferRange($stream, $reading, $region->__doriaNativePointer($reading), count($region));
+        $this->transferRange($stream, $reading, $region->__doriaNativeStorage($reading),
+            $region->__doriaRegionOffset(), count($region));
     }
 
     public function transferFields(int $stream, bool $reading, WeakReference $storage,
         int $offset, int $length): void
     {
-        $this->transferRange($stream, $reading,
-            __DoriaByteRegion::__doriaNativeRegionPointer($storage, $offset, $length), $length);
+        $this->transferRange($stream, $reading, __DoriaByteRegion::__doriaNativeSource($storage), $offset, $length);
     }
 
-    private function transferRange(int $stream, bool $reading, ?FFI\CData $data, int $length): void
+    private function transferRange(int $stream, bool $reading, __DoriaBytes $source, int $offset, int $length): void
     {
         __DoriaValueResult::clear();
         $s = &$this->slots;
-        $code = $this->runtime->dr_v1_checked_standard_stream_io(null, $stream, $reading ? 1 : 2,
-            $data, $length, $s['tag'], $s['count'],
+        $code = $this->runtime->dr_v1_host_standard_stream_io(null, $stream, $reading ? 1 : 2,
+            $source->__doriaNativeBase(), count($source), $offset, $length, $s['tag'], $s['count'],
             $s['message'], $s['path'], $s['system'], $s['transferred'], $s['meta']);
         try {
             if ($code === 1) { $this->failure(0, 0, ''); }
@@ -328,7 +328,7 @@ final class __DoriaNativeStandardIo
         $nativePath = $path === null ? null : $runtime->dr_v1_string_from_utf8($path, strlen($path));
         $length = $contents instanceof __DoriaBytes ? count($contents) : strlen($contents ?? '');
         $data = $contents instanceof __DoriaBytes
-            ? ($length === 0 ? null : $runtime->cast('char *', $contents->__doriaNativePointer(0, $length)))
+            ? ($length === 0 ? null : $runtime->cast('char *', $contents->__doriaNativeBase()))
             : $contents;
         try {
             $code = $runtime->dr_v4_checked_io(null, $operation, $nativePath, $data, $length,

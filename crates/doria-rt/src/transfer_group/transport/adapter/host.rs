@@ -443,8 +443,9 @@ pub unsafe extern "C" fn dr_v1_host_transfer_group_action(
 /// Lends the native selector only for this checked configuration call. PHP
 /// obtains a fresh typed source first; no driver address survives that dispatch.
 /// # Safety
-/// Owner/view describe the outstanding preparation. File, source, buffer and
-/// outputs obey checked_pending_request_configure_file's retained-loan contract.
+/// Owner/view describe the outstanding preparation. File, source, the range
+/// `byte_region::host_range` forms and outputs obey
+/// checked_pending_request_configure_file's retained-loan contract.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_host_pending_request_configure_file(
     frame: *const DrStackFrameV2,
@@ -452,7 +453,9 @@ pub unsafe extern "C" fn dr_v1_host_pending_request_configure_file(
     view: *mut c_void,
     file: *mut c_void,
     fresh_source: *const c_void,
-    data: *mut u8,
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
     length: usize,
     error: *mut DrInterfaceCarrierV1,
     message: *mut *mut DrStringV1,
@@ -467,7 +470,7 @@ pub unsafe extern "C" fn dr_v1_host_pending_request_configure_file(
             view,
             file,
             fresh_source,
-            data,
+            crate::byte_region::host_range(base, capacity, offset, length),
             length,
             error,
             message,
@@ -480,8 +483,9 @@ pub unsafe extern "C" fn dr_v1_host_pending_request_configure_file(
 }
 
 /// # Safety
-/// Owner/view describe the outstanding preparation. Stream, source, buffer and
-/// outputs obey checked_pending_request_configure_standard's retained-loan contract.
+/// Owner/view describe the outstanding preparation. Stream, source, the range
+/// `byte_region::host_range` forms and outputs obey
+/// checked_pending_request_configure_standard's retained-loan contract.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_host_pending_request_configure_standard(
     frame: *const DrStackFrameV2,
@@ -489,7 +493,9 @@ pub unsafe extern "C" fn dr_v1_host_pending_request_configure_standard(
     view: *mut c_void,
     stream: u8,
     fresh_source: *const c_void,
-    data: *mut u8,
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
     length: usize,
     error: *mut DrInterfaceCarrierV1,
     message: *mut *mut DrStringV1,
@@ -504,7 +510,7 @@ pub unsafe extern "C" fn dr_v1_host_pending_request_configure_standard(
             view,
             stream,
             fresh_source,
-            data,
+            crate::byte_region::host_range(base, capacity, offset, length),
             length,
             error,
             message,

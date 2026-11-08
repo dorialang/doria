@@ -11,6 +11,42 @@ use super::StandardStream;
 const READ: u8 = 1;
 const WRITE: u8 = 2;
 
+/// `dr_v1_checked_standard_stream_io` for a PHP host, which names the buffer by range.
+/// # Safety
+/// As `dr_v1_checked_standard_stream_io`, for the range `byte_region::host_range` forms.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_standard_stream_io(
+    frame: *const DrStackFrameV2,
+    stream: u8,
+    operation: u8,
+    base: *mut u8,
+    capacity: usize,
+    offset: usize,
+    length: usize,
+    result_tag: *mut u64,
+    result_value: *mut usize,
+    message: *mut *mut DrStringV1,
+    error_path: *mut *mut DrStringV1,
+    system_code: *mut i64,
+    transferred: *mut usize,
+    meta: *mut u64,
+) -> u8 {
+    dr_v1_checked_standard_stream_io(
+        frame,
+        stream,
+        operation,
+        crate::byte_region::host_range(base, capacity, offset, length),
+        length,
+        result_tag,
+        result_value,
+        message,
+        error_path,
+        system_code,
+        transferred,
+        meta,
+    )
+}
+
 /// Borrows a standard view and caller storage for one primitive transfer.
 /// Stream tags: 0 input, 1 output, 2 error. Operation tags: 1 read, 2 write.
 /// Returns 0 success or 1 existing IoError. Read outcomes are 0 Data,

@@ -473,17 +473,16 @@ final class __DoriaBytes implements Countable, IteratorAggregate, __DoriaValueEq
         return new __DoriaByteCell($this, $index, $start, $end, $callable);
     }
 
-    public function __doriaNativePointer(int $offset, int $length): ?FFI\CData
+    /**
+     * The one address view of this storage. A native call names a range by this
+     * base, this owner's count, and integers; the runtime checks the range and
+     * forms the address, so no call allocates an interior view. PHP-array and
+     * empty storage have no base, and the runtime rejects a nonempty range there.
+     */
+    public function __doriaNativeBase(): ?FFI\CData
     {
-        if ($length === 0) { return null; }
-        if (!($this->values instanceof FFI\CData) || $offset < 0 ||
-            $length < 0 || $offset > $this->length || $length > $this->length - $offset) {
-            throw new LogicException("compiler invariant violated: invalid native byte borrow");
-        }
-        if ($offset === 0) {
-            return $this->nativeBase ??= FFI::addr($this->values[0]);
-        }
-        return FFI::addr($this->values[$offset]);
+        if ($this->length === 0 || !($this->values instanceof FFI\CData)) { return null; }
+        return $this->nativeBase ??= FFI::addr($this->values[0]);
     }
 
     /** WritableByteRegion::copyFrom storage step; the caller checked both ranges. */
@@ -491,11 +490,10 @@ final class __DoriaBytes implements Countable, IteratorAggregate, __DoriaValueEq
     {
         if ($count === 0) { return; }
         if ($this->values instanceof FFI\CData && $source->values instanceof FFI\CData) {
-            // Only copyWithin shares storage, and its ranges may overlap: copy
-            // through a snapshot there. Distinct storage cannot overlap.
-            $from = FFI::addr($source->values[$sourceOffset]);
-            FFI::memcpy(FFI::addr($this->values[$offset]),
-                $source === $this ? FFI::string($from, $count) : $from, $count);
+            // The runtime copies correctly when copyWithin's ranges overlap.
+            __DoriaNativeIo::get()->dr_v1_host_byte_range_copy(
+                $this->__doriaNativeBase(), $this->length, $offset,
+                $source->__doriaNativeBase(), $source->length, $sourceOffset, $count);
             return;
         }
         $bytes = [];
@@ -553,8 +551,6 @@ final class __DoriaByteCell extends __DoriaCell
 
 final class __DoriaByteRegion implements Countable
 {
-    private ?FFI\CData $nativePointer = null;
-
     private function __construct(private readonly WeakReference $storage,
         private readonly int $offset, private readonly int $length,
         private readonly bool $writable) {}
@@ -589,11 +585,10 @@ final class __DoriaByteRegion implements Countable
             $this->writable, 0, $this->length, $this->writable, 0, 0, '');
     }
 
-    public static function __doriaNativeRegionPointer(WeakReference $storage,
-        int $offset, int $length): ?FFI\CData
+    /** The live owner of a scalar region; the caller holds it through the native call. */
+    public static function __doriaNativeSource(WeakReference $storage): __DoriaBytes
     {
-        $source = $storage->get() ?? throw new LogicException("MIR byte region outlived its source");
-        return $source->__doriaNativePointer($offset, $length);
+        return $storage->get() ?? throw new LogicException("MIR byte region outlived its source");
     }
 
     public static function __doriaGet(WeakReference $storage, int $offset, int $length,
@@ -640,14 +635,13 @@ final class __DoriaByteRegion implements Countable
 
     public function count(): int { return $this->length; }
 
-    public function __doriaNativePointer(bool $writable): ?FFI\CData
+    /** The live owner a native transfer addresses; the caller holds it through the call. */
+    public function __doriaNativeStorage(bool $writable): __DoriaBytes
     {
         if ($writable && !$this->writable) {
             throw new LogicException("MIR native transfer upgraded readonly access");
         }
-        // Cached CData pointers do not own the buffer; check its lifetime on every use.
-        $source = $this->source();
-        return $this->nativePointer ??= $source->__doriaNativePointer($this->offset, $this->length);
+        return $this->source();
     }
 
     public function __doriaWriteBytes(string $bytes): void

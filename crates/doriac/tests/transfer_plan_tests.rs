@@ -505,7 +505,7 @@ fn php_setup_uses_the_shared_runtime_and_matches_checked_failure() {
         BackendOutput::TextWithRuntime { contents, .. } => contents,
         _ => panic!("plan configuration needs the checked native runtime"),
     };
-    assert!(contents.contains("dr_v1_checked_transfer_plan_append"));
+    assert!(contents.contains("dr_v1_host_transfer_plan_append"));
     let directory = native_execution::ExecutionDirectory::new();
     std::fs::write(directory.path().join("input"), b"unread bytes\n").unwrap();
     let path = directory.path().join("main.php");
