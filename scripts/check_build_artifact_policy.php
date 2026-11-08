@@ -14,6 +14,7 @@ $cargo = read('Cargo.toml');
 $agents = read('AGENTS.md');
 $contributing = read('CONTRIBUTING.md');
 $validator = read('scripts/validate_work_unit.php');
+$vetCommands = read('scripts/vet_commands.php');
 $refresh = read('scripts/refresh_development_toolchain.php');
 $compilerMain = read('crates/doriac/src/main.rs');
 $runtimeArtifact = read('crates/doriac/src/runtime_artifact.rs');
@@ -107,7 +108,7 @@ foreach ([
     'io_progress_native_structure_tests',
 ] as $suite) {
     if (
-        !str_contains($validator, "'{$suite}'")
+        !str_contains($vetCommands, "'{$suite}'")
         || !str_contains($llvmStep, "--test {$suite}\n")
     ) {
         $failures[] = "missing canonical local or tier-1 LLVM stream suite: {$suite}";

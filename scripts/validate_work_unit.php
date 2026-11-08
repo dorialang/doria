@@ -5,6 +5,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/cargo_artifacts.php';
 require_once __DIR__ . '/cargo_artifact_cleanup.php';
+require_once __DIR__ . '/vet_commands.php';
 
 const CACHE_POLICY_VERSION = 1;
 const UNTRACKED_CACHE_BYTES = 256 * 1024 * 1024;
@@ -205,6 +206,9 @@ function default_commands(string $root, string $target): array
         command(['php', 'scripts/check_test_callback_guards.php'], $target),
         command(['php', 'scripts/check_ci_timeouts.php'], $target),
         command(['php', 'scripts/check_ci_shells.php'], $target),
+        command(['php', 'scripts/check_vet_covers_ci.php'], $target),
+        command(['php', 'scripts/test_cross_repo_pins.php'], $target),
+        command(['php', 'scripts/check_cross_repo_pins.php'], $target),
         command(['php', 'scripts/check_docs_authority.php'], $target),
         command(['php', 'scripts/check_diagnostic_style.php'], $target),
         command(['php', 'scripts/check_panic_catalogue.php'], $target),
@@ -329,47 +333,10 @@ function llvm_commands(string $target): array
         command(['cargo', 'clippy', '-p', 'doriac', '--all-targets', '--features', 'llvm-backend', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '-p', 'doriac', '--lib', '--features', 'llvm-backend', '--locked'], $target),
     ];
-    foreach ([
-        'mir_validation_tests',
-        'llvm_mir_tests',
-        'cli_tests',
-        'constructor_owned_property_tests',
-        'stage17_io_tests',
-        'stage18_tests',
-        'stage21_tests',
-        'stage22_tests',
-        'stage25a_tests',
-        'stage27_tests',
-        'return_borrow_alias_tests',
-        'writable_borrow_writeback_tests',
-        'returned_closure_transport_tests',
-        'stage35_runtime_tests',
-        'stage35a_optimizer_tests',
-        'stage36_property_hook_tests',
-        'property_hook_initializer_tests',
-        'property_hook_cleanup_effect_tests',
-        'php_integer_execution_tests',
-        'bytes_allocate_tests',
-        'byte_region_execution_tests',
-        'byte_region_mir_validation_tests',
-        'byte_region_transport_tests',
-        'byte_region_native_structure_tests',
-        'consuming_receiver_tests',
-        'stream_capability_tests',
-        'time_contract_tests',
-        'nullable_default_tests',
-        'registration_key_tests',
-        'readiness_set_contract_tests',
-        'transfer_plan_tests',
-        'pending_stream_contract_tests',
-        'pending_selected_storage_tests',
-        'pending_selected_storage_mir_tests',
-        'io_progress_native_structure_tests',
-        'indexed_access_span_tests',
-        'performance_report_tests',
-        'native_testing_slice1_tests',
-        'native_mir_parity_tests',
-    ] as $suite) {
+    foreach (release_runtime_tests() as $runtimeTest) {
+        $commands[] = command($runtimeTest, $target);
+    }
+    foreach (llvm_test_suites() as $suite) {
         $commands[] = command(
             ['cargo', 'test', '-p', 'doriac', '--test', $suite, '--features', 'llvm-backend', '--locked'],
             $target,

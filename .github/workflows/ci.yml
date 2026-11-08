@@ -290,6 +290,7 @@ jobs:
           php scripts/check_test_callback_guards.php
           php scripts/check_ci_timeouts.php
           php scripts/check_ci_shells.php
+          php scripts/check_vet_covers_ci.php
 
       - name: Check documentation authority
         run: php scripts/check_docs_authority.php
