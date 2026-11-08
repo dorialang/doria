@@ -9,6 +9,7 @@ pub mod contracts;
 mod enum_inference;
 #[cfg(test)]
 mod enum_specialization_tests;
+pub(crate) mod executable_effects;
 mod instantiation;
 mod interface_witnesses;
 mod nominal_proof;
@@ -412,6 +413,9 @@ pub struct SemanticInfo {
     pub callable_signatures: HashMap<Span, CallableSignatureSemanticInfo>,
     /// Exact checked effects produced at each source operation.
     pub(crate) checked_effect_sites: crate::checked_effects::EffectSiteMap,
+    /// What each specialization's transport carries. Backends read this for
+    /// signatures and catch routing; diagnostics never do.
+    pub(crate) executable_effects: std::sync::Arc<executable_effects::ExecutableEffects>,
     /// Resolved owned Error type transferred by each `throw` statement.
     pub throw_error_types: HashMap<Span, ResolvedType>,
     /// Protected effects left after catch coverage for each `try` statement.
@@ -1370,6 +1374,7 @@ fn finish_checked_analysis(
             ))
         }
     };
+    let executable_effects = std::sync::Arc::new(checker.collect_executable_effects());
     let ownership_program = checker.callable_body_program();
     let (specialized_ownership, mut ownership_analysis) = checker.analyze_ownership(
         ownership_program,
@@ -1572,6 +1577,7 @@ fn finish_checked_analysis(
             exact_method_calls: checker.exact_method_calls,
             callable_signatures,
             checked_effect_sites: checker.checked_effect_sites,
+            executable_effects,
             throw_error_types: checker.throw_error_types,
             try_uncovered_effects: checker.try_uncovered_effects,
             catch_error_types: checker.catch_error_types,
@@ -2909,6 +2915,12 @@ struct Checker<'program> {
     active_loop_depth: usize,
     finalizer_boundaries: Vec<FinalizerBoundary>,
     effect_scopes: Vec<CheckedEffectSet>,
+    /// Where each effect site's contributions come from, for the executable view.
+    effect_site_sources: HashMap<Span, Vec<executable_effects::SiteSource>>,
+    /// The checked region structure of every body, for the executable view.
+    effect_regions: executable_effects::Regions,
+    /// Automatic effects that escape statements outside every callable.
+    unscoped_automatic_effects: HashMap<crate::source::SourceId, Vec<ResolvedType>>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
     callable_observed_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     /// Escaping authored reach of each checked body (`CheckedEffectSet::reach`).
@@ -3031,6 +3043,10 @@ enum FunctionTypeMismatch {
 struct CheckedEffectSet {
     ordered: Vec<TypeId>,
     reach: Vec<TypeId>,
+    /// Effects the scope starts with, before any member (`ordered` holds them too).
+    seed: Vec<TypeId>,
+    /// The sites and nested regions recorded directly in this scope.
+    members: Vec<executable_effects::Member>,
 }
 
 impl CheckedEffectSet {
@@ -3748,6 +3764,9 @@ impl<'program> Checker<'program> {
             active_loop_depth: 0,
             finalizer_boundaries: Vec::new(),
             effect_scopes: Vec::new(),
+            effect_site_sources: HashMap::new(),
+            effect_regions: executable_effects::Regions::default(),
+            unscoped_automatic_effects: HashMap::new(),
             class_initializer_effects: HashMap::new(),
             callable_observed_checked_effects: HashMap::new(),
             callable_observed_reach_effects: HashMap::new(),
@@ -3873,10 +3892,50 @@ impl<'program> Checker<'program> {
                 Item::Trait(declaration) => self.check_trait_bodies(declaration),
             }
         }
+        self.attach_entry_prelude_effects();
         // Closure capture identities are available only after checking bodies.
         // Publish their returned loans before comparing callable contracts.
         self.infer_return_borrow_signatures(true);
         self.check_pending_availability_calls();
+    }
+
+    /// The selected entrypoint's frame runs its source's top-level statements,
+    /// so the automatic effects that escape them are the entrypoint's own.
+    fn attach_entry_prelude_effects(&mut self) {
+        let Some(entry) = self
+            .callable_body_program()
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(function) if self.is_accepted_program_entrypoint(function) => {
+                    Some(function.span)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Some(effects) = self.unscoped_automatic_effects.get(&entry.source).cloned() else {
+            return;
+        };
+        for observed in [
+            &mut self.callable_observed_checked_effects,
+            &mut self.callable_observed_reach_effects,
+        ] {
+            let target = observed.entry(entry).or_default();
+            for effect in &effects {
+                if !target.contains(effect) {
+                    target.push(effect.clone());
+                }
+            }
+        }
+        if let Some(root) = self.effect_regions.roots.get_mut(&entry) {
+            for effect in effects {
+                if !root.seed.contains(&effect) {
+                    root.seed.push(effect);
+                }
+            }
+        }
     }
 
     fn check_attributes(&mut self) {
@@ -8901,6 +8960,7 @@ impl<'program> Checker<'program> {
             if let Some(class_name) = method_context.as_ref().map(|context| &context.class_name) {
                 if let Some(initializer_effects) = self.class_initializer_effects.get(class_name) {
                     body_effects.extend_set(initializer_effects);
+                    body_effects.seed = initializer_effects.ordered.clone();
                 }
             }
         }
@@ -9001,6 +9061,8 @@ impl<'program> Checker<'program> {
         }
         let body_effects = self.effect_scopes.pop().expect("callable effect scope");
         if body.is_some() {
+            let region = self.effect_region(&body_effects);
+            self.effect_regions.roots.insert(function.span, region);
             self.callable_observed_checked_effects.insert(
                 function.span,
                 body_effects
@@ -9236,10 +9298,77 @@ impl<'program> Checker<'program> {
         self.record_effect_profiles(effects.clone(), effects, span);
     }
 
-    /// Record a region's or a call's two profiles (see `CheckedEffectSet`).
-    /// Effect sites and catch routing keep transport; the enclosing scope
-    /// receives both, and an unenclosed occurrence is judged by its reach.
+    /// Record an operation's two profiles (see `CheckedEffectSet`): what it
+    /// raises is the same in every specialization.
     fn record_effect_profiles(&mut self, transport: Vec<TypeId>, reach: Vec<TypeId>, span: Span) {
+        let effects = self.resolved_effects(&transport);
+        self.record_site_source(span, executable_effects::SiteSource::Operation(effects));
+        self.publish_effect_profiles(
+            transport,
+            reach,
+            span,
+            Some(executable_effects::Member::Site(span)),
+        );
+    }
+
+    /// Record a call's two profiles and the callee each specialization selects.
+    fn record_call_effect_profiles(
+        &mut self,
+        transport: Vec<TypeId>,
+        reach: Vec<TypeId>,
+        span: Span,
+        callee: executable_effects::Callee,
+    ) {
+        let effects = self.resolved_effects(&transport);
+        self.record_site_source(
+            span,
+            executable_effects::SiteSource::Call { callee, effects },
+        );
+        self.publish_effect_profiles(
+            transport,
+            reach,
+            span,
+            Some(executable_effects::Member::Site(span)),
+        );
+    }
+
+    fn resolved_effects(&self, effects: &[TypeId]) -> Vec<ResolvedType> {
+        effects
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .collect()
+    }
+
+    /// Sources describe a body being checked. Re-selection for a concrete
+    /// instance happens after checking, outside every scope, and is exactly
+    /// what the executable view derives per specialization.
+    fn record_site_source(&mut self, span: Span, source: executable_effects::SiteSource) {
+        if self.effect_scopes.is_empty() {
+            return;
+        }
+        executable_effects::merge_site_source(
+            self.effect_site_sources.entry(span).or_default(),
+            source,
+        );
+    }
+
+    fn effect_region(&self, scope: &CheckedEffectSet) -> executable_effects::Region {
+        executable_effects::Region {
+            seed: self.resolved_effects(&scope.seed),
+            members: scope.members.clone(),
+        }
+    }
+
+    /// Effect sites and catch routing keep transport; the enclosing scope
+    /// receives both profiles and the region member, and an unenclosed
+    /// occurrence is judged by its reach.
+    fn publish_effect_profiles(
+        &mut self,
+        transport: Vec<TypeId>,
+        reach: Vec<TypeId>,
+        span: Span,
+        member: Option<executable_effects::Member>,
+    ) {
         crate::checked_effects::record_effect_site(
             &mut self.checked_effect_sites,
             span,
@@ -9248,7 +9377,28 @@ impl<'program> Checker<'program> {
         if let Some(scope) = self.effect_scopes.last_mut() {
             scope.extend(transport.iter().copied());
             scope.extend_reach(reach);
+            if let Some(member) = member {
+                if !scope.members.contains(&member) {
+                    scope.members.push(member);
+                }
+            }
             return;
+        }
+        let automatic = transport
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .filter(crate::checked_effects::is_automatic_effect)
+            .collect::<Vec<_>>();
+        if !automatic.is_empty() {
+            let escaping = self
+                .unscoped_automatic_effects
+                .entry(span.source)
+                .or_default();
+            for effect in automatic {
+                if !escaping.contains(&effect) {
+                    escaping.push(effect);
+                }
+            }
         }
         let mut effects = transport;
         extend_type_ids(&mut effects, reach);
@@ -9412,6 +9562,7 @@ impl<'program> Checker<'program> {
         callee: callable_contracts::EffectDependency,
         transport: Vec<TypeId>,
         span: Span,
+        source: Option<executable_effects::Callee>,
     ) {
         let mut reach = transport.clone();
         let callee_reach = self.ambient_reach_seed.effects(callee).to_vec();
@@ -9421,7 +9572,10 @@ impl<'program> Checker<'program> {
                 reach.push(effect);
             }
         }
-        self.record_effect_profiles(transport, reach, span);
+        match source {
+            Some(source) => self.record_call_effect_profiles(transport, reach, span, source),
+            None => self.record_effect_profiles(transport, reach, span),
+        }
     }
 
     fn check_parameter_default_support(
@@ -10337,6 +10491,11 @@ impl<'program> Checker<'program> {
             loop_depth,
         );
         let protected = self.effect_scopes.pop().expect("try effect scope");
+        let mut try_region = executable_effects::TryRegion {
+            body: self.effect_region(&protected),
+            catches: Vec::new(),
+            finally: None,
+        };
         let mut uncovered = protected.clone();
         let mut seen_catches = Vec::new();
         let mut saw_error_catch = false;
@@ -10473,6 +10632,12 @@ impl<'program> Checker<'program> {
             }
             let mut catch_constructor =
                 constructor_init_context.map(ConstructorInitContext::nested);
+            // A handler's effects escape to the enclosing scope exactly as
+            // before; its own scope only names which ones belong to it.
+            let enclosed = !self.effect_scopes.is_empty();
+            if enclosed {
+                self.effect_scopes.push(CheckedEffectSet::default());
+            }
             self.check_block(
                 &catch.body,
                 &mut catch_scopes,
@@ -10481,6 +10646,18 @@ impl<'program> Checker<'program> {
                 return_context,
                 loop_depth,
             );
+            if enclosed {
+                let handler = self.effect_scopes.pop().expect("catch effect scope");
+                try_region.catches.push(executable_effects::CatchRegion {
+                    span: catch.span,
+                    catches_all,
+                    body: self.effect_region(&handler),
+                });
+                self.effect_scopes
+                    .last_mut()
+                    .expect("enclosing effect scope")
+                    .extend_set(&handler);
+            }
             catch_scopes.pop();
         }
 
@@ -10505,10 +10682,12 @@ impl<'program> Checker<'program> {
                 .pop()
                 .expect("checked try finalizer boundary");
             let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-            self.record_effect_profiles(
+            try_region.finally = Some(self.effect_region(&finalizer_effects));
+            self.publish_effect_profiles(
                 finalizer_effects.ordered,
                 finalizer_effects.reach,
                 finally.span,
+                None,
             );
         }
 
@@ -10520,7 +10699,13 @@ impl<'program> Checker<'program> {
                 .map(|effect| self.types.resolved(*effect))
                 .collect(),
         );
-        self.record_effect_profiles(uncovered.ordered, uncovered.reach, statement.span);
+        self.effect_regions.tries.insert(statement.span, try_region);
+        self.publish_effect_profiles(
+            uncovered.ordered,
+            uncovered.reach,
+            statement.span,
+            Some(executable_effects::Member::Try(statement.span)),
+        );
     }
 
     fn check_local_declaration(
@@ -11140,10 +11325,13 @@ impl<'program> Checker<'program> {
             .pop()
             .expect("checked finalizer boundary");
         let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-        self.record_effect_profiles(
+        let region = self.effect_region(&finalizer_effects);
+        self.effect_regions.finalizers.insert(finally.span, region);
+        self.publish_effect_profiles(
             finalizer_effects.ordered,
             finalizer_effects.reach,
             finally.span,
+            Some(executable_effects::Member::Finalizer(finally.span)),
         );
         self.active_loop_depth = loop_depth;
     }
@@ -14053,6 +14241,14 @@ impl<'program> Checker<'program> {
         self.finalizer_boundaries = enclosing_finalizers;
         self.active_loop_depth = enclosing_loop_depth;
         let inferred_effects = self.effect_scopes.pop().expect("closure effect scope");
+        let region = self.effect_region(&inferred_effects);
+        self.effect_regions.roots.insert(closure.span, region);
+        if let Some(enclosing) = self.effect_scopes.last_mut() {
+            let member = executable_effects::Member::Closure(closure.span);
+            if !enclosing.members.contains(&member) {
+                enclosing.members.push(member);
+            }
+        }
         self.closure_reach_effects
             .insert(closure_id, inferred_effects.reach.clone());
         let mut active = self.active_closures.pop().expect("active closure");
@@ -16697,7 +16893,17 @@ impl<'program> Checker<'program> {
         ) {
             self.display_conversion_sites.insert(expr.span());
             let effects = self.complete_function_value_effects(&[], expr.span());
-            self.record_checked_effects(effects, expr.span());
+            let receiver = self.types.resolved(ty);
+            self.record_call_effect_profiles(
+                effects.clone(),
+                effects,
+                expr.span(),
+                executable_effects::Callee::Selected {
+                    receiver,
+                    member: "toString".to_string(),
+                    call: false,
+                },
+            );
         }
     }
 
@@ -18229,6 +18435,11 @@ impl<'program> Checker<'program> {
                 callable_contracts::EffectDependency::Exact(function_info.declaration),
                 function_info.checked_effects,
                 span,
+                Some(executable_effects::Callee::Named {
+                    declaration: function_info.declaration,
+                    owner: None,
+                    slot: false,
+                }),
             );
         }
     }
@@ -20007,10 +20218,19 @@ impl<'program> Checker<'program> {
             method_context,
         );
         if self.diagnostics.len() == diagnostics_before {
+            let owner = self.types.intern(TypeKind::Class(class_type.clone()));
+            let ResolvedType::Class(owner) = self.types.resolved(owner) else {
+                unreachable!("interned constructor class type must resolve as a class");
+            };
             self.record_named_call_effects(
                 callable_contracts::EffectDependency::Exact(constructor.declaration),
                 constructor.checked_effects,
                 span,
+                Some(executable_effects::Callee::Named {
+                    declaration: constructor.declaration,
+                    owner: Some(owner),
+                    slot: false,
+                }),
             );
         }
     }

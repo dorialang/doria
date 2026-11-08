@@ -44,7 +44,7 @@ pub(super) fn guarded(
     diagnostic: bool,
     scopes: &PhpNameScopes,
 ) -> String {
-    let checked = scopes.specialization.has_checked_effects(expr.span());
+    let checked = scopes.has_checked_effects(expr.span());
     let diagnostic = diagnostic && !scopes.compiler_owned_callable;
     if checked || diagnostic {
         if let Some(root) = &scopes.expression_region {

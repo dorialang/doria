@@ -2572,7 +2572,14 @@ function __doria_printf(
         })
         .collect();
     emit_closure_entries(None, &mut output, 0, &scopes);
-    for item in &program.items {
+    // PHP binds a class that implements an interface or extends a parent when
+    // execution reaches it, so every declaration precedes the statements that
+    // run, whichever source order the program lists them in.
+    let (statements, declarations): (Vec<_>, Vec<_>) = program
+        .items
+        .iter()
+        .partition(|item| matches!(item, Item::Statement(_)));
+    for item in declarations.into_iter().chain(statements) {
         emit_item(item, &program.semantic_info, &mut output, 0, &mut scopes);
         if !output.ends_with("\n\n") {
             output.push('\n');
@@ -4193,6 +4200,9 @@ struct PhpNameScopes {
     expression_inputs: Vec<String>,
     current_callable: Option<String>,
     compiler_owned_callable: bool,
+    /// The current specialization's executable effects, when it has its own.
+    executable_effects:
+        Option<std::sync::Arc<crate::semantics::executable_effects::InstanceEffects>>,
     current_class: Option<String>,
     closure_owner: Option<mir::ClosureOwner>,
     current_class_id: Option<crate::class_layout::ClassId>,
@@ -4269,6 +4279,19 @@ impl PhpBindingPlace {
 }
 
 impl PhpNameScopes {
+    /// Whether an operation can raise in this specialization, which decides
+    /// whether it needs an origin guard.
+    fn has_checked_effects(&self, span: Span) -> bool {
+        match self
+            .executable_effects
+            .as_ref()
+            .and_then(|effects| effects.site(span))
+        {
+            Some(effects) => !effects.is_empty(),
+            None => self.specialization.has_checked_effects(span),
+        }
+    }
+
     fn new(symbols: PhpScopeSymbols, closure_plan: Rc<PhpClosurePlan>) -> Self {
         Self {
             diagnostic_sites: Rc::default(),
@@ -4298,6 +4321,7 @@ impl PhpNameScopes {
             expression_inputs: Vec::new(),
             current_callable: None,
             compiler_owned_callable: false,
+            executable_effects: None,
             current_class: None,
             closure_owner: None,
             current_class_id: None,
@@ -4342,6 +4366,7 @@ impl PhpNameScopes {
         scopes.const_evaluation = self.const_evaluation.clone();
         scopes.current_callable = self.current_callable.clone();
         scopes.compiler_owned_callable = self.compiler_owned_callable;
+        scopes.executable_effects = self.executable_effects.clone();
         scopes.current_class = self.current_class.clone();
         scopes.closure_owner = self.closure_owner;
         scopes.current_class_id = self.current_class_id;

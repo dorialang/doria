@@ -1481,6 +1481,11 @@ impl Plan {
         let mut scopes = scopes.expression_scope();
         scopes.closure_owner = Some(mir::ClosureOwner::Callable(callable.id));
         scopes.compiler_owned_callable = callable.compiler_owned;
+        scopes.executable_effects = self
+            .semantic
+            .executable_effects
+            .instance(callable.declaration, &callable.substitutions)
+            .cloned();
         scopes.substitutions = callable.substitutions.clone();
         scopes.expression_types = php_expression_types(&self.semantic);
         scopes.type_test_types = self.semantic.type_test_types.clone();

@@ -82,12 +82,10 @@ calls and constrained core operations do. A catch for ambient I/O around such
 a call is therefore never unreachable, and a generic template's diagnostics
 never depend on its callers. A trait member with a body is the trait's own
 implementation, so a call to it keeps that member's exact profile; each
-composed copy is checked again with the composer's members. Every
-specialization currently shares the template contract. Exact
-per-specialization contracts would narrow only the executable ABI, never the
-template's diagnostics. Each call's executable transport belongs to its
-selected callee, so an effect-free selection uses the ordinary call. (Amended
-2026-11-06, Stage 36a decision log entry 51.)
+composed copy is checked again with the composer's members. Each call's
+executable transport belongs to its selected callee, so an effect-free
+selection uses the ordinary call. (Amended 2026-11-06, Stage 36a decision log
+entry 51.)
 
 Every checked region carries two ambient profiles. Authored reach is what the
 body may raise, judged from its own syntax. A named callee contributes its own
@@ -104,6 +102,19 @@ it compiles to a route that is never taken. A composed trait copy has exact
 transport and its authored member's reach. The authored member's check alone decides the copy's catches.
 No caller, closure, or composer elsewhere in the program changes a body's
 diagnostics. (Amended 2026-11-07, Stage 36a decision log entry 52.)
+
+Transport is exact per specialization. Each callable instance's contract, catch
+routing and origin guards come from what that instance selects, computed as a
+least fixpoint over the instance call graph. `go<Quiet>` uses the ordinary ABI
+when its selected `release` performs no I/O, and so does a non-generic caller of
+it. A handler no Error can reach in a specialization is not lowered in it.
+Required Errors and explicit ambient `throws` entries stay, because both are
+authored contract. Erased interface calls dispatch over an open implementer set
+and virtual slots over their family, so both keep their dispatch-wide profile.
+None of this changes authored reach or any diagnostic. The selected entrypoint's
+contract includes the automatic effects of its source's top-level statements,
+which run in its frame. (Amended 2026-11-08, Stage 36a decision log "Exact
+per-specialization contracts".)
 
 ### Fallible source finalizers
 

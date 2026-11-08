@@ -15,6 +15,7 @@ use crate::monomorphization::{
     InterfaceGenericCall,
 };
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
+use crate::semantics::executable_effects::InstanceEffects;
 use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
 use crate::source::Span;
 use crate::types::{
@@ -740,6 +741,7 @@ fn lower_virtual_family(
             class_ids: classes,
             semantic_info,
             substitutions: &substitutions,
+            executable_effects: None,
         },
         SignatureOptions {
             lifecycle: false,
@@ -1809,6 +1811,11 @@ fn lower_program_impl(
                 class_ids: &class_ids,
                 semantic_info: &signature_semantics,
                 substitutions: &substitutions,
+                executable_effects: program
+                    .semantic_info
+                    .executable_effects
+                    .instance(function.span, &substitutions)
+                    .map(|effects| effects.as_ref()),
             },
             SignatureOptions {
                 lifecycle: matches!(function.name.as_str(), "__construct" | "__destruct"),
@@ -2039,6 +2046,11 @@ fn lower_program_impl(
             error_origin_ids: &error_origin_ids,
             closure_plans,
             closure_environment_layouts: &closure_environment_layouts,
+            executable_effects: program
+                .semantic_info
+                .executable_effects
+                .instance(declaration.function.span, substitutions)
+                .map(|effects| effects.as_ref()),
         };
         let direct = signature.direct_signature();
         functions.push(lower_function(
@@ -2095,6 +2107,11 @@ fn lower_program_impl(
                     error_origin_ids: &error_origin_ids,
                     closure_plans,
                     closure_environment_layouts: &closure_environment_layouts,
+                    executable_effects: program
+                        .semantic_info
+                        .executable_effects
+                        .instance(declaration.function.span, substitutions)
+                        .map(|effects| effects.as_ref()),
                 },
                 declaration.class,
                 metrics.as_deref_mut(),
@@ -2126,6 +2143,7 @@ fn lower_program_impl(
                     error_origin_ids: &error_origin_ids,
                     closure_plans: &initializer.closure_plans,
                     closure_environment_layouts: &closure_environment_layouts,
+                    executable_effects: None,
                 },
                 Some(initializer.class),
                 metrics.as_deref_mut(),
@@ -2219,6 +2237,7 @@ fn lower_program_impl(
                         class_ids: &class_ids,
                         semantic_info: &program.semantic_info,
                         substitutions: &substitutions,
+                        executable_effects: None,
                     },
                     SignatureOptions {
                         lifecycle: false,
@@ -2278,6 +2297,7 @@ fn lower_program_impl(
                             class_ids: &class_ids,
                             semantic_info: &program.semantic_info,
                             substitutions: &substitutions,
+                            executable_effects: None,
                         },
                         SignatureOptions {
                             lifecycle: false,
@@ -3264,7 +3284,31 @@ fn collect_function_signature(
         class_ids,
         semantic_info,
         substitutions,
+        executable_effects,
     } = context;
+    let narrowed = executable_effects
+        .and_then(InstanceEffects::contract)
+        .map(|contract| {
+            (
+                crate::checked_effects::CheckedEffectProfile::classify(contract.iter().cloned()),
+                contract,
+            )
+        });
+    let (required_effects, ambient_effects, test_assertion_effects, complete_effects) =
+        match &narrowed {
+            Some((profile, contract)) => (
+                profile.required.as_slice(),
+                profile.ambient.as_slice(),
+                profile.test_assertion.as_slice(),
+                *contract,
+            ),
+            None => (
+                function.required_checked_effects.as_slice(),
+                function.ambient_checked_effects.as_slice(),
+                function.test_assertion_checked_effects.as_slice(),
+                function.checked_effects.as_slice(),
+            ),
+        };
     let return_type = collect_function_return_type(
         function,
         class_ids,
@@ -3404,8 +3448,7 @@ fn collect_function_signature(
         parameter_owns,
         method_class: None,
         receiver_mode: None,
-        required_checked_effects: function
-            .required_checked_effects
+        required_checked_effects: required_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -3421,8 +3464,7 @@ fn collect_function_signature(
                 })
             })
             .collect::<DiagnosticResult<Vec<_>>>()?,
-        ambient_checked_effects: function
-            .ambient_checked_effects
+        ambient_checked_effects: ambient_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -3438,8 +3480,7 @@ fn collect_function_signature(
                 })
             })
             .collect::<DiagnosticResult<Vec<_>>>()?,
-        test_assertion_checked_effects: function
-            .test_assertion_checked_effects
+        test_assertion_checked_effects: test_assertion_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -3455,8 +3496,7 @@ fn collect_function_signature(
                 })
             })
             .collect::<DiagnosticResult<Vec<_>>>()?,
-        checked_effects: function
-            .checked_effects
+        checked_effects: complete_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -3480,6 +3520,8 @@ struct SignatureContext<'a> {
     class_ids: &'a ClassIds,
     semantic_info: &'a SemanticInfo,
     substitutions: &'a HashMap<String, crate::types::ResolvedType>,
+    /// This specialization's executable effects, when it has its own.
+    executable_effects: Option<&'a InstanceEffects>,
 }
 
 #[derive(Clone, Copy)]
@@ -3663,6 +3705,8 @@ struct FunctionLoweringInputs<'a> {
     error_origin_ids: &'a HashMap<Span, mir::ErrorOriginId>,
     closure_plans: &'a HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     closure_environment_layouts: &'a [mir::ClosureEnvironmentLayout],
+    /// This specialization's catch routing, when it differs from the template.
+    executable_effects: Option<&'a InstanceEffects>,
 }
 
 fn lower_function(
@@ -5268,14 +5312,20 @@ fn lower_try_statement(
         );
     }
 
-    let catch_entries = statement
+    // A handler this specialization can never enter is not part of its body:
+    // no Error reaching the dispatcher can match its type.
+    let handlers = statement
         .catches
+        .iter()
+        .filter(|clause| context.catch_reachable(clause.span))
+        .collect::<Vec<_>>();
+    let catch_entries = handlers
         .iter()
         .map(|_| context.create_block())
         .collect::<Vec<_>>();
     let fallback = context.create_block();
     context.current_block = Some(dispatcher);
-    for (clause, entry) in statement.catches.iter().zip(catch_entries.iter().copied()) {
+    for (clause, entry) in handlers.iter().zip(catch_entries.iter().copied()) {
         let ty = context
             .mir_resolved_type(&clause.error_type)
             .expect("checked catch type has executable MIR metadata");
@@ -5298,7 +5348,7 @@ fn lower_try_statement(
         context.terminate_current(mir::Terminator::Jump(fallback));
     }
 
-    for (clause, entry) in statement.catches.iter().zip(catch_entries) {
+    for (clause, entry) in handlers.iter().zip(catch_entries) {
         context.push_scope();
         context.current_block = Some(entry);
         let catch_ty = context
@@ -5344,7 +5394,7 @@ fn lower_try_statement(
     }
 
     context.current_block = Some(fallback);
-    if statement.uncovered_effects.is_empty() {
+    if context.try_has_no_uncovered_effects(statement) {
         context.terminate_current(mir::Terminator::Unreachable);
     } else {
         context.route_checked_error(protected_error);
@@ -8924,6 +8974,7 @@ struct LoweringContext<'semantic> {
     signatures: HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'semantic SemanticInfo,
+    executable_effects: Option<&'semantic InstanceEffects>,
     property_initializers: HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
     static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: NativeTypeRegistry,
@@ -9044,6 +9095,7 @@ impl<'semantic> LoweringContext<'semantic> {
             signatures: inputs.signatures.clone(),
             method_signatures: inputs.method_signatures.clone(),
             semantic_info: inputs.semantic_info,
+            executable_effects: inputs.executable_effects,
             property_initializers: inputs.property_initializers.clone(),
             static_ids: inputs.static_ids.clone(),
             collection_registry: inputs.collection_registry.clone(),
@@ -9510,6 +9562,18 @@ impl<'semantic> LoweringContext<'semantic> {
                 error: target.error,
                 destination: target.destination,
             })
+    }
+
+    fn catch_reachable(&self, catch: Span) -> bool {
+        self.executable_effects
+            .is_none_or(|effects| effects.catch_reachable(catch))
+    }
+
+    fn try_has_no_uncovered_effects(&self, statement: &hir::TryStmt) -> bool {
+        self.executable_effects
+            .and_then(|effects| effects.try_uncovered(statement.span))
+            .unwrap_or(&statement.uncovered_effects)
+            .is_empty()
     }
 
     fn route_checked_error(&mut self, source: mir::LocalId) {

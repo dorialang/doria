@@ -992,7 +992,12 @@ impl Checker<'_> {
         else {
             return false;
         };
-        self.record_selected_contract_effects(&target, &method, span);
+        self.record_selected_effects(
+            &target,
+            &method,
+            span,
+            super::executable_effects::SelectedUse::Implicit,
+        );
         let call = CoreValueCallInfo {
             operation,
             receiver_type: self.types.resolved(ty),
@@ -1073,9 +1078,31 @@ impl Checker<'_> {
         method: &MethodInfo,
         span: Span,
     ) -> Vec<TypeId> {
+        self.record_selected_effects(
+            target,
+            method,
+            span,
+            super::executable_effects::SelectedUse::Call,
+        )
+    }
+
+    /// Record a contract-selected member use and return its transport. `selected`
+    /// says how each specialization finds the member again.
+    pub(super) fn record_selected_effects(
+        &mut self,
+        target: &CallableTarget,
+        method: &MethodInfo,
+        span: Span,
+        selected: super::executable_effects::SelectedUse,
+    ) -> Vec<TypeId> {
         if self.selects_implementation_after_checking(target) {
             let effects = self.complete_function_value_effects(&method.checked_effects, span);
-            self.record_checked_effects(effects.iter().copied(), span);
+            match super::executable_effects::call_source(target, method, false, selected) {
+                Some(callee) => {
+                    self.record_call_effect_profiles(effects.clone(), effects.clone(), span, callee)
+                }
+                None => self.record_checked_effects(effects.iter().copied(), span),
+            }
             return effects;
         }
         let virtual_call = method.virtual_root.is_some()
@@ -1109,7 +1136,8 @@ impl Checker<'_> {
         } else {
             super::callable_contracts::EffectDependency::Exact(method.declaration)
         };
-        self.record_named_call_effects(dependency, effects.clone(), span);
+        let source = super::executable_effects::call_source(target, method, virtual_call, selected);
+        self.record_named_call_effects(dependency, effects.clone(), span, source);
         effects
     }
 
@@ -1141,13 +1169,27 @@ impl Checker<'_> {
         let Some((target, method)) = self.select_contract_method(ty, "iterator", span) else {
             return;
         };
-        self.record_selected_contract_effects(&target, &method, span);
+        self.record_selected_effects(
+            &target,
+            &method,
+            span,
+            super::executable_effects::SelectedUse::Implicit,
+        );
         self.call_targets.entry(span).or_insert(target);
+        let iterable = self.types.resolved(ty);
         for name in ["hasCurrent", "getCurrent", "advance"] {
             if let Some((target, operation)) =
                 self.select_contract_method(method.return_ty, name, span)
             {
-                self.record_selected_contract_effects(&target, &operation, span);
+                self.record_selected_effects(
+                    &target,
+                    &operation,
+                    span,
+                    super::executable_effects::SelectedUse::IterationStep {
+                        iterable: iterable.clone(),
+                        member: name,
+                    },
+                );
             }
         }
     }

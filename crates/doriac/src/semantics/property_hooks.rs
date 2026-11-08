@@ -701,7 +701,12 @@ impl Checker<'_> {
                 implementations: Vec::new(),
             },
         };
-        let effects = self.record_selected_contract_effects(&target, method, span);
+        let effects = self.record_selected_effects(
+            &target,
+            method,
+            span,
+            super::executable_effects::SelectedUse::Accessor(kind),
+        );
         let call = PropertyAccessorCallSemanticInfo {
             target,
             declaring_type,

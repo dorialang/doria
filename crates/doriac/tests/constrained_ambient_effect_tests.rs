@@ -161,36 +161,275 @@ function main(): void { let $loud = new Loud(); $loud->safe(); $loud->noted(); }
     }
 }
 
-#[test]
-fn every_specialization_shares_the_conservative_template_contract() {
-    // Decision log entry 51: a template is checked once for every
-    // implementation it may select, so `go<Quiet>` carries the same automatic
-    // I/O contract as `go<Handle>`. Exact per-specialization contracts are a
-    // recorded follow-up; this assertion changes with that work.
-    let program = doriac::lower_source_to_mir("selected-calls.doria", SELECTED_CALLS)
-        .unwrap_or_else(|errors| panic!("{errors:#?}"));
-    let specializations = program
+/// The specialization of `name` whose first parameter is the class `class`.
+fn specialization<'a>(
+    program: &'a doriac::mir::Program,
+    name: &str,
+    class: &str,
+) -> &'a doriac::mir::Function {
+    program
         .functions
         .iter()
-        .filter(|function| function.name == "go" || function.name.starts_with("go<"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        specializations.len(),
-        2,
+        .filter(|function| function.name == name)
+        .find(|function| {
+            function.params.first().is_some_and(|parameter| {
+                function.locals.iter().any(|local| {
+                    local.id == *parameter
+                        && matches!(local.ty, doriac::mir::Type::Class(id)
+                            if program.classes[id.0].declaration_name == class)
+                })
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{name}<{class}> not lowered: {:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|function| &function.name)
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+fn function_named<'a>(program: &'a doriac::mir::Program, name: &str) -> &'a doriac::mir::Function {
+    program
+        .functions
+        .iter()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("{name} not lowered"))
+}
+
+#[test]
+fn every_specialization_carries_only_what_it_selects() {
+    // Decision 0123: `go<Quiet>` selects a body that performs no I/O, so its
+    // ABI carries no status or Error slot, while `go<Handle>` keeps both. The
+    // template's diagnostics are unaffected.
+    let program = doriac::lower_source_to_mir("selected-calls.doria", SELECTED_CALLS)
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let quiet = specialization(&program, "go", "Quiet");
+    assert!(
+        quiet.checked_effects.is_empty(),
         "{:?}",
-        program
-            .functions
-            .iter()
-            .map(|function| &function.name)
-            .collect::<Vec<_>>()
+        quiet.checked_effects
     );
-    for function in specializations {
+    assert!(quiet.ambient_checked_effects.is_empty());
+    let handle = specialization(&program, "go", "Handle");
+    assert!(!handle.ambient_checked_effects.is_empty());
+    assert_eq!(handle.checked_effects, handle.ambient_checked_effects);
+}
+
+/// Every form a specialization selects through, in a quiet and a loud version.
+const EXACT_CONTRACTS: &str = r#"
+use Doria\Std\Io\IoError;
+interface Rel {
+    function release(): void;
+    function count(): int;
+}
+class Handle implements Rel {
+    function release(): void { echo "released;"; }
+    function count(): int { echo "counted;"; return 7; }
+}
+class Quiet implements Rel {
+    function release(): void {}
+    function count(): int { return 1; }
+}
+function go<F implements Rel>(F $f): void { $f->release(); }
+function logged<F implements Rel>(F $f): int {
+    try { return $f->count(); } catch (IoError $error) { echo "failed;"; return -1; }
+}
+function rethrown<F implements Rel>(F $f): int {
+    try { return $f->count(); } catch (IoError $error) { throw $error; }
+}
+function spin<F implements Rel>(F $f, int $n): void {
+    if ($n > 0) { $f->release(); spin($f, $n - 1); }
+}
+function quietly(): void { go(new Quiet()); }
+function loudly(): void { go(new Handle()); }
+class Key implements Equatable<Key> {
+    function equals(Key $other): bool { return true; }
+}
+class LoudKey implements Equatable<LoudKey> {
+    function equals(LoudKey $other): bool { echo "compared;"; return true; }
+}
+function same<T implements Equatable<T>>(T $left, T $right): bool { return $left == $right; }
+class Tag implements Displayable { function toString(): string { return "tag"; } }
+class LoudTag implements Displayable { function toString(): string { echo "shown;"; return "loud"; } }
+function render<T implements Displayable>(T $value): string { return "<{$value}>"; }
+interface Gauge { int $level { get; } }
+class Still implements Gauge { int $level { get => 3; } }
+function levelOf<G implements Gauge>(G $gauge): int { return $gauge->level; }
+class Cell<T implements Rel> {
+    function __construct(take T $item) {}
+    function close(): void { $this->item->release(); }
+}
+function main(): void {
+    go(new Handle());
+    go(new Quiet());
+    echo logged(new Handle()) . ";";
+    echo logged(new Quiet()) . ";";
+    echo rethrown(new Handle()) . ";";
+    echo rethrown(new Quiet()) . ";";
+    spin(new Handle(), 1);
+    spin(new Quiet(), 1);
+    quietly();
+    loudly();
+    echo (same(new Key(), new Key()) ? "y" : "n") . ";";
+    echo (same(new LoudKey(), new LoudKey()) ? "y" : "n") . ";";
+    echo render(new Tag()) . render(new LoudTag()) . ";";
+    echo levelOf(new Still());
+    echo ";";
+    let $still = new Cell<Quiet>(new Quiet());
+    $still->close();
+    let $loud = new Cell<Handle>(new Handle());
+    $loud->close();
+    echo "\n";
+}
+"#;
+
+const EXACT_CONTRACTS_OUTPUT: &str = "released;counted;7;1;counted;7;1;released;released;y;compared;y;shown;<tag><loud>;3;released;\n";
+
+fn assert_on_every_backend(name: &str, source: &str, expected: &str) {
+    let program =
+        doriac::lower_source_to_mir(name, source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let result = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
+    assert!(result.stderr.is_empty());
+    assert_eq!(result.exit_status, 0);
+    native_execution::assert_native_execution(&program, NativeProfile::Fast, expected);
+    #[cfg(feature = "llvm-backend")]
+    native_execution::assert_native_execution(&program, NativeProfile::Release, expected);
+
+    let directory = execution_directory::ExecutionDirectory::new();
+    let artifact = doriac::compile_source(name, source, BackendTarget::Php).unwrap();
+    let path = directory.path().join("main.php");
+    doriac::backend::publish_output(&path, artifact).unwrap();
+    let output = std::process::Command::new("php")
+        .current_dir(directory.path())
+        .arg(path)
+        .output()
+        .expect("PHP is required for compatibility parity");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn quiet_and_loud_specializations_run_on_every_backend() {
+    assert_on_every_backend(
+        "exact-contracts.doria",
+        EXACT_CONTRACTS,
+        EXACT_CONTRACTS_OUTPUT,
+    );
+}
+
+#[test]
+fn each_selection_form_narrows_its_specialization() {
+    let program = doriac::lower_source_to_mir("exact-contracts.doria", EXACT_CONTRACTS)
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    for (name, quiet, loud) in [
+        // A constrained method, void and through a handler.
+        ("go", "Quiet", "Handle"),
+        // The handler's own I/O belongs to specializations that can enter it.
+        ("logged", "Quiet", "Handle"),
+        ("rethrown", "Quiet", "Handle"),
+        // Recursion that never reaches an operation stays empty.
+        ("spin", "Quiet", "Handle"),
+        // Constrained core operations.
+        ("same", "Key", "LoudKey"),
+        // Display conversion of a type parameter.
+        ("render", "Tag", "LoudTag"),
+    ] {
+        let narrowed = specialization(&program, name, quiet);
         assert!(
-            !function.ambient_checked_effects.is_empty(),
-            "{} has no ambient contract",
-            function.name
+            narrowed.checked_effects.is_empty(),
+            "{name}<{quiet}>: {:?}",
+            narrowed.checked_effects
+        );
+        assert!(
+            !specialization(&program, name, loud)
+                .ambient_checked_effects
+                .is_empty(),
+            "{name}<{loud}>"
         );
     }
+    // A constrained accessor selects the hook of its class. Hooks cannot block,
+    // so only the quiet form exists.
+    assert!(specialization(&program, "levelOf", "Still")
+        .checked_effects
+        .is_empty());
+    // A caller's contract follows the specialization it calls.
+    assert!(function_named(&program, "quietly")
+        .checked_effects
+        .is_empty());
+    assert!(!function_named(&program, "loudly")
+        .checked_effects
+        .is_empty());
+    // A method of a generic class specializes with its class.
+    let closes = program
+        .functions
+        .iter()
+        .filter(|function| function.name.ends_with("::close"))
+        .map(|function| function.checked_effects.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(closes.len(), 2, "{closes:?}");
+    assert!(
+        closes.contains(&true) && closes.contains(&false),
+        "{closes:?}"
+    );
+}
+
+#[test]
+fn a_specialization_keeps_the_errors_its_template_declares() {
+    // Required errors and written ambient `throws` entries are authored
+    // contract, unlike inferred ambient I/O, so a quiet implementation keeps its
+    // template's declared transport and its callers must route it.
+    let source = r#"
+use Doria\Std\Io\IoError;
+class Boom implements Error { function __construct(string $message) {} }
+interface Task { function run(): void throws Boom; }
+class Safe implements Task { function run(): void {} }
+function drive<T implements Task>(T $task): void throws Boom { $task->run(); }
+interface Step { function step(): void; }
+class Mute implements Step { function step(): void {} }
+function declared<T implements Step>(T $step): void throws IoError { $step->step(); }
+function forwarder(): void { declared(new Mute()); }
+function main(): void {
+    try { drive(new Safe()); echo "ran\n"; } catch (Boom $boom) { echo "boom\n"; }
+    forwarder();
+}
+"#;
+    assert_on_every_backend("declared-errors.doria", source, "ran\n");
+    let program = doriac::lower_source_to_mir("declared-errors.doria", source)
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let drive = specialization(&program, "drive", "Safe");
+    assert_eq!(drive.required_checked_effects.len(), 1);
+    assert!(drive.ambient_checked_effects.is_empty());
+    assert_eq!(
+        specialization(&program, "declared", "Mute")
+            .ambient_checked_effects
+            .len(),
+        1
+    );
+    // The declared entry is in the callee's ABI, so its caller carries it too.
+    assert_eq!(
+        function_named(&program, "forwarder")
+            .ambient_checked_effects
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn the_entry_frame_owns_the_effects_of_top_level_statements() {
+    // MIR runs the entry source's top-level statements in main's frame, so
+    // their I/O needs main's transport even when main's own body has none.
+    assert_on_every_backend(
+        "entry-prelude.doria",
+        "echo \"top;\";\nfunction main(): void {}\n",
+        "top;",
+    );
 }
 
 /// Calls whose implementation is chosen outside the body: a callback
