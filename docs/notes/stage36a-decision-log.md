@@ -1664,10 +1664,10 @@ from that plan's hidden inputs.
   static callee is an open override, so that `direct_for_return` decides the
   slot. It also covers an open class returned through a function value.
 
-**Found, not fixed here: open-class methods that return a region.** The
+**Open-class methods that return a region (fixed after this entry).** The
 covariant test first used `?ByteRegion` and `ByteRegion`. A program that
-declares this pair and calls `view` through a `Source` fails shared MIR
-validation before any backend runs:
+declares this pair and calls `view` through a `Source` failed shared MIR
+validation before any backend ran:
 
 ```doria
 use Doria\Std\Io\ByteRegion;
@@ -1680,11 +1680,9 @@ class Filled extends Source {
 }
 ```
 
-The error is "retained source path must name stored owning properties (in
-function `Source::view`)", raised by `validate_source_path` in
-`mir_validation/retained.rs`. This change touches no MIR lowering or
-validation, so the defect predates it. It belongs to retained-source lowering
-for open-class receivers, a separate follow-up.
+The error was "retained source path must name stored owning properties (in
+function `Source::view`)". "Open-class region returns: bodies and dispatch
+get separate summaries" below records the cause and the fix.
 
 **Every tier-1 target lowers on every host.** The executable parity matrix
 runs each program on the host only, which is how an x86-64 ABI limit first
@@ -2155,3 +2153,95 @@ The gap was in the vet, not in any one test. `974762d` ran only the targets
 it touched, and this test is in none of them. This update and the next fix
 are committed only after the complete doriac suite passes with llvm-backend:
 every target, the parity suite and its shards, and both clippy runs.
+
+### Open-class region returns: bodies and dispatch get separate summaries (2026-11-08)
+
+`Source::view`'s MIR plan carried a retained source whose path named
+`Filled`'s property, `PropertyId { class: Filled, index: 0 }`. On a `Source`
+receiver that path names a property the receiver does not have, so
+`validate_source_path` rejected it.
+
+The ownership pass keyed two different facts by the same declaration span:
+- the **body summary** of `Source::view`: what that body returns and stores;
+- the **dispatch summary** of the open method: the join over every override,
+  which a call through `Source` may select.
+
+The family join merged the overrides into the base method's own entry. Each
+body analysis then appended its own body on top of that union. MIR lowering
+reads the entry as the base body's plan, so the base definition retained
+every override's sources. Its stores, removals, selectors and writeback were
+merged the same way.
+
+**Chosen:** `RetainedCallableInfo::dispatch` holds the join, and the
+declaration's own fields stay its body.
+- The family join in `ownership/retained.rs` builds the join from each
+  implementation's body, plus the requirement's own entry (its body, or an
+  interface requirement's seeded selections), and stores it in `dispatch`.
+- Every lookup of a callee's summary at a call goes through `for_callers()`:
+  `owned_storage`, `pending`, `retained` and `writeback`. Per-implementation
+  loops keep reading each implementation's body.
+- MIR definition plans, closure plans and PHP parameter roles read the body.
+- `seed_callables` and the composed-summary refinement carry both views,
+  because the field travels with the summary.
+
+A second defect sat behind the first. With a covariant override (family
+`?ByteRegion`, override `ByteRegion`), the virtual return adapter that MIR
+lowering synthesizes had no retained plan at all. Validation rejected it:
+"byte region return signature loses its retained source plan".
+- An adapter returns exactly what its implementation returns, so it now
+  carries the implementation's plan, mapped onto its identical parameters.
+- `RetainedSourcesPlan::forwarded` in `mir.rs` is the one owner of that
+  mapping: returns, stores, removals, selectors and returned storage, with no
+  constructs or promotions.
+- Interface entries used an inline copy of the same mapping. They now call
+  `forwarded`, and `remap_storage_selection` is gone.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Separate `dispatch` join in the summary; calls read it, bodies keep their own (chosen) | Both facts get the owner each consumer needs; one field carries both views through every pass and seed; no instance-specific rule | Every call-site lookup must choose `for_callers()`; a future lookup that forgets reads the body |
+| Canonicalize inherited property ids to the declaring class | Fixes the inherited-property case | An override returning its own property (`Extra::$more`) still lands in the base plan; stores and writeback stay merged |
+| Relax `validate_source_path` to accept subclass paths on a base receiver | One line | Accepts a plan that names storage the receiver may not have, which the validator exists to reject |
+| A separate exported map of body summaries | No new field | Needs a new `SemanticInfo` field (in a file another session owns) and two parallel maps that every pass must keep aligned |
+
+Coverage: `native_return_transport_tests::open_class_region_returns_retain_each_implementations_sources`.
+It checks a `?ByteRegion` family, a `ByteRegion` override from an inherited
+property, and one from the override's own property, called through the base
+and through an open override, on the interpreter, Cranelift and LLVM. The
+`?Deadline` form stays as well.
+
+**Found, not fixed: region-returning interface and trait requirements.**
+`interface Viewing { function view(): ?ByteRegion; }` cannot be implemented
+by a method that returns `$this->bytes->getRegion(...)`. That fails with
+E0755 "does not preserve the required return ownership or provenance", and
+the trait form fails with E0757. Both are rejected before MIR, so they are a
+different failure from the one fixed here:
+- a bodyless requirement gets no return borrow, so its contract reads as an
+  independent return;
+- Decision 0134 lets a borrowed return satisfy a requirement only when it
+  preserves at least the required provenance;
+- Doria has no lifetime annotations, so the requirement has no way to state
+  that borrow.
+
+Closures returning regions through function values work. No standard
+library interface or SPEC example declares a region-returning requirement
+today, so nothing shipped depends on the gap.
+
+**Chosen (36a Recommended rule; Andrew reviews it with the log):** a
+bodyless requirement with a receiver elides its region return to a
+`Retained` receiver borrow, under the single-source rule method bodies
+already use. An implementation that returns a receiver-held region then
+preserves the required provenance, and one that returns an independent
+region preserves more than it.
+
+Sequencing: the rule changes `semantics/contracts.rs` and Decision 0134.
+The paused catch-reachability session has uncommitted edits in both, and
+exact contracts builds on that tree. The rule lands after both, in the same
+tree, with its own tests for the interface and trait forms on the
+interpreter, Cranelift and LLVM.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Elide to a receiver borrow, as method bodies do (chosen) | One elision rule for bodies and requirements; no new syntax; receiver-held and independent implementations both satisfy it | Callers of a requirement whose implementations all return independent regions still get a receiver-bound result |
+| Explicit return-borrow syntax on requirements | States the contract exactly | New syntax for one case; Doria has no lifetime annotations and this would be the first |
+| Infer the contract from known implementations | Callers get the tightest result | An interface's contract would depend on its implementers; an open world and separate compilation make that unknowable |
+| Keep rejecting | No rule change | Region-returning interfaces and traits stay inexpressible, a design limitation left in place |

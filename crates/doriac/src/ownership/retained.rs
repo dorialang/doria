@@ -789,7 +789,10 @@ impl Checker<'_> {
                 self.check_function(function, *receiver);
             }
             // A call through a checked requirement can select any of its
-            // implementations. Keep their source dependencies at that boundary.
+            // implementations. Keep their source dependencies at that boundary,
+            // in the requirement's dispatch join. The requirement's own entry
+            // stays its body: an open method's body and MIR plan retain only
+            // what that body returns, never an override's properties.
             for (requirement, implementations) in &self.retained.implementations {
                 let summaries = implementations
                     .iter()
@@ -802,7 +805,15 @@ impl Checker<'_> {
                         self.retained.callables.get(implementation).cloned()
                     })
                     .collect::<Vec<_>>();
-                let summary = self.retained.callables.entry(*requirement).or_default();
+                let mut summary = RetainedCallableInfo {
+                    dispatch: None,
+                    ..self
+                        .retained
+                        .callables
+                        .get(requirement)
+                        .cloned()
+                        .unwrap_or_default()
+                };
                 summary.returned_storage = None;
                 summary.removals = summaries
                     .first()
@@ -859,6 +870,11 @@ impl Checker<'_> {
                         }
                     }
                 }
+                self.retained
+                    .callables
+                    .entry(*requirement)
+                    .or_default()
+                    .dispatch = Some(Box::new(summary));
             }
             self.diagnostics.clear();
             self.writeback.constraints.clear();
@@ -1203,7 +1219,7 @@ impl Checker<'_> {
         let mut sources = signature
             .declaration
             .and_then(|declaration| self.retained.callables.get(&declaration))
-            .map(|info| info.constructs.clone())
+            .map(|info| info.for_callers().constructs.clone())
             .unwrap_or_default();
         for (index, parameter) in signature
             .params
@@ -1439,7 +1455,8 @@ impl Checker<'_> {
         if !matches!(ungroup_expr(expr), Expr::New { .. }) {
             let info = signature
                 .declaration
-                .and_then(|declaration| self.retained.callables.get(&declaration));
+                .and_then(|declaration| self.retained.callables.get(&declaration))
+                .map(RetainedCallableInfo::for_callers);
             let mut storage = info.and_then(|info| info.returned_storage.clone());
             for candidate in signature
                 .declaration
@@ -1480,7 +1497,7 @@ impl Checker<'_> {
             signature
                 .declaration
                 .and_then(|declaration| self.retained.callables.get(&declaration))
-                .map(|info| info.returns.clone())
+                .map(|info| info.for_callers().returns.clone())
                 .unwrap_or_default()
         };
         if sources.is_empty() {
@@ -1960,6 +1977,7 @@ impl Checker<'_> {
         let (required, payload_inputs) = signature
             .declaration
             .and_then(|declaration| self.retained.callables.get(&declaration))
+            .map(RetainedCallableInfo::for_callers)
             .map(|info| {
                 (
                     info.requires_independent.clone(),

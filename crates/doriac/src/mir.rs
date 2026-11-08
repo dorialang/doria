@@ -6322,6 +6322,75 @@ pub struct RetainedSourcesPlan {
     pub returned_storage: Option<RetainedReturnedStorage>,
 }
 
+impl RetainedSourcesPlan {
+    /// The plan of an entry that passes its parameters to this plan's
+    /// callable and returns that callable's result: an interface entry or a
+    /// virtual return adapter. The entry returns, stores and removes exactly
+    /// what the callable does and constructs nothing itself. `parameter` maps
+    /// each of the callable's parameters to the entry's.
+    pub(crate) fn forwarded(&self, parameter: impl Fn(LocalId) -> LocalId) -> Self {
+        let source = |source: &RetainedSource| RetainedSource {
+            local: parameter(source.local),
+            ..source.clone()
+        };
+        let store = |store: &RetainedStore| RetainedStore {
+            destination: parameter(store.destination),
+            path: store.path.clone(),
+            identity: store.identity.clone(),
+            sources: store.sources.iter().map(source).collect(),
+        };
+        let selector = |selector: &RetainedStorageSelector| match selector {
+            RetainedStorageSelector::Input(local) => {
+                RetainedStorageSelector::Input(parameter(*local))
+            }
+            other => other.clone(),
+        };
+        let selection = |selection: &RetainedStorageSelection| {
+            let mut selectors = selection.selectors.iter().map(selector).collect::<Vec<_>>();
+            selectors.sort();
+            RetainedStorageSelection {
+                destination: parameter(selection.destination),
+                path: selection.path.clone(),
+                selectors,
+            }
+        };
+        Self {
+            returns: self.returns.iter().map(source).collect(),
+            constructs: Vec::new(),
+            independent_parameters: self
+                .independent_parameters
+                .iter()
+                .map(|local| parameter(*local))
+                .collect(),
+            promotions: Vec::new(),
+            stores: self.stores.iter().map(store).collect(),
+            exceptional_stores: self.exceptional_stores.iter().map(store).collect(),
+            removals: self.removals.iter().map(selection).collect(),
+            exceptional_removals: self.exceptional_removals.iter().map(selection).collect(),
+            returned_selectors: self.returned_selectors.iter().map(selector).collect(),
+            returned_storage: self.returned_storage.as_ref().map(|storage| {
+                RetainedReturnedStorage {
+                    inputs: storage
+                        .inputs
+                        .iter()
+                        .map(|local| parameter(*local))
+                        .collect(),
+                    direct: storage.direct.iter().map(source).collect(),
+                    members: storage
+                        .members
+                        .iter()
+                        .map(|member| RetainedReturnedMember {
+                            sources: member.sources.iter().map(source).collect(),
+                            ..member.clone()
+                        })
+                        .collect(),
+                    selections: storage.selections.iter().map(selection).collect(),
+                }
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetainedReturnedStorage {
     pub inputs: Vec<LocalId>,

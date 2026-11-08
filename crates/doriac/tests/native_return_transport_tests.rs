@@ -126,3 +126,54 @@ fn virtual_and_function_value_returns_follow_the_entry_they_reach() {
         native_execution::assert_native_execution(&program, profile, COVARIANT_RETURNS_OUTPUT);
     }
 }
+
+/// Open-class region returns. The family returns a three-word `?ByteRegion`
+/// through the result slot; the overrides return a two-word `ByteRegion` in
+/// registers, one from an inherited property and one from the override's own.
+/// Each method's MIR plan retains only its own body's sources, the family's
+/// call boundary retains every override's, and each return adapter retains
+/// what its implementation retains.
+const OPEN_CLASS_REGIONS: &str = r#"
+use Doria\Std\Io\ByteRegion;
+open class Source {
+    Bytes $bytes = Bytes::allocate(2);
+    open function view(): ?ByteRegion { return $this->bytes->getRegion(0, 1); }
+}
+open class Filled extends Source {
+    override function view(): ByteRegion { return $this->bytes->getRegion(0, 2); }
+}
+class Extra extends Filled {
+    Bytes $more = Bytes::allocate(3);
+    override function view(): ByteRegion { return $this->more->getRegion(0, 3); }
+}
+function look(Source $source): void {
+    let $view = $source->view();
+    if ($view != null) { echo "{$view->length}\n"; }
+}
+function filled(Filled $filled): void { echo "f{$filled->view()->length}\n"; }
+function main(): void {
+    look(new Source());
+    look(new Filled());
+    look(new Extra());
+    filled(new Filled());
+    filled(new Extra());
+}
+"#;
+
+const OPEN_CLASS_REGIONS_OUTPUT: &str = "1\n2\n3\nf2\nf3\n";
+
+#[test]
+fn open_class_region_returns_retain_each_implementations_sources() {
+    let program = doriac::lower_source_to_mir("open-class-regions.doria", OPEN_CLASS_REGIONS)
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        OPEN_CLASS_REGIONS_OUTPUT
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, OPEN_CLASS_REGIONS_OUTPUT);
+    }
+}

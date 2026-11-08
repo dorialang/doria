@@ -327,7 +327,7 @@ impl Checker<'_> {
                         .retained
                         .callables
                         .get(&declaration)
-                        .map(|s| s.writeback.returns.as_slice())
+                        .map(|s| s.for_callers().writeback.returns.as_slice())
                         .unwrap_or_default();
                     return homes
                         .iter()
@@ -545,7 +545,7 @@ impl Checker<'_> {
                 .retained
                 .callables
                 .get(&declaration)
-                .map(|s| s.writeback.clone())
+                .map(|s| s.for_callers().writeback.clone())
                 .unwrap_or_default();
             for effect in summary.writes {
                 let move_condition = effect
@@ -685,7 +685,7 @@ impl Checker<'_> {
                         .retained
                         .callables
                         .get(&target.declaration)
-                        .map(|s| s.writeback.clone())
+                        .map(|s| s.for_callers().writeback.clone())
                         .unwrap_or_default();
                     let signature = Signature::for_function_value(
                         &invocation.function,

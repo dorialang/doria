@@ -148,6 +148,21 @@ pub struct RetainedCallableInfo {
     pub returned_selectors: Vec<owned_storage::Selector>,
     pub returned_storage: Option<owned_storage::ReturnedStorage>,
     pub(crate) writeback: writeback::Summary,
+    /// The join of every implementation a call through this declaration may
+    /// select: an open method with overrides, an interface or bodyless trait
+    /// requirement, or a callback site. A call sees this join. The fields above
+    /// stay the declaration's own body, because its body and its MIR plan
+    /// retain only what that body returns and stores. An override's sources
+    /// name the override's properties, which the base receiver does not have.
+    pub dispatch: Option<Box<RetainedCallableInfo>>,
+}
+
+impl RetainedCallableInfo {
+    /// The summary a call sees: the dispatch join when the call may select a
+    /// later implementation, otherwise this body.
+    pub fn for_callers(&self) -> &Self {
+        self.dispatch.as_deref().unwrap_or(self)
+    }
 }
 
 #[derive(Debug, Clone)]

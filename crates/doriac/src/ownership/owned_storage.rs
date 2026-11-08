@@ -864,6 +864,7 @@ impl Checker<'_> {
             let Some(mut info) = signature
                 .declaration
                 .and_then(|declaration| self.retained.callables.get(&declaration))
+                .map(RetainedCallableInfo::for_callers)
                 .cloned()
             else {
                 return;

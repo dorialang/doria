@@ -901,16 +901,7 @@ fn build_entry(
         .collect::<Vec<_>>();
     let params = locals.iter().map(|local| local.id).collect::<Vec<_>>();
     let mut statements = Vec::new();
-    if let Some(plan) = implementation.blocks[implementation.entry_block.0]
-        .statements
-        .iter()
-        .find_map(|statement| match statement {
-            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => {
-                Some(plan)
-            }
-            _ => None,
-        })
-    {
+    if let Some(plan) = implementation.retained_sources_plan() {
         let remap = |local| {
             params[implementation
                 .params
@@ -919,119 +910,7 @@ fn build_entry(
                 .expect("retained input parameter")]
         };
         statements.push(mir::Statement::ControlFlowPlan(
-            mir::ControlFlowPlan::RetainedSources(mir::RetainedSourcesPlan {
-                returns: plan
-                    .returns
-                    .iter()
-                    .map(|source| mir::RetainedSource {
-                        local: remap(source.local),
-                        inherited: source.inherited,
-                        writable: source.writable,
-                        lifetime: source.lifetime,
-                        owned_path: source.owned_path.clone(),
-                    })
-                    .collect(),
-                constructs: Vec::new(),
-                independent_parameters: plan
-                    .independent_parameters
-                    .iter()
-                    .map(|local| remap(*local))
-                    .collect(),
-                promotions: Vec::new(),
-                stores: plan
-                    .stores
-                    .iter()
-                    .map(|store| mir::RetainedStore {
-                        destination: remap(store.destination),
-                        path: store.path.clone(),
-                        identity: store.identity.clone(),
-                        sources: store
-                            .sources
-                            .iter()
-                            .map(|source| mir::RetainedSource {
-                                local: remap(source.local),
-                                ..source.clone()
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                exceptional_stores: plan
-                    .exceptional_stores
-                    .iter()
-                    .map(|store| mir::RetainedStore {
-                        destination: remap(store.destination),
-                        path: store.path.clone(),
-                        identity: store.identity.clone(),
-                        sources: store
-                            .sources
-                            .iter()
-                            .map(|source| mir::RetainedSource {
-                                local: remap(source.local),
-                                ..source.clone()
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                returned_selectors: plan
-                    .returned_selectors
-                    .iter()
-                    .map(|selector| match selector {
-                        mir::RetainedStorageSelector::Member(identity) => {
-                            mir::RetainedStorageSelector::Member(identity.clone())
-                        }
-                        mir::RetainedStorageSelector::Input(local) => {
-                            mir::RetainedStorageSelector::Input(remap(*local))
-                        }
-                        mir::RetainedStorageSelector::Unknown => {
-                            mir::RetainedStorageSelector::Unknown
-                        }
-                        mir::RetainedStorageSelector::All => mir::RetainedStorageSelector::All,
-                    })
-                    .collect(),
-                returned_storage: plan.returned_storage.as_ref().map(|storage| {
-                    mir::RetainedReturnedStorage {
-                        inputs: storage.inputs.iter().map(|local| remap(*local)).collect(),
-                        selections: storage
-                            .selections
-                            .iter()
-                            .map(|selection| remap_storage_selection(selection, &remap))
-                            .collect(),
-                        direct: storage
-                            .direct
-                            .iter()
-                            .map(|source| mir::RetainedSource {
-                                local: remap(source.local),
-                                ..source.clone()
-                            })
-                            .collect(),
-                        members: storage
-                            .members
-                            .iter()
-                            .map(|member| mir::RetainedReturnedMember {
-                                sources: member
-                                    .sources
-                                    .iter()
-                                    .map(|source| mir::RetainedSource {
-                                        local: remap(source.local),
-                                        ..source.clone()
-                                    })
-                                    .collect(),
-                                ..member.clone()
-                            })
-                            .collect(),
-                    }
-                }),
-                removals: plan
-                    .removals
-                    .iter()
-                    .map(|selection| remap_storage_selection(selection, &remap))
-                    .collect(),
-                exceptional_removals: plan
-                    .exceptional_removals
-                    .iter()
-                    .map(|selection| remap_storage_selection(selection, &remap))
-                    .collect(),
-            }),
+            mir::ControlFlowPlan::RetainedSources(plan.forwarded(remap)),
         ));
     }
     let receiver = if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) =
@@ -1208,28 +1087,6 @@ fn build_entry(
         blocks,
         entry_block: mir::BlockId(0),
     })
-}
-
-fn remap_storage_selection(
-    selection: &mir::RetainedStorageSelection,
-    remap: &impl Fn(mir::LocalId) -> mir::LocalId,
-) -> mir::RetainedStorageSelection {
-    let mut selectors = selection
-        .selectors
-        .iter()
-        .map(|selector| match selector {
-            mir::RetainedStorageSelector::Input(local) => {
-                mir::RetainedStorageSelector::Input(remap(*local))
-            }
-            other => other.clone(),
-        })
-        .collect::<Vec<_>>();
-    selectors.sort();
-    mir::RetainedStorageSelection {
-        destination: remap(selection.destination),
-        path: selection.path.clone(),
-        selectors,
-    }
 }
 
 #[cfg(test)]

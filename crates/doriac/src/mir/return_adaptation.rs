@@ -287,6 +287,23 @@ pub(crate) fn build_virtual_return_adapter(
         ]
     };
 
+    // The adapter returns what the implementation returns, so it retains the
+    // implementation's sources through its own identical parameters.
+    let mut blocks = blocks;
+    if let Some(plan) = direct.retained_sources_plan() {
+        let forwarded = plan.forwarded(|local| {
+            params[direct
+                .params
+                .iter()
+                .position(|parameter| *parameter == local)
+                .expect("retained input parameter")]
+        });
+        blocks[0].statements.insert(
+            0,
+            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(forwarded)),
+        );
+    }
+
     let mut method = implementation.method.clone();
     method
         .as_mut()

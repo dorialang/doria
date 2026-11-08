@@ -449,7 +449,7 @@ impl Checker<'_> {
         let selections = signature
             .declaration
             .and_then(|declaration| self.retained.callables.get(&declaration))
-            .map(|info| info.pending_selections.clone())
+            .map(|info| info.for_callers().pending_selections.clone())
             .unwrap_or_default();
         for selection in selections {
             let requests = self.pending_inputs(
