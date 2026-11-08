@@ -114,7 +114,7 @@ function ownedWriter(): void throws IoError {
         let writable $group = $set->begin($plan);
         if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(10)))) { panic("large write did not pass through"); }
     }
-    if (read_file("through-output") != "abcdefghij") { panic("pass-through wrote the wrong bytes"); }
+    if (!liveFileHolds("through-output", $data)) { panic("pass-through wrote the wrong bytes"); }
     echo "writer;";
 }
 
@@ -131,7 +131,7 @@ function borrowedWriter(): void throws IoError {
             let writable $group = $set->begin($plan);
             if ($group->getNextCompletion(Wait::Indefinite) != TransferWaitResult::Completed(TransferCompletion::Write($key, WriteOutcome::Accepted(2)))) { panic("borrowed write not buffered"); }
         }
-        if (read_file("borrowed-output") != "") { panic("buffered bytes reached the file early"); }
+        if (liveFileLength("borrowed-output") != 0) { panic("buffered bytes reached the file early"); }
         let $returned = $set->unregister($registration);
         let $finished = match (take $returned->finish()) {
             BorrowedFinishOutcome::Complete => true,
@@ -139,7 +139,7 @@ function borrowedWriter(): void throws IoError {
         };
         if (!$finished) { panic("borrowed finish pending"); }
     }
-    if (read_file("borrowed-output") != "xy") { panic("borrowed finish lost bytes"); }
+    if (!liveFileHolds("borrowed-output", $data)) { panic("borrowed finish lost bytes"); }
     echo "borrowed writer\n";
 }
 
