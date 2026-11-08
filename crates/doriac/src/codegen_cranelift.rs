@@ -85,6 +85,8 @@ const RUNTIME_RETURNED_TRAP: u8 = 1;
 
 mod process;
 mod readiness_set;
+#[cfg(test)]
+mod return_transport_tests;
 mod stream_callbacks;
 
 struct DeclaredNativeItems<'a> {
@@ -114,12 +116,42 @@ pub(crate) fn lower_validated_mir_to_object_with_metrics(
 ) -> Result<Vec<u8>, BackendError> {
     let isa_builder =
         cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
+    lower_validated_mir_to_object_for_isa(program, isa_builder, metrics)
+}
+
+/// The shared Cranelift settings for every Doria object.
+///
+/// `enable_llvm_abi_extensions` lets a 16-byte inline scalar (an `i128`
+/// carrier: `Deadline`, registration and transfer keys) appear in a Doria
+/// callable's signature on x86-64. It travels as two consecutive 64-bit
+/// integer registers (`rax`/`rdx` when returned), the System V `__int128`
+/// convention that LLVM also uses. Without it Cranelift rejects every `i128`
+/// parameter and return under System V and Windows fastcall; AArch64 already
+/// passes it as a register pair. Only Doria-to-Doria calls carry an `i128`.
+/// The C boundary to `doria-rt` passes 128-bit values as two words, and
+/// `declare_runtime` rejects an `i128` there. The extension also lets System
+/// V return a third integer register, which `DIRECT_RETURN_SLOTS` never uses.
+fn native_flags() -> Result<settings::Flags, BackendError> {
     let mut flag_builder = settings::builder();
-    flag_builder
-        .set("is_pic", "true")
-        .map_err(|error| backend_failure(error.to_string()))?;
+    for (name, value) in [("is_pic", "true"), ("enable_llvm_abi_extensions", "true")] {
+        flag_builder
+            .set(name, value)
+            .map_err(|error| backend_failure(error.to_string()))?;
+    }
+    Ok(settings::Flags::new(flag_builder))
+}
+
+/// Lowers for the target `isa_builder` describes. Executables use the host's;
+/// tests also lower for every tier-1 target, because a host whose ABI accepts
+/// a shape (AArch64 returns eight registers) cannot show that another target
+/// rejects it (x86-64 returns two).
+fn lower_validated_mir_to_object_for_isa(
+    program: &mir::Program,
+    isa_builder: cranelift_codegen::isa::Builder,
+    metrics: Option<&mut mir_validation::OptimizationMetrics>,
+) -> Result<Vec<u8>, BackendError> {
     let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
+        .finish(native_flags()?)
         .map_err(|error| backend_failure(error.to_string()))?;
     let mut module = ObjectModule::new(
         ObjectBuilder::new(isa, "doria_stage_13", default_libcall_names())
@@ -612,7 +644,8 @@ fn function_signature_with_return(
     return_type: mir::ReturnType,
 ) -> Result<Signature, BackendError> {
     let mut signature = module.make_signature();
-    let plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+    let plan =
+        native_closure_abi::NativeCallableSignaturePlan::direct_for_return(function, return_type);
     for _ in &plan.hidden_inputs {
         signature
             .params
@@ -645,22 +678,33 @@ fn function_signature_with_return(
             );
         }
     }
+    append_return_abi_params(
+        &mut signature,
+        &plan,
+        program,
+        return_type,
+        module.target_config().pointer_type(),
+    );
+    Ok(signature)
+}
+
+/// The returns of a Doria callable signature follow its plan: a checked
+/// callable returns its status byte, a value written through `ResultOut`
+/// returns nothing, and any other value returns its direct carrier.
+fn append_return_abi_params(
+    signature: &mut Signature,
+    plan: &native_closure_abi::NativeCallableSignaturePlan,
+    program: &mir::Program,
+    return_type: mir::ReturnType,
+    pointer_type: ClifType,
+) {
     if plan.checked {
         signature.returns.push(AbiParam::new(types::I8));
     } else if let mir::ReturnType::Value(ty) = return_type {
-        if !matches!(
-            ty,
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-        ) {
-            append_type_abi_params(
-                &mut signature.returns,
-                program,
-                ty,
-                module.target_config().pointer_type(),
-            );
+        if plan.returns_value_directly() {
+            append_type_abi_params(&mut signature.returns, program, ty, pointer_type);
         }
     }
-    Ok(signature)
 }
 
 fn clif_integer_type(ty: IntegerType) -> ClifType {
@@ -917,6 +961,62 @@ fn byte_region_from_abi(ty: mir::Type, values: &[Value]) -> Result<LoweredValue,
         }),
         _ => Err(malformed_mir("expected a byte region ABI result")),
     }
+}
+
+/// The value a callee returned in registers, decoded from the carrier
+/// `append_type_abi_params` gives `ty` and `value_to_doria_abi` produces. Every
+/// call shape that receives a direct return decodes it here.
+fn lowered_from_direct_results(
+    builder: &mut FunctionBuilder,
+    program: &mir::Program,
+    ty: mir::Type,
+    results: &[Value],
+) -> Result<LoweredValue, BackendError> {
+    let word = |index: usize| {
+        results
+            .get(index)
+            .copied()
+            .ok_or_else(|| malformed_mir("call is missing a return register word"))
+    };
+    Ok(match ty {
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            byte_region_from_abi(ty, results)?
+        }
+        _ if ty.shared_interface().is_some() => LoweredValue::Nullable {
+            present: word(0)?,
+            payload: word(1)?,
+        },
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::Interface(_)
+        | mir::Type::NullableInterface(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => {
+            let present = word(0)?;
+            let payload = word(1)?;
+            LoweredValue::Nullable {
+                present,
+                payload: nullable_payload_from_doria_abi(builder, payload, ty),
+            }
+        }
+        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+            return Err(malformed_mir(
+                "a payload enum returns through its result slot",
+            ))
+        }
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class) =>
+        {
+            LoweredValue::OpenClass {
+                object: word(0)?,
+                descriptor: word(1)?,
+            }
+        }
+        _ => {
+            let value = word(0)?;
+            LoweredValue::Single(value_from_doria_abi(builder, value, ty))
+        }
+    })
 }
 
 fn value_to_doria_abi(
@@ -3159,6 +3259,20 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
     ) -> Result<FuncId, BackendError> {
         if let Some(id) = self.runtime_functions.get(name) {
             return Ok(*id);
+        }
+        // `doria-rt` is Rust `extern "C"`, whose 128-bit integer convention
+        // differs by target: Windows x64 follows clang, not the register pair
+        // Doria's own calls use. The runtime ABI therefore carries 128-bit
+        // values as two words, and an `i128` here is a lowering defect on
+        // every target.
+        if params
+            .iter()
+            .chain(result.as_ref())
+            .any(|ty| ty.bits() > 64 && ty.is_int())
+        {
+            return Err(malformed_mir(format!(
+                "runtime function {name} declares a 128-bit integer; the runtime ABI passes it as two words"
+            )));
         }
         let mut signature = self.module.make_signature();
         signature
@@ -5836,11 +5950,34 @@ fn lower_terminator(
             }
             resources.defer_class_temporary_drops = false;
             flush_deferred_class_temporary_drops(builder, resources)?;
-            if let Some(destination) = resources.return_address.filter(|_| {
-                function_in(resources.program, resources.function_id)
-                    .expect("validated function identity")
-                    .has_checked_transport()
-            }) {
+            let checked = function_in(resources.program, resources.function_id)
+                .expect("validated function identity")
+                .has_checked_transport();
+            let payload = match expression.ty() {
+                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                    Some(payload)
+                }
+                _ => None,
+            };
+            if let Some(destination) = resources.return_address {
+                if let Some(payload) = payload.filter(|_| !checked) {
+                    cleanup_class_locals(builder, resources)?;
+                    cleanup_string_locals(builder, resources)?;
+                    copy_inline_bytes(
+                        builder,
+                        destination,
+                        value.single()?,
+                        payload.storage_size(matches!(
+                            expression.ty(),
+                            mir::Type::NullablePayloadEnum(_)
+                        )),
+                        resources.module.target_config().pointer_type(),
+                    );
+                    builder.ins().return_(&[]);
+                    return Ok(());
+                }
+                // A checked value, or one wider than the direct return budget,
+                // goes to the caller's result slot.
                 store_lowered_to_address(
                     builder,
                     resources.program,
@@ -5851,28 +5988,20 @@ fn lower_terminator(
                 )?;
                 cleanup_class_locals(builder, resources)?;
                 cleanup_string_locals(builder, resources)?;
-                let success = builder.ins().iconst(types::I8, 0);
-                builder.ins().return_(&[success]);
+                if checked {
+                    let success = builder.ins().iconst(types::I8, 0);
+                    builder.ins().return_(&[success]);
+                } else {
+                    builder.ins().return_(&[]);
+                }
                 return Ok(());
             }
             cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
-            if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
-                expression.ty()
-            {
-                let destination = resources.return_address.ok_or_else(|| {
-                    malformed_mir("payload enum return has no hidden result address")
-                })?;
-                copy_inline_bytes(
-                    builder,
-                    destination,
-                    value.single()?,
-                    payload
-                        .storage_size(matches!(expression.ty(), mir::Type::NullablePayloadEnum(_))),
-                    resources.module.target_config().pointer_type(),
-                );
-                builder.ins().return_(&[]);
-                return Ok(());
+            if payload.is_some() {
+                return Err(malformed_mir(
+                    "payload enum return has no hidden result address",
+                ));
             }
             let mut values = Vec::with_capacity(2);
             value_to_doria_abi(builder, value, expression.ty()).append_to(&mut values);
@@ -7695,12 +7824,20 @@ fn lower_indirect_call(
         resources,
     )?;
     let pointer = resources.module.target_config().pointer_type();
+    let plan = if environment.is_some() {
+        native_closure_abi::NativeCallableSignaturePlan::indirect(&function_type)
+    } else {
+        native_closure_abi::NativeCallableSignaturePlan::interface_entry(&function_type)
+    };
     let mut values = vec![resources.current_frame];
-    if matches!(
-        function_type.return_type,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-    ) {
-        let target = result.ok_or_else(|| malformed_mir("indirect payload call has no result"))?;
+    if plan
+        .index_of(native_closure_abi::NativeCallableHiddenInput::ResultOut)
+        .is_some()
+    {
+        // The callee writes its value straight into the result local, as a
+        // checked indirect call does.
+        let target =
+            result.ok_or_else(|| malformed_mir("indirect slot-result call has no result"))?;
         let slot = local_slot(resources.local_slots, target)?;
         values.push(builder.ins().stack_addr(pointer, slot, 0));
     }
@@ -7718,11 +7855,6 @@ fn lower_indirect_call(
     )? {
         values.push(home);
     }
-    let plan = if environment.is_some() {
-        native_closure_abi::NativeCallableSignaturePlan::indirect(&function_type)
-    } else {
-        native_closure_abi::NativeCallableSignaturePlan::interface_entry(&function_type)
-    };
     append_parameter_borrow_homes(builder, &plan, args, &lowered, None, &mut values, resources)?;
     if let Some(environment) = environment {
         values.push(environment);
@@ -7738,13 +7870,15 @@ fn lower_indirect_call(
     set_active_panic_site(builder, span, resources);
     let call = builder.ins().call_indirect(signature, entry, &values);
     let call_results = builder.inst_results(call).to_vec();
-    store_indirect_result(
-        builder,
-        &function_type.return_type,
-        result,
-        &call_results,
-        resources,
-    )?;
+    if plan.returns_value_directly() {
+        store_indirect_result(
+            builder,
+            &function_type.return_type,
+            result,
+            &call_results,
+            resources,
+        )?;
+    }
     cleanup_indirect_call_arguments(builder, &function_type, args, &lowered, resources)?;
     if invocation_mode == mir::FunctionInvocationMode::Once {
         lower_drop_function_carrier(
@@ -7943,16 +8077,13 @@ fn indirect_function_signature(
             append_type_abi_params(&mut signature.params, program, parameter.ty, pointer);
         }
     }
-    if plan.checked {
-        signature.returns.push(AbiParam::new(types::I8));
-    } else if let mir::ReturnType::Value(ty) = function_type.return_type {
-        if !matches!(
-            ty,
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-        ) {
-            append_type_abi_params(&mut signature.returns, program, ty, pointer);
-        }
-    }
+    append_return_abi_params(
+        &mut signature,
+        &plan,
+        program,
+        function_type.return_type,
+        pointer,
+    );
     signature
 }
 
@@ -7963,48 +8094,13 @@ fn store_indirect_result(
     results: &[Value],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
+    // Only a directly returned value reaches here; a slot result is already in
+    // the result local.
     let mir::ReturnType::Value(ty) = *return_type else {
         return Ok(());
     };
-    if matches!(
-        ty,
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-    ) {
-        return Ok(());
-    }
     let target = result.ok_or_else(|| malformed_mir("value indirect call has no result local"))?;
-    let value = if matches!(
-        ty,
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-    ) {
-        byte_region_from_abi(ty, results)?
-    } else if ty.shared_interface().is_some()
-        || matches!(
-            ty,
-            mir::Type::NullableScalar(_)
-                | mir::Type::NullableString
-                | mir::Type::Interface(_)
-                | mir::Type::NullableInterface(_)
-                | mir::Type::Function(_)
-                | mir::Type::NullableFunction(_)
-        )
-    {
-        let present = *results
-            .first()
-            .ok_or_else(|| malformed_mir("indirect call has no first result word"))?;
-        let payload = *results
-            .get(1)
-            .ok_or_else(|| malformed_mir("indirect call has no second result word"))?;
-        LoweredValue::Nullable {
-            present,
-            payload: nullable_payload_from_doria_abi(builder, payload, ty),
-        }
-    } else {
-        let value = *results
-            .first()
-            .ok_or_else(|| malformed_mir("indirect call has no result"))?;
-        LoweredValue::Single(value_from_doria_abi(builder, value, ty))
-    };
+    let value = lowered_from_direct_results(builder, resources.program, ty, results)?;
     let pointer = resources.module.target_config().pointer_type();
     let slot = local_slot(resources.local_slots, target)?;
     store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)
@@ -21743,7 +21839,7 @@ fn lower_function_call_at(
             .1
             .is_some();
     let physical_return = crate::native_abi::call_return_type(callee_definition, virtual_dispatch);
-    let payload_result = ordinary_call_outputs(
+    let slot_result = ordinary_call_outputs(
         builder,
         callee_definition,
         physical_return,
@@ -21805,75 +21901,18 @@ fn lower_function_call_at(
         let callee = declared_function(builder, resources, function)?;
         builder.ins().call(callee, &values)
     };
-    let results = builder.inst_results(call);
-    let result = if callee_definition.has_checked_transport() {
-        ordinary_checked_result(builder, physical_return, payload_result, resources)?
+    let results = builder.inst_results(call).to_vec();
+    let result = if slot_result.is_some() || callee_definition.has_checked_transport() {
+        ordinary_slot_result(builder, physical_return, slot_result, resources)?
     } else {
         match physical_return {
             mir::ReturnType::Void => None,
-            mir::ReturnType::Value(
-                ty @ (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)),
-            ) => Some(byte_region_from_abi(ty, results)?),
-            mir::ReturnType::Value(ty) if ty.shared_interface().is_some() => {
-                Some(LoweredValue::Nullable {
-                    present: *results
-                        .first()
-                        .ok_or_else(|| malformed_mir("shared call has no control result"))?,
-                    payload: *results
-                        .get(1)
-                        .ok_or_else(|| malformed_mir("shared call has no interface view"))?,
-                })
-            }
-            mir::ReturnType::Value(
-                mir::Type::NullableScalar(_)
-                | mir::Type::NullableString
-                | mir::Type::Interface(_)
-                | mir::Type::NullableInterface(_)
-                | mir::Type::Function(_)
-                | mir::Type::NullableFunction(_),
-            ) => {
-                let ty = match physical_return {
-                    mir::ReturnType::Value(ty) => ty,
-                    mir::ReturnType::Void => unreachable!(),
-                };
-                Some(LoweredValue::Nullable {
-                    present: *results.first().ok_or_else(|| {
-                        malformed_mir("nullable call produced no presence result")
-                    })?,
-                    payload: nullable_payload_from_doria_abi(
-                        builder,
-                        *results.get(1).ok_or_else(|| {
-                            malformed_mir("nullable call produced no payload result")
-                        })?,
-                        ty,
-                    ),
-                })
-            }
-            mir::ReturnType::Value(
-                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_),
-            ) => Some(LoweredValue::Single(payload_result.ok_or_else(|| {
-                malformed_mir("payload enum call has no result storage")
-            })?)),
-            mir::ReturnType::Value(mir::Type::Class(class) | mir::Type::NullableClass(class))
-                if class_uses_open_carrier(resources.program, class) =>
-            {
-                Some(LoweredValue::OpenClass {
-                    object: *results.first().ok_or_else(|| {
-                        malformed_mir("open class call produced no object result")
-                    })?,
-                    descriptor: *results.get(1).ok_or_else(|| {
-                        malformed_mir("open class call produced no descriptor result")
-                    })?,
-                })
-            }
-            mir::ReturnType::Value(ty) => {
-                let value = *results
-                    .first()
-                    .ok_or_else(|| malformed_mir("value call produced no result"))?;
-                Some(LoweredValue::Single(value_from_doria_abi(
-                    builder, value, ty,
-                )))
-            }
+            mir::ReturnType::Value(ty) => Some(lowered_from_direct_results(
+                builder,
+                resources.program,
+                ty,
+                &results,
+            )?),
         }
     };
     let result = adapt_covariant_call_result(
@@ -21967,11 +22006,7 @@ fn ordinary_call_outputs(
     let checked = function.has_checked_transport();
     let result = match physical_return {
         mir::ReturnType::Value(ty)
-            if checked
-                || matches!(
-                    ty,
-                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-                ) =>
+            if native_closure_abi::returns_through_result_slot(physical_return, checked) =>
         {
             let address = create_call_storage(builder, ty, resources)?;
             values.push(address);
@@ -21985,21 +22020,25 @@ fn ordinary_call_outputs(
     Ok(result)
 }
 
-fn ordinary_checked_result(
+/// The value of an ordinary call whose callee wrote it to the caller's result
+/// storage: a checked callee, a payload enum, or a value wider than the direct
+/// return budget. A payload enum's value is that storage's address.
+fn ordinary_slot_result(
     builder: &mut FunctionBuilder,
     physical_return: mir::ReturnType,
     result: Option<Value>,
     resources: &LoweringResources<'_, '_>,
 ) -> Result<Option<LoweredValue>, BackendError> {
-    // Shared MIR validation proves every reachable entry is logically infallible.
-    // Its physical status carrier still belongs to the canonical root family.
+    // For a checked callee, shared MIR validation proves every reachable entry
+    // is logically infallible. Its physical status carrier still belongs to the
+    // canonical root family.
     Ok(match physical_return {
         mir::ReturnType::Void => None,
         mir::ReturnType::Value(ty) => Some(load_lowered_from_address(
             builder,
             resources.program,
             ty,
-            result.ok_or_else(|| malformed_mir("checked call has no result storage"))?,
+            result.ok_or_else(|| malformed_mir("slot-result call has no result storage"))?,
             resources.module.target_config().pointer_type(),
         )),
     })
@@ -22078,7 +22117,7 @@ fn lower_method_call_with_receiver(
         definition.virtual_slot.is_some() && receiver.class_parts()?.1.is_some(),
     );
     let mut values = vec![resources.current_frame];
-    let payload_result =
+    let slot_result =
         ordinary_call_outputs(builder, definition, physical_return, &mut values, resources)?;
     if let Some(borrow) = definition.return_borrow.filter(|_| {
         native_closure_abi::NativeCallableSignaturePlan::direct(definition)
@@ -22162,75 +22201,18 @@ fn lower_method_call_with_receiver(
         let callee = declared_function(builder, resources, function)?;
         builder.ins().call(callee, &values)
     };
-    let results = builder.inst_results(call);
-    let result = if definition.has_checked_transport() {
-        ordinary_checked_result(builder, physical_return, payload_result, resources)?
+    let results = builder.inst_results(call).to_vec();
+    let result = if slot_result.is_some() || definition.has_checked_transport() {
+        ordinary_slot_result(builder, physical_return, slot_result, resources)?
     } else {
         match physical_return {
             mir::ReturnType::Void => None,
-            mir::ReturnType::Value(
-                ty @ (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)),
-            ) => Some(byte_region_from_abi(ty, results)?),
-            mir::ReturnType::Value(ty) if ty.shared_interface().is_some() => {
-                Some(LoweredValue::Nullable {
-                    present: *results
-                        .first()
-                        .ok_or_else(|| malformed_mir("shared method call has no control result"))?,
-                    payload: *results
-                        .get(1)
-                        .ok_or_else(|| malformed_mir("shared method call has no interface view"))?,
-                })
-            }
-            mir::ReturnType::Value(
-                mir::Type::NullableScalar(_)
-                | mir::Type::NullableString
-                | mir::Type::Interface(_)
-                | mir::Type::NullableInterface(_)
-                | mir::Type::Function(_)
-                | mir::Type::NullableFunction(_),
-            ) => {
-                let ty = match physical_return {
-                    mir::ReturnType::Value(ty) => ty,
-                    mir::ReturnType::Void => unreachable!(),
-                };
-                Some(LoweredValue::Nullable {
-                    present: *results.first().ok_or_else(|| {
-                        malformed_mir("nullable method call has no presence result")
-                    })?,
-                    payload: nullable_payload_from_doria_abi(
-                        builder,
-                        *results.get(1).ok_or_else(|| {
-                            malformed_mir("nullable method call has no payload result")
-                        })?,
-                        ty,
-                    ),
-                })
-            }
-            mir::ReturnType::Value(
-                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_),
-            ) => Some(LoweredValue::Single(payload_result.ok_or_else(|| {
-                malformed_mir("payload enum method call has no result storage")
-            })?)),
-            mir::ReturnType::Value(mir::Type::Class(class) | mir::Type::NullableClass(class))
-                if class_uses_open_carrier(resources.program, class) =>
-            {
-                Some(LoweredValue::OpenClass {
-                    object: *results.first().ok_or_else(|| {
-                        malformed_mir("open class method call produced no object result")
-                    })?,
-                    descriptor: *results.get(1).ok_or_else(|| {
-                        malformed_mir("open class method call produced no descriptor result")
-                    })?,
-                })
-            }
-            mir::ReturnType::Value(ty) => {
-                let value = *results
-                    .first()
-                    .ok_or_else(|| malformed_mir("method call has no result"))?;
-                Some(LoweredValue::Single(value_from_doria_abi(
-                    builder, value, ty,
-                )))
-            }
+            mir::ReturnType::Value(ty) => Some(lowered_from_direct_results(
+                builder,
+                resources.program,
+                ty,
+                &results,
+            )?),
         }
     };
     let result = adapt_covariant_call_result(

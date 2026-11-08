@@ -1038,13 +1038,13 @@ fn function_type_with_return<'ctx>(
     return_type: mir::ReturnType,
 ) -> Result<inkwell::types::FunctionType<'ctx>, BackendError> {
     let pointer = context.ptr_type(AddressSpace::default());
-    let signature_plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+    let signature_plan =
+        native_closure_abi::NativeCallableSignaturePlan::direct_for_return(function, return_type);
     let mut parameters = signature_plan
         .hidden_inputs
         .iter()
         .map(|_| pointer.into())
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
-    let checked = signature_plan.checked;
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         if index == 0 && function.uses_virtual_receiver_abi() {
@@ -1062,18 +1062,10 @@ fn function_type_with_return<'ctx>(
             llvm_type(context, target_data, program, local.ty).into()
         });
     }
-    if checked {
-        return Ok(context.i8_type().fn_type(&parameters, false));
-    }
-    Ok(match return_type {
-        mir::ReturnType::Void => context.void_type().fn_type(&parameters, false),
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
-            context.void_type().fn_type(&parameters, false)
-        }
-        mir::ReturnType::Value(ty) => {
-            llvm_type(context, target_data, program, ty).fn_type(&parameters, false)
-        }
-    })
+    Ok(
+        callable_return_type(context, target_data, program, &signature_plan, return_type)
+            .fn_type(&parameters, false),
+    )
 }
 
 fn indirect_function_type<'ctx>(
@@ -1094,7 +1086,6 @@ fn indirect_function_type<'ctx>(
         .iter()
         .map(|_| pointer.into())
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
-    let checked = signature_plan.checked;
     for parameter in &function.parameters {
         let passed_by_pointer =
             parameter_uses_pointer_abi(parameter.ty, parameter.mode, environment);
@@ -1104,18 +1095,53 @@ fn indirect_function_type<'ctx>(
             llvm_type(context, target_data, program, parameter.ty).into()
         });
     }
-    if checked {
-        return Ok(context.i8_type().fn_type(&parameters, false));
+    Ok(callable_return_type(
+        context,
+        target_data,
+        program,
+        &signature_plan,
+        function.return_type,
+    )
+    .fn_type(&parameters, false))
+}
+
+/// The return of a Doria callable follows its plan: a checked callable returns
+/// its status byte, a value written through `ResultOut` returns nothing, and
+/// any other value returns its direct carrier.
+fn callable_return_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+    program: &mir::Program,
+    plan: &native_closure_abi::NativeCallableSignaturePlan,
+    return_type: mir::ReturnType,
+) -> CallableReturnType<'ctx> {
+    if plan.checked {
+        return CallableReturnType::Value(context.i8_type().into());
     }
-    Ok(match function.return_type {
-        mir::ReturnType::Void => context.void_type().fn_type(&parameters, false),
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
-            context.void_type().fn_type(&parameters, false)
+    match return_type {
+        mir::ReturnType::Value(ty) if plan.returns_value_directly() => {
+            CallableReturnType::Value(llvm_type(context, target_data, program, ty))
         }
-        mir::ReturnType::Value(ty) => {
-            llvm_type(context, target_data, program, ty).fn_type(&parameters, false)
+        _ => CallableReturnType::Void(context.void_type()),
+    }
+}
+
+enum CallableReturnType<'ctx> {
+    Value(BasicTypeEnum<'ctx>),
+    Void(inkwell::types::VoidType<'ctx>),
+}
+
+impl<'ctx> CallableReturnType<'ctx> {
+    fn fn_type(
+        self,
+        parameters: &[BasicMetadataTypeEnum<'ctx>],
+        variadic: bool,
+    ) -> inkwell::types::FunctionType<'ctx> {
+        match self {
+            Self::Value(ty) => ty.fn_type(parameters, variadic),
+            Self::Void(ty) => ty.fn_type(parameters, variadic),
         }
-    })
+    }
 }
 
 fn apply_function_abi_attributes(
@@ -4758,14 +4784,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             args,
             environment.map(|_| function_type.parameters.as_slice()),
         )?;
+        let plan = if environment.is_some() {
+            native_closure_abi::NativeCallableSignaturePlan::indirect(&function_type)
+        } else {
+            native_closure_abi::NativeCallableSignaturePlan::interface_entry(&function_type)
+        };
         let mut values = vec![self.current_frame.into()];
-        let aggregate_return = matches!(
-            function_type.return_type,
-            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-        );
-        if aggregate_return {
+        if plan
+            .index_of(native_closure_abi::NativeCallableHiddenInput::ResultOut)
+            .is_some()
+        {
+            // The callee writes its value straight into the result local, as a
+            // checked indirect call does.
             let result =
-                result.ok_or_else(|| malformed_mir("indirect payload call has no result"))?;
+                result.ok_or_else(|| malformed_mir("indirect slot-result call has no result"))?;
             values.push(local_slot(&self.local_slots, result)?.into());
         }
         if let Some(home) =
@@ -4780,11 +4812,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         )? {
             values.push(home.into());
         }
-        let plan = if environment.is_some() {
-            native_closure_abi::NativeCallableSignaturePlan::indirect(&function_type)
-        } else {
-            native_closure_abi::NativeCallableSignaturePlan::interface_entry(&function_type)
-        };
         self.append_parameter_borrow_homes(&plan, args, &lowered.lowered, None, &mut values)?;
         if let Some(environment) = environment {
             values.push(environment.into());
@@ -4810,7 +4837,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             environment.is_some(),
         );
         if let mir::ReturnType::Value(ty) = function_type.return_type {
-            if !aggregate_return {
+            if plan.returns_value_directly() {
                 let value = call
                     .try_as_basic_value()
                     .basic()
@@ -6538,25 +6565,42 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?;
                     return Ok(());
                 }
+                if let Some(destination) = self.return_address {
+                    // A payload enum, or a value wider than the direct return
+                    // budget, goes to the caller's result slot.
+                    if let mir::Type::PayloadEnum(payload)
+                    | mir::Type::NullablePayloadEnum(payload) = expression.ty()
+                    {
+                        self.cleanup_mixed_locals()?;
+                        self.cleanup_class_locals()?;
+                        self.cleanup_string_locals()?;
+                        self.copy_payload_bytes(
+                            destination,
+                            value.into_pointer_value(),
+                            payload,
+                            matches!(expression.ty(), mir::Type::NullablePayloadEnum(_)),
+                        )?;
+                    } else {
+                        build(self.builder.build_store(destination, value))?;
+                        self.cleanup_mixed_locals()?;
+                        self.cleanup_class_locals()?;
+                        self.cleanup_string_locals()?;
+                    }
+                    build(self.builder.build_return(None))?;
+                    return Ok(());
+                }
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
-                if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
-                    expression.ty()
-                {
-                    let destination = self.return_address.ok_or_else(|| {
-                        malformed_mir("payload enum return has no hidden result address")
-                    })?;
-                    self.copy_payload_bytes(
-                        destination,
-                        value.into_pointer_value(),
-                        payload,
-                        matches!(expression.ty(), mir::Type::NullablePayloadEnum(_)),
-                    )?;
-                    build(self.builder.build_return(None))?;
-                } else {
-                    build(self.builder.build_return(Some(&value)))?;
+                if matches!(
+                    expression.ty(),
+                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+                ) {
+                    return Err(malformed_mir(
+                        "payload enum return has no hidden result address",
+                    ));
                 }
+                build(self.builder.build_return(Some(&value)))?;
             }
             mir::Terminator::ReturnVoid => {
                 self.cleanup_mixed_locals()?;
@@ -23081,42 +23125,31 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ));
         }
         let checked = callee_definition.has_checked_transport();
-        let checked_result = match physical_return {
-            mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) if checked => {
-                Some(self.entry_payload_alloca(ty, false, "call.checked.result")?)
+        // A checked callee, a payload enum, or a value wider than the direct
+        // return budget writes its value to the caller's result storage.
+        let slot_result = match physical_return {
+            mir::ReturnType::Value(ty)
+                if native_closure_abi::returns_through_result_slot(physical_return, checked) =>
+            {
+                Some(match ty {
+                    mir::Type::PayloadEnum(payload) => {
+                        self.entry_payload_alloca(payload, false, "call.slot.result")?
+                    }
+                    mir::Type::NullablePayloadEnum(payload) => {
+                        self.entry_payload_alloca(payload, true, "call.slot.result")?
+                    }
+                    _ => self.entry_alloca(
+                        llvm_type(self.context, self.target_data, self.program, ty),
+                        "call.slot.result",
+                    )?,
+                })
             }
-            mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) if checked => {
-                Some(self.entry_payload_alloca(ty, true, "call.checked.result")?)
-            }
-            mir::ReturnType::Value(ty) if checked => Some(self.entry_alloca(
-                llvm_type(self.context, self.target_data, self.program, ty),
-                "call.checked.result",
-            )?),
             _ => None,
-        };
-        let aggregate_result = if checked {
-            None
-        } else {
-            match physical_return {
-                mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) => Some((
-                    self.entry_payload_alloca(ty, false, "call.payload.result")?,
-                    ty,
-                    false,
-                )),
-                mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) => Some((
-                    self.entry_payload_alloca(ty, true, "call.payload.result")?,
-                    ty,
-                    true,
-                )),
-                mir::ReturnType::Value(_) | mir::ReturnType::Void => None,
-            }
         };
         let mut values = Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(args.len() + 2);
         let lowered = self.lower_call_arguments(args)?;
         values.push(self.current_frame.into());
-        if let Some(result) = checked_result {
-            values.push(result.into());
-        } else if let Some((result, _, _)) = aggregate_result {
+        if let Some(result) = slot_result {
             values.push(result.into());
         }
         if checked {
@@ -23224,10 +23257,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir(format!("function{} does not exist", function.0)))?;
             build(self.builder.build_call(callee, &values, "call"))?
         };
-        apply_call_abi_attributes(self.context, call, function_in(self.program, function)?)?;
+        apply_call_abi_attributes_for_return(
+            self.context,
+            call,
+            function_in(self.program, function)?,
+            physical_return,
+        )?;
         let result = if expects_result {
-            if let Some(result) = checked_result {
-                // MIR proves the selected logical contract cannot fail.
+            if let Some(result) = slot_result {
+                // For a checked callee, MIR proves the selected logical
+                // contract cannot fail.
                 let mir::ReturnType::Value(ty) = physical_return else {
                     unreachable!()
                 };
@@ -23240,11 +23279,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     Some(build(self.builder.build_load(
                         llvm_type(self.context, self.target_data, self.program, ty),
                         result,
-                        "call.checked.value",
+                        "call.slot.value",
                     ))?)
                 }
-            } else if let Some((result, _, _)) = aggregate_result {
-                Some(result.into())
             } else {
                 Some(call.try_as_basic_value().basic().ok_or_else(|| {
                     malformed_mir(format!("call to function{} produced no result", function.0))
@@ -23299,15 +23336,29 @@ fn apply_call_abi_attributes(
     call: inkwell::values::CallSiteValue<'_>,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
-    if !function.has_checked_transport() {
+    apply_call_abi_attributes_for_return(context, call, function, function.return_type)
+}
+
+/// Call attributes for the entry a call reaches, whose return carrier is
+/// `physical_return`: a virtual call reaches its family's return adapter.
+fn apply_call_abi_attributes_for_return(
+    context: &Context,
+    call: inkwell::values::CallSiteValue<'_>,
+    function: &mir::Function,
+    physical_return: mir::ReturnType,
+) -> Result<(), BackendError> {
+    let plan = native_closure_abi::NativeCallableSignaturePlan::direct_for_return(
+        function,
+        physical_return,
+    );
+    if plan.returns_value_directly() {
         if let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))) =
-            function.return_type
+            physical_return
         {
             apply_call_integer_extension_attribute(context, call, AttributeLoc::Return, ty);
         }
     }
-    let source_parameter_offset = native_closure_abi::NativeCallableSignaturePlan::direct(function)
-        .source_parameter_offset() as u32;
+    let source_parameter_offset = plan.source_parameter_offset() as u32;
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         if let Some(ty) = parameter_integer_extension(

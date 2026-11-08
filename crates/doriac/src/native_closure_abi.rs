@@ -658,16 +658,11 @@ impl NativeCallableSignaturePlan {
         environment: bool,
     ) -> Self {
         let mut hidden_inputs = vec![NativeCallableHiddenInput::CurrentFrame];
-        if checked {
-            if matches!(return_type, mir::ReturnType::Value(_)) {
-                hidden_inputs.push(NativeCallableHiddenInput::ResultOut);
-            }
-            hidden_inputs.push(NativeCallableHiddenInput::ErrorOut);
-        } else if matches!(
-            return_type,
-            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-        ) {
+        if returns_through_result_slot(return_type, checked) {
             hidden_inputs.push(NativeCallableHiddenInput::ResultOut);
+        }
+        if checked {
+            hidden_inputs.push(NativeCallableHiddenInput::ErrorOut);
         }
         if return_borrow.is_some()
             && (returns_function_value(return_type)
@@ -693,6 +688,43 @@ impl NativeCallableSignaturePlan {
             .position(|candidate| *candidate == input)
     }
 
+    /// The plan of a direct call that receives `physical_return`, the return
+    /// carrier of the entry the call actually reaches. A virtual call reaches
+    /// its family's return adapter, whose carrier may differ from the
+    /// statically named method's. The result slot follows the carrier the
+    /// entry returns; every other hidden input keeps the named method's
+    /// contract, exactly as the call's argument lowering does.
+    pub fn direct_for_return(function: &mir::Function, physical_return: mir::ReturnType) -> Self {
+        let mut plan = Self::direct(function);
+        let result = plan.index_of(NativeCallableHiddenInput::ResultOut);
+        let after_frame = plan
+            .index_of(NativeCallableHiddenInput::CurrentFrame)
+            .map_or(0, |index| index + 1);
+        match (
+            returns_through_result_slot(physical_return, plan.checked),
+            result,
+        ) {
+            (true, None) => plan
+                .hidden_inputs
+                .insert(after_frame, NativeCallableHiddenInput::ResultOut),
+            (false, Some(index)) => {
+                plan.hidden_inputs.remove(index);
+            }
+            _ => {}
+        }
+        plan
+    }
+
+    /// Whether the callee hands its value back in return registers. Otherwise
+    /// it writes the value through the `ResultOut` slot, and a checked callee
+    /// returns only its status byte.
+    pub fn returns_value_directly(&self) -> bool {
+        !self.checked
+            && self
+                .index_of(NativeCallableHiddenInput::ResultOut)
+                .is_none()
+    }
+
     pub fn source_parameter_offset(&self) -> usize {
         self.hidden_inputs.len()
     }
@@ -715,6 +747,121 @@ pub const fn returns_borrowed_value(
     match return_type {
         mir::ReturnType::Value(ty) => ty.borrows_returned_value(return_borrow),
         mir::ReturnType::Void => false,
+    }
+}
+
+/// Register slots a value occupies when the private native ABI passes or
+/// returns it directly. `float` counts the slots a backend may carry in a
+/// floating-point register; a 128-bit inline scalar takes two slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectValueSlots {
+    pub total: u32,
+    pub float: u32,
+}
+
+impl DirectValueSlots {
+    const fn integer(total: u32) -> Self {
+        Self { total, float: 0 }
+    }
+
+    const fn plus(self, other: Self) -> Self {
+        Self {
+            total: self.total + other.total,
+            float: self.float + other.float,
+        }
+    }
+
+    pub const fn fits(self, budget: Self) -> bool {
+        self.total <= budget.total && self.float <= budget.float
+    }
+}
+
+/// The largest value a callable returns in registers: two slots, at most one
+/// of them floating-point. This is the smallest return-register budget of the
+/// supported native targets. x86-64 System V and Windows x64 return two
+/// integer registers (`rax`, `rdx`), and Windows x64 one floating-point
+/// register (`xmm0`). It is also C's threshold: System V and AAPCS64 return
+/// an aggregate of at most 16 bytes in registers and a larger one through
+/// caller memory. One budget on every target keeps the lowering identical
+/// across hosts, so a run on any host exercises the transport every other host
+/// uses.
+pub const DIRECT_RETURN_SLOTS: DirectValueSlots = DirectValueSlots { total: 2, float: 1 };
+
+/// The direct register shape of `ty`, independent of the program. A class
+/// reports its widest carrier (an open class's object and descriptor words).
+/// Payload enums are inline aggregates and travel by address; their slot
+/// count is that address.
+pub const fn direct_value_slots(ty: mir::Type) -> DirectValueSlots {
+    match ty {
+        mir::Type::Scalar(scalar) => direct_scalar_slots(scalar),
+        mir::Type::NullableScalar(scalar) => {
+            DirectValueSlots::integer(1).plus(direct_scalar_slots(scalar))
+        }
+        mir::Type::ByteRegion(_)
+        | mir::Type::NullableString
+        | mir::Type::Interface(_)
+        | mir::Type::NullableInterface(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::Class(_)
+        | mir::Type::NullableClass(_) => DirectValueSlots::integer(2),
+        mir::Type::NullableByteRegion(_) => DirectValueSlots::integer(3),
+        mir::Type::SharedReference(_)
+        | mir::Type::WeakReference(_)
+        | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+            if ty.shared_interface().is_some() {
+                DirectValueSlots::integer(2)
+            } else {
+                DirectValueSlots::integer(1)
+            }
+        }
+        mir::Type::String
+        | mir::Type::Mixed
+        | mir::Type::NullableMixed
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ClosureEnvironment(_) => DirectValueSlots::integer(1),
+    }
+}
+
+const fn direct_scalar_slots(scalar: mir::ScalarType) -> DirectValueSlots {
+    match scalar {
+        mir::ScalarType::Float(_) => DirectValueSlots { total: 1, float: 1 },
+        mir::ScalarType::Inline(inline) => {
+            DirectValueSlots::integer(inline.storage_bytes().div_ceil(8))
+        }
+        mir::ScalarType::Integer(_) | mir::ScalarType::Bool | mir::ScalarType::Enum(_) => {
+            DirectValueSlots::integer(1)
+        }
+    }
+}
+
+/// Whether a callable's value travels through the caller's result slot
+/// (`NativeCallableHiddenInput::ResultOut`) instead of return registers. A
+/// checked callable returns its status in the register and its value through
+/// the slot. Otherwise a payload enum, an inline aggregate, always uses the
+/// slot, and any other value uses it when it exceeds [`DIRECT_RETURN_SLOTS`].
+/// Every definition and call shape in both native backends derives its
+/// signature from this one rule.
+pub const fn returns_through_result_slot(return_type: mir::ReturnType, checked: bool) -> bool {
+    match return_type {
+        mir::ReturnType::Void => false,
+        mir::ReturnType::Value(_) if checked => true,
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
+            true
+        }
+        mir::ReturnType::Value(ty) => !direct_value_slots(ty).fits(DIRECT_RETURN_SLOTS),
     }
 }
 
@@ -1809,5 +1956,47 @@ function main(): void
                     .div_ceil(8)
             );
         }
+    }
+
+    #[test]
+    fn direct_returns_fit_the_smallest_target_return_budget() {
+        use super::{direct_value_slots, returns_through_result_slot, DIRECT_RETURN_SLOTS};
+        use crate::inline_value::InlineValueType;
+        use crate::numeric::{FloatType, IntegerType};
+        use crate::types::ByteRegionKind;
+
+        let value = mir::ReturnType::Value;
+        let int = mir::ScalarType::Integer(IntegerType::Int64);
+        let float = mir::ScalarType::Float(FloatType::Float64);
+        let deadline = mir::ScalarType::Inline(InlineValueType::Deadline);
+        // Two slots, at most one floating-point: x86-64 System V and Windows
+        // x64 return these in rax/rdx and xmm0, AArch64 in x0/x1 and v0.
+        for ty in [
+            mir::Type::Scalar(int),
+            mir::Type::Scalar(float),
+            mir::Type::Scalar(deadline),
+            mir::Type::NullableScalar(int),
+            mir::Type::NullableScalar(float),
+            mir::Type::ByteRegion(ByteRegionKind::Readonly),
+            mir::Type::NullableString,
+            mir::Type::Interface(mir::InterfaceTypeId(0)),
+            mir::Type::NullableFunction(mir::FunctionTypeId(0)),
+            mir::Type::NullableClass(crate::class_layout::ClassId(0)),
+        ] {
+            assert!(direct_value_slots(ty).fits(DIRECT_RETURN_SLOTS), "{ty:?}");
+            assert!(!returns_through_result_slot(value(ty), false), "{ty:?}");
+            assert!(returns_through_result_slot(value(ty), true), "{ty:?}");
+        }
+        // Three slots exceed x86-64's two integer return registers.
+        for ty in [
+            mir::Type::NullableByteRegion(ByteRegionKind::Readonly),
+            mir::Type::NullableByteRegion(ByteRegionKind::Writable),
+            mir::Type::NullableScalar(deadline),
+        ] {
+            assert_eq!(direct_value_slots(ty).total, 3, "{ty:?}");
+            assert!(returns_through_result_slot(value(ty), false), "{ty:?}");
+        }
+        assert!(!returns_through_result_slot(mir::ReturnType::Void, false));
+        assert!(!returns_through_result_slot(mir::ReturnType::Void, true));
     }
 }

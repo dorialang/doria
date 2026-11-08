@@ -40,6 +40,10 @@ ryu.workspace = true
 
 [dev-dependencies]
 doria-rt = { path = "../doria-rt", default-features = false }
+# Tests lower every durable native program for every tier-1 target, not only
+# the host's: a target's ABI limits (x86-64 returns two integer registers,
+# AArch64 eight) must fail locally, not first in CI.
+cranelift-codegen = { version = "0.134.2", features = ["x86", "arm64"] }
 
 [[bin]]
 name = "doriac"

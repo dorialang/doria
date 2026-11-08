@@ -1605,6 +1605,154 @@ callbacks), 21 of them with assertions.
 - The fix is verified at the object level and by the native release and
   debug suites, but no Windows machine here can execute the harness.
 
+### Returns wider than two registers take the result slot (2026-11-07)
+
+CI's ubuntu job (run 42404305965) failed two `byte_region_execution_tests`
+with Cranelift's "Too many return values to fit in registers". A
+`?ByteRegion` returns three pointer-sized words: data, length and presence.
+x86-64 System V and Windows x64 return at most two integer registers (`rax`,
+`rdx`). AArch64 returns up to eight, so macOS passed. `?Deadline` has the same
+shape: a presence word and a 16-byte inline scalar in two registers. Only
+payload enums and checked values used the caller's result slot
+(`NativeCallableHiddenInput::ResultOut`). Every other value went to the return
+registers, whatever its width.
+
+The return transport of a Doria callable belongs to the backend-neutral
+callable plan (`native_closure_abi::NativeCallableSignaturePlan`). Both
+backends already build every definition, call shape and runtime trampoline
+from that plan's hidden inputs.
+
+**Chosen:** one rule in the plan, `returns_through_result_slot`.
+
+- A value returns in registers only if it fits `DIRECT_RETURN_SLOTS`: two
+  slots, at most one of them floating-point.
+- Anything wider uses the result slot, like payload enums, on every target.
+- `direct_value_slots` gives each MIR type's register shape: a class counts
+  its widest carrier, and a 128-bit inline scalar counts two slots.
+- Every signature builder takes its returns from the plan in both backends:
+  - Cranelift: `append_return_abi_params`;
+  - LLVM: `callable_return_type`.
+- The definition stores through the slot and the caller loads from it:
+  - an ordinary call loads from fresh storage;
+  - an indirect call passes the result local, as a checked indirect call
+    already does.
+- `direct_for_return` builds a virtual call's plan from the carrier of the
+  family adapter it reaches, so a covariant return can't leave caller and
+  callee disagreeing about the slot.
+
+| Option | Pros | Cons |
+|---|---|---|
+| One budget for every target, in the shared plan (chosen) | Every host runs the same transport, so macOS now exercises what Linux and Windows need; matches C, whose System V and AAPCS64 return aggregates above 16 bytes through memory; one rule for both backends | A three-word value on AArch64 goes through memory where eight return registers could carry it, at the same cost C pays |
+| Per-target capacity from the ISA | Keeps AArch64's register return for three words | The lowering differs by host, which is how this reached CI unseen; LLVM and Cranelift need the target in the plan |
+| Cranelift `enable_multi_ret_implicit_sret` | One flag | Cranelift documents it as non-conforming, with an ABI that may change between versions; LLVM would still need its own path |
+| Cranelift `CallConv::Tail` for Doria-internal calls | Eight return registers on x86-64 | Changes every internal signature and runtime boundary, and its Windows unwind support needs proving; out of proportion to this fix |
+
+**Tests:**
+
+- `native_closure_abi` checks the budget for every two-slot shape and every
+  three-slot shape.
+- `codegen_cranelift::return_transport_tests` runs on any host:
+  - every function and function-type signature of a program with
+    `?ByteRegion` and `?Deadline` returns, from a free function, a method and
+    a closure, fits the budget;
+  - those returns carry a result slot;
+  - `direct_value_slots` bounds every Cranelift carrier the program uses.
+- `native_return_transport_tests` runs the same shapes on the interpreter and
+  every available native profile. It also runs virtual calls whose family
+  returns `?Deadline` (three slots, through the result slot) while the
+  overrides return `Deadline` (two slots, in registers), including one whose
+  static callee is an open override, so that `direct_for_return` decides the
+  slot. It also covers an open class returned through a function value.
+
+**Found, not fixed here: open-class methods that return a region.** The
+covariant test first used `?ByteRegion` and `ByteRegion`. A program that
+declares this pair and calls `view` through a `Source` fails shared MIR
+validation before any backend runs:
+
+```doria
+use Doria\Std\Io\ByteRegion;
+open class Source {
+    Bytes $bytes = Bytes::allocate(2);
+    open function view(): ?ByteRegion { return $this->bytes->getRegion(0, 1); }
+}
+class Filled extends Source {
+    override function view(): ByteRegion { return $this->bytes->getRegion(0, 2); }
+}
+```
+
+The error is "retained source path must name stored owning properties (in
+function `Source::view`)", raised by `validate_source_path` in
+`mir_validation/retained.rs`. This change touches no MIR lowering or
+validation, so the defect predates it. It belongs to retained-source lowering
+for open-class receivers, a separate follow-up.
+
+**Every tier-1 target lowers on every host.** The executable parity matrix
+runs each program on the host only, which is how an x86-64 ABI limit first
+appeared in CI.
+- doriac's dev-dependency on `cranelift-codegen` enables the `x86` and `arm64`
+  ISAs, so test builds carry every tier-1 backend while the shipped compiler
+  keeps the host's.
+- `lower_validated_mir_to_object_for_isa` takes the target. Executables pass
+  the host's; the tests pass x86-64 and AArch64 Linux, x86-64 Windows and
+  AArch64 macOS (Windows on ARM64 is blocked upstream, below).
+- `return_transport_tests` lowers the wide-return program and every program in
+  the durable native manifest for all four.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Test-only ISA features (chosen) | Every vet sees every target's ABI limits; the shipped compiler is unchanged | Test builds compile two extra Cranelift backends, a second feature variant of `cranelift-codegen` and its dependents in the cache |
+| Enable the ISAs in the shipped compiler | One feature graph; groundwork for cross-compilation | A larger compiler for a capability no command exposes yet |
+| Rely on CI's per-OS runners | No change | The defect class keeps surfacing first in CI |
+
+**16-byte inline scalars in x86-64 signatures.** The cross-target lowering
+found that Cranelift rejects every `i128` parameter and return under x86-64
+System V and Windows fastcall ("i128 args/return values not supported unless
+LLVM ABI extensions are enabled"). AArch64 accepts them. `Deadline` and the
+registration and transfer keys are 16-byte inline scalars with an `i128`
+carrier, so the fast profile could not compile a Doria function that passes
+or returns one by value on Linux or Windows x64.
+
+The ABIs on each side:
+- **C and LLVM.** System V passes `__int128` in two consecutive integer
+  registers and returns it in `rax`/`rdx`. AAPCS64 uses an even register
+  pair. MSVC has no 128-bit integer; clang and current Rust pass it by
+  reference on Windows x64.
+- **doria-rt.** Its `extern "C"` functions already carry 128-bit values as
+  two words (`dr_v1_deadline_from_now` writes `low` and `high`). An `i128`
+  appears only in Doria-to-Doria calls, and the two native backends never
+  call each other.
+
+**Chosen:** `native_flags`, the one Cranelift settings owner, enables
+`enable_llvm_abi_extensions`. An `i128` then travels as two consecutive
+64-bit registers on x86-64 targets: the System V convention, applied to
+Windows x64 for these internal calls. AArch64 is unchanged.
+`declare_runtime` now rejects a 128-bit integer in any `doria-rt` import, so
+the C boundary stays word-based on every target.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Cranelift's LLVM ABI extension, word-based runtime boundary enforced (chosen) | Cranelift's documented setting for `i128` signatures, as rustc's Cranelift backend uses it; the System V `__int128` transport; one setting for every target | On Windows x64 the internal convention is a register pair, not clang's by-reference passing; it is private to Doria-to-Doria calls, and the runtime boundary refuses it. It also lets System V return a third integer register, which `DIRECT_RETURN_SLOTS` never uses |
+| Two `i64` words at every Doria signature in the shared plan | The carrier no longer depends on any code generator's `i128` support; same words as the runtime boundary | Splits and joins at every parameter, argument, return, call result and trampoline in both backends for the same machine code; LLVM already handles `i128` natively for its own calls |
+| Pass 16-byte inline scalars by address | No register-pair rules | A memory round trip for every `Deadline` or key argument, slower than C |
+
+**Windows on ARM64.** cranelift-object 0.134 maps the AArch64
+symbol-relocation kinds for ELF and Mach-O only: `Aarch64AdrGotPage21`,
+`Aarch64AdrPrelPgHi21` and `Aarch64AddAbsLo12Nc`. The fast profile therefore
+cannot emit a COFF object for `aarch64-pc-windows-msvc`. The cross-target
+test covers x86-64 Linux, x86-64 Windows, AArch64 Linux and AArch64 macOS,
+and names this gap. It is an upstream Cranelift limitation: closing it needs
+those relocations in cranelift-object, or a different object writer for that
+target.
+
+**One decoder for direct returns.** Cranelift decoded register returns in
+three copies: ordinary calls, method calls and indirect calls. The indirect
+copy had no open-class arm, so an open class returned there in registers would
+have failed lowering with "open class storage received no class descriptor".
+Function values and erased interface calls carry ambient I/O today and return
+through the slot, so no test program reached that arm.
+`lowered_from_direct_results` is now the only decoder, the inverse of
+`append_type_abi_params` and `value_to_doria_abi`.
+
 ### Windows CI reports what happened (2026-11-07)
 
 CI on `5470711` (push run 42407455781, cancelled after 70 minutes) ran the
