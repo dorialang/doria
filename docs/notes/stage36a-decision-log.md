@@ -2127,3 +2127,31 @@ is clean for Windows and Linux.
 `x86_64-unknown-linux-gnu` standard libraries for the pinned 1.98.1
 toolchain. Installing them is a download, which needs Andrew's approval.
 Until then the validator stops before running, with the command to run.
+
+### Tests that pinned the pre-`974762d` return ABI (2026-11-08)
+
+CI on `f94c9b3` (run 42428913999) failed `byte_region_native_structure_tests`
+on macOS, Linux and the rust job. Two of its tests pinned the old contract:
+- the native plan of the `?ByteRegion` triple listed only `CurrentFrame`;
+- its LLVM definition returned the `{ word, { ptr, word } }` triple directly.
+
+Both now assert the new contract:
+- the two-word pair stays direct: `[CurrentFrame]`, returning its
+  `{ ptr, word }` carrier;
+- the triple returns `void` through `ResultOut`, after the current frame,
+  while its parameter keeps the explicit triple;
+- neither plan has a borrow-home result, which is what the tests existed to
+  prove.
+
+A sweep for tests asserting native signatures, `define` lines,
+`hidden_inputs`, `ResultOut` or return shapes found no other test that pins a
+shape this ABI change moved:
+- `llvm_mir_tests`, `common/native_structure.rs`;
+- `monomorphization/tests.rs`;
+- the readiness-set tests;
+- `native_closure_abi` and the return-transport tests.
+
+The gap was in the vet, not in any one test. `974762d` ran only the targets
+it touched, and this test is in none of them. This update and the next fix
+are committed only after the complete doriac suite passes with llvm-backend:
+every target, the parity suite and its shards, and both clippy runs.

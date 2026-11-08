@@ -119,10 +119,26 @@ fn native_region_layout_and_returns_use_inline_carriers_not_borrow_home_results(
         }
     }
 
+    // A retained region returns its carrier, never a borrow-home result. The
+    // two-word pair fits the direct return budget and stays in registers. The
+    // three-word nullable triple exceeds it and returns through the caller's
+    // result slot (Decision log: "Returns wider than two registers take the
+    // result slot").
     let mir = lower();
-    for (name, expected) in [
-        ("pair", Type::ByteRegion(ByteRegionKind::Readonly)),
-        ("triple", Type::NullableByteRegion(ByteRegionKind::Readonly)),
+    for (name, expected, hidden_inputs) in [
+        (
+            "pair",
+            Type::ByteRegion(ByteRegionKind::Readonly),
+            vec![NativeCallableHiddenInput::CurrentFrame],
+        ),
+        (
+            "triple",
+            Type::NullableByteRegion(ByteRegionKind::Readonly),
+            vec![
+                NativeCallableHiddenInput::CurrentFrame,
+                NativeCallableHiddenInput::ResultOut,
+            ],
+        ),
     ] {
         let function = mir
             .functions
@@ -136,9 +152,16 @@ fn native_region_layout_and_returns_use_inline_carriers_not_borrow_home_results(
             ReturnBorrowKind::Retained
         );
         let signature = NativeCallableSignaturePlan::direct(function);
+        assert_eq!(signature.hidden_inputs, hidden_inputs, "{name}");
+        assert!(!signature.hidden_inputs.iter().any(|input| matches!(
+            input,
+            NativeCallableHiddenInput::BorrowHome | NativeCallableHiddenInput::ResultBorrowHomeOut
+        )));
         assert_eq!(
-            signature.hidden_inputs,
-            vec![NativeCallableHiddenInput::CurrentFrame]
+            signature.returns_value_directly(),
+            doriac::native_closure_abi::direct_value_slots(expected)
+                .fits(doriac::native_closure_abi::DIRECT_RETURN_SLOTS),
+            "{name}"
         );
     }
 }
@@ -171,10 +194,14 @@ fn llvm_region_calls_and_signatures_preserve_pair_and_explicit_presence_triple()
         &ir,
     );
 
+    // The pair returns its `{ ptr, word }` carrier directly. The presence
+    // triple exceeds the direct return budget: its definition returns `void`
+    // and writes the `{ word, { ptr, word } }` carrier through the result slot
+    // after the current frame, while its parameter keeps the explicit triple.
     let word = format!("i{}", usize::BITS);
     let pair = format!("{{ ptr, {word} }}");
     let triple = format!("{{ {word}, {pair} }}");
-    for (name, carrier) in [("pair", pair), ("triple", triple)] {
+    for (name, carrier, direct) in [("pair", pair, true), ("triple", triple, false)] {
         let function = mir
             .functions
             .iter()
@@ -185,9 +212,40 @@ fn llvm_region_calls_and_signatures_preserve_pair_and_explicit_presence_triple()
             .lines()
             .find(|line| line.starts_with("define ") && line.contains(&format!("@{symbol}(")))
             .unwrap_or_else(|| panic!("missing {symbol}: {ir}"));
+        let (returned, parameters) = signature
+            .split_once(&format!("@{symbol}("))
+            .and_then(|(returned, rest)| Some((returned, rest.split_once(')')?.0)))
+            .unwrap_or_else(|| panic!("{name} has no parameter list: {signature}"));
+        // The hidden inputs (the current frame, then any result slot) lead the
+        // parameters as pointers; the region parameter keeps its carrier.
+        let hidden = NativeCallableSignaturePlan::direct(function)
+            .hidden_inputs
+            .len();
+        let mut rest = parameters;
+        for _ in 0..hidden {
+            assert!(
+                rest.starts_with("ptr "),
+                "{name}'s hidden inputs must be pointers: {signature}"
+            );
+            rest = rest
+                .split_once(", ")
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("{name} has no source parameter: {signature}"));
+        }
         assert!(
-            signature.matches(&carrier).count() >= 2,
-            "return and parameter must both use {carrier}: {signature}"
+            rest.starts_with(&format!("{carrier} ")),
+            "{name}'s parameter must keep {carrier}: {signature}"
         );
+        if direct {
+            assert!(
+                returned.contains(&carrier),
+                "{name} must return {carrier}: {signature}"
+            );
+        } else {
+            assert!(
+                returned.ends_with(" void "),
+                "{name} must return through its result slot: {signature}"
+            );
+        }
     }
 }
