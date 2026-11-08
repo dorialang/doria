@@ -89,6 +89,22 @@ template's diagnostics. Each call's executable transport belongs to its
 selected callee, so an effect-free selection uses the ordinary call. (Amended
 2026-11-06, Stage 36a decision log entry 51.)
 
+Every checked region carries two ambient profiles. Authored reach is what the
+body may raise, judged from its own syntax. A named callee contributes its own
+authored reach. A closure literal that the call names contributes what that
+literal reaches. A call whose implementation is chosen elsewhere contributes
+its complete contract: a function value, an erased interface, a constrained
+method, or a bodyless trait requirement. Transport is what the selected
+implementations can raise. Whole-program facts, such as the closures callers
+pass or a composer's exact members, may narrow it, and it never exceeds reach.
+Catch reachability, the destructor boundary, and nonthrowing initializers read
+authored reach. Catch routing, MIR, and the ABI read transport. A catch that
+authored reach allows but narrowed transport can never enter is accepted, and
+it compiles to a route that is never taken. A composed trait copy has exact
+transport and its authored member's reach. The authored member's check alone decides the copy's catches.
+No caller, closure, or composer elsewhere in the program changes a body's
+diagnostics. (Amended 2026-11-07, Stage 36a decision log entry 52.)
+
 ### Fallible source finalizers
 
 A source `finally` block may propagate a checked Error. Finalizer effects are

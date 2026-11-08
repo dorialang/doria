@@ -1801,7 +1801,11 @@ readonly, and catch-scoped. Concrete catches cover the named Error class and its
 descendants (Decision 0130); `catch (Error)` catches every checked error.
 Source order applies: a parent catch makes a later descendant catch unreachable.
 Duplicate catches, catches after `Error`, and catches proven unable to match a protected effect are
-unreachable. Catch bodies are independent: sibling catches do not handle an
+unreachable. That proof uses the protected body's authored reach (Decision
+0123). A call through a function value, an erased interface, a constrained
+method, or a bodyless trait requirement contributes its complete contract, so
+no caller, closure, or composer elsewhere decides a catch's reachability.
+Catch bodies are independent: sibling catches do not handle an
 error raised by another catch. A checked Error may escape `finally`; a catch on
 that same `try` does not cover it, while a finalizer-local or outer catch may.
 The finalizer Error supersedes any pending nonfatal outcome and destroys a

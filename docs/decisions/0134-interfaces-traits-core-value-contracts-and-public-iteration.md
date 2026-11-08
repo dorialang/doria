@@ -729,7 +729,9 @@ interface contract's set. Interface slots use the existing checked return ABI.
 AmbientIo and TestAssertion remain automatic and separate.
 
 Trait requirements use the same subset law. Trait bodies are checked when
-authored and revalidated after substitution. Error subinterfaces participate in
+authored and revalidated after substitution. Revalidation narrows executable
+transport only; the authored check decides catch reachability for every
+composer (Decision 0123, amended 2026-11-07). Error subinterfaces participate in
 catch coverage, rethrow, `toThrow`, finalizers, constructor failure, and dynamic
 drop without losing concrete Error identity.
 

@@ -701,8 +701,7 @@ impl Checker<'_> {
                 implementations: Vec::new(),
             },
         };
-        let effects = self.selected_contract_effects(&target, method, span);
-        self.record_checked_effects(effects.iter().copied(), span);
+        let effects = self.record_selected_contract_effects(&target, method, span);
         let call = PropertyAccessorCallSemanticInfo {
             target,
             declaring_type,

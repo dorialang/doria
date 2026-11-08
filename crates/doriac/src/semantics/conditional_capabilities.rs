@@ -383,6 +383,19 @@ impl Checker<'_> {
         ) {
             return false;
         }
+        self.project_composed_templates(effects)
+    }
+
+    /// Give each composed copy its authored trait member's profile.
+    ///
+    /// Transport projects only in the authored source view; executable checks
+    /// recheck each copy against its composer's exact members. Authored reach
+    /// projects in every view, because a composer may narrow a copy's
+    /// transport but never what the trait body it copies may raise.
+    pub(super) fn project_composed_templates(
+        &self,
+        effects: &mut HashMap<Span, Vec<crate::types::ResolvedType>>,
+    ) -> bool {
         let mut changed = false;
         for (effective, template) in &self.composition.callable_templates {
             let projected = effects

@@ -192,3 +192,233 @@ fn every_specialization_shares_the_conservative_template_contract() {
         );
     }
 }
+
+/// Calls whose implementation is chosen outside the body: a callback
+/// parameter, a callback forwarded through a named helper, a function value
+/// in a local, a trait requirement satisfied by a quiet and a loud composer,
+/// a quiet composer's copy called from a guarded caller, a destructor that
+/// guards a stored callback, and a destructor that maps with a pure literal.
+/// Every caller passes only pure closures and every composer of `safe` may be
+/// quiet, so each catch here is never taken at run time.
+const CALLER_INDEPENDENT_CATCHES: &str = r#"
+use Doria\Std\Io\InvalidUtf8Error;
+use Doria\Std\Io\IoError;
+function run(function(): int $cb): int {
+    try { return $cb(); } catch (IoError $error) { return -1; }
+}
+function relay(function(): int $cb): int { return $cb(); }
+function guardedRelay(): int {
+    try { return relay(fn() => 6); } catch (IoError) { return -3; }
+}
+function viaLocal(): int {
+    function(): int $local = fn() => 4;
+    try { return $local(); } catch (IoError) { return -2; }
+}
+trait Closing {
+    function release(): void;
+    function safe(): void { try { $this->release(); } catch (IoError $error) { echo "caught;"; } }
+    function closeAll(): void { $this->release(); }
+}
+class Quiet { uses Closing; function release(): void {} }
+class Loud { uses Closing; function release(): void { echo "loud;"; } }
+function guardedClose(): int {
+    let $quiet = new Quiet();
+    try { $quiet->closeAll(); return 7; } catch (IoError) { return -4; }
+}
+class Hook {
+    function __construct(take function(): void $callback) {}
+    function __destruct() {
+        try { $this->callback(); } catch (IoError) {} catch (InvalidUtf8Error) {}
+    }
+}
+class Tally {
+    function __destruct() {
+        List<int> $values = [1, 2];
+        List<int> $doubled = $values->map(fn(int $value) => $value * 2);
+    }
+}
+function main(): void {
+    echo run(fn() => 3) . ";";
+    echo guardedRelay() . ";";
+    echo viaLocal() . ";";
+    let $quiet = new Quiet();
+    $quiet->safe();
+    let $loud = new Loud();
+    $loud->safe();
+    echo guardedClose() . ";";
+    {
+        let $hook = new Hook(function (): void {});
+        let $tally = new Tally();
+    }
+    echo "done\n";
+}
+"#;
+
+const CALLER_INDEPENDENT_OUTPUT: &str = "3;6;4;loud;7;done\n";
+
+/// One unrelated conditional member moves a program onto the authored source
+/// check plus the executable recheck of admitted and composed bodies.
+const CONDITIONAL_DECLARATION: &str =
+    "interface Ready {}\nclass Gate<T> { function admit(): void where (T implements Ready) {} }\n";
+
+#[test]
+fn callers_and_composers_never_decide_catch_reachability_on_every_backend() {
+    // Each catch above was a false E0629 or each destructor a false
+    // E0631 once the only closures or composer in the program were quiet:
+    // the narrowed transport of the callback or the composed copy decided
+    // the authored body's diagnostics. Transport stays narrow, so the
+    // catches compile to routes that are never taken.
+    let conditional = format!("{CALLER_INDEPENDENT_CATCHES}{CONDITIONAL_DECLARATION}");
+    for source in [CALLER_INDEPENDENT_CATCHES, conditional.as_str()] {
+        let (_, analysis) = doriac::analyze_source_for_ide("caller-independent.doria", source)
+            .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{source}\n{:#?}",
+            analysis.diagnostics
+        );
+        let program = doriac::lower_source_to_mir("caller-independent.doria", source)
+            .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        doriac::mir_validation::validate_program(&program).unwrap();
+        let result = doriac::mir_interpreter::interpret(&program).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            CALLER_INDEPENDENT_OUTPUT
+        );
+        assert!(result.stderr.is_empty());
+        assert_eq!(result.exit_status, 0);
+        native_execution::assert_native_execution(
+            &program,
+            NativeProfile::Fast,
+            CALLER_INDEPENDENT_OUTPUT,
+        );
+        #[cfg(feature = "llvm-backend")]
+        native_execution::assert_native_execution(
+            &program,
+            NativeProfile::Release,
+            CALLER_INDEPENDENT_OUTPUT,
+        );
+
+        let directory = execution_directory::ExecutionDirectory::new();
+        let artifact =
+            doriac::compile_source("caller-independent.doria", source, BackendTarget::Php).unwrap();
+        let path = directory.path().join("main.php");
+        doriac::backend::publish_output(&path, artifact).unwrap();
+        let output = std::process::Command::new("php")
+            .current_dir(directory.path())
+            .arg(path)
+            .output()
+            .expect("PHP is required for compatibility parity");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            CALLER_INDEPENDENT_OUTPUT
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
+
+#[test]
+fn narrowed_transport_keeps_callers_and_composers_off_the_catch_route() {
+    // Reach decides diagnostics; transport still decides execution. A
+    // quiet composer's copy and a callback parameter that only ever receives
+    // pure closures keep their narrowed contracts, so `Quiet::closeAll` and
+    // `relay` use the ordinary ABI, while the loud composer's copy keeps its
+    // exact I/O transport. Both hold for ordinary and conditional programs.
+    let conditional = format!("{CALLER_INDEPENDENT_CATCHES}{CONDITIONAL_DECLARATION}");
+    for source in [CALLER_INDEPENDENT_CATCHES, conditional.as_str()] {
+        assert_narrowed_transport(source);
+    }
+}
+
+fn assert_narrowed_transport(source: &str) {
+    let program = doriac::lower_source_to_mir("caller-independent.doria", source)
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let contract = |name: &str| {
+        program
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} not lowered: {:?}",
+                    program
+                        .functions
+                        .iter()
+                        .map(|function| &function.name)
+                        .collect::<Vec<_>>()
+                )
+            })
+            .ambient_checked_effects
+            .clone()
+    };
+    for quiet in ["relay", "Quiet::closeAll"] {
+        assert!(contract(quiet).is_empty(), "{quiet}: {:?}", contract(quiet));
+    }
+    assert!(!contract("Loud::closeAll").is_empty());
+}
+
+#[test]
+fn the_authored_body_still_rejects_catches_it_cannot_reach() {
+    // The authored verdict is not weakened: a named callee that handles every
+    // Error, a closure literal invoked in place, and a trait member's own
+    // quiet body still make the catch unreachable. A trait catch is reported
+    // once at the authored trait body, never once per composer.
+    for (label, source, expected) in [
+        (
+            "handled by a named callee",
+            "use Doria\\Std\\Io\\IoError;\nfunction shield(function(): int $cb): int { try { return $cb(); } catch (Error) { return -1; } }\nfunction main(): int { try { return shield(fn() => 3); } catch (IoError) { return -2; } }",
+            1,
+        ),
+        (
+            "closure literal invoked in place",
+            "use Doria\\Std\\Io\\IoError;\nfunction main(): int { try { return (fn() => 3)(); } catch (IoError) { return -2; } }",
+            1,
+        ),
+        (
+            "trait member's own quiet body, two composers",
+            "use Doria\\Std\\Io\\IoError;\ntrait Noting { function note(): void {} function noted(): void { try { $this->note(); } catch (IoError) {} } }\nclass First { uses Noting; }\nclass Second { uses Noting; }\nfunction main(): void { (new First())->noted(); (new Second())->noted(); }",
+            1,
+        ),
+    ] {
+        let conditional = format!("{source}\n{CONDITIONAL_DECLARATION}");
+        for source in [source, conditional.as_str()] {
+            let diagnostics = doriac::check_source("authored-verdict.doria", source)
+                .expect_err(label);
+            let unreachable = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E0629")
+                .collect::<Vec<_>>();
+            assert_eq!(unreachable.len(), expected, "{label}\n{source}\n{diagnostics:#?}");
+            assert!(
+                diagnostics.iter().all(|diagnostic| diagnostic.code == "E0629"),
+                "{label}\n{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn destructors_judge_stored_callbacks_by_their_contract_not_by_what_is_stored() {
+    // Only an empty closure is ever stored, yet the destructor may run any
+    // `function(): void` its callers supply, so leaving ambient I/O uncaught
+    // is E0631 whatever the program's callers pass.
+    let source = r#"
+class Hook {
+    function __construct(take function(): void $callback) {}
+    function __destruct() { $this->callback(); }
+}
+function main(): void { let $hook = new Hook(function (): void {}); }
+"#;
+    let conditional = format!("{source}{CONDITIONAL_DECLARATION}");
+    for source in [source, conditional.as_str()] {
+        let diagnostics = doriac::check_source("stored-callback.doria", source)
+            .expect_err("a destructor must catch its stored callback's ambient I/O");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0631"),
+            "{diagnostics:#?}"
+        );
+    }
+}

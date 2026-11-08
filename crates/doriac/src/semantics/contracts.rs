@@ -750,7 +750,9 @@ impl Checker<'_> {
         // implementation after this body is checked, so they carry the complete
         // automatic set, exactly as selected core operations do.
         match self.call_targets.get(&span).cloned() {
-            Some(target) => self.record_selected_contract_effects(&target, &method, span),
+            Some(target) => {
+                self.record_selected_contract_effects(&target, &method, span);
+            }
             None => self.record_checked_effects(method.checked_effects, span),
         }
     }
@@ -1064,55 +1066,51 @@ impl Checker<'_> {
         })
     }
 
+    /// Record a contract-selected call and return its transport.
     pub(super) fn record_selected_contract_effects(
-        &mut self,
-        target: &CallableTarget,
-        method: &MethodInfo,
-        span: Span,
-    ) {
-        let effects = self.selected_contract_effects(target, method, span);
-        self.record_checked_effects(effects, span);
-    }
-
-    pub(super) fn selected_contract_effects(
         &mut self,
         target: &CallableTarget,
         method: &MethodInfo,
         span: Span,
     ) -> Vec<TypeId> {
         if self.selects_implementation_after_checking(target) {
-            self.complete_function_value_effects(&method.checked_effects, span)
-        } else {
-            let mut effects = method.checked_effects.clone();
-            if method.virtual_root.is_some()
-                && !self
-                    .exact_method_calls
-                    .contains(&(span, method.declaration))
-                && !matches!(
-                    target,
-                    CallableTarget::Method {
-                        direct_parent: true,
-                        ..
-                    }
-                )
-            {
-                let ambient = self
-                    .ambient_effect_seed
-                    .virtual_calls
-                    .get(&method.declaration)
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for effect in ambient {
-                    let effect = self.types.intern_resolved(&effect);
-                    if !effects.contains(&effect) {
-                        effects.push(effect);
-                    }
+            let effects = self.complete_function_value_effects(&method.checked_effects, span);
+            self.record_checked_effects(effects.iter().copied(), span);
+            return effects;
+        }
+        let virtual_call = method.virtual_root.is_some()
+            && !self
+                .exact_method_calls
+                .contains(&(span, method.declaration))
+            && !matches!(
+                target,
+                CallableTarget::Method {
+                    direct_parent: true,
+                    ..
+                }
+            );
+        let mut effects = method.checked_effects.clone();
+        let dependency = if virtual_call {
+            let ambient = self
+                .ambient_effect_seed
+                .virtual_calls
+                .get(&method.declaration)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            for effect in ambient {
+                let effect = self.types.intern_resolved(&effect);
+                if !effects.contains(&effect) {
+                    effects.push(effect);
                 }
             }
-            effects
-        }
+            super::callable_contracts::EffectDependency::Virtual(method.declaration)
+        } else {
+            super::callable_contracts::EffectDependency::Exact(method.declaration)
+        };
+        self.record_named_call_effects(dependency, effects.clone(), span);
+        effects
     }
 
     /// Whether a call's implementation is selected after the calling body is

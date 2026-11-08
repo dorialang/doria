@@ -2911,10 +2911,18 @@ struct Checker<'program> {
     effect_scopes: Vec<CheckedEffectSet>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
     callable_observed_checked_effects: HashMap<Span, Vec<ResolvedType>>,
+    /// Escaping authored reach of each checked body (`CheckedEffectSet::reach`).
+    callable_observed_reach_effects: HashMap<Span, Vec<ResolvedType>>,
+    /// Authored reach of each checked closure literal's body.
+    closure_reach_effects: HashMap<ClosureId, Vec<TypeId>>,
     callable_declared_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     callable_dependencies: HashMap<Span, Vec<callable_contracts::EffectDependency>>,
     exact_method_calls: HashSet<(Span, Span)>,
     ambient_effect_seed: callable_contracts::AmbientProfiles,
+    /// Ambient authored reach of named callables from the preceding pass. A
+    /// direct call reaches what its callee's authored body reaches, never what
+    /// the callee's transport was narrowed to by unrelated callers.
+    ambient_reach_seed: callable_contracts::AmbientProfiles,
     /// An entry, including an empty one, proves the complete set of ambient
     /// effects for this invocation through the shared call-provenance solver.
     /// Missing entries retain the ambient-capable unknown-call contract.
@@ -3009,9 +3017,20 @@ enum FunctionTypeMismatch {
     ReturnBorrow,
 }
 
+/// The checked effects of a region in two profiles (Decision 0123).
+///
+/// `ordered` is executable transport: what the selected implementations can
+/// raise, narrowed by whole-program facts such as the closures callers pass
+/// and a composer's exact members. Catch routing, MIR and the callable ABI use
+/// it. `reach` is the authored profile: what the region may raise judged from
+/// its own syntax, the authored reach of the declarations it names, and the
+/// declared contracts of calls whose implementation is chosen elsewhere.
+/// Diagnostics read `reach`, so caller- and composer-specific facts never
+/// decide them. `reach` always contains `ordered`.
 #[derive(Debug, Clone, Default)]
 struct CheckedEffectSet {
     ordered: Vec<TypeId>,
+    reach: Vec<TypeId>,
 }
 
 impl CheckedEffectSet {
@@ -3019,12 +3038,31 @@ impl CheckedEffectSet {
         if !self.ordered.contains(&ty) {
             self.ordered.push(ty);
         }
+        self.insert_reach(ty);
+    }
+
+    fn insert_reach(&mut self, ty: TypeId) {
+        if !self.reach.contains(&ty) {
+            self.reach.push(ty);
+        }
     }
 
     fn extend(&mut self, effects: impl IntoIterator<Item = TypeId>) {
         for effect in effects {
             self.insert(effect);
         }
+    }
+
+    fn extend_reach(&mut self, effects: impl IntoIterator<Item = TypeId>) {
+        for effect in effects {
+            self.insert_reach(effect);
+        }
+    }
+
+    /// Both profiles of another region, for a scope that contains it.
+    fn extend_set(&mut self, other: &Self) {
+        self.extend(other.ordered.iter().copied());
+        self.extend_reach(other.reach.iter().copied());
     }
 }
 
@@ -3712,10 +3750,13 @@ impl<'program> Checker<'program> {
             effect_scopes: Vec::new(),
             class_initializer_effects: HashMap::new(),
             callable_observed_checked_effects: HashMap::new(),
+            callable_observed_reach_effects: HashMap::new(),
+            closure_reach_effects: HashMap::new(),
             callable_declared_checked_effects: HashMap::new(),
             callable_dependencies: HashMap::new(),
             exact_method_calls: HashSet::new(),
             ambient_effect_seed: callable_contracts::AmbientProfiles::default(),
+            ambient_reach_seed: callable_contracts::AmbientProfiles::default(),
             callback_ambient_effect_seed: HashMap::new(),
             return_borrow_seed: HashMap::new(),
             specialized_return_borrow_seed: HashMap::new(),
@@ -4683,6 +4724,71 @@ impl<'program> Checker<'program> {
         }
         self.project_composed_ambient_effects(&mut ambient);
         self.ambient_profiles(ambient)
+    }
+
+    /// Discovery over-approximation of authored reach, the counterpart of
+    /// `inferred_ambient_effects` over the reach each body observed.
+    fn inferred_ambient_reach(&self) -> callable_contracts::AmbientProfiles {
+        let mut ambient = self.authored_reach_basis();
+        loop {
+            let mut changed = self.project_composed_templates(&mut ambient);
+            let profiles = self.ambient_profiles(ambient.clone());
+            for (caller, callees) in &self.callable_dependencies {
+                let inherited = callees
+                    .iter()
+                    .flat_map(|callee| profiles.effects(*callee))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let target = ambient.entry(*caller).or_default();
+                for effect in inherited {
+                    if !target.contains(&effect) {
+                        target.push(effect);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.ambient_profiles(ambient)
+    }
+
+    /// Authored reach that escapes each checked body, the counterpart of
+    /// `escaping_ambient_effects`.
+    fn escaping_ambient_reach(&self) -> callable_contracts::AmbientProfiles {
+        let mut ambient = self.authored_reach_basis();
+        self.project_composed_templates(&mut ambient);
+        self.ambient_profiles(ambient)
+    }
+
+    fn authored_reach_basis(&self) -> HashMap<Span, Vec<ResolvedType>> {
+        // A body this pass does not check (an authored trait member during the
+        // executable recheck) keeps the reach its own check established.
+        let mut ambient = self
+            .ambient_reach_seed
+            .exact
+            .iter()
+            .filter(|(declaration, _)| {
+                !self
+                    .callable_observed_reach_effects
+                    .contains_key(declaration)
+            })
+            .map(|(declaration, effects)| (*declaration, effects.clone()))
+            .collect::<HashMap<_, _>>();
+        for (callable, effects) in self
+            .callable_declared_checked_effects
+            .iter()
+            .chain(self.callable_observed_reach_effects.iter())
+        {
+            let target = ambient.entry(*callable).or_default();
+            for effect in effects {
+                if crate::checked_effects::is_automatic_effect(effect) && !target.contains(effect) {
+                    target.push(effect.clone());
+                }
+            }
+        }
+        ambient
     }
 
     fn callback_ambient_effects(
@@ -8252,7 +8358,7 @@ impl<'program> Checker<'program> {
         );
         if !has_constructor {
             if let Some(effects) = self.class_initializer_effects.get(&class_decl.name) {
-                let required = effects.ordered.iter().any(|effect| {
+                let required = effects.reach.iter().any(|effect| {
                     !crate::checked_effects::is_automatic_effect(&self.types.resolved(*effect))
                 });
                 if required {
@@ -8347,7 +8453,7 @@ impl<'program> Checker<'program> {
         self.effect_scopes.push(CheckedEffectSet::default());
         self.check_expr(initializer, &scopes, context.as_ref());
         let effects = self.effect_scopes.pop().expect("initializer effect scope");
-        if !effects.ordered.is_empty() {
+        if !effects.reach.is_empty() {
             self.diagnostics.push(
                 Diagnostic::new(
                     code,
@@ -8388,7 +8494,7 @@ impl<'program> Checker<'program> {
         self.class_initializer_effects
             .entry(class_name.to_string())
             .or_default()
-            .extend(effects.ordered);
+            .extend_set(&effects);
         self.check_expr_assignable(
             target_ty,
             initializer,
@@ -8794,7 +8900,7 @@ impl<'program> Checker<'program> {
         if function.name == "__construct" {
             if let Some(class_name) = method_context.as_ref().map(|context| &context.class_name) {
                 if let Some(initializer_effects) = self.class_initializer_effects.get(class_name) {
-                    body_effects.extend(initializer_effects.ordered.iter().copied());
+                    body_effects.extend_set(initializer_effects);
                 }
             }
         }
@@ -8903,6 +9009,14 @@ impl<'program> Checker<'program> {
                     .map(|effect| self.types.resolved(*effect))
                     .collect(),
             );
+            self.callable_observed_reach_effects.insert(
+                function.span,
+                body_effects
+                    .reach
+                    .iter()
+                    .map(|effect| self.types.resolved(*effect))
+                    .collect(),
+            );
             if function.throws.is_none()
                 && (self.is_accepted_program_entrypoint(function)
                     || self.test_semantics.is_generated_function(function.span))
@@ -9002,8 +9116,11 @@ impl<'program> Checker<'program> {
         declared: &[TypeId],
         observed: &CheckedEffectSet,
     ) {
+        // Authored reach: a destructor must catch whatever its own body may
+        // raise, not only what the closures and members it currently reaches
+        // happen to raise.
         let mut uncovered = Vec::new();
-        for effect in observed.ordered.iter().copied() {
+        for effect in observed.reach.iter().copied() {
             let resolved = self.types.resolved(effect);
             if crate::checked_effects::is_test_assertion_effect(&resolved)
                 || (function.name != "__destruct"
@@ -9113,17 +9230,28 @@ impl<'program> Checker<'program> {
         }
     }
 
+    /// Record an occurrence whose transport and authored reach coincide.
     fn record_checked_effects(&mut self, effects: impl IntoIterator<Item = TypeId>, span: Span) {
         let effects = effects.into_iter().collect::<Vec<_>>();
+        self.record_effect_profiles(effects.clone(), effects, span);
+    }
+
+    /// Record a region's or a call's two profiles (see `CheckedEffectSet`).
+    /// Effect sites and catch routing keep transport; the enclosing scope
+    /// receives both, and an unenclosed occurrence is judged by its reach.
+    fn record_effect_profiles(&mut self, transport: Vec<TypeId>, reach: Vec<TypeId>, span: Span) {
         crate::checked_effects::record_effect_site(
             &mut self.checked_effect_sites,
             span,
-            effects.iter().map(|effect| self.types.resolved(*effect)),
+            transport.iter().map(|effect| self.types.resolved(*effect)),
         );
         if let Some(scope) = self.effect_scopes.last_mut() {
-            scope.extend(effects);
+            scope.extend(transport.iter().copied());
+            scope.extend_reach(reach);
             return;
         }
+        let mut effects = transport;
+        extend_type_ids(&mut effects, reach);
         let required = effects
             .into_iter()
             .filter(|effect| {
@@ -9221,22 +9349,79 @@ impl<'program> Checker<'program> {
         complete
     }
 
-    fn complete_callback_invocation_effects(
+    /// Record a function-value invocation and return its transport.
+    ///
+    /// When the call names a closure literal, as `$list->map(fn(int $x) => $x)`
+    /// does, the authored body chose the implementation and the call reaches
+    /// what that literal reaches. Any other function value is chosen by whoever
+    /// supplies it, so its authored reach is the function type's contract
+    /// completed with ambient I/O, the one ambient-capable indirect convention
+    /// of Decision 0123. The call-provenance solver may prove the closures that
+    /// actually arrive; that narrows transport only, never the reach that
+    /// decides this body's diagnostics.
+    fn record_callable_value_effects(
         &mut self,
         required: &[TypeId],
+        invoked: &Expr,
         span: Span,
     ) -> Vec<TypeId> {
-        let Some(ambient) = self.callback_ambient_effect_seed.get(&span).cloned() else {
-            return self.complete_function_value_effects(required, span);
+        let named_literal = match Self::ungroup_expr(invoked) {
+            Expr::Closure(closure) => self
+                .closure_reach_effects
+                .get(&ClosureId::from_span(closure.span))
+                .cloned(),
+            _ => None,
         };
-        let mut complete = required.to_vec();
+        let reach = match named_literal {
+            Some(literal) => {
+                let mut reach = required.to_vec();
+                for effect in literal {
+                    if crate::checked_effects::is_automatic_effect(&self.types.resolved(effect))
+                        && !reach.contains(&effect)
+                    {
+                        reach.push(effect);
+                    }
+                }
+                reach
+            }
+            None => self.complete_function_value_effects(required, span),
+        };
+        // Without proven provenance, transport is the complete contract and
+        // reach, which always contains transport, equals it.
+        let Some(ambient) = self.callback_ambient_effect_seed.get(&span).cloned() else {
+            let complete = self.complete_function_value_effects(required, span);
+            self.record_effect_profiles(complete.clone(), complete.clone(), span);
+            return complete;
+        };
+        let mut transport = required.to_vec();
         for effect in ambient {
             let effect = self.types.intern_resolved(&effect);
-            if !complete.contains(&effect) {
-                complete.push(effect);
+            if !transport.contains(&effect) {
+                transport.push(effect);
             }
         }
-        complete
+        self.record_effect_profiles(transport.clone(), reach, span);
+        transport
+    }
+
+    /// Record a call to a named callable: its transport plus the authored
+    /// reach of the callee's body, which may exceed that transport when the
+    /// callee invokes values or selects implementations elsewhere.
+    fn record_named_call_effects(
+        &mut self,
+        callee: callable_contracts::EffectDependency,
+        transport: Vec<TypeId>,
+        span: Span,
+    ) {
+        let mut reach = transport.clone();
+        let callee_reach = self.ambient_reach_seed.effects(callee).to_vec();
+        for effect in callee_reach {
+            let effect = self.types.intern_resolved(&effect);
+            if !reach.contains(&effect) {
+                reach.push(effect);
+            }
+        }
+        self.record_effect_profiles(transport, reach, span);
     }
 
     fn check_parameter_default_support(
@@ -10223,6 +10408,7 @@ impl<'program> Checker<'program> {
                 );
                 continue;
             }
+            // Routing follows transport; reachability follows authored reach.
             let coverage = protected
                 .ordered
                 .iter()
@@ -10232,11 +10418,15 @@ impl<'program> Checker<'program> {
                     (self.types.resolved(effect), coverage)
                 })
                 .collect::<HashMap<_, _>>();
-            let reachable = coverage
-                .values()
-                .any(|coverage| *coverage != crate::checked_effects::CatchCoverage::None);
+            let reachable = protected.reach.iter().copied().any(|effect| {
+                self.checked_catch_coverage(catch_type, effect)
+                    != crate::checked_effects::CatchCoverage::None
+            });
             self.catch_coverage.insert(catch.span, coverage);
-            if !reachable {
+            // A composed trait copy is the authored trait member checked again
+            // with one composer's members. The authored member's check owns
+            // this catch's verdict for every composer (Decision 0134).
+            if !reachable && self.composition.origin(catch.span).is_none() {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0629",
@@ -10251,12 +10441,19 @@ impl<'program> Checker<'program> {
             }
             if catches_all {
                 uncovered.ordered.clear();
+                uncovered.reach.clear();
                 saw_error_catch = true;
             } else {
                 let effects = std::mem::take(&mut uncovered.ordered);
                 for effect in effects {
                     if !self.checked_error_type_covers(&catch_set, effect) {
                         uncovered.ordered.push(effect);
+                    }
+                }
+                let effects = std::mem::take(&mut uncovered.reach);
+                for effect in effects {
+                    if !self.checked_error_type_covers(&catch_set, effect) {
+                        uncovered.reach.push(effect);
                     }
                 }
             }
@@ -10308,7 +10505,11 @@ impl<'program> Checker<'program> {
                 .pop()
                 .expect("checked try finalizer boundary");
             let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-            self.record_checked_effects(finalizer_effects.ordered, finally.span);
+            self.record_effect_profiles(
+                finalizer_effects.ordered,
+                finalizer_effects.reach,
+                finally.span,
+            );
         }
 
         self.try_uncovered_effects.insert(
@@ -10319,7 +10520,7 @@ impl<'program> Checker<'program> {
                 .map(|effect| self.types.resolved(*effect))
                 .collect(),
         );
-        self.record_checked_effects(uncovered.ordered, statement.span);
+        self.record_effect_profiles(uncovered.ordered, uncovered.reach, statement.span);
     }
 
     fn check_local_declaration(
@@ -10939,7 +11140,11 @@ impl<'program> Checker<'program> {
             .pop()
             .expect("checked finalizer boundary");
         let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-        self.record_checked_effects(finalizer_effects.ordered, finally.span);
+        self.record_effect_profiles(
+            finalizer_effects.ordered,
+            finalizer_effects.reach,
+            finally.span,
+        );
         self.active_loop_depth = loop_depth;
     }
 
@@ -12385,8 +12590,7 @@ impl<'program> Checker<'program> {
                 .with_title("Error Inspector Must Return Void"),
             );
         }
-        let complete = self.complete_callback_invocation_effects(&function.checked_effects, span);
-        self.record_checked_effects(complete, span);
+        self.record_callable_value_effects(&function.checked_effects, inspector, span);
         let inspector_requirement = match function.invocation_mode {
             FunctionInvocationMode::Readonly => CaptureRequirement::Readonly,
             FunctionInvocationMode::Writable => CaptureRequirement::Writable,
@@ -13413,8 +13617,7 @@ impl<'program> Checker<'program> {
         }
 
         let complete_effects =
-            self.complete_callback_invocation_effects(&function.checked_effects, span);
-        self.record_checked_effects(complete_effects.iter().copied(), span);
+            self.record_callable_value_effects(&function.checked_effects, callee, span);
         let resolved_function = self.types.resolved(callee_ty);
         let resolved_effects = complete_effects
             .iter()
@@ -13850,6 +14053,8 @@ impl<'program> Checker<'program> {
         self.finalizer_boundaries = enclosing_finalizers;
         self.active_loop_depth = enclosing_loop_depth;
         let inferred_effects = self.effect_scopes.pop().expect("closure effect scope");
+        self.closure_reach_effects
+            .insert(closure_id, inferred_effects.reach.clone());
         let mut active = self.active_closures.pop().expect("active closure");
 
         let invocation_mode = active
@@ -18020,7 +18225,11 @@ impl<'program> Checker<'program> {
             method_context,
         );
         if self.diagnostics.len() == diagnostics_before {
-            self.record_checked_effects(function_info.checked_effects, span);
+            self.record_named_call_effects(
+                callable_contracts::EffectDependency::Exact(function_info.declaration),
+                function_info.checked_effects,
+                span,
+            );
         }
     }
 
@@ -19756,9 +19965,9 @@ impl<'program> Checker<'program> {
                 let effects = self
                     .class_initializer_effects
                     .get(class_name)
-                    .map(|effects| effects.ordered.clone())
+                    .cloned()
                     .unwrap_or_default();
-                self.record_checked_effects(effects, span);
+                self.record_effect_profiles(effects.ordered, effects.reach, span);
             }
             return;
         };
@@ -19798,7 +20007,11 @@ impl<'program> Checker<'program> {
             method_context,
         );
         if self.diagnostics.len() == diagnostics_before {
-            self.record_checked_effects(constructor.checked_effects, span);
+            self.record_named_call_effects(
+                callable_contracts::EffectDependency::Exact(constructor.declaration),
+                constructor.checked_effects,
+                span,
+            );
         }
     }
 
@@ -24951,8 +25164,7 @@ impl<'program> Checker<'program> {
         };
 
         let complete_effects =
-            self.complete_callback_invocation_effects(&function.checked_effects, span);
-        self.record_checked_effects(complete_effects.iter().copied(), span);
+            self.record_callable_value_effects(&function.checked_effects, callback, span);
         let checked_effects = complete_effects
             .iter()
             .map(|effect| self.types.resolved(*effect))

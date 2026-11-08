@@ -283,6 +283,7 @@ impl AmbientProfiles {
 
 pub(super) struct Seeds {
     effects: AmbientProfiles,
+    reach: AmbientProfiles,
     callbacks: HashMap<Span, Vec<ResolvedType>>,
     borrows: HashMap<Span, Option<ReturnBorrow>>,
     specialized_borrows: SpecializedReturnBorrows,
@@ -291,10 +292,16 @@ pub(super) struct Seeds {
 
 impl Seeds {
     pub(super) fn collect(checker: &mut Checker<'_>, discovery: bool) -> Self {
-        let effects = if discovery {
-            checker.inferred_ambient_effects()
+        let (effects, reach) = if discovery {
+            (
+                checker.inferred_ambient_effects(),
+                checker.inferred_ambient_reach(),
+            )
         } else {
-            checker.escaping_ambient_effects()
+            (
+                checker.escaping_ambient_effects(),
+                checker.escaping_ambient_reach(),
+            )
         };
         let borrows = checker.inferred_return_borrows();
         let specialized_borrows = checker.infer_specialized_return_borrows();
@@ -305,6 +312,7 @@ impl Seeds {
             checker.callback_ambient_effects(&checker.known_callback_targets(&provenance));
         Self {
             effects,
+            reach,
             callbacks,
             borrows,
             specialized_borrows,
@@ -314,6 +322,7 @@ impl Seeds {
 
     pub(super) fn apply(&self, checker: &mut Checker<'_>) {
         checker.ambient_effect_seed = self.effects.clone();
+        checker.ambient_reach_seed = self.reach.clone();
         checker.callback_ambient_effect_seed = self.callbacks.clone();
         checker.return_borrow_seed = self.borrows.clone();
         checker.specialized_return_borrow_seed = self.specialized_borrows.clone();
@@ -323,6 +332,8 @@ impl Seeds {
     fn equivalent(&self, other: &Self) -> bool {
         ambient_effect_maps_equal(&self.effects.exact, &other.effects.exact)
             && ambient_effect_maps_equal(&self.effects.virtual_calls, &other.effects.virtual_calls)
+            && ambient_effect_maps_equal(&self.reach.exact, &other.reach.exact)
+            && ambient_effect_maps_equal(&self.reach.virtual_calls, &other.reach.virtual_calls)
             && ambient_effect_maps_equal(&self.callbacks, &other.callbacks)
             && self.borrows == other.borrows
             && self.specialized_borrows == other.specialized_borrows
