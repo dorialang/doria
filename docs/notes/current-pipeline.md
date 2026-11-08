@@ -13,9 +13,7 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
-- Stage 36a push, 2026-11-05 (on origin develop since 2026-11-08; not
-  delivered until the compiler round's CI passes on Linux and Windows and the
-  benchmark pin moves). Decisions and their
+- Stage 36a push, 2026-11-05 (delivered 2026-11-08). Decisions and their
   alternatives are in `docs/notes/stage36a-decision-log.md` (entries 1-51).
   Landed: PHP generic payload enums (class per specialization, exact `mixed`
   identity); `FinishOutcome<S, R>` / `BorrowedFinishOutcome<R>`; ordinary-class
@@ -169,10 +167,12 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   Stream gate: all ten binding cases exist and verify at bounded size on macOS
   at `d176222`; the structural baseline is accepted in `benchmarks`
   (26 entries, all Pass). Timing stays Pending Available Runner.
-  Open in 36a: CI on Linux and Windows for this round, which has never executed
-  there; publishing the benchmark commits and moving the pin; re-pinning the
-  language server and website. Doria programs for the gate's cases have not
-  been compiled for Windows; their C and Rust peers have run only under Wine.
+  CI is green on Linux, macOS and Windows for `doria` at `4670b18`, the language
+  server at `fbd4564`, the website at `c7c8fa8` and `benchmarks` at `00c0eb2`,
+  and the toolchain is refreshed from those pins. `benchmarks` CI compiles and
+  verifies the ten gate programs on all three platforms with the fast native
+  profile. On Windows, their LLVM builds and their C and Rust peers have not run
+  (the peers ran under Wine). Controlled timing stays Pending Available Runner.
 
 - Scoped class borrowing contract (approved 2026-11-03; implementation open): extend Decision 0134's
   constructor promotion to ordinary classes with `borrow T $source` for
@@ -5984,8 +5984,8 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   allocation or whole-chunk copy; reusable buffers expose safe byte regions;
   concrete adapters remain statically specializable; readiness storage is
   reused; and synchronous programs initialize no async executor/task machinery.
-- Stage 36a — In Progress. Stage 36a Remaining Public Spellings — Deferred.
-  **Stage 36a — Not Delivered**: transfer capabilities, byte regions, owned files,
+- Stage 36a — Complete. Stage 36a Remaining Public Spellings — Deferred.
+  At this entry's date the stage was still in progress: transfer capabilities, byte regions, owned files,
   readiness registrations, reusable transfer groups, time/cancellation controls,
   and file seek/inspection/synchronization/resizing execute on macOS through the
   interpreter, native profiles and PHP compatibility. The active checkpoints
@@ -6201,7 +6201,7 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   and language server are refreshed together and verified after installation-cache
   reclamation. Stage 36a follows; its remaining public spellings are deferred.
 - Pre-Stage-45 Doria-Native Baton Transition — Scheduled, Mandatory Before Unsuffixed `2026.03.1`.
-- Stage 36a — In Progress, Not Delivered.
+- Stage 36a — Complete (at this entry's date it was still in progress).
 
 ## Do not duplicate
 

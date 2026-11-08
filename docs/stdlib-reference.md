@@ -247,8 +247,8 @@ Stable messages are Doria-owned, while raw platform prose is never
 exposed. Ordinary closed stdout/stderr pipes still exit cleanly with status 0;
 allocation remains panic. An unhandled Error is R1000/status 70 after cleanup.
 
-**Stage 36a in progress and not delivered; semantics and performance contract
-accepted, remaining public spellings deferred.** It will use small
+**Stage 36a complete; semantics and performance contract accepted, remaining
+public spellings deferred.** It uses small
 readable/writable/duplex/seekable/flushable/blocking/readiness capabilities with
 owned handles, reusable buffers, and first-class standard streams. The bounded
 appendix names byte-transfer interfaces, inline outcomes, and owned file

@@ -387,7 +387,7 @@ function check_stream_io_completeness(string $root): array
         'Stage 26b — Performance Baseline Foundation — Complete; All Three Slices Complete',
         'Stage 27 — Enums + payload cases — Complete; No Performance-Evidence Dependency',
         'Stage 36a Remaining Public Spellings — Deferred',
-        'Stage 36a — Not Delivered',
+        'Stage 36a — Complete',
     ] as $required) {
         if (!str_contains($plan, $required)) {
             $failures[] = "docs/doria-end-to-end-plan.md: missing {$required}";
@@ -400,9 +400,8 @@ function check_stream_io_completeness(string $root): array
         'Stage 26 — Complete',
         'Stage 26b — Performance Baseline Foundation — Complete',
         'Stage 27 — Complete; No Performance-Evidence Dependency',
-        'Stage 36a — In Progress',
+        'Stage 36a — Complete',
         'Stage 36a Remaining Public Spellings — Deferred',
-        'Stage 36a — Not Delivered',
     ] as $required) {
         if (!str_contains($pipeline, $required)) {
             $failures[] = "docs/notes/current-pipeline.md: missing {$required}";
@@ -805,7 +804,7 @@ function check_stream_io_completeness(string $root): array
         }
     }
     foreach ([
-        'Stage 36a is in progress and not delivered',
+        'Stage 36a is complete',
         'Exact remaining public interface, member',
         'remain deferred under decision 0110',
         'Persistent readiness sets own registered streams',
@@ -819,7 +818,7 @@ function check_stream_io_completeness(string $root): array
     $normalizedStdlib = preg_replace('/\s+/', ' ', $stdlib);
     foreach ([
         'small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities',
-        'Stage 36a in progress and not delivered; semantics and performance contract accepted, remaining public spellings deferred',
+        'Stage 36a complete; semantics and performance contract accepted, remaining public spellings deferred',
         'persistent readiness sets to own registered streams',
         'removal returns ownership',
         'Temporary one-stream waits may borrow for the call',

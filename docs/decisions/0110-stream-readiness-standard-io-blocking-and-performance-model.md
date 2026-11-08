@@ -13,7 +13,7 @@
 
 Doria needs one portable I/O foundation for files, standard devices, child-process pipes, networking, terminals, and future async execution. PHP's stream inventory is useful as a capability checklist, but its resources, global contexts, string modes, dynamic wrapper/filter registries, mixed metadata bags, and sentinel results are not Doria's model. The completed PHP Stream And I/O Completeness Audit exposed the decisions that had to be settled before Stage 26 could resume and before Stage 36a could be implemented.
 
-This record accepts the semantic architecture and its binding performance and memory contract. It deliberately defers public type and member spellings that do not affect those requirements. Stage 36a is in progress and not delivered.
+This record accepts the semantic architecture and its binding performance and memory contract. It deliberately defers public type and member spellings that do not affect those requirements. Stage 36a is complete.
 
 ## Decision
 
@@ -474,7 +474,7 @@ comparison but does not replace Stage 36a's portable gate.
 - The architecture review is complete and this record unblocks Stage 26. Stage 26 remains collections work; it does not implement streams.
 - Stage 29 supplies checked errors, including observable explicit close/finish failures. It does not implement the stream layer.
 - Stage 35 supplies small capability-interface machinery while preserving static specialization for concrete generic paths and deliberate erasure only where needed.
-- Stage 36a implements this record, including reusable storage, safe byte regions, structural allocation/copy constraints, and its own measured performance gate. It is in progress and not delivered.
+- Stage 36a implements this record, including reusable storage, safe byte regions, structural allocation/copy constraints, and its own measured performance gate. It is complete.
 - Stage 37 designs async by consuming Stage 36a readiness, ownership, reusable buffers, byte regions, time, cancellation, backpressure, and process-pipe semantics without taxing synchronous startup.
 - Stages 38 and 39 lower and structure async execution without changing the I/O contracts or imposing eager executor/task infrastructure on synchronous programs.
 - Stage 43 retains the Stage 36a stream cases in the long-term benchmark suite and tracks their accepted baselines.

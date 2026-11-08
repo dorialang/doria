@@ -3320,3 +3320,198 @@ the suite list from its old file after the list moved to `vet_commands.php`,
 and now reads it there. `check_docs_authority` reports only that the sibling
 `benchmarks` checkout is ahead of the pin, which is expected until the pin moves.
 Linux and Windows have not executed this round; that is the next step.
+
+### Callable-returning requirements stay rejected (2026-11-08, settles the open item under "Region-Returning Requirements")
+
+`interface F { function make(): function(): int; }` cannot be implemented by a
+closure that captures `$this` (E0755).
+
+**Chosen:** leave it rejected and outside Stage 36a. The region rule fits regions
+because a region is a view of storage. A callable is commonly a value that
+outlives its factory, so a default tying it to the receiver would change what
+every caller of such a requirement can do with the result. A sound opt-in needs
+its own language decision.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Keep E0755 (chosen) | Sound; no program changes meaning; no 36a work | A receiver-capturing closure still cannot implement the requirement |
+| Apply the region rule to callables | One rule for both | Binds every returned callable to its receiver and rejects programs that keep it, which breaks factories |
+| Add an explicit retained-callable return form | Precise | New language surface unrelated to streams |
+
+### Benchmark CI: which compiler revision the structural tests use (2026-11-08)
+
+The benchmark tests run the compiler repository's own cache helpers, and CI had no
+copy of that repository. `doria_build_environment` exists on `develop` and not yet
+on `main`, so the revision matters.
+
+**Chosen:** `tests.yml` checks out `dorialang/doria` under `.ci/doria` and sets
+`DORIA_REPO`. A run for `main`, or a pull request into it, uses compiler `main`.
+Every other ref uses compiler `develop`. Benchmarks `main` therefore cannot go green
+until compiler `main` has the helpers it calls, which is the real ordering between
+the two repositories.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `main` tracks `main`, everything else tracks `develop` (chosen) | Each line is tested against its counterpart; feature-branch dispatches work | A `main` merge fails until the compiler's `main` catches up |
+| Always compiler `develop` | Simple; never blocks a merge | `main` is validated against helpers it may not ship with |
+| Pin a compiler commit in the workflow | Reproducible | Another pin to move by hand, and it hides drift in the helpers the tests exist to exercise |
+| Skip the tests when the repository is absent | No checkout | CI stops testing the delegation these tests prove |
+
+### Benchmark CI: line endings in the benchmark repository (2026-11-08)
+
+The Windows runner checks out with `core.autocrlf`, which rewrote `expected/*` to
+CRLF and broke byte comparisons. All 297 tracked files are LF or empty in the index.
+
+**Chosen:** `.gitattributes` holds `* -text`, so Git never rewrites a byte in any
+checkout on any host.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `* -text` (chosen) | States the actual rule; covers hashed sources as well as expected output; needs no renormalization | A future CRLF file stays CRLF, which here is correct |
+| `* text=auto eol=lf` | Normalizes what is committed | Git guesses which files are text, and a data file with CRLF would be altered |
+| Attributes only on `expected/` | Narrowest | Benchmark sources are hashed too and would still differ on Windows |
+| Strip CR in the comparisons | No repository change | Weakens exact-output checks and leaves the checkout wrong |
+
+### Benchmark CI: 64-bit only Windows declarations (2026-11-08)
+
+The adapter's 26 native declarations named `__stdcall`. PHP FFI rejects that where
+the platform has one calling convention, so every Windows launch failed at load.
+arm64 macOS reproduces the same `ParserException`.
+
+**Chosen:** the declarations name no convention and the preflight refuses 32-bit
+PHP with a message naming the fix. A new test parses them on every 64-bit host.
+
+| Option | Pros | Cons |
+|---|---|---|
+| No annotation, refuse 32-bit (chosen) | One supported ABI, matching the Win64 layout test and the 64-bit Unix requirement | 32-bit Windows PHP cannot run new measurements |
+| Add `__stdcall` only when `PHP_INT_SIZE` is 4 | Keeps a nominal 32-bit path | A code path no host runs, and the struct layouts are only tested for Win64 |
+| Declare `__cdecl` | Parses everywhere | Wrong on 32-bit Windows, where kernel32 is stdcall, so it would corrupt the stack instead of refusing |
+
+### Benchmark CI: testing for INVALID_HANDLE_VALUE (2026-11-08)
+
+Once the declarations loaded, PHP died without output at the first launch. `FFI::cast`
+to an integer reads through a `void *`, and a kernel handle is not an address. A
+`0x1f4` handle gives signal 11 on macOS with the same cast.
+
+**Chosen:** compare with `$handle == $api->cast('HANDLE', -1)`, which compares pointer
+values. A new test passes a plausible handle value through the validator on every
+64-bit host.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Compare against a cast `-1` handle (chosen) | Says what Windows documents; no read through the handle | Relies on FFI's pointer comparison |
+| Cast through `char *` before `intptr_t` | Yields the integer | An unexplained double cast that avoids the trap by accident |
+| Make `HANDLE` a pointer to an opaque struct | The cast stops dereferencing | Changes every declaration to serve one check |
+
+### Benchmark CI: a real compiler probe on Windows (2026-11-08)
+
+Nine compiler locator tests were gated off Windows only because their stand-in for
+`doriac` was a shebang script. The locator, cache precedence and provenance checks do
+run on Windows, and `is_executable` there requires a real image.
+
+**Chosen:** a short C# program, compiled once per suite run with the .NET Framework 4
+`csc.exe` and copied to each fixture path. It reads the same sibling `version.json`
+and writes the same `unexpected-invocation.log` as the Unix script. A host without
+that compiler fails with a message naming the fix.
+
+| Option | Pros | Cons |
+|---|---|---|
+| C# probe built with the system `csc.exe` (chosen) | Readable; ships with Windows; test bodies unchanged | Depends on a Windows component, and C# appears in a PHP repository as an embedded fixture |
+| Hand-assembled PE written by PHP | No compiler dependency | Opaque machine code in a test fixture, and x64 only |
+| Compile the probe with MSVC or MinGW | Conventional | Not on every Windows host |
+| Commit a prebuilt `.exe` | No build step | Violates the rule against tracked binaries |
+| Leave the tests Unix-only | No work | Nine tests of behaviour that exists on Windows stay unrun |
+
+### Benchmark CI: symlink tests on hosts that cannot create links (2026-11-08)
+
+Windows has symlinks, and the fixture and compiler code guards against them, so those
+tests belong on Windows. Creating a link there needs Developer Mode or elevation. The
+GitHub runners have it.
+
+**Chosen:** the tests run unconditionally. Without the privilege they fail with a
+message naming the fix. The helpers supply what PHP on Windows needs: a target that
+exists at link time, backslash targets, and `rmdir` for links to directories.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Fail and name the fix (chosen) | Coverage cannot vanish silently; matches the rule that errors name the fix | An unprivileged Windows developer must enable Developer Mode to get a green suite |
+| Skip when `symlink()` is refused | Green everywhere | A misconfigured runner would drop the coverage unnoticed |
+| Keep the OS gate | No work | Symlink rejection stays untested on the platform where links are least obvious |
+
+### Benchmark CI: inherited-pipe tests without fork (2026-11-08)
+
+Two tests used `pcntl_fork` to leave a descendant holding the child's pipes after the
+direct child exits. Windows has no fork, but the capture loop has the same obligation
+there.
+
+**Chosen:** on Windows the direct child spawns the descendant with `proc_open`,
+sharing its stdio, then leaves through `ExitProcess`. PHP's normal shutdown waits for
+whatever `proc_open` started, so `exit` would have hidden the case. Unix still forks.
+
+| Option | Pros | Cons |
+|---|---|---|
+| `proc_open` plus `ExitProcess` on Windows (chosen) | Same assertions on all three platforms; FFI is already required there | The script differs by platform |
+| `proc_open` on every platform | One script | Unix would need its own way to skip PHP's shutdown wait, and fork already works |
+| Keep them gated on `pcntl_fork` | No work | The Windows capture loop stays unproven for this case |
+
+### Benchmark CI: canonical test scratch (2026-11-08)
+
+The runner reports its temporary directory by short name, `RUNNER~1`. A child's
+`getcwd` kept that spelling, and the test compared it with `realpath`.
+
+**Chosen:** `make_fixture_directory` builds from `realpath(sys_get_temp_dir())`,
+matching what `benchmark_create_runtime_fixture` already does for runtime fixtures.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Canonicalize the test scratch (chosen) | Fixes the spelling at its source; all fixture paths benefit; no change to launches | None found |
+| `realpath` the working directory in the Windows adapter | Children always see the long name | Changes production launches to satisfy a test, and rewrites what the caller asked for |
+| Compare case-insensitively or by short name in the test | Local | Weakens the assertion about the working directory |
+
+### Benchmark CI: the gate's programs run on every platform (2026-11-08)
+
+The gate's Doria programs had only run on macOS, and the Windows forms of three
+cases had never compiled there.
+
+**Chosen:** a `stream-gate` job in `benchmarks` CI builds the compiler from
+`dorialang/doria` and verifies every case in `matrices/stage36a.json` on Linux,
+macOS and Windows with the fast native profile. All ten pass on all three.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Job in `benchmarks` CI with the fast profile (chosen) | Real Windows execution; `doria` is public, so no secret is needed; no LLVM install | LLVM builds of these programs on Windows stay unrun |
+| Job in `doria` CI | LLVM is already installed there | `benchmarks` is private, so it needs a cross-repository token, a settings change |
+| Leave Windows to an available runner | No work | Claims a cross-platform gate from one platform |
+
+### The benchmark pin may name `develop` (2026-11-08)
+
+`cross-repo-pins.json` accepted a benchmark revision only from `main`, while the
+language server and website pins accept `main` or `develop`. The check exists
+to reject a commit that is on no remote.
+
+**Chosen:** accept `develop` here too.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Accept `develop` (chosen) | Same rule as the other pins; the commit is published | A `benchmarks` main merge is still to come |
+| Merge `benchmarks` to `main` first | Keeps the narrower rule | Merging to `main` is Andrew's call, and that merge fails until compiler `main` catches up |
+
+## Stage 36a delivered (2026-11-08)
+
+Closure conditions in the plan, with their evidence:
+
+| Condition | Evidence |
+|---|---|
+| Complete portable checks | `doria` CI green on Linux, macOS and Windows at `4670b18`, audited for hidden failures |
+| Required backend regressions | Closing vet 6,156 tests on macOS; interpreter, Cranelift, LLVM and PHP suites and parity shards; CI on all three platforms |
+| Structural baselines | `baselines/stage36a.json` accepted, 26 entries, all Pass |
+| Benchmark commands and report schemas | All ten binding cases in `benchmarks`; verified on Linux, macOS and Windows in CI |
+| Coordinated tooling | Language server pinned at `fbd4564`, CI green |
+| Target-state website and API updates | Website at `c7c8fa8`, CI green, API lock at `4670b18` |
+| Installed-tool refresh | `doriac` from `4670b18`, `doria-lsp` from `fbd4564` |
+
+Still open and not closure conditions: controlled timing is Pending Available
+Runner; LLVM builds of the gate programs have not run on Windows; the remaining
+public spellings are deferred under Decision 0110; callable-returning
+requirements stay rejected with E0755; `benchmarks` and `doria` have not been
+merged to `main`.

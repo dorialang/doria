@@ -1086,7 +1086,8 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   - **Stage 35:** Interfaces And Traits — Complete under Decision 0134; all five slices complete.
   - **Stage 35a:** Optimizer Contracts, Dispatch, And Escape Audit — Complete.
   - **Stage 36:** Property Hooks — Complete under Decision 0135.
-  - **Remaining:** Stage 36a — In Progress; Stage 36a Remaining Public Spellings — Deferred; Stage 36a — Not Delivered; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
+  - **Stage 36a:** Stream, Readiness, And Standard I/O Foundation — Stage 36a — Complete under Decision 0110.
+  - **Remaining:** Stage 36a Remaining Public Spellings — Deferred; Pre-Stage-45 Doria-Native Baton Transition — Scheduled.
   - **Non-blocking evidence:** Stage 26b controlled timing remains `Measurement Status: Pending Available Runner`; this is not a performance pass.
   - **Release gate:** the unsuffixed `2026.03.1` release remains blocked on the Doria-native Baton cutover.
 
@@ -1260,7 +1261,7 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   - **Analysis:** concrete, interface, and constrained accessor calls reuse ownership and checked-effect rules. Exact setter input types, inherited backing-field reuse, transitive rejection of blocking I/O, and separate callback ownership and receiver-bound lifetimes are implemented with regression coverage.
   - **Execution And Ownership:** HIR storage and accessor bodies, MIR dispatch, and PHP accessor calls implement backed/computed access, exactly-once read-modify-write, ownership, and cleanup. Backed override initializers run parent then child in one shared field, preserving replacement ownership and failed-construction cleanup.
   - **Closure:** interpreter/Cranelift/LLVM parity passes for Temperature, validation, caching, failures, composition, ownership, and negative contracts, with tier-1 CI and native leak checks. PHP preserves the same hooks within its existing numeric compatibility boundaries. Coordinated tooling, website guides/API/tutorials, eleven executable hook examples, and the installed-toolchain refresh are verified.
-- **Stage 36a — Stream, readiness, and standard I/O foundation.** **In progress, not delivered.** Decision 0110 owns the accepted semantic architecture and binding performance/memory contract. Prerequisites are checked errors, namespaces, capability interfaces, ownership/RAII, the existing device substrate, and Decision 0109 runtime outcomes. Stage 36a remains after Stage 36 in the accepted sequence.
+- **Stage 36a — Stream, readiness, and standard I/O foundation.** **Complete.** Decision 0110 owns the accepted semantic architecture and binding performance/memory contract. Prerequisites are checked errors, namespaces, capability interfaces, ownership/RAII, the existing device substrate, and Decision 0109 runtime outcomes. Stage 36a remains after Stage 36 in the accepted sequence.
   - **Symbolic coherence ruling:** Formed-type and concrete target/storage checks
     reject established active conflicts under frozen caller premises, including
     inherited and nested active targets. Shared cycle identity preserves

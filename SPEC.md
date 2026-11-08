@@ -1666,7 +1666,7 @@ scheduler infrastructure. Stage 36a owns the initial cross-platform stream
 performance and memory regression gate defined by decision 0110; Stage 43
 continues and broadens the benchmark suite rather than postponing that gate.
 
-Stage 36a is in progress and not delivered. The semantic and performance
+Stage 36a is complete. The semantic and performance
 contracts are accepted. The byte-transfer interfaces and outcome cases are
 named above, together with standard-stream accessors and view types.
 Exact remaining public interface, member, readiness, file, adapter, and process spellings
