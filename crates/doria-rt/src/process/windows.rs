@@ -1,19 +1,21 @@
-//! Windows child processes: CreateProcessW with three anonymous pipes whose
-//! child ends alone are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), the
-//! program found on the child's own PATH, MSVC command-line quoting, and a
-//! drain that reads the error output on a helper thread so neither pipe can
-//! fill and stall the child.
+//! Windows child processes: CreateProcessW with three named pipes whose child
+//! ends alone are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), the program
+//! found on the child's own PATH, MSVC command-line quoting, and a drain that
+//! reads the error output on a helper thread so neither pipe can fill and stall
+//! the child. The parent's pipe ends are overlapped so they can join a transfer
+//! group; the child's ends are ordinary synchronous handles.
 use core::{ffi::c_void, mem, ptr};
 
 use super::Request;
+use crate::byte_io::{PipeEnd, ReadProgress};
 use crate::native_handle::{NativeHandle, OwnedHandle};
 use crate::platform_io::{last_failure, Failure};
 use crate::win32::{
-    wait_for_single_object, CloseHandle, CreatePipe, CreateProcessW, CreateThread,
-    DeleteProcThreadAttributeList, FreeEnvironmentStringsW, GetEnvironmentStringsW,
-    GetEnvironmentVariableW, GetExitCodeProcess, GetFileAttributesW, GetLastError,
-    InitializeProcThreadAttributeList, ProcessInformation, ReadFile, SecurityAttributes,
-    SetHandleInformation, StartupInfoEx, TerminateProcess, UpdateProcThreadAttribute, INFINITE,
+    wait_for_single_object, CloseHandle, CreateFileW, CreateNamedPipeW, CreateProcessW,
+    CreateThread, DeleteProcThreadAttributeList, FreeEnvironmentStringsW, GetCurrentProcessId,
+    GetEnvironmentStringsW, GetEnvironmentVariableW, GetExitCodeProcess, GetFileAttributesW,
+    GetLastError, InitializeProcThreadAttributeList, ProcessInformation, SecurityAttributes,
+    StartupInfoEx, TerminateProcess, UpdateProcThreadAttribute, INFINITE,
 };
 use crate::DrStackFrameV2;
 
@@ -24,15 +26,27 @@ type Handle = *mut c_void;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 const STILL_ACTIVE: u32 = 259;
-const HANDLE_FLAG_INHERIT: u32 = 1;
 const STARTF_USESTDHANDLES: u32 = 0x100;
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
 const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x8_0000;
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x2_0002;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
-const ERROR_BROKEN_PIPE: u32 = 109;
 const ERROR_FILE_NOT_FOUND: i64 = 2;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_PIPE_BUSY: u32 = 231;
+const PIPE_ACCESS_INBOUND: u32 = 1;
+const PIPE_ACCESS_OUTBOUND: u32 = 2;
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+const PIPE_REJECT_REMOTE_CLIENTS: u32 = 8;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const OPEN_EXISTING: u32 = 3;
+/// The pipe's buffer in each direction, close to Linux's default capacity.
+const PIPE_BUFFER_BYTES: u32 = 65536;
+/// Name collisions are only possible with another process using our prefix.
+const PIPE_NAME_ATTEMPTS: u32 = 16;
 
 pub(crate) struct Process {
     handle: Handle,
@@ -107,25 +121,17 @@ struct ErrorsJob {
     failure: Option<Failure>,
 }
 
+/// Reads one pipe end to the end of the stream. Each call owns its own wait,
+/// because the two ends of a drain are read on separate threads.
 unsafe fn read_to_end(handle: NativeHandle, sink: &mut dyn FnMut(&[u8])) -> Option<Failure> {
+    let mut pipe = PipeEnd::new();
     let mut chunk = [0u8; 16384];
     loop {
-        let mut count = 0;
-        if ReadFile(
-            handle,
-            chunk.as_mut_ptr().cast(),
-            chunk.len() as u32,
-            &mut count,
-            ptr::null_mut(),
-        ) == 0
-        {
-            let code = GetLastError();
-            return (code != ERROR_BROKEN_PIPE).then(|| Failure::from_system_code(i64::from(code)));
+        match pipe.read(handle, chunk.as_mut_ptr(), chunk.len()) {
+            Ok(ReadProgress::Data(count)) => sink(&chunk[..count]),
+            Ok(ReadProgress::EndOfStream) => return None,
+            Ok(ReadProgress::WouldBlock(failure)) | Err(failure) => return Some(failure),
         }
-        if count == 0 {
-            return None;
-        }
-        sink(&chunk[..count as usize]);
     }
 }
 
@@ -484,27 +490,96 @@ unsafe fn resolve(frame: *const DrStackFrameV2, request: &Request<'_>) -> Result
     Err(Failure::from_system_code(ERROR_FILE_NOT_FOUND))
 }
 
-unsafe fn pipe(child_reads: bool) -> Result<(OwnedHandle, OwnedHandle), Failure> {
+static NEXT_PIPE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+unsafe fn push_decimal(wide: &mut Wide, mut value: u64) {
+    let mut digits = [0u16; 20];
+    let mut used = 0;
+    loop {
+        digits[used] = b'0' as u16 + (value % 10) as u16;
+        used += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    while used > 0 {
+        used -= 1;
+        wide.push(digits[used]);
+    }
+}
+
+/// A unique pipe name, NUL-terminated.
+unsafe fn pipe_name(frame: *const DrStackFrameV2) -> Wide {
+    use core::sync::atomic::Ordering;
+    let mut name = Wide::new(frame);
+    name.text(b"\\\\.\\pipe\\doria-child-");
+    push_decimal(&mut name, u64::from(GetCurrentProcessId()));
+    name.push(b'-' as u16);
+    push_decimal(&mut name, NEXT_PIPE.fetch_add(1, Ordering::Relaxed));
+    name.push(0);
+    name
+}
+
+/// One pipe, returned as (parent end, child end). The parent's end is
+/// overlapped, so it can join a transfer group, and is not inheritable. The
+/// child's end is an ordinary synchronous handle the child inherits.
+unsafe fn pipe(
+    frame: *const DrStackFrameV2,
+    child_reads: bool,
+) -> Result<(OwnedHandle, OwnedHandle), Failure> {
+    let access = if child_reads {
+        PIPE_ACCESS_OUTBOUND
+    } else {
+        PIPE_ACCESS_INBOUND
+    };
+    let invalid = usize::MAX as Handle;
+    let mut attempts = 0;
+    let (parent, name) = loop {
+        let name = pipe_name(frame);
+        let handle = CreateNamedPipeW(
+            name.data,
+            access | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            PIPE_BUFFER_BYTES,
+            PIPE_BUFFER_BYTES,
+            0,
+            ptr::null(),
+        );
+        if handle != invalid {
+            break (OwnedHandle::from_raw(handle), name);
+        }
+        let code = GetLastError();
+        attempts += 1;
+        // FIRST_PIPE_INSTANCE reports a name someone else already holds.
+        if !matches!(code, ERROR_ACCESS_DENIED | ERROR_PIPE_BUSY) || attempts == PIPE_NAME_ATTEMPTS
+        {
+            return Err(Failure::from_system_code(i64::from(code)));
+        }
+    };
     let attributes = SecurityAttributes {
         length: mem::size_of::<SecurityAttributes>() as u32,
         descriptor: ptr::null_mut(),
         inherit: 1,
     };
-    let (mut read, mut write) = (ptr::null_mut(), ptr::null_mut());
-    if CreatePipe(&mut read, &mut write, &attributes, 0) == 0 {
+    let child = CreateFileW(
+        name.data,
+        if child_reads {
+            GENERIC_READ
+        } else {
+            GENERIC_WRITE
+        },
+        0,
+        &attributes,
+        OPEN_EXISTING,
+        0,
+        ptr::null_mut(),
+    );
+    if child == invalid {
         return Err(last_failure());
     }
-    let (read, write) = (OwnedHandle::from_raw(read), OwnedHandle::from_raw(write));
-    // (parent end, child end): only the child's end stays inheritable.
-    let (parent, child) = if child_reads {
-        (write, read)
-    } else {
-        (read, write)
-    };
-    if SetHandleInformation(parent.get(), HANDLE_FLAG_INHERIT, 0) == 0 {
-        return Err(last_failure());
-    }
-    Ok((parent, child))
+    Ok((parent, OwnedHandle::from_raw(child)))
 }
 
 /// Spawns the child with its own pipe ends as standard handles and returns
@@ -535,9 +610,9 @@ pub(super) unsafe fn spawn(
         wide.push(0);
         wide
     });
-    let (input, child_input) = pipe(true)?;
-    let (output, child_output) = pipe(false)?;
-    let (errors, child_errors) = pipe(false)?;
+    let (input, child_input) = pipe(frame, true)?;
+    let (output, child_output) = pipe(frame, false)?;
+    let (errors, child_errors) = pipe(frame, false)?;
     let inherited = [child_input.get(), child_output.get(), child_errors.get()];
     let mut size = 0;
     InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);

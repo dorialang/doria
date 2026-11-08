@@ -15,7 +15,7 @@ mod native;
 #[cfg(windows)]
 pub(crate) use native::{
     NativeAdapterGroup, NativeAdapterSet, NativePendingGroup, NativePendingSet, NativePendingSetup,
-    NativeTransferGroup, NativeTransferSet,
+    NativeTransferGroup, NativeTransferSet, PipeAttachment,
 };
 #[cfg(test)]
 mod tests;
@@ -47,7 +47,7 @@ const IO_PENDING: u32 = 997;
 /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
 /// https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-overlapped
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Issued {
+pub(super) enum Issued {
     Completed,
     Pending,
     Failed(u32),
@@ -55,7 +55,7 @@ enum Issued {
 
 /// Classifies an overlapped transfer call. `last_error` is read only when the
 /// call returned `FALSE`, before any other API can overwrite it.
-fn issued(returned: i32, last_error: impl FnOnce() -> u32) -> Issued {
+pub(super) fn issued(returned: i32, last_error: impl FnOnce() -> u32) -> Issued {
     if returned != 0 {
         return Issued::Completed;
     }

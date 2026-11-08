@@ -110,6 +110,10 @@ impl FileResource {
         Ok((*self.shared_file()?).native_handle())
     }
 
+    pub(crate) unsafe fn is_pipe(&self) -> Result<bool, Failure> {
+        Ok((*self.shared_file()?).is_pipe())
+    }
+
     pub(crate) unsafe fn is_regular(&self) -> Result<bool, Failure> {
         let handle = self.handle()?;
         if let Some(regular) = self.regular.get() {

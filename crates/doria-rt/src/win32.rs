@@ -177,13 +177,13 @@ pub(crate) type ThreadStart = extern "system" fn(parameter: *mut c_void) -> u32;
 unsafe extern "system" {
     // Errors.
     pub(crate) fn GetLastError() -> u32;
+    pub(crate) fn GetCurrentProcessId() -> u32;
     pub(crate) fn SetLastError(code: u32);
 
     // Handles.
     pub(crate) fn CloseHandle(handle: NativeHandle) -> i32;
     #[cfg(test)]
     pub(crate) fn GetHandleInformation(handle: NativeHandle, flags: *mut u32) -> i32;
-    pub(crate) fn SetHandleInformation(handle: NativeHandle, mask: u32, flags: u32) -> i32;
     pub(crate) fn GetFileType(handle: NativeHandle) -> u32;
     pub(crate) fn GetModuleHandleW(name: *const u16) -> NativeHandle;
     pub(crate) fn GetProcAddress(module: NativeHandle, name: *const u8) -> *mut c_void;
@@ -233,13 +233,13 @@ unsafe extern "system" {
     pub(crate) fn CancelSynchronousIo(thread: NativeHandle) -> i32;
 
     // Pipes.
+    #[cfg(test)]
     pub(crate) fn CreatePipe(
         read: *mut NativeHandle,
         write: *mut NativeHandle,
         attributes: *const SecurityAttributes,
         size: u32,
     ) -> i32;
-    #[cfg(test)]
     pub(crate) fn CreateNamedPipeW(
         name: *const u16,
         open_mode: u32,

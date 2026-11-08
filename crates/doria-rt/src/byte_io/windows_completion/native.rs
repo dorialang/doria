@@ -24,6 +24,7 @@ mod broker;
 pub(crate) mod pending;
 pub(crate) use adapter::{AdapterGroup as NativeAdapterGroup, AdapterSet as NativeAdapterSet};
 pub(crate) use broker::transport::{NativeTransferGroup, NativeTransferSet};
+pub(crate) use broker::PipeAttachment;
 pub(crate) use pending::{
     PendingGroup as NativePendingGroup, PendingSet as NativePendingSet,
     PendingSetup as NativePendingSetup,

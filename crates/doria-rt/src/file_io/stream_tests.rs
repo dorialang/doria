@@ -603,3 +603,189 @@ fn allocation_probe_observes_the_actual_runtime_owner_and_open_setup() {
     let (_, allocations) = crate::probe_runtime_allocations(|| file.close().unwrap());
     assert_eq!(allocations, 0);
 }
+
+/// The parent's end of a child pipe: mode control belongs to the runtime, and
+/// a plain transfer waits instead of reporting would-block to the program.
+#[cfg(unix)]
+mod child_pipe_ends {
+    use super::*;
+    use crate::native_handle::OwnedHandle;
+    use std::time::Duration;
+
+    fn pipe() -> (OwnedHandle, OwnedHandle) {
+        let mut ends = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        unsafe {
+            (
+                OwnedHandle::from_raw(ends[0]),
+                OwnedHandle::from_raw(ends[1]),
+            )
+        }
+    }
+
+    fn nonblocking(end: &OwnedHandle) {
+        unsafe {
+            let flags = libc::fcntl(end.get(), libc::F_GETFL);
+            assert!(flags >= 0);
+            assert!(libc::fcntl(end.get(), libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0);
+        }
+    }
+
+    #[test]
+    fn a_plain_read_waits_for_data_and_then_reports_end_of_stream() {
+        let (reader, writer) = pipe();
+        nonblocking(&reader);
+        let mut reader = OwnedFile::adopt_stream(reader);
+        assert!(reader.is_pipe());
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let writer = writer;
+            let sent = unsafe { libc::write(writer.get(), b"late".as_ptr().cast(), 4) };
+            assert_eq!(sent, 4);
+            drop(writer);
+        });
+        let mut buffer = [0; 8];
+        assert_eq!(reader.read(&mut buffer), Ok(ReadProgress::Data(4)));
+        assert_eq!(&buffer[..4], b"late");
+        assert_eq!(reader.read(&mut buffer), Ok(ReadProgress::EndOfStream));
+        feeder.join().unwrap();
+        reader.close().unwrap();
+    }
+
+    #[test]
+    fn a_plain_write_past_the_pipe_capacity_takes_every_byte() {
+        let (reader, writer) = pipe();
+        nonblocking(&writer);
+        let mut writer = OwnedFile::adopt_stream(writer);
+        let large = vec![7u8; 1 << 20];
+        let reading = std::thread::spawn(move || {
+            let reader = reader;
+            let mut total = 0;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let count =
+                    unsafe { libc::read(reader.get(), chunk.as_mut_ptr().cast(), chunk.len()) };
+                assert!(count >= 0);
+                if count == 0 {
+                    return total;
+                }
+                total += count as usize;
+            }
+        });
+        assert_eq!(
+            writer.write(&large),
+            Ok(WriteProgress::Accepted(large.len()))
+        );
+        writer.close().unwrap();
+        assert_eq!(reading.join().unwrap(), large.len());
+    }
+
+    #[test]
+    fn a_write_keeps_its_accepted_bytes_when_the_reader_goes_away() {
+        let (reader, writer) = pipe();
+        nonblocking(&writer);
+        let mut writer = OwnedFile::adopt_stream(writer);
+        let large = vec![7u8; 1 << 20];
+        let closing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(reader);
+        });
+        let accepted = match writer.write(&large) {
+            Ok(WriteProgress::Accepted(count)) => count,
+            other => panic!("unexpected write result: {other:?}"),
+        };
+        assert!(accepted > 0 && accepted < large.len(), "{accepted}");
+        closing.join().unwrap();
+        // The broken pipe arrives on the next write, as with a blocking pipe.
+        let failure = writer.write(&large).unwrap_err();
+        assert_eq!(failure.reason, crate::platform_io::Reason::Closed);
+        assert_eq!(failure.system_code, Some(i64::from(libc::EPIPE)));
+    }
+}
+
+/// Plain transfers on an overlapped parent end wait for their own event.
+#[cfg(windows)]
+mod child_pipe_ends {
+    use super::*;
+    use crate::native_handle::OwnedHandle;
+    use crate::win32::{CreateFileW, CreateNamedPipeW};
+    use core::ptr;
+    use std::os::windows::io::FromRawHandle;
+    use std::time::Duration;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// (overlapped server end, synchronous client file). `inbound` makes the
+    /// server the reading end.
+    fn pipe(inbound: bool) -> (OwnedHandle, std::fs::File) {
+        let name = format!(
+            r"\\.\pipe\doria-file-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let server = CreateNamedPipeW(
+                wide.as_ptr(),
+                if inbound { 1 } else { 2 } | 0x4000_0000 | 0x0008_0000,
+                8,
+                1,
+                4096,
+                4096,
+                0,
+                ptr::null(),
+            );
+            assert_ne!(server, usize::MAX as _);
+            let client = CreateFileW(
+                wide.as_ptr(),
+                if inbound { 0x4000_0000 } else { 0x8000_0000 },
+                0,
+                ptr::null(),
+                3,
+                0,
+                ptr::null_mut(),
+            );
+            assert_ne!(client, usize::MAX as _);
+            (
+                OwnedHandle::from_raw(server),
+                std::fs::File::from_raw_handle(client),
+            )
+        }
+    }
+
+    #[test]
+    fn a_plain_read_waits_for_data_and_then_reports_end_of_stream() {
+        use std::io::Write;
+        let (reader, mut writer) = pipe(true);
+        let mut reader = OwnedFile::adopt_stream(reader);
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            writer.write_all(b"late").unwrap();
+        });
+        let mut buffer = [0; 8];
+        assert_eq!(reader.read(&mut buffer), Ok(ReadProgress::Data(4)));
+        assert_eq!(&buffer[..4], b"late");
+        feeder.join().unwrap();
+        assert_eq!(reader.read(&mut buffer), Ok(ReadProgress::EndOfStream));
+        reader.close().unwrap();
+    }
+
+    #[test]
+    fn a_plain_write_past_the_pipe_buffer_takes_every_byte() {
+        use std::io::Read;
+        let (writer, mut reader) = pipe(false);
+        let mut writer = OwnedFile::adopt_stream(writer);
+        let large = vec![7u8; 1 << 20];
+        let reading = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).unwrap();
+            received.len()
+        });
+        assert_eq!(
+            writer.write(&large),
+            Ok(WriteProgress::Accepted(large.len()))
+        );
+        writer.close().unwrap();
+        assert_eq!(reading.join().unwrap(), large.len());
+    }
+}

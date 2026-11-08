@@ -628,16 +628,13 @@ impl Dispatcher<'_> {
         let route = self
             .sources
             .rebind(binding, resolved, |_, origin, handle, _| {
-                Ok(InlineLeaf::from_origin(origin, handle))
+                InlineLeaf::from_origin(origin, handle)
             })
             .map_err(AdapterTerminal::PlatformFailure)?;
         let mut snapshot = route.snapshot();
-        if !matches!(
-            snapshot.origin,
-            crate::native_handle::PhysicalOrigin::Standard(_)
-        ) && !snapshot
+        if !snapshot
             .origin
-            .is_regular()
+            .supports_pending()
             .map_err(AdapterTerminal::PlatformFailure)?
         {
             return Err(AdapterTerminal::PlatformFailure(Failure::unsupported()));
@@ -649,10 +646,17 @@ impl Dispatcher<'_> {
                 .map_err(AdapterTerminal::PlatformFailure)?;
             snapshot = selected.snapshot();
             let file = &*selected.platform();
-            if let InlineOwner::Standard { stream } = file.owner {
-                self.acquire_device(stream, file.handle)
-                    .map_err(AdapterTerminal::PlatformFailure)?;
-            }
+            let association = match file.owner {
+                InlineOwner::Standard { stream } => {
+                    self.acquire_device(stream, file.handle)
+                        .map_err(AdapterTerminal::PlatformFailure)?;
+                    ptr::null_mut()
+                }
+                InlineOwner::Pipe { association, .. } => association,
+                InlineOwner::File(_) => ptr::null_mut(),
+            };
+            self.link_pipe_route(index, association)
+                .map_err(AdapterTerminal::PlatformFailure)?;
             let operation = self.configured_route(index);
             if operation.inline.helper_active.get() {
                 crate::runtime_invariant_panic();
@@ -660,6 +664,68 @@ impl Dispatcher<'_> {
             *operation.selected.get() = Some(selected);
         }
         Ok(Some(snapshot))
+    }
+
+    /// Links this operation's route to the selected child pipe's association.
+    /// An attached stream's route is linked for the whole group; a pipe is known
+    /// only once its source is selected. Null unlinks the operation.
+    unsafe fn link_pipe_route(
+        &self,
+        index: usize,
+        association: *mut Association,
+    ) -> Result<(), Failure> {
+        let operation = self.configured_route(index);
+        if operation.inline.pipe_route.get() == association {
+            return Ok(());
+        }
+        self.unlink_pipe_route(index);
+        if !association.is_null() {
+            let operation = self.configured_route(index);
+            let mut routing = self.broker.routing().lock();
+            routing.registry.insert_route(
+                association,
+                self.group,
+                self.route(index),
+                operation.request as usize,
+            )?;
+            operation.inline.pipe_route.set(association);
+        }
+        Ok(())
+    }
+
+    /// The operation's native request has retired before this runs.
+    unsafe fn unlink_pipe_route(&self, index: usize) {
+        let operation = self.configured_route(index);
+        if operation.inline.pipe_route.get().is_null() {
+            return;
+        }
+        let mut routing = self.broker.routing().lock();
+        if routing.registry.remove_route(self.route(index)).is_err() {
+            crate::runtime_invariant_panic();
+        }
+        operation.inline.pipe_route.set(ptr::null_mut());
+    }
+
+    /// Records a child pipe's retired result in the same typed form as other
+    /// inline owners, so EOF is the broken-pipe fact and not a zero count.
+    fn finish_pipe(operation: &InlineTransfer, result: Result<usize, Failure>) -> FileTerminal {
+        use crate::byte_io::{ReadProgress, WriteProgress};
+        let terminal = if operation.reading.get() {
+            FileTerminal::Read(match result {
+                Ok(count) => Ok(ReadProgress::Data(count)),
+                Err(failure)
+                    if failure.system_code == Some(109)
+                        && !failure.transferred_byte_count.is_some_and(|n| n > 0) =>
+                {
+                    Ok(ReadProgress::EndOfStream)
+                }
+                Err(failure) => Err(failure),
+            })
+        } else {
+            FileTerminal::Write(result.map(WriteProgress::Accepted))
+        };
+        operation.terminal.set(Some(terminal));
+        terminal
     }
 
     fn route(&self, index: usize) -> *mut Route {
@@ -711,7 +777,8 @@ unsafe impl PendingNativeDriver for Dispatcher<'_> {
         if operation.inline.helper_active.get() {
             crate::runtime_invariant_panic();
         }
-        drop((&mut *operation.selected.get()).take());
+        self.unlink_pipe_route(index);
+        drop((&mut *self.configured_route(index).selected.get()).take());
     }
     unsafe fn prepare_region(
         &self,
@@ -874,7 +941,8 @@ unsafe impl GroupDriver for Dispatcher<'_> {
         let operation = self.configured_route(index);
         (&mut *operation.inline.helper.get()).shutdown();
         operation.inline.helper_active.set(false);
-        drop((&mut *operation.selected.get()).take());
+        self.unlink_pipe_route(index);
+        drop((&mut *self.configured_route(index).selected.get()).take());
     }
 
     unsafe fn reset_request(&mut self, index: usize, request: *mut Overlapped) {
@@ -886,6 +954,7 @@ unsafe impl GroupDriver for Dispatcher<'_> {
             let operation = &self.configured_route(index).inline;
             operation.terminal.set(None);
             operation.selected_length.set(0);
+            operation.reading.set(false);
             operation.helper_active.set(false);
             operation.control_failure.set(None);
             request.write(Overlapped::new(ptr::null_mut()));
@@ -919,6 +988,26 @@ unsafe impl GroupDriver for Dispatcher<'_> {
             // contract; no broker lock, new native handle, or callback bypass is
             // involved in the selected underlying leaf operation.
             operation.selected_length.set(buffer.len());
+            if file.is_pipe() {
+                operation.reading.set(matches!(buffer, Buffer::Read(_)));
+                if buffer.len() == 0 {
+                    // Complete it here: an overlapped zero-byte read would wait
+                    // for data to arrive instead of transferring nothing.
+                    Self::finish_pipe(operation, Ok(0));
+                    return Submission::Complete;
+                }
+                return match self.submit_to_port(index, request, file.handle, buffer) {
+                    Submission::Failed(failure) => {
+                        // A finished child can fail the read at once with a
+                        // broken pipe; that is its end of stream, not an error.
+                        match Self::finish_pipe(operation, Err(failure)).result() {
+                            Ok(_) => Submission::Complete,
+                            Err(failure) => Submission::Failed(failure),
+                        }
+                    }
+                    submission => submission,
+                };
+            }
             if matches!(file.owner, InlineOwner::Standard { .. }) && buffer.len() != 0 {
                 // Opening-mode proof and byte I/O both run on the helper. An
                 // inherited alias may serialize native metadata work with an
@@ -955,58 +1044,27 @@ unsafe impl GroupDriver for Dispatcher<'_> {
             operation.terminal.set(Some(terminal));
             return Submission::Complete;
         }
-        let route = self.route(index);
-        if self.broker.routing().lock().registry.arm(route).is_err() {
-            crate::runtime_invariant_panic();
-        }
         let handle = self.handle(index);
-        let success = match buffer {
-            Buffer::Read(bytes) => ReadFile(
-                handle,
-                bytes.as_mut_ptr().cast(),
-                request_length(bytes.len()),
-                ptr::null_mut(),
-                request.cast(),
-            ),
-            Buffer::Write(bytes) => WriteFile(
-                handle,
-                bytes.as_ptr().cast(),
-                request_length(bytes.len()),
-                ptr::null_mut(),
-                request.cast(),
-            ),
-        };
-        // Synchronous success still queues this handle's one packet; only a
-        // synchronous failure queues none (see `issued`).
-        let rejection = match issued(success, || GetLastError()) {
-            Issued::Completed | Issued::Pending => None,
-            Issued::Failed(code) => Some(Failure::from_system_code(code.into())),
-        };
-        let mut routing = self.broker.routing().lock();
-        let finalized = match rejection {
-            None => routing.registry.accepted(route),
-            Some(failure) => routing.registry.rejected(route, failure),
-        };
-        if finalized.is_err() {
-            crate::runtime_invariant_panic();
-        }
-        // An early packet was hidden until this finalization. Wake protected
-        // followers now, without a second native notification or allocation.
-        self.broker.routing().wake_all();
-        match rejection {
-            None => Submission::Pending,
-            Some(failure) => {
-                // The kernel never took this request; it is idle and ours again.
-                // Rewrite it so its Internal no longer reads STATUS_PENDING.
-                request.write(Overlapped::new(ptr::null_mut()));
-                Submission::Failed(failure)
-            }
-        }
+        self.submit_to_port(index, request, handle, buffer)
     }
 
     unsafe fn query(&mut self, index: usize, request: *mut Overlapped) -> Query {
         self.check_request(index, request);
         if let Some((file, operation)) = self.file(index) {
+            if file.is_pipe() {
+                if let Some(terminal) = operation.terminal.get() {
+                    return Query::Terminal(terminal.result());
+                }
+                return self
+                    .broker
+                    .routing()
+                    .lock()
+                    .registry
+                    .query(self.route(index))
+                    .map_or(Query::Pending, |result| {
+                        Query::Terminal(Self::finish_pipe(operation, result).result())
+                    });
+            }
             if let Some(failure) = operation.control_failure.get() {
                 return Query::PendingFailure(
                     doria_diagnostic_catalogue::IoMessageOperation::Register,
@@ -1050,20 +1108,29 @@ unsafe impl GroupDriver for Dispatcher<'_> {
         request: *mut Overlapped,
     ) -> Result<(), (doria_diagnostic_catalogue::IoMessageOperation, Failure)> {
         self.check_request(index, request);
-        if let Some((_, operation)) = self.file(index) {
-            if operation.helper_active.get() {
-                return (&*operation.helper.get()).cancel().map_err(|failure| {
-                    (
-                        doria_diagnostic_catalogue::IoMessageOperation::Wait,
-                        failure,
-                    )
-                });
+        let mut handle = None;
+        if let Some((file, operation)) = self.file(index) {
+            if file.is_pipe() {
+                if operation.terminal.get().is_some() {
+                    return Ok(());
+                }
+                handle = Some(file.handle);
+            } else {
+                if operation.helper_active.get() {
+                    return (&*operation.helper.get()).cancel().map_err(|failure| {
+                        (
+                            doria_diagnostic_catalogue::IoMessageOperation::Wait,
+                            failure,
+                        )
+                    });
+                }
+                // The operation already retired in submit. Cancellation cannot
+                // erase a won result or undo its cursor/append side effects.
+                return Ok(());
             }
-            // The operation already retired in submit. Cancellation cannot
-            // erase a won result or undo its cursor/append side effects.
-            return Ok(());
         }
-        if CancelIoEx(self.handle(index), request.cast()) != 0 {
+        let handle = handle.unwrap_or_else(|| self.handle(index));
+        if CancelIoEx(handle, request.cast()) != 0 {
             Ok(())
         } else {
             Err((
@@ -1079,21 +1146,29 @@ unsafe impl GroupDriver for Dispatcher<'_> {
         request: *mut Overlapped,
     ) -> Option<Result<usize, Failure>> {
         self.check_request(index, request);
+        let mut pipe = None;
         if let Some((file, operation)) = self.file(index) {
-            if operation.control_failure.get().is_some() {
-                return None;
+            if file.is_pipe() {
+                if let Some(terminal) = operation.terminal.get() {
+                    return Some(terminal.result());
+                }
+                pipe = Some(operation);
+            } else {
+                if operation.control_failure.get().is_some() {
+                    return None;
+                }
+                if operation.helper_active.get() && operation.terminal.get().is_none() {
+                    let terminal = (&*operation.helper.get()).drain()?;
+                    self.helper_terminal(file, operation, terminal);
+                }
+                return Some(
+                    operation
+                        .terminal
+                        .get()
+                        .unwrap_or_else(|| crate::runtime_invariant_panic())
+                        .result(),
+                );
             }
-            if operation.helper_active.get() && operation.terminal.get().is_none() {
-                let terminal = (&*operation.helper.get()).drain()?;
-                self.helper_terminal(file, operation, terminal);
-            }
-            return Some(
-                operation
-                    .terminal
-                    .get()
-                    .unwrap_or_else(|| crate::runtime_invariant_panic())
-                    .result(),
-            );
         }
         let route = self.route(index);
         loop {
@@ -1102,7 +1177,10 @@ unsafe impl GroupDriver for Dispatcher<'_> {
                 // The registry owns each submission's one terminal: a published
                 // packet, or the synchronous failure `rejected` recorded.
                 if let Some(result) = routing.registry.query(route) {
-                    return Some(result);
+                    return Some(match pipe {
+                        Some(operation) => Self::finish_pipe(operation, result).result(),
+                        None => result,
+                    });
                 }
                 // Only an accepted, unpublished submission has a packet coming.
                 // A slot that was never armed has nothing to drain.
@@ -1118,6 +1196,64 @@ unsafe impl GroupDriver for Dispatcher<'_> {
                 // A queue failure is not retirement proof. The shared core must
                 // never release the kernel's borrowed storage on that assumption.
                 crate::runtime_invariant_panic();
+            }
+        }
+    }
+}
+
+impl Dispatcher<'_> {
+    /// Issues one overlapped transfer whose completion packet retires it.
+    unsafe fn submit_to_port(
+        &self,
+        index: usize,
+        request: *mut Overlapped,
+        handle: NativeHandle,
+        buffer: &mut Buffer<'_>,
+    ) -> Submission {
+        let route = self.route(index);
+        if self.broker.routing().lock().registry.arm(route).is_err() {
+            crate::runtime_invariant_panic();
+        }
+        let success = match buffer {
+            Buffer::Read(bytes) => ReadFile(
+                handle,
+                bytes.as_mut_ptr().cast(),
+                request_length(bytes.len()),
+                ptr::null_mut(),
+                request.cast(),
+            ),
+            Buffer::Write(bytes) => WriteFile(
+                handle,
+                bytes.as_ptr().cast(),
+                request_length(bytes.len()),
+                ptr::null_mut(),
+                request.cast(),
+            ),
+        };
+        // Synchronous success still queues this handle's one packet; only a
+        // synchronous failure queues none (see `issued`).
+        let rejection = match issued(success, || GetLastError()) {
+            Issued::Completed | Issued::Pending => None,
+            Issued::Failed(code) => Some(Failure::from_system_code(code.into())),
+        };
+        let mut routing = self.broker.routing().lock();
+        let finalized = match rejection {
+            None => routing.registry.accepted(route),
+            Some(failure) => routing.registry.rejected(route, failure),
+        };
+        if finalized.is_err() {
+            crate::runtime_invariant_panic();
+        }
+        // An early packet was hidden until this finalization. Wake protected
+        // followers now, without a second native notification or allocation.
+        self.broker.routing().wake_all();
+        match rejection {
+            None => Submission::Pending,
+            Some(failure) => {
+                // The kernel never took this request; it is idle and ours again.
+                // Rewrite it so its Internal no longer reads STATUS_PENDING.
+                request.write(Overlapped::new(ptr::null_mut()));
+                Submission::Failed(failure)
             }
         }
     }

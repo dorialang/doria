@@ -242,10 +242,11 @@ impl Analysis {
         fields
             .iter()
             .take_while(|field| {
-                !self
-                    .properties
-                    .values()
-                    .any(|(id, borrowed)| id == *field && *borrowed)
+                !crate::compiler_known_stream::is_child_pipe_place(**field)
+                    && !self
+                        .properties
+                        .values()
+                        .any(|(id, borrowed)| id == *field && *borrowed)
             })
             .copied()
             .collect()

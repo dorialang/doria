@@ -811,9 +811,11 @@ pub(super) fn source_roots(
     if let Some((callee, args)) = call {
         if let Some(borrow) = function_in(program, callee)?.return_borrow {
             let input = borrowed_call_rvalue_source(program, callee, args, borrow)?;
+            let pipe = child_pipe_place(program, callee)?;
             return Ok(source_roots(program, input, roots)?
                 .into_iter()
-                .map(|mut place| {
+                .map(|place| {
+                    let mut place = pipe.map_or(place.clone(), |slot| place.project(slot));
                     place.opaque = true;
                     place
                 })

@@ -6905,6 +6905,37 @@ impl Checker<'_> {
         self.use_binding_at_place(name, span, scopes, mode, None);
     }
 
+    /// The child pipe getter at `site`, if it is one.
+    fn child_pipe_place(&self, site: Span) -> Option<crate::class_layout::PropertyId> {
+        match self.call_targets.get(&site) {
+            Some(crate::semantics::CallableTarget::Method {
+                class_type,
+                method_name,
+                ..
+            }) => crate::compiler_known_stream::child_pipe_place(&class_type.name, method_name),
+            _ => None,
+        }
+    }
+
+    /// The places a child pipe getter's receiver actually reaches: the lent
+    /// slot of its owner. Empty for every other call, and when the owner's
+    /// place is opaque, so those keep whole-receiver rules.
+    fn child_pipe_receiver_places(
+        &self,
+        site: Span,
+        receiver: &Expr,
+        scopes: &Scopes,
+    ) -> Vec<BorrowPlace> {
+        let Some(slot) = self.child_pipe_place(site) else {
+            return Vec::new();
+        };
+        self.borrow_root_keys(receiver, scopes)
+            .into_iter()
+            .filter(|root| root.projectable)
+            .map(|root| root.project(slot))
+            .collect()
+    }
+
     fn use_place_base(
         &mut self,
         expr: &Expr,
@@ -8557,6 +8588,8 @@ impl Checker<'_> {
                 signature.receiver.unwrap_or(UseMode::Read)
             };
             self.check_pending_storage_access(receiver, mode, scopes);
+            // A child pipe getter reaches only the slot it lends.
+            let pipe_places = self.child_pipe_receiver_places(site, receiver, scopes);
             if mode == UseMode::Give && self.expr_returns_borrow(receiver, scopes) {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -8567,15 +8600,19 @@ impl Checker<'_> {
                     .with_help("call the consuming method on an independently owned value"),
                 );
             }
-            self.use_expr(
-                receiver,
-                scopes,
-                if mode == UseMode::Give {
-                    UseMode::Give
-                } else {
-                    UseMode::Read
-                },
-            );
+            if pipe_places.is_empty() {
+                self.use_expr(
+                    receiver,
+                    scopes,
+                    if mode == UseMode::Give {
+                        UseMode::Give
+                    } else {
+                        UseMode::Read
+                    },
+                );
+            } else {
+                self.use_place_base(receiver, scopes, UseMode::Read, &pipe_places);
+            }
             self.activate_place_input_borrows(receiver, scopes);
             if execution == CallExecution::Never {
                 self.active_borrows.truncate(borrow_depth);
@@ -8589,7 +8626,14 @@ impl Checker<'_> {
                     scopes.lexical_depth(),
                 );
             } else if let Some(mode) = signature.receiver {
-                self.activate_borrow(receiver, mode, scopes);
+                if pipe_places.is_empty() {
+                    self.activate_borrow(receiver, mode, scopes);
+                } else {
+                    let through = self.borrow_input_bindings(receiver, scopes);
+                    for root in pipe_places {
+                        self.activate_borrow_root(root, mode, receiver.span(), &through, scopes);
+                    }
+                }
             }
             self.activate_retained_value_borrows(receiver, scopes);
         }
@@ -9262,8 +9306,13 @@ impl Checker<'_> {
             });
         }
         if let Some((signature, receiver, args)) = self.retained_call(expr, scopes) {
+            let pipe = self.child_pipe_place(expr.span());
             return signature.return_borrow.and_then(|borrow| {
                 self.call_borrow_source_root(borrow, receiver, &signature, args, scopes)
+                    .map(|root| match pipe {
+                        Some(slot) => root.map_places(|place| place.project(slot)),
+                        None => root,
+                    })
                     .map(|root| {
                         if borrow.kind == ReturnBorrowKind::Value {
                             root.map_places(BorrowPlace::opaque)

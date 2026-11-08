@@ -258,6 +258,28 @@ impl PhysicalOrigin {
         }
     }
 
+    /// Whether this source is the parent's end of a child pipe.
+    /// # Safety
+    /// The source is live under its current owner or the selected use.
+    pub(crate) unsafe fn is_pipe(self) -> Result<bool, Failure> {
+        match self {
+            Self::File { file, origin } if origin.resource.is_null() => Ok((*file).is_pipe()),
+            Self::File { origin, .. } => (*origin.resource).is_pipe(),
+            Self::Standard(_) => Ok(false),
+        }
+    }
+
+    /// Whether a pending transfer can run through this source. Standard
+    /// devices, regular files and child pipes can; other file objects cannot.
+    /// # Safety
+    /// The source is live under its current owner or the selected use.
+    pub(crate) unsafe fn supports_pending(self) -> Result<bool, Failure> {
+        match self {
+            Self::File { .. } => Ok(self.is_pipe()? || self.is_regular()?),
+            Self::Standard(_) => Ok(true),
+        }
+    }
+
     /// # Safety
     /// The endpoint is live under the current owner/selected use. Public File
     /// kind is cached at its resource home, never re-queried per chunk/getter.

@@ -5,9 +5,7 @@ use super::{
     decode_terminal, Configuration, DrAdapterOutcomeV1, DrIoStatusV1, DrPendingRegionV1,
     PendingState, Phase, Prepared,
 };
-use crate::checked_io::{
-    fail_file_io, fail_named_io, fail_standard_io, IoFailureOutputs, OP_READ, OP_WRITE,
-};
+use crate::checked_io::{fail_named_io, fail_standard_io, IoFailureOutputs, OP_READ, OP_WRITE};
 use crate::native_handle::PhysicalOrigin;
 use crate::platform_io::Failure;
 use crate::transfer_group::adapter::AdapterTerminal;
@@ -230,13 +228,14 @@ pub unsafe extern "C" fn dr_v1_checked_pending_request_configure_file(
             1
         }
         Err(AdapterTerminal::PlatformFailure(failure)) => {
-            fail_file_io(
-                frame,
-                doria_diagnostic_catalogue::IoMessageOperation::Configure as u8,
-                failure,
-                file_path,
-                outputs,
-            );
+            let operation = doria_diagnostic_catalogue::IoMessageOperation::Configure as u8;
+            // A child pipe's failure names the pipe, as its transfers do.
+            let target = if file.is_null() {
+                crate::checked_io::TARGET_FILE
+            } else {
+                crate::file_io::stream::transport::object::file_object_target(file)
+            };
+            fail_named_io(frame, operation, target, failure, file_path, outputs);
             3
         }
         Err(_) => crate::runtime_invariant_panic(),

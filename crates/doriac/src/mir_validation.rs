@@ -22863,6 +22863,16 @@ fn extend_unique_locals(target: &mut Vec<mir::LocalId>, incoming: Vec<mir::Local
     }
 }
 
+/// The child pipe slot `function` lends, when it is a pipe getter.
+fn child_pipe_place(
+    program: &mir::Program,
+    function: mir::FunctionId,
+) -> Result<Option<crate::class_layout::PropertyId>, BackendError> {
+    Ok(crate::compiler_known_stream::child_pipe_place_of_function(
+        &function_in(program, function)?.name,
+    ))
+}
+
 fn borrowed_call_rvalue_source<'a>(
     program: &mir::Program,
     function: mir::FunctionId,

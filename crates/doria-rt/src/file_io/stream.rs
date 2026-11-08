@@ -1,4 +1,4 @@
-use crate::byte_io::{self, ReadProgress, WriteProgress};
+use crate::byte_io::{self, PipeEnd, ReadProgress, WriteProgress};
 use crate::native_handle::{self, NativeHandle, OwnedHandle, ReadinessSource};
 use crate::platform_io::Failure;
 
@@ -82,6 +82,8 @@ pub struct OwnedFile {
     readiness: ReadinessSource,
     /// The whole-file lock this owner holds through a Doria lock guard.
     lock: Option<locking::LockMode>,
+    /// Set when this owner is the parent's end of a child pipe.
+    pipe: Option<PipeEnd>,
 }
 
 impl OwnedFile {
@@ -107,8 +109,9 @@ impl OwnedFile {
         }
     }
 
-    /// Wraps the parent end of a child pipe: a blocking byte stream with no
-    /// path. Pending admission rejects it as a non-regular endpoint.
+    /// Wraps the parent's end of a child pipe, which the runtime created
+    /// nonblocking (Unix) or overlapped (Windows). It has no path, plain
+    /// transfers wait in `PipeEnd`, and pending transfers go through the group.
     pub(crate) fn adopt_stream(handle: OwnedHandle) -> Self {
         let readiness = ReadinessSource::new(handle.get());
         Self {
@@ -116,6 +119,27 @@ impl OwnedFile {
             append: false,
             readiness,
             lock: None,
+            pipe: Some(PipeEnd::new()),
+        }
+    }
+
+    pub(crate) fn is_pipe(&self) -> bool {
+        self.pipe.is_some()
+    }
+
+    /// The completion-port association of this child pipe end, made on first
+    /// use. It lasts until the end is closed.
+    ///
+    /// # Safety
+    /// No transfer is in progress on this end.
+    #[cfg(windows)]
+    pub(crate) unsafe fn pipe_attachment(
+        &mut self,
+    ) -> Result<&crate::byte_io::PipeAttachment, Failure> {
+        let handle = self.handle.get();
+        match self.pipe.as_mut() {
+            Some(pipe) => pipe.attachment(handle),
+            None => Err(Failure::invalid_input()),
         }
     }
 
@@ -129,11 +153,19 @@ impl OwnedFile {
             append: request.append,
             readiness,
             lock: None,
+            pipe: None,
         })
     }
 
     pub(crate) fn read(&mut self, destination: &mut [u8]) -> Result<ReadProgress, Failure> {
         unsafe {
+            if let Some(pipe) = &mut self.pipe {
+                return pipe.read(
+                    self.handle.get(),
+                    destination.as_mut_ptr(),
+                    destination.len(),
+                );
+            }
             byte_io::read(
                 self.handle.get(),
                 destination.as_mut_ptr(),
@@ -144,6 +176,9 @@ impl OwnedFile {
 
     pub(crate) fn write(&mut self, source: &[u8]) -> Result<WriteProgress, Failure> {
         unsafe {
+            if let Some(pipe) = &mut self.pipe {
+                return pipe.write(self.handle.get(), source.as_ptr(), source.len());
+            }
             if self.append {
                 byte_io::append(self.handle.get(), source.as_ptr(), source.len())
             } else {
@@ -220,6 +255,7 @@ mod pending_metadata_tests {
             append: false,
             readiness: ReadinessSource::new(raw),
             lock: None,
+            pipe: None,
         }
     }
 

@@ -139,6 +139,24 @@ fn widen_payload_loans_on_cycle(old: &HashSet<Source>, next: &mut PayloadLoans) 
     }
 }
 
+/// Whether this argument borrow is the receiver of a child pipe getter call.
+/// The call's own access check covers the slot the getter lends, so the
+/// argument must not claim the whole owner.
+fn is_child_pipe_receiver(
+    program: &mir::Program,
+    accesses: &ClassLocalAccesses<'_>,
+    position: usize,
+    local: mir::LocalId,
+) -> Result<bool, BackendError> {
+    let Some(ClassLocalAccess::Call(CallTarget::Direct { function, .. }, args)) =
+        accesses.iter().nth(position + 1)
+    else {
+        return Ok(false);
+    };
+    Ok(child_pipe_place(program, function)?.is_some()
+        && args.first().and_then(mir::Rvalue::direct_place_local) == Some(local))
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct State {
     roots: Vec<HashSet<Place>>,
@@ -646,7 +664,9 @@ impl State {
                             }
                         }
                         self.end(local);
-                    } else if checking {
+                    } else if checking
+                        && !is_child_pipe_receiver(program, accesses, position, local)?
+                    {
                         self.conflicting_access(local, false)?;
                     }
                 }
@@ -681,6 +701,18 @@ impl State {
                             retained::source_roots(program, value, &self.roots)?
                         } else {
                             self.sources(program, value)?
+                        };
+                        // A child pipe getter reaches only the slot it lends.
+                        let places = match callee {
+                            CallTarget::Direct { function, .. } => {
+                                match child_pipe_place(program, function)? {
+                                    Some(slot) => {
+                                        places.iter().map(|place| place.project(slot)).collect()
+                                    }
+                                    None => places,
+                                }
+                            }
+                            CallTarget::Indirect(_) => places,
                         };
                         let through = self.ancestors(parents);
                         direct_inputs.extend(through.iter().copied());
@@ -893,7 +925,10 @@ impl State {
                             if borrow.kind == mir::ReturnBorrowKind::Value {
                                 let source =
                                     borrowed_call_rvalue_source(program, callee.id, args, borrow)?;
+                                let pipe = child_pipe_place(program, callee.id)?;
                                 for place in retained::source_roots(program, source, &self.roots)? {
+                                    let place =
+                                        pipe.map_or(place.clone(), |slot| place.project(slot));
                                     *result.entry(place).or_default() |= borrow.writable;
                                 }
                             }

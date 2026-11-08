@@ -51,6 +51,14 @@ function text(Bytes $bytes): string {
     let $text = String::fromBytes($bytes);
     return $text ?? "<invalid>";
 }
+function prefix(Bytes $bytes, int $length): string {
+    writable Bytes $copy = Bytes::allocate($length);
+    {
+        let writable $destination = $copy->getWritableRegion(0, $length);
+        $destination->copyFrom($bytes->getRegion(0, $length));
+    }
+    return text($copy);
+}
 "#;
 
 #[test]
@@ -274,6 +282,10 @@ struct Host {
     shell_name: &'static str,
     /// How `describe` reports a child ended by `terminate`.
     terminated: &'static str,
+    /// A Command that waits, then writes `ready` and exits.
+    slow: &'static str,
+    /// A Command that reads its input to the end and writes how many bytes.
+    count: &'static str,
 }
 
 #[cfg(unix)]
@@ -301,6 +313,8 @@ function sleeper(): Command {
     shell_script: "true",
     shell_name: "/bin/sh",
     terminated: "signaled 9",
+    slow: "Command::shell('sleep 0.3; printf ready')",
+    count: "Command::shell('wc -c | tr -d \" \\n\"')",
 };
 
 // `-InputFormat None` keeps PowerShell from reading its input as commands, so
@@ -330,6 +344,8 @@ function powershell(string $script): Command {
     shell_script: "exit /b 0",
     shell_name: "cmd.exe",
     terminated: "exited 1",
+    slow: r"powershell('Start-Sleep -Milliseconds 300; [Console]::Out.Write(\'ready\')')",
+    count: "powershell('$i = [Console]::OpenStandardInput(); $b = New-Object byte[] 65536; $n = 0; while (($r = $i.Read($b, 0, $b.Length)) -gt 0) { $n += $r }; [Console]::Out.Write($n)')",
 };
 
 /// The filesystem root the environment scenario runs its child in.
@@ -524,4 +540,470 @@ function main(): void {{
         native_execution::assert_native_execution(&program, profile, &expected);
     }
     assert_php_execution(&source, &expected, &[]);
+}
+
+/// Doria shared by the transfer-group scenarios: drain a registered reader
+/// until the end of the stream, reusing one read transfer.
+const GROUP_DRAIN: &str = r#"
+function drainRead(writable TransferGroup $group, ReadTransferKey $key, int $size, writable Bytes $received, int $start): int throws IoError {
+    let writable $total = $start;
+    while (true) {
+        let $count = match ($group->getNextCompletion(Wait::Indefinite)) {
+            TransferWaitResult::Completed($completion) => match ($completion) {
+                TransferCompletion::Read($finished, $outcome) => match ($outcome) {
+                    ReadOutcome::Data($bytes) => $bytes,
+                    ReadOutcome::EndOfStream => -1,
+                    default => 0,
+                },
+                default => 0,
+            },
+            default => 0,
+        };
+        if ($count < 0) {
+            return $total;
+        }
+        {
+            let $region = $group->getReadRegion($key);
+            if ($region != null) {
+                let writable $index = 0;
+                while ($index < $count) {
+                    $received[$total] = $region[$index];
+                    $total += 1;
+                    $index += 1;
+                }
+            }
+        }
+        $group->resubmitRead($key, 0, $size);
+    }
+}
+"#;
+
+const GROUP_IMPORTS: &str = r"use Doria\Std\Process\{Command, ChildCleanup, ExitStatus, ChildInput, ChildOutput};
+use Doria\Std\Io\{BorrowedBufferedReader, BorrowedBufferedWriter, ReadinessSet, TransferPlan,
+    TransferGroup, TransferWaitResult, TransferCompletion, Wait, ReadOutcome, WriteOutcome,
+    ReadTransferKey, IoError, IoErrorReason};";
+
+/// A child's output through a readiness set and a transfer plan: on the
+/// interpreter's scripted child, then on real children below.
+fn group_read_program(command: &str, prelude: &str) -> String {
+    format!(
+        r#"{GROUP_IMPORTS}
+{STATUS}
+{prelude}
+{GROUP_DRAIN}
+function main(): void throws IoError {{
+    let writable $child = {command}->spawn(ChildCleanup::Wait);
+    writable Bytes $received = Bytes::allocate(64);
+    let writable $total = 0;
+    {{
+        let writable $reader = new BorrowedBufferedReader<ChildOutput>($child->getOutput(), 64);
+        writable ReadinessSet $set = new ReadinessSet();
+        let $registration = $set->register($reader);
+        writable Bytes $storage = Bytes::allocate(4);
+        {{
+            let $plan = TransferPlan::read($registration, $storage->getWritableRegion(0, 4));
+            let $key = $plan->getReadKey(0);
+            let writable $group = $set->begin($plan);
+            $total = drainRead($group, $key, 4, $received, 0);
+        }}
+        let $returned = $set->unregister($registration);
+    }}
+    let $seen = prefix($received, $total);
+    echo "{{$total}}:{{$seen}}|" . describe($child->wait()) . "\n";
+}}
+"#
+    )
+}
+
+#[test]
+fn a_scripted_childs_output_joins_a_transfer_group() {
+    let observed = interpret(
+        &group_read_program("Command::executable('/usr/bin/report')", ""),
+        programs(&[(
+            "/usr/bin/report",
+            MirProgram {
+                output: b"abcdefghij".to_vec(),
+                exit: Some(MirExitStatus::Exited(0)),
+                ..MirProgram::default()
+            },
+        )]),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&observed.output.stdout),
+        "10:abcdefghij|exited 0\n"
+    );
+}
+
+/// A real child's output is read through the shared transfer machinery on
+/// every native profile and through PHP, and the child still resolves.
+#[test]
+fn native_child_output_joins_a_transfer_group() {
+    let Host {
+        prelude, partial, ..
+    } = HOST;
+    let source = group_read_program(partial, prelude);
+    let program = lower(&source);
+    let expected = "6:abcdef|exited 0\n";
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
+    assert_php_execution(&source, expected, &[]);
+}
+
+/// A plain read on a child pipe waits for a slow child and never reports
+/// would-block, and the child's own input stays blocking while it waits.
+#[test]
+fn native_plain_reads_wait_on_a_slow_child() {
+    let Host {
+        prelude,
+        copy,
+        slow,
+        ..
+    } = HOST;
+    let source = format!(
+        r#"use Doria\Std\Process\{{Command, ChildCleanup, ExitStatus, WaitOutcome}};
+use Doria\Std\Io\{{ReadOutcome, IoError}};
+use Doria\Std\Time\{{Deadline, Duration, ClockError}};
+{STATUS}
+{prelude}
+function main(): void throws IoError, ClockError {{
+    let writable $child = {slow}->spawn(ChildCleanup::Wait);
+    writable Bytes $buffer = Bytes::allocate(16);
+    let writable $total = 0;
+    let writable $blocked = false;
+    while (true) {{
+        let $count = match ($child->getOutput()->read($buffer->getWritableRegion($total, 16 - $total))) {{
+            ReadOutcome::Data($bytes) => $bytes,
+            ReadOutcome::EndOfStream => -1,
+            ReadOutcome::WouldBlock => -2,
+            ReadOutcome::TimedOut => -3,
+        }};
+        if ($count == -1) {{ break; }}
+        if ($count < 0) {{ $blocked = true; break; }}
+        $total += $count;
+    }}
+    echo prefix($buffer, $total) . ($blocked ? "|would block\n" : "|waited\n");
+    echo describe($child->wait()) . "\n";
+
+    // The copier reads its input while the parent is busy elsewhere. Its
+    // input is the blocking end of the pipe, so waiting does not end it.
+    let writable $cat = {copy}->spawn(ChildCleanup::Terminate);
+    let writable $timer = {slow}->spawn(ChildCleanup::Terminate);
+    echo match ($timer->waitUntil(Deadline::fromNow(Duration::fromNanoseconds(100000000)))) {{
+        WaitOutcome::Exited($status) => "ended early\n",
+        WaitOutcome::TimedOut => "parent waited\n",
+    }};
+    writable Bytes $message = Bytes::fromArray([120, 121, 122]);
+    let $written = $cat->getInput()->write($message->getRegion(0, 3));
+    $cat->getInput()->closeInput();
+    writable Bytes $copied = Bytes::allocate(8);
+    let writable $seen = 0;
+    while (true) {{
+        let $count = match ($cat->getOutput()->read($copied->getWritableRegion($seen, 8 - $seen))) {{
+            ReadOutcome::Data($bytes) => $bytes,
+            default => -1,
+        }};
+        if ($count < 0) {{ break; }}
+        $seen += $count;
+    }}
+    echo prefix($copied, $seen) . "|" . describe($cat->wait()) . "\n";
+}}
+"#
+    );
+    let program = lower(&source);
+    let expected = "ready|waited\nexited 0\nparent waited\nxyz|exited 0\n";
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
+    assert_php_execution(&source, expected, &[]);
+}
+
+/// A write larger than the pipe's capacity: a plain write waits for the child
+/// to take every byte, and a pending write is resubmitted until it has done so.
+#[test]
+fn native_writes_past_pipe_capacity_deliver_every_byte() {
+    let Host { prelude, count, .. } = HOST;
+    let source = format!(
+        r#"{GROUP_IMPORTS}
+{STATUS}
+{prelude}
+function counted(writable ChildOutput $output): string throws IoError {{
+    writable Bytes $buffer = Bytes::allocate(32);
+    let writable $total = 0;
+    while (true) {{
+        let $read = match ($output->read($buffer->getWritableRegion($total, 32 - $total))) {{
+            ReadOutcome::Data($bytes) => $bytes,
+            default => -1,
+        }};
+        if ($read < 0) {{ break; }}
+        $total += $read;
+    }}
+    return prefix($buffer, $total);
+}}
+function main(): void throws IoError {{
+    writable Bytes $large = Bytes::allocate(1048576);
+
+    let writable $plain = {count}->spawn(ChildCleanup::Wait);
+    let $accepted = match ($plain->getInput()->write($large->getRegion(0, 1048576))) {{
+        WriteOutcome::Accepted($bytes) => $bytes,
+        WriteOutcome::WouldBlock => -1,
+    }};
+    $plain->getInput()->closeInput();
+    let $plainCount = counted($plain->getOutput());
+    echo "plain {{$accepted}}|{{$plainCount}}|" . describe($plain->wait()) . "\n";
+
+    let writable $pending = {count}->spawn(ChildCleanup::Wait);
+    let writable $sent = 0;
+    {{
+        let writable $writer = new BorrowedBufferedWriter<ChildInput>($pending->getInput(), 64);
+        writable ReadinessSet $set = new ReadinessSet();
+        let $registration = $set->register($writer);
+        {{
+            let $plan = TransferPlan::writeTo($registration, $large->getRegion(0, 1048576));
+            let $key = $plan->getWriteKey(0);
+            let writable $group = $set->begin($plan);
+            while ($sent < 1048576) {{
+                $sent += match ($group->getNextCompletion(Wait::Indefinite)) {{
+                    TransferWaitResult::Completed($completion) => match ($completion) {{
+                        TransferCompletion::Write($finished, $outcome) => match ($outcome) {{
+                            WriteOutcome::Accepted($bytes) => $bytes,
+                            default => 0,
+                        }},
+                        default => 0,
+                    }},
+                    default => 0,
+                }};
+                if ($sent < 1048576) {{
+                    $group->resubmitWrite($key, $sent, 1048576 - $sent);
+                }}
+            }}
+        }}
+        let $returned = $set->unregister($registration);
+    }}
+    $pending->getInput()->closeInput();
+    let $pendingCount = counted($pending->getOutput());
+    echo "pending {{$sent}}|{{$pendingCount}}|" . describe($pending->wait()) . "\n";
+}}
+"#
+    );
+    let program = lower(&source);
+    let expected = "plain 1048576|1048576|exited 0\npending 1048576|1048576|exited 0\n";
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
+    assert_php_execution(&source, expected, &[]);
+}
+
+/// A half-closed input is a checked Closed failure at registration, not a
+/// runtime failure, and every outcome is checked on each backend.
+#[test]
+fn a_closed_child_input_is_rejected_as_closed() {
+    let Host { prelude, copy, .. } = HOST;
+    let source = format!(
+        r#"{GROUP_IMPORTS}
+{STATUS}
+{prelude}
+function main(): void {{
+    let writable $child = {copy}->spawn(ChildCleanup::Wait);
+    $child->getInput()->closeInput();
+    try {{
+        let writable $writer = new BorrowedBufferedWriter<ChildInput>($child->getInput(), 64);
+        writable ReadinessSet $set = new ReadinessSet();
+        let $registration = $set->register($writer);
+        echo "registered\n";
+    }} catch (IoError $error) {{
+        echo ($error->reason == IoErrorReason::Closed ? "closed\n" : "other\n");
+    }}
+    try {{
+        echo describe($child->wait()) . "\n";
+    }} catch (IoError $error) {{
+        echo "wait failed\n";
+    }}
+}}
+"#
+    );
+    let program = lower(&source);
+    let expected = "closed\nexited 0\n";
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, expected);
+    }
+    assert_php_execution(&source, expected, &[]);
+}
+
+/// One child's input and output in one group: the bytes written come back
+/// through the child while the group waits on both pipes.
+fn input_and_output_program(copy: &str, prelude: &str, total: usize) -> String {
+    format!(
+        r#"{GROUP_IMPORTS}
+{STATUS}
+{prelude}
+function writtenBytes(TransferWaitResult $result): int {{
+    return match ($result) {{
+        TransferWaitResult::Completed($completion) => match ($completion) {{
+            TransferCompletion::Write($finished, $outcome) => match ($outcome) {{
+                WriteOutcome::Accepted($bytes) => $bytes,
+                default => 0,
+            }},
+            default => -1,
+        }},
+        default => -1,
+    }};
+}}
+function readBytes(TransferWaitResult $result): int {{
+    return match ($result) {{
+        TransferWaitResult::Completed($completion) => match ($completion) {{
+            TransferCompletion::Read($finished, $outcome) => match ($outcome) {{
+                ReadOutcome::Data($bytes) => $bytes,
+                default => 0,
+            }},
+            default => -1,
+        }},
+        default => -1,
+    }};
+}}
+function main(): void throws IoError {{
+    let writable $child = {copy}->spawn(ChildCleanup::Wait);
+    writable Bytes $source = Bytes::allocate({total});
+    let writable $index = 0;
+    while ($index < {total}) {{
+        $source[$index] = 7;
+        $index += 251;
+    }}
+    writable Bytes $storage = Bytes::allocate(4096);
+    let writable $sent = 0;
+    let writable $received = 0;
+    let writable $sum = 0;
+    {{
+        let writable $writer = new BorrowedBufferedWriter<ChildInput>($child->getInput(), 64);
+        let writable $reader = new BorrowedBufferedReader<ChildOutput>($child->getOutput(), 64);
+        writable ReadinessSet $set = new ReadinessSet();
+        let $sink = $set->register($writer);
+        let $tap = $set->register($reader);
+        {{
+            let $plan = TransferPlan::writeTo($sink, $source->getRegion(0, {total}))
+                ->andReadFrom($tap, $storage->getWritableRegion(0, 4096));
+            let $writeKey = $plan->getWriteKey(0);
+            let $readKey = $plan->getReadKey(1);
+            let writable $group = $set->begin($plan);
+            while ($sent < {total} || $received < {total}) {{
+                let $result = $group->getNextCompletion(Wait::Indefinite);
+                let $wrote = writtenBytes($result);
+                if ($wrote >= 0) {{
+                    $sent += $wrote;
+                    if ($sent < {total}) {{
+                        $group->resubmitWrite($writeKey, $sent, {total} - $sent);
+                    }}
+                }}
+                let $count = readBytes($result);
+                if ($count >= 0) {{
+                    {{
+                        let $region = $group->getReadRegion($readKey);
+                        if ($region != null) {{
+                            let writable $at = 0;
+                            while ($at < $count) {{
+                                $sum += Int::from($region[$at]);
+                                $at += 1;
+                            }}
+                        }}
+                    }}
+                    $received += $count;
+                    if ($received < {total}) {{
+                        $group->resubmitRead($readKey, 0, 4096);
+                    }}
+                }}
+            }}
+        }}
+        let $firstBack = $set->unregister($sink);
+        let $secondBack = $set->unregister($tap);
+    }}
+    $child->getInput()->closeInput();
+    echo "{{$sent}}|{{$received}}|{{$sum}}|" . describe($child->wait()) . "\n";
+}}
+"#
+    )
+}
+
+/// The expected sum of the pattern `input_and_output_program` sends.
+fn pattern_sum(total: usize) -> usize {
+    (0..total).filter(|index| index % 251 == 0).count() * 7
+}
+
+#[test]
+fn a_scripted_childs_input_and_output_share_a_transfer_group() {
+    let total = 200;
+    let source = input_and_output_program("Command::executable('cat')", "", total);
+    let observed = interpret(
+        &source,
+        programs(&[(
+            "cat",
+            MirProgram {
+                echo_input: true,
+                exit: Some(MirExitStatus::Exited(0)),
+                ..MirProgram::default()
+            },
+        )]),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&observed.output.stdout),
+        format!("{total}|{total}|{}|exited 0\n", pattern_sum(total))
+    );
+}
+
+/// Writing a child's input while reading its output: the classic case that
+/// deadlocks when each side blocks on a full pipe.
+#[test]
+fn native_child_input_and_output_share_a_transfer_group() {
+    let Host { prelude, copy, .. } = HOST;
+    let total = 300_000;
+    let source = input_and_output_program(copy, prelude, total);
+    let program = lower(&source);
+    let expected = format!("{total}|{total}|{}|exited 0\n", pattern_sum(total));
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, &expected);
+    }
+    assert_php_execution(&source, &expected, &[]);
+}
+
+/// A slot is exclusive and the owner stays whole: a second loan of the same
+/// pipe, or resolving the child while a pipe loan lives, is still rejected.
+#[test]
+fn child_pipe_loans_are_disjoint_only_between_different_pipes() {
+    let prefix = r#"use Doria\Std\Process\{Command, ChildCleanup, ChildInput, ChildOutput};
+use Doria\Std\Io\{BorrowedBufferedReader, BorrowedBufferedWriter, IoError};
+function main(): void throws IoError {
+    let writable $child = Command::executable('cat')->spawn(ChildCleanup::Wait);
+    let writable $reader = new BorrowedBufferedReader<ChildOutput>($child->getOutput(), 8);
+"#;
+    let accepted = format!(
+        "{prefix}    let writable $writer = new BorrowedBufferedWriter<ChildInput>($child->getInput(), 8);\n    let writable $errors = new BorrowedBufferedReader<ChildOutput>($child->getErrors(), 8);\n}}\n"
+    );
+    lower(&accepted);
+    // The same holds when the child lives in a stored property.
+    lower(
+        r#"use Doria\Std\Process\{Command, ChildCleanup, Child, ChildInput, ChildOutput};
+use Doria\Std\Io\{BorrowedBufferedReader, BorrowedBufferedWriter, IoError};
+class Holder {
+    writable Child $child;
+    function __construct(parameter take Child $child) { $this->child = $child; }
+    writable function both(): void throws IoError {
+        let writable $reader = new BorrowedBufferedReader<ChildOutput>($this->child->getOutput(), 8);
+        let writable $writer = new BorrowedBufferedWriter<ChildInput>($this->child->getInput(), 8);
+        $reader->fill();
+    }
+}
+function main(): void {}
+"#,
+    );
+    for rejected in [
+        "    let writable $again = new BorrowedBufferedReader<ChildOutput>($child->getOutput(), 8);\n    $reader->fill();\n",
+        "    let $status = $child->wait();\n    $reader->fill();\n",
+    ] {
+        let source = format!("{prefix}{rejected}}}\n");
+        let errors = doriac::lower_source_to_mir(PATH, &source)
+            .expect_err("the conflicting pipe loan must be rejected");
+        assert!(
+            errors.iter().any(|error| error.code == "E0763"),
+            "{source}\n{errors:#?}"
+        );
+    }
 }

@@ -660,6 +660,7 @@ unsafe fn fail_io(
 /// Constructs the canonical checked file failure, retaining its borrowed path.
 /// # Safety
 /// Outputs must be writable and disjoint; path must be a live borrowed string.
+#[cfg(test)]
 pub(crate) unsafe fn fail_file_io(
     frame: *const DrStackFrameV2,
     operation: u8,

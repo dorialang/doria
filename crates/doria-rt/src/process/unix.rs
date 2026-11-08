@@ -385,6 +385,17 @@ unsafe fn pipe() -> Result<[OwnedHandle; 2], Failure> {
     Ok(owned)
 }
 
+/// Makes a parent's pipe end nonblocking so it can join a transfer group. The
+/// two ends of a pipe are separate open file descriptions, so the child's end,
+/// which becomes its standard stream, stays blocking.
+unsafe fn set_nonblocking(end: &OwnedHandle) -> Result<(), Failure> {
+    let flags = libc::fcntl(end.get(), libc::F_GETFL);
+    if flags < 0 || libc::fcntl(end.get(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+        return Err(last_failure());
+    }
+    Ok(())
+}
+
 unsafe extern "C" {
     // macOS 10.15 and glibc 2.29 export this; libc binds it for glibc only.
     fn posix_spawn_file_actions_addchdir_np(
@@ -466,6 +477,9 @@ pub(super) unsafe fn spawn(
     let [input_read, input_write] = pipe()?;
     let [output_read, output_write] = pipe()?;
     let [errors_read, errors_write] = pipe()?;
+    for parent_end in [&input_write, &output_read, &errors_read] {
+        set_nonblocking(parent_end)?;
+    }
     let mut actions: libc::posix_spawn_file_actions_t = core::mem::zeroed();
     let mut attributes: libc::posix_spawnattr_t = core::mem::zeroed();
     let mut code = libc::posix_spawn_file_actions_init(&mut actions);

@@ -8,8 +8,86 @@ mod windows_completion;
 #[cfg(windows)]
 pub(crate) use windows_completion::{
     NativeAdapterGroup, NativeAdapterSet, NativePendingGroup, NativePendingSet, NativePendingSetup,
-    NativeTransferGroup, NativeTransferSet,
+    NativeTransferGroup, NativeTransferSet, PipeAttachment,
 };
+
+/// What the parent's end of a child pipe holds beyond its handle.
+///
+/// The runtime creates this end itself, so it may choose the end's mode:
+/// nonblocking on Unix, overlapped on Windows. That is what lets the pipe join
+/// a transfer group. The program still sees an ordinary blocking pipe, so the
+/// wait a plain `read` or `write` needs lives here, once. Pending transfers do
+/// not come through here; they use the transfer group's own wait.
+pub(crate) struct PipeEnd {
+    /// Signals a plain transfer's completion. Made on first use.
+    #[cfg(windows)]
+    event: Option<crate::win32::KernelObject>,
+    /// This end's completion-port association, made when it first joins a set.
+    #[cfg(windows)]
+    attachment: Option<windows_completion::PipeAttachment>,
+}
+
+impl PipeEnd {
+    pub(crate) const fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            event: None,
+            #[cfg(windows)]
+            attachment: None,
+        }
+    }
+
+    /// Waits for data or the end of the stream; never reports would-block.
+    ///
+    /// # Safety
+    /// `handle` is this end's handle. `destination` is writable for `capacity`
+    /// bytes, or may be null when `capacity` is zero.
+    pub(crate) unsafe fn read(
+        &mut self,
+        handle: NativeHandle,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> Result<ReadProgress, Failure> {
+        if capacity == 0 {
+            return Ok(ReadProgress::Data(0));
+        }
+        platform::read_pipe(self, handle, destination, capacity)
+    }
+
+    /// Waits until the child has taken the bytes, as a blocking pipe does.
+    /// A failure after some bytes were accepted reports those bytes; the
+    /// failure itself returns on the next write.
+    ///
+    /// # Safety
+    /// `handle` is this end's handle. `source` is readable for `length` bytes,
+    /// or may be null when `length` is zero.
+    pub(crate) unsafe fn write(
+        &mut self,
+        handle: NativeHandle,
+        source: *const u8,
+        length: usize,
+    ) -> Result<WriteProgress, Failure> {
+        if length == 0 {
+            return Ok(WriteProgress::Accepted(0));
+        }
+        platform::write_pipe(self, handle, source, length)
+    }
+
+    /// This end's completion-port association, made on first use.
+    ///
+    /// # Safety
+    /// `handle` is this end's handle and has no transfer in progress.
+    #[cfg(windows)]
+    pub(crate) unsafe fn attachment(
+        &mut self,
+        handle: NativeHandle,
+    ) -> Result<&windows_completion::PipeAttachment, Failure> {
+        if self.attachment.is_none() {
+            self.attachment = Some(windows_completion::PipeAttachment::attach(handle)?);
+        }
+        Ok(self.attachment.as_ref().unwrap())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadProgress {
@@ -267,6 +345,66 @@ mod platform {
         }
     }
 
+    pub(super) unsafe fn read_pipe(
+        _: &mut PipeEnd,
+        handle: NativeHandle,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> Result<ReadProgress, Failure> {
+        loop {
+            match read(handle, destination, capacity)? {
+                ReadProgress::WouldBlock(_) => wait_ready(handle, libc::POLLIN)?,
+                progress => return Ok(progress),
+            }
+        }
+    }
+
+    pub(super) unsafe fn write_pipe(
+        _: &mut PipeEnd,
+        handle: NativeHandle,
+        source: *const u8,
+        length: usize,
+    ) -> Result<WriteProgress, Failure> {
+        let mut accepted = 0;
+        while accepted < length {
+            let step = match write(handle, source.add(accepted), length - accepted) {
+                Ok(WriteProgress::Accepted(count)) if count > 0 => {
+                    accepted += count;
+                    continue;
+                }
+                Ok(_) => wait_ready(handle, libc::POLLOUT),
+                Err(failure) => Err(failure),
+            };
+            if let Err(failure) = step {
+                return if accepted == 0 {
+                    Err(failure)
+                } else {
+                    Ok(WriteProgress::Accepted(accepted))
+                };
+            }
+        }
+        Ok(WriteProgress::Accepted(accepted))
+    }
+
+    /// Blocks until the descriptor may be ready. The caller's next transfer
+    /// decides what actually happened, including a closed peer or a bad handle.
+    unsafe fn wait_ready(handle: NativeHandle, events: libc::c_short) -> Result<(), Failure> {
+        let mut descriptor = libc::pollfd {
+            fd: handle,
+            events,
+            revents: 0,
+        };
+        loop {
+            if libc::poll(&mut descriptor, 1, -1) >= 0 {
+                return Ok(());
+            }
+            let failure = crate::platform_io::last_failure();
+            if failure.system_code != Some(EINTR) {
+                return Err(failure);
+            }
+        }
+    }
+
     pub(super) fn retry_interrupted<T>(
         mut attempt: impl FnMut() -> Result<T, Failure>,
     ) -> Result<T, Failure> {
@@ -295,7 +433,8 @@ mod platform {
 
     use super::*;
     use crate::win32::{
-        pipe_write_quota_available, GetFileType, GetLastError, Overlapped, ReadFile, WriteFile,
+        pipe_write_quota_available, wait_for_single_object, CreateEventW, GetFileType,
+        GetLastError, GetOverlappedResult, KernelObject, Overlapped, ReadFile, WriteFile, INFINITE,
     };
 
     pub(super) unsafe fn read(
@@ -328,6 +467,100 @@ mod platform {
             Ok(ReadProgress::EndOfStream)
         } else {
             Ok(ReadProgress::Data(count as usize))
+        }
+    }
+
+    pub(super) unsafe fn read_pipe(
+        pipe: &mut PipeEnd,
+        handle: NativeHandle,
+        destination: *mut u8,
+        capacity: usize,
+    ) -> Result<ReadProgress, Failure> {
+        let requested = capacity.min(u32::MAX as usize);
+        let event = pipe_event(pipe)?;
+        let result = overlapped_transfer(handle, event, |request| {
+            ReadFile(
+                handle,
+                destination.cast(),
+                requested as u32,
+                ptr::null_mut(),
+                request,
+            )
+        });
+        match result {
+            // A successful empty read is an empty write by the child, not EOF.
+            Ok(count) => Ok(ReadProgress::Data(count as usize)),
+            Err((109, 0)) => Ok(ReadProgress::EndOfStream),
+            Err((code, count)) => Err(failed_windows_transfer(code, count, requested)),
+        }
+    }
+
+    pub(super) unsafe fn write_pipe(
+        pipe: &mut PipeEnd,
+        handle: NativeHandle,
+        source: *const u8,
+        length: usize,
+    ) -> Result<WriteProgress, Failure> {
+        let requested = length.min(u32::MAX as usize);
+        let event = pipe_event(pipe)?;
+        let result = overlapped_transfer(handle, event, |request| {
+            WriteFile(
+                handle,
+                source.cast(),
+                requested as u32,
+                ptr::null_mut(),
+                request,
+            )
+        });
+        match result {
+            Ok(count) => Ok(WriteProgress::Accepted(count as usize)),
+            Err((_, count)) if count > 0 && count as usize <= requested => {
+                Ok(WriteProgress::Accepted(count as usize))
+            }
+            Err((code, count)) => Err(failed_windows_transfer(code, count, requested)),
+        }
+    }
+
+    unsafe fn pipe_event(pipe: &mut PipeEnd) -> Result<NativeHandle, Failure> {
+        if pipe.event.is_none() {
+            let event = CreateEventW(ptr::null(), 1, 0, ptr::null());
+            if event.is_null() {
+                return Err(crate::platform_io::last_failure());
+            }
+            pipe.event = Some(KernelObject::from_raw(event));
+        }
+        Ok(pipe.event.as_ref().unwrap().get())
+    }
+
+    /// Issues one overlapped transfer and waits for it on `event`. Returns the
+    /// byte count, or the system code and any count the failure reports. The
+    /// tagged event keeps this transfer's completion off the completion port
+    /// the pipe may have joined.
+    unsafe fn overlapped_transfer(
+        handle: NativeHandle,
+        event: NativeHandle,
+        issue: impl FnOnce(*mut Overlapped) -> i32,
+    ) -> Result<u32, (u32, u32)> {
+        let tagged = (event as usize | 1) as NativeHandle;
+        let mut request = core::pin::pin!(Overlapped::new(tagged));
+        // The request stays pinned here until the transfer has finished.
+        let raw: *mut Overlapped = request.as_mut().get_unchecked_mut();
+        match windows_completion::issued(issue(raw), || GetLastError()) {
+            windows_completion::Issued::Failed(code) => return Err((code, 0)),
+            windows_completion::Issued::Completed => {}
+            windows_completion::Issued::Pending => {
+                // A failed wait on this runtime-owned event is a broken runtime
+                // invariant, not permission to release a live kernel request.
+                if wait_for_single_object(event, INFINITE, "a child pipe transfer to finish") != 0 {
+                    crate::runtime_invariant_panic();
+                }
+            }
+        }
+        let mut count = 0;
+        if GetOverlappedResult(handle, raw, &mut count, 0) != 0 {
+            Ok(count)
+        } else {
+            Err((GetLastError(), count))
         }
     }
 
@@ -419,6 +652,24 @@ mod platform {
     }
 
     pub(super) unsafe fn write(
+        _: NativeHandle,
+        _: *const u8,
+        _: usize,
+    ) -> Result<WriteProgress, Failure> {
+        Err(Failure::unsupported())
+    }
+
+    pub(super) unsafe fn read_pipe(
+        _: &mut PipeEnd,
+        _: NativeHandle,
+        _: *mut u8,
+        _: usize,
+    ) -> Result<ReadProgress, Failure> {
+        Err(Failure::unsupported())
+    }
+
+    pub(super) unsafe fn write_pipe(
+        _: &mut PipeEnd,
         _: NativeHandle,
         _: *const u8,
         _: usize,

@@ -35,6 +35,8 @@ Last-use and explicit retained-lifetime rules remain unchanged.
 Computed getters and borrowed properties do not establish separate storage.
 Returned loans preserve proved source paths; an opaque projection remains
 conservative and cannot recover disjointness by subsequently naming a field.
+The compiler-known `Child` pipe getters are the one exception: each lends its
+own owner-held pipe slot (Decision 0110, Child Process Declarations).
 Collection indices and byte ranges do not establish independent places. Two
 regions of one buffer still conflict according to their source access modes.
 Shared ownership retains its existing allocation and dynamic-access contracts.

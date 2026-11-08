@@ -12,6 +12,11 @@ pub(super) enum InlineOwner {
     Standard {
         stream: crate::device_io::StandardStream,
     },
+    /// A child pipe's parent end, overlapped and attached to the shared port.
+    Pipe {
+        file: *mut OwnedFile,
+        association: *mut Association,
+    },
 }
 
 pub(super) struct InlineLeaf {
@@ -26,10 +31,14 @@ pub(super) struct InlineTransfer {
     // observes it; a synchronous File operation retires before returning.
     pub(super) terminal: Cell<Option<FileTerminal>>,
     pub(super) selected_length: Cell<usize>,
+    pub(super) reading: Cell<bool>,
     pub(super) helper: UnsafeCell<crate::device_io::helper::Helper>,
     pub(super) helper_active: Cell<bool>,
     pub(super) control_failure: Cell<Option<Failure>>,
     pub(super) helper_notice: UnsafeCell<HelperNotice>,
+    /// The association this operation's route is linked to while it has a
+    /// child pipe selected; null otherwise.
+    pub(super) pipe_route: Cell<*mut Association>,
 }
 
 impl InlineTransfer {
@@ -37,6 +46,7 @@ impl InlineTransfer {
         Self {
             terminal: Cell::new(None),
             selected_length: Cell::new(0),
+            reading: Cell::new(false),
             helper: UnsafeCell::new(crate::device_io::helper::Helper::new()),
             helper_active: Cell::new(false),
             control_failure: Cell::new(None),
@@ -44,6 +54,7 @@ impl InlineTransfer {
                 broker: ptr::null(),
                 group: ptr::null_mut(),
             }),
+            pipe_route: Cell::new(ptr::null_mut()),
         }
     }
 }
@@ -66,21 +77,37 @@ pub(super) unsafe fn helper_notice(context: usize) {
 }
 
 impl InlineLeaf {
-    pub(super) fn from_origin(
+    /// A child pipe joins the shared completion port here, the first time it
+    /// is routed. Decision 0110: association is lazy; it costs nothing until a
+    /// pipe enters a set.
+    /// # Safety
+    /// The origin is live under its current owner, with no transfer in progress.
+    pub(super) unsafe fn from_origin(
         origin: crate::native_handle::PhysicalOrigin,
         handle: NativeHandle,
-    ) -> Self {
+    ) -> Result<Self, Failure> {
         let owner = match origin {
+            crate::native_handle::PhysicalOrigin::File { file, .. } if origin.is_pipe()? => {
+                InlineOwner::Pipe {
+                    file,
+                    association: (*file).pipe_attachment()?.association(),
+                }
+            }
             crate::native_handle::PhysicalOrigin::File { file, .. } => InlineOwner::File(file),
             crate::native_handle::PhysicalOrigin::Standard(stream) => {
                 InlineOwner::Standard { stream }
             }
         };
-        Self { owner, handle }
+        Ok(Self { owner, handle })
     }
+
+    pub(super) fn is_pipe(&self) -> bool {
+        matches!(self.owner, InlineOwner::Pipe { .. })
+    }
+
     pub(super) fn endpoint(&self) -> *const c_void {
         match self.owner {
-            InlineOwner::File(file) => file.cast_const().cast(),
+            InlineOwner::File(file) | InlineOwner::Pipe { file, .. } => file.cast_const().cast(),
             InlineOwner::Standard { stream, .. } => {
                 ptr::from_ref(crate::device_io::standard_device(stream)).cast()
             }
@@ -89,7 +116,7 @@ impl InlineLeaf {
 
     pub(super) unsafe fn validate(&self) -> Result<(), Failure> {
         let handle = match self.owner {
-            InlineOwner::File(file) => (*file).native_handle(),
+            InlineOwner::File(file) | InlineOwner::Pipe { file, .. } => (*file).native_handle(),
             InlineOwner::Standard { stream, .. } => crate::device_io::byte_handle(stream)?,
         };
         if handle != self.handle {
@@ -109,6 +136,8 @@ impl InlineLeaf {
                 Buffer::Read(bytes) => FileTerminal::Read((*file).read(bytes)),
                 Buffer::Write(bytes) => FileTerminal::Write((*file).write(bytes)),
             },
+            // A pipe's transfer goes through the completion port, never here.
+            InlineOwner::Pipe { .. } => crate::runtime_invariant_panic(),
             InlineOwner::Standard { .. } => {
                 let loan = loan.unwrap_or_else(|| crate::runtime_invariant_panic());
                 // Nonempty raw standard-device work belongs to the helper
@@ -345,7 +374,7 @@ impl CompletionSet {
                     return Err(Failure::invalid_input());
                 }
                 let handle = origin.handle()?;
-                let pending_supported = crate::native_handle::is_regular_file(handle)?;
+                let pending_supported = origin.supports_pending()?;
                 if (0..routes.records.len()).any(|index| {
                     routes.records.get(index).is_some_and(|record| {
                         record.source.is_none() && record.leaf.handle() == handle
@@ -455,7 +484,7 @@ impl CompletionSet {
         let mut binding = SourceBinding::new(provider);
         self.sources
             .rebind(&mut binding, resolved, |_, origin, handle, _| {
-                Ok(InlineLeaf::from_origin(origin, handle))
+                InlineLeaf::from_origin(origin, handle)
             })?;
         match self.add_readiness_origin(key, origin) {
             Ok(index) => {
@@ -496,7 +525,7 @@ impl CompletionSet {
         let origin = resolved.origin();
         self.sources
             .rebind(binding, resolved, |_, origin, handle, _| {
-                Ok(InlineLeaf::from_origin(origin, handle))
+                InlineLeaf::from_origin(origin, handle)
             })?;
         Ok(origin)
     }

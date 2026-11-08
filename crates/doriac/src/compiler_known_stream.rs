@@ -364,6 +364,25 @@ impl ProcessFunction {
         matches!(self, Self::InputPipe | Self::OutputPipe | Self::ErrorsPipe)
     }
 
+    /// The owner slot this pipe getter lends. The runtime `Child` owner holds
+    /// its three pipes as separate owned objects, so a loan of one does not
+    /// reach the others (Decision 0136's sibling-path rule; Stage 36a decision
+    /// log entry on child pipe access). The identity names a place only, like
+    /// `add_template_fields` does for generic templates: it is never storage
+    /// and never appears in a contract.
+    pub(crate) const fn pipe_place(self) -> Option<crate::class_layout::PropertyId> {
+        let index = match self {
+            Self::InputPipe => 0,
+            Self::OutputPipe => 1,
+            Self::ErrorsPipe => 2,
+            _ => return None,
+        };
+        Some(crate::class_layout::PropertyId {
+            class: CHILD_PIPE_PLACES,
+            index,
+        })
+    }
+
     /// A pipe getter lends one of the owner's pipe objects for its last use.
     pub fn return_borrow(self) -> Option<crate::symbols::ReturnBorrow> {
         self.is_pipe().then_some(crate::symbols::ReturnBorrow {
@@ -482,6 +501,36 @@ impl FileFunction {
 pub const READABLE_FILE: &str = "Doria\\Std\\Io\\ReadableFile";
 pub const COMMAND: &str = "Doria\\Std\\Process\\Command";
 pub const CHILD: &str = "Doria\\Std\\Process\\Child";
+/// The class identity of `ProcessFunction::pipe_place`. No class uses it.
+const CHILD_PIPE_PLACES: crate::class_layout::ClassId =
+    crate::class_layout::ClassId(usize::MAX / 2);
+
+/// The place identity of a pipe getter, found by its member name.
+pub(crate) fn child_pipe_place(
+    class: &str,
+    method: &str,
+) -> Option<crate::class_layout::PropertyId> {
+    if class != CHILD {
+        return None;
+    }
+    match method {
+        "getInput" => ProcessFunction::InputPipe.pipe_place(),
+        "getOutput" => ProcessFunction::OutputPipe.pipe_place(),
+        "getErrors" => ProcessFunction::ErrorsPipe.pipe_place(),
+        _ => None,
+    }
+}
+
+/// The place identity of a pipe getter, found by its compiled function name.
+pub(crate) fn child_pipe_place_of_function(name: &str) -> Option<crate::class_layout::PropertyId> {
+    let (class, method) = name.rsplit_once("::")?;
+    child_pipe_place(class, method)
+}
+
+/// Whether a place identity is one of the child pipe slots above.
+pub(crate) fn is_child_pipe_place(field: crate::class_layout::PropertyId) -> bool {
+    field.class == CHILD_PIPE_PLACES
+}
 pub const CHILD_INPUT: &str = "Doria\\Std\\Process\\ChildInput";
 pub const CHILD_OUTPUT: &str = "Doria\\Std\\Process\\ChildOutput";
 pub const STANDARD_STREAMS: &str = "Doria\\Std\\Io\\StandardStreams";

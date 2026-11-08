@@ -367,31 +367,12 @@ impl AttachedStream {
     /// Adoption consumes the supplied owner, including on failure.
     pub(super) unsafe fn adopt(owner: OwnedHandle) -> Result<Self, Failure> {
         let broker = BrokerClaim::acquire()?;
-        let mut association = FixedSlice::new(1)?;
-        let key = broker.broker().routing().lock().registry.reserve_key()?;
-        association.push(Association::new(key))?;
-        let stream = Self {
+        let association = associate(&broker, owner.get())?;
+        Ok(Self {
             owner: Some(owner),
             association,
             broker,
-        };
-        {
-            let mut routing = stream.broker.broker().routing().lock();
-            if routing
-                .registry
-                .insert_association(stream.association.raw(0))
-                .is_err()
-            {
-                crate::runtime_invariant_panic();
-            }
-        }
-        // All allocations and routing capacity exist before irreversible native
-        // attachment. Rollback removes only our metadata, never pretends detach.
-        let port = stream.broker.broker().port.get();
-        if CreateIoCompletionPort(stream.handle(), port, key, 0) != port {
-            return Err(last_failure());
-        }
-        Ok(stream)
+        })
     }
 
     fn handle(&self) -> NativeHandle {
@@ -410,10 +391,76 @@ impl AttachedStream {
         if self.owner.is_none() {
             return;
         }
-        let mut routing = self.broker.broker().routing().lock();
-        if unsafe { routing.registry.remove_association(self.association.raw(0)) }.is_err() {
-            unsafe { crate::runtime_invariant_panic() };
+        disassociate(&self.broker, self.association.raw(0));
+    }
+}
+
+/// Creates a pinned association and attaches `handle` to the broker's port.
+/// All allocations and routing capacity exist before irreversible native
+/// attachment. Rollback removes only our metadata, never pretends detach.
+unsafe fn associate(
+    broker: &BrokerClaim,
+    handle: NativeHandle,
+) -> Result<FixedSlice<Association>, Failure> {
+    let mut association = FixedSlice::new(1)?;
+    let key = broker.broker().routing().lock().registry.reserve_key()?;
+    association.push(Association::new(key))?;
+    {
+        let mut routing = broker.broker().routing().lock();
+        if routing
+            .registry
+            .insert_association(association.raw(0))
+            .is_err()
+        {
+            crate::runtime_invariant_panic();
         }
+    }
+    let port = broker.broker().port.get();
+    if CreateIoCompletionPort(handle, port, key, 0) != port {
+        let failure = last_failure();
+        disassociate(broker, association.raw(0));
+        return Err(failure);
+    }
+    Ok(association)
+}
+
+fn disassociate(broker: &BrokerClaim, association: *mut Association) {
+    let mut routing = broker.broker().routing().lock();
+    if unsafe { routing.registry.remove_association(association) }.is_err() {
+        unsafe { crate::runtime_invariant_panic() };
+    }
+}
+
+/// A child pipe's lasting association with the completion port. It belongs to
+/// the pipe's parent end, not to a set, so the pipe can leave one set and join
+/// another. A plain transfer on the same handle uses a tagged event and adds
+/// no completion packet. Dropped after the pipe's last transfer has retired.
+pub(crate) struct PipeAttachment {
+    association: FixedSlice<Association>,
+    broker: BrokerClaim,
+}
+
+impl PipeAttachment {
+    /// # Safety
+    /// `handle` is an idle overlapped byte-mode PIPE_WAIT pipe end with no other
+    /// completion-port association.
+    pub(crate) unsafe fn attach(handle: NativeHandle) -> Result<Self, Failure> {
+        let broker = BrokerClaim::acquire()?;
+        let association = associate(&broker, handle)?;
+        Ok(Self {
+            association,
+            broker,
+        })
+    }
+
+    fn association(&self) -> *mut Association {
+        self.association.raw(0)
+    }
+}
+
+impl Drop for PipeAttachment {
+    fn drop(&mut self) {
+        disassociate(&self.broker, self.association.raw(0));
     }
 }
 

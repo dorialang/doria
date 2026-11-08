@@ -24,15 +24,23 @@ enum Endpoint {
     Raw,
     HandleHome(*const c_void),
     File(*mut OwnedFile),
+    /// A child pipe's parent end. It is nonblocking, so it takes the same
+    /// attempt-then-watch path as any readiness stream, not the file path.
+    Pipe(*mut OwnedFile),
     Standard(crate::device_io::StandardStream),
 }
 
 impl Endpoint {
-    fn from_origin(origin: crate::native_handle::PhysicalOrigin) -> Self {
-        match origin {
+    /// # Safety
+    /// The origin is live under its current owner or the selected use.
+    unsafe fn from_origin(origin: crate::native_handle::PhysicalOrigin) -> Result<Self, Failure> {
+        Ok(match origin {
+            crate::native_handle::PhysicalOrigin::File { file, .. } if origin.is_pipe()? => {
+                Self::Pipe(file)
+            }
             crate::native_handle::PhysicalOrigin::File { file, .. } => Self::File(file),
             crate::native_handle::PhysicalOrigin::Standard(stream) => Self::Standard(stream),
-        }
+        })
     }
 }
 
@@ -49,10 +57,9 @@ unsafe fn source_route(
     resource: crate::transfer_group::TransferResource,
 ) -> Result<PhysicalRoute, Failure> {
     Ok(PhysicalRoute {
-        endpoint: Endpoint::from_origin(origin),
+        endpoint: Endpoint::from_origin(origin)?,
         watch: RegistrationWatch::source(handle, index)?,
-        pending_supported: matches!(origin, crate::native_handle::PhysicalOrigin::Standard(_))
-            || resource.shared_cursor,
+        pending_supported: resource.shared_cursor || origin.supports_pending()?,
     })
 }
 
@@ -302,7 +309,10 @@ impl TransferSet {
         }) {
             return Err(Failure::invalid_input());
         }
-        if !matches!(endpoint, Endpoint::File(_) | Endpoint::Standard(_)) {
+        if !matches!(
+            endpoint,
+            Endpoint::File(_) | Endpoint::Pipe(_) | Endpoint::Standard(_)
+        ) {
             Self::validate_handle(projection)?;
         }
         let required = self
@@ -403,18 +413,10 @@ impl TransferSet {
             return Err(Failure::invalid_input());
         }
         let handle = origin.handle()?;
-        let endpoint = match origin {
-            crate::native_handle::PhysicalOrigin::File { file, .. } => Endpoint::File(file),
-            crate::native_handle::PhysicalOrigin::Standard(stream) => Endpoint::Standard(stream),
-        };
+        let endpoint = Endpoint::from_origin(origin)?;
         // Cache endpoint support once at configuration. It is not an admission
         // requirement and must not add a syscall to every group reuse.
-        let pending_supported = match origin {
-            crate::native_handle::PhysicalOrigin::File { .. } => {
-                crate::native_handle::is_regular_file(handle)?
-            }
-            crate::native_handle::PhysicalOrigin::Standard(_) => true,
-        };
+        let pending_supported = origin.supports_pending()?;
         let index = self.add_validated(key, handle, endpoint)?;
         (*self.registrations.raw(index).unwrap()).pending_supported = pending_supported;
         Ok(index)
@@ -495,7 +497,7 @@ impl TransferSet {
         if !record.pending_supported {
             return Err(Failure::unsupported());
         }
-        if let Endpoint::File(file) = record.endpoint {
+        if let Endpoint::File(file) | Endpoint::Pipe(file) = record.endpoint {
             if unsafe { (*file).native_handle() } != record.handle {
                 return Err(Failure::invalid_input());
             }
@@ -870,12 +872,9 @@ impl Dispatcher<'_> {
             })
             .map_err(AdapterTerminal::PlatformFailure)?;
         let mut snapshot = route.snapshot();
-        if !matches!(
-            snapshot.origin,
-            crate::native_handle::PhysicalOrigin::Standard(_)
-        ) && !snapshot
+        if !snapshot
             .origin
-            .is_regular()
+            .supports_pending()
             .map_err(AdapterTerminal::PlatformFailure)?
         {
             return Err(AdapterTerminal::PlatformFailure(Failure::unsupported()));
@@ -1059,13 +1058,17 @@ impl Dispatcher<'_> {
                 return self.submit_helper(request);
             }
         }
+        // Devices and pipes report EOF and no-progress as typed outcomes, so
+        // the retired attempt keeps its exact result for completion.
+        let typed =
+            self.device_loan(request).is_some() || matches!(request.endpoint, Endpoint::Pipe(_));
         let result = if request.reading {
             let result = if let Some(device) = self.device_loan(request) {
                 device.read_attempt(request.handle, request.data, request.length)
             } else {
                 byte_io::read_attempt(request.handle, request.data, request.length)
             };
-            if self.device_loan(request).is_some() {
+            if typed {
                 request.file_terminal = Some(FileTerminal::Read(result));
             }
             match result {
@@ -1086,7 +1089,7 @@ impl Dispatcher<'_> {
             } else {
                 byte_io::write_attempt(request.handle, request.data, request.length)
             };
-            if self.device_loan(request).is_some() {
+            if typed {
                 request.file_terminal = Some(FileTerminal::Write(result));
             }
             match result {
@@ -1329,7 +1332,10 @@ unsafe impl crate::transfer_group::pending::PendingNativeDriver for Dispatcher<'
         result: Result<usize, Failure>,
     ) -> (u8, DrIoStatusV1) {
         let request = &*request;
-        if matches!(request.endpoint, Endpoint::File(_) | Endpoint::Standard(_)) {
+        if matches!(
+            request.endpoint,
+            Endpoint::File(_) | Endpoint::Pipe(_) | Endpoint::Standard(_)
+        ) {
             let terminal = request
                 .file_terminal
                 .unwrap_or_else(|| crate::runtime_invariant_panic());
@@ -1360,7 +1366,7 @@ unsafe impl crate::transfer_group::pending::PendingNativeDriver for Dispatcher<'
                     return Err(Failure::invalid_input());
                 }
             }
-            Endpoint::File(file) if endpoint == file.cast_const().cast() => {
+            Endpoint::File(file) | Endpoint::Pipe(file) if endpoint == file.cast_const().cast() => {
                 if unsafe { (*file).native_handle() } != request.handle {
                     return Err(Failure::invalid_input());
                 }

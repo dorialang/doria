@@ -1518,7 +1518,12 @@ has no default.
 `Child` is a runtime-owned value holding the handle, the policy, the cached
 status and the three pipes. The pipe getters are writable loans, like
 `ReadinessSet::getWritableStream`; a `writable borrowed get` property would
-lend them readonly (Decision 0135). `waitUntil` keeps ownership on `TimedOut`.
+lend them readonly (Decision 0135). Each getter lends only its own pipe, so
+loans of different pipes of one child may be live together (Decision 0136's
+sibling-path rule; Stage 36a decision log, "Child pipes in transfer groups"). The parent's end of each
+pipe is nonblocking (Unix) or overlapped (Windows), so it joins a transfer
+group directly; the child's end stays an ordinary blocking inheritable handle.
+A plain `read` or `write` waits in the runtime and never reports `WouldBlock`. `waitUntil` keeps ownership on `TimedOut`.
 `wait` closes the input, drains and discards both outputs concurrently, then
 waits. `collect` does the same but keeps at most `$limit` bytes of each stream
 (`truncated`). Both drain with the platform's readiness wait: `poll` on Unix, a

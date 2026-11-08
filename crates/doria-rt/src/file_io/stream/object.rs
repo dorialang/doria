@@ -201,17 +201,16 @@ pub(crate) unsafe fn pending_source<'a>(
 /// Borrows the typed resource-embedded source, carrying actual native readiness
 /// identity and opening-path origin through opaque adapter forwarding. This is
 /// distinct from raw fixture metadata; no class/owner layout alias is assumed.
-/// No association, allocation, path retention or I/O occurs here.
+/// No association, allocation, path retention or I/O occurs here. A half-closed
+/// child input still forms its source; admission reports it as Closed.
 /// # Safety
-/// File is a live initialized open payload during formation. Ordinary borrowed
+/// File is a live initialized payload during formation. Ordinary borrowed
 /// use remains within its owner loan. Runtime routes explicitly pin metadata;
 /// selected native work additionally pins the resource's native obligation.
 /// The result grants no independent close claim or access to a platform handle.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_file_object_readiness_source(file: *const c_void) -> *const c_void {
-    pending_source(file)
-        .expect("live owned file object")
-        .value()
+    (*(*file.cast::<FileObject>()).resource).source().value()
 }
 
 /// Exact embedded source home, with the same pure formation and receiver loan
@@ -224,7 +223,7 @@ pub unsafe extern "C" fn dr_v1_file_object_readiness_source(file: *const c_void)
 pub unsafe extern "C" fn dr_v1_file_object_readiness_source_home(
     file: *const c_void,
 ) -> *const c_void {
-    pending_source(file).expect("live owned file object").home()
+    (*(*file.cast::<FileObject>()).resource).source().home()
 }
 
 /// Borrows a live owner and writable caller region; returns raw read statuses.
