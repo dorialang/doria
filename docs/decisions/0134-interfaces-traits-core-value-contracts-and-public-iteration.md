@@ -178,6 +178,33 @@ requirement's parameter names, which is why parameter-name identity is exact.
 `open` and `override` remain class-hierarchy declarations rather than interface
 requirements.
 
+### Region-Returning Requirements
+
+Doria has no lifetime annotations, so a requirement cannot spell the borrow its
+result keeps. A bodyless requirement with a receiver whose return type is
+`ByteRegion`, `WritableByteRegion`, or a nullable region therefore elides to a
+retained borrow of that receiver. This is Decision 0089's single-source rule
+applied where there are no return statements to read: `$this` is the one source
+every implementation can share. It covers interface methods and accessors and
+bodyless trait methods, and it decides from the substituted return type, so
+`T` in `Producing<ByteRegion>` is a region and `T` in `Producing<int>` is not.
+
+- An implementation may return a region its receiver holds or one independent
+  of the receiver, such as absence or storage the receiver only borrows. Both
+  preserve at least the required provenance. A region from a parameter does not
+  conform.
+- Callers always hold the receiver borrowed. The result cannot outlive the
+  receiver, whichever implementation runs, even when every implementation
+  returns an independent region. Calls through an interface view, a witness, or
+  a constrained generic parameter all carry this borrow.
+- A static requirement has no receiver and a consuming receiver dies with the
+  call, so neither elides a source.
+- A readonly requirement holds a shared borrow even for a writable region. A
+  readonly receiver cannot lend exclusive access, so no implementation can
+  return a writable region held by that receiver.
+- A generic method's own `T` comes from its arguments, not from the contract,
+  so its result keeps the argument's borrow.
+
 ## Interface Values And Ownership
 
 An owned interface value is a Move value. Its runtime carrier is exactly:

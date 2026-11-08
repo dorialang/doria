@@ -1994,7 +1994,12 @@ interface requirements. Stored properties are not user-interface requirements.
 Decision 0135 extends the requirement graph with bodyless getter and setter
 contracts, preserving each accessor's receiver mode, result ownership, exact
 setter input type, and checked Errors. `Error` retains its narrow compiler-known
-readonly stored `string $message` exception.
+readonly stored `string $message` exception. A bodyless interface method or
+accessor, or bodyless trait method, whose substituted return type is a region
+or nullable region elides to a retained borrow of its readonly or writable
+receiver (Decision 0134). An implementation may return a region its receiver
+holds or one independent of it, and a region from a parameter does not conform;
+callers keep the receiver borrowed for as long as the result lives.
 
 Classes conform only through authored or inherited `implements`. Interface
 values are `(data pointer, interface vtable pointer)` carriers over the original

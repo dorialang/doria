@@ -59,6 +59,13 @@ pub struct ReturnedMember {
 }
 
 impl ReturnedStorage {
+    pub(super) fn retain_whole_receivers(&mut self) {
+        retained::whole_receiver_sources(&mut self.direct);
+        for member in &mut self.members {
+            retained::whole_receiver_sources(&mut member.sources);
+        }
+    }
+
     pub(super) fn merge(&mut self, incoming: Self) {
         for selection in incoming.selections {
             if !self.selections.contains(&selection) {

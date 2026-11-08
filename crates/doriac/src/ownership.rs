@@ -2493,6 +2493,44 @@ pub(crate) fn closure_borrow_function(
     }
 }
 
+/// A region result is an owned descriptor that retains its source, so whatever
+/// loan the return analysis found becomes a retained one, with the access the
+/// region grants.
+pub(crate) fn region_return_borrow(
+    region: Option<crate::types::ByteRegionKind>,
+    borrow: ReturnBorrow,
+) -> ReturnBorrow {
+    region.map_or(borrow, |kind| ReturnBorrow {
+        source: borrow.source,
+        kind: ReturnBorrowKind::Retained,
+        writable: kind.is_writable(),
+        lifetime: borrow.lifetime,
+    })
+}
+
+/// The contract of a bodyless requirement that returns a region (Decision 0134).
+///
+/// A requirement has no return statements for the single-source rule to read.
+/// `$this` is the one source every implementation can honor, so the rule
+/// starts from it and then proceeds as it does for a body. A static requirement
+/// has no receiver, and a consuming receiver dies with the call, so neither has
+/// a source to lend. The retained access cannot exceed what the receiver grants.
+pub(crate) fn requirement_return_borrow(
+    region: Option<crate::types::ByteRegionKind>,
+    receiver: Option<crate::symbols::ReceiverMode>,
+) -> Option<ReturnBorrow> {
+    let region = region?;
+    let receiver = receiver.filter(|mode| !mode.is_consuming())?;
+    let borrow = region_return_borrow(
+        Some(region),
+        BorrowOrigins::receiver(receiver.is_writable()).contract()?,
+    );
+    Some(ReturnBorrow {
+        writable: borrow.writable && receiver.is_writable(),
+        ..borrow
+    })
+}
+
 /// After body checking, infer through the canonical binding identities and
 /// control-flow graph. The earlier signature pass has neither local binding
 /// facts nor checked call targets and remains deliberately conservative.
@@ -2529,6 +2567,17 @@ struct BorrowOrigins {
 }
 
 impl BorrowOrigins {
+    /// `$this` as a return source, before anything has been forwarded from it.
+    fn receiver(writable: bool) -> Self {
+        Self {
+            sources: vec![BorrowOrigin::Receiver],
+            kind: ReturnBorrowKind::Value,
+            lifetime: RetainedLifetime::LastUse,
+            writable,
+            borrowed: true,
+        }
+    }
+
     fn contract(&self) -> Option<ReturnBorrow> {
         if !self.borrowed {
             return None;
@@ -2702,13 +2751,9 @@ impl ReturnBorrowAliases<'_> {
         match ungroup_expr(expr) {
             Expr::Null { .. } => ReturnBorrowAlias::Null,
             Expr::This { .. } if !self.function.is_static && !self.function.consuming_this => {
-                ReturnBorrowAlias::Places(BorrowOrigins {
-                    sources: vec![BorrowOrigin::Receiver],
-                    kind: ReturnBorrowKind::Value,
-                    lifetime: RetainedLifetime::LastUse,
-                    writable: self.function.has_writable_receiver(),
-                    borrowed: true,
-                })
+                ReturnBorrowAlias::Places(BorrowOrigins::receiver(
+                    self.function.has_writable_receiver(),
+                ))
             }
             Expr::Variable { span, .. } => self
                 .bindings

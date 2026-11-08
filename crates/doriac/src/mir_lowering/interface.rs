@@ -901,16 +901,30 @@ fn build_entry(
         .collect::<Vec<_>>();
     let params = locals.iter().map(|local| local.id).collect::<Vec<_>>();
     let mut statements = Vec::new();
-    if let Some(plan) = implementation.retained_sources_plan() {
-        let remap = |local| {
-            params[implementation
-                .params
-                .iter()
-                .position(|parameter| *parameter == local)
-                .expect("retained input parameter")]
-        };
+    let remap = |local| {
+        params[implementation
+            .params
+            .iter()
+            .position(|parameter| *parameter == local)
+            .expect("retained input parameter")]
+    };
+    let mut plan = implementation
+        .retained_sources_plan()
+        .map(|plan| plan.forwarded(remap))
+        .unwrap_or_default();
+    plan.state_region_contract(
+        contract.return_type,
+        contract.return_borrow,
+        |source| match source {
+            mir::BorrowSource::Parameter(index) => params[index],
+            mir::BorrowSource::Receiver => {
+                unreachable!("structural interface contracts name parameters")
+            }
+        },
+    );
+    if plan != mir::RetainedSourcesPlan::default() {
         statements.push(mir::Statement::ControlFlowPlan(
-            mir::ControlFlowPlan::RetainedSources(plan.forwarded(remap)),
+            mir::ControlFlowPlan::RetainedSources(plan),
         ));
     }
     let receiver = if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) =

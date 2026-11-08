@@ -350,6 +350,19 @@ pub(super) fn nullable_expression(
         }
         _ => {
             let (signature, args) = call(expr, context)?;
+            // A constrained call can select an implementation that narrows the
+            // requirement's nullable region to a present one.
+            if signature.return_type == mir::ReturnType::Value(mir::Type::ByteRegion(kind)) {
+                return Ok(mir::NullableByteRegionExpression::Present(
+                    mir::ByteRegionExpression::Call {
+                        span: expr.span(),
+                        kind,
+                        function: signature.id,
+                        args,
+                        return_borrow: signature.return_borrow,
+                    },
+                ));
+            }
             Ok(mir::NullableByteRegionExpression::Call {
                 span: expr.span(),
                 kind,

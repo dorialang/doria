@@ -188,6 +188,38 @@ impl Checker<'_> {
         ))
     }
 
+    /// A requirement returning `T` promises a region loan only in the
+    /// instances where `T` is a region, so an instance reads that contract from
+    /// the call's substituted type.
+    fn requirement_return_for_instance(
+        &self,
+        call: &Expr,
+        substitute: impl Fn(&ResolvedType) -> ResolvedType,
+    ) -> Option<ReturnBorrow> {
+        let target = self
+            .property_accessor_calls
+            .get(&call.span())
+            .and_then(|calls| calls.getter.as_ref())
+            .map(|getter| &getter.target)
+            .or_else(|| self.call_targets.get(&call.span()))?;
+        let (CallableTarget::InterfaceMethod { requirement, .. }
+        | CallableTarget::ConstrainedMethod { requirement, .. }) = target
+        else {
+            return None;
+        };
+        // A generic method's own `T` comes from its arguments, not the contract.
+        let signature = self.function_signatures.get(requirement)?;
+        if !signature.type_params.is_empty() && self.type_is_symbolic(signature.return_ty) {
+            return None;
+        }
+        let receiver = self.interface_requirement_receiver(*requirement)?;
+        let result = substitute(self.expression_types.get(&call.span())?);
+        crate::ownership::requirement_return_borrow(
+            crate::types::ByteRegionKind::from_resolved(&result),
+            Some(receiver),
+        )
+    }
+
     pub(super) fn infer_specialized_return_borrows(&mut self) -> Facts {
         let program = self.program;
         let backing_fields = self.property_backing_fields();
@@ -353,6 +385,13 @@ impl Checker<'_> {
                             body.substitute(ty)
                         }) {
                             calls.insert(expression.span(), ReturnBorrowLookup::OwnedValue);
+                        } else if let Some(borrow) = self
+                            .requirement_return_for_instance(expression, |ty| body.substitute(ty))
+                        {
+                            calls.insert(
+                                expression.span(),
+                                ReturnBorrowLookup::Resolved(Some(borrow)),
+                            );
                         } else if let Some((instance, callee)) =
                             self.return_call_instance(expression, |ty| body.substitute(ty))
                         {

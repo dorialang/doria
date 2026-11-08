@@ -6323,6 +6323,36 @@ pub struct RetainedSourcesPlan {
 }
 
 impl RetainedSourcesPlan {
+    /// A region return signature promises its retained source to every caller,
+    /// so the plan states that source even when this callable's body does not
+    /// need it: an interface entry that selects an implementation returning an
+    /// independent region, or a generic instance with such an implementation.
+    pub(crate) fn state_region_contract(
+        &mut self,
+        return_type: ReturnType,
+        contract: Option<ReturnBorrow>,
+        source: impl Fn(BorrowSource) -> LocalId,
+    ) {
+        let ReturnType::Value(Type::ByteRegion(_) | Type::NullableByteRegion(_)) = return_type
+        else {
+            return;
+        };
+        let Some(borrow) = contract.filter(|borrow| borrow.kind == ReturnBorrowKind::Retained)
+        else {
+            return;
+        };
+        let local = source(borrow.source);
+        if !self.returns.iter().any(|source| source.local == local) {
+            self.returns.push(RetainedSource {
+                local,
+                inherited: false,
+                writable: borrow.writable,
+                lifetime: borrow.lifetime,
+                owned_path: Vec::new(),
+            });
+        }
+    }
+
     /// The plan of an entry that passes its parameters to this plan's
     /// callable and returns that callable's result: an interface entry or a
     /// virtual return adapter. The entry returns, stores and removes exactly

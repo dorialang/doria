@@ -1238,3 +1238,53 @@ fn consuming_receiver_cannot_be_forged_as_any_retained_return_source() {
         }
     }
 }
+
+/// Decision 0134: a caller through a region requirement holds the receiver
+/// loan whichever implementation runs, so an interface entry and a generic
+/// instance must state it even when their implementation returns no region.
+#[test]
+fn region_requirement_plans_state_the_contract_for_independent_implementations() {
+    let program = doriac::lower_source_to_mir(
+        "region-requirement-plans.doria",
+        r#"
+use Doria\Std\Io\ByteRegion;
+interface Viewing { function view(): ?ByteRegion; }
+class Absent implements Viewing { function view(): ?ByteRegion { return null; } }
+function erased(Viewing $viewing): ?ByteRegion { return $viewing->view(); }
+function constrained<T implements Viewing>(T $value): ?ByteRegion { return $value->view(); }
+function main(): void {
+    let $absent = new Absent();
+    echo erased($absent) == null;
+    echo constrained($absent) == null;
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    for is_target in [
+        |name: &str| name.contains("<interface-entry#"),
+        |name: &str| name.contains("constrained"),
+    ] {
+        let mut missing = program.clone();
+        let function = missing
+            .functions
+            .iter_mut()
+            .find(|function| is_target(&function.name))
+            .expect("program should contain this function");
+        for statement in &mut function.blocks[0].statements {
+            if let Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) =
+                statement
+            {
+                plan.returns.clear();
+            }
+        }
+        let error = doriac::mir_validation::validate_program(&missing)
+            .expect_err("a plan without its region contract must be rejected");
+        assert!(
+            error
+                .message
+                .contains("byte region return signature loses its retained source plan"),
+            "{error:?}"
+        );
+    }
+}

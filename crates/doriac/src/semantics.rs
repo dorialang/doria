@@ -6962,8 +6962,8 @@ impl<'program> Checker<'program> {
                     &mut |_| crate::ownership::ReturnBorrowLookup::Unresolved,
                 )
             })
-            .flatten()
-            .map(|borrow| Self::region_return_borrow(region, borrow));
+            .flatten();
+        let return_borrow = Self::declared_return_borrow(function, region, return_borrow);
 
         FunctionInfo {
             declaration: function.span,
@@ -7295,16 +7295,20 @@ impl<'program> Checker<'program> {
             || crate::types::ByteRegionKind::from_resolved(&self.types.resolved(ty)).is_some()
     }
 
-    fn region_return_borrow(
+    /// What a declaration promises about its returned loan: the loan its body
+    /// returns or, for a bodyless requirement, the one that requirement elides.
+    fn declared_return_borrow(
+        function: &FunctionDecl,
         region: Option<crate::types::ByteRegionKind>,
-        borrow: ReturnBorrow,
-    ) -> ReturnBorrow {
-        region.map_or(borrow, |kind| ReturnBorrow {
-            source: borrow.source,
-            kind: ReturnBorrowKind::Retained,
-            writable: kind.is_writable(),
-            lifetime: borrow.lifetime,
-        })
+        inferred: Option<ReturnBorrow>,
+    ) -> Option<ReturnBorrow> {
+        if matches!(function.body, FunctionBody::Requirement { .. }) {
+            return crate::ownership::requirement_return_borrow(
+                region,
+                (!function.is_static).then(|| ReceiverMode::from_declaration(function)),
+            );
+        }
+        inferred.map(|borrow| crate::ownership::region_return_borrow(region, borrow))
     }
 
     fn infer_return_borrow_signatures(&mut self, checked_bodies: bool) {
@@ -7468,7 +7472,7 @@ impl<'program> Checker<'program> {
                     }
                     _ => inferred,
                 };
-                let inferred = inferred.map(|borrow| Self::region_return_borrow(region, borrow));
+                let inferred = Self::declared_return_borrow(function, region, inferred);
                 self.type_parameter_scopes.truncate(type_scope_depth);
                 self.nominal_condition_scopes
                     .truncate(condition_scope_depth);
@@ -7640,7 +7644,7 @@ impl<'program> Checker<'program> {
         return_ty: TypeId,
     ) -> Option<ReturnBorrow> {
         let region = crate::types::ByteRegionKind::from_resolved(&self.types.resolved(return_ty));
-        let mut borrow = Self::region_return_borrow(region, borrow?);
+        let mut borrow = crate::ownership::region_return_borrow(region, borrow?);
         if borrow.kind == ReturnBorrowKind::Value {
             if let BorrowSource::Parameter(index) = borrow.source {
                 if !self.type_is_move_type(parameters.get(index)?.ty) {

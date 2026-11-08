@@ -846,15 +846,22 @@ impl Checker<'_> {
                 } else {
                     None
                 };
-                signature.return_borrow = kind.map(|kind| ReturnBorrow {
-                    source: BorrowSource::Receiver,
-                    writable: false,
-                    kind,
-                    lifetime: match kind {
-                        ReturnBorrowKind::Value => RetainedLifetime::LastUse,
-                        ReturnBorrowKind::Retained => RetainedLifetime::Cleanup,
-                    },
-                });
+                // A region getter keeps the contract its requirement elided.
+                if crate::types::ByteRegionKind::from_resolved(
+                    &self.types.resolved(signature.return_ty),
+                )
+                .is_none()
+                {
+                    signature.return_borrow = kind.map(|kind| ReturnBorrow {
+                        source: BorrowSource::Receiver,
+                        writable: false,
+                        kind,
+                        lifetime: match kind {
+                            ReturnBorrowKind::Value => RetainedLifetime::LastUse,
+                            ReturnBorrowKind::Retained => RetainedLifetime::Cleanup,
+                        },
+                    });
+                }
             }
             self.function_signatures.insert(callable.span, signature);
         }

@@ -3970,6 +3970,7 @@ fn lower_function(
         source_parameter,
         promotions,
         signature.return_type,
+        signature.return_borrow,
         &[],
     );
     let membership_plan = match crate::compiler_known_stream::readiness_function(function.span) {
@@ -4117,11 +4118,9 @@ fn insert_retained_sources_plan(
     source_parameter: impl Fn(crate::symbols::BorrowSource) -> mir::LocalId,
     promotions: Vec<(PropertyId, mir::LocalId)>,
     return_type: mir::ReturnType,
+    contract: Option<mir::ReturnBorrow>,
     captures: &[(crate::symbols::BindingId, mir::LocalId)],
 ) {
-    if retained.is_none() && promotions.is_empty() {
-        return;
-    }
     let sources = |sources: &[crate::ownership::RetainedSource]| {
         sources
             .iter()
@@ -4187,7 +4186,7 @@ fn insert_retained_sources_plan(
             })
             .collect()
     };
-    let plan = mir::RetainedSourcesPlan {
+    let mut plan = mir::RetainedSourcesPlan {
         returns: retained
             .map(|info| sources(&info.returns))
             .unwrap_or_default(),
@@ -4259,6 +4258,12 @@ fn insert_retained_sources_plan(
             .map(selector)
             .collect(),
     };
+    plan.state_region_contract(return_type, contract, |source| {
+        source_parameter(match source {
+            mir::BorrowSource::Receiver => crate::symbols::BorrowSource::Receiver,
+            mir::BorrowSource::Parameter(index) => crate::symbols::BorrowSource::Parameter(index),
+        })
+    });
     if plan != mir::RetainedSourcesPlan::default() {
         blocks[0].statements.insert(
             0,
@@ -4431,6 +4436,7 @@ fn lower_closure_function(
         },
         Vec::new(),
         definition.return_type,
+        definition.return_borrow,
         &selector_captures,
     );
     Ok(mir::Function {

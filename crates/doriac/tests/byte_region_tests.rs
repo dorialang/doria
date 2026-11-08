@@ -972,3 +972,255 @@ function main(): void {
         "E0521",
     );
 }
+
+const REGION_REQUIREMENT_DECLARATIONS: &str = r#"
+interface Viewing { function view(): ?ByteRegion; }
+interface Exact { ByteRegion $whole { get; } }
+interface Editing {
+    writable function edit(): WritableByteRegion;
+    writable function touch(): void;
+}
+class Held implements Viewing, Exact, Editing {
+    Bytes $bytes = Bytes::allocate(2);
+    writable Bytes $edits = Bytes::allocate(2);
+    function view(): ?ByteRegion { return $this->bytes->getRegion(0, 1); }
+    ByteRegion $whole { get => $this->bytes->getRegion(0, 2); }
+    writable function edit(): WritableByteRegion { return $this->edits->getWritableRegion(0, 1); }
+    writable function touch(): void {}
+}
+class Absent implements Viewing { function view(): ?ByteRegion { return null; } }
+trait Exposing {
+    function exposed(): ?ByteRegion;
+    function through(): ?ByteRegion { return $this->exposed(); }
+}
+class Composed {
+    uses Exposing;
+    Bytes $bytes = Bytes::allocate(2);
+    function exposed(): ?ByteRegion { return $this->bytes->getRegion(0, 1); }
+}
+function make(): Viewing { return new Absent(); }
+function consume(take Viewing $viewing): void {}
+function report(?ByteRegion $view): void {}
+"#;
+
+fn requirement_program(body: &str) -> String {
+    format!("{REGION_REQUIREMENT_DECLARATIONS}\n{body}")
+}
+
+/// Decision 0134: the region a requirement returns cannot outlive its
+/// receiver, including when every implementation in the program returns an
+/// independent region.
+#[test]
+fn region_requirement_results_cannot_outlive_the_receiver() {
+    for body in [
+        "function bad(): ?ByteRegion { Viewing $viewing = new Held(); return $viewing->view(); }",
+        "function bad(): ?ByteRegion { Viewing $viewing = new Absent(); return $viewing->view(); }",
+        "function bad(take Viewing $viewing): ?ByteRegion { return $viewing->view(); }",
+        "function bad<T implements Viewing>(take T $value): ?ByteRegion { return $value->view(); }",
+        "function bad(): ByteRegion { Exact $exact = new Held(); return $exact->whole; }",
+        "function bad(): ?ByteRegion { let $composed = new Composed(); return $composed->through(); }",
+        "function main(): void { let $view = make()->view(); report($view); }",
+        r#"trait Leaky {
+            function view(): ?ByteRegion;
+            consuming function leak(): ?ByteRegion { return $this->view(); }
+        }"#,
+        r#"function main(): void {
+            writable ?ByteRegion $view = null;
+            { Viewing $viewing = new Held(); $view = $viewing->view(); }
+            report($view);
+        }"#,
+    ] {
+        rejects(&requirement_program(body), "E0762");
+    }
+}
+
+#[test]
+fn region_requirement_results_keep_their_receiver_borrowed() {
+    for (body, code) in [
+        (
+            r#"function main(): void {
+                Viewing $viewing = new Held();
+                let $view = $viewing->view();
+                consume($viewing);
+                report($view);
+            }"#,
+            "E0763",
+        ),
+        (
+            r#"function main(): void {
+                writable Editing $editing = new Held();
+                let writable $region = $editing->edit();
+                $editing->touch();
+                $region[0] = 1;
+            }"#,
+            "E0763",
+        ),
+        (
+            r#"function conflict<T implements Editing>(writable T $value): void {
+                let writable $region = $value->edit();
+                $value->touch();
+                $region[0] = 1;
+            }"#,
+            "E0763",
+        ),
+    ] {
+        rejects(&requirement_program(body), code);
+    }
+    // Both loans end at their last use.
+    check(&requirement_program(
+        r#"function main(): void {
+            Viewing $viewing = new Held();
+            let $view = $viewing->view();
+            report($view);
+            consume($viewing);
+            writable Editing $editing = new Held();
+            let writable $region = $editing->edit();
+            $region[0] = 1;
+            $editing->touch();
+        }"#,
+    ));
+}
+
+/// Only `$this` can back the contract. A region from a parameter would let the
+/// caller keep it past the argument, so the implementation does not conform.
+#[test]
+fn region_requirements_reject_implementations_that_retain_another_source() {
+    rejects(
+        r#"
+interface Viewing { function view(Bytes $source): ByteRegion; }
+class Param implements Viewing {
+    function view(Bytes $source): ByteRegion { return $source->getRegion(0, 1); }
+}
+"#,
+        "E0755",
+    );
+    rejects(
+        r#"
+trait Viewing { function view(Bytes $source): ByteRegion; }
+class Param {
+    uses Viewing;
+    function view(Bytes $source): ByteRegion { return $source->getRegion(0, 1); }
+}
+"#,
+        "E0757",
+    );
+    // A static requirement has no receiver to elide to.
+    rejects(
+        r#"
+trait Viewing { static function view(Bytes $source): ByteRegion; }
+class Param {
+    uses Viewing;
+    static function view(Bytes $source): ByteRegion { return $source->getRegion(0, 1); }
+}
+"#,
+        "E0757",
+    );
+    // A consuming receiver dies with the call, so it elides to no source.
+    rejects(
+        r#"
+interface Viewing { consuming function view(): ?ByteRegion; }
+class Held implements Viewing {
+    Bytes $bytes = Bytes::allocate(1);
+    consuming function view(): ?ByteRegion { return $this->bytes->getRegion(0, 1); }
+}
+"#,
+        "E0762",
+    );
+    check(
+        r#"
+interface Viewing { consuming function view(): ?ByteRegion; }
+class Absent implements Viewing { consuming function view(): ?ByteRegion { return null; } }
+function main(): void {
+    Viewing $viewing = new Absent();
+    let $view = $viewing->view();
+    if ($view == null) { echo "none"; }
+}
+"#,
+    );
+}
+
+/// A readonly receiver cannot lend exclusive access, so a writable region
+/// requirement on one holds a shared loan. No implementation can return a
+/// region it holds, but one that returns none still conforms and runs.
+#[test]
+fn readonly_requirements_returning_writable_regions_hold_a_shared_loan() {
+    let source = format!(
+        "{IMPORTS}\n{}",
+        r#"
+interface Editing { function edit(): ?WritableByteRegion; }
+class Absent implements Editing { function edit(): ?WritableByteRegion { return null; } }
+function look(Editing $editing): void {
+    let $first = $editing->edit();
+    let $second = $editing->edit();
+    if ($first == null && $second == null) { echo "none\n"; }
+}
+function main(): void { look(new Absent()); }
+"#
+    );
+    let program = doriac::lower_source_to_mir("byte-region.doria", &source)
+        .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "none\n");
+    rejects(
+        r#"
+interface Editing { function edit(): WritableByteRegion; }
+class Held implements Editing {
+    writable Bytes $bytes = Bytes::allocate(1);
+    function edit(): WritableByteRegion { return $this->bytes->getWritableRegion(0, 1); }
+}
+"#,
+        "E0201",
+    );
+}
+
+/// A generic requirement decides its contract per specialization, and a
+/// generic method's own `T` keeps the argument's loan, not the receiver's.
+#[test]
+fn generic_requirement_contracts_follow_each_specialization() {
+    let program = r#"
+interface Producing<T> { function make(): T; }
+class ByteProducer implements Producing<ByteRegion> {
+    Bytes $bytes = Bytes::allocate(1);
+    function make(): ByteRegion { return $this->bytes->getRegion(0, 1); }
+}
+class IntProducer implements Producing<int> {
+    function make(): int { return 1; }
+}
+function consume(take Producing<int> $producer): void {}
+"#;
+    check(&format!(
+        r#"{program}
+function main(): void {{
+    Producing<int> $producer = new IntProducer();
+    let $value = $producer->make();
+    consume($producer);
+    echo $value;
+}}
+"#
+    ));
+    rejects(
+        &format!(
+            r#"{program}
+function bad(): ByteRegion {{
+    Producing<ByteRegion> $producer = new ByteProducer();
+    return $producer->make();
+}}
+"#
+        ),
+        "E0762",
+    );
+    rejects(
+        r#"
+interface Relay { function own<T>(take T $view): T; }
+class Echo implements Relay { function own<T>(take T $view): T { return $view; } }
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(1);
+    Relay $erased = new Echo();
+    let writable $view = $erased->own($bytes->getWritableRegion(0, 1));
+    echo $bytes[0];
+    $view[0] = 71;
+}
+"#,
+        "E0763",
+    );
+}

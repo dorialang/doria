@@ -161,6 +161,11 @@ pub(super) struct Analysis {
     requirements: HashMap<Span, Signature>,
     pub(super) implementations: HashMap<Span, Vec<Span>>,
     pub(super) analyzed_callables: HashSet<Span>,
+    /// Bodyless trait members. An interface requirement is in `requirements`.
+    trait_requirements: HashSet<Span>,
+    /// Requirements returning one of their own generic parameters. That result
+    /// comes from the call's arguments, so a region there is not the contract's.
+    argument_typed_requirements: HashSet<Span>,
     recursive_calls: HashSet<(Span, Span)>,
     live_bindings: HashMap<Span, HashMap<Span, HashSet<BindingId>>>,
     ancestors: HashMap<String, Vec<String>>,
@@ -366,7 +371,14 @@ impl Analysis {
                         ) && requirement
                             .return_borrow
                             .is_none_or(|borrow| borrow.kind == ReturnBorrowKind::Retained),
-                        return_borrow: requirement.return_borrow,
+                        // A region contract follows the type of each call:
+                        // see `specialize_requirement_return`.
+                        return_borrow: requirement.return_borrow.filter(|_| {
+                            crate::types::ByteRegionKind::from_resolved(
+                                &requirement.signature.return_type,
+                            )
+                            .is_none()
+                        }),
                         receiver: Some(if requirement.receiver_mode.is_consuming() {
                             UseMode::Give
                         } else if requirement.receiver_mode.is_writable() {
@@ -380,6 +392,15 @@ impl Analysis {
                         .requirements
                         .entry(origin.declaration)
                         .or_insert(signature);
+                    if requirement.signature.generic_parameter_count > 0
+                        && crate::types::resolved_type_is_symbolic(
+                            &requirement.signature.return_type,
+                        )
+                    {
+                        analysis
+                            .argument_typed_requirements
+                            .insert(origin.declaration);
+                    }
                     if requirement.name == "iterator"
                         && requirement.origins.iter().any(|origin| {
                             origin.declaration.source == crate::compiler_known_contracts::SOURCE_ID
@@ -689,6 +710,9 @@ impl Checker<'_> {
         let callables = program_callables(program);
         for (function, _) in &callables {
             self.seed_pending_file_selection(function);
+            if matches!(function.body, ast::FunctionBody::Requirement { .. }) {
+                self.retained.trait_requirements.insert(function.span);
+            }
             if let ast::FunctionBody::Intrinsic { implementation, .. } = function.body {
                 append_sources(
                     &mut self
@@ -837,17 +861,25 @@ impl Checker<'_> {
                     summary
                         .exceptional_removals
                         .retain(|selection| candidate.exceptional_removals.contains(selection));
-                    let storage = candidate.returned_storage.unwrap_or_else(|| {
+                    let mut storage = candidate.returned_storage.unwrap_or_else(|| {
                         owned_storage::ReturnedStorage {
                             direct: candidate.returns.clone(),
                             ..Default::default()
                         }
                     });
+                    let mut returns = candidate.returns;
+                    // An interface receiver is opaque, and a requirement's
+                    // implementations can include classes this receiver is
+                    // not, so a path into one of them names nothing here.
+                    if self.retained.requirements.contains_key(requirement) {
+                        whole_receiver_sources(&mut returns);
+                        storage.retain_whole_receivers();
+                    }
                     summary
                         .returned_storage
                         .get_or_insert_with(Default::default)
                         .merge(storage);
-                    append_sources(&mut summary.returns, candidate.returns);
+                    append_sources(&mut summary.returns, returns);
                     owned_storage::append_stores(
                         &mut summary.stored_sources,
                         candidate.stored_sources,
@@ -1032,6 +1064,7 @@ impl Checker<'_> {
             Expr::PropertyAccess { object, .. } => {
                 let mut signature = self.getter_signature(expr)?;
                 self.specialize_carrier_return(expr, &mut signature);
+                self.specialize_requirement_return(expr, &mut signature);
                 return Some((signature, Some(object), &[]));
             }
             Expr::New {
@@ -1141,7 +1174,76 @@ impl Checker<'_> {
         let mut signature = signature.clone();
         self.specialize_carrier_return(expr, &mut signature);
         self.specialize_copy_parameter_return(expr, args, &mut signature);
+        self.specialize_requirement_return(expr, &mut signature);
         Some((signature, receiver, args))
+    }
+
+    /// Whether this call reaches a bodyless requirement whose contract decides
+    /// its result. An interface requirement never has a body; a trait member may.
+    fn calls_requirement(&self, expr: &Expr) -> bool {
+        let target = self.call_targets.get(&expr.span()).or_else(|| {
+            self.property_accessor_calls
+                .get(&ungroup_expr(expr).span())
+                .and_then(|calls| calls.getter.as_ref())
+                .map(|getter| &getter.target)
+        });
+        let Some(
+            crate::semantics::CallableTarget::InterfaceMethod { requirement, .. }
+            | crate::semantics::CallableTarget::ConstrainedMethod { requirement, .. },
+        ) = target
+        else {
+            return false;
+        };
+        (self.retained.requirements.contains_key(requirement)
+            || self.retained.trait_requirements.contains(requirement))
+            && !self
+                .retained
+                .argument_typed_requirements
+                .contains(requirement)
+    }
+
+    /// A call through a requirement carries the loan that requirement elides
+    /// (Decision 0134). The call's own type decides it, because a generic
+    /// requirement returns a region only where its `T` is one.
+    fn specialize_requirement_return(&self, expr: &Expr, signature: &mut Signature) {
+        if !self.calls_requirement(expr) {
+            return;
+        }
+        let region = self
+            .resolved_type(expr)
+            .and_then(crate::types::ByteRegionKind::from_resolved);
+        if region.is_some() {
+            signature.return_borrow = super::requirement_return_borrow(
+                region,
+                signature.receiver.map(|mode| match mode {
+                    UseMode::Read => crate::symbols::ReceiverMode::Readonly,
+                    UseMode::Write => crate::symbols::ReceiverMode::Writable,
+                    UseMode::Give => crate::symbols::ReceiverMode::Consuming,
+                }),
+            );
+        }
+    }
+
+    /// The source a call through a region-returning requirement retains: the
+    /// whole receiver, whichever implementation the call selects.
+    fn requirement_region_source(
+        &self,
+        expr: &Expr,
+        signature: &Signature,
+    ) -> Option<RetainedSource> {
+        if !self.calls_requirement(expr) {
+            return None;
+        }
+        self.resolved_type(expr)
+            .and_then(crate::types::ByteRegionKind::from_resolved)?;
+        let borrow = signature.return_borrow?;
+        Some(RetainedSource {
+            source: borrow.source,
+            inherited: false,
+            writable: borrow.writable,
+            lifetime: borrow.lifetime,
+            owned_path: Vec::new(),
+        })
     }
 
     fn specialize_carrier_return(&self, expr: &Expr, signature: &mut Signature) {
@@ -1453,6 +1555,22 @@ impl Checker<'_> {
             }
         }
         let (signature, receiver, args) = self.retained_call(expr, scopes)?;
+        // One join covers every specialization of a generic requirement. A
+        // call whose own result cannot carry a loan keeps none of them.
+        if self.calls_requirement(expr)
+            && self.resolved_type(expr).is_some_and(|ty| {
+                !self.retained.carries_source(ty) && !crate::types::resolved_type_is_symbolic(ty)
+            })
+        {
+            return None;
+        }
+        // The contract is all a caller can rely on. Paths from the dispatch join
+        // would name properties of implementers this receiver may not be.
+        if let Some(declared) = self.requirement_region_source(expr, &signature) {
+            return self
+                .retained_call_loans(&[declared], expr.span(), receiver, args, &signature, scopes)
+                .map(iterator_value);
+        }
         if !matches!(ungroup_expr(expr), Expr::New { .. }) {
             let info = signature
                 .declaration
@@ -2065,6 +2183,14 @@ pub(super) fn append_loans(destination: &mut Vec<RetainedLoan>, incoming: &[Reta
             found.lifetime = found.lifetime.join(loan.lifetime);
         } else {
             destination.push(loan.clone());
+        }
+    }
+}
+
+pub(super) fn whole_receiver_sources(sources: &mut [RetainedSource]) {
+    for source in sources {
+        if source.source == BorrowSource::Receiver {
+            source.owned_path.clear();
         }
     }
 }

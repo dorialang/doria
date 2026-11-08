@@ -464,6 +464,16 @@ impl Checker<'_> {
         Some(requirement)
     }
 
+    /// The receiver mode an interface requirement declares.
+    pub(super) fn interface_requirement_receiver(&self, requirement: Span) -> Option<ReceiverMode> {
+        self.interface_definitions
+            .values()
+            .flat_map(|definition| &definition.local_requirements)
+            .find(|(_, _, method)| method.declaration == requirement)?
+            .2
+            .receiver_mode
+    }
+
     fn resolve_interface_self_result(
         &mut self,
         method: &mut MethodInfo,
@@ -1473,7 +1483,7 @@ impl Checker<'_> {
                         virtual_root: None,
                         access: MemberAccess::External,
                         receiver_mode: Some(ReceiverMode::from_declaration(requirement)),
-                        return_borrow: None,
+                        return_borrow: signature.return_borrow,
                         is_static: false,
                         enclosing_type_bindings: HashMap::new(),
                         type_params: signature.type_params,
@@ -1709,7 +1719,7 @@ impl Checker<'_> {
                 name: name.clone(),
                 accessor: *accessor,
                 origins: vec![(interface.clone(), method.declaration)],
-                method: self.substitute_contract_method(method, &substitutions),
+                method: self.substitute_requirement_method(method, &substitutions),
             })
             .collect::<Vec<_>>();
         let mut member_kinds = HashMap::new();
@@ -1800,6 +1810,23 @@ impl Checker<'_> {
         self.interface_requirements
             .insert(interface.clone(), result.clone());
         result
+    }
+
+    /// Substitution can turn a requirement's `T` into a region, so a region
+    /// contract is decided from the substituted return type.
+    fn substitute_requirement_method(
+        &mut self,
+        method: &MethodInfo,
+        substitutions: &HashMap<String, TypeId>,
+    ) -> MethodInfo {
+        let mut method = self.substitute_contract_method(method, substitutions);
+        let region =
+            crate::types::ByteRegionKind::from_resolved(&self.types.resolved(method.return_ty));
+        if region.is_some() {
+            method.return_borrow =
+                crate::ownership::requirement_return_borrow(region, method.receiver_mode);
+        }
+        method
     }
 
     pub(super) fn substitute_contract_method(
