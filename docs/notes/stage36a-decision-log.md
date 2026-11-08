@@ -2062,3 +2062,68 @@ The broker test also keeps its `lifecycle_snapshot` check.
 | A separate kernel-object probe, measured alongside the stream probe (chosen) | Each test still proves exactly what it meant to prove (port with its last claim, events closed once), in the owner's own accounting | Two counters to read in five tests |
 | Only lower the counts | Smallest edit | Loses the evidence that the port and events close exactly once |
 | Count kernel objects in the stream probe again | Original numbers | Reintroduces the contradiction `f1ead7c` removed |
+
+### Windows child processes get native coverage; the vet type-checks every tier-1 target (2026-11-08)
+
+CI on `db20b35` (run 42427011057) passed both Windows `doria-rt` steps,
+including hosted-shared-runtime on its first run. It then failed "Clippy
+LLVM-enabled compiler": `child_process_tests` had 11 dead-code and
+unused-import errors. Its only native tests were `#[cfg(unix)]` because they
+drive `/bin/sh`, so on Windows the shared helpers were unused. The root
+problem was that no doriac test executed `process/windows.rs`.
+
+**Chosen:** the two native scenarios are written once and run on every host.
+
+- A `Host` table spells, per platform, only the programs and how each test
+  child is started: the shell report, a two-stream flood, the
+  environment/directory printer, an input copier, a 30-second sleeper, a
+  partial writer, the shell's name, the filesystem root, and the report for a
+  terminated child.
+- Unix uses POSIX tools. Windows uses `cmd.exe` for the shell form and
+  Windows PowerShell (`-NoProfile -NonInteractive -InputFormat None`) for
+  executables. Both exist on every Windows host.
+- The environment scenario now removes a variable the test injects into the
+  native program and PHP (`DORIA_CHILD_INHERITED`) instead of `HOME`. So
+  removing an inherited variable is exercised on both platforms, including
+  the Windows environment block built from `GetEnvironmentStringsW`.
+- Expected outputs differ only where the platform does. A terminated child
+  reports `signaled 9` on Unix and `exited 1` on Windows (`TerminateProcess`
+  with code 1). The shell is `/bin/sh` or `cmd.exe`, the root is `/` or the
+  system drive, and the copier is named `cat` or `powershell`.
+
+Reading `process/windows.rs` against these scenarios found no defect:
+
+- resolution tries the name, then the name with `.exe`, on the child's PATH;
+- the shell form is `cmd.exe /d /s /c "<script>"`;
+- arguments use MSVC quoting;
+- the environment block is sorted and folded case-insensitively;
+- a handle list restricts inheritance to the child's pipe ends;
+- the error output drains on a helper thread;
+- terminate exits the child with 1;
+- waits are bounded by the budget.
+
+Windows CI is the first execution.
+
+**Closing the local gap:** `validate_work_unit.php` now runs clippy for every
+tier-1 target other than the host, with the pinned toolchain. That is
+`doria-rt` (default features and `hosted-shared-runtime`) and `doriac
+--no-default-features`. doriac's `bundled-runtime` build script links a
+runtime library with the target's own linker, and `llvm-backend` needs that
+target's LLVM. CI's native jobs keep covering both. The validator fails,
+naming `rustup target add <triple>`, when a cross target's standard library
+is missing. It checks only when it runs commands, so `--plan` and
+`--reclaim` (used by the artifact-policy guard in CI) are unaffected.
+`cargo clippy -p doriac --all-targets --no-default-features -D warnings`
+is clean for Windows and Linux.
+
+| Option | Pros | Cons |
+|---|---|---|
+| One scenario set with per-host spellings (chosen) | The same contract is executed on every tier-1 host; the Windows implementation runs in CI | PowerShell start-up adds a few seconds per child |
+| A separate Windows test with its own scenarios | Free choice of spelling | Two copies of the contract drift |
+| `cfg`-gate the helpers or `allow(dead_code)` | Silences the lint | Leaves `process/windows.rs` unexecuted |
+| A test-built helper executable | Exact byte control | A new `[[bin]]` in doriac's `Cargo.toml`, which another agent is editing |
+
+**Open:** the local validator now needs the `x86_64-pc-windows-msvc` and
+`x86_64-unknown-linux-gnu` standard libraries for the pinned 1.98.1
+toolchain. Installing them is a download, which needs Andrew's approval.
+Until then the validator stops before running, with the command to run.

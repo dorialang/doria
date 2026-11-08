@@ -10,6 +10,14 @@ const CACHE_POLICY_VERSION = 1;
 const UNTRACKED_CACHE_BYTES = 256 * 1024 * 1024;
 const MINIMUM_FREE_BYTES = 5 * 1024 * 1024 * 1024;
 
+/**
+ * The tier-1 targets CI builds and tests natively. A local vet runs on one of
+ * them and type-checks the others, so a defect that only one platform's code
+ * contains is found before CI: Windows-only dead code in a test, a binding
+ * whose signature drifted, a cfg that leaves a helper unused.
+ */
+const TIER_ONE_TARGETS = ['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'];
+
 $root = dirname(__DIR__);
 $withLlvm = false;
 $plan = false;
@@ -118,6 +126,7 @@ if ($reclaim) {
 }
 
 $commands = default_commands($root, $target);
+array_push($commands, ...cross_target_commands($root, $target));
 if ($withLlvm) {
     array_push($commands, ...llvm_commands($llvmTarget));
 }
@@ -147,6 +156,7 @@ if ($freeAfterReclaim < MINIMUM_FREE_BYTES) {
     );
 }
 
+require_cross_targets($root);
 $failed = null;
 try {
     foreach ($commands as $command) {
@@ -212,6 +222,101 @@ function default_commands(string $root, string $target): array
         command([$executable, 'compile', 'examples/native/main_return_42.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_42'], $target),
         command([$executable, 'compile', 'examples/native/main_void_hello.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_void_hello'], $target),
     ];
+}
+
+/**
+ * Clippy for every tier-1 target except the host, with the pinned toolchain.
+ * doriac is checked without `bundled-runtime`, whose build script links a
+ * runtime library with the target's own linker, and without `llvm-backend`,
+ * which needs that target's LLVM; CI's native jobs cover both.
+ *
+ * @return list<array{command: list<string>, target: string, discardOutput: bool}>
+ */
+function cross_target_commands(string $root, string $target): array
+{
+    $commands = [];
+    foreach (cross_targets($root) as $triple) {
+        $clippy = ['cargo', 'clippy', '--target', $triple, '--locked'];
+        $commands[] = command([...$clippy, '-p', 'doria-rt', '--all-targets', '--', '-D', 'warnings'], $target);
+        $commands[] = command([
+            ...$clippy,
+            '-p',
+            'doria-rt',
+            '--all-targets',
+            '--no-default-features',
+            '--features',
+            'hosted-shared-runtime',
+            '--',
+            '-D',
+            'warnings',
+        ], $target);
+        $commands[] = command([
+            ...$clippy,
+            '-p',
+            'doriac',
+            '--all-targets',
+            '--no-default-features',
+            '--',
+            '-D',
+            'warnings',
+        ], $target);
+    }
+    return $commands;
+}
+
+/** @return list<string> The tier-1 targets other than the pinned toolchain's host. */
+function cross_targets(string $root): array
+{
+    $host = pinned_rustc_host($root);
+    return array_values(array_filter(TIER_ONE_TARGETS, static fn (string $triple): bool => $triple !== $host));
+}
+
+/** Fails, naming the command to run, when a cross target's standard library is missing. */
+function require_cross_targets(string $root): void
+{
+    $installed = installed_rust_targets($root);
+    foreach (cross_targets($root) as $triple) {
+        if (!in_array($triple, $installed, true)) {
+            fail(
+                "the cross-target checks need the {$triple} standard library for the pinned toolchain; "
+                    . "install it with: rustup target add {$triple}",
+            );
+        }
+    }
+}
+
+/** The pinned toolchain's host triple, read in the repository so rust-toolchain.toml applies. */
+function pinned_rustc_host(string $root): string
+{
+    foreach (captured_lines(['rustc', '-vV'], $root) as $line) {
+        if (str_starts_with($line, 'host: ')) {
+            return substr($line, strlen('host: '));
+        }
+    }
+    fail('rustc -vV reported no host triple; check the pinned toolchain with: rustup show');
+}
+
+/** @return list<string> The pinned toolchain's installed target triples. */
+function installed_rust_targets(string $root): array
+{
+    return captured_lines(['rustup', 'target', 'list', '--installed'], $root);
+}
+
+/** @param list<string> $command @return list<string> */
+function captured_lines(array $command, string $workingDirectory): array
+{
+    $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $workingDirectory);
+    if (!is_resource($process)) {
+        fail('could not run ' . display_command($command));
+    }
+    $output = (string) stream_get_contents($pipes[1]);
+    $errors = (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    if (proc_close($process) !== 0) {
+        fail(display_command($command) . ' failed: ' . trim($errors));
+    }
+    return array_values(array_filter(array_map('trim', explode("\n", $output)), static fn (string $line): bool => $line !== ''));
 }
 
 /** @return list<array{command: list<string>, target: string, discardOutput: bool}> */
