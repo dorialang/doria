@@ -2245,3 +2245,64 @@ interpreter, Cranelift and LLVM.
 | Explicit return-borrow syntax on requirements | States the contract exactly | New syntax for one case; Doria has no lifetime annotations and this would be the first |
 | Infer the contract from known implementations | Callers get the tightest result | An interface's contract would depend on its implementers; an open world and separate compilation make that unknowable |
 | Keep rejecting | No rule change | Region-returning interfaces and traits stay inexpressible, a design limitation left in place |
+
+### CI hid failures on Windows and behind the first failing target (2026-11-08)
+
+CI on `f59169b` (run 42453796180) failed the `rust` and Ubuntu LLVM jobs, and
+reading the Windows log showed a worse problem.
+
+**Windows was never green.** The Windows job showed success on `f94c9b3` and
+`f59169b`, and I reported that to Andrew as a pass. Its LLVM test step ran 38
+`cargo test` lines with no `shell:`. Windows defaults to PowerShell, and GitHub
+fails such a step only on the last command's exit code. Five earlier targets
+were failing, 13 tests in all.
+
+**Linux stopped at the first failure.** `cargo test` without `--no-fail-fast`
+and a `bash -e` list both stop at the first failing target, so each CI round
+could report one failing target per job and hid the rest.
+
+| Failure | Tests | Root cause | Fix |
+|---|---|---|---|
+| Runtime symbol missing from relocations | 8 on Windows | Cranelift's COFF output reaches an external symbol through a `.refptr.` pointer cell, and the tests compared exact names | `native_structure::relocation_target_name` owns the rule; both relocation readers use it |
+| Interface identity read as 0 | 1 on Windows | `object`'s `is_64()` is false for every COFF object, so the test read 4-byte words | Word width comes from the architecture's address size |
+| Removing a match arm changed nothing | 1 on Windows | The Windows checkout converted the example to CRLF, so the test's `\n` text never matched | `*.doria text eol=lf` |
+| `permission denied` reading a live file | 3 on Windows | The programs called `read_file` while a writer was open | Read through a public owner (below) |
+| Injected failure did not reach PHP | 2 on Linux | PHP 8.4 loads libraries with `RTLD_DEEPBIND`, binding the runtime's imports to libc ahead of `LD_PRELOAD` | The fixture interposes `dlopen` and drops the flag (below) |
+
+**`RTLD_DEEPBIND`.** PHP's `DL_LOAD` passes it unconditionally through 8.4; 8.5
+uses it only under Apache. This machine runs 8.5 and CI pins 8.4. The fixture
+now replaces `dlopen` and clears the flag. PHP's own call loads `ffi.so`
+through the replacement, so `ffi.so`'s call that loads the runtime reaches it
+too.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Interpose `dlopen` in the fixture (chosen) | The real runtime and real error path run; no product code changes; holds on every PHP version | Other PHP extensions in that test process bind without `RTLD_DEEPBIND` |
+| Move CI to PHP 8.5 | One line | Drops 8.4 coverage, and the test would still break on the next PHP that deep-binds |
+| Run the PHP half of this test on macOS only | No fixture change | Linux never proves that PHP transports these failures |
+| A failure hook in the runtime | Direct | A test seam in shipped runtime code |
+
+**`read_file` with a live writer.** `docs/stdlib-reference.md` states that public
+file owners permit simultaneous readers and writers on every platform, and
+that the free helpers keep their stricter Windows sharing. So the programs
+were outside that contract, not the runtime. The checks have to happen while
+the writer lives, so `fixtures/live_file_observation.doria` reads through
+`File::openRead`.
+
+| Option | Pros | Cons |
+|---|---|---|
+| Observe through a public owner (chosen) | Uses the documented contract; the tests still check mid-operation file contents | Two small helper functions in the test programs |
+| Widen `read_file` to share with writers | Same program behaves alike on every platform | Changes a documented contract to suit tests; a language decision of its own |
+| Move the reads after the writer closes | No new helper | Loses what these checks exist for: the file's contents during the operation |
+
+**CI.** The LLVM step is now one `cargo test --no-fail-fast` command, whose exit
+code covers every target on every shell. The `rust` job's test command also
+takes `--no-fail-fast`. `scripts/check_ci_shells.php` rejects a multi-command
+step that can run on Windows without a named shell; it flagged both offending
+steps before this change.
+
+| Option | Pros | Cons |
+|---|---|---|
+| One command plus a guard (chosen) | Every failure in one round; a false pass cannot return | One long command line |
+| Add `shell: bash` only | Smallest edit | Still stops at the first failing target |
+| A loop that records each exit code | Keeps one line per suite | Shell logic to maintain, on three operating systems |

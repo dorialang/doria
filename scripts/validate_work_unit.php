@@ -204,6 +204,7 @@ function default_commands(string $root, string $target): array
         command(['php', 'scripts/test_test_callback_guards.php'], $target),
         command(['php', 'scripts/check_test_callback_guards.php'], $target),
         command(['php', 'scripts/check_ci_timeouts.php'], $target),
+        command(['php', 'scripts/check_ci_shells.php'], $target),
         command(['php', 'scripts/check_docs_authority.php'], $target),
         command(['php', 'scripts/check_diagnostic_style.php'], $target),
         command(['php', 'scripts/check_panic_catalogue.php'], $target),

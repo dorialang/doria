@@ -91,6 +91,12 @@ foreach ([
     }
 }
 
+$llvmStep = strstr($ci, '- name: Run shared validator and LLVM-focused tests');
+$llvmStep = $llvmStep === false ? '' : (string) strstr(substr($llvmStep, 6), '- name:', true);
+if (!str_contains($llvmStep, 'cargo test -p doriac --features llvm-backend --locked --verbose --no-fail-fast')) {
+    $failures[] = 'the tier-1 LLVM test step must be one cargo test command with --no-fail-fast';
+}
+
 foreach ([
     'stream_capability_tests',
     'time_contract_tests',
@@ -102,7 +108,7 @@ foreach ([
 ] as $suite) {
     if (
         !str_contains($validator, "'{$suite}'")
-        || !str_contains($ci, "cargo test -p doriac --test {$suite} --features llvm-backend --locked")
+        || !str_contains($llvmStep, "--test {$suite}\n")
     ) {
         $failures[] = "missing canonical local or tier-1 LLVM stream suite: {$suite}";
     }
