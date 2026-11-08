@@ -239,6 +239,67 @@ function relay(int $depth): void {
 }
 
 #[test]
+fn specialized_enums_and_the_standard_library_keep_their_sources_in_a_graph() {
+    // A graph's source ids are hashes, so source 0 does not exist in one. A
+    // specialized generic enum has no HIR item under its materialized name;
+    // its location has to come from the semantic declaration.
+    let lower = |main: &str, declaring: &str| {
+        let package_name = "acme/application";
+        let document = plan(
+            vec![package(
+                package_name,
+                vec![
+                    source(package_name, "main.doria", SourceOrigin::Entry),
+                    source(package_name, "Packet.doria", SourceOrigin::Explicit),
+                ],
+                Vec::new(),
+            )],
+            "acme/application:main.doria",
+        );
+        let mut provider = InMemorySourceProvider::new();
+        provider.insert(package_name, "main.doria", main);
+        provider.insert(package_name, "Packet.doria", declaring);
+        let graph = load_compilation_graph(&document, &provider).expect("complete source graph");
+        doriac::lower_compilation_graph_to_mir(&graph).expect("valid MIR for a source graph")
+    };
+
+    let authored = lower(
+        r#"
+function ready(int $value): Packet<int> { return Packet::Value($value); }
+function main(): void {
+    echo match (ready(7)) {
+        Packet::Value($value) => $value,
+        Packet::Empty => 0,
+    };
+}
+"#,
+        r#"
+enum Packet<T> { case Value(T $value); case Empty; }
+"#,
+    );
+    let outcome = doriac::mir_interpreter::interpret(&authored).unwrap();
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(outcome.stdout, b"7");
+    let declaring = authored
+        .sources
+        .iter()
+        .find(|source| source.display_path.ends_with("Packet.doria"))
+        .expect("the declaring source is in the graph")
+        .id;
+    assert!(authored
+        .enums
+        .iter()
+        .filter(|definition| definition.name.starts_with("Packet"))
+        .all(|definition| definition.source_span.source == declaring));
+
+    // Reaching File brings in the standard library's specialized enums.
+    lower(
+        "use Doria\\Std\\Io\\File;\nfunction main(): void { let $file = File::openRead(\"o\"); }",
+        "function unused(): void {}",
+    );
+}
+
+#[test]
 fn unknown_schema_version_is_rejected_before_schema_one_fields() {
     let diagnostics = doriac::build_plan::parse_build_plan(
         "future.json",

@@ -2454,16 +2454,7 @@ fn lower_program_impl(
         .enums
         .iter()
         .map(|enum_info| {
-            let source_span = program
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    hir::Item::Enum(declaration) if declaration.name == enum_info.name => {
-                        Some(declaration.span)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let source_span = enum_info.declaration;
             Ok(mir::EnumDefinition {
                 id: enum_info.id,
                 name: enum_info.name.clone(),
