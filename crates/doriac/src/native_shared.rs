@@ -39,6 +39,7 @@ pub(crate) enum Operation<'a> {
     Call {
         function: FunctionId,
         args: &'a [Rvalue],
+        span: Span,
         return_borrow: Option<mir::ReturnBorrow>,
     },
     Runtime {
@@ -55,12 +56,14 @@ pub(crate) enum Operation<'a> {
     Index {
         collection: LocalId,
         index: &'a Rvalue,
+        index_span: Span,
         remove: bool,
         positional: bool,
     },
     Get {
         collection: LocalId,
         key: &'a Rvalue,
+        index_span: Span,
         access: NullableCollectionAccess,
         stored: Type,
     },
@@ -163,10 +166,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Share { value, .. } => O::Runtime {
@@ -188,12 +193,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -221,10 +228,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Create { value, .. } => O::Runtime {
@@ -246,12 +255,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -278,10 +289,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Acquire { value, .. } => O::Runtime {
@@ -315,12 +328,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -328,11 +343,13 @@ impl<'a> Expression<'a> {
                         payload,
                         collection,
                         key,
+                        index_span,
                         access,
                         stored_nullable,
                     } => O::Get {
                         collection: *collection,
                         key,
+                        index_span: *index_span,
                         access: *access,
                         stored: if *stored_nullable {
                             Type::NullableSharedReference(*payload)
@@ -363,10 +380,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::NullSafeCreate { value, .. } => O::Runtime {
@@ -388,12 +407,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -401,11 +422,13 @@ impl<'a> Expression<'a> {
                         payload,
                         collection,
                         key,
+                        index_span,
                         access,
                         stored_nullable,
                     } => O::Get {
                         collection: *collection,
                         key,
+                        index_span: *index_span,
                         access: *access,
                         stored: if *stored_nullable {
                             Type::NullableWeakReference(*payload)
@@ -441,10 +464,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Share { value, .. } => O::Runtime {
@@ -466,12 +491,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -499,10 +526,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Create { value, .. } => O::Runtime {
@@ -524,12 +553,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -556,10 +587,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Acquire { value, .. } => O::Runtime {
@@ -594,11 +627,13 @@ impl<'a> Expression<'a> {
                         payload,
                         collection,
                         key,
+                        index_span,
                         access,
                         stored_nullable,
                     } => O::Get {
                         collection: *collection,
                         key,
+                        index_span: *index_span,
                         access: *access,
                         stored: if *stored_nullable {
                             Type::NullableWritableSharedReference(*payload)
@@ -629,10 +664,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::NullSafeCreate { value, .. } => O::Runtime {
@@ -655,11 +692,13 @@ impl<'a> Expression<'a> {
                         payload,
                         collection,
                         key,
+                        index_span,
                         access,
                         stored_nullable,
                     } => O::Get {
                         collection: *collection,
                         key,
+                        index_span: *index_span,
                         access: *access,
                         stored: if *stored_nullable {
                             Type::NullableWritableWeakReference(*payload)
@@ -691,10 +730,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::Acquire {
@@ -715,12 +756,14 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
@@ -747,10 +790,12 @@ impl<'a> Expression<'a> {
                         function,
                         args,
                         return_borrow,
+                        span,
                         ..
                     } => O::Call {
                         function: *function,
                         args,
+                        span: *span,
                         return_borrow: *return_borrow,
                     },
                     E::NullSafeAcquire {
@@ -771,23 +816,27 @@ impl<'a> Expression<'a> {
                     E::CollectionIndex {
                         collection,
                         index,
+                        index_span,
                         remove,
                         positional,
                         ..
                     } => O::Index {
                         collection: *collection,
                         index,
+                        index_span: *index_span,
                         remove: *remove,
                         positional: *positional,
                     },
                     E::CollectionGet {
                         collection,
                         key,
+                        index_span,
                         access,
                         stored,
                     } => O::Get {
                         collection: *collection,
                         key,
+                        index_span: *index_span,
                         access: *access,
                         stored: stored.into_type(),
                     },

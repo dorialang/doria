@@ -1,0 +1,11 @@
+written 1
+first cursor 66
+independent cursor 88
+positioned XBCD
+empty
+append XBCDXXX
+append initial cursor 65
+append empty cursor 66
+second append eof
+first append eof
+duplex append ABXX

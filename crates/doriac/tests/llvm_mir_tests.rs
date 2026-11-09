@@ -15,6 +15,39 @@ fn assert_object(source: &str) {
 }
 
 #[test]
+fn generated_owner_drop_functions_forward_the_callers_diagnostic_frame() {
+    let program = doriac::lower_source_to_mir(
+        "drop-frame.doria",
+        r#"class Marker { function __destruct() { panic("cleanup"); } }
+class Holder { Marker $marker = new Marker(); }
+function main(): void {
+    let $holder = new Holder();
+    List<Marker> $markers = [new Marker()];
+}"#,
+    )
+    .unwrap();
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program).unwrap();
+    let mut checked = 0;
+    for body in ir.split("define ").filter(|body| {
+        body.lines().next().is_some_and(|line| {
+            line.contains("@__doria_drop_class_") || line.contains("@__doria_drop_collection_")
+        })
+    }) {
+        let body = body.split("\n}").next().unwrap();
+        for call in body.lines().filter(|line| {
+            line.contains("call ")
+                && (line.contains("@__doria_fn_")
+                    || line.contains("@__doria_drop_class_")
+                    || line.contains("@__doria_drop_collection_"))
+        }) {
+            assert!(call.contains("(ptr %0,"), "{call}\n{body}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "{checked} forwarded drop calls\n{ir}");
+}
+
+#[test]
 fn interface_ir_keeps_static_vtables_and_allocation_free_loop_dispatch() {
     let program = doriac::lower_source_to_mir(
         "interface-structure.doria",
@@ -763,6 +796,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 name: "main".to_string(),
                 source_span: Default::default(),
                 method: None,
+                diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
                 virtual_slot: None,
                 receiver_mode: None,
                 params: Vec::new(),
@@ -787,6 +821,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 name: "mixedWidth".to_string(),
                 source_span: Default::default(),
                 method: None,
+                diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
                 virtual_slot: None,
                 receiver_mode: None,
                 params: Vec::new(),

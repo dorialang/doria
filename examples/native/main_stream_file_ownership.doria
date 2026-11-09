@@ -1,0 +1,42 @@
+use Doria\Std\Io\{File, ReadableFile, ReadOutcome};
+
+class Holder<T>
+{
+    function __construct(take T $value) {}
+}
+
+class FileGroup
+{
+    function __construct(take List<ReadableFile> $files) {}
+}
+
+function maybeFile(): ?ReadableFile
+{
+    return File::openRead("stream-owned.txt");
+}
+
+function main(): void
+{
+    write_file("stream-owned.txt", "AB\n");
+    {
+        let $holder = new Holder<ReadableFile>(File::openRead("stream-owned.txt"));
+        let $group = new FileGroup([
+            File::openRead("stream-owned.txt"),
+            File::openRead("stream-owned.txt"),
+        ]);
+    }
+    writable ?ReadableFile $file = maybeFile();
+    if ($file != null) {
+        writable Bytes $bytes = Bytes::allocate(2);
+        {
+            let writable $destination = $bytes->getWritableRegion(0, 2);
+            echo match ($file->read($destination)) {
+                ReadOutcome::Data($count) => "read {$count}\n",
+                default => "wrong outcome\n",
+            };
+        }
+        echo "bytes {$bytes[0]} {$bytes[1]}\n";
+        $file->close();
+    }
+    echo "done\n";
+}

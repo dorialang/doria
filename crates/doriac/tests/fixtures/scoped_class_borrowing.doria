@@ -1,0 +1,32 @@
+class View {
+    function __construct(borrow List<int> $source) {}
+    function first(): int { return $this->source[0]; }
+}
+
+class Counter {
+    function __construct(writable int $value) {}
+    writable function bump(): void { $this->value++; }
+}
+
+class Drops {
+    static writable int $handles = 0;
+}
+
+class Handle {
+    function __construct(borrow writable Counter $counter) {}
+    writable function bump(): void { $this->counter->bump(); }
+    function __destruct(): void { Drops::handles++; }
+}
+
+function main(): void {
+    let $list = [4, 5];
+    let $view = new View($list);
+    echo $view->first() . ";" . $list->count . ";";
+    let writable $counter = new Counter(1);
+    {
+        let writable $handle = new Handle($counter);
+        $handle->bump();
+        $handle->bump();
+    }
+    echo $counter->value . ";" . Drops::handles . "\n";
+}

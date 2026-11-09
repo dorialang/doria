@@ -1,0 +1,65 @@
+class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+enum Packet { case Number(int $value); }
+open class Animal { int $value = 9; }
+class Dog extends Animal {}
+
+open class Root
+{
+    open function value(): int throws Failure { return 1; }
+    open function ping(): void throws Failure {}
+    open function text(): string throws Failure { return "root"; }
+    open function maybe(): ?int throws Failure { return 1; }
+    open function packet(): Packet throws Failure { return Packet::Number(1); }
+    open function produce(): Animal throws Failure { return new Animal(); }
+    open function optional(): ?Animal throws Failure { return null; }
+}
+
+open class Child extends Root
+{
+    override function value(): int { return 7; }
+    override function ping(): void {}
+    override function text(): string { return "t"; }
+    override function maybe(): ?int { return null; }
+    override function packet(): Packet { return Packet::Number(5); }
+    override function produce(): Dog { return new Dog(); }
+    override function optional(): ?Dog { return null; }
+}
+
+class Leaf extends Child {}
+
+function throughRoot(Root $source): int throws Failure { return $source->value(); }
+function throughChild(Child $source): int { return $source->value(); }
+function packetNumber(Packet $packet): int
+{
+    return match ($packet) { Packet::Number($number) => $number, };
+}
+
+function main(): void
+{
+    try
+    {
+        Root $source = new Leaf();
+        echo throughRoot($source);
+        $source->ping();
+        echo $source->text();
+        if ($source->maybe() == null) { echo "n"; }
+        echo packetNumber($source->packet());
+        let $animal = $source->produce();
+        echo $animal->value;
+        if ($source->optional() == null) { echo "z"; }
+    }
+    catch (Failure $error) { echo $error->message; }
+    let $source = new Leaf();
+    echo throughChild($source);
+    $source->ping();
+    echo $source->text();
+    if ($source->maybe() == null) { echo "n"; }
+    echo packetNumber($source->packet());
+    let $dog = $source->produce();
+    echo $dog->value;
+    if ($source->optional() == null) { echo "z"; }
+}

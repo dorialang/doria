@@ -70,10 +70,7 @@ fn invoke(
             .methods
             .iter()
             .enumerate()
-            .find(|(slot, _)| {
-                definition.iteration_operation(*slot, &context.collection_registry.interface_types)
-                    == Some(operation)
-            })
+            .find(|(slot, _)| definition.iteration_operation(*slot) == Some(operation))
             .ok_or_else(|| {
                 vec![unsupported(
                     span,
@@ -109,12 +106,7 @@ fn invoke(
             .find_map(|table| {
                 let definition = &context.collection_registry.interface_types[table.interface.0];
                 (0..definition.methods.len())
-                    .find(|slot| {
-                        definition.iteration_operation(
-                            *slot,
-                            &context.collection_registry.interface_types,
-                        ) == Some(operation)
-                    })
+                    .find(|slot| definition.iteration_operation(*slot) == Some(operation))
                     .map(|slot| (table.id, table.interface, slot))
             })
             .ok_or_else(|| {
@@ -141,6 +133,7 @@ fn invoke(
                         signature.id,
                         args,
                         signature.return_borrow,
+                        span,
                     );
                     let owned = user_local_type_owns_value(ty) && !value.borrows_move_value();
                     let local =
@@ -312,7 +305,12 @@ fn lower_foreach_in_scope(
                 target: temporary,
                 value,
             });
-            virtual_adapter_local_result(temporary, ty, actual, false, span)?
+            adapt_return_value(
+                pending_owned_rvalue(temporary, actual, false),
+                ty,
+                span,
+                &context.collection_registry,
+            )?
         };
         let owned = user_local_type_owns_value(ty) && !ty.has_move_ownership();
         let target =

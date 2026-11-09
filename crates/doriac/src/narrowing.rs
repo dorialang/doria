@@ -75,6 +75,7 @@ struct Resolution {
     declaration_callable_modes: HashMap<BindingId, ParamModes>,
     declaration_member_types: HashMap<BindingId, TypeRef>,
     current_class: Option<String>,
+    type_params: BTreeSet<String>,
     nullability: NullabilityCatalog,
     member_types: MemberTypeCatalog,
     closure_bodies: Vec<(Block, Span)>,
@@ -218,7 +219,7 @@ impl NullabilityCatalog {
         for item in &program.items {
             match item {
                 Item::Function(function) => {
-                    if let Some(non_null) = declared_return_is_non_null(function) {
+                    if let Some(non_null) = declared_return_is_non_null(function, &[]) {
                         catalog.functions.insert(function.name.clone(), non_null);
                     }
                 }
@@ -226,7 +227,9 @@ impl NullabilityCatalog {
                     for member in &class.members {
                         match member {
                             crate::ast::ClassMember::Method(method) => {
-                                if let Some(non_null) = declared_return_is_non_null(method) {
+                                if let Some(non_null) =
+                                    declared_return_is_non_null(method, &class.type_params)
+                                {
                                     merge_guarantee(
                                         catalog.methods.entry(method.name.clone()),
                                         non_null,
@@ -243,7 +246,13 @@ impl NullabilityCatalog {
                                         catalog.record_property(
                                             &class.name,
                                             &parameter.name,
-                                            member_is_non_null(&parameter.ty, &class.type_params),
+                                            declared_type_is_non_null(
+                                                &parameter.ty,
+                                                class
+                                                    .type_params
+                                                    .iter()
+                                                    .map(|param| param.name.as_str()),
+                                            ),
                                         );
                                     }
                                 }
@@ -252,7 +261,10 @@ impl NullabilityCatalog {
                                 catalog.record_property(
                                     &class.name,
                                     &property.name,
-                                    member_is_non_null(&property.ty, &class.type_params),
+                                    declared_type_is_non_null(
+                                        &property.ty,
+                                        class.type_params.iter().map(|param| param.name.as_str()),
+                                    ),
                                 );
                             }
                             crate::ast::ClassMember::Constant(_)
@@ -377,27 +389,36 @@ impl NullabilityCatalog {
     }
 }
 
-fn declared_return_is_non_null(function: &FunctionDecl) -> Option<bool> {
-    function.return_type.as_ref().map(|ty| !ty.nullable)
+fn declared_return_is_non_null(
+    function: &FunctionDecl,
+    enclosing_type_params: &[crate::ast::TypeParamDecl],
+) -> Option<bool> {
+    function.return_type.as_ref().map(|ty| {
+        declared_type_is_non_null(
+            ty,
+            enclosing_type_params
+                .iter()
+                .chain(&function.type_params)
+                .map(|param| param.name.as_str()),
+        )
+    })
 }
 
-/// A member whose declared type is a bare class type parameter can become
-/// nullable once the class is instantiated (e.g. `Box<?int>` for `T $value`),
-/// so its nullability cannot be established from the unspecialized syntax.
-fn type_ref_is_type_param(
-    ty: &crate::types::TypeRef,
-    type_params: &[crate::ast::TypeParamDecl],
+/// Bare type parameters can specialize to nullable values; enclosing a type
+/// parameter in a non-null aggregate does not make the aggregate nullable.
+fn declared_type_is_non_null<'a>(
+    mut ty: &TypeRef,
+    mut type_params: impl Iterator<Item = &'a str>,
 ) -> bool {
-    type_params.iter().any(|param| param.name == ty.name)
-}
-
-/// Non-null guarantee for a class member, treating members typed by a bare
-/// type parameter conservatively (never guaranteed non-null).
-fn member_is_non_null(
-    ty: &crate::types::TypeRef,
-    type_params: &[crate::ast::TypeParamDecl],
-) -> bool {
-    !ty.nullable && !type_ref_is_type_param(ty, type_params)
+    loop {
+        if ty.nullable {
+            return false;
+        }
+        let Some(grouped) = &ty.grouped else {
+            return !type_params.any(|name| name == ty.name);
+        };
+        ty = &grouped.inner;
+    }
 }
 
 fn merge_guarantee(entry: std::collections::hash_map::Entry<'_, String, bool>, incoming: bool) {
@@ -583,12 +604,19 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
         span: top_level_span,
     };
     if !top_level.statements.is_empty() {
-        analyze_body(
+        let resolution = Resolver::resolve(
             &top_level,
             &[],
+            None,
+            None,
+            &catalog.nullability,
+            &catalog.member_types,
+            BTreeSet::new(),
+        );
+        analyze_body(
+            &top_level,
             top_level_span,
-            None,
-            None,
+            &resolution,
             &mut facts,
             &catalog,
         );
@@ -597,7 +625,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
     for item in &program.items {
         match item {
             Item::Function(function) => {
-                analyze_function(function, None, None, &mut facts, &catalog)
+                analyze_function(function, None, &[], None, &mut facts, &catalog)
             }
             Item::Class(class) => {
                 for member in &class.members {
@@ -605,6 +633,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
                         analyze_function(
                             &callable,
                             Some(&class.name),
+                            &class.type_params,
                             (callable.name == "__construct").then_some(class),
                             &mut facts,
                             &catalog,
@@ -618,6 +647,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
                         analyze_function(
                             &callable,
                             Some(&declaration.name),
+                            &declaration.type_params,
                             None,
                             &mut facts,
                             &catalog,
@@ -655,6 +685,7 @@ fn statement_span(statement: &Stmt) -> Span {
 fn analyze_function(
     function: &FunctionDecl,
     current_class: Option<&str>,
+    enclosing_type_params: &[crate::ast::TypeParamDecl],
     constructor_class: Option<&crate::ast::ClassDecl>,
     facts: &mut FactsByUse,
     catalog: &FlowCatalog,
@@ -662,37 +693,32 @@ fn analyze_function(
     let Some(body) = function.body.as_block() else {
         return;
     };
-    analyze_body(
-        body,
-        &function.params,
-        function.span,
-        current_class,
-        constructor_class,
-        facts,
-        catalog,
-    );
-}
-
-fn analyze_body(
-    body: &Block,
-    params: &[Param],
-    span: Span,
-    current_class: Option<&str>,
-    constructor_class: Option<&crate::ast::ClassDecl>,
-    facts: &mut FactsByUse,
-    catalog: &FlowCatalog,
-) {
     let resolution = Resolver::resolve(
         body,
-        params,
+        &function.params,
         current_class,
         constructor_class,
         &catalog.nullability,
         &catalog.member_types,
+        enclosing_type_params
+            .iter()
+            .chain(&function.type_params)
+            .map(|param| param.name.clone())
+            .collect(),
     );
-    analyze_resolved_body(body, span, &resolution, facts, catalog);
+    analyze_body(body, function.span, &resolution, facts, catalog);
+}
+
+fn analyze_body(
+    body: &Block,
+    span: Span,
+    resolution: &Resolution,
+    facts: &mut FactsByUse,
+    catalog: &FlowCatalog,
+) {
+    analyze_resolved_body(body, span, resolution, facts, catalog);
     for (closure_body, closure_span) in &resolution.closure_bodies {
-        analyze_resolved_body(closure_body, *closure_span, &resolution, facts, catalog);
+        analyze_resolved_body(closure_body, *closure_span, resolution, facts, catalog);
     }
 }
 
@@ -1429,7 +1455,12 @@ fn expression_fact(
                     .declaration_types
                     .get(&binding)
                     .and_then(Option::as_ref)
-                    .filter(|ty| !ty.nullable)
+                    .filter(|ty| {
+                        declared_type_is_non_null(
+                            ty,
+                            resolution.type_params.iter().map(String::as_str),
+                        )
+                    })
                     .map(|_| Fact::NonNull)
             })
         }),
@@ -2259,12 +2290,14 @@ impl Resolver {
         constructor_class: Option<&crate::ast::ClassDecl>,
         nullability: &NullabilityCatalog,
         member_types: &MemberTypeCatalog,
+        type_params: BTreeSet<String>,
     ) -> Resolution {
         let mut resolver = Self {
             next_binding: 0,
             scopes: vec![HashMap::new()],
             resolution: Resolution {
                 current_class: current_class.map(str::to_string),
+                type_params,
                 nullability: nullability.clone(),
                 member_types: member_types.clone(),
                 ..Resolution::default()
@@ -2296,7 +2329,10 @@ impl Resolver {
                     .resolution
                     .constructor_properties
                     .insert(parameter.name.clone(), binding);
-                if !parameter.ty.nullable {
+                if declared_type_is_non_null(
+                    &parameter.ty,
+                    resolver.resolution.type_params.iter().map(String::as_str),
+                ) {
                     resolver
                         .resolution
                         .entry_facts
@@ -2755,6 +2791,83 @@ impl Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_returns_keep_callable_and_enclosing_nullability_unknown() {
+        let program = crate::parse_source(
+            "generic-return-facts.doria",
+            r#"
+function relay<T>(T $value): T { return $value; }
+function collect<T>(List<T> $values): List<T> { return $values; }
+class Holder<T> {
+    function __construct(take T $value) {}
+    function getValue(): T { return $this->value; }
+    function relay<U>(U $value): U { return $value; }
+    static function relayStatic<U>(U $value): U { return $value; }
+    function getNumber(): int { return 1; }
+}
+"#,
+        )
+        .unwrap();
+        let catalog = NullabilityCatalog::from_program(&program);
+        assert_eq!(catalog.function_is_non_null("relay"), Some(false));
+        assert_eq!(catalog.function_is_non_null("collect"), Some(true));
+        for method in ["getValue", "relay", "relayStatic"] {
+            assert_eq!(
+                catalog
+                    .qualified_methods
+                    .get(&("Holder".into(), method.into())),
+                Some(&false),
+                "{method}",
+            );
+        }
+        assert_eq!(catalog.method_is_non_null("getNumber"), Some(true));
+        assert_eq!(catalog.property_is_non_null("value"), Some(false));
+    }
+
+    #[test]
+    fn generic_binding_facts_require_proof_but_preserve_real_narrowing() {
+        for (source, non_null) in [
+            ("function relay<T>(T $value): T { T $copy = $value; return $copy; }", false),
+            ("class Holder<T> { function relay(T $value): T { T $copy = $value; return $copy; } }", false),
+            ("class Holder<T> { function __construct(take T $value) { let $copy = $this->value; } }", false),
+            ("function relay((?int) $value): (?int) { (?int) $copy = $value; return $copy; }", false),
+            ("class Holder { function __construct((?int) $value) { let $copy = $this->value; echo $copy; } }", false),
+            ("function relay(?int $value): int { if ($value == null) { return 0; } let $copy = $value; return $copy; }", true),
+            ("class Holder { function __construct(int $value) { let $copy = $this->value; echo $copy; } }", true),
+        ] {
+            let program = crate::parse_source("generic-binding-facts.doria", source).unwrap();
+            let facts = analyze_program(&program);
+            let start = source.rfind("$copy").unwrap();
+            let fact = facts.iter().find_map(|(span, fact)| (span.start == start).then_some(fact));
+            assert_eq!(fact, non_null.then_some(&Fact::NonNull), "{source}");
+        }
+    }
+
+    #[test]
+    fn grouped_type_facts_preserve_inner_nullability() {
+        let program = crate::parse_source(
+            "grouped-type-facts.doria",
+            r#"
+function optional((?int) $value): (?int) { return $value; }
+function optionalOuter(?(int) $value): ?(int) { return $value; }
+function number(((int)) $value): ((int)) { return $value; }
+function collect<T>((List<?T>) $values): (List<?T>) { return $values; }
+class Holder {
+    function __construct((?int) $value) {}
+    function getValue(): (?int) { return $this->value; }
+}
+"#,
+        )
+        .unwrap();
+        let catalog = NullabilityCatalog::from_program(&program);
+        assert_eq!(catalog.function_is_non_null("optional"), Some(false));
+        assert_eq!(catalog.function_is_non_null("optionalOuter"), Some(false));
+        assert_eq!(catalog.function_is_non_null("number"), Some(true));
+        assert_eq!(catalog.function_is_non_null("collect"), Some(true));
+        assert_eq!(catalog.method_is_non_null("getValue"), Some(false));
+        assert_eq!(catalog.property_is_non_null("value"), Some(false));
+    }
 
     #[test]
     fn unresolved_shared_member_names_do_not_inherit_user_nullability_guarantees() {

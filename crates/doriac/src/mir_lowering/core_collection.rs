@@ -17,6 +17,7 @@ pub(super) fn value_at(
     collection: mir::LocalId,
     position: mir::LocalId,
     ty: mir::Type,
+    index_span: Span,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::Rvalue> {
     let mir::Type::Collection(id) = context.local_type(collection) else {
@@ -24,7 +25,7 @@ pub(super) fn value_at(
     };
     if !context.collection_type(id).uses_core_operations() {
         let offset = collection_offset_rvalue(position);
-        return collection_value_rvalue(collection, offset.clone(), offset, ty, true);
+        return collection_value_rvalue(collection, offset.clone(), offset, ty, true, index_span);
     }
     let writable = context.locals[collection.0].writable
         && context
@@ -106,6 +107,7 @@ pub(super) fn literal(
             local_rvalue(lowered.0, lowered.1, true),
             value,
             key.span(),
+            None,
             context,
         )?;
     }
@@ -216,6 +218,7 @@ fn append_duplicate(
             key: None,
             value: duplicate.0,
             hash,
+            storage_origin: None,
         },
         context,
     );
@@ -247,7 +250,7 @@ pub(super) fn set_algebra(
     };
     for (pass, source) in sources.into_iter().enumerate() {
         walk(source, span, context, |index, context| {
-            let value = value_at(source, index, definition.value, context)?;
+            let value = value_at(source, index, definition.value, span, context)?;
             let value = core_value::materialize_value(value, context);
             let exit = context.create_block();
             if algebra != mir::SetAlgebraOp::Union || pass == 1 {
@@ -301,7 +304,7 @@ pub(super) fn preserving_set(
         }),
     });
     walk(input, source.span(), context, |index, context| {
-        let value = value_at(input, index, definition.value, context)?;
+        let value = value_at(input, index, definition.value, source.span(), context)?;
         let value = core_value::materialize_value(value, context);
         let (position, _) = hash_lookup(output, &definition, value, source.span(), context)?;
         let append = context.create_block();
@@ -392,7 +395,7 @@ pub(super) fn expression(
     let (position, _, _) = lookup(collection, &definition, key, expr.span(), context)?;
     if required {
         operation(collection, Op::RequireKey { position }, context);
-        return value_at(collection, position, definition.value, context).map(Some);
+        return value_at(collection, position, definition.value, expr.span(), context).map(Some);
     }
     let owned = user_local_type_owns_value(expected) && (remove || !expected.has_move_ownership());
     let result = context.declare_checked_call_slot(expected, owned);
@@ -408,7 +411,7 @@ pub(super) fn expression(
     let value = if remove {
         remove_at(collection, &definition, position, context)
     } else {
-        value_at(collection, position, definition.value, context)?
+        value_at(collection, position, definition.value, expr.span(), context)?
     };
     let value = core_value::materialize_value(value, context);
     let value = convert_call_result(value.0, value.1, expected, remove, expr.span(), context)?;
@@ -436,6 +439,7 @@ pub(super) fn set(
     key: mir::Rvalue,
     value: mir::Rvalue,
     span: Span,
+    storage_origin: Option<Span>,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<()> {
     let key = core_value::materialize_value(key, context);
@@ -460,6 +464,7 @@ pub(super) fn set(
             position,
             value: value.0,
             previous,
+            storage_origin,
         },
         context,
     );
@@ -473,6 +478,7 @@ pub(super) fn set(
             key: Some(key.0),
             value: value.0,
             hash,
+            storage_origin,
         },
         context,
     );
@@ -558,7 +564,7 @@ pub(super) fn hash_lookup(
     let key = if let Some(ty) = definition.key {
         key_at(collection, position, ty, context)
     } else {
-        value_at(collection, position, definition.value, context)?
+        value_at(collection, position, definition.value, span, context)?
     };
     let key = core_value::materialize_value(key, context);
     let condition = core_value::lower_local_equality(key, expected, false, span, context)?;
@@ -671,6 +677,7 @@ pub(super) fn membership(
                 key: None,
                 value: value.0,
                 hash,
+                storage_origin: Some(span),
             },
             context,
         );

@@ -3,16 +3,99 @@
 use super::*;
 use crate::types::InterfaceType;
 
+mod availability;
+mod conformance;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContractFacts {
     pub interfaces: Vec<InterfaceFacts>,
     pub interface_specializations: Vec<InterfaceSpecializationFacts>,
     /// Scope-resolved member contracts for each constrained receiver expression.
     pub constrained_member_surfaces: HashMap<Span, ConstrainedMemberSurface>,
+    /// Resolved authored clauses keyed by conformance or member declaration.
+    /// These are predicates, not evidence that a member or witness is active.
+    pub conditions: HashMap<Span, NominalConditionFacts>,
+    /// Method/accessor declaration to its authored condition declaration.
+    /// Accessors of one computed property share the property's condition.
+    pub callable_conditions: HashMap<Span, Span>,
     pub traits: Vec<TraitFacts>,
     pub conformances: Vec<ConformanceFacts>,
     pub member_references: Vec<ContractMemberReference>,
     pub compositions: Vec<CompositionFacts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NominalTypeParameter {
+    pub name: String,
+    pub declaration: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NominalObligation {
+    /// Authored parameter identity survives composition and specialization.
+    pub subject: NominalTypeParameter,
+    pub subject_type: ResolvedType,
+    pub subject_span: Span,
+    pub interface: InterfaceType<ResolvedType>,
+    pub interface_span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NominalConditionFacts {
+    pub clause: Span,
+    /// Lexical identities for every symbolic type in the obligations, including
+    /// interface arguments. Method parameters cannot shadow owner parameters.
+    pub parameters: Vec<NominalTypeParameter>,
+    pub obligations: Vec<NominalObligation>,
+}
+
+impl NominalConditionFacts {
+    pub(crate) fn substitute(
+        &self,
+        bindings: &HashMap<String, ResolvedType>,
+        receiver: &ResolvedType,
+        parameters: Vec<NominalTypeParameter>,
+    ) -> Self {
+        let mut condition = self.clone();
+        condition.parameters = parameters;
+        for obligation in &mut condition.obligations {
+            obligation.subject_type =
+                crate::types::substitute_trait_type(&obligation.subject_type, bindings, receiver);
+            for argument in &mut obligation.interface.arguments {
+                *argument = crate::types::substitute_trait_type(argument, bindings, receiver);
+            }
+        }
+        condition
+    }
+}
+
+impl ContractFacts {
+    pub(crate) fn method_implementations<'a>(
+        &'a self,
+        interface: &'a InterfaceType<ResolvedType>,
+        requirement: Span,
+    ) -> impl Iterator<Item = (&'a ResolvedType, Option<Span>)> + 'a {
+        self.conformances
+            .iter()
+            .filter(move |fact| {
+                fact.interface == *interface
+                    && fact.status == ConformanceStatus::Checked
+                    && !crate::types::resolved_type_is_symbolic(&fact.implementing_type)
+            })
+            .map(move |fact| {
+                let implementation = fact
+                    .implementations
+                    .iter()
+                    .find(|implementation| {
+                        implementation
+                            .requirement_origins
+                            .iter()
+                            .any(|origin| origin.declaration == requirement)
+                    })
+                    .and_then(|implementation| implementation.implementation);
+                (&fact.implementing_type, implementation)
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +131,9 @@ pub struct InterfaceFacts {
     pub valid: bool,
 }
 
-/// The checked, substituted requirement graph used by runtime lowering. Keeping
-/// this separate from declaration syntax prevents backend conformance lookup.
+/// The checked, substituted requirement graph used by ownership, retained-source
+/// analysis and lowering. It does not establish conformance or executable admission.
+/// Keeping it separate from declaration syntax prevents backend conformance lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceSpecializationFacts {
     pub specialization: InterfaceType<ResolvedType>,
@@ -84,7 +168,7 @@ pub struct RequirementFacts {
     pub origins: Vec<RequirementOrigin>,
     pub signature: CallableSignatureSemanticInfo,
     pub generic_parameters: Vec<TypeParamDecl>,
-    pub writable_receiver: bool,
+    pub receiver_mode: ReceiverMode,
     pub checked_effects: Vec<ResolvedType>,
     pub return_borrow: Option<ReturnBorrow>,
 }
@@ -147,7 +231,24 @@ pub(super) struct InterfaceRequirements {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct ClassConformances {
-    entries: Vec<(InterfaceType<TypeId>, Span)>,
+    pub(super) entries: Vec<(InterfaceType<TypeId>, Span)>,
+    pub(super) active_arguments: Vec<TypeId>,
+    pub(super) valid: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ClassConformancePath {
+    interface: InterfaceType<TypeId>,
+    origin: Span,
+    declaring_class: String,
+    direct: bool,
+    conditional: bool,
+    obligations: Result<Vec<super::nominal_proof::Step>, super::nominal_proof::Failure>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct DeclaredClassConformances {
+    paths: Vec<ClassConformancePath>,
     valid: bool,
 }
 
@@ -169,6 +270,7 @@ fn type_ref_contains_self(ty: &TypeRef) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContractMismatch {
+    Availability,
     GenericParameters,
     ParameterCount,
     ParameterNames,
@@ -186,6 +288,7 @@ pub enum ContractMismatch {
 impl ContractMismatch {
     pub fn description(self) -> &'static str {
         match self {
+            Self::Availability => "availability condition",
             Self::GenericParameters => "generic arity or constraints",
             Self::ParameterCount => "parameter count",
             Self::ParameterNames => "parameter names",
@@ -361,6 +464,16 @@ impl Checker<'_> {
         Some(requirement)
     }
 
+    /// The receiver mode an interface requirement declares.
+    pub(super) fn interface_requirement_receiver(&self, requirement: Span) -> Option<ReceiverMode> {
+        self.interface_definitions
+            .values()
+            .flat_map(|definition| &definition.local_requirements)
+            .find(|(_, _, method)| method.declaration == requirement)?
+            .2
+            .receiver_mode
+    }
+
     fn resolve_interface_self_result(
         &mut self,
         method: &mut MethodInfo,
@@ -394,7 +507,7 @@ impl Checker<'_> {
         self.constrained_requirement_from_interfaces(parameter, &interfaces, name, accessor)
     }
 
-    fn constrained_interfaces(
+    pub(super) fn constrained_interfaces(
         &mut self,
         parameter: &str,
         span: Span,
@@ -423,6 +536,14 @@ impl Checker<'_> {
             }
             if let Some(interface) = self.resolve_interface_edge(&constraint, span) {
                 interfaces.push(interface);
+            }
+        }
+        let subject = self
+            .types
+            .intern(TypeKind::TypeParameter(parameter.to_string()));
+        for step in self.nominal_condition_scopes.iter().flatten() {
+            if step.query.subject == subject && !interfaces.contains(&step.query.interface) {
+                interfaces.push(step.query.interface.clone());
             }
         }
         interfaces
@@ -615,6 +736,9 @@ impl Checker<'_> {
                 span,
             ));
         }
+        if declared.receiver_mode == Some(ReceiverMode::Consuming) {
+            self.record_capture_requirement_for_expr(object, scopes, CaptureRequirement::Take);
+        }
         let method = self.instantiate_generic_method_call(
             &format!("declared method `{method}`"),
             &declared,
@@ -631,21 +755,39 @@ impl Checker<'_> {
             scopes,
             method_context,
         );
-        let effects = if matches!(
-            self.call_targets.get(&span),
-            Some(CallableTarget::InterfaceMethod { .. })
-        ) {
-            self.complete_function_value_effects(&method.checked_effects, span)
-        } else {
-            method.checked_effects
-        };
-        self.record_checked_effects(effects, span);
+        // The selected target owns the effect rule. Erased and constrained
+        // calls (type-parameter and trait-self receivers) pick their
+        // implementation after this body is checked, so they carry the complete
+        // automatic set, exactly as selected core operations do.
+        match self.call_targets.get(&span).cloned() {
+            Some(target) => {
+                self.record_selected_contract_effects(&target, &method, span);
+            }
+            None => self.record_checked_effects(method.checked_effects, span),
+        }
+    }
+
+    pub(super) fn record_trait_method_target(
+        &mut self,
+        owner: &str,
+        name: &str,
+        declaration: Span,
+        span: Span,
+    ) {
+        self.call_targets
+            .entry(span)
+            .or_insert_with(|| CallableTarget::ConstrainedMethod {
+                receiver: ResolvedType::TraitSelf(owner.into()),
+                method_name: name.into(),
+                requirement: declaration,
+                implementations: Vec::new(),
+            });
     }
 
     pub(super) fn specialize_constrained_method(
         &mut self,
         span: Span,
-        substitutions: &HashMap<String, TypeId>,
+        body: &super::callable_contracts::BodyInstance,
     ) -> Option<MethodInfo> {
         let CallableTarget::ConstrainedMethod {
             receiver,
@@ -656,8 +798,7 @@ impl Checker<'_> {
         else {
             return None;
         };
-        let receiver = self.types.intern_resolved(&receiver);
-        let receiver = self.substitute_type_id(receiver, substitutions);
+        let receiver = self.types.intern_resolved(&body.substitute(&receiver));
         if requirement.source == crate::compiler_known_contracts::SOURCE_ID
             && matches!(
                 self.types.kind(receiver),
@@ -714,10 +855,7 @@ impl Checker<'_> {
             TypeKind::Nullable(inner) => *inner,
             _ => value,
         };
-        if !matches!(
-            self.types.kind(value),
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
-        ) {
+        if !self.primitive_interface_erasure_is_forbidden(value) {
             return false;
         }
         self.diagnostics.push(
@@ -733,6 +871,13 @@ impl Checker<'_> {
             .with_help("use a generic constraint for an unboxed primitive value"),
         );
         true
+    }
+
+    pub(super) fn primitive_interface_erasure_is_forbidden(&self, value: TypeId) -> bool {
+        matches!(
+            self.types.kind(value),
+            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
+        )
     }
 
     pub(super) fn interface_declaration(&self, name: &str) -> Option<&InterfaceDecl> {
@@ -772,19 +917,11 @@ impl Checker<'_> {
         } else {
             Vec::new()
         };
-        self.type_has_declared_interface(
-            ty,
-            &InterfaceType::new(name, arguments),
-            &mut HashSet::new(),
-        )
+        self.type_has_declared_interface(ty, &InterfaceType::new(name, arguments))
     }
 
     pub(super) fn public_iterable_element(&mut self, ty: TypeId) -> Option<TypeId> {
         self.core_iteration_element(ty, "Iterable")
-    }
-
-    pub(super) fn public_iterator_element(&mut self, ty: TypeId) -> Option<TypeId> {
-        self.core_iteration_element(ty, "Iterator")
     }
 
     fn core_iteration_element(&mut self, ty: TypeId, contract: &str) -> Option<TypeId> {
@@ -792,12 +929,17 @@ impl Checker<'_> {
             return None;
         }
         let interfaces = match self.types.kind(ty).clone() {
-            TypeKind::Class(class) => self
-                .class_interface_closure(&class, &mut HashSet::new())
-                .entries
-                .into_iter()
-                .map(|(interface, _)| interface)
-                .collect::<Vec<_>>(),
+            TypeKind::Class(class) => {
+                let conformances = self.class_interface_closure(&class, &mut HashSet::new());
+                if !conformances.valid {
+                    return None;
+                }
+                conformances
+                    .entries
+                    .into_iter()
+                    .map(|(interface, _)| interface)
+                    .collect::<Vec<_>>()
+            }
             TypeKind::Interface(interface) => vec![interface],
             TypeKind::TypeParameter(parameter) => {
                 let constraints = self
@@ -860,7 +1002,12 @@ impl Checker<'_> {
         else {
             return false;
         };
-        self.record_selected_contract_effects(&target, &method, span);
+        self.record_selected_effects(
+            &target,
+            &method,
+            span,
+            super::executable_effects::SelectedUse::Implicit,
+        );
         let call = CoreValueCallInfo {
             operation,
             receiver_type: self.types.resolved(ty),
@@ -892,7 +1039,14 @@ impl Checker<'_> {
                     method_name,
                     direct_parent: false,
                 };
-                self.record_callable_dependency(method.declaration);
+                let direct = self
+                    .classes
+                    .get(&class.name)
+                    .is_some_and(|class| !class.is_open);
+                if direct {
+                    self.exact_method_calls.insert((span, method.declaration));
+                }
+                self.record_method_effect_dependency(&method, direct);
                 (target, method)
             }
             TypeKind::TypeParameter(parameter) => {
@@ -927,29 +1081,97 @@ impl Checker<'_> {
         })
     }
 
-    fn record_selected_contract_effects(
-        &mut self,
-        target: &CallableTarget,
-        method: &MethodInfo,
-        span: Span,
-    ) {
-        let effects = self.selected_contract_effects(target, method, span);
-        self.record_checked_effects(effects, span);
-    }
-
-    pub(super) fn selected_contract_effects(
+    /// Record a contract-selected call and return its transport.
+    pub(super) fn record_selected_contract_effects(
         &mut self,
         target: &CallableTarget,
         method: &MethodInfo,
         span: Span,
     ) -> Vec<TypeId> {
-        if matches!(
+        self.record_selected_effects(
             target,
-            CallableTarget::InterfaceMethod { .. } | CallableTarget::ConstrainedMethod { .. }
-        ) {
-            self.complete_function_value_effects(&method.checked_effects, span)
+            method,
+            span,
+            super::executable_effects::SelectedUse::Call,
+        )
+    }
+
+    /// Record a contract-selected member use and return its transport. `selected`
+    /// says how each specialization finds the member again.
+    pub(super) fn record_selected_effects(
+        &mut self,
+        target: &CallableTarget,
+        method: &MethodInfo,
+        span: Span,
+        selected: super::executable_effects::SelectedUse,
+    ) -> Vec<TypeId> {
+        if self.selects_implementation_after_checking(target) {
+            let effects = self.complete_function_value_effects(&method.checked_effects, span);
+            match super::executable_effects::call_source(target, method, false, selected) {
+                Some(callee) => {
+                    self.record_call_effect_profiles(effects.clone(), effects.clone(), span, callee)
+                }
+                None => self.record_checked_effects(effects.iter().copied(), span),
+            }
+            return effects;
+        }
+        let virtual_call = method.virtual_root.is_some()
+            && !self
+                .exact_method_calls
+                .contains(&(span, method.declaration))
+            && !matches!(
+                target,
+                CallableTarget::Method {
+                    direct_parent: true,
+                    ..
+                }
+            );
+        let mut effects = method.checked_effects.clone();
+        let dependency = if virtual_call {
+            let ambient = self
+                .ambient_effect_seed
+                .virtual_calls
+                .get(&method.declaration)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            for effect in ambient {
+                let effect = self.types.intern_resolved(&effect);
+                if !effects.contains(&effect) {
+                    effects.push(effect);
+                }
+            }
+            super::callable_contracts::EffectDependency::Virtual(method.declaration)
         } else {
-            method.checked_effects.clone()
+            super::callable_contracts::EffectDependency::Exact(method.declaration)
+        };
+        let source = super::executable_effects::call_source(target, method, virtual_call, selected);
+        self.record_named_call_effects(dependency, effects.clone(), span, source);
+        effects
+    }
+
+    /// Whether a call's implementation is selected after the calling body is
+    /// checked. One check then stands for every implementation the call may
+    /// select, so the call carries the complete ambient profile: erased
+    /// interface calls, type-parameter receivers, and trait-self calls that the
+    /// composer satisfies. A trait member with a body is the trait's own
+    /// implementation, so its exact profile applies; each composed copy is
+    /// revalidated against the composer's members (Decision 0134).
+    fn selects_implementation_after_checking(&self, target: &CallableTarget) -> bool {
+        match target {
+            CallableTarget::InterfaceMethod { .. } => true,
+            CallableTarget::ConstrainedMethod {
+                receiver: ResolvedType::TraitSelf(owner),
+                method_name,
+                ..
+            } => !matches!(
+                self.trait_source_member(owner, method_name),
+                Some(ClassMember::Method(method))
+                    if !matches!(method.body, FunctionBody::Requirement { .. })
+            ),
+            CallableTarget::ConstrainedMethod { .. } => true,
+            _ => false,
         }
     }
 
@@ -957,39 +1179,53 @@ impl Checker<'_> {
         let Some((target, method)) = self.select_contract_method(ty, "iterator", span) else {
             return;
         };
-        self.record_selected_contract_effects(&target, &method, span);
+        self.record_selected_effects(
+            &target,
+            &method,
+            span,
+            super::executable_effects::SelectedUse::Implicit,
+        );
         self.call_targets.entry(span).or_insert(target);
+        let iterable = self.types.resolved(ty);
         for name in ["hasCurrent", "getCurrent", "advance"] {
             if let Some((target, operation)) =
                 self.select_contract_method(method.return_ty, name, span)
             {
-                self.record_selected_contract_effects(&target, &operation, span);
+                self.record_selected_effects(
+                    &target,
+                    &operation,
+                    span,
+                    super::executable_effects::SelectedUse::IterationStep {
+                        iterable: iterable.clone(),
+                        member: name,
+                    },
+                );
             }
         }
     }
 
     pub(super) fn check_specialized_core_operations(
         &mut self,
-        declaration: Span,
-        substitutions: &HashMap<String, TypeId>,
+        body: &super::callable_contracts::BodyInstance,
     ) {
         for (span, foreach) in self.foreach_loops.clone() {
             if foreach.iterable_family == ForeachIterableFamily::PublicIterable
-                && declaration.contains(span)
+                && body.declaration.contains(span)
             {
-                self.specialize_constrained_method(span, substitutions);
-                let ty = self.types.intern_resolved(&foreach.iterable_type);
-                let ty = self.substitute_type_id(ty, substitutions);
+                self.specialize_constrained_method(span, body);
+                let ty = self
+                    .types
+                    .intern_resolved(&body.substitute(&foreach.iterable_type));
                 if !self.type_is_symbolic(ty) {
                     self.select_public_iteration(ty, span);
                 }
             }
         }
         for (span, calls) in self.core_operation_calls.clone() {
-            if declaration.contains(span) {
+            if body.declaration.contains(span) {
                 for call in calls {
                     let template = self.types.intern_resolved(&call.receiver_type);
-                    let ty = self.substitute_type_id(template, substitutions);
+                    let ty = body.substitute_id(template, &mut self.types);
                     if ty != template && !self.type_is_symbolic(ty) {
                         self.select_core_operation(ty, call.operation, span);
                     }
@@ -997,9 +1233,9 @@ impl Checker<'_> {
             }
         }
         for (span, left, right) in self.pending_relational_comparisons.clone() {
-            if declaration.contains(span) {
-                let left = self.substitute_type_id(left, substitutions);
-                let right = self.substitute_type_id(right, substitutions);
+            if body.declaration.contains(span) {
+                let left = body.substitute_id(left, &mut self.types);
+                let right = body.substitute_id(right, &mut self.types);
                 if !self.type_is_symbolic(left) && !self.type_is_symbolic(right) {
                     self.check_relational_operand_types(left, right, span);
                 }
@@ -1246,12 +1482,8 @@ impl Checker<'_> {
                         is_override: false,
                         virtual_root: None,
                         access: MemberAccess::External,
-                        receiver_mode: Some(if requirement.writable_this {
-                            ReceiverMode::Writable
-                        } else {
-                            ReceiverMode::Readonly
-                        }),
-                        return_borrow: None,
+                        receiver_mode: Some(ReceiverMode::from_declaration(requirement)),
+                        return_borrow: signature.return_borrow,
                         is_static: false,
                         enclosing_type_bindings: HashMap::new(),
                         type_params: signature.type_params,
@@ -1332,6 +1564,15 @@ impl Checker<'_> {
         ty: &TypeRef,
         span: Span,
     ) -> Option<InterfaceType<TypeId>> {
+        self.resolve_interface_edge_in_owner(ty, span, None)
+    }
+
+    pub(super) fn resolve_interface_edge_in_owner(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        owner: Option<&str>,
+    ) -> Option<InterfaceType<TypeId>> {
         if ty.nullable || ty.function.is_some() || self.interface_declaration(&ty.name).is_none() {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -1350,7 +1591,7 @@ impl Checker<'_> {
                 .expect_type_arg_count(ty, 0, span)
                 .then(|| InterfaceType::new(&ty.name, Vec::new()));
         }
-        let resolved = self.resolve_contract_type(ty, span);
+        let resolved = self.resolve_contract_type_in_owner(ty, span, owner);
         match self.types.kind(resolved) {
             TypeKind::Interface(interface) => Some(interface.clone()),
             _ => None,
@@ -1358,145 +1599,19 @@ impl Checker<'_> {
     }
 
     pub(super) fn resolve_contract_type(&mut self, ty: &TypeRef, span: Span) -> TypeId {
-        self.contract_type_depth += 1;
-        let resolved = self.resolve_type_ref_in_position(ty, span, TypePosition::Value, None);
-        self.contract_type_depth -= 1;
-        resolved
+        self.resolve_contract_type_in_owner(ty, span, None)
     }
 
-    /// Nominality depends on authored edges, not member discovery order. Final
-    /// method conformance is checked separately once every signature is known.
-    pub(super) fn type_has_declared_interface(
+    fn resolve_contract_type_in_owner(
         &mut self,
-        ty: TypeId,
-        target: &InterfaceType<TypeId>,
-        visiting: &mut HashSet<String>,
-    ) -> bool {
-        if self.is_core_interface("Iterable") && target.name == "Iterable" {
-            let element = match self.types.kind(ty) {
-                TypeKind::TypedArray(element)
-                | TypeKind::List(element)
-                | TypeKind::Set(element)
-                | TypeKind::SortedSet(element)
-                | TypeKind::Deque(element) => Some(*element),
-                TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value) => {
-                    Some(*value)
-                }
-                _ => None,
-            };
-            if let Some(element) = element {
-                let conforms = target.arguments.as_slice() == [element];
-                if conforms {
-                    self.types.intern(TypeKind::Interface(target.clone()));
-                }
-                return conforms;
-            }
-        }
-        let (name, arguments, parameters, edges) = match self.types.kind(ty).clone() {
-            TypeKind::TypeParameter(parameter) => {
-                let key = format!("parameter:{parameter}");
-                if !visiting.insert(key.clone()) {
-                    return false;
-                }
-                let constraints = self
-                    .type_parameter_scopes
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.get(&parameter))
-                    .cloned()
-                    .unwrap_or_default();
-                let found = constraints.iter().any(|constraint| {
-                    let interface = if self.is_core_interface(&constraint.name)
-                        && matches!(constraint.name.as_str(), "Comparable" | "Equatable")
-                        && constraint.arguments.is_empty()
-                    {
-                        Some(InterfaceType::new(&constraint.name, vec![ty]))
-                    } else {
-                        self.resolve_interface_edge(
-                            constraint,
-                            self.interface_declaration(&constraint.name)
-                                .map_or(Span::new(0, 0), |declaration| declaration.span),
-                        )
-                    };
-                    interface.is_some_and(|interface| {
-                        let resolved = self.types.intern(TypeKind::Interface(interface));
-                        self.type_has_declared_interface(resolved, target, visiting)
-                    })
-                });
-                visiting.remove(&key);
-                return found;
-            }
-            TypeKind::Error => return target.name == "Error" && target.arguments.is_empty(),
-            TypeKind::Interface(interface) => {
-                if &interface == target {
-                    return true;
-                }
-                let Some(declaration) = self.interface_declaration(&interface.name).cloned() else {
-                    return false;
-                };
-                let edges = declaration
-                    .parents
-                    .into_iter()
-                    .zip(declaration.syntax.inheritance_type_spans)
-                    .collect::<Vec<_>>();
-                (
-                    interface.name,
-                    interface.arguments,
-                    declaration.type_params,
-                    edges,
-                )
-            }
-            TypeKind::Class(class) => {
-                let Some(declaration) = self.program.items.iter().find_map(|item| match item {
-                    Item::Class(declaration) if declaration.name == class.name => {
-                        Some(declaration.clone())
-                    }
-                    _ => None,
-                }) else {
-                    return false;
-                };
-                let mut edges = declaration
-                    .implements
-                    .into_iter()
-                    .zip(declaration.syntax.inheritance_type_spans)
-                    .collect::<Vec<_>>();
-                if let Some(parent) = declaration.parent {
-                    edges.push((parent, declaration.parent_span.unwrap_or(declaration.span)));
-                }
-                (class.name, class.arguments, declaration.type_params, edges)
-            }
-            _ => return false,
-        };
-        if !visiting.insert(name.clone()) {
-            return false;
-        }
-        let bindings = parameters
-            .iter()
-            .zip(arguments)
-            .map(|(parameter, ty)| (parameter.name.clone(), ty))
-            .collect::<HashMap<_, _>>();
-        self.type_parameter_scopes
-            .push(type_parameter_scope(&parameters));
-        let found = edges.iter().any(|(edge, span)| {
-            if self.interface_declaration(&edge.name).is_none()
-                && !self.classes.contains_key(&edge.name)
-            {
-                return false;
-            }
-            let resolved = if self.interface_declaration(&edge.name).is_some() {
-                let Some(interface) = self.resolve_interface_edge(edge, *span) else {
-                    return false;
-                };
-                self.types.intern(TypeKind::Interface(interface))
-            } else {
-                self.resolve_contract_type(edge, *span)
-            };
-            let resolved = self.substitute_type_id(resolved, &bindings);
-            self.type_has_declared_interface(resolved, target, visiting)
-        });
-        self.type_parameter_scopes.pop();
-        visiting.remove(&name);
-        found
+        ty: &TypeRef,
+        span: Span,
+        owner: Option<&str>,
+    ) -> TypeId {
+        self.contract_type_depth += 1;
+        let resolved = self.resolve_type_ref_in_position(ty, span, TypePosition::Value, owner);
+        self.contract_type_depth -= 1;
+        resolved
     }
 
     fn canonical_interface_requirements(
@@ -1604,7 +1719,7 @@ impl Checker<'_> {
                 name: name.clone(),
                 accessor: *accessor,
                 origins: vec![(interface.clone(), method.declaration)],
-                method: self.substitute_contract_method(method, &substitutions),
+                method: self.substitute_requirement_method(method, &substitutions),
             })
             .collect::<Vec<_>>();
         let mut member_kinds = HashMap::new();
@@ -1697,6 +1812,23 @@ impl Checker<'_> {
         result
     }
 
+    /// Substitution can turn a requirement's `T` into a region, so a region
+    /// contract is decided from the substituted return type.
+    fn substitute_requirement_method(
+        &mut self,
+        method: &MethodInfo,
+        substitutions: &HashMap<String, TypeId>,
+    ) -> MethodInfo {
+        let mut method = self.substitute_contract_method(method, substitutions);
+        let region =
+            crate::types::ByteRegionKind::from_resolved(&self.types.resolved(method.return_ty));
+        if region.is_some() {
+            method.return_borrow =
+                crate::ownership::requirement_return_borrow(region, method.receiver_mode);
+        }
+        method
+    }
+
     pub(super) fn substitute_contract_method(
         &mut self,
         method: &MethodInfo,
@@ -1707,14 +1839,32 @@ impl Checker<'_> {
             *binding = self.substitute_type_id(*binding, substitutions);
         }
         method.enclosing_type_bindings.extend(substitutions.clone());
-        for parameter in &mut method.params {
-            parameter.ty = self.substitute_type_id(parameter.ty, substitutions);
+        for parameter in &method.type_params {
+            method.enclosing_type_bindings.remove(&parameter.name);
         }
-        method.return_ty = self.substitute_type_id(method.return_ty, substitutions);
-        // A generic borrowed result specialised to Copy has no loan to retain.
-        if !self.type_is_move_type(method.return_ty) {
-            method.return_borrow = None;
+        if method.type_params.is_empty() {
+            for parameter in &mut method.params {
+                parameter.ty = self.substitute_type_id(parameter.ty, substitutions);
+            }
+            method.return_ty = self.substitute_type_id(method.return_ty, substitutions);
+            method.checked_effects = method
+                .checked_effects
+                .iter()
+                .map(|effect| self.substitute_type_id(*effect, substitutions))
+                .collect();
+        } else {
+            let signature = self.bound_method_signature(&method, &method.enclosing_type_bindings);
+            method.params = signature.params;
+            method.return_ty = signature.return_ty;
+            method.checked_effects = signature.checked_effects;
         }
+        if let Some(borrow) =
+            self.return_borrow_for_instance(method.declaration, &method.enclosing_type_bindings)
+        {
+            method.return_borrow = borrow;
+        }
+        method.return_borrow =
+            self.specialize_return_borrow(method.return_borrow, &method.params, method.return_ty);
         // A generic ordinary getter can become callable only after substitution.
         // Its interface contract must retain the same receiver bound as an
         // explicitly spelled callable getter, without borrowing the new carrier.
@@ -1734,6 +1884,7 @@ impl Checker<'_> {
                 source: BorrowSource::Receiver,
                 writable: method.receiver_mode == Some(ReceiverMode::Writable),
                 kind: ReturnBorrowKind::Retained,
+                lifetime: RetainedLifetime::Cleanup,
             });
         }
         if method.declaration.source == crate::compiler_known_contracts::SOURCE_ID
@@ -1750,17 +1901,16 @@ impl Checker<'_> {
                         source: BorrowSource::Receiver,
                         writable: false,
                         kind: ReturnBorrowKind::Value,
+                        lifetime: RetainedLifetime::LastUse,
                     });
         }
-        method.checked_effects = method
-            .checked_effects
-            .iter()
-            .map(|effect| self.substitute_type_id(*effect, substitutions))
-            .collect();
         method
     }
 
-    fn resolved_interface(&self, interface: &InterfaceType<TypeId>) -> InterfaceType<ResolvedType> {
+    pub(super) fn resolved_interface(
+        &self,
+        interface: &InterfaceType<TypeId>,
+    ) -> InterfaceType<ResolvedType> {
         InterfaceType::new(
             &interface.name,
             interface
@@ -1815,7 +1965,9 @@ impl Checker<'_> {
                     .collect(),
                 return_type: self.types.resolved(method.return_ty),
             },
-            writable_receiver: method.receiver_mode == Some(ReceiverMode::Writable),
+            receiver_mode: method
+                .receiver_mode
+                .expect("interface requirements have a receiver"),
             checked_effects: method
                 .checked_effects
                 .iter()
@@ -1837,6 +1989,11 @@ impl Checker<'_> {
             .map(|failure| failure.description())
             .collect::<Vec<_>>()
             .join(", ");
+        let condition = if failures == [ContractMismatch::Availability] {
+            self.callable_condition(method).ok().flatten()
+        } else {
+            None
+        };
         let mut diagnostic = Diagnostic::new(
             "E0755",
             format!(
@@ -1847,11 +2004,25 @@ impl Checker<'_> {
                     None => "method",
                 }
             ),
-            method.declaration,
+            condition
+                .as_ref()
+                .map_or(method.declaration, |condition| condition.clause),
         )
         .with_title("Interface Contract Does Not Match");
+        if condition.is_some() {
+            diagnostic =
+                diagnostic.with_related(method.declaration, "the implementation is declared here");
+        }
         for (_, origin) in &required.origins {
             diagnostic = diagnostic.with_related(*origin, "the required contract is declared here");
+        }
+        if failures.contains(&ContractMismatch::Availability) {
+            if let Ok(Some(condition)) = self.callable_condition(method) {
+                diagnostic = diagnostic.with_related(
+                    condition.clause,
+                    "this implementation's condition must follow from the required contract",
+                );
+            }
         }
         self.diagnostics.push(diagnostic);
     }
@@ -1902,173 +2073,157 @@ impl Checker<'_> {
             let Some(class) = self.class_type(implementing_type) else {
                 continue;
             };
-            let conformances = self.class_interface_closure(&class, &mut HashSet::new());
-            let composition_valid = !self.class_requires_trait_composition(&class.name)
-                && self.class_composition_is_valid(&class.name);
-            for (interface, origin) in conformances.entries {
-                let legacy_diagnostic = matches!(interface.name.as_str(), "Displayable" | "Error")
-                    && self.diagnostics.iter().any(|diagnostic| {
-                        matches!(
-                            diagnostic.code,
-                            "E0463" | "E0613" | "E0614" | "E0615" | "E0616"
-                        ) && diagnostic.span.source == declaration.span.source
-                            && diagnostic.span.start >= declaration.span.start
-                            && diagnostic.span.end <= declaration.span.end
-                    });
-                let requirements =
-                    self.canonical_interface_requirements(&interface, &mut Vec::new());
-                let mut fact = ConformanceFacts {
-                    implementing_type: self.types.resolved(implementing_type),
-                    interface: self.resolved_interface(&interface),
-                    origin,
-                    status: if !conformances.valid || !requirements.valid || !composition_valid {
-                        ConformanceStatus::Invalid
-                    } else if requirements.valid && !legacy_diagnostic {
-                        ConformanceStatus::Checked
-                    } else {
-                        ConformanceStatus::Invalid
-                    },
-                    implementations: Vec::new(),
-                };
-                for mut requirement in requirements.requirements {
-                    // Dependent interface `self` is instantiated by the concrete implementer,
-                    // never by the lexical interface or the method's declaring ancestor.
-                    let requires_exact_return = matches!(
-                        self.types.kind(requirement.method.return_ty),
-                        TypeKind::InterfaceSelf(_)
-                    );
-                    if requires_exact_return {
-                        requirement.method.return_ty = implementing_type;
-                    }
-                    let method = if let Some(kind) = requirement.accessor {
-                        self.lookup_instance_property(&class, &requirement.name)
-                            .and_then(|(owner, property)| {
-                                self.property_accessor_method(&property, &owner, kind)
-                            })
-                    } else {
-                        self.find_concrete_contract_method(&class, &requirement.name)
-                    };
-                    let mut implementation = RequirementImplementation {
-                        requirement_origins: self.requirement_origins(&requirement),
-                        implementation: None,
-                        failures: Vec::new(),
-                        exact_dynamic_return: None,
-                    };
-                    if composition_valid && requirements.valid {
-                        if let Some(method) = method {
-                            implementation.implementation = Some(method.declaration);
-                            implementation.failures =
-                                self.method_contract_failures(&method, &requirement.method);
-                            if requires_exact_return {
-                                let expected = self.types.resolved(implementing_type);
-                                if method.return_borrow.is_none()
-                                    && self.prove_exact_return(
-                                        method.declaration,
-                                        &expected,
-                                        &method.enclosing_type_bindings,
-                                        &mut HashSet::new(),
-                                    )
-                                {
-                                    implementation.exact_dynamic_return = Some(expected);
-                                } else {
-                                    implementation
-                                        .failures
-                                        .push(ContractMismatch::ExactDynamicReturn);
-                                }
-                            }
-                            if !implementation.failures.is_empty() {
-                                fact.status = ConformanceStatus::Invalid;
-                                if !legacy_diagnostic {
-                                    self.report_requirement_mismatch(
-                                        &requirement.name,
-                                        &method,
-                                        &requirement,
-                                        &implementation.failures,
-                                    );
-                                }
-                            }
-                        } else {
-                            fact.status = ConformanceStatus::Invalid;
-                            let mut diagnostic = Diagnostic::new(
-                                "E0754",
-                                format!(
-                                    "class `{}` does not implement required {} `{}`",
-                                    class.name,
-                                    match requirement.accessor {
-                                        Some(crate::ast::PropertyHookKind::Get) => "getter",
-                                        Some(crate::ast::PropertyHookKind::Set) => "setter",
-                                        None => "method",
-                                    },
-                                    requirement.name
-                                ),
-                                declaration.name_span,
-                            )
-                            .with_title("Interface Implementation Is Missing");
-                            for (_, origin) in &requirement.origins {
-                                diagnostic = diagnostic
-                                    .with_related(*origin, "this requirement must be implemented");
-                            }
-                            if !legacy_diagnostic {
-                                self.diagnostics.push(diagnostic);
-                            }
-                        }
-                    }
-                    fact.implementations.push(implementation);
-                }
-                self.contracts.conformances.push(fact);
-            }
+            self.type_parameter_scopes
+                .push(type_parameter_scope(&declaration.type_params));
+            let facts = self.checked_class_conformance_facts(&declaration, &class);
+            self.type_parameter_scopes.pop();
+            self.contracts.conformances.extend(facts);
         }
     }
 
+    fn checked_class_conformance_facts(
+        &mut self,
+        declaration: &ClassDecl,
+        class: &ClassType<TypeId>,
+    ) -> Vec<ConformanceFacts> {
+        let mut facts = Vec::new();
+        let implementing_type = self.types.intern(TypeKind::Class(class.clone()));
+        let conformances = self.class_interface_closure(class, &mut HashSet::new());
+        let composition_valid = !self.class_requires_trait_composition(&class.name)
+            && self.class_composition_is_valid(&class.name);
+        for (interface, origin) in conformances.entries {
+            let legacy_diagnostic = matches!(interface.name.as_str(), "Displayable" | "Error")
+                && self.diagnostics.iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic.code,
+                        "E0463" | "E0613" | "E0614" | "E0615" | "E0616"
+                    ) && diagnostic.span.source == declaration.span.source
+                        && diagnostic.span.start >= declaration.span.start
+                        && diagnostic.span.end <= declaration.span.end
+                });
+            let requirements = self.canonical_interface_requirements(&interface, &mut Vec::new());
+            let mut fact = ConformanceFacts {
+                implementing_type: self.types.resolved(implementing_type),
+                interface: self.resolved_interface(&interface),
+                origin,
+                status: if !conformances.valid || !requirements.valid || !composition_valid {
+                    ConformanceStatus::Invalid
+                } else if requirements.valid && !legacy_diagnostic {
+                    ConformanceStatus::Checked
+                } else {
+                    ConformanceStatus::Invalid
+                },
+                implementations: Vec::new(),
+            };
+            for mut requirement in requirements.requirements {
+                // Dependent interface `self` is instantiated by the concrete implementer,
+                // never by the lexical interface or the method's declaring ancestor.
+                let requires_exact_return = matches!(
+                    self.types.kind(requirement.method.return_ty),
+                    TypeKind::InterfaceSelf(_)
+                );
+                if requires_exact_return {
+                    requirement.method.return_ty = implementing_type;
+                }
+                let method = if let Some(kind) = requirement.accessor {
+                    self.lookup_instance_property(class, &requirement.name)
+                        .and_then(|(owner, property)| {
+                            self.property_accessor_method(&property, &owner, kind)
+                        })
+                } else {
+                    self.find_concrete_contract_method(class, &requirement.name)
+                };
+                let mut implementation = RequirementImplementation {
+                    requirement_origins: self.requirement_origins(&requirement),
+                    implementation: None,
+                    failures: Vec::new(),
+                    exact_dynamic_return: None,
+                };
+                if conformances.valid && composition_valid && requirements.valid {
+                    if let Some(method) = method {
+                        implementation.implementation = Some(method.declaration);
+                        implementation.failures =
+                            self.method_contract_failures(&method, &requirement.method);
+                        if requires_exact_return {
+                            let expected = self.types.resolved(implementing_type);
+                            if method.return_borrow.is_none()
+                                && self.prove_exact_return(
+                                    method.declaration,
+                                    &expected,
+                                    &method.enclosing_type_bindings,
+                                    &mut HashSet::new(),
+                                )
+                            {
+                                implementation.exact_dynamic_return = Some(expected);
+                            } else {
+                                implementation
+                                    .failures
+                                    .push(ContractMismatch::ExactDynamicReturn);
+                            }
+                        }
+                        if !implementation.failures.is_empty() {
+                            fact.status = ConformanceStatus::Invalid;
+                            if !legacy_diagnostic {
+                                self.report_requirement_mismatch(
+                                    &requirement.name,
+                                    &method,
+                                    &requirement,
+                                    &implementation.failures,
+                                );
+                            }
+                        }
+                    } else {
+                        fact.status = ConformanceStatus::Invalid;
+                        let mut diagnostic = Diagnostic::new(
+                            "E0754",
+                            format!(
+                                "class `{}` does not implement required {} `{}`",
+                                class.name,
+                                match requirement.accessor {
+                                    Some(crate::ast::PropertyHookKind::Get) => "getter",
+                                    Some(crate::ast::PropertyHookKind::Set) => "setter",
+                                    None => "method",
+                                },
+                                requirement.name
+                            ),
+                            declaration.name_span,
+                        )
+                        .with_title("Interface Implementation Is Missing");
+                        for (_, origin) in &requirement.origins {
+                            diagnostic = diagnostic
+                                .with_related(*origin, "this requirement must be implemented");
+                        }
+                        if !legacy_diagnostic {
+                            self.diagnostics.push(diagnostic);
+                        }
+                    }
+                }
+                fact.implementations.push(implementation);
+            }
+            facts.push(fact);
+        }
+        facts
+    }
+
     pub(super) fn specialize_conformance_facts(&mut self, classes: &[ClassSemanticInfo]) {
-        let templates = self.contracts.conformances.clone();
         for class in classes.iter().filter(|class| !class.arguments.is_empty()) {
             let Some(declaration) = self.program.items.iter().find_map(|item| match item {
                 Item::Class(declaration) if declaration.name == class.declaration_name => {
-                    Some(declaration)
+                    Some(declaration.clone())
                 }
                 _ => None,
             }) else {
                 continue;
             };
-            let substitutions = declaration
-                .type_params
-                .iter()
-                .zip(&class.arguments)
-                .map(|(parameter, argument)| {
-                    (parameter.name.clone(), self.types.intern_resolved(argument))
-                })
-                .collect::<HashMap<_, _>>();
-            for template in &templates {
-                if !matches!(&template.implementing_type, ResolvedType::Class(implementer) if implementer.name == class.declaration_name)
-                {
-                    continue;
-                }
-                let mut fact = template.clone();
-                let ty = self.types.intern_resolved(&fact.implementing_type);
-                let ty = self.substitute_type_id(ty, &substitutions);
-                fact.implementing_type = self.types.resolved(ty);
-                for implementation in &mut fact.implementations {
-                    if let Some(exact) = &mut implementation.exact_dynamic_return {
-                        let ty = self.types.intern_resolved(exact);
-                        let ty = self.substitute_type_id(ty, &substitutions);
-                        *exact = self.types.resolved(ty);
-                    }
-                }
-                for interface in std::iter::once(&mut fact.interface).chain(
-                    fact.implementations.iter_mut().flat_map(|implementation| {
-                        implementation
-                            .requirement_origins
-                            .iter_mut()
-                            .map(|origin| &mut origin.interface)
-                    }),
-                ) {
-                    for argument in &mut interface.arguments {
-                        let ty = self.types.intern_resolved(argument);
-                        let ty = self.substitute_type_id(ty, &substitutions);
-                        *argument = self.types.resolved(ty);
-                    }
-                }
+            let instance = ClassType::new(
+                &class.declaration_name,
+                class
+                    .arguments
+                    .iter()
+                    .map(|argument| self.types.intern_resolved(argument))
+                    .collect(),
+            );
+            for fact in self.checked_class_conformance_facts(&declaration, &instance) {
                 if !self.contracts.conformances.contains(&fact) {
                     self.contracts.conformances.push(fact);
                 }
@@ -2240,103 +2395,6 @@ impl Checker<'_> {
         None
     }
 
-    fn class_interface_closure(
-        &mut self,
-        class: &ClassType<TypeId>,
-        visiting: &mut HashSet<String>,
-    ) -> ClassConformances {
-        if let Some(cached) = self.class_conformance_cache.get(class) {
-            return cached.clone();
-        }
-        if !visiting.insert(class.name.clone()) {
-            return ClassConformances::default();
-        }
-        let mut result = self
-            .specialized_parent_type(class)
-            .map(|parent| self.class_interface_closure(&parent, visiting))
-            .unwrap_or(ClassConformances {
-                entries: Vec::new(),
-                valid: true,
-            });
-        let declaration = self.program.items.iter().find_map(|item| match item {
-            Item::Class(declaration) if declaration.name == class.name => Some(declaration.clone()),
-            _ => None,
-        });
-        if let Some(declaration) = declaration {
-            let substitutions = self.class_type_substitutions(class);
-            self.type_parameter_scopes
-                .push(type_parameter_scope(&declaration.type_params));
-            for (index, ty) in declaration.implements.iter().enumerate() {
-                let span = declaration
-                    .syntax
-                    .inheritance_type_spans
-                    .get(index)
-                    .copied()
-                    .unwrap_or(declaration.span);
-                let Some(mut interface) = self.resolve_interface_edge(ty, span) else {
-                    result.valid = false;
-                    continue;
-                };
-                interface.arguments = interface
-                    .arguments
-                    .iter()
-                    .map(|ty| self.substitute_type_id(*ty, &substitutions))
-                    .collect();
-                let requirements =
-                    self.canonical_interface_requirements(&interface, &mut Vec::new());
-                result.valid &= requirements.valid;
-                let ancestors = requirements.ancestors;
-                if let Some((previous, previous_span)) = result
-                    .entries
-                    .iter()
-                    .find(|(previous, _)| previous.name == interface.name)
-                {
-                    let description = if previous == &interface {
-                        "repeats an existing conformance"
-                    } else {
-                        "conflicts with an existing specialization"
-                    };
-                    result.valid = false;
-                    if !self
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.code == "E0752" && diagnostic.span == span)
-                    {
-                        self.diagnostics.push(
-                            Diagnostic::new("E0752", format!("`{ty}` {description}"), span)
-                                .with_title("Redundant Or Conflicting Conformance")
-                                .with_related(
-                                    *previous_span,
-                                    "the existing conformance originates here",
-                                ),
-                        );
-                    }
-                    continue;
-                }
-                result.entries.push((interface, span));
-                for ancestor in ancestors {
-                    if let Some((previous, previous_span)) = result
-                        .entries
-                        .iter()
-                        .find(|(previous, _)| previous.name == ancestor.name)
-                    {
-                        if previous != &ancestor {
-                            result.valid = false;
-                            self.diagnostics.push(Diagnostic::new("E0752", format!("different specializations of `{}` cannot be implemented together", ancestor.name), span).with_title("Conflicting Interface Specializations").with_related(*previous_span, "the other specialization originates here"));
-                        }
-                    } else {
-                        result.entries.push((ancestor, span));
-                    }
-                }
-            }
-            self.type_parameter_scopes.pop();
-        }
-        visiting.remove(&class.name);
-        self.class_conformance_cache
-            .insert(class.clone(), result.clone());
-        result
-    }
-
     pub(super) fn class_requires_trait_composition(&self, class: &str) -> bool {
         let mut current = Some(class);
         let mut visited = HashSet::new();
@@ -2467,11 +2525,8 @@ impl Checker<'_> {
                 declaration: required.span,
                 access: required.access,
                 is_static: required.is_static,
-                receiver_mode: (!required.is_static).then_some(if required.writable_this {
-                    ReceiverMode::Writable
-                } else {
-                    ReceiverMode::Readonly
-                }),
+                receiver_mode: (!required.is_static)
+                    .then_some(ReceiverMode::from_declaration(required)),
                 return_borrow: signature.return_borrow,
                 is_open: false,
                 is_override: false,
@@ -2592,7 +2647,9 @@ impl Checker<'_> {
                         Some((&method.name, method.name_span))
                     }
                     ClassMember::Property(property) => {
-                        self.check_trait_type(&property.ty, property.span, &declaration.name);
+                        self.with_declaration_condition(property.span, |checker| {
+                            checker.check_trait_type(&property.ty, property.span, &declaration.name)
+                        });
                         self.collect_property_hook_signatures(
                             property,
                             &declaration.name,
@@ -2711,7 +2768,10 @@ impl Checker<'_> {
     }
 
     fn check_trait_type(&mut self, ty: &TypeRef, span: Span, owner: &str) {
-        self.resolve_type_ref_in_position(ty, span, TypePosition::Value, Some(owner));
+        let ty = self.resolve_type_ref_in_position(ty, span, TypePosition::Value, Some(owner));
+        if crate::compiler_known_stream::contains_call_scoped_request(&self.types.resolved(ty)) {
+            self.report_call_scoped_request(span, "be stored in a trait member");
+        }
     }
 
     pub(super) fn check_trait_bodies(&mut self, declaration: &crate::ast::TraitDecl) {
@@ -2759,23 +2819,18 @@ impl Checker<'_> {
     }
 
     pub(super) fn trait_property(&mut self, owner: &str, name: &str) -> Option<PropertyInfo> {
-        let property =
-            self.trait_declaration(owner)?
-                .members
-                .iter()
-                .find_map(|member| match member {
-                    ClassMember::Property(property)
-                        if property.name == name && !property.is_static =>
-                    {
-                        Some(property.clone())
-                    }
-                    _ => None,
-                })?;
-        let ty = self.resolve_type_ref_with_class(&property.ty, property.span, Some(owner));
+        let ClassMember::Property(property) = self.trait_source_member(owner, name)? else {
+            return None;
+        };
+        if property.is_static {
+            return None;
+        }
+        let property = property.clone();
+        let ty = self.resolve_property_type(&property, owner, property.span);
         Some(PropertyInfo {
             access: property.access,
             writable: property.writable,
-            borrowed_source: false,
+            borrowed_source: None,
             ty,
             init_state: if property.initializer.is_some() {
                 PropertyInitState::HasInitializer
@@ -2792,24 +2847,15 @@ impl Checker<'_> {
     }
 
     pub(super) fn trait_method(&self, owner: &str, name: &str) -> Option<MethodInfo> {
-        let method =
-            self.trait_declaration(owner)?
-                .members
-                .iter()
-                .find_map(|member| match member {
-                    ClassMember::Method(method) if method.name == name => Some(method),
-                    _ => None,
-                })?;
+        let ClassMember::Method(method) = self.trait_source_member(owner, name)? else {
+            return None;
+        };
         let signature = self.function_signatures.get(&method.span)?;
         Some(MethodInfo {
             declaration: method.span,
             access: method.access,
             is_static: method.is_static,
-            receiver_mode: (!method.is_static).then_some(if method.writable_this {
-                ReceiverMode::Writable
-            } else {
-                ReceiverMode::Readonly
-            }),
+            receiver_mode: (!method.is_static).then_some(ReceiverMode::from_declaration(method)),
             return_borrow: signature.return_borrow,
             is_open: false,
             is_override: false,
@@ -2820,6 +2866,24 @@ impl Checker<'_> {
             return_ty: signature.return_ty,
             checked_effects: signature.checked_effects.clone(),
         })
+    }
+
+    fn trait_source_member(&self, owner: &str, name: &str) -> Option<&ClassMember> {
+        let authored = &self.trait_declaration(owner)?.members;
+        let imported: &[ClassMember] = match self.callable_body_program {
+            CallableBodyProgram::Expanded(_) => &[],
+            CallableBodyProgram::Authored(_) => self.composition.source_trait_members.get(owner)?,
+        };
+        let mut matches = authored
+            .iter()
+            .chain(imported)
+            .filter(|member| crate::trait_composition::member_name(member) == name);
+        let member = matches.next()?;
+        // Ambiguous contributions still need the shared coherence decision.
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(member)
     }
 
     fn check_adaptation_namespace(&mut self, members: &[ClassMember]) -> bool {
@@ -2917,7 +2981,14 @@ impl Checker<'_> {
                     constraints: parameter.constraints.clone(),
                 })
                 .collect::<Vec<_>>();
-            self.check_class_type_constraints(&declaration.name, &parameters, &arguments, *span);
+            if !self.check_nominal_type_constraints(
+                &declaration.name,
+                &parameters,
+                &arguments,
+                *span,
+            ) {
+                continue;
+            }
             edges.push(ContractEdge {
                 authored_type: ty.clone(),
                 specialization: crate::types::NominalType::new(
@@ -3069,46 +3140,47 @@ impl Checker<'_> {
         required: &MethodInfo,
     ) -> Vec<ContractMismatch> {
         let mut failures = Vec::new();
+        if !self.callable_availability_preserved(method, required) {
+            failures.push(ContractMismatch::Availability);
+        }
         let generic_valid = method.type_params.len() == required.type_params.len()
             && self.normalized_method_constraints(method)
                 == self.normalized_method_constraints(required);
         if !generic_valid {
             failures.push(ContractMismatch::GenericParameters);
         }
-        let substitutions = method
-            .type_params
-            .iter()
-            .zip(&required.type_params)
-            .map(|(actual, required)| {
-                (
-                    actual.name.clone(),
-                    self.types
-                        .intern(TypeKind::TypeParameter(required.name.clone())),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let bindings = self.normalized_method_bindings(method);
+        let actual_signature = self.bound_method_signature(method, &bindings);
+        let bindings = self.normalized_method_bindings(required);
+        let required_signature = self.bound_method_signature(required, &bindings);
         if method.params.len() != required.params.len() {
             failures.push(ContractMismatch::ParameterCount);
         }
-        for (actual, expected) in method.params.iter().zip(&required.params) {
+        for (actual, expected) in actual_signature
+            .params
+            .iter()
+            .zip(&required_signature.params)
+        {
             if actual.name != expected.name {
                 failures.push(ContractMismatch::ParameterNames);
             }
-            if self.substitute_type_id(actual.ty, &substitutions) != expected.ty {
+            if actual.ty != expected.ty {
                 failures.push(ContractMismatch::ParameterTypes);
             }
             if actual.take != expected.take || actual.writable != expected.writable {
                 failures.push(ContractMismatch::ParameterOwnership);
             }
         }
-        if matches!(
-            (required.receiver_mode, method.receiver_mode),
-            (Some(ReceiverMode::Readonly), Some(ReceiverMode::Writable))
-        ) {
+        let receiver_matches = match (method.receiver_mode, required.receiver_mode) {
+            (Some(actual), Some(required)) => actual.can_override(required),
+            (actual, required) => actual == required,
+        };
+        if !receiver_matches {
             failures.push(ContractMismatch::Receiver);
         }
-        let actual_return = self.substitute_type_id(method.return_ty, &substitutions);
-        if !self.override_return_is_compatible(required.return_ty, actual_return) {
+        if !self
+            .override_return_is_compatible(required_signature.return_ty, actual_signature.return_ty)
+        {
             failures.push(ContractMismatch::ReturnType);
         }
         if !match (required.return_borrow, method.return_borrow) {
@@ -3117,6 +3189,7 @@ impl Checker<'_> {
             (Some(expected), Some(actual)) => {
                 expected.kind == actual.kind
                     && expected.source == actual.source
+                    && expected.lifetime.accepts(actual.lifetime)
                     && expected
                         .kind
                         .accepts_writable(expected.writable, actual.writable)
@@ -3125,14 +3198,9 @@ impl Checker<'_> {
         } {
             failures.push(ContractMismatch::ReturnProvenance);
         }
-        let actual_effects = method
-            .checked_effects
-            .iter()
-            .map(|effect| self.substitute_type_id(*effect, &substitutions))
-            .collect::<Vec<_>>();
-        if !actual_effects.iter().all(|actual| {
+        if !actual_signature.checked_effects.iter().all(|actual| {
             crate::checked_effects::is_automatic_effect(&self.types.resolved(*actual))
-                || self.checked_error_type_covers(&required.checked_effects, *actual)
+                || self.checked_error_type_covers(&required_signature.checked_effects, *actual)
         }) {
             failures.push(ContractMismatch::CheckedEffects);
         }
@@ -3154,18 +3222,11 @@ impl Checker<'_> {
         failures
     }
 
-    fn normalized_method_constraints(
+    pub(super) fn normalized_method_constraints(
         &mut self,
         method: &MethodInfo,
     ) -> Vec<HashSet<(String, Vec<TypeId>)>> {
-        let mut bindings = method.enclosing_type_bindings.clone();
-        for (index, parameter) in method.type_params.iter().enumerate() {
-            bindings.insert(
-                parameter.name.clone(),
-                self.types
-                    .intern(TypeKind::TypeParameter(format!("#method{index}"))),
-            );
-        }
+        let bindings = self.normalized_method_bindings(method);
         self.type_parameter_scopes.push(
             bindings
                 .keys()
@@ -3202,6 +3263,61 @@ impl Checker<'_> {
             .collect();
         self.type_parameter_scopes.pop();
         result
+    }
+
+    pub(super) fn normalized_method_bindings(
+        &mut self,
+        method: &MethodInfo,
+    ) -> HashMap<String, TypeId> {
+        let mut bindings = method.enclosing_type_bindings.clone();
+        for (index, parameter) in method.type_params.iter().enumerate() {
+            bindings.insert(
+                parameter.name.clone(),
+                self.types
+                    .intern(TypeKind::TypeParameter(format!("#method{index}"))),
+            );
+        }
+        bindings
+    }
+
+    pub(super) fn method_signature_template(&self, method: &MethodInfo) -> FunctionInfo {
+        if !method.type_params.is_empty() {
+            if let Some(signature) = self.function_signatures.get(&method.declaration) {
+                return signature.clone();
+            }
+        }
+        // Compiler-known methods carry their signature directly.
+        FunctionInfo {
+            declaration: method.declaration,
+            type_params: method.type_params.clone(),
+            params: method.params.clone(),
+            return_ty: method.return_ty,
+            return_borrow: method.return_borrow,
+            checked_effects: method.checked_effects.clone(),
+        }
+    }
+
+    fn bound_method_signature(
+        &mut self,
+        method: &MethodInfo,
+        bindings: &HashMap<String, TypeId>,
+    ) -> FunctionInfo {
+        // Bind the authored template once: an owner replacement can have the
+        // same spelling as a method parameter without becoming that parameter.
+        let mut signature = self.method_signature_template(method);
+        if method.type_params.is_empty() {
+            return signature;
+        }
+        for parameter in &mut signature.params {
+            parameter.ty = self.substitute_type_id(parameter.ty, bindings);
+        }
+        signature.return_ty = self.substitute_type_id(signature.return_ty, bindings);
+        signature.checked_effects = signature
+            .checked_effects
+            .iter()
+            .map(|effect| self.substitute_type_id(*effect, bindings))
+            .collect();
+        signature
     }
 }
 

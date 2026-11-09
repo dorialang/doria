@@ -1,0 +1,31 @@
+use Doria\Std\Io\ByteRegion;
+
+function empty(Bytes $source): ?ByteRegion {
+    return $source->getRegion(0, 0);
+}
+
+function apply(function(ByteRegion): ByteRegion $call, ByteRegion $view): ByteRegion {
+    return $call($view);
+}
+
+function main(): void {
+    let $bytes = Bytes::allocate(0);
+    ?ByteRegion $view = empty($bytes);
+    if ($view != null) {
+        echo "present {$view->length}\n";
+    }
+    let $copy = $view;
+    let $forward = fn(ByteRegion $source) => $source;
+    let $result = apply($forward, $copy ?? $bytes->getRegion(0, 0));
+    echo "callback {$result->length}\n";
+    {
+        let $read = fn() with (take $result) => $result->length;
+        echo "capture {$read()}\n";
+    }
+    ?ByteRegion $missing = null;
+    if ($missing == null) {
+        echo "absent\n";
+    }
+    let $fallback = $missing ?? $bytes->getRegion(0, 0);
+    echo "fallback {$fallback->length}\n";
+}

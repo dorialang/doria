@@ -8,6 +8,9 @@ use crate::source::Span;
 use crate::symbols::{BindingId, BorrowSource, ClosureId, LexicalOwner};
 use crate::types::{FunctionTypeParameterMode, ResolvedType};
 
+mod argument_places;
+pub(crate) use argument_places::argument_place_bindings;
+
 #[derive(Debug, Clone)]
 pub(crate) struct PhpClosureDescriptor {
     pub(crate) closure_id: ClosureId,
@@ -35,7 +38,8 @@ pub(crate) struct PhpClosurePlan {
     pub(crate) semantic_closures: HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     pub(crate) ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
     pub(crate) callable_value_calls: HashMap<Span, crate::semantics::CallableValueCallInfo>,
-    pub(crate) property_write_types: HashMap<Span, ResolvedType>,
+    indirect_call_types: HashMap<(mir::ClosureOwner, Span), mir::FunctionTypeId>,
+    pub(crate) callable_return_borrows: HashMap<mir::FunctionId, Option<mir::ReturnBorrow>>,
     pub(crate) callables: HashMap<Span, PhpCallablePlan>,
     pub(crate) source_callables: HashMap<Span, PhpCallablePlan>,
     pub(crate) call_targets: HashMap<Span, Span>,
@@ -52,9 +56,18 @@ pub(crate) struct PhpCallableParameter {
 #[derive(Debug, Clone)]
 pub(crate) struct PhpCallablePlan {
     pub(crate) parameters: Vec<PhpCallableParameter>,
+    pub(crate) consumes_receiver: bool,
     // True only when the returned carrier is borrowed. An owned closure may
     // retain source borrows without lending its carrier or environment.
     pub(crate) returns_borrow: bool,
+    pub(crate) receiver_home: bool,
+    pub(crate) lifecycle_receiver: bool,
+}
+
+impl PhpCallablePlan {
+    pub(crate) fn caller_receiver_home(&self) -> bool {
+        self.receiver_home && !self.lifecycle_receiver
+    }
 }
 
 impl PhpClosurePlan {
@@ -118,14 +131,7 @@ impl PhpClosurePlan {
             .binding_resolution
             .declarations_by_id
             .values()
-            .filter(|declaration| {
-                declaration
-                    .source_type
-                    .as_ref()
-                    .is_some_and(requires_owned_cell)
-                    && (declaration.ownership == crate::symbols::BindingOwnership::Owned
-                        || declaration.writable)
-            })
+            .filter(|declaration| requires_binding_cell(declaration, &program.semantic_info.enums))
             .map(|declaration| declaration.id)
             .collect::<HashSet<_>>();
 
@@ -156,31 +162,78 @@ impl PhpClosurePlan {
             }
         }
 
-        mark_parameter_home_bindings(program, &mut cell_bindings);
+        // Returned parameter homes are selected again for each concrete callable.
         let binding_homes = cell_bindings.clone();
+        mark_parameter_home_bindings(program, &mut cell_bindings);
         let (source_callables, callables) = collect_callable_plans(program, &cell_bindings);
         let call_targets = collect_call_targets(program);
         mark_call_argument_places(program, &callables, &call_targets, &mut cell_bindings);
 
-        let property_write_types = program
-            .semantic_info
-            .property_writes
+        let property_initializers = program
+            .items
             .iter()
-            .filter_map(|(span, write)| {
-                program
-                    .semantic_info
-                    .classes
-                    .iter()
-                    .find(|class| class.name == write.class_name)
-                    .and_then(|class| {
-                        class
-                            .properties
-                            .iter()
-                            .find(|property| property.name == write.property_name)
-                    })
-                    .map(|property| (*span, property.ty.clone()))
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(class),
+                _ => None,
             })
-            .collect();
+            .flat_map(|class| {
+                class.members.iter().filter_map(move |member| match member {
+                    ClassMember::Property(property) => property
+                        .initializer
+                        .as_ref()
+                        .map(|value| ((class.name.as_str(), property.name.as_str()), value.span())),
+                    _ => None,
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut indirect_call_types = HashMap::new();
+        for function in mir.into_iter().flat_map(|program| &program.functions) {
+            let owner = function
+                .closure
+                .as_ref()
+                .map_or(mir::ClosureOwner::Callable(function.id), |closure| {
+                    descriptors[&closure.descriptor].source_instance
+                });
+            for block in &function.blocks {
+                let (span, function_type) = match &block.terminator {
+                    mir::Terminator::IndirectCall {
+                        callee: mir::IndirectCallee::Closure(_),
+                        span,
+                        function_type,
+                        ..
+                    }
+                    | mir::Terminator::CheckedIndirectCall {
+                        callee: mir::IndirectCallee::Closure(_),
+                        span,
+                        function_type,
+                        ..
+                    } => (*span, *function_type),
+                    _ => continue,
+                };
+                indirect_call_types.insert((owner, span), function_type);
+                if let Some(method) = function
+                    .method
+                    .as_ref()
+                    .filter(|method| method.name == "__construct")
+                {
+                    for property in &program.semantic_info.classes[method.class.0].properties {
+                        if property_initializers
+                            .get(&(property.declaring_class.as_str(), property.name.as_str()))
+                            .is_some_and(|initializer| {
+                                initializer.source == span.source
+                                    && initializer.start <= span.start
+                                    && span.end <= initializer.end
+                            })
+                        {
+                            indirect_call_types.insert(
+                                (mir::ClosureOwner::PropertyInitializer(property.id), span),
+                                function_type,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         Self {
             descriptors,
@@ -203,7 +256,12 @@ impl PhpClosurePlan {
             semantic_closures: program.semantic_info.closures.clone(),
             ownership: program.semantic_info.closure_ownership.clone(),
             callable_value_calls: program.semantic_info.callable_value_calls.clone(),
-            property_write_types,
+            indirect_call_types,
+            callable_return_borrows: mir
+                .into_iter()
+                .flat_map(|program| &program.functions)
+                .map(|function| (function.id, function.return_borrow))
+                .collect(),
             callables,
             source_callables,
             call_targets,
@@ -249,6 +307,23 @@ impl PhpClosurePlan {
             .expect("validated MIR must describe every closure function type")
     }
 
+    pub(crate) fn parameter_uses_cell(&self, function: mir::FunctionTypeId, index: usize) -> bool {
+        parameter_uses_cell(self.function_type(function), index)
+    }
+
+    pub(crate) fn callable_value_type(
+        &self,
+        owner: Option<mir::ClosureOwner>,
+        span: Span,
+    ) -> &mir::FunctionType {
+        let owner = owner.expect("callable invocation requires its concrete owner");
+        let id = self
+            .indirect_call_types
+            .get(&(owner, span))
+            .expect("validated MIR must describe every callable invocation");
+        self.function_type(*id)
+    }
+
     pub(crate) fn layout(
         &self,
         id: mir::ClosureEnvironmentLayoutId,
@@ -257,6 +332,22 @@ impl PhpClosurePlan {
             .get(&id)
             .expect("validated MIR must describe every closure environment")
     }
+}
+
+pub(crate) fn parameter_uses_cell(function: &mir::FunctionType, index: usize) -> bool {
+    function.parameters[index].mode == mir::FunctionParameterMode::Writable
+        || (function.parameters[index].mode == mir::FunctionParameterMode::Take
+            && function.parameters[index].ty.requires_owned_cleanup())
+        || function.return_borrow.is_some_and(|borrow| {
+            borrow.kind == mir::ReturnBorrowKind::Value
+                && !matches!(
+                    function.return_type,
+                    mir::ReturnType::Value(
+                        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
+                    )
+                )
+                && borrow.source == mir::BorrowSource::Parameter(index)
+        })
 }
 
 fn collect_closures(program: &hir::Program) -> HashMap<ClosureId, hir::ClosureExpression> {
@@ -409,6 +500,13 @@ fn mark_callable_parameter_homes(
     let Some(borrow) = program.semantic_info.return_borrows.get(&function.span) else {
         return;
     };
+    if borrow.kind != crate::types::ReturnBorrowKind::Value
+        || !borrowed_value_uses_cell(
+            &program.semantic_info.callable_signatures[&function.span].return_type,
+        )
+    {
+        return;
+    }
     let BorrowSource::Parameter(index) = borrow.source else {
         return;
     };
@@ -434,7 +532,7 @@ fn mark_call_argument_places(
                 .get(&call.span)
                 .map(|call| &call.function_type)
             {
-                mark_mode_arguments(&call.args, &function_type.parameters, program, cells);
+                mark_mode_arguments(&call.args, function_type, program, cells);
             }
         }
         Expr::FunctionCall { args, span, .. }
@@ -475,15 +573,22 @@ fn collect_callable_plans(
             Item::Enum(_) | Item::Constant(_) | Item::Statement(_) => {}
         }
     }
-    let source_callables = callables.clone();
+    let mut source_callables = callables.clone();
     // An erased requirement and every checked implementation must agree on
     // the parameter home ABI, including homes needed for returned borrows.
     for interface in &program.semantic_info.contracts.interface_specializations {
         for requirement in &interface.requirements {
+            let returns_borrow = requirement.return_borrow.is_some_and(|borrow| {
+                borrow.kind == crate::types::ReturnBorrowKind::Value
+                    && borrowed_value_uses_cell(&requirement.signature.return_type)
+            });
             let plan = PhpCallablePlan {
-                returns_borrow: requirement
-                    .return_borrow
-                    .is_some_and(|borrow| borrow.kind == crate::types::ReturnBorrowKind::Value),
+                consumes_receiver: requirement.receiver_mode.is_consuming(),
+                lifecycle_receiver: false,
+                returns_borrow,
+                receiver_home: requirement.return_borrow.is_some_and(|borrow| {
+                    returns_borrow && borrow.source == BorrowSource::Receiver
+                }),
                 parameters: requirement
                     .signature
                     .parameters
@@ -491,11 +596,14 @@ fn collect_callable_plans(
                     .enumerate()
                     .map(|(index, parameter)| PhpCallableParameter {
                         name: parameter.name.clone(),
-                        cell: (requires_owned_cell(&parameter.r#type)
-                            && (parameter.take || parameter.writable))
-                            || requirement.return_borrow.is_some_and(|borrow| {
-                                borrow.source == BorrowSource::Parameter(index)
-                            }),
+                        cell: requires_parameter_cell(
+                            &parameter.r#type,
+                            parameter.take,
+                            parameter.writable,
+                            &program.semantic_info.enums,
+                        ) || requirement.return_borrow.is_some_and(|borrow| {
+                            returns_borrow && borrow.source == BorrowSource::Parameter(index)
+                        }),
                         take: parameter.take,
                     })
                     .collect(),
@@ -532,7 +640,11 @@ fn collect_callable_plans(
                         .zip(&requirement_plan.parameters)
                         .map(|(body, requirement)| body.cell || requirement.cell)
                         .collect::<Vec<_>>();
+                    let receiver_home = body_plan.receiver_home || requirement_plan.receiver_home;
                     for target in [body, origin.declaration] {
+                        let plan = callables.get_mut(&target).unwrap();
+                        changed |= plan.receiver_home != receiver_home;
+                        plan.receiver_home = receiver_home;
                         for (parameter, cell) in callables
                             .get_mut(&target)
                             .unwrap()
@@ -547,9 +659,99 @@ fn collect_callable_plans(
                 }
             }
         }
+        for method in program.semantic_info.method_hierarchy.values() {
+            let Some(root) = method.virtual_root else {
+                continue;
+            };
+            let (Some(body), Some(root_plan)) =
+                (callables.get(&method.declaration), callables.get(&root))
+            else {
+                continue;
+            };
+            let home = body.receiver_home || root_plan.receiver_home;
+            for target in [method.declaration, root] {
+                let plan = callables.get_mut(&target).unwrap();
+                changed |= plan.receiver_home != home;
+                plan.receiver_home = home;
+            }
+        }
+        let targets = collect_call_targets(program);
+        let mut receiver_callers = HashSet::new();
+        hir::visit::expressions(program, &mut |expr| {
+            let (object, target) = match expr {
+                Expr::MethodCall { object, span, .. } => {
+                    (Some(object.as_ref()), targets.get(span).copied())
+                }
+                Expr::PropertyAccess { object, span, .. } => (
+                    Some(object.as_ref()),
+                    program
+                        .semantic_info
+                        .property_accessor_calls
+                        .get(span)
+                        .and_then(|calls| calls.getter.as_ref())
+                        .map(|getter| getter.declaration),
+                ),
+                Expr::StaticCall { span, .. }
+                    if program
+                        .semantic_info
+                        .method_call_targets
+                        .get(span)
+                        .is_some_and(|call| call.direct_parent) =>
+                {
+                    (None, targets.get(span).copied())
+                }
+                _ => return,
+            };
+            if !target
+                .and_then(|target| callables.get(&target))
+                .is_some_and(|plan| plan.receiver_home)
+            {
+                return;
+            }
+            let Some(mut object) = object else {
+                if let Some(owner) = program
+                    .semantic_info
+                    .method_hierarchy
+                    .keys()
+                    .filter(|owner| owner.contains(expr.span()))
+                    .min_by_key(|owner| owner.end - owner.start)
+                {
+                    receiver_callers.insert(*owner);
+                }
+                return;
+            };
+            while let Expr::Grouped { expr, .. } = object {
+                object = expr;
+            }
+            if !matches!(object, Expr::This { .. }) {
+                return;
+            }
+            let Some(binding) = binding_used_at(program, object.span()) else {
+                return;
+            };
+            if let Some(declaration) = program
+                .semantic_info
+                .binding_resolution
+                .declarations_by_id
+                .get(&binding)
+            {
+                if let LexicalOwner::Callable(owner) = declaration.owner {
+                    receiver_callers.insert(owner);
+                }
+            }
+        });
+        for caller in receiver_callers {
+            if let Some(plan) = callables.get_mut(&caller) {
+                changed |= !plan.receiver_home;
+                plan.receiver_home = true;
+            }
+        }
         if !changed {
             break;
         }
+    }
+    for (span, source) in &mut source_callables {
+        source.receiver_home = callables[span].receiver_home;
     }
     (source_callables, callables)
 }
@@ -559,20 +761,68 @@ fn callable_plan(
     program: &hir::Program,
     cells: &HashSet<BindingId>,
 ) -> PhpCallablePlan {
+    let returns_borrow = program
+        .semantic_info
+        .return_borrows
+        .get(&function.span)
+        .is_some_and(|borrow| {
+            borrow.kind == crate::types::ReturnBorrowKind::Value
+                && borrowed_value_uses_cell(
+                    &program.semantic_info.callable_signatures[&function.span].return_type,
+                )
+        });
     PhpCallablePlan {
-        returns_borrow: program
+        consumes_receiver: function.consuming_this,
+        lifecycle_receiver: matches!(function.name.as_str(), "__construct" | "__destruct")
+            && program
+                .semantic_info
+                .binding_resolution
+                .receiver_for_callable(function.span)
+                .is_some(),
+        receiver_home: program
             .semantic_info
             .return_borrows
             .get(&function.span)
-            .is_some_and(|borrow| borrow.kind == crate::types::ReturnBorrowKind::Value),
+            .is_some_and(|borrow| returns_borrow && borrow.source == BorrowSource::Receiver),
+        returns_borrow,
         parameters: function
             .params
             .iter()
-            .map(|parameter| {
+            .enumerate()
+            .map(|(index, parameter)| {
                 let binding = binding_declared_in_span(program, &parameter.name, parameter.span);
+                let copies = program
+                    .semantic_info
+                    .callable_signatures
+                    .get(&function.span)
+                    .and_then(|signature| signature.parameters.get(index))
+                    .is_some_and(|parameter| {
+                        parameter_copies_value(&parameter.r#type, &program.semantic_info.enums)
+                    });
+                let lends = program
+                    .semantic_info
+                    .return_borrows
+                    .get(&function.span)
+                    .is_some_and(|borrow| {
+                        returns_borrow && borrow.source == BorrowSource::Parameter(index)
+                    });
+                let retains_writable_place = program
+                    .semantic_info
+                    .retained_callables
+                    .get(&function.span)
+                    .is_some_and(|plan| {
+                        plan.constructs.iter().any(|source| {
+                            source.source == BorrowSource::Parameter(index)
+                                && !source.inherited
+                                && source.writable
+                        })
+                    });
                 PhpCallableParameter {
                     name: parameter.name.clone(),
-                    cell: binding.is_some_and(|binding| cells.contains(&binding)),
+                    cell: lends
+                        || retains_writable_place
+                        || ((!copies || parameter.take)
+                            && binding.is_some_and(|binding| cells.contains(&binding))),
                     take: parameter.take,
                 }
             })
@@ -655,26 +905,35 @@ fn mark_callable_arguments(
             .get(index)
             .is_some_and(|parameter| parameter.cell)
         {
-            if let Some(binding) = binding_used_at(program, argument.value.span()) {
-                cells.insert(binding);
-            }
+            cells.extend(argument_place_bindings(program, &argument.value));
         }
     }
 }
 
 fn mark_mode_arguments(
     args: &[hir::Argument],
-    parameters: &[crate::types::SemanticFunctionParameter<ResolvedType>],
+    function: &crate::types::SemanticFunctionType<ResolvedType>,
     program: &hir::Program,
     cells: &mut HashSet<BindingId>,
 ) {
-    for (argument, parameter) in args.iter().zip(parameters) {
-        if parameter.ownership_mode == FunctionTypeParameterMode::Writable {
-            if let Some(binding) = binding_used_at(program, argument.value.span()) {
-                cells.insert(binding);
-            }
+    for (index, (argument, parameter)) in args.iter().zip(&function.parameters).enumerate() {
+        if parameter.ownership_mode == FunctionTypeParameterMode::Writable
+            || function_parameter_requires_return_home(function, index)
+        {
+            cells.extend(argument_place_bindings(program, &argument.value));
         }
     }
+}
+
+pub(crate) fn function_parameter_requires_return_home(
+    function: &crate::types::SemanticFunctionType<ResolvedType>,
+    index: usize,
+) -> bool {
+    function.return_borrow.is_some_and(|borrow| {
+        borrow.kind == crate::types::ReturnBorrowKind::Value
+            && borrowed_value_uses_cell(&function.return_type)
+            && borrow.source == crate::types::FunctionBorrowSource::Parameter(index)
+    })
 }
 
 pub(crate) fn binding_used_at(
@@ -687,6 +946,15 @@ pub(crate) fn binding_used_at(
         .uses_by_span
         .get(&span)
         .copied()
+}
+
+pub(crate) fn place_root_binding(program: &hir::Program, expr: &Expr) -> Option<BindingId> {
+    match expr {
+        Expr::Grouped { expr, .. } => place_root_binding(program, expr),
+        Expr::Index { collection, .. } => place_root_binding(program, collection),
+        Expr::PropertyAccess { object, .. } => place_root_binding(program, object),
+        _ => binding_used_at(program, expr.span()),
+    }
 }
 
 pub(crate) fn binding_declared_in_span(
@@ -708,16 +976,54 @@ pub(crate) fn binding_declared_in_span(
         .map(|declaration| declaration.id)
 }
 
+pub(crate) fn requires_binding_cell(
+    declaration: &crate::symbols::BindingDeclaration,
+    enums: &[crate::semantics::EnumSemanticInfo],
+) -> bool {
+    let Some(ty) = &declaration.source_type else {
+        return false;
+    };
+    let parameter = matches!(
+        declaration.kind,
+        crate::symbols::BindingKind::FunctionParameter
+            | crate::symbols::BindingKind::MethodParameter
+            | crate::symbols::BindingKind::ClosureParameter
+    );
+    let mut inner = ty;
+    while let ResolvedType::Nullable(value) = inner {
+        inner = value;
+    }
+    // Applications are classified per instance; a symbolic one keeps a cell.
+    if let ResolvedType::Enum(ty) = inner {
+        // Trivial Copy bindings, including named parameters, are independent
+        // values. Capture and loan consumers mark actual shared homes below.
+        if enums
+            .iter()
+            .find(|definition| definition.source_type == *ty)
+            .is_some_and(|definition| definition.capabilities.trivial_copy)
+        {
+            return false;
+        }
+    }
+    (requires_owned_cell(ty) && declaration.ownership == crate::symbols::BindingOwnership::Owned)
+        || (declaration.ownership != crate::symbols::BindingOwnership::Owned
+            && !parameter
+            && requires_writable_cell(ty))
+        || (declaration.writable && requires_writable_cell(ty))
+}
+
 pub(crate) fn requires_owned_cell(ty: &ResolvedType) -> bool {
     match ty {
         ResolvedType::Interface(_)
         | ResolvedType::InterfaceSelf(_)
         | ResolvedType::Error
-        | ResolvedType::Class(_)
         | ResolvedType::Enum(_)
         | ResolvedType::Mixed
         | ResolvedType::SharedHandle(_, _)
         | ResolvedType::Function(_) => true,
+        ResolvedType::Class(class) => class
+            .inline_copy_type()
+            .is_none_or(|kind| kind.requires_owned_cleanup()),
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
         | ResolvedType::List(inner)
@@ -729,5 +1035,139 @@ pub(crate) fn requires_owned_cell(ty: &ResolvedType) -> bool {
             requires_owned_cell(key) || requires_owned_cell(value)
         }
         _ => false,
+    }
+}
+
+pub(crate) fn parameter_copies_value(
+    ty: &ResolvedType,
+    enums: &[crate::semantics::EnumSemanticInfo],
+) -> bool {
+    match ty {
+        ResolvedType::Nullable(inner) => parameter_copies_value(inner, enums),
+        // Applications are classified per instance; a symbolic one is not Copy.
+        ResolvedType::Enum(ty) => enums
+            .iter()
+            .find(|definition| definition.source_type == *ty)
+            .is_some_and(|definition| definition.capabilities.copy),
+        ResolvedType::TypeParameter(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_) => false,
+        _ => !crate::ownership::resolved_type_is_move_type(
+            ty,
+            &crate::ownership::MoveEnums::default(),
+        ),
+    }
+}
+
+pub(crate) fn borrowed_value_uses_cell(ty: &ResolvedType) -> bool {
+    match ty {
+        ResolvedType::Nullable(inner) => borrowed_value_uses_cell(inner),
+        // Regions retain storage provenance in their inline descriptor, not an
+        // address of the caller's descriptor binding.
+        ResolvedType::ByteRegion(_) => false,
+        _ => true,
+    }
+}
+
+pub(crate) fn requires_parameter_cell(
+    ty: &ResolvedType,
+    take: bool,
+    writable: bool,
+    enums: &[crate::semantics::EnumSemanticInfo],
+) -> bool {
+    let mut payload = ty;
+    while let ResolvedType::Nullable(inner) = payload {
+        payload = inner;
+    }
+    let ownership_cell = match payload {
+        ResolvedType::Enum(ty) => !enums
+            .iter()
+            .find(|definition| definition.source_type == *ty)
+            .is_some_and(|definition| definition.capabilities.trivial_copy),
+        _ => requires_owned_cell(ty),
+    };
+    (take && ownership_cell)
+        || (writable && !parameter_copies_value(ty, enums) && requires_writable_cell(ty))
+}
+
+pub(crate) fn requires_writable_cell(ty: &ResolvedType) -> bool {
+    match ty {
+        // PHP arrays have value semantics. Their writable Doria loans must
+        // share a stable home even when every element is a Copy scalar.
+        ResolvedType::Bytes
+        | ResolvedType::TypedArray(_)
+        | ResolvedType::List(_)
+        | ResolvedType::Dictionary(_, _)
+        | ResolvedType::SortedDictionary(_, _)
+        | ResolvedType::Set(_)
+        | ResolvedType::SortedSet(_)
+        | ResolvedType::PriorityQueue(_)
+        | ResolvedType::Deque(_) => true,
+        ResolvedType::Nullable(inner) => requires_writable_cell(inner),
+        _ => requires_owned_cell(ty),
+    }
+}
+
+#[cfg(test)]
+mod parameter_home_tests {
+    use super::*;
+
+    #[test]
+    fn region_returns_keep_provenance_without_descriptor_parameter_homes() {
+        let program = crate::lower_source(
+            "region-parameter-homes.doria",
+            r#"
+use Doria\Std\Io\{ByteRegion, WritableByteRegion};
+class Token {}
+function forward(ByteRegion $value): ByteRegion { return $value; }
+function optional(?ByteRegion $value): ?ByteRegion { return $value; }
+function writableForward(writable WritableByteRegion $value): WritableByteRegion {
+    let $length = $value->length;
+    return $value->getWritableRegion(0, $length);
+}
+function objectBorrow(Token $value): Token { return $value; }
+"#,
+        )
+        .unwrap();
+        let plans = PhpClosurePlan::build(&program, None);
+        for item in &program.items {
+            let Item::Function(function) = item else {
+                continue;
+            };
+            let home = &plans.source_callables[&function.span];
+            let expected = function.name == "objectBorrow";
+            assert_eq!(home.returns_borrow, expected, "{}", function.name);
+            assert_eq!(home.parameters[0].cell, expected, "{}", function.name);
+        }
+    }
+
+    #[test]
+    fn taken_trivial_copy_enums_do_not_acquire_move_ownership_homes() {
+        let program = crate::lower_source(
+            "parameter-homes.doria",
+            r#"
+class Token {}
+enum Scalar { case Item(int $value); }
+enum Managed { case Item(string $value); }
+enum Linear { case Item(Token $value); }
+"#,
+        )
+        .unwrap();
+        let enums = &program.semantic_info.enums;
+        for (name, owned) in [("Scalar", false), ("Managed", true), ("Linear", true)] {
+            let facts = enums.iter().find(|value| value.name == name).unwrap();
+            let ty = ResolvedType::Enum(facts.source_type.clone());
+            assert_eq!(
+                requires_parameter_cell(&ty, true, false, enums),
+                owned,
+                "{name}"
+            );
+            let nullable = ResolvedType::Nullable(Box::new(ty));
+            assert_eq!(
+                requires_parameter_cell(&nullable, true, false, enums),
+                owned,
+                "?{name}"
+            );
+        }
     }
 }

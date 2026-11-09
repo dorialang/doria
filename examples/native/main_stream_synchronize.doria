@@ -1,0 +1,24 @@
+use Doria\Std\Io\{File, FileCreation, FileWriteMode, SeekOrigin};
+
+function main(): void
+{
+    write_file("synchronize.bin", "abc");
+    let writable $writer = File::openWrite("synchronize.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+    writable Bytes $marker = Bytes::allocate(2);
+    $marker[0] = 90;
+    $marker[1] = 10;
+    $writer->write($marker->getRegion(0, 2));
+    $writer->seek(1, SeekOrigin::Start);
+    $writer->synchronizeData();
+    $writer->synchronizeMetadata();
+    echo $writer->getPosition() . " " . $writer->getLength() . "\n";
+    $writer->close();
+
+    let writable $duplex = File::openReadWrite("synchronize.bin", FileCreation::OpenExisting, FileWriteMode::Positioned);
+    $duplex->seek(0, SeekOrigin::End);
+    $duplex->synchronizeData();
+    $duplex->synchronizeMetadata();
+    echo $duplex->getPosition() . " " . $duplex->getLength() . "\n";
+    $duplex->close();
+    echo read_file("synchronize.bin");
+}

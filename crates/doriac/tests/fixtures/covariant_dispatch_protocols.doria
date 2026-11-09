@@ -1,0 +1,72 @@
+interface Values { function values(int $number): Iterable<int>; }
+
+open class RootFactory implements Values
+{
+    open function values(int $number = 4): Iterable<int> { return [$number]; }
+}
+open class ChildFactory extends RootFactory
+{
+    override function values(int $number): List<int> { return [$number + 1]; }
+}
+class LeafFactory extends ChildFactory {}
+class PlainFactory implements Values
+{
+    function values(int $number = 4): Iterable<int> { return [$number + 2]; }
+}
+
+open class RootPrinter
+{
+    open function toString(): ?string { return "root"; }
+}
+class Printer extends RootPrinter implements Displayable
+{
+    override function toString(): string { return "p"; }
+}
+
+class Cursor implements Iterator<int>
+{
+    writable int $position = 0;
+    function hasCurrent(): bool { return $this->position == 0; }
+    function getCurrent(): int { return 9; }
+    writable function advance(): void { $this->position++; }
+}
+class Sequence implements Iterable<int>
+{
+    function iterator(): Cursor { return new Cursor(); }
+}
+
+function throughInterface(Values $source): void
+{
+    let $values = $source->values(4);
+    foreach ($values as int $value) { echo $value; }
+}
+function throughRoot(RootFactory $source): void
+{
+    let $values = $source->values();
+    foreach ($values as int $value) { echo $value; }
+}
+function throughChild(ChildFactory $source): void
+{
+    let $values = $source->values();
+    echo $values->count;
+}
+function throughIterable(Iterable<int> $source): void
+{
+    foreach ($source as int $value) { echo $value; }
+}
+
+function main(): void
+{
+    let $factory = new LeafFactory();
+    throughInterface($factory);
+    throughRoot($factory);
+    throughChild($factory);
+    let $plain = new PlainFactory();
+    throughInterface($plain);
+    let $printer = new Printer();
+    echo $printer;
+    let $sequence = new Sequence();
+    throughIterable($sequence);
+    let $values = [7, 8];
+    throughIterable($values);
+}

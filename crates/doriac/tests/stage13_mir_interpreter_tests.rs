@@ -72,8 +72,14 @@ function main(): int
 "#,
     );
 
+    // Diagnostic sites precede the assignment; find the assignment itself.
+    let assignment = program.functions[0].blocks[0]
+        .statements
+        .iter()
+        .find(|statement| matches!(statement, Statement::AssignLocal { .. }))
+        .expect("the typed initializer is an assignment");
     assert!(matches!(
-        &program.functions[0].blocks[0].statements[0],
+        assignment,
         Statement::AssignLocal {
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
                 ty: IntegerType::UInt16,

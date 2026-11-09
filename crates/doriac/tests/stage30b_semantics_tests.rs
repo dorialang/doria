@@ -291,6 +291,89 @@ function main(): void
 }
 
 #[test]
+fn rejected_authored_captures_are_not_reported_as_missing() {
+    for (source, primary) in [
+        (
+            "class Item {} function inspect(Item $item): void {} function capture(Item $item): void { let $callback = function(): void with (take $item) { inspect($item); }; }",
+            "E0645",
+        ),
+        (
+            "class Item {} function inspect(Item $item): void {} function capture(Item $item): void { let $callback = function(): void with (writable $item) { inspect($item); }; }",
+            "E0645",
+        ),
+        (
+            "function capture(int $value): void { let $callback = fn() with (writable $value) => $value; }",
+            "E0645",
+        ),
+        (
+            "class Item { int $value = 1; function capture(): void { let $callback = fn() with (take $this) => $this->value; } }",
+            "E0644",
+        ),
+        (
+            "class Item { internal int $value = 1; function capture(): void { let $callback = fn() with (writable $this) => $this->value; } }",
+            "E0645",
+        ),
+        (
+            "class Item {} function inspect(Item $item): void {} function capture(Item $item): void { let $outer = function(): void with (take $item) { let $inner = function(): void with ($item) { inspect($item); }; }; }",
+            "E0645",
+        ),
+        (
+            "function capture(int $value): void { let $callback = function(): void with ($value) { echo $value; let $value = 2; echo $value; }; }",
+            "E0644",
+        ),
+    ] {
+        let analysis = analyze(source);
+        diagnostic(&analysis.diagnostics, primary);
+        assert!(
+            analysis.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != "E0642"
+                    && diagnostic.fixes.iter().all(|fix| fix.title != "Add Missing Closure Captures")
+            }),
+            "{source}\n{:#?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
+fn missing_capture_fixes_preserve_rejected_authored_entries_without_duplication() {
+    let source = r#"
+function capture(int $value, int $other): void {
+    let $callback = fn() with (writable $value) => $value + $other;
+}
+"#;
+    let analysis = analyze(source);
+    diagnostic(&analysis.diagnostics, "E0645");
+    let missing = analysis
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0642")
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 1, "{:#?}", analysis.diagnostics);
+    assert!(missing[0].message.contains("$other"));
+    let fix = missing[0]
+        .fixes
+        .first()
+        .expect("genuinely missing capture fix");
+    assert_eq!(fix.applicability, FixApplicability::MachineApplicable);
+    assert_eq!(fix.edits.len(), 1);
+    let edit = &fix.edits[0];
+    let fixed = format!(
+        "{}{}{}",
+        &source[..edit.span.start],
+        edit.replacement,
+        &source[edit.span.end..]
+    );
+    assert!(fixed.contains("with (writable $value, $other)"), "{fixed}");
+    let fixed_analysis = analyze(&fixed);
+    diagnostic(&fixed_analysis.diagnostics, "E0645");
+    assert!(fixed_analysis
+        .diagnostics
+        .iter()
+        .all(|diagnostic| !matches!(diagnostic.code, "E0642" | "E0643")));
+}
+
+#[test]
 fn duplicate_invalid_recursive_and_unused_captures_are_precise() {
     let source = r#"
 const int LIMIT = 2;
@@ -922,6 +1005,148 @@ function main(): void
                 ResolvedType::Function(_)
             ))
         )));
+}
+
+#[test]
+fn typed_owned_callbacks_preserve_conditional_generic_and_concrete_source_loans() {
+    let source = r#"
+class Factory<T> {
+    function(take T): T $identity = fn(take T $value) => $value;
+}
+class OptionalFactory<T> {
+    function(take T): ?T $identity = function(take T $value): ?T { return $value; };
+}
+class Callbacks {
+    function(take Cursor): Cursor $identity = fn(take Cursor $value) => $value;
+}
+class Item { function __construct(int $value) {} }
+class Cursor implements Iterator<int> {
+    function __construct(borrow List<int> $source) {}
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): int { return $this->source[0]; }
+    writable function advance(): void {}
+}
+function relay<T>(take T $value): T {
+    function(take T): T $identity = function(take T $input): T { return $input; };
+    return $identity($value);
+}
+function main(): void {
+    let $integers = new Factory<int>();
+    let $items = new Factory<Item>();
+    let $optionalIntegers = new OptionalFactory<int>();
+    echo ($optionalIntegers->identity)(42) ?? 0;
+    echo ($integers->identity)(42);
+    echo ($items->identity)(new Item(3))->value;
+    function(take int): int $integer = fn(take int $input) => $input;
+    function(take Item): Item $item = fn(take Item $input) => $input;
+    echo $integer(42);
+    echo $item(new Item(3))->value;
+    writable List<int> $source = [7];
+    {
+        function(take Cursor): Cursor $identity = fn(take Cursor $input) => $input;
+        function(take List<Cursor>): List<Cursor> $identities = fn(take List<Cursor> $input) => $input;
+        let $cursor = $identity(new Cursor($source));
+        echo $cursor->getCurrent();
+        let $cursors = $identities([new Cursor($source)]);
+        echo $cursors[0]->getCurrent();
+        function(take Cursor): ?Cursor $optionalIdentity = function(take Cursor $input): ?Cursor { return $input; };
+        let $optional = $optionalIdentity(new Cursor($source));
+        if ($optional != null) { echo $optional->getCurrent(); }
+        let $optionalFactory = new OptionalFactory<Cursor>();
+        let $genericOptional = ($optionalFactory->identity)(new Cursor($source));
+        if ($genericOptional != null) { echo $genericOptional->getCurrent(); }
+    }
+    {
+        function(take Cursor): ?Cursor $discard = function(take Cursor $input): ?Cursor { return null; };
+        let $absent = $discard(new Cursor($source));
+        $source->add(8);
+        echo $absent == null;
+        function(take List<Cursor>): List<Cursor> $clear = function(take List<Cursor> $input): List<Cursor> { return []; };
+        let $empty = $clear([new Cursor($source)]);
+        $source->add(8);
+        echo $empty->count;
+    }
+    $source->add(8);
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    for ty in [
+        ResolvedType::Integer(doriac::types::IntegerType::Int64),
+        ResolvedType::Class(doriac::types::ClassType::new("Item", vec![])),
+    ] {
+        let signatures = analysis
+            .info
+            .closures
+            .values()
+            .filter_map(|closure| match &closure.function_type {
+                ResolvedType::Function(function) if function.return_type == ty => Some(function),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!signatures.is_empty());
+        assert!(signatures
+            .iter()
+            .all(|function| function.return_borrow.is_none()));
+    }
+    let conflicting = source.replace(
+        "echo $cursor->getCurrent();",
+        "$source->add(8); echo $cursor->getCurrent();",
+    );
+    diagnostic(&analyze(&conflicting).diagnostics, "E0763");
+    for observation in [
+        "echo $optional->getCurrent();",
+        "echo $genericOptional->getCurrent();",
+    ] {
+        let conflicting = source.replace(observation, &format!("$source->add(8); {observation}"));
+        diagnostic(&analyze(&conflicting).diagnostics, "E0763");
+    }
+}
+
+#[test]
+fn owned_result_retention_does_not_relax_returned_alias_identity() {
+    let analysis = analyze(
+        r#"
+function main(): void {
+    function(List<int>): List<int> $borrow = function(List<int> $input): List<int> { return []; };
+}
+"#,
+    );
+    diagnostic(&analysis.diagnostics, "E0648");
+}
+
+#[test]
+fn writable_captures_can_reborrow_themselves_but_not_a_competing_alias() {
+    let source = r#"
+class Counter {
+    writable int $value = 0;
+    writable function update(): void { $this->value++; }
+}
+function update(writable Counter $counter): void { $counter->update(); }
+function main(): void {
+    let writable $counter = new Counter();
+    let writable $callback = function(): void with (writable $counter) {
+        update($counter);
+        $counter->update();
+    };
+    $callback();
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    let conflicting = source.replace(
+        "update($counter);",
+        "let $alias = $counter; update($counter); echo $alias->value;",
+    );
+    diagnostic(&analyze(&conflicting).diagnostics, "E0477");
 }
 
 #[test]

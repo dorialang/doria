@@ -5,18 +5,44 @@
 use core::ffi::c_void;
 use core::mem;
 use core::ptr;
-use unicode_width::UnicodeWidthChar;
+use doria_diagnostic_catalogue::source_excerpt::{self, SourceExcerpt};
+use unicode_width::UnicodeWidthStr;
 
+mod byte_io;
+mod byte_region;
 mod bytes;
+mod cancellation;
+mod cancellation_signal;
 mod checked_io;
 mod collection;
+mod deadline;
 mod device_io;
 mod entry_args;
 mod file_io;
+#[cfg(feature = "hosted-shared-runtime")]
+mod identity;
+#[cfg(test)]
+mod io_cost_probe;
+mod io_status;
 mod line_io;
 mod mixed;
+mod monotonic_clock;
+mod native_handle;
+mod owned_interface;
 mod platform_io;
+mod process;
 mod string_ops;
+#[cfg(test)]
+mod test_callback;
+#[cfg(test)]
+mod test_report;
+mod transfer_group;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_readiness;
+mod utf8_stream;
+mod wait_budget;
+#[cfg(any(windows, test))]
+mod win32;
 
 use device_io::{StandardStream, WriteOutcome};
 
@@ -142,6 +168,10 @@ pub struct DrStringV1 {
     byte_length: usize,
 }
 
+pub use byte_region::{
+    dr_v1_byte_region_copy, dr_v1_byte_region_copy_within, dr_v2_byte_region_get,
+    dr_v2_byte_region_set, dr_v2_byte_region_subregion, dr_v2_bytes_region,
+};
 pub use bytes::DrBytesV1;
 pub use collection::{
     DrCollectionV1, DR_COLLECTION_AGGREGATE_OFFSET, DR_COLLECTION_ALIGN,
@@ -152,7 +182,12 @@ pub use collection::{
     DR_COLLECTION_VALUE_SIZE_OFFSET, DR_COLLECTION_VALUE_STRIDE_OFFSET,
     DR_COLLECTION_VALUE_WIDTH_OFFSET,
 };
+pub use deadline::{dr_v1_deadline_from_now, DrDeadlineV1};
 pub use mixed::DrMixedV1;
+pub use monotonic_clock::dr_v1_monotonic_clock;
+pub use transfer_group::adapter::DrAdapterContextV1;
+pub use transfer_group::source::ResolveSourceCallback;
+pub use wait_budget::{dr_v1_wait_budget_init_deadline, DrWaitBudgetV1};
 
 /// # Safety
 ///
@@ -160,6 +195,31 @@ pub use mixed::DrMixedV1;
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_bytes_copy(source: *const u8, length: usize) -> *mut DrBytesV1 {
     bytes::copy(source, length)
+}
+
+/// Allocates zero-initialized reusable byte storage.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain. The result
+/// must be released exactly once with `dr_v1_bytes_free`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_bytes_allocate(
+    current_frame: *const DrStackFrameV2,
+    length: i64,
+) -> *mut DrBytesV1 {
+    if length < 0 {
+        panic_signed_fact(
+            current_frame,
+            b"P1303",
+            doria_diagnostic_catalogue::BYTE_BUFFER_LENGTH_FACT.as_bytes(),
+            length,
+        );
+    }
+    let Ok(length) = usize::try_from(length) else {
+        dr_v2_panic_code(current_frame, b"P1302".as_ptr(), 5, ptr::null(), 0);
+    };
+    bytes::zeroed(length)
 }
 
 /// # Safety
@@ -390,6 +450,44 @@ pub unsafe extern "C" fn dr_v2_collection_fill_word(
     )
 }
 
+/// Copies complete Copy storage, including nullable presence and wide payloads.
+/// Generated typed glue retains each copied managed inline claim.
+///
+/// # Safety
+///
+/// `value` points to a readable Copy carrier of the stated size and alignment.
+/// Boolean flags are canonical, and `current_frame` is null or a live frame.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v6_collection_fill_value(
+    current_frame: *const DrStackFrameV2,
+    value: *const u8,
+    count: i64,
+    fixed: u8,
+    value_size: usize,
+    value_alignment: usize,
+    aggregate: u8,
+    nullable: u8,
+) -> *mut DrCollectionV1 {
+    if count < 0 {
+        panic_signed_fact(
+            current_frame,
+            b"P1311",
+            doria_diagnostic_catalogue::COLLECTION_FILL_COUNT_FACT.as_bytes(),
+            count,
+        );
+    }
+    collection::fill_value(
+        current_frame,
+        value,
+        count as usize,
+        fixed != 0,
+        value_size,
+        value_alignment,
+        aggregate != 0,
+        nullable != 0,
+    )
+}
+
 /// Allocates a sequence whose live length begins at zero. Generated code
 /// initializes owned elements in order; cleanup visits only the live prefix.
 ///
@@ -398,11 +496,12 @@ pub unsafe extern "C" fn dr_v2_collection_fill_word(
 /// `current_frame` is null or a live frame chain, `fixed` is a canonical bool,
 /// and generated code must not append beyond the reserved fixed capacity.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v5_collection_construction_capacity(
+pub unsafe extern "C" fn dr_v6_collection_construction_capacity(
     current_frame: *const DrStackFrameV2,
     count: i64,
     fixed: u8,
     value_width: u8,
+    value_alignment: u8,
     aggregate: u8,
     keyed: u8,
     kind: u8,
@@ -421,6 +520,7 @@ pub unsafe extern "C" fn dr_v5_collection_construction_capacity(
         count as usize,
         fixed != 0,
         value_width,
+        value_alignment,
         aggregate != 0,
         keyed != 0,
         kind,
@@ -1250,8 +1350,10 @@ pub type DrMainVoidV2 = unsafe extern "C" fn(*const DrStackFrameV2);
 
 /// Entry forms that take the program arguments (decision 0099). The list is
 /// owned by the glue and borrowed by `main`, so the callee never releases it.
-pub type DrMainIntArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1) -> i64;
-pub type DrMainVoidArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1);
+pub type DrMainIntArgsV2 =
+    unsafe extern "C" fn(*const DrStackFrameV2, *const usize, *mut DrCollectionV1) -> i64;
+pub type DrMainVoidArgsV2 =
+    unsafe extern "C" fn(*const DrStackFrameV2, *const usize, *mut DrCollectionV1);
 
 #[repr(C)]
 pub struct DrInterfaceCarrierV1 {
@@ -1271,12 +1373,16 @@ struct DrInterfaceVtableV1 {
     assertion_magic: usize,
     class_descriptor: *const u8,
     interface_id: usize,
+    io_transferred_byte_count_offset: usize,
+    io_progress_magic: usize,
 }
 
 pub const DR_INTERFACE_CARRIER_SIZE: usize = mem::size_of::<DrInterfaceCarrierV1>();
 pub const DR_INTERFACE_VTABLE_HEADER_SIZE: usize = mem::size_of::<DrInterfaceVtableV1>();
 
 const ASSERTION_ERROR_DESCRIPTOR_MAGIC: usize = 0xA557_0004;
+const IO_ERROR_PROGRESS_DESCRIPTOR_MAGIC: usize = 0x10E0_0005;
+const IO_ERROR_TYPE: &[u8] = b"Doria\\Std\\Io\\IoError";
 const ASSERTION_ERROR_TYPE: &[u8] = b"Doria\\Std\\Test\\AssertionError";
 const ASSERTION_FACT_COUNT: usize = 12;
 
@@ -1315,11 +1421,13 @@ pub type DrMainCheckedIntArgsV3 = unsafe extern "C" fn(
     *const DrStackFrameV2,
     *mut i64,
     *mut DrInterfaceCarrierV1,
+    *const usize,
     *mut DrCollectionV1,
 ) -> u8;
 pub type DrMainCheckedVoidArgsV3 = unsafe extern "C" fn(
     *const DrStackFrameV2,
     *mut DrInterfaceCarrierV1,
+    *const usize,
     *mut DrCollectionV1,
 ) -> u8;
 
@@ -1337,8 +1445,8 @@ pub unsafe extern "C" fn dr_v1_validate_entry_args(argc: i32, argv: *const *cons
 /// Allocates a headerless native class payload.
 ///
 /// This is a private, versioned compiler/runtime ABI. `byte_alignment` is
-/// currently bounded by the platform allocator alignment because every Stage
-/// 19 property is at most pointer/f64 aligned. Empty classes receive a unique,
+/// bounded by the platform allocator's natural alignment, including wide inline
+/// values. Empty classes receive a unique,
 /// freeable one-byte allocation. Allocation failure panics with status 101.
 ///
 /// # Safety
@@ -1351,10 +1459,9 @@ pub unsafe extern "C" fn dr_v2_class_allocate(
     byte_length: usize,
     byte_alignment: usize,
 ) -> *mut u8 {
-    let supported_alignment = mem::align_of::<u64>().max(mem::align_of::<usize>());
     if byte_alignment == 0
         || !byte_alignment.is_power_of_two()
-        || byte_alignment > supported_alignment
+        || byte_alignment > NATURAL_ALLOCATION_ALIGNMENT
     {
         panic_catalogued(current_frame, b"P1601");
     }
@@ -1957,6 +2064,7 @@ pub unsafe extern "C" fn dr_v2_main_int_args(
     entry: DrMainIntArgsV2,
     argc: i32,
     argv: *const *const u8,
+    args_type: usize,
     source_path: *const u8,
     source_path_length: usize,
     source_text: *const u8,
@@ -1965,9 +2073,10 @@ pub unsafe extern "C" fn dr_v2_main_int_args(
     source_span_end: usize,
 ) -> i32 {
     let args = entry_args::build(argc, argv);
+    let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     // Validate before cleanup: an invalid status is an abort-only panic path.
     let status = process_status(
-        entry(ptr::null(), args),
+        entry(ptr::null(), home.as_ptr(), args),
         source_path,
         source_path_length,
         source_text,
@@ -1990,9 +2099,11 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
     entry: DrMainVoidArgsV2,
     argc: i32,
     argv: *const *const u8,
+    args_type: usize,
 ) -> i32 {
     let args = entry_args::build(argc, argv);
-    entry(ptr::null(), args);
+    let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
+    entry(ptr::null(), home.as_ptr(), args);
     entry_args::release(args);
     0
 }
@@ -2063,6 +2174,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
     entry: DrMainCheckedIntArgsV3,
     argc: i32,
     argv: *const *const u8,
+    args_type: usize,
     source_path: *const u8,
     source_path_length: usize,
     source_text: *const u8,
@@ -2071,9 +2183,10 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
     source_span_end: usize,
 ) -> i32 {
     let args = entry_args::build(argc, argv);
+    let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     let mut value = 0_i64;
     let mut error = empty_error_carrier();
-    let status = entry(ptr::null(), &mut value, &mut error, args);
+    let status = entry(ptr::null(), &mut value, &mut error, home.as_ptr(), args);
     entry_args::release(args);
     match status {
         0 => process_status(
@@ -2099,10 +2212,12 @@ pub unsafe extern "C" fn dr_v3_main_checked_void_args(
     entry: DrMainCheckedVoidArgsV3,
     argc: i32,
     argv: *const *const u8,
+    args_type: usize,
 ) -> i32 {
     let args = entry_args::build(argc, argv);
+    let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     let mut error = empty_error_carrier();
-    let status = entry(ptr::null(), &mut error, args);
+    let status = entry(ptr::null(), &mut error, home.as_ptr(), args);
     entry_args::release(args);
     match status {
         0 => 0,
@@ -2137,14 +2252,42 @@ unsafe fn report_unhandled_error(error: DrInterfaceCarrierV1) -> i32 {
             if !write_runtime_assertion_record(channel_path, descriptor, &facts, origin) {
                 render_runtime_assertion(message, &facts, origin);
             }
-        } else if !write_runtime_error_record(descriptor, message, origin) {
+        } else if !write_runtime_error_record(descriptor, message, origin, None) {
             render_runtime_assertion(message, &facts, origin);
         }
-    } else if !write_runtime_error_record(descriptor, message, origin) {
-        render_runtime_error(descriptor, message, origin);
+    } else {
+        let transferred_byte_count = io_transferred_byte_count(error.object, descriptor);
+        if !write_runtime_error_record(descriptor, message, origin, transferred_byte_count) {
+            render_runtime_error(descriptor, message, origin, transferred_byte_count);
+        }
     }
     (descriptor.drop)(ptr::null(), error.object);
     70
+}
+
+unsafe fn io_transferred_byte_count(
+    object: *mut u8,
+    descriptor: &DrInterfaceVtableV1,
+) -> Option<i64> {
+    if descriptor.io_progress_magic != IO_ERROR_PROGRESS_DESCRIPTOR_MAGIC
+        || descriptor.type_name_length != IO_ERROR_TYPE.len()
+        || core::slice::from_raw_parts(descriptor.type_name, descriptor.type_name_length)
+            != IO_ERROR_TYPE
+    {
+        return None;
+    }
+    let offset = descriptor.io_transferred_byte_count_offset;
+    let payload_offset = offset.checked_add(mem::size_of::<usize>())?;
+    if payload_offset.checked_add(mem::size_of::<i64>())? > descriptor.class_size {
+        return None;
+    }
+    if *(object.add(offset) as *const usize) == 1 {
+        Some(ptr::read_unaligned(
+            object.add(payload_offset).cast::<i64>(),
+        ))
+    } else {
+        None
+    }
 }
 
 unsafe fn assertion_facts(
@@ -2243,6 +2386,7 @@ unsafe fn render_runtime_error(
     descriptor: &DrInterfaceVtableV1,
     message: *const DrStringV1,
     origin: *const DrErrorOriginV1,
+    transferred_byte_count: Option<i64>,
 ) {
     write_panic_fragment(b"Error[R1000]: Unhandled ");
     write_panic_bytes(descriptor.type_name, descriptor.type_name_length);
@@ -2264,6 +2408,16 @@ unsafe fn render_runtime_error(
             emergency_runtime_panic();
         };
         render_runtime_where(&raw const frame, entry.primary_label.as_bytes());
+    }
+    if let Some(count) = transferred_byte_count {
+        write_panic_fragment(b"\n\n");
+        write_panic_fragment(
+            doria_diagnostic_catalogue::IO_TRANSFERRED_BYTE_COUNT_HEADING.as_bytes(),
+        );
+        write_panic_fragment(b"\n  ");
+        let mut buffer = [0_u8; 20];
+        let (start, length) = signed_decimal(count, &mut buffer);
+        write_panic_fragment(&buffer[start..start + length]);
     }
     write_panic_fragment(b"\n\nWhy\n  ");
     write_safe_runtime_error_message(string_bytes(message), (*message).byte_length);
@@ -2325,7 +2479,7 @@ pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize
     match write_standard_stream(StandardStream::Stderr, bytes, byte_length) {
         WriteOutcome::Success => {}
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure(_) => exit_process(PANIC_STATUS),
+        WriteOutcome::OtherFailure(_) => abort_process(PANIC_STATUS),
     }
 }
 
@@ -2370,7 +2524,8 @@ pub unsafe extern "C" fn dr_v2_write_stderr_bytes(
 pub unsafe extern "C" fn dr_v2_read_stdin_bytes(
     current_frame: *const DrStackFrameV2,
 ) -> *mut DrBytesV1 {
-    let buffered = line_io::take_buffered_input();
+    let (loan, buffered) = line_io::take_buffered_input()
+        .unwrap_or_else(|_| panic_catalogued(current_frame, b"P1403"));
     let mut capacity = 4096_usize;
     while capacity < buffered.length {
         let Some(next) = capacity.checked_mul(2) else {
@@ -2404,7 +2559,7 @@ pub unsafe extern "C" fn dr_v2_read_stdin_bytes(
             data = replacement;
             capacity = next;
         }
-        match device_io::read_bytes(StandardStream::Stdin, data.add(length), capacity - length) {
+        match loan.read_bytes(data.add(length), capacity - length) {
             Ok(0) => return bytes::from_owned(data, length),
             Ok(read) => length += read,
             Err(_) => {
@@ -2475,8 +2630,10 @@ pub unsafe extern "C" fn dr_v2_read_stdin_line(
     current_frame: *const DrStackFrameV2,
 ) -> *mut DrStringV1 {
     match line_io::read_line() {
-        Ok(Some((bytes, length))) => dr_v1_string_from_utf8(bytes, length),
-        Ok(None) => ptr::null_mut(),
+        Ok(line) => match line.bytes {
+            Some((bytes, length)) => dr_v1_string_from_utf8(bytes, length),
+            None => ptr::null_mut(),
+        },
         Err(line_io::ReadLineError::InvalidUtf8 { .. }) => {
             panic_catalogued(current_frame, b"P1404")
         }
@@ -2962,7 +3119,7 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
         facts,
         fact_count,
     ) {
-        exit_process(PANIC_STATUS)
+        abort_process(PANIC_STATUS)
     }
 
     write_panic_fragment(b"Panic[");
@@ -3016,7 +3173,7 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
         }
     }
     write_panic_fragment(b"\n\nProcess Exited With Status 101\n");
-    exit_process(PANIC_STATUS)
+    abort_process(PANIC_STATUS)
 }
 
 unsafe fn shared_access_conflict_fact_matches(
@@ -3068,7 +3225,7 @@ unsafe fn emergency_runtime_panic() -> ! {
     write_panic_fragment(
         b"Panic[P1001]: Runtime Diagnostic Failed\n\nProcess Exited With Status 101\n",
     );
-    exit_process(PANIC_STATUS)
+    abort_process(PANIC_STATUS)
 }
 
 struct PrivateRecordWriter<'path> {
@@ -3112,6 +3269,7 @@ unsafe fn write_runtime_error_record(
     descriptor: &DrInterfaceVtableV1,
     message: *const DrStringV1,
     origin: *const DrErrorOriginV1,
+    transferred_byte_count: Option<i64>,
 ) -> bool {
     const MAX_TYPE: usize = 4096;
     const MAX_PATH: usize = 4096;
@@ -3119,7 +3277,7 @@ unsafe fn write_runtime_error_record(
     const MAX_FUNCTION: usize = 1024;
 
     let mut path_buffer = [0_u8; MAX_PATH];
-    let Some(channel_path) = runtime_error_channel_path(&mut path_buffer) else {
+    let Some((channel_path, version)) = runtime_error_channel_path(&mut path_buffer) else {
         return false;
     };
     let known_origin = !origin.is_null();
@@ -3142,9 +3300,13 @@ unsafe fn write_runtime_error_record(
         return false;
     }
 
-    let mut header = [0_u8; 51];
-    header[..8].copy_from_slice(b"DORIAO3\0");
-    put_u16(&mut header[8..10], 3);
+    let mut header = [0_u8; 60];
+    header[..8].copy_from_slice(if version == 5 {
+        b"DORIAO5\0"
+    } else {
+        b"DORIAO3\0"
+    });
+    put_u16(&mut header[8..10], version);
     put_u32(&mut header[10..14], descriptor.type_name_length as u32);
     put_u64(&mut header[14..22], (*message).byte_length as u64);
     put_u32(&mut header[22..26], path_length as u32);
@@ -3153,8 +3315,15 @@ unsafe fn write_runtime_error_record(
     header[34] = u8::from(known_origin);
     put_u64(&mut header[35..43], span_start as u64);
     put_u64(&mut header[43..51], span_end as u64);
+    header[51] = u8::from(transferred_byte_count.is_some());
+    put_u64(
+        &mut header[52..60],
+        transferred_byte_count.unwrap_or(0) as u64,
+    );
 
-    let Some(mut record) = PrivateRecordWriter::begin(channel_path, &header) else {
+    let header_length = if version == 5 { 60 } else { 51 };
+    let Some(mut record) = PrivateRecordWriter::begin(channel_path, &header[..header_length])
+    else {
         return false;
     };
     if !record.append(core::slice::from_raw_parts(
@@ -3453,87 +3622,58 @@ fn put_u64(target: &mut [u8], value: u64) {
 }
 
 #[cfg(unix)]
+unsafe fn runtime_channel_path_length(name: &[u8], buffer: &mut [u8]) -> Result<Option<usize>, ()> {
+    let value = getenv(name.as_ptr());
+    if value.is_null() {
+        return Ok(None);
+    }
+    for (index, destination) in buffer.iter_mut().enumerate() {
+        let byte = *value.add(index);
+        if byte == 0 {
+            return Ok(Some(index));
+        }
+        *destination = byte;
+    }
+    Err(())
+}
+
+#[cfg(windows)]
+unsafe fn runtime_channel_path_length(name: &[u8], buffer: &mut [u8]) -> Result<Option<usize>, ()> {
+    let length = GetEnvironmentVariableA(
+        name.as_ptr(),
+        buffer.as_mut_ptr(),
+        buffer.len().try_into().map_err(|_| ())?,
+    ) as usize;
+    if length >= buffer.len() {
+        Err(())
+    } else {
+        Ok((length != 0).then_some(length))
+    }
+}
+
 unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
-    let name = b"DORIA_RUNTIME_OUTCOME_V2\0";
-    let value = getenv(name.as_ptr());
-    if value.is_null() {
-        return None;
-    }
-    for index in 0..buffer.len() {
-        let byte = *value.add(index);
-        if byte == 0 {
-            return Some(&buffer[..index]);
-        }
-        buffer[index] = byte;
-    }
-    None
+    let length = runtime_channel_path_length(b"DORIA_RUNTIME_OUTCOME_V2\0", buffer).ok()??;
+    Some(&buffer[..length])
 }
 
-#[cfg(unix)]
-unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
-    let name = b"DORIA_RUNTIME_OUTCOME_V3\0";
-    let value = getenv(name.as_ptr());
-    if value.is_null() {
-        return None;
-    }
-    for index in 0..buffer.len() {
-        let byte = *value.add(index);
-        if byte == 0 {
-            return Some(&buffer[..index]);
-        }
-        buffer[index] = byte;
-    }
-    None
+unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<(&[u8], u16)> {
+    let (length, version) = match runtime_channel_path_length(b"DORIA_RUNTIME_OUTCOME_V5\0", buffer)
+    {
+        Ok(Some(length)) => (length, 5),
+        Ok(None) => (
+            runtime_channel_path_length(b"DORIA_RUNTIME_OUTCOME_V3\0", buffer).ok()??,
+            3,
+        ),
+        // A requested but invalid v5 channel must not silently publish a
+        // lossy v3 record. The caller renders the complete diagnostic instead.
+        Err(()) => return None,
+    };
+    Some((&buffer[..length], version))
 }
 
-#[cfg(unix)]
 unsafe fn runtime_assertion_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
-    let name = b"DORIA_RUNTIME_OUTCOME_V4\0";
-    let value = getenv(name.as_ptr());
-    if value.is_null() {
-        return None;
-    }
-    for index in 0..buffer.len() {
-        let byte = *value.add(index);
-        if byte == 0 {
-            return Some(&buffer[..index]);
-        }
-        buffer[index] = byte;
-    }
-    None
-}
-
-#[cfg(windows)]
-unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
-    let name = b"DORIA_RUNTIME_OUTCOME_V2\0";
-    let length = GetEnvironmentVariableA(
-        name.as_ptr(),
-        buffer.as_mut_ptr(),
-        buffer.len().try_into().ok()?,
-    ) as usize;
-    (length != 0 && length < buffer.len()).then_some(&buffer[..length])
-}
-
-#[cfg(windows)]
-unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
-    let name = b"DORIA_RUNTIME_OUTCOME_V3\0";
-    let length = GetEnvironmentVariableA(
-        name.as_ptr(),
-        buffer.as_mut_ptr(),
-        buffer.len().try_into().ok()?,
-    ) as usize;
-    (length != 0 && length < buffer.len()).then_some(&buffer[..length])
-}
-
-#[cfg(windows)]
-unsafe fn runtime_assertion_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
-    let name = b"DORIA_RUNTIME_OUTCOME_V4\0";
-    let length = GetEnvironmentVariableA(
-        name.as_ptr(),
-        buffer.as_mut_ptr(),
-        buffer.len().try_into().ok()?,
-    ) as usize;
-    (length != 0 && length < buffer.len()).then_some(&buffer[..length])
+    let length = runtime_channel_path_length(b"DORIA_RUNTIME_OUTCOME_V4\0", buffer).ok()??;
+    Some(&buffer[..length])
 }
 
 unsafe fn render_runtime_where(frame: *const DrStackFrameV2, primary_label: &[u8]) {
@@ -3553,31 +3693,34 @@ unsafe fn render_runtime_where(frame: *const DrStackFrameV2, primary_label: &[u8
         return;
     }
     let source = core::slice::from_raw_parts((*frame).source_text, (*frame).source_text_length);
-    if core::str::from_utf8(source).is_err() {
+    let Ok(text) = core::str::from_utf8(source) else {
         return;
-    }
+    };
     let start = (*frame).active_span_start.min(source.len());
-    let end = (*frame)
-        .active_span_end
-        .max(start.saturating_add(1))
-        .min(source.len());
+    let end = (*frame).active_span_end.max(start).min(source.len());
     let mut line_number = line;
     let mut line_start = source[..start]
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
     let final_line = source_line(source.as_ptr(), source.len(), end);
-    let gutter = decimal_digits(final_line).max(3);
+    let gutter = decimal_digits(final_line).max(source_excerpt::MINIMUM_GUTTER_WIDTH);
     while line_number <= final_line && line_start <= source.len() {
-        let mut line_end = source[line_start..]
+        let untrimmed_end = source[line_start..]
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(source.len(), |index| line_start + index);
-        if line_end > line_start && source[line_end - 1] == b'\r' {
-            line_end -= 1;
-        }
+        let raw_line = text[line_start..untrimmed_end].trim_end_matches('\r');
+        let line_end = line_start + raw_line.len();
         let marker_start = start.max(line_start).min(line_end);
         let marker_end = end.min(line_end).max(marker_start);
+        let excerpt = SourceExcerpt::new(
+            raw_line,
+            Some((marker_start - line_start, marker_end - line_start)),
+            source_excerpt::DEFAULT_TERMINAL_WIDTH,
+            doria_unicode::grapheme_boundaries,
+            UnicodeWidthStr::width,
+        );
         let digits = decimal_digits(line_number);
         if line_number == line {
             write_panic_fragment(b"\n\n");
@@ -3588,20 +3731,20 @@ unsafe fn render_runtime_where(frame: *const DrStackFrameV2, primary_label: &[u8
             write_panic_fragment(b" ");
         }
         write_usize(line_number);
-        write_panic_fragment(b"      ");
-        write_source_line(&source[line_start..line_end]);
+        if !excerpt.is_empty() {
+            write_panic_fragment(source_excerpt::GUTTER_GAP.as_bytes());
+            excerpt.write(|bytes| write_panic_fragment(bytes));
+        }
         write_panic_fragment(b"\n");
-        let marker_offset = display_width_with_tabs(&source[line_start..marker_start], 4);
-        let marker_width = display_width_with_tabs(&source[marker_start..marker_end], 4).max(1);
-        for _ in 0..(gutter + 6 + marker_offset) {
+        for _ in 0..(gutter + source_excerpt::GUTTER_GAP.len() + excerpt.marker_offset) {
             write_panic_fragment(b" ");
         }
-        for _ in 0..marker_width {
+        for _ in 0..excerpt.marker_width {
             write_panic_fragment(b"^");
         }
         if line_number == line {
             write_panic_fragment(b"\n");
-            for _ in 0..(gutter + 6 + marker_offset) {
+            for _ in 0..(gutter + source_excerpt::GUTTER_GAP.len() + excerpt.marker_offset) {
                 write_panic_fragment(b" ");
             }
             write_panic_fragment(primary_label);
@@ -3615,42 +3758,6 @@ unsafe fn render_runtime_where(frame: *const DrStackFrameV2, primary_label: &[u8
         };
         line_start = next_line_start;
         line_number += 1;
-    }
-}
-
-fn display_width_with_tabs(bytes: &[u8], tab_width: usize) -> usize {
-    let Ok(text) = core::str::from_utf8(bytes) else {
-        return 0;
-    };
-    let mut width = 0;
-    for character in text.chars() {
-        if character == '\t' {
-            width += tab_width - (width % tab_width);
-        } else {
-            width += character.width().unwrap_or(0);
-        }
-    }
-    width
-}
-
-unsafe fn write_source_line(bytes: &[u8]) {
-    let Ok(text) = core::str::from_utf8(bytes) else {
-        return;
-    };
-    let mut width = 0;
-    for character in text.chars() {
-        if character == '\t' {
-            let spaces = 4 - (width % 4);
-            for _ in 0..spaces {
-                write_panic_fragment(b" ");
-            }
-            width += spaces;
-        } else {
-            let mut encoded = [0_u8; 4];
-            let value = character.encode_utf8(&mut encoded);
-            write_panic_fragment(value.as_bytes());
-            width += character.width().unwrap_or(0);
-        }
     }
 }
 
@@ -4371,8 +4478,88 @@ unsafe fn runtime_invariant_panic() -> ! {
     panic_catalogued(ptr::null(), b"P1001")
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static RUNTIME_ALLOCATION_PROBE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static RUNTIME_ALLOCATION_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_runtime_allocation() -> bool {
+    RUNTIME_ALLOCATION_PROBE.with(|count| {
+        if let Some(value) = count.get() {
+            count.set(Some(value + 1));
+        }
+    });
+    RUNTIME_ALLOCATION_FAILURE.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+        None => false,
+    })
+}
+
+/// Fails exactly one allocation at the shared allocation owner. The scoped,
+/// thread-local probe cannot affect another test or a production executable.
+#[cfg(test)]
+pub(crate) fn with_runtime_allocation_failure<R>(
+    successful_allocations: usize,
+    operation: impl FnOnce() -> R,
+) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RUNTIME_ALLOCATION_FAILURE.with(|remaining| remaining.set(None));
+        }
+    }
+    RUNTIME_ALLOCATION_FAILURE.with(|remaining| {
+        assert!(
+            remaining.get().is_none(),
+            "nested runtime allocation failure probe"
+        );
+        remaining.set(Some(successful_allocations));
+    });
+    let _reset = Reset;
+    operation()
+}
+
+/// Counts this thread's calls to the real runtime allocation owner, including
+/// direct malloc/HeapAlloc paths that bypass Rust's test allocator.
+#[cfg(test)]
+pub(crate) fn probe_runtime_allocations<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    struct Probe;
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            RUNTIME_ALLOCATION_PROBE.with(|count| count.set(None));
+        }
+    }
+    RUNTIME_ALLOCATION_PROBE.with(|count| {
+        assert!(count.get().is_none(), "nested runtime allocation probe");
+        count.set(Some(0));
+    });
+    let probe = Probe;
+    let result = operation();
+    let count = RUNTIME_ALLOCATION_PROBE.with(|count| count.get().unwrap());
+    drop(probe);
+    (result, count)
+}
+
+// malloc on GNU/Darwin and HeapAlloc guarantee at least two-word alignment on
+// the supported platforms. Keep the class payload headerless and freeable by
+// the same allocation owner rather than adding per-type aligned allocations.
+const NATURAL_ALLOCATION_ALIGNMENT: usize = 2 * mem::size_of::<usize>();
+
 #[cfg(unix)]
 unsafe fn allocate(byte_length: usize) -> *mut u8 {
+    #[cfg(test)]
+    if record_runtime_allocation() {
+        return ptr::null_mut();
+    }
     malloc(byte_length).cast::<u8>()
 }
 #[cfg(unix)]
@@ -4382,6 +4569,10 @@ unsafe fn deallocate(memory: *mut u8) {
 
 #[cfg(windows)]
 unsafe fn allocate(byte_length: usize) -> *mut u8 {
+    #[cfg(test)]
+    if record_runtime_allocation() {
+        return ptr::null_mut();
+    }
     HeapAlloc(GetProcessHeap(), 0, byte_length).cast::<u8>()
 }
 #[cfg(windows)]
@@ -4391,6 +4582,8 @@ unsafe fn deallocate(memory: *mut u8) {
 
 #[cfg(not(any(unix, windows)))]
 unsafe fn allocate(_byte_length: usize) -> *mut u8 {
+    #[cfg(test)]
+    let _ = record_runtime_allocation();
     ptr::null_mut()
 }
 #[cfg(not(any(unix, windows)))]
@@ -4402,7 +4595,7 @@ unsafe fn write_panic_fragment(bytes: &[u8]) {
 
 unsafe fn write_panic_bytes(bytes: *const u8, byte_length: usize) {
     // Panic diagnostics are best effort; their sink must not replace the fatal status.
-    let _ = write_standard_stream(StandardStream::Stderr, bytes, byte_length);
+    let _ = device_io::write_panic(bytes, byte_length);
 }
 
 unsafe fn write_standard_stream(
@@ -4430,18 +4623,22 @@ unsafe fn write_byte_stream(
     }
 }
 
-#[cfg(unix)]
 unsafe fn exit_process(status: i32) -> ! {
+    abort_process(status)
+}
+
+#[cfg(unix)]
+unsafe fn abort_process(status: i32) -> ! {
     _exit(status)
 }
 
 #[cfg(windows)]
-unsafe fn exit_process(status: i32) -> ! {
+unsafe fn abort_process(status: i32) -> ! {
     ExitProcess(status as u32)
 }
 
 #[cfg(not(any(unix, windows)))]
-unsafe fn exit_process(_status: i32) -> ! {
+unsafe fn abort_process(_status: i32) -> ! {
     loop {
         core::hint::spin_loop();
     }
@@ -4456,16 +4653,25 @@ extern "C" {
 }
 
 #[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetEnvironmentVariableA(name: *const u8, buffer: *mut u8, size: u32) -> u32;
-}
+use win32::GetEnvironmentVariableA;
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
 // memory operations, string scans, and floating-point use to these support symbols. The runtime
-// owns the small subset they require. Hosted Rust binaries link the CRT and disable this feature
-// through their dependency declaration so both providers can never define the same symbol.
-#[cfg(all(windows, feature = "standalone-windows-support"))]
+// owns the small subset they require, and only where the CRT is absent: the freestanding build,
+// `all(not(test), panic = "abort")`, the same condition that makes the crate `no_std`. Every other
+// build of this crate links `std` and therefore the CRT, whose definitions must win; that includes
+// the crate's own test harness, which has the feature on by default. Exporting the replacements
+// there overrode the CRT inside the test executable, and the `__CxxFrameHandler3` stub disabled
+// every `catch_unwind` on MSVC. Hosted Rust binaries that depend on the freestanding build link the
+// CRT too, and disable this feature through their dependency declaration so both providers can
+// never define the same symbol. In builds that link the CRT the functions below stay ordinary Rust
+// functions, so the harness can still test them.
+#[cfg(all(
+    windows,
+    feature = "standalone-windows-support",
+    not(test),
+    panic = "abort"
+))]
 #[no_mangle]
 pub static _fltused: i32 = 0;
 
@@ -4476,7 +4682,9 @@ pub static _fltused: i32 = 0;
     windows,
     target_env = "msvc",
     target_arch = "x86_64",
-    feature = "standalone-windows-support"
+    feature = "standalone-windows-support",
+    not(test),
+    panic = "abort"
 ))]
 core::arch::global_asm!(
     r#"
@@ -4511,7 +4719,7 @@ __chkstk:
 ///
 /// `source` and `destination` must be valid for `count` bytes and must not overlap.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memcpy(
     destination: *mut c_void,
     source: *const c_void,
@@ -4532,7 +4740,7 @@ pub unsafe extern "C" fn memcpy(
 ///
 /// `source` and `destination` must be valid for `count` bytes.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memmove(
     destination: *mut c_void,
     source: *const c_void,
@@ -4565,7 +4773,7 @@ pub unsafe extern "C" fn memmove(
 ///
 /// `left` and `right` must both be valid for reads of `count` bytes.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count: usize) -> i32 {
     let left = left.cast::<u8>();
     let right = right.cast::<u8>();
@@ -4585,7 +4793,7 @@ pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count
 ///
 /// `value` must point to a readable null-terminated byte string.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn strlen(value: *const core::ffi::c_char) -> usize {
     let mut length = 0;
     while ptr::read_volatile(value.add(length)) != 0 {
@@ -4600,7 +4808,7 @@ pub unsafe extern "C" fn strlen(value: *const core::ffi::c_char) -> usize {
 ///
 /// `value` must point to a readable null-terminated UTF-16 code-unit sequence.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn wcslen(value: *const u16) -> usize {
     let mut length = 0;
     // Prevent the optimizer from replacing this support implementation with itself.
@@ -4617,12 +4825,17 @@ pub unsafe extern "C" fn wcslen(value: *const u16) -> usize {
 /// deliberately links without the CRT. Returning `ExceptionContinueSearch` preserves the
 /// abort-only boundary if an unrelated structured exception reaches this metadata.
 ///
+/// MSVC Rust uses this handler as the personality of every `catch_unwind`, so a binary that
+/// can unwind must get the CRT's real one. That is why it is exported only from the
+/// freestanding build: in the test harness this stub made every caught panic abort the process.
+///
 /// # Safety
 ///
 /// This function may only be entered by the Windows exception dispatcher with its four native
 /// dispatcher pointers. Doria code must never call it directly.
 #[cfg(all(windows, target_env = "msvc", feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
+#[allow(non_snake_case)] // The MSVC ABI names this handler.
 pub unsafe extern "C" fn __CxxFrameHandler3(
     _exception_record: *mut c_void,
     _establisher_frame: *mut c_void,
@@ -4639,7 +4852,7 @@ pub unsafe extern "C" fn __CxxFrameHandler3(
 ///
 /// `destination` must be valid for writes of `count` bytes.
 #[cfg(all(windows, feature = "standalone-windows-support"))]
-#[no_mangle]
+#[cfg_attr(all(not(test), panic = "abort"), no_mangle)]
 pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usize) -> *mut c_void {
     let destination_bytes = destination.cast::<u8>();
     for index in 0..count {
@@ -4649,17 +4862,13 @@ pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usi
 }
 
 #[cfg(windows)]
-extern "system" {
-    fn GetProcessHeap() -> *mut c_void;
-    fn HeapAlloc(heap: *mut c_void, flags: u32, byte_length: usize) -> *mut c_void;
-    fn HeapFree(heap: *mut c_void, flags: u32, memory: *mut c_void) -> i32;
-    fn ExitProcess(status: u32) -> !;
-}
+use win32::{ExitProcess, GetProcessHeap, HeapAlloc, HeapFree};
 
 #[cfg(all(not(test), panic = "abort"))]
 #[panic_handler]
 fn rust_panic(_information: &core::panic::PanicInfo<'_>) -> ! {
-    unsafe { exit_process(PANIC_STATUS) }
+    // A broken runtime invariant: still say so, never exit silently.
+    unsafe { emergency_runtime_panic() }
 }
 
 #[cfg(all(not(test), panic = "abort"))]
@@ -4671,6 +4880,42 @@ mod tests {
     use super::*;
     use core::cell::Cell;
 
+    #[test]
+    fn argument_free_successful_entry_uses_no_runtime_allocations() {
+        unsafe extern "C" fn main_void(_frame: *const DrStackFrameV2) {
+            crate::test_callback::guard(|| {})
+        }
+        unsafe extern "C" fn main_int(_frame: *const DrStackFrameV2) -> i64 {
+            crate::test_callback::guard(|| 7)
+        }
+        unsafe extern "C" fn checked_void(
+            _frame: *const DrStackFrameV2,
+            _error: *mut DrInterfaceCarrierV1,
+        ) -> u8 {
+            crate::test_callback::guard(|| 0)
+        }
+        unsafe extern "C" fn checked_int(
+            _frame: *const DrStackFrameV2,
+            value: *mut i64,
+            _error: *mut DrInterfaceCarrierV1,
+        ) -> u8 {
+            crate::test_callback::guard(|| {
+                *value = 7;
+                0
+            })
+        }
+        let (statuses, allocations) = probe_runtime_allocations(|| unsafe {
+            [
+                dr_v2_main_void(main_void),
+                dr_v2_main_int(main_int, ptr::null(), 0, ptr::null(), 0, 0, 0),
+                dr_v3_main_checked_void(checked_void),
+                dr_v3_main_checked_int(checked_int, ptr::null(), 0, ptr::null(), 0, 0, 0),
+            ]
+        });
+        assert_eq!(statuses, [0, 7, 0, 7]);
+        assert_eq!(allocations, 0);
+    }
+
     std::thread_local! {
         static SHARED_PAYLOAD_DROPS: Cell<usize> = const { Cell::new(0) };
     }
@@ -4681,6 +4926,67 @@ mod tests {
 
     fn shared_payload_drops() -> usize {
         SHARED_PAYLOAD_DROPS.get()
+    }
+
+    #[test]
+    fn io_error_progress_projection_preserves_nullable_signed_values() {
+        #[repr(C)]
+        struct Progress {
+            present: usize,
+            value: i64,
+        }
+        unsafe extern "C" fn unused_drop(_frame: *const DrStackFrameV2, _object: *mut u8) {
+            crate::test_callback::guard(|| {})
+        }
+        let mut value = Progress {
+            present: 0,
+            value: 2048,
+        };
+        let mut descriptor = DrInterfaceVtableV1 {
+            type_name: IO_ERROR_TYPE.as_ptr(),
+            type_name_length: IO_ERROR_TYPE.len(),
+            message_offset: 0,
+            drop: unused_drop,
+            class_size: mem::size_of::<Progress>(),
+            origin_offset: 0,
+            assertion_offsets: 0,
+            assertion_magic: 0,
+            class_descriptor: ptr::null(),
+            interface_id: 0,
+            io_transferred_byte_count_offset: 0,
+            io_progress_magic: IO_ERROR_PROGRESS_DESCRIPTOR_MAGIC,
+        };
+        unsafe {
+            assert_eq!(
+                io_transferred_byte_count((&raw mut value).cast(), &descriptor),
+                None
+            );
+            value.present = 1;
+            for count in [0, 2048, -1, i64::MAX] {
+                value.value = count;
+                assert_eq!(
+                    io_transferred_byte_count((&raw mut value).cast(), &descriptor),
+                    Some(count)
+                );
+            }
+            descriptor.io_progress_magic = 0;
+            assert_eq!(
+                io_transferred_byte_count((&raw mut value).cast(), &descriptor),
+                None
+            );
+            descriptor.io_progress_magic = IO_ERROR_PROGRESS_DESCRIPTOR_MAGIC;
+            descriptor.class_size = mem::size_of::<usize>();
+            assert_eq!(
+                io_transferred_byte_count((&raw mut value).cast(), &descriptor),
+                None
+            );
+            descriptor.class_size = mem::size_of::<Progress>();
+            descriptor.io_transferred_byte_count_offset = usize::MAX;
+            assert_eq!(
+                io_transferred_byte_count((&raw mut value).cast(), &descriptor),
+                None
+            );
+        }
     }
 
     #[test]
@@ -4729,8 +5035,10 @@ mod tests {
         _current_frame: *const DrStackFrameV2,
         payload: *mut u8,
     ) {
-        SHARED_PAYLOAD_DROPS.set(SHARED_PAYLOAD_DROPS.get() + 1);
-        dr_v1_class_free(payload);
+        crate::test_callback::guard(|| {
+            SHARED_PAYLOAD_DROPS.set(SHARED_PAYLOAD_DROPS.get() + 1);
+            dr_v1_class_free(payload);
+        })
     }
 
     unsafe fn bytes(string: *const DrStringV1) -> &'static [u8] {
@@ -4776,16 +5084,20 @@ mod tests {
     #[test]
     fn headerless_class_allocation_handles_empty_and_nonempty_payloads() {
         unsafe {
-            for size in [0, 1, 24] {
-                let payload = dr_v2_class_allocate(ptr::null(), size, 8);
-                assert!(!payload.is_null());
-                if size > 0 {
-                    assert!(core::slice::from_raw_parts(payload, size)
+            for alignment in [1, 2, 4, 8, NATURAL_ALLOCATION_ALIGNMENT] {
+                for size in [0, 1, 24, 64] {
+                    let (payload, allocations) = probe_runtime_allocations(|| {
+                        dr_v2_class_allocate(ptr::null(), size, alignment)
+                    });
+                    assert_eq!(allocations, 1);
+                    assert!(!payload.is_null());
+                    assert_eq!(payload.addr() % alignment, 0);
+                    assert!(core::slice::from_raw_parts(payload, size.max(1))
                         .iter()
                         .all(|byte| *byte == 0));
-                    ptr::write_bytes(payload, 0xa5, size);
+                    ptr::write_bytes(payload, 0xa5, size.max(1));
+                    dr_v1_class_free(payload);
                 }
-                dr_v1_class_free(payload);
             }
         }
     }
@@ -5011,11 +5323,45 @@ mod tests {
 
     #[test]
     fn runtime_source_markers_use_terminal_display_width() {
-        assert_eq!(display_width_with_tabs(b"\t", 4), 4);
-        assert_eq!(display_width_with_tabs("e\u{301}".as_bytes(), 4), 1);
-        assert_eq!(display_width_with_tabs("🙂".as_bytes(), 4), 2);
-        assert_eq!(display_width_with_tabs("界".as_bytes(), 4), 2);
-        assert_eq!(display_width_with_tabs(b"a\tb", 4), 5);
+        for (text, expected) in [
+            ("\t", 4),
+            ("e\u{301}", 1),
+            ("🙂", 2),
+            ("界", 2),
+            ("a\tb", 5),
+            ("a\t👩‍💻\te\u{301}界", 11),
+        ] {
+            assert_eq!(
+                source_excerpt::display_width_with_tabs(
+                    text,
+                    source_excerpt::TAB_WIDTH,
+                    doria_unicode::grapheme_boundaries,
+                    UnicodeWidthStr::width,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_source_excerpts_window_late_markers_and_keep_unicode_clusters() {
+        let text = format!("{}👩‍💻\te\u{301}界", "a".repeat(100));
+        let start = text.find('👩').unwrap();
+        let excerpt = SourceExcerpt::new(
+            &text,
+            Some((start, start + "👩‍💻".len())),
+            source_excerpt::DEFAULT_TERMINAL_WIDTH,
+            doria_unicode::grapheme_boundaries,
+            UnicodeWidthStr::width,
+        );
+        let mut output = Vec::new();
+        excerpt.write(|bytes| output.extend_from_slice(bytes));
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, format!("…{}👩‍💻  e\u{301}界", "a".repeat(79)));
+        assert_eq!((excerpt.marker_offset, excerpt.marker_width), (80, 2));
+        assert!(
+            output.width() <= source_excerpt::source_width(source_excerpt::DEFAULT_TERMINAL_WIDTH)
+        );
     }
 
     #[test]
@@ -5147,7 +5493,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "standalone-windows-support"))]
     #[test]
     fn no_crt_memory_support_symbols_preserve_bytes_and_overlap() {
         unsafe {

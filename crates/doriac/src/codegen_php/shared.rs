@@ -52,8 +52,8 @@ pub(super) fn emit_method(
         _ => None,
     };
     let operator = if null_safe { "?->" } else { "->" };
-    let object = emit_member_receiver(object, scopes);
     Some(if let Some(operation) = operation {
+        let receiver = emit_member_receiver(object, scopes);
         let writable = if operation == "access" {
             if method == "acquireWritableAccess" {
                 "true, "
@@ -64,20 +64,30 @@ pub(super) fn emit_method(
             ""
         };
         format!(
-            "{object}{operator}{operation}({writable}{}, {}, {})",
-            php_source_location(span, span.start),
-            php_source_location(span, span.end),
+            "{receiver}{operator}{operation}({writable}{}, {}, {})",
+            scopes.source_location(span, span.start),
+            scopes.source_location(span, span.end),
             scopes.callable_identity()
         )
     } else {
-        let method = scopes
-            .specialization
-            .call_symbol(span, &scopes.substitutions)
-            .unwrap_or(method);
-        format!(
-            "{object}{operator}payload()->{method}({})",
-            emit_arguments_for_call(args, span, scopes)
-        )
+        let symbol = scopes.call_symbol(span).unwrap_or(method);
+        if scopes
+            .closure_plan
+            .callable_at(span)
+            .is_some_and(|plan| plan.caller_receiver_home())
+        {
+            return Some(emit_method_with_receiver_home(
+                object,
+                symbol,
+                || emit_method_arguments_for_call(object, method, args, span, scopes),
+                span,
+                null_safe,
+                scopes,
+            ));
+        }
+        let receiver = emit_member_receiver(object, scopes);
+        let arguments = emit_method_arguments_for_call(object, method, args, span, scopes);
+        format!("{receiver}{operator}payload()->{symbol}({arguments})")
     })
 }
 
@@ -148,6 +158,12 @@ final class __DoriaSharedHandle
         return $control->payload;
     }
 
+    public function payloadCell(): __DoriaCell
+    {
+        $this->payload();
+        return __DoriaCell::borrowed($this->control->payload);
+    }
+
     public function share(int $start, int $end, string $callable): self
     {
         $control = $this->checked();
@@ -174,12 +190,12 @@ final class __DoriaSharedHandle
     {
         $control = $this->checked();
         if ($writable && $control->readers !== 0) {
-            __doria_panic("P1501", $start, $end, null, $callable, ["conflictReason" => "Cannot Acquire Writable Access While Readonly Access Is Active"]);
+            __doria_panic("P1501", $start, $end, null, $callable, ["conflictReason" => [4, "Cannot Acquire Writable Access While Readonly Access Is Active"]]);
         }
         if ($control->writer) {
-            __doria_panic("P1501", $start, $end, null, $callable, ["conflictReason" => $writable
+            __doria_panic("P1501", $start, $end, null, $callable, ["conflictReason" => [4, $writable
                 ? "Cannot Acquire Writable Access While Writable Access Is Active"
-                : "Cannot Acquire Readonly Access While Writable Access Is Active"]);
+                : "Cannot Acquire Readonly Access While Writable Access Is Active"]]);
         }
         __doria_shared_retain($control->strong, "P1503", $start, $end, $callable);
         if ($writable) { $control->writer = true; }

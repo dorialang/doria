@@ -1,0 +1,63 @@
+use Doria\Std\Io\{File, ReadableFile, ReadOutcome, IoError};
+
+class FixtureRegistrationError implements Error
+{
+    function __construct(string $message) {}
+}
+
+class FixtureKey<T>
+{
+    function __construct(string $name) {}
+}
+
+class FixtureRegistry<T>
+{
+    internal writable Dictionary<string, T> $streams = [];
+
+    writable function register(string $name, take T $stream): FixtureKey<T> throws FixtureRegistrationError
+    {
+        if ($this->streams->containsKey($name)) {
+            throw new FixtureRegistrationError("duplicate");
+        }
+        $this->streams[$name] = $stream;
+        return new FixtureKey<T>($name);
+    }
+
+    writable function remove(FixtureKey<T> $key): T throws FixtureRegistrationError
+    {
+        let $stream = $this->streams->remove($key->name);
+        if ($stream == null) {
+            throw new FixtureRegistrationError("stale");
+        }
+        return $stream;
+    }
+}
+
+function report(take ReadableFile $file, writable Bytes $buffer, string $name): void throws IoError
+{
+    let writable $returned = $file;
+    {
+        let writable $destination = $buffer->getWritableRegion(0, 1);
+        $returned->read($destination);
+    }
+    echo "{$name} {$buffer[0]}\n";
+    $returned->close();
+}
+
+function main(): void
+{
+    write_file("registered.txt", "abc\n");
+    writable Bytes $buffer = Bytes::allocate(1);
+    let writable $registry = new FixtureRegistry<ReadableFile>();
+    let $first = $registry->register("first", File::openRead("registered.txt"));
+    let $second = $registry->register("second", File::openRead("registered.txt"));
+    let $third = $registry->register("third", File::openRead("registered.txt"));
+    $registry->register("retained", File::openRead("registered.txt"));
+    try { $registry->register("first", File::openRead("registered.txt")); }
+    catch (FixtureRegistrationError $error) { echo "{$error->message}\n"; }
+    report($registry->remove($first), $buffer, "first");
+    report($registry->remove($third), $buffer, "third");
+    report($registry->remove($second), $buffer, "second");
+    try { $registry->remove($first); }
+    catch (FixtureRegistrationError $error) { echo "{$error->message}\n"; }
+}

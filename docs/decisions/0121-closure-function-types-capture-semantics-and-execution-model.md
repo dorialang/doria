@@ -207,6 +207,16 @@ Stage 30 substitutions are:
 General parameter contravariance and return covariance remain deferred until
 inheritance and interface work provides executable consumers.
 
+Andrew approved owned-result retention as a permitted upper bound on
+2026-10-12. `function(take Cursor): ?Cursor` accepts both forwarding the
+consumed input and consuming it before returning loan-free `null`. Likewise,
+`function(take List<Cursor>): List<Cursor>` accepts forwarding or a fresh empty
+list. Known bodies preserve their actual source loans; an annotation does not
+invent loans for a proved loan-free result. Opaque calls retain the declared
+bound until a body proof is available. This compatibility does not apply to
+returned borrowed aliases, erase an actual loan, weaken exclusivity or shorten
+its required lifetime. Parameter modes and value types remain exact.
+
 ### 6. Closure-Expression Typing
 
 Closure parameters remain explicitly typed. Arrow closures infer their return
@@ -333,6 +343,13 @@ obligation. Repeatable calls do not reacquire captures. A once call consumes the
 environment and, after normal completion or checked propagation, destroys every
 remaining capture exactly once. Fatal panic remains non-unwinding; allocation
 failure uses the existing fatal allocation panic.
+
+Readonly and writable capture loans follow ordinary non-lexical last-use rules.
+Environment ownership does not extend a borrow-only capture's loan to lexical
+cleanup. However, cleanup of an owned capture may itself observe a borrowed
+source, such as through a captured iterator's destructor; that dependency lasts
+through cleanup. Ending a loan never advances destruction of owned captures or
+changes their reverse logical cleanup order.
 
 Doria adds no `nonescaping` keyword. Existing function-value parameter ownership
 controls escape:

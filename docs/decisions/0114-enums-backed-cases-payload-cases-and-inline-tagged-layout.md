@@ -131,9 +131,11 @@ During Stage 27 Slice 1, the compiler parsed and preserved payload schemas but
 stopped payload case construction before MIR with one Slice 2 diagnostic.
 Slice 2 removed that temporary boundary and delivered payload execution.
 
-## Generic Enum Deferral
+## Generic Enum Amendment
 
-Generic enum syntax is reserved for future monomorphized enums:
+Andrew approved "A: General generic finish enums (Recommended)" on 2026-11-03.
+Stage 36a implements general monomorphized generic payload enums, including
+ordinary user-defined declarations:
 
 ```doria
 enum Optional<T>
@@ -143,8 +145,24 @@ enum Optional<T>
 }
 ```
 
-The syntax parses, but semantic analysis reports that generic enums are not yet
-implemented. This decision does not assign a fictional landing stage.
+Each specialization applies the existing enum rules after type substitution:
+nominal type and case identity, inline tagged layout, Copy classification only
+when every payload is Copy, and ordinary active-case cleanup. Owned payloads
+transfer ownership and retained source loans. Matching releases or forwards
+those loans according to the selected case. Generic specialization introduces
+no extra result allocation. Shared checking, specialization, ownership and MIR
+facts govern native and PHP lowering and Tooling; finish results do not receive
+an adapter-specific compiler carrier.
+
+Implementation status (2026-11-05): generic payload enums execute on the
+interpreter, Cranelift, LLVM and PHP. The E0572 boundary is removed. PHP emits
+one class per specialization, and its `mixed` identity includes the type
+arguments. Move-ness and Copy classification are decided per application.
+Payloads transport the source loans of class wrappers, iterators and byte
+regions. Borrow-bound closures stay rejected (E0658), including through a
+generic `take` parameter. Decision 0110 owns the finish result declarations,
+which are now declared and executable; it also records the extraction and
+borrowed class storage rulings.
 
 ## Case Identity And Type Identity
 
@@ -192,6 +210,11 @@ payloads make the whole enum Move.
 Enum equality requires the same nominal enum type. Unit and backed enum values
 compare by case identity. Payload enums additionally compare active payloads
 left to right when every payload type supports equality.
+
+Nullable operands preserve that same nominal and payload-equality requirement.
+Two absent values compare equal, one absent value compares unequal to a present
+value, and two present values use the enum's equality. Comparing with `null`
+tests presence only and does not require payload equality.
 
 Different enum types cannot compare, even when backing values match. An enum
 cannot compare directly with its backing value. Enums have no ordered
@@ -334,7 +357,8 @@ equality, payload `mixed` boxing, payload PHP lowering, and Stage 27 closure.
 construction, layout, ownership, destruction, equality, nullable and `mixed`
 transport, Copy constants/defaults, aggregate ABI, class/generic/collection
 storage, PHP lowering, and durable interpreter/Cranelift/LLVM parity are
-implemented. Generic enums remain deferred and `match` remains Stage 28.
+implemented. Generic enums were outside Stage 27; the amendment above now
+assigns them to Stage 36a. `match` belongs to Stage 28.
 
 Controlled payload-enum timing is `Pending Available Runner` and non-blocking.
 No unmeasured result is recorded as a performance pass.

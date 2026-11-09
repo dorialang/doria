@@ -120,11 +120,21 @@ $require($knownIoPath, $knownIoCanonical, [
     'Doria\\Std\\Io\\Utf8InputSource',
     'Doria\\Std\\Io\\IoError',
     'Doria\\Std\\Io\\InvalidUtf8Error',
-    'pub const CANONICAL_TYPES: [&str; 6]',
     'validate_reserved_identities',
     'visit_io_error_message_parts',
     'visit_invalid_utf8_message_parts',
 ]);
+// Later I/O stages may add identities; the original error family must remain
+// registered, not freeze the complete namespace at its Stage 29 size.
+if (preg_match('/pub const CANONICAL_TYPES:\s*\[&str;\s*\d+\]\s*=\s*\[(.*?)\];/s', $knownIo, $registry) !== 1) {
+    $failures[] = "{$knownIoPath}: canonical I/O type registry is missing";
+} else {
+    foreach (['IO_OPERATION', 'IO_TARGET', 'IO_ERROR_REASON', 'UTF8_INPUT_SOURCE', 'IO_ERROR', 'INVALID_UTF8_ERROR'] as $identity) {
+        if (preg_match('/\b' . preg_quote($identity, '/') . '\s*,/', $registry[1]) !== 1) {
+            $failures[] = "{$knownIoPath}: Stage 29 identity {$identity} is no longer registered";
+        }
+    }
+}
 $forbid($knownIoPath, $knownIo, ['"IoError" =>', '"InvalidUtf8Error" =>']);
 
 $require($builtinsPath, $builtins, [

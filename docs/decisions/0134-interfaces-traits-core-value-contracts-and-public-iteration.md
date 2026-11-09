@@ -144,6 +144,16 @@ does not invent abstract classes or incomplete conforming classes. Open and
 closed classes follow the same conformance law; a valid child override updates
 the inherited interface vtable for the child's dynamic specialization.
 
+### Stage 36a Conditional Capability Direction
+
+Andrew approved general explicitly conditional nominal conformance and
+constrained member bodies for generic adapters. Decision 0139 records that
+accepted direction and subsequently approved local-clause spelling and detailed
+coherence contract. Implementation remains pending. This extends authored
+nominal conformance; method-name coincidence and trait-granted conformance
+remain excluded. The master plan assigns the grammar and execution slices.
+Existing unconditional declarations and compiler behavior are unchanged.
+
 ## Requirement Compatibility
 
 Interface conformance reuses Decision 0130's callable substitution machinery:
@@ -168,6 +178,33 @@ requirement's parameter names, which is why parameter-name identity is exact.
 `open` and `override` remain class-hierarchy declarations rather than interface
 requirements.
 
+### Region-Returning Requirements
+
+Doria has no lifetime annotations, so a requirement cannot spell the borrow its
+result keeps. A bodyless requirement with a receiver whose return type is
+`ByteRegion`, `WritableByteRegion`, or a nullable region therefore elides to a
+retained borrow of that receiver. This is Decision 0089's single-source rule
+applied where there are no return statements to read: `$this` is the one source
+every implementation can share. It covers interface methods and accessors and
+bodyless trait methods, and it decides from the substituted return type, so
+`T` in `Producing<ByteRegion>` is a region and `T` in `Producing<int>` is not.
+
+- An implementation may return a region its receiver holds or one independent
+  of the receiver, such as absence or storage the receiver only borrows. Both
+  preserve at least the required provenance. A region from a parameter does not
+  conform.
+- Callers always hold the receiver borrowed. The result cannot outlive the
+  receiver, whichever implementation runs, even when every implementation
+  returns an independent region. Calls through an interface view, a witness, or
+  a constrained generic parameter all carry this borrow.
+- A static requirement has no receiver and a consuming receiver dies with the
+  call, so neither elides a source.
+- A readonly requirement holds a shared borrow even for a writable region. A
+  readonly receiver cannot lend exclusive access, so no implementation can
+  return a writable region held by that receiver.
+- A generic method's own `T` comes from its arguments, not from the contract,
+  so its result keeps the argument's borrow.
+
 ## Interface Values And Ownership
 
 An owned interface value is a Move value. Its runtime carrier is exactly:
@@ -191,6 +228,12 @@ carrier without allocating, copying the object, or creating another owner.
 - Interface-typed properties, supported statics, collection elements, and
   closure captures store owned carriers; borrowed carriers cannot escape into
   storage.
+
+Decision 0138's C-B ruling covers inline Copy implementers: erasure creates an
+independent owned Copy snapshot. An implicit carrier temporary lasts through
+the calling statement. A returned borrow may be used within that statement;
+storing it requires an explicitly stored interface owner first. Nullable Copy
+erasure follows the same rule. The original Copy binding remains independent.
 
 Upcasting an interface to an ancestor changes only the vtable word. Sibling
 interface conversion and interface-to-class conversion require checked `is`
@@ -713,7 +756,9 @@ interface contract's set. Interface slots use the existing checked return ABI.
 AmbientIo and TestAssertion remain automatic and separate.
 
 Trait requirements use the same subset law. Trait bodies are checked when
-authored and revalidated after substitution. Error subinterfaces participate in
+authored and revalidated after substitution. Revalidation narrows executable
+transport only; the authored check decides catch reachability for every
+composer (Decision 0123, amended 2026-11-07). Error subinterfaces participate in
 catch coverage, rethrow, `toThrow`, finalizers, constructor failure, and dynamic
 drop without losing concrete Error identity.
 

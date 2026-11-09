@@ -89,7 +89,7 @@ class Message implements App\Renderable<int>, Serializable {
     let Item::Class(class) = &program.items[1] else {
         panic!("class");
     };
-    assert_eq!(class.implements[0].to_string(), "App\\Renderable<int>");
+    assert_eq!(class.implements[0].ty.to_string(), "App\\Renderable<int>");
     assert!(matches!(class.members[0], ClassMember::Property(_)));
     let ClassMember::Uses(composition) = &class.members[1] else {
         panic!("ordered uses entry");

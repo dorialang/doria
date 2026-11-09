@@ -5,7 +5,7 @@
     {
       "id": "benchmarks-engine",
       "repository": "dorialang/benchmarks",
-      "publishedRefs": ["refs/heads/main"],
+      "publishedRefs": ["refs/heads/main", "refs/heads/develop"],
       "source": {
         "file": "benchmarks-revision.json",
         "format": "json-pointer",

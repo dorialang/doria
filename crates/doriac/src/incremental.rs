@@ -7,6 +7,7 @@ use crate::diagnostics::DiagnosticResult;
 use crate::runtime_digest::sha256_hex;
 use crate::source::SourceId;
 use crate::source_provider::SourceProvider;
+use crate::symbols::ReceiverMode;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedSource {
@@ -460,7 +461,8 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
             }
             surface.push_str("implements:");
             for implemented in &class.implements {
-                surface.push_str(&implemented.to_string());
+                surface.push_str(&implemented.ty.to_string());
+                append_nominal_condition(surface, implemented.condition.as_ref());
                 surface.push(',');
             }
             for member in &class.members {
@@ -537,6 +539,7 @@ fn append_member_signature(surface: &mut String, member: &ClassMember, source_te
             surface.push_str(&property.ty.to_string());
             surface.push(':');
             surface.push_str(&property.name);
+            append_nominal_condition(surface, property.availability.as_ref());
             append_optional_expression(surface, property.initializer.as_ref(), source_text);
         }
         ClassMember::Method(function) => {
@@ -572,7 +575,11 @@ fn append_function_signature(
     surface.push(if function.is_open { 'o' } else { '-' });
     surface.push(if function.is_override { 'v' } else { '-' });
     surface.push(if function.is_static { 's' } else { '-' });
-    surface.push(if function.writable_this { 'w' } else { 'r' });
+    surface.push(match ReceiverMode::from_declaration(function) {
+        ReceiverMode::Readonly => 'r',
+        ReceiverMode::Writable => 'w',
+        ReceiverMode::Consuming => 'c',
+    });
     surface.push_str(&function.name);
     append_type_params(surface, &function.type_params);
     for parameter in &function.params {
@@ -608,7 +615,11 @@ fn append_function_signature(
             surface.push(',');
         }
     }
+    append_nominal_condition(surface, function.availability.as_ref());
     match &function.body {
+        crate::ast::FunctionBody::Intrinsic { implementation, .. } => {
+            surface.push_str(&format!("intrinsic:{implementation:?};"));
+        }
         crate::ast::FunctionBody::Requirement { .. } => surface.push_str("requirement;"),
         crate::ast::FunctionBody::Block(body) => {
             surface.push_str("body;");
@@ -630,6 +641,25 @@ fn append_function_signature(
                 );
             }
         }
+    }
+}
+
+fn append_nominal_condition(
+    surface: &mut String,
+    condition: Option<&crate::ast::NominalCondition>,
+) {
+    if let Some(condition) = condition {
+        surface.push_str("where(");
+        for bound in &condition.bounds {
+            surface.push_str(&bound.subject.text);
+            surface.push(':');
+            for interface in &bound.interfaces {
+                surface.push_str(&interface.to_string());
+                surface.push(',');
+            }
+            surface.push(';');
+        }
+        surface.push(')');
     }
 }
 
@@ -681,4 +711,40 @@ fn append_access(surface: &mut String, access: MemberAccess) {
         MemberAccess::External => "external:",
         MemberAccess::Internal => "internal:",
     });
+}
+
+#[cfg(test)]
+mod conditional_signature_tests {
+    use super::*;
+
+    fn signature(source: &str) -> String {
+        let program = crate::parse_source("signature.doria", source).unwrap();
+        let mut result = String::new();
+        for item in &program.items {
+            append_item_signature(&mut result, item, source);
+        }
+        result
+    }
+
+    #[test]
+    fn condition_edits_invalidate_each_declaration_surface() {
+        for source in [
+            "class C<T> implements Ready where (T implements First) {}",
+            "class C<T> { function inspect(): int where (T implements First) { return 1; } }",
+            "class C<T> { int $state where (T implements First) { get { return 1; } } }",
+            "trait C<T> { function inspect(): int where (T implements First) { return 1; } }",
+        ] {
+            assert_ne!(
+                signature(source),
+                signature(&source.replace("First", "Second"))
+            );
+        }
+        let compact = "class C<T> implements Ready where (T implements First) {}";
+        assert_eq!(
+            signature(compact),
+            signature(
+                &compact.replace("where (T implements First)", "where ( T implements First )")
+            )
+        );
+    }
 }

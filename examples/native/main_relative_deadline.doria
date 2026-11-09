@@ -1,0 +1,30 @@
+use Doria\Std\Io\Wait;
+use Doria\Std\Time\{Deadline, Duration};
+
+class DeadlineHolder {
+    function __construct(Deadline $deadline) {}
+}
+
+function identity<T>(T $value): T { return $value; }
+
+function main(): void {
+    let $duration = Duration::fromNanoseconds(-9223372036854775808);
+    let $deadline = Deadline::fromNow(duration: $duration);
+    let $copy = identity($deadline);
+    let $holder = new DeadlineHolder($deadline);
+    let $callback = fn() with ($deadline) => $deadline;
+    ?Deadline $optional = $copy;
+    List<Deadline> $deadlines = [$deadline];
+    let $wait = Wait::Until(deadline: $deadline);
+    let $positive = Deadline::fromNow(Duration::fromNanoseconds(9223372036854775807));
+    if ($duration->nanoseconds != -9223372036854775808
+        || $deadline != $copy || $holder->deadline != $deadline
+        || $callback() != $deadline || ($optional ?? $positive) != $deadline
+        || $deadlines[0] != $deadline || $positive == $deadline) {
+        panic("relative deadline Copy transport changed");
+    }
+    if (match ($wait) { Wait::Until($value) => $value != $deadline, default => true }) {
+        panic("wait deadline changed");
+    }
+    echo "deadline copy: correct\n";
+}

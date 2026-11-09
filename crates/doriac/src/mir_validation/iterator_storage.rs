@@ -72,7 +72,8 @@ pub fn stack_collection_iterators(
                         mir::Statement::BindClosureEnvironment { bindings, .. } => {
                             bindings.iter().map(|(_, local)| *local).collect()
                         }
-                        mir::Statement::ExtractErrorObject { target, .. } => vec![*target],
+                        mir::Statement::ExtractErrorObject { target, .. }
+                        | mir::Statement::TakeProperty { target, .. } => vec![*target],
                         _ => Vec::new(),
                     };
                     if writes.iter().any(|local| aliases.contains(local)) {
@@ -146,7 +147,11 @@ fn protocol_only(
     let (result, error) = match terminator {
         mir::Terminator::CheckedCall { result, error, .. }
         | mir::Terminator::CheckedIndirectCall { result, error, .. }
-        | mir::Terminator::CheckedIo { result, error, .. } => (*result, Some(*error)),
+        | mir::Terminator::CheckedIo { result, error, .. }
+        | mir::Terminator::CheckedDeadlineFromNow { result, error, .. }
+        | mir::Terminator::CheckedCancellationRequest { result, error, .. } => {
+            (*result, Some(*error))
+        }
         mir::Terminator::IndirectCall { result, .. } => (*result, None),
         mir::Terminator::CheckedConstruct { result, error, .. } => (Some(*result), Some(*error)),
         _ => (None, None),

@@ -4,7 +4,7 @@
 > `Cloneable`; the source is evaluated once and cloned once per destination slot
 > in ascending order. Copy values retain the existing direct path.
 
-**Status:** Accepted And Implemented (Copy scalars, immutable strings, and
+**Status:** Accepted And Implemented (checked Copy values, immutable strings, and
 Decision 0134 Cloneable Move elements). Amends decision 0100's fill deferral and
 plan §4.9's bracket-literal forms. Un-parks the *fill* half of 0100's deferred
 constructors; the *capacity hint* (`withCapacity`) stays parked.
@@ -61,8 +61,10 @@ let $flags = [false; n];          // no expected type -> List<bool>
 Replicating a value `count` times requires its checked duplication plan.
 Stage 35 Slice 3 implements Decision 0134's widening:
 
-- **Copy scalars** (`bool`, `int` and the fixed-width integers, `float`/`float32`/
-  `float64`) — a bit copy. This covers the motivating buffer workloads.
+- **Copy values** include scalars, Copy enums, and compiler-known inline Copy
+  values. Each destination receives the complete representation, including
+  nullable presence, and retains any required managed payload claims. Scalar
+  bit copies still cover the motivating buffer workloads.
 - **`string`** — immutable and reference-counted, so `count` copies are `count`
   retained handles to the same `DrStringV1`; sound and cheap.
 

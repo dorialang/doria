@@ -1,0 +1,28 @@
+use Doria\Std\Io\{ByteRegion, WritableByteRegion};
+
+function bound(string $name, int $value): int {
+    echo "{$name}\n";
+    return $value;
+}
+
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(4);
+    echo "zero {$bytes[0]}:{$bytes[3]}\n";
+    {
+        let writable $whole = $bytes->getWritableRegion(length: bound("length", 4), offset: bound("offset", 0));
+        {
+            let writable $tail = $whole->getWritableRegion(length: bound("tail length", 2), offset: bound("tail offset", 1));
+            $tail[0] = 41;
+            $tail[0]++;
+            echo "tail {$tail[0]}:{$tail->length}\n";
+        }
+        echo "whole {$whole[1]}:{$whole->length}\n";
+    }
+    {
+        ByteRegion $view = $bytes->getRegion(1, 2);
+        let $copy = $view;
+        echo "copy {$copy[0]}:{$view->length}\n";
+    }
+    $bytes[1] = 9;
+    echo "owner {$bytes[1]}\n";
+}

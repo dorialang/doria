@@ -1,0 +1,32 @@
+open class Root<T>
+{
+    open function value<U>(T $input, U $tag): T { return $input; }
+}
+
+class Child<T> extends Root<T>
+{
+    override function value<U>(T $input, U $tag): T { echo "c"; return $input; }
+    function exact<U>(T $input, U $tag): T { return parent::value($input, $tag); }
+}
+
+trait Relay<T>
+{
+    function relay<U>(Child<T> $source, T $input, U $tag): T
+    {
+        return $source->exact($input, $tag);
+    }
+}
+
+class Forwarder<T> { uses Relay<T>; }
+
+function viaCallback(function(): int $callback): int { return $callback(); }
+
+function main(): void
+{
+    let $child = new Child<int>();
+    let $forwarder = new Forwarder<int>();
+    echo $child->exact(7, true);
+    echo $forwarder->relay($child, 8, false);
+    let $callback = fn() with ($child) => $child->exact(9, true);
+    echo viaCallback($callback);
+}

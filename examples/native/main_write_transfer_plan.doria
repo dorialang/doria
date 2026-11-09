@@ -1,0 +1,80 @@
+use Doria\Std\Io\{TransferPlan, PendingWritableStream, RegistrationKey, ByteRegion,
+    ReadinessSet, File, FileCreation, FileWriteMode, IoError, IoErrorReason, IoOperation, IoTarget,
+    ReadTransferKey, WriteTransferKey};
+
+function configureWrite<T implements PendingWritableStream>(
+    RegistrationKey<T> $key, ByteRegion $source
+): TransferPlan throws IoError {
+    return TransferPlan::writeTo($key, $source);
+}
+
+function appendWrite<T implements PendingWritableStream>(
+    take TransferPlan $plan, RegistrationKey<T> $key, ByteRegion $source
+): TransferPlan throws IoError {
+    return $plan->andWriteTo($key, $source);
+}
+
+function main(): void {
+    write_file("input", "unchanged\n");
+    writable ReadinessSet $set = new ReadinessSet();
+    let $key = $set->register(File::openReadWrite("input", FileCreation::OpenExisting, FileWriteMode::Positioned));
+    writable ReadinessSet $other = new ReadinessSet();
+    let $foreign = $other->register(File::openReadWrite("input", FileCreation::OpenExisting, FileWriteMode::Positioned));
+    writable Bytes $source = Bytes::allocate(2);
+    $source[0] = 65;
+    $source[1] = 66;
+    writable Bytes $destination = Bytes::allocate(1);
+    writable ?WriteTransferKey $saved = null;
+    {
+        let $first = configureWrite($key, $source->getRegion(0, 2));
+        let $original = $first->getWriteKey(position: 0);
+        let $plan = appendWrite($first,
+            $key, $source->getRegion(0, 2))
+            ->andReadFrom($key, $destination->getWritableRegion(0, 1));
+        WriteTransferKey $copied = $plan->getWriteKey(0);
+        $saved = $copied;
+        if ($copied != $original || $copied == $plan->getWriteKey(1)) {
+            panic("operation identity was lost");
+        }
+        ReadTransferKey $read = $plan->getReadKey(2);
+        if ($read != $plan->getReadKey(2)) { panic("read identity was lost"); }
+        let $independent = configureWrite($key, $source->getRegion(0, 2));
+        if ($copied == $independent->getWriteKey(0)) { panic("independent plans shared an identity"); }
+        foreach (-1..3 as int $position) {
+            if ($position != 2) {
+                try {
+                    let $wrong = $plan->getReadKey($position);
+                    panic("invalid read position accepted");
+                } catch (IoError $error) {
+                    if ($error->operation != IoOperation::Access || $error->reason != IoErrorReason::InvalidInput
+                        || $error->target != IoTarget::TransferPlan || $error->systemCode != null
+                        || $error->transferredByteCount != null) { panic("wrong key failure"); }
+                }
+            }
+            if ($position != 0 && $position != 1) {
+                try {
+                    let $wrong = $plan->getWriteKey($position);
+                    panic("invalid write position accepted");
+                } catch (IoError $error) {
+                    if ($error->reason != IoErrorReason::InvalidInput) { panic("wrong write key failure"); }
+                }
+            }
+        }
+        echo "typed keys survive appends\n";
+        echo "configured without writing\n";
+        echo "shared {$source[0]}:{$source[1]}\n";
+    }
+    if ($saved == null) { panic("copy retained no value after plan drop"); }
+    echo "read destination {$destination[0]}\n";
+    try {
+        let $plan = TransferPlan::read($key, $destination->getWritableRegion(0, 1));
+        let $replacement = $plan->andWriteTo($foreign, $source->getRegion(0, 2));
+        panic("foreign write key accepted");
+    } catch (IoError $error) {
+        if ($error->reason != IoErrorReason::InvalidInput) { panic("wrong failure"); }
+        echo "foreign write key rejected\n";
+    }
+    $source[0] = 67;
+    $destination[0] = 1;
+    echo "reused {$source[0]}:{$destination[0]}\n";
+}

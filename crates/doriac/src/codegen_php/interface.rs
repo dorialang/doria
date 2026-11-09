@@ -29,10 +29,24 @@ pub(super) fn convert_collection(
         return value;
     };
     let expected = crate::types::substitute_resolved_type(expected, &scopes.substitutions);
-    let expected = if let ResolvedType::Nullable(inner) = &expected {
+    let Some(actual) = scopes.expression_types.get(&expr.span()) else {
+        return value;
+    };
+    let actual = crate::types::substitute_resolved_type(actual, &scopes.substitutions);
+    convert_typed_collection(&actual, &expected, value, owned, false)
+}
+
+pub(super) fn convert_typed_collection(
+    actual: &ResolvedType,
+    expected: &ResolvedType,
+    value: String,
+    owned: bool,
+    borrowed_cell: bool,
+) -> String {
+    let expected = if let ResolvedType::Nullable(inner) = expected {
         inner.as_ref()
     } else {
-        &expected
+        expected
     };
     let ResolvedType::Interface(interface) = expected else {
         return value;
@@ -40,14 +54,10 @@ pub(super) fn convert_collection(
     if interface.name != "Iterable" {
         return value;
     }
-    let Some(actual) = scopes.expression_types.get(&expr.span()) else {
-        return value;
-    };
-    let actual = crate::types::substitute_resolved_type(actual, &scopes.substitutions);
-    let actual = if let ResolvedType::Nullable(inner) = &actual {
+    let actual = if let ResolvedType::Nullable(inner) = actual {
         inner.as_ref()
     } else {
-        &actual
+        actual
     };
     if !matches!(
         actual,
@@ -60,6 +70,12 @@ pub(super) fn convert_collection(
             | ResolvedType::SortedDictionary(_, _)
     ) {
         return value;
+    }
+    if borrowed_cell {
+        return format!(
+            "{}Borrow::fromCell({value})",
+            collection_adapter_name(interface)
+        );
     }
     format!(
         "{}::from({value}, {})",
@@ -116,7 +132,11 @@ pub(super) fn nominal_type_name(ty: &ResolvedType, scopes: &PhpNameScopes) -> Op
     }
 }
 
-pub(super) fn emit_declarations(semantic: &SemanticInfo, output: &mut String) {
+pub(super) fn emit_declarations(
+    semantic: &SemanticInfo,
+    specialization: &specialization::Plan,
+    output: &mut String,
+) {
     for interface in &semantic.contracts.interfaces {
         if !interface.valid || matches!(interface.name.as_str(), "Error" | "Displayable") {
             continue;
@@ -147,11 +167,16 @@ pub(super) fn emit_declarations(semantic: &SemanticInfo, output: &mut String) {
         ));
     }
     output.push_str(r#"
-abstract class __DoriaBuiltinIterable implements __DoriaOwnedObject
+interface __DoriaCollectionView
+{
+    public function __doriaCollectionValues(): iterable;
+}
+abstract class __DoriaBuiltinIterable implements __DoriaOwnedObject, __DoriaCollectionView
 {
     public mixed $source;
     private bool $owns;
     public function __construct(mixed $source, bool $owns) { $this->source = $source; $this->owns = $owns; }
+    public function __doriaCollectionValues(): iterable { return $this->source; }
     public static function from(mixed $source, bool $owns): ?static
     {
         if ($source === null || $source instanceof static) { return $source; }
@@ -169,17 +194,17 @@ abstract class __DoriaBuiltinIterator implements __DoriaOwnedObject
 {
     private ?Generator $cursor;
     private int $position = 0;
-    public function __construct(__DoriaBuiltinIterable $source)
+    public function __construct(__DoriaCollectionView $source)
     {
         $this->cursor = (static function() use ($source) {
-            foreach ($source->source as $value) { yield $value; }
+            foreach ($source->__doriaCollectionValues() as $value) { yield $value; }
         })();
         $this->cursor->rewind();
     }
     public function hasCurrent(): bool { return $this->cursor !== null && $this->cursor->valid(); }
-    public function getCurrent(): mixed
+    protected function currentValue(): mixed
     {
-        if (!$this->hasCurrent()) { __doria_panic("P1310", 0, 0, null, "Iterator::getCurrent", ["index" => $this->position, "length" => $this->position]); }
+        if (!$this->hasCurrent()) { __doria_panic("P1310", 0, 0, null, "Iterator::getCurrent", ["index" => [1, $this->position], "length" => [2, $this->position]]); }
         return $this->cursor->current();
     }
     public function advance(): void { if ($this->hasCurrent()) { ++$this->position; $this->cursor->next(); } }
@@ -203,7 +228,73 @@ abstract class __DoriaBuiltinIterator implements __DoriaOwnedObject
         let iterator = InterfaceType::new("Iterator", iterable.arguments.clone());
         let carrier = collection_adapter_name(iterable);
         let cursor = collection_adapter_name(&iterator);
-        output.push_str(&format!("final class {carrier} extends __DoriaBuiltinIterable implements {} {{ public function iterator(): {cursor} {{ return new {cursor}($this); }} }}\nfinal class {cursor} extends __DoriaBuiltinIterator implements {} {{}}\n", specialization_name(iterable), specialization_name(&iterator)));
+        let (current, plan, current_symbol) = specialization
+            .iteration_callable(
+                &ResolvedType::Interface(iterator.clone()),
+                crate::compiler_known_contracts::IterationOperation::GetCurrent,
+            )
+            .expect("checked collection iterator has a current-value callable");
+        let home = if plan.caller_receiver_home() {
+            "__DoriaCell $__doriaReceiver"
+        } else {
+            ""
+        };
+        let body =
+            if plan.returns_borrow && borrowed_result_uses_cell(&current.signature.return_type) {
+                "$value = $this->currentValue(); return __DoriaCell::borrowed($value);"
+            } else if !plan.returns_borrow {
+                "return __doria_copy_value($this->currentValue());"
+            } else {
+                "return $this->currentValue();"
+            };
+        let (_, _, acquire_symbol) = specialization
+            .iteration_callable(
+                &ResolvedType::Interface(iterable.clone()),
+                crate::compiler_known_contracts::IterationOperation::Acquire,
+            )
+            .expect("checked iterable has an acquisition entry");
+        let acquire_alias = if acquire_symbol == "iterator" {
+            String::new()
+        } else {
+            format!("public function {acquire_symbol}(): {cursor} {{ return $this->iterator(); }}")
+        };
+        let mut cursor_aliases = String::new();
+        for (operation, original, returned) in [
+            (
+                crate::compiler_known_contracts::IterationOperation::HasCurrent,
+                "hasCurrent",
+                "bool",
+            ),
+            (
+                crate::compiler_known_contracts::IterationOperation::Advance,
+                "advance",
+                "void",
+            ),
+        ] {
+            let (_, _, symbol) = specialization
+                .iteration_callable(&ResolvedType::Interface(iterator.clone()), operation)
+                .expect("checked iterator has its protocol entry");
+            if symbol != original {
+                cursor_aliases.push_str(&format!(
+                    "public function {symbol}(): {returned} {{ {}parent::{original}(); }}",
+                    if returned == "void" { "" } else { "return " }
+                ));
+            }
+        }
+        output.push_str(&format!("final class {carrier} extends __DoriaBuiltinIterable implements {} {{ public function iterator(): {cursor} {{ return new {cursor}($this); }} {acquire_alias} }}\nfinal class {cursor} extends __DoriaBuiltinIterator implements {} {{ public function {current_symbol}({home}): mixed {{ {body} }} {cursor_aliases} }}\n", specialization_name(iterable), specialization_name(&iterator)));
+        output.push_str(&format!(r#"final class {carrier}Borrow extends __DoriaCell implements {}, __DoriaCollectionView
+{{
+    public mixed $value {{
+        get => $this->source->value === null ? null : $this;
+        set {{ throw new LogicException('cannot replace a borrowed collection view'); }}
+    }}
+    private function __construct(private readonly __DoriaCell $source) {{ $this->borrowed = true; }}
+    public static function fromCell(__DoriaCell $source): static {{ return $source instanceof static ? $source : new static($source); }}
+    public function __doriaCollectionValues(): iterable {{ return $this->source->value; }}
+    public function iterator(): {cursor} {{ return new {cursor}($this); }}
+    {acquire_alias}
+}}
+"#, specialization_name(iterable)));
     }
     output.push('\n');
 }

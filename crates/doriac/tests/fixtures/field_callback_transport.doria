@@ -1,0 +1,63 @@
+enum Packet { case Number(int $count); case Pair(int $left, int $right); case Empty; }
+
+function consume(Packet $value): int {
+    return match ($value) {
+        Packet::Number($count) => $count,
+        Packet::Pair($left, $right) => $left + $right,
+        Packet::Empty => -1,
+    };
+}
+function apply<T>(T $value, function(T): int $callback): int { return $callback($value); }
+function optionalPacket(bool $present): ?Packet {
+    if ($present) { return Packet::Pair(2, 3); }
+    return null;
+}
+
+class Token {
+    function __construct(int $value) {}
+    function __destruct() { try { echo "drop;"; } catch (Error) {} }
+}
+
+function main(): void {
+    let $value = Packet::Pair(1, 3);
+    let $read = fn(Packet $input) => consume($input);
+    let $optional = function(?Packet $input): int {
+        if ($input != null) { return consume($input); }
+        return -1;
+    };
+    let $take = fn(take Packet $input) => consume($input);
+    let $captured = function(Packet $input): int {
+        let $inner = fn() with ($input) => consume($input);
+        return $inner();
+    };
+    let $write = function(writable Packet $input): int {
+        $input = Packet::Number(9);
+        return consume($input);
+    };
+    echo $read($value) . ";" . $optional(null) . ";" . $optional($value) . ";" . $take($value) . ";";
+    let writable $mutable = Packet::Number(0);
+    echo $write($mutable) . ";" . consume($mutable) . ";";
+    echo $captured($value) . ";" . apply($value, $read) . ";";
+    List<Packet> $stored = [$value];
+    echo $read($stored[0]) . ";" . $read(Packet::Empty) . ";" .
+        $take(Packet::Number(6)) . ";" . $optional(optionalPacket(false)) . ";" .
+        $optional(optionalPacket(true)) . ";";
+    {
+        let $token = new Token(7);
+        let $once = function(Packet $input): Token with (take $token) {
+            echo consume($input) . ";";
+            return $token;
+        };
+        let $result = $once($value);
+        echo $result->value . ";";
+    }
+    {
+        let $token = new Token(8);
+        let $once = function(Packet $input): Token with (take $token) {
+            echo consume($input) . ";";
+            return $token;
+        };
+        let $result = $once(Packet::Number(2));
+        echo $result->value . ";";
+    }
+}

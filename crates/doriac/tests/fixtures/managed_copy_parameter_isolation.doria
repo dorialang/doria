@@ -1,0 +1,51 @@
+use Doria\Std\Concurrency\{CancellationSource, CancellationToken};
+enum Packet { case Token(CancellationToken $token); }
+function replace(writable CancellationToken $value, CancellationToken $replacement): bool {
+    $value = $replacement;
+    return $value == $replacement;
+}
+function replacePacket(writable Packet $value, Packet $replacement): bool {
+    $value = $replacement;
+    return $value == $replacement;
+}
+function replaceGeneric<T>(writable T $value, take T $replacement): void {
+    $value = $replacement;
+}
+function replaceOptional(writable ?CancellationToken $value, ?CancellationToken $replacement): bool {
+    $value = $replacement;
+    return $value == $replacement;
+}
+function replaceOptionalPacket(writable ?Packet $value, ?Packet $replacement): bool {
+    $value = $replacement;
+    return $value == $replacement;
+}
+class Failure implements Error {
+    function __construct(string $message) {}
+}
+function replaceAndThrow(writable Packet $value, Packet $replacement): void throws Failure {
+    $value = $replacement;
+    throw new Failure("replacement");
+}
+function main(): void {
+    let $first = new CancellationSource();
+    let $second = new CancellationSource();
+    let writable $token = $first->token;
+    let $replacement = $second->token;
+    if (!replace($token, $replacement) || $token != $first->token) { panic("managed Copy parameter"); }
+    let writable $packet = Packet::Token($token);
+    if (!replacePacket($packet, Packet::Token($replacement)) || $packet != Packet::Token($token)) { panic("managed Copy enum parameter"); }
+    for (let writable $index = 0; $index < 1000; $index++) {
+        replaceGeneric($token, $replacement);
+        replaceGeneric($packet, Packet::Token($replacement));
+        if ($token != $first->token || $packet != Packet::Token($token)) { panic("managed Copy generic parameter"); }
+    }
+    ?CancellationToken $absent = null;
+    ?Packet $absentPacket = null;
+    if (!replaceOptional($absent, $token) || $absent != null) { panic("nullable managed Copy parameter"); }
+    if (!replaceOptional($token, null) || $token != $first->token) { panic("nullable managed Copy release"); }
+    if (!replaceOptionalPacket($absentPacket, $packet) || $absentPacket != null) { panic("nullable managed Copy enum parameter"); }
+    if (!replaceOptionalPacket($packet, null) || $packet != Packet::Token($token)) { panic("nullable managed Copy enum release"); }
+    try { replaceAndThrow($packet, Packet::Token($replacement)); } catch (Failure $error) {}
+    if ($packet != Packet::Token($token)) { panic("checked managed Copy cleanup"); }
+    echo "managed copy parameters passed";
+}

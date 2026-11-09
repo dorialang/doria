@@ -364,7 +364,7 @@ fn assert_behavioral_output(source: &str, expected_stdout: &[u8], include_php: b
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(
@@ -473,7 +473,7 @@ fn assert_behavioral_failure_on_every_enabled_backend(source: &str, expected_fac
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(
@@ -567,7 +567,7 @@ fn assert_behavioral_panic_on_every_enabled_backend(source: &str) {
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(
@@ -608,13 +608,27 @@ fn assert_behavioral_panic_on_every_enabled_backend(source: &str) {
             .arg(&path)
             .output()
             .expect("run PHP panic dispatcher");
-        let _ = fs::remove_file(path);
+        let payload = fs::read(&outcome).expect("PHP panic outcome");
         let _ = fs::remove_file(outcome);
         assert_eq!(output.status.code(), Some(101));
+        assert!(payload.starts_with(b"DORIAO2\0\x02\0"), "{payload:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+
+        let human = Command::new("php")
+            .env_remove("DORIA_RUNTIME_OUTCOME_V2")
+            .env_remove("DORIA_RUNTIME_OUTCOME_V3")
+            .env_remove("DORIA_RUNTIME_OUTCOME_V4")
+            .arg(&path)
+            .output()
+            .expect("run human PHP panic dispatcher");
+        let _ = fs::remove_file(path);
+        assert_eq!(human.status.code(), Some(101));
+        assert!(human.stdout.is_empty(), "{human:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("Program Panicked"),
+            String::from_utf8_lossy(&human.stderr).contains("Program Panicked"),
             "{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&human.stderr)
         );
     }
 }
@@ -1174,6 +1188,43 @@ describe("suite", function (): void { it("case", function (): void {}); });
 }
 
 #[test]
+fn compiler_generated_error_edges_preserve_exact_nominal_facts() {
+    let source = r#"
+use Doria\Std\Io\{IoError, InvalidUtf8Error};
+use Doria\Std\Test\AssertionError;
+function io(take IoError $error): void throws IoError { throw $error; }
+function utf8(take InvalidUtf8Error $error): void throws InvalidUtf8Error { throw $error; }
+function assertion(take AssertionError $error): void throws AssertionError { throw $error; }
+function main(): void {}
+"#;
+    let graph = graph(source, SourceScope::Development, None);
+    let analysis = analyze_compilation_graph_for_ide(&graph);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    for name in [
+        doriac::compiler_known_io::IO_ERROR,
+        doriac::compiler_known_io::INVALID_UTF8_ERROR,
+        doriac::compiler_known_test::ASSERTION_ERROR,
+    ] {
+        let class = analysis
+            .semantic_info
+            .classes
+            .iter()
+            .find(|class| class.name == name)
+            .unwrap();
+        assert!(
+            class.implements(doriac::symbols::BuiltinInterface::Error),
+            "{name}"
+        );
+    }
+    doriac::lower_compilation_graph_to_mir(&graph)
+        .expect("compiler-generated Error edges must retain reporting metadata");
+}
+
+#[test]
 fn assertion_error_is_an_exact_development_only_compiler_known_type() {
     let source = r#"
 use Doria\Std\Test\AssertionError;
@@ -1241,35 +1292,25 @@ it("dispatches", function (): void {
         .output()
         .is_ok()
     {
-        let native = doriac::compile_compilation_graph(&dispatcher_graph(
-            source,
-            &dispatcher,
-            CompilerTarget::Native,
-            Some(BuildNativeProfile::Fast),
-        ))
-        .expect("Cranelift dispatcher");
-        let output = run_emitted(native);
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(output.stdout, b"behavioral\n");
-        assert!(
-            output.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        #[cfg(feature = "llvm-backend")]
-        {
-            let llvm = doriac::compile_compilation_graph(&dispatcher_graph(
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if !profile.native().is_available() {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
                 source,
                 &dispatcher,
                 CompilerTarget::Native,
-                Some(BuildNativeProfile::Release),
+                Some(profile),
             ))
-            .expect("LLVM dispatcher");
-            let output = run_emitted(llvm);
-            assert_eq!(output.status.code(), Some(0));
-            assert_eq!(output.stdout, b"behavioral\n");
-            assert!(output.stderr.is_empty());
+            .unwrap_or_else(|error| panic!("{profile:?} dispatcher: {error:?}"));
+            let output = run_emitted(native);
+            assert_eq!(output.status.code(), Some(0), "{profile:?}");
+            assert_eq!(output.stdout, b"behavioral\n", "{profile:?}");
+            assert!(
+                output.stderr.is_empty(),
+                "{profile:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -2236,30 +2277,20 @@ it("reports", function (): void {
         .output()
         .is_ok()
     {
-        let native = doriac::compile_compilation_graph(&dispatcher_graph(
-            source,
-            &dispatcher,
-            CompilerTarget::Native,
-            Some(BuildNativeProfile::Fast),
-        ))
-        .expect("Cranelift dispatcher");
-        let (output, payload) = run_emitted_with_assertion_outcome(native);
-        assert_eq!(output.status.code(), Some(70));
-        assert!(output.stderr.is_empty());
-        assert_v4(&payload);
-
-        #[cfg(feature = "llvm-backend")]
-        {
-            let llvm = doriac::compile_compilation_graph(&dispatcher_graph(
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if !profile.native().is_available() {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
                 source,
                 &dispatcher,
                 CompilerTarget::Native,
-                Some(BuildNativeProfile::Release),
+                Some(profile),
             ))
-            .expect("LLVM dispatcher");
-            let (output, payload) = run_emitted_with_assertion_outcome(llvm);
-            assert_eq!(output.status.code(), Some(70));
-            assert!(output.stderr.is_empty());
+            .unwrap_or_else(|error| panic!("{profile:?} dispatcher: {error:?}"));
+            let (output, payload) = run_emitted_with_assertion_outcome(native);
+            assert_eq!(output.status.code(), Some(70), "{profile:?}");
+            assert!(output.stderr.is_empty(), "{profile:?}");
             assert_v4(&payload);
         }
     }
@@ -2372,7 +2403,7 @@ it("unicode difference", function (): void {
         .is_ok()
     {
         for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
-            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.native().is_available() {
                 continue;
             }
             let native = doriac::compile_compilation_graph(&dispatcher_graph(

@@ -2,6 +2,7 @@
 members = [
     "crates/doria-diagnostic-catalogue",
     "crates/doria-rt",
+    "crates/doria-time",
     "crates/doria-unicode",
     "crates/doriac",
 ]

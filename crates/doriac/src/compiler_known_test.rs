@@ -209,8 +209,10 @@ pub fn augment_program(program: &Program) -> Program {
         extends_span: None,
         parent_span: None,
         modifier_prefix_span: span,
-        implements: vec![TypeRef::named("Error")],
-        syntax: crate::ast::TypeDeclarationSyntax::synthetic(span),
+        implements: vec![crate::ast::InterfaceConformance::unconditional(
+            TypeRef::named("Error"),
+        )],
+        syntax: crate::ast::TypeDeclarationSyntax::synthetic(span, vec![span]),
         members: vec![ClassMember::Method(FunctionDecl {
             access: MemberAccess::Internal,
             access_span: None,
@@ -220,6 +222,8 @@ pub fn augment_program(program: &Program) -> Program {
             override_span: None,
             writable_this: false,
             writable_span: None,
+            consuming_this: false,
+            consuming_span: None,
             is_static: false,
             static_span: None,
             name: "__construct".to_string(),
@@ -228,6 +232,7 @@ pub fn augment_program(program: &Program) -> Program {
             params,
             return_type: None,
             throws: None,
+            availability: None,
             body: crate::ast::FunctionBody::Block(Block {
                 statements: Vec::new(),
                 span,

@@ -351,8 +351,8 @@ pub unsafe extern "C" fn dr_v4_bytes_assertion_difference(
     actual: *const DrBytesV1,
     expected: *const DrBytesV1,
 ) -> *mut DrStringV1 {
-    let actual = core::slice::from_raw_parts(bytes::data(actual), bytes::length(actual));
-    let expected = core::slice::from_raw_parts(bytes::data(expected), bytes::length(expected));
+    let actual = bytes::contents(actual);
+    let expected = bytes::contents(expected);
     let common = actual.len().min(expected.len());
     let mut buffer = AssertionBuffer::new();
     if let Some(index) = (0..common).find(|index| actual[*index] != expected[*index]) {
@@ -506,7 +506,7 @@ pub unsafe extern "C" fn dr_v4_collection_assertion_presentation(
         let bytes = value.cast::<DrBytesV1>();
         let length = bytes::length(bytes);
         let _ = write!(buffer, "Bytes(length: {length}, hex: \"");
-        let contents = core::slice::from_raw_parts(bytes::data(bytes), length);
+        let contents = bytes::contents(bytes);
         for (index, byte) in contents.iter().take(ITEM_LIMIT).enumerate() {
             if index != 0 {
                 let _ = buffer.write_char(' ');
@@ -1083,8 +1083,7 @@ pub unsafe extern "C" fn dr_v2_string_pad_end(
 
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_string_from_bytes(value: *const DrBytesV1) -> *mut DrStringV1 {
-    let length = bytes::length(value);
-    let source = core::slice::from_raw_parts(bytes::data(value), length);
+    let source = bytes::contents(value);
     if core::str::from_utf8(source).is_err() {
         return ptr::null_mut();
     }
@@ -1245,6 +1244,18 @@ mod tests {
             assert!(dr_v1_string_from_bytes(bytes).is_null());
             bytes::set(ptr::null(), bytes, 0, b'D');
             assert!(dr_v1_string_from_bytes(bytes).is_null());
+            bytes::free(bytes);
+        }
+    }
+
+    #[test]
+    fn empty_bytes_without_an_allocation_convert_to_the_empty_string() {
+        unsafe {
+            let bytes = bytes::copy(ptr::null(), 0);
+            assert!(bytes::data(bytes).is_null() || bytes::length(bytes) == 0);
+            let text = dr_v1_string_from_bytes(bytes);
+            assert!(!text.is_null());
+            assert_eq!((*text).byte_length, 0);
             bytes::free(bytes);
         }
     }

@@ -1,0 +1,49 @@
+use Doria\Std\Io\{File, FileCreation, FileWriteMode, SeekOrigin, IoError, IoOperation, IoTarget, IoErrorReason};
+
+function main(): void
+{
+    write_file("resize.bin", "abcdef");
+    let $reader = File::openRead("resize.bin");
+    let writable $file = File::openReadWrite("resize.bin", FileCreation::OpenExisting, FileWriteMode::Positioned);
+    $file->seek(5, SeekOrigin::Start);
+    $file->setLength(2);
+    echo $file->getPosition() . " " . $file->getLength() . " " . $reader->getLength() . " " . $reader->getPosition() . "\n";
+    $file->setLength(6);
+    echo $file->getPosition() . " " . $file->getLength() . "\n";
+    $file->seek(2, SeekOrigin::Start);
+    writable Bytes $storage = Bytes::allocate(4);
+    $file->read($storage->getWritableRegion(0, 4));
+    echo "{$storage[0]} {$storage[1]} {$storage[2]} {$storage[3]}\n";
+    try {
+        $file->setLength(-1);
+        panic("negative resize accepted");
+    } catch (IoError $error) {
+        if ($error->operation != IoOperation::Resize || $error->target != IoTarget::File("resize.bin")
+            || $error->reason != IoErrorReason::InvalidInput || $error->systemCode != null
+            || $error->transferredByteCount != null) {
+            panic("resize error facts changed");
+        }
+        echo "resize-error " . $file->getPosition() . " " . $file->getLength() . "\n";
+    }
+    $file->setLength(0);
+    $file->setLength(3);
+    $file->seek(0, SeekOrigin::Start);
+    $storage[0] = 97;
+    $storage[1] = 98;
+    $storage[2] = 99;
+    $file->write($storage->getRegion(0, 3));
+    $file->close();
+
+    let writable $append = File::openWrite("resize.bin", FileCreation::OpenExisting, FileWriteMode::Append);
+    $append->seek(10, SeekOrigin::Start);
+    $append->setLength(2);
+    echo $append->getPosition() . " " . $append->getLength() . " ";
+    $storage[0] = 88;
+    $storage[1] = 10;
+    $append->write($storage->getRegion(0, 2));
+    echo $append->getPosition() . " " . $append->getLength() . "\n";
+    $append->close();
+    echo $reader->getLength() . " " . $reader->getPosition() . "\n";
+    $reader->close();
+    echo read_file("resize.bin");
+}

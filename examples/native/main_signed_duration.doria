@@ -1,0 +1,44 @@
+use Doria\Std\Time\Duration;
+
+class DurationBox<T> {
+    function __construct(take T $value) {}
+}
+
+function keepDuration(Duration $value): Duration { return $value; }
+function nullableNanoseconds(?Duration $value): ?int64 { return $value?->nanoseconds; }
+function sameDuration(?Duration $left, ?Duration $right): bool { return $left == $right; }
+function durationReader(Duration $value): function(): int64 {
+    return fn() with (take $value) => $value->nanoseconds;
+}
+
+function main(): void {
+    let $minimum = Duration::fromNanoseconds(nanoseconds: -9223372036854775808);
+    let $maximum = Duration::fromNanoseconds(9223372036854775807);
+    let $late = Duration::fromNanoseconds(-250000000);
+    let $zero = Duration::fromNanoseconds(0);
+    if (keepDuration($late) != Duration::fromNanoseconds(-250000000) || keepDuration($late) != $late) {
+        panic("duration copies changed");
+    }
+    if (!sameDuration($late, Duration::fromNanoseconds(-250000000)) ||
+        sameDuration($late, $zero) || sameDuration($late, null) || !sameDuration(null, null)) {
+        panic("nullable duration equality changed");
+    }
+    if ((nullableNanoseconds($late) ?? 0) != -250000000 || nullableNanoseconds(null) != null) {
+        panic("nullable duration getter changed");
+    }
+    let $box = new DurationBox<Duration>($late);
+    if ($box->value->nanoseconds != -250000000 || $late->nanoseconds != -250000000) {
+        panic("generic duration copy changed");
+    }
+    let $read = durationReader($late);
+    if ($read() != -250000000 || $read() != -250000000) { panic("duration capture changed"); }
+    mixed $value = $late;
+    if ($value is Duration) {
+        Duration $interval = $value;
+        if ($interval->nanoseconds != -250000000) { panic("mixed duration changed"); }
+    } else { panic("duration identity changed"); }
+    List<Duration> $intervals = [$minimum, $maximum, $late, $zero];
+    foreach ($intervals as Duration $interval) {
+        echo $interval->nanoseconds . " ns\n";
+    }
+}

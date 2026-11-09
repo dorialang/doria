@@ -118,6 +118,64 @@ fn bundled_runtime(profile: &str) -> PathBuf {
 }
 
 #[test]
+fn php_publication_probe_without_ffi_extension_reports_unavailable() {
+    if !cfg!(feature = "bundled-runtime") {
+        return;
+    }
+    let Ok(php) = Command::new("php")
+        .args([
+            "-n",
+            "-r",
+            "echo extension_loaded('FFI') ? 'available' : 'absent';",
+        ])
+        .output()
+    else {
+        eprintln!("no-extension PHP publication regression unavailable: PHP was not found");
+        return;
+    };
+    assert!(php.status.success(), "{php:?}");
+    assert!(php.stderr.is_empty(), "{php:?}");
+    if php.stdout == b"available" {
+        eprintln!(
+            "no-extension PHP publication regression unavailable: PHP -n retains built-in FFI"
+        );
+        return;
+    }
+    assert_eq!(php.stdout, b"absent");
+    let scratch = ScratchDirectory::new(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("php-publication-without-ffi"),
+    );
+    std::fs::create_dir_all(scratch.path()).unwrap();
+    let output = Command::new("php")
+        .arg("-r")
+        .arg(concat!(
+            "require $argv[1]; $environment = current_environment(); ",
+            "unset($environment['DORIA_RT_PATH']); ",
+            "$environment['CARGO_TARGET_DIR'] = $argv[3] . '/empty-target'; ",
+            "mkdir($environment['CARGO_TARGET_DIR']); ",
+            "verify_installed_php_compiler($argv[2], $environment, $argv[3], ['-n']);",
+        ))
+        .arg(workspace_root().join("scripts/refresh_development_toolchain.php"))
+        .arg(env!("CARGO_BIN_EXE_doriac"))
+        .arg(scratch.path())
+        .current_dir(workspace_root())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("FFI extension absent"), "{stdout}");
+    assert!(stdout.contains("positive execution skipped"), "{stdout}");
+    assert!(!stdout.contains("execution validated"), "{stdout}");
+    assert_eq!(
+        std::fs::read_dir(scratch.path().join("empty-target"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn one_revision_produces_one_runtime_archive() {
     if !cfg!(feature = "bundled-runtime") {
         return;

@@ -1,0 +1,53 @@
+use Doria\Std\Io\BorrowedFinishOutcome;
+
+enum Optional<T> {
+    case Some(T $value);
+    case Empty;
+}
+
+class Counter {
+    function __construct(writable int $value) {}
+    writable function bump(): void { $this->value++; }
+}
+
+class Drops {
+    static writable int $handles = 0;
+}
+
+class Handle {
+    function __construct(borrow writable Counter $counter, writable int $remaining) {}
+    writable function bump(): void { $this->counter->bump(); }
+    function __destruct(): void { Drops::handles++; }
+    consuming function finish(): BorrowedFinishOutcome<Handle> {
+        if ($this->remaining == 0) {
+            return BorrowedFinishOutcome::Complete;
+        }
+        return BorrowedFinishOutcome::Pending($this);
+    }
+}
+
+function wrap(writable Counter $counter): Optional<Handle> {
+    return Optional::Some(new Handle($counter, 0));
+}
+
+function main(): void {
+    let writable $counter = new Counter(1);
+    {
+        let $wrapped = wrap($counter);
+        echo match ($wrapped) {
+            Optional::Some($handle) => "some;",
+            Optional::Empty => "empty;",
+        };
+    }
+    $counter->bump();
+    {
+        let writable $handle = new Handle($counter, 1);
+        $handle->bump();
+        let $first = $handle->finish();
+        echo match ($first) {
+            BorrowedFinishOutcome::Complete => "complete;",
+            BorrowedFinishOutcome::Pending($retry) => "pending" . $retry->remaining . ";",
+        };
+    }
+    echo $counter->value . ";" . Drops::handles . "\n";
+}

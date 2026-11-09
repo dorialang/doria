@@ -13,6 +13,8 @@ function check_stream_io_completeness(string $root): array
     $planPath = $root . '/docs/doria-end-to-end-plan.md';
     $pipelinePath = $root . '/docs/notes/current-pipeline.md';
     $decisionPath = $root . '/docs/decisions/0110-stream-readiness-standard-io-blocking-and-performance-model.md';
+    $deviceHelperDecisionPath = $root . '/docs/decisions/0137-inherited-device-pending-transfer-helpers.md';
+    $lockOwnershipDecisionPath = $root . '/docs/decisions/0138-standard-stream-copy-and-native-file-lock-ownership.md';
     $specPath = $root . '/SPEC.md';
     $stdlibPath = $root . '/docs/stdlib-reference.md';
     $apiGuidelinesPath = $root . '/docs/api-design-guidelines.md';
@@ -199,7 +201,7 @@ function check_stream_io_completeness(string $root): array
         'publicSpellingStatus' => 'deferred',
         'stage26Blocked' => false,
         'stage26Status' => 'next',
-        'stage36aStatus' => 'scheduled',
+        'stage36aStatus' => 'in-progress',
         'stage36aImplemented' => false,
     ];
     foreach ($expectedReview as $field => $expected) {
@@ -268,6 +270,15 @@ function check_stream_io_completeness(string $root): array
                 $failures[] = "manifest row {$index}: approved semantics and deferred spelling metadata are incomplete";
             }
         }
+        if (in_array($row['phpName'] ?? null, ['flock', 'stream_supports_lock', 'streamWrapper::stream_lock'], true)
+            && (($row['semanticStatus'] ?? null) !== 'accepted'
+                || ($row['publicSpellingStatus'] ?? null) !== 'deferred'
+                || ($row['decisionRecord'] ?? null) !== '0138'
+                || ($row['platformConstraints'] ?? []) === []
+                || ($row['doriaCandidateSpelling'] ?? null) !== null
+                || ($row['designerDecisionRequired'] ?? true) !== false)) {
+            $failures[] = "manifest row {$index}: missing approved native file-lock ruling with deferred names";
+        }
     }
 
     $auditText = (string) file_get_contents($auditPath);
@@ -282,6 +293,43 @@ function check_stream_io_completeness(string $root): array
     $websiteGuidelines = (string) file_get_contents($websiteGuidelinesPath);
     $performanceAuthority = (string) file_get_contents($performancePath);
     foreach ([
+        'decision 0110' => $decision,
+        'SPEC.md' => $spec,
+        'docs/stdlib-reference.md' => $stdlib,
+        'docs/notes/io-surface-audit.md' => $auditText,
+    ] as $authority => $text) {
+        $normalized = preg_replace('/\s+/', ' ', $text);
+        foreach ([
+            'registered static type `T`',
+            'without automatic capability erasure or runtime type discovery',
+            'ordinary `take` cleanup',
+        ] as $required) {
+            if (!str_contains($normalized, $required)) {
+                $failures[] = "{$authority}: missing static-type-preserving registration contract {$required}";
+            }
+        }
+        foreach (['opaque borrowed readiness source', 'transfers dispatch through',
+            'ReadinessStream', 'native association'] as $required) {
+            if (stripos($normalized, $required) === false) {
+                $failures[] = "{$authority}: missing explicit adapter readiness contract {$required}";
+            }
+        }
+        foreach (['explicit pending-transfer capability', 'group-owned',
+            'ordinary synchronous', 'not suspended'] as $required) {
+            if (stripos($normalized, $required) === false) {
+                $failures[] = "{$authority}: missing concurrent adapter contract {$required}";
+            }
+        }
+        foreach (['Expiry stops only the wait; transfers remain active.',
+            'typed timeout observation',
+            'Cancellation or an explicit group deadline cancels and drains outstanding transfers.',
+            'Untimed waits require no clock sampling or per-wait allocation.'] as $required) {
+            if (stripos($normalized, $required) === false) {
+                $failures[] = "{$authority}: missing wait-only timeout contract {$required}";
+            }
+        }
+    }
+    foreach ([
         '# PHP Stream And I/O Completeness Audit',
         'supersedes the previous partial completeness scope',
         '## Required v1.0 recommendation matrix',
@@ -291,11 +339,36 @@ function check_stream_io_completeness(string $root): array
         'Performance constraints',
         'Semantic status',
         'Public spelling status',
-        'Stage 26 is unblocked and next',
-        'Stage 36a is scheduled, not implemented',
+        'Persistent readiness sets own registered streams',
+        'ownership, access goes through the registration, and removal returns ownership',
+        'Temporary one-stream waits may',
     ] as $required) {
         if (!str_contains($auditText, $required)) {
             $failures[] = "docs/notes/io-surface-audit.md: missing {$required}";
+        }
+    }
+    foreach (['docs/notes/io-surface-audit.md' => $auditText,
+        'docs/decisions/0110-stream-readiness-standard-io-blocking-and-performance-model.md' => $decision] as $path => $text) {
+        if (!str_contains($text, '(../doria-end-to-end-plan.md#approved-execution-sequence-after-stage-36a)')) {
+            $failures[] = "{$path}: execution order must link to the master plan's approved sequence";
+        }
+    }
+    if (!str_contains($auditText, '(current-pipeline.md)')) {
+        $failures[] = 'docs/notes/io-surface-audit.md: delivery tracking must link to the current-pipeline note';
+    }
+    foreach ($rows as $row) {
+        if (($row['phpName'] ?? null) !== 'stream_select') {
+            continue;
+        }
+        $differences = $row['semanticDifferences'] ?? [];
+        foreach ([
+            'Persistent registration transfers stream ownership; removal returns ownership and set destruction cleans up remaining streams',
+            'Typed registration preserves the registered static type T; removal returns owned T without automatic erasure or runtime type discovery',
+            'Temporary one-stream waits may borrow for the call; explicit borrowing adapters retain their separate contract',
+        ] as $required) {
+            if (!in_array($required, $differences, true)) {
+                $failures[] = "stream_select inventory: missing accepted ownership contract {$required}";
+            }
         }
     }
 
@@ -303,7 +376,7 @@ function check_stream_io_completeness(string $root): array
     $stage36a = strpos($plan, '- **Stage 36a — Stream, readiness, and standard I/O foundation.**');
     $stage37 = strpos($plan, '- **Stage 37 —');
     if ($stage36 === false || $stage36a === false || $stage37 === false || !($stage36 < $stage36a && $stage36a < $stage37)) {
-        $failures[] = 'docs/doria-end-to-end-plan.md: Stage 36a must appear between Stage 36 and Stage 37';
+        $failures[] = 'docs/doria-end-to-end-plan.md: the stage catalogue must list Stage 36a between Stages 36 and 37; execution order belongs to the approved sequence';
     }
     foreach ([
         'Stage 37 must consume Stage 36a readiness',
@@ -313,8 +386,8 @@ function check_stream_io_completeness(string $root): array
         'Stage 26 — Remaining collection family — Complete.',
         'Stage 26b — Performance Baseline Foundation — Complete; All Three Slices Complete',
         'Stage 27 — Enums + payload cases — Complete; No Performance-Evidence Dependency',
-        'Stage 36a Public Spellings — Deferred',
-        'Stage 36a — Not Implemented',
+        'Stage 36a Remaining Public Spellings — Deferred',
+        'Stage 36a — Complete',
     ] as $required) {
         if (!str_contains($plan, $required)) {
             $failures[] = "docs/doria-end-to-end-plan.md: missing {$required}";
@@ -327,17 +400,172 @@ function check_stream_io_completeness(string $root): array
         'Stage 26 — Complete',
         'Stage 26b — Performance Baseline Foundation — Complete',
         'Stage 27 — Complete; No Performance-Evidence Dependency',
-        'Stage 36a — Scheduled',
-        'Stage 36a Public Spellings — Deferred',
-        'Stage 36a — Not Implemented',
+        'Stage 36a — Complete',
+        'Stage 36a Remaining Public Spellings — Deferred',
     ] as $required) {
         if (!str_contains($pipeline, $required)) {
             $failures[] = "docs/notes/current-pipeline.md: missing {$required}";
         }
     }
-    foreach (['BlockingMode', 'ReadOutcome', 'Poller'] as $candidate) {
+    foreach (['BlockingMode', 'Poller'] as $candidate) {
         if (str_contains($pipeline, "{$candidate} is implemented")) {
             $failures[] = "docs/notes/current-pipeline.md: falsely claims {$candidate} is implemented";
+        }
+    }
+
+    foreach ([$decision, $stdlib] as $authority) {
+        foreach (['OpenExisting', 'OpenOrCreate', 'CreateNew', 'TruncateExisting',
+            'CreateOrTruncate', 'FileWriteMode::Append', 'IoOperation::Close'] as $contract) {
+            if (!str_contains($authority, $contract)) {
+                $failures[] = "decision 0110 and stdlib inventory must preserve {$contract}";
+            }
+        }
+        if (!preg_match('/consuming function close\(\): void throws\s+IoError/', $authority)) {
+            $failures[] = 'decision 0110 and stdlib inventory must preserve consuming checked close';
+        }
+    }
+    $ioSource = (string) file_get_contents($root . '/crates/doriac/src/compiler_known_io.rs');
+    $ioVocabulary = (string) file_get_contents($root . '/crates/doria-diagnostic-catalogue/src/lib.rs');
+    if (!preg_match('/const ALL: \[Self; 19\] = \[\s*Self::Open,\s*Self::Read,\s*'
+        . 'Self::Write,\s*Self::Append,\s*Self::Flush,\s*Self::Close,\s*'
+        . 'Self::Register,\s*Self::Unregister,\s*Self::Wait,\s*Self::Configure,\s*Self::Access,\s*Self::Seek,\s*'
+        . 'Self::SynchronizeData,\s*Self::SynchronizeMetadata,\s*Self::Resize,\s*'
+        . 'Self::Lock,\s*Self::Unlock,\s*Self::Spawn,\s*Self::Terminate,\s*\]/', $ioVocabulary)
+        || !str_contains($ioSource, 'use doria_diagnostic_catalogue::IoMessageOperation as IoOperation;')
+        || !str_contains($ioSource, '&IoOperation::ALL.map(IoOperation::case_name)')) {
+        $failures[] = 'IoOperation must use shared vocabulary and preserve append-only operation tags';
+    }
+    foreach ([$decision, $stdlib, $spec] as $authority) {
+        foreach (['IoOperation::Register', 'IoOperation::Unregister', 'IoOperation::Wait',
+            'IoTarget::ReadinessSet', 'IoOperation::Configure', 'IoTarget::TransferPlan',
+            'IoTarget::TransferGroup', 'IoOperation::Access',
+            'IoOperation::SynchronizeData', 'IoOperation::SynchronizeMetadata',
+            'IoOperation::Resize',
+            'getReadRegion(ReadTransferKey $key): ?ByteRegion throws IoError',
+            'resubmitRead', 'resubmitWrite'] as $contract) {
+            if (!str_contains($authority, $contract)) {
+                $failures[] = "stream error authority must preserve {$contract}";
+            }
+        }
+    }
+
+    $streamSource = str_replace('Doria\\Std\\Io\\', '', (string) file_get_contents(
+        $root . '/crates/doriac/src/compiler_known_stream.rs'
+    ));
+    foreach ([
+        'static function openRead(string $path): ReadableFile throws IoError',
+        'static function openWrite(string $path, FileCreation $creation, FileWriteMode $mode): WritableFile throws IoError',
+        'static function openReadWrite(string $path, FileCreation $creation, FileWriteMode $mode): DuplexFile throws IoError',
+        'class ReadableFile implements PendingReadableStream, SeekableStream {',
+        'class WritableFile implements PendingWritableStream, SeekableStream {',
+        'class DuplexFile implements DuplexStream, PendingReadableStream, PendingWritableStream, SeekableStream {',
+        'writable function seek(int $offset, SeekOrigin $origin): int throws IoError',
+        'function getPosition(): int throws IoError',
+        'function getLength(): int throws IoError',
+        'writable function synchronizeData(): void throws IoError',
+        'writable function synchronizeMetadata(): void throws IoError',
+        'writable function setLength(int $length): void throws IoError',
+        'ReadinessSource $readinessSource { borrowed get;',
+        'consuming function close(): void throws IoError',
+    ] as $contract) {
+        if (!str_contains($streamSource, $contract) || !str_contains($decision, $contract)) {
+            $failures[] = "decision 0110 and compiler file declarations must agree on {$contract}";
+        }
+    }
+    foreach ([
+        'enum FileCreation {',
+        'case OpenExisting;',
+        'case OpenOrCreate;',
+        'case CreateNew;',
+        'case TruncateExisting;',
+        'case CreateOrTruncate;',
+        'enum FileWriteMode {',
+        'case Positioned;',
+        'case Append;',
+        'enum ReadOutcome {',
+        'case Data(int $byteCount);',
+        'case WouldBlock;',
+        'case EndOfStream;',
+        'case TimedOut;',
+        'enum WriteOutcome {',
+        'case Accepted(int $byteCount);',
+        'enum FlushOutcome {',
+        'case Complete;',
+        'case Pending;',
+        'interface ReadableStream {',
+        'writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError;',
+        'interface WritableStream {',
+        'writable function write(ByteRegion $source): WriteOutcome throws IoError;',
+        'interface DuplexStream extends ReadableStream, WritableStream {}',
+        'interface FlushableStream {',
+        'writable function flush(): FlushOutcome throws IoError;',
+        'interface PendingReadableStream extends ReadableStream, ReadinessStream {',
+        'writable function prepareRead(writable ReadRequest $request, writable WritableByteRegion $destination): void throws IoError;',
+        'writable function completeRead(ReadRequest $request, writable WritableByteRegion $destination): ?ReadOutcome throws IoError;',
+        'interface PendingWritableStream extends WritableStream, ReadinessStream {',
+        'writable function prepareWrite(writable WriteRequest $request, ByteRegion $source): void throws IoError;',
+        'writable function completeWrite(WriteRequest $request, ByteRegion $source): ?WriteOutcome throws IoError;',
+        'class ReadRequest {',
+        '?ReadOutcome $outcome { get throws IoError',
+        'writable function complete(ReadOutcome $outcome): void',
+        'class WriteRequest {',
+        '?WriteOutcome $outcome { get throws IoError',
+        'writable function complete(WriteOutcome $outcome): void',
+    ] as $contract) {
+        if (!str_contains($streamSource, $contract) || !str_contains($decision, $contract)) {
+            $failures[] = "decision 0110 and compiler stream declarations must agree on {$contract}";
+        }
+    }
+
+    $normalizedStdlib = preg_replace('/\s+/', ' ', $stdlib);
+    foreach ([$streamSource, $decision] as $authority) {
+        $normalized = preg_replace('/\s+/', ' ', $authority);
+        if (!str_contains($normalized, 'enum FlushOutcome { case Complete; case Pending; }')) {
+            $failures[] = 'stream declarations and decision 0110 must preserve both FlushOutcome cases';
+        }
+    }
+    foreach ([$normalizedStdlib, preg_replace('/\s+/', ' ', $spec)] as $authority) {
+        if (!str_contains($authority, 'flush(): FlushOutcome')) {
+            $failures[] = 'SPEC and stdlib inventory must preserve the resumable flush return';
+        }
+        if (preg_match('/flush\(\):\s*void\b/', $authority)) {
+            $failures[] = 'SPEC and stdlib inventory must not restore the replaced void flush return';
+        }
+    }
+    foreach ([
+        'read(writable WritableByteRegion $destination): ReadOutcome throws IoError',
+        'write(ByteRegion $source): WriteOutcome throws IoError',
+        'completeRead(ReadRequest $request, writable WritableByteRegion $destination): ?ReadOutcome throws IoError',
+        'completeWrite(WriteRequest $request, ByteRegion $source): ?WriteOutcome throws IoError',
+        '?ReadOutcome $outcome { get throws IoError; }',
+        '?WriteOutcome $outcome { get throws IoError; }',
+        'complete(ReadOutcome $outcome): void',
+        'complete(WriteOutcome $outcome): void',
+    ] as $contract) {
+        if (!str_contains($normalizedStdlib, $contract)) {
+            $failures[] = "stdlib inventory must preserve pending contract {$contract}";
+        }
+    }
+    if (preg_match('/complete(?:Read|Write)\([^)]*\):\s*(?:Read|Write)Outcome\b/', $normalizedStdlib)) {
+        $failures[] = 'stdlib inventory must not restate nonnullable pending completion returns';
+    }
+    if (preg_match('/(?<![?\\w])(?:Read|Write)Outcome \$outcome\s*\{\s*get\b/', $normalizedStdlib)) {
+        $failures[] = 'stdlib inventory must not restate nonnullable pending outcome getters';
+    }
+    if (preg_match('/complete\(\?(?:Read|Write)Outcome\b/', $normalizedStdlib)) {
+        $failures[] = 'stdlib inventory must not accept absent immediate completion outcomes';
+    }
+    if (preg_match('/\b(?:read|write)\([^)]*\):\s*\?(?:Read|Write)Outcome\b/', $normalizedStdlib)) {
+        $failures[] = 'stdlib inventory must preserve nonnullable synchronous transfer returns';
+    }
+
+    foreach ([
+        'Fetching a failed completion raises the original checked error',
+        'the owned error transfers exactly once',
+        'Catching it neither releases the group loans nor cancels the other operations',
+    ] as $contract) {
+        if (!str_contains($normalizedStdlib, $contract)) {
+            $failures[] = "stdlib inventory must preserve completion observation contract: {$contract}";
         }
     }
 
@@ -354,7 +582,13 @@ function check_stream_io_completeness(string $root): array
         '## Reusable Buffer And Byte-Region Requirement',
         '## Dispatch And Specialization', '## Readiness Efficiency',
         '## Async Cost Isolation', '## Benchmark And Regression Requirements',
-        '## Stage Boundaries', '## Deferred Public Spellings',
+        '## Stage Boundaries', '## Stage 36a Public Surface Appendix',
+        '### Reusable Bytes And Borrowed Regions',
+        '### PHP Native Runtime And Windows Completion', '## Deferred Public Spellings',
+        '### Standalone Clock Failures',
+        '### Concurrent Transfer Group Ownership',
+        '### Competing Operation Order',
+        '### Typed Registration Keys',
         '## Reopening Rules', '## Consequences', '## Invalidated Elsewhere',
     ];
     foreach ($decisionHeadings as $heading) {
@@ -363,28 +597,163 @@ function check_stream_io_completeness(string $root): array
         }
     }
     $decisionSemantics = [
+        'shared native runtime through PHP FFI',
+        'without a host-I/O fallback',
+        'submit-then-await completion',
+        'Cancellation requests do not release that storage',
+        'class ClockError implements Error',
+        'function __construct(string $message, ?int $systemCode = null)',
+        'cancellation must be drained',
+        'does not let synchronous `read` or `write` retain a',
+        'one exclusively borrowing transfer group',
+        'The group retains those loans for its lifetime',
+        'original checked error when',
+        "The failed operation's identity must",
+        'The owned error transfers exactly once',
+        'Registration keys do not establish disjoint ownership',
+        'Andrew approved nullable pending outcomes',
+        'return `null` only when no transfer outcome exists',
+        'completion still runs exactly once to release prepared storage',
+        'Request `complete` requires a nonnullable actual',
+        'Group teardown cancels and drains outstanding operations to terminal completion',
         'There is no universal stream god object',
         'Ordinary stream handles are owned move values',
         'Explicit close or finish consumes the owned handle',
+        '`consuming function`',
+        '### Explicit Child Cleanup Policy',
+        'explicit cleanup policy, with no default',
+        'Destructor cleanup remains nonthrowing and best-effort',
+        '`Bytes::allocate(int $length): Bytes`',
+        '`Doria\\Std\\Io\\ByteRegion`',
+        '`Doria\\Std\\Io\\WritableByteRegion`',
+        '`ByteRegion` is a readonly borrowed Copy carrier',
+        'is a borrowed move carrier',
         'first-class, non-owning, nonclosable views',
         'Blocking mode is a named typed state',
         'data, would-block, end-of-stream, and timed-out outcomes',
         'partial progress is observable',
+        '### Partial-Transfer Failure Facts',
+        'readonly `?int`',
+        'optional `IoError.transferredByteCount`',
+        'No backend may replace unknown',
         'One multi-stream readiness core',
+        '### Persistent Registration Ownership',
+        'owns its registered streams',
+        'removal returns ownership to the caller',
+        'One-stream temporary waits may borrow for the call',
         'Durations and absolute deadlines are both semantic concepts',
+        '### Shared Cancellation State',
+        'A token may outlive its',
+        'it does not implicitly request cancellation',
+        '### Classified Unix Launch Evidence',
+        'including resource-measured runs',
+        'launch outcomes are inconclusive, never Pass',
         'Buffering is typed and per value',
         'File opening uses typed request/options values',
-        'Advisory locking is v1 functionality represented by an ownership guard',
+        '### Owned File Family',
+        '`File::openRead`',
+        '`ReadableFile`',
+        '`File::openWrite`',
+        '`WritableFile`',
+        '`File::openReadWrite`',
+        '`DuplexFile`',
+        'remaining control names are still deferred',
+        'Native platform locking is v1 functionality represented by an ownership guard',
         'Active ownership must be resolved explicitly by waiting, detaching, or terminating',
         'Typed composition replaces PHP wrappers, filters, contexts, registries, string options, and mixed bags',
         'Sync and async I/O, networking, processes, and terminals share one ownership, read, write, readiness, time, cancellation, and backpressure model',
         'Stage 37 consumes it in the async design',
-        'Stage 44 owns network-specific',
+        'Stage 40a owns the first network-specific',
+        'Stage 44 owns network-specific maturation',
         'Stage 46 owns terminal raw mode',
     ];
     foreach ($decisionSemantics as $semantic) {
         if (!str_contains($decision, $semantic)) {
             $failures[] = "decision 0110: missing accepted semantic rule {$semantic}";
+        }
+    }
+    $lockOwnershipDecision = preg_replace('/\s+/', ' ', (string) file_get_contents($lockOwnershipDecisionPath));
+    foreach (['inline Copy values', 'both bindings usable',
+        'both explicit borrowed and explicit owning constructions',
+        'without closing that file', 'native platform mechanisms',
+        'Windows exclusive byte-range locks', 'Remaining public declarations'] as $contract) {
+        if (!str_contains($lockOwnershipDecision, $contract)) {
+            $failures[] = "decision 0138: missing approved ownership/locking constraint {$contract}";
+        }
+    }
+    foreach (['decision 0110' => $decision, 'audit' => $auditText, 'plan' => $plan,
+        'SPEC.md' => $spec, 'stdlib' => $stdlib] as $path => $authority) {
+        foreach (['StandardStreams', 'StandardInput', 'StandardOutput', 'StandardError',
+            'readonly static', '`input`', '`output`', '`error`'] as $declaration) {
+            if (!str_contains($authority, $declaration)) {
+                $failures[] = "{$path}: missing approved S-A standard-stream declaration {$declaration}";
+            }
+        }
+        if (!str_contains($authority, '0138')) {
+            $failures[] = "{$path}: missing approved standard-view/native-lock amendment";
+        }
+        if (preg_match('/shared\/exclusive advisory lock|Advisory locking is v1/', $authority) === 1) {
+            $failures[] = "{$path}: stale advisory-only file-lock contract";
+        }
+    }
+    $deviceHelperDecision = preg_replace('/\s+/', ' ', (string) file_get_contents($deviceHelperDecisionPath));
+    foreach (['bounded by the group', 'original caller or adapter buffer',
+        'callbacks remain on the', 'only after actual host-operation retirement',
+        'ordinary synchronous I/O start none'] as $contract) {
+        if (!str_contains($deviceHelperDecision, $contract)) {
+            $failures[] = "decision 0137: missing inherited-device constraint {$contract}";
+        }
+    }
+    foreach (['decision 0110' => $decision, 'SPEC.md' => $spec,
+        'docs/stdlib-reference.md' => $stdlib, 'docs/notes/io-surface-audit.md' => $auditText] as $path => $authority) {
+        if (!str_contains($authority, 'ClockError')) {
+            $failures[] = "{$path}: missing Time-owned standalone ClockError";
+        }
+    }
+    foreach (['decision 0110' => $decision, 'SPEC.md' => $spec,
+        'docs/stdlib-reference.md' => $stdlib] as $path => $authority) {
+        foreach (['signed `int64` nanoseconds', 'fromNanoseconds', 'nanoseconds'] as $contract) {
+            if (!str_contains($authority, $contract)) {
+                $failures[] = "{$path}: missing accepted Duration contract {$contract}";
+            }
+        }
+    }
+    foreach (['decision 0110' => $decision, 'SPEC.md' => $spec,
+        'docs/stdlib-reference.md' => $stdlib, 'docs/notes/io-surface-audit.md' => $auditText] as $path => $authority) {
+        $normalized = preg_replace('/\s+/', ' ', $authority);
+        foreach (['RegistrationKey<T>', 'inline Copy', 'static type `T`', 'Stale and foreign keys',
+            '`register`', '`unregister`', 'returns the same owned `T`', 'writable set access'] as $contract) {
+            if (!str_contains($normalized, $contract)) {
+                $failures[] = "{$path}: missing accepted typed registration-key contract {$contract}";
+            }
+        }
+        foreach (['Competing operations on one stream follow plan order',
+            'Independent duplex read/write directions may overlap',
+            'operations sharing a file cursor compete',
+            'not completion observation across independent streams'] as $contract) {
+            if (!str_contains($normalized, $contract)) {
+                $failures[] = "{$path}: missing accepted competing-operation contract {$contract}";
+            }
+        }
+        if (!str_contains($normalized, 'negative interval used for a timed wait or relative deadline is already expired')) {
+            $failures[] = "{$path}: missing accepted negative-interval expiry contract";
+        }
+    }
+    if (!str_contains($decision, 'Decision 0137') || str_contains($decision, 'general borrowed fields, hidden')) {
+        $failures[] = 'decision 0110: inherited-device helper exception must not retain the blanket worker exclusion';
+    }
+    $fileFactories = [
+        'openRead' => ['ReadableFile', 'ReadableStream'],
+        'openWrite' => ['WritableFile', 'WritableStream'],
+        'openReadWrite' => ['DuplexFile', 'DuplexStream'],
+    ];
+    foreach (['decision 0110' => $decision, 'docs/stdlib-reference.md' => $stdlib] as $path => $authority) {
+        foreach ($fileFactories as $factory => [$result, $capability]) {
+            $mapping = '/^\|\s*`File::' . $factory . '`\s*\|\s*`' . $result
+                . '`\s*\|\s*`' . $capability . '`\s*\|\s*$/m';
+            if (!preg_match($mapping, $authority)) {
+                $failures[] = "{$path}: File::{$factory} must return {$result} with {$capability}";
+            }
         }
     }
     $decisionPerformance = [
@@ -409,12 +778,24 @@ function check_stream_io_completeness(string $root): array
             $failures[] = "decision 0110: missing accepted performance constraint {$constraint}";
         }
     }
+    foreach (['decision 0110' => $decision, 'docs/performance-and-benchmarking.md' => $performanceAuthority] as $path => $authority) {
+        $normalized = preg_replace('/\s+/', ' ', $authority);
+        foreach ([
+            '1.30',
+            'Measurement Status: Pending Available Runner',
+            'must not block Stage 36a completion or later language development',
+        ] as $required) {
+            if (!str_contains($normalized, $required)) {
+                $failures[] = "{$path}: missing non-blocking stream measurement rule {$required}";
+            }
+        }
+    }
     $deferralRules = [
-        'before Stage 36a implementation begins',
+        'before their Stage 36a implementation begins',
         'Reopen in `Doria\\Std\\Fs` design',
         'no later than Stage 36a surface finalization',
         'after the Stage 36a foundation and before their v1 implementation',
-        'Reopen in the Stage 44 `Doria\\Std\\Net` design',
+        'Reopen in the Stage 40a `Doria\\Std\\Net` design',
         'first operation or adapter that requires it',
     ];
     foreach ($deferralRules as $rule) {
@@ -423,19 +804,26 @@ function check_stream_io_completeness(string $root): array
         }
     }
     foreach ([
-        'Stage 36a is scheduled and not implemented',
-        'Exact public interface, member',
+        'Stage 36a is complete',
+        'Exact remaining public interface, member',
         'remain deferred under decision 0110',
+        'Persistent readiness sets own registered streams',
+        'ownership, access goes through the registration, and removal returns ownership',
+        'one-stream wait may instead borrow for that call',
     ] as $required) {
         if (!str_contains($spec, $required)) {
             $failures[] = "SPEC.md: missing accepted stream authority {$required}";
         }
     }
+    $normalizedStdlib = preg_replace('/\s+/', ' ', $stdlib);
     foreach ([
         'small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities',
-        'Stage 36a scheduled and not implemented; semantics and performance contract accepted, public spellings deferred',
+        'Stage 36a complete; semantics and performance contract accepted, remaining public spellings deferred',
+        'persistent readiness sets to own registered streams',
+        'removal returns ownership',
+        'Temporary one-stream waits may borrow for the call',
     ] as $required) {
-        if (!str_contains($stdlib, $required)) {
+        if (!str_contains($normalizedStdlib, $required)) {
             $failures[] = "docs/stdlib-reference.md: missing {$required}";
         }
     }
@@ -498,20 +886,25 @@ function check_stream_io_completeness(string $root): array
         'docs/doria-end-to-end-plan.md' => $plan,
         'docs/notes/current-pipeline.md' => $pipeline,
         'docs/decisions/0110-stream-readiness-standard-io-blocking-and-performance-model.md' => $decision,
+        'docs/notes/io-surface-audit.md' => $auditText,
         'docs/stdlib-reference.md' => $stdlib,
         'docs/api-design-guidelines.md' => $apiGuidelines,
         'docs/website-content-guidelines.md' => $websiteGuidelines,
         'docs/performance-and-benchmarking.md' => $performanceAuthority,
     ];
     $staleReviewStates = [
+        'Stage 26 is unblocked and next',
         "Andrew’s Stream API Completeness Review — Next",
         'Stage 26 — Blocked Pending Review',
         'Stage 36a Public Surface — Pending Review',
         'unauthored **Stream, Readiness, Standard I/O, And Blocking-Mode Model**',
+        'Before Stage 36a completion, the first accepted baseline',
+        'versioned with the harness before the Stage 36a gate can pass',
     ];
     foreach ($activeAuthorities as $path => $authority) {
+        $normalized = preg_replace('/\s+/', ' ', $authority);
         foreach ($staleReviewStates as $stale) {
-            if (str_contains($authority, $stale)) {
+            if (str_contains($normalized, $stale)) {
                 $failures[] = "{$path}: active authority retains stale stream-review state {$stale}";
             }
         }

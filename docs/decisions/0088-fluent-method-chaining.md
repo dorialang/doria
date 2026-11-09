@@ -1,8 +1,9 @@
 # Decision 0088: Fluent method chaining
 
 **Status:** Accepted (design direction; readonly/writable self-return and the
-owned-temporary rule belong with Stage 21, the consuming receiver is deferred —
-see Sequencing). Feeds the borrowing-rules and borrow-checker decision.
+owned-temporary rule belong with Stage 21; `consuming function` spelling approved
+on 2026-10-04, with grammar and execution assigned to Stage 36a — see Sequencing).
+Feeds the borrowing-rules and borrow-checker decision.
 
 ## Context
 
@@ -17,10 +18,10 @@ assumed. Three facts set the problem:
 - A method call binds what the method **returns**, not the receiver. So
   `let $x = $recv->m()` is only useful for chaining when `m` returns something
   chainable, and only useful for binding when it returns something bindable.
-- A freshly-constructed temporary is currently a **readonly value**: calling a
+- Before this decision, a freshly-constructed temporary was a **readonly value**: calling a
   `writable` method on `new UserStore()` fails with `E0203`. There is no defined
   self-return convention, so mutation chains and construct-and-bind one-liners do
-  not work today.
+  did not work in that implementation.
 
 The returned-borrow elision rule (§3.2 / plan line 141) already permits a method
 to return a borrow derived from `$this`, which is the mechanism the chaining
@@ -55,16 +56,39 @@ Receiver consuming `$this` (owned); returns the owned `self`. Ownership flows
 through the chain, so it works on temporaries and the **result is bindable**:
 `let $store = new UserStore()->add($a)->add($b);`. This is the deferred third
 receiver mode reserved by the Stage 20 receiver-mode note; it is also what the
-DDO decision's consuming `Transaction::commit` needs. **Its declaration spelling
-is deliberately not fixed here**: it must reuse the existing `take` ownership
-vocabulary for consistency, but the exact surface form is decided with the
-receiver-mode work, not this record — so convention 3 stays a semantic
-reservation until then.
+DDO decision's consuming `Transaction::commit` needs.
+
+**Spelling amendment approved by Andrew on 2026-10-04:** the declaration is
+`consuming function`, for example `consuming function finish(): Product`.
+`consuming` describes the method's receiver behavior, just as `writable` does;
+`take` remains the ownership-transfer spelling for explicit inputs. This
+supersedes the earlier requirement to reuse `take` in the receiver declaration.
+`take function` and `taker function` are not alternative method modifiers.
+Existing `take function(...) $callback` parameters and `function once(...)`
+closure types are unchanged.
+
+Calling a consuming method transfers ownership of its instance into the callee,
+not ownership of every argument. It need not destroy the instance: it may return
+owned `self` or another declared result. This is a general receiver mode, not a
+special rule for method names such as `close` or `finish`. Grammar and execution
+remain unimplemented until the Stage 36a receiver work lands.
+
+Ownership and writable access remain separate. Like an explicit `take`
+parameter, a consuming receiver is owned but readonly; `consuming` does not
+implicitly permit mutation or combine with `writable`. Existing rules still
+allow transferring that owned value into an explicitly writable local. A
+readonly or writable borrow cannot be consumed, and a live borrow prevents
+transferring its owner.
+
+An owned carrier may forward loans it acquired earlier when it is consumed;
+those loans still belong to the returned carrier. Returning such a carrier
+does not borrow the consumed receiver's own storage. Generic calls and checked
+interface erasure preserve the same retained sources and cleanup obligations.
 
 ### Owned temporaries are exclusive places
 
 A freshly-owned rvalue (`new X()`, or a call returning an owned `T`) may receive
-`writable` and `take` method calls. It is provably exclusive — no other binding
+`writable` and `consuming` method calls. It is provably exclusive — no other binding
 aliases it — so an exclusive borrow or a move of it is sound. This narrows the
 current `E0203`-on-temporary restriction and is what lets `(new X())->mutate()`
 and construct-and-chain work at all. (Precedent: Rust's `String::new().push_str(...)`.)
@@ -130,9 +154,11 @@ belong with Stage 21**, which is already implementing borrow-returning accessors
 and lifting the temporary native-eligibility gate (record 0083). Deciding them
 now avoids building the borrow checker on a "readonly getters only, temporaries
 stay readonly" assumption and reworking it later. Convention 3 (the consuming
-receiver) is the deferred third receiver mode; it lands with the
-builder-finalizer / DDO consuming-commit work, which also fixes its declaration
-spelling, and the receiver-mode representation already reserves room for it.
+receiver) is the deferred third receiver mode. Stage 36a now owns its grammar,
+accepted-but-unimplemented diagnostics, and execution for the stream close/finish
+contract; builder finalizers and DDO consume the same mechanism. The declaration
+spelling is settled above, and the receiver-mode representation already reserves
+room for it.
 
 ## Affected components
 
@@ -143,6 +169,12 @@ specification, and the master plan.
 ## Invalidated elsewhere
 
 - `E0203` applied uniformly to owned temporaries — to be narrowed so an owned,
-  exclusive temporary may receive `writable` and `take` calls.
+  exclusive temporary may receive `writable` and `consuming` method calls.
 - Any assumption that fluent chaining is unsupported, or that a `new` temporary
   is permanently a readonly value.
+- The earlier unresolved receiver spelling and requirement to use `take` there
+  are superseded. SPEC, plan, Decision 0089, and Decision 0110 must agree.
+- Stage 36a grammar, compiler-owned signatures, LSP/editor highlighting and
+  diagnostics, and the website's versioned guide, API reference, and examples
+  must use `consuming function`; no executable support is claimed by this
+  spelling amendment.

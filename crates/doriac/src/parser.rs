@@ -35,6 +35,7 @@ struct FunctionModifiers {
     open_span: Option<Span>,
     override_span: Option<Span>,
     writable_span: Option<Span>,
+    consuming_span: Option<Span>,
     static_span: Option<Span>,
     start_span: Span,
     is_member: bool,
@@ -494,6 +495,21 @@ impl Parser {
         } else if self.match_kind(&TokenKind::Internal) {
             self.reject_type_modifier(open_span, override_span, "`internal`");
             self.parse_internal_item(self.previous().span)
+        } else if self.match_kind(&TokenKind::Consuming) {
+            let consuming_span = self.previous().span;
+            self.expect(TokenKind::Function, "expected `function` after `consuming`")?;
+            self.parse_function_with_modifiers(FunctionModifiers {
+                access: MemberAccess::External,
+                open_span,
+                override_span,
+                writable_span: None,
+                consuming_span: Some(consuming_span),
+                static_span: None,
+                start_span: self.span(declaration_start, self.previous().span.end),
+                is_member: false,
+                allow_requirement: false,
+            })
+            .map(Item::Function)
         } else if self.check(&TokenKind::Function)
             && self
                 .tokens
@@ -506,6 +522,7 @@ impl Parser {
                 open_span,
                 override_span,
                 writable_span: None,
+                consuming_span: None,
                 static_span: None,
                 start_span: self.span(declaration_start, self.previous().span.end),
                 is_member: false,
@@ -861,6 +878,21 @@ impl Parser {
             self.reject_type_modifier(open_span, override_span, "a trait");
             self.parse_trait(MemberAccess::Internal, internal_span.start)
                 .map(Item::Trait)
+        } else if self.match_kind(&TokenKind::Consuming) {
+            let consuming_span = self.previous().span;
+            self.expect(TokenKind::Function, "expected `function` after `consuming`")?;
+            self.parse_function_with_modifiers(FunctionModifiers {
+                access: MemberAccess::Internal,
+                open_span,
+                override_span,
+                writable_span: None,
+                consuming_span: Some(consuming_span),
+                static_span: None,
+                start_span: internal_span.merge(self.previous().span),
+                is_member: false,
+                allow_requirement: false,
+            })
+            .map(Item::Function)
         } else if self.check(&TokenKind::Function)
             && self
                 .tokens
@@ -873,6 +905,7 @@ impl Parser {
                 open_span,
                 override_span,
                 writable_span: None,
+                consuming_span: None,
                 static_span: None,
                 start_span: internal_span.merge(self.previous().span),
                 is_member: false,
@@ -1018,7 +1051,7 @@ impl Parser {
             .then(|| self.previous().span);
         let (implements, inheritance_type_spans, inheritance_comma_spans) =
             if inheritance_keyword_span.is_some() {
-                self.parse_type_list()?
+                self.parse_conformance_list()?
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
@@ -1166,18 +1199,60 @@ impl Parser {
             .match_kind(&TokenKind::Static)
             .then(|| self.previous().span);
 
-        let writable_span = self
-            .match_kind(&TokenKind::Writable)
-            .then(|| self.previous().span);
+        let mut writable_span = None;
+        let mut consuming_span = None;
+        let mut readonly_span = None;
+        while matches!(
+            self.peek().kind,
+            TokenKind::Writable | TokenKind::Consuming | TokenKind::Readonly
+        ) {
+            let token = self.advance().clone();
+            let slot = match token.kind {
+                TokenKind::Writable => &mut writable_span,
+                TokenKind::Consuming => &mut consuming_span,
+                TokenKind::Readonly => &mut readonly_span,
+                _ => unreachable!("receiver modifier was checked above"),
+            };
+            if slot.replace(token.span).is_some() {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a receiver modifier cannot be repeated",
+                        token.span,
+                    )
+                    .with_title("Duplicate Receiver Modifier"),
+                );
+            }
+        }
+        if let Some(consuming) = consuming_span {
+            if let Some(borrowed) = writable_span.or(readonly_span) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "`consuming` cannot be combined with `readonly` or `writable`",
+                        consuming.merge(borrowed),
+                    )
+                    .with_title("Conflicting Receiver Modes"),
+                );
+            }
+        } else if let Some(readonly) = readonly_span {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "readonly access does not use a member modifier",
+                    readonly,
+                )
+                .with_title("Readonly Member Access Is Implicit"),
+            );
+        }
         if self.check(&TokenKind::AttributeOpen) {
             self.reject_attribute_after_modifier(self.peek().span);
             let _ = self.parse_attribute_groups();
         }
         if self.check(&TokenKind::Function)
-            && self
-                .tokens
-                .get(self.current + 1)
-                .is_some_and(Self::is_callable_name_token)
+            && self.tokens.get(self.current + 1).is_some_and(|token| {
+                Self::is_callable_name_token(token) || matches!(token.kind, TokenKind::Reserved(_))
+            })
         {
             self.advance();
             let start = self.previous().span.start;
@@ -1187,6 +1262,7 @@ impl Parser {
                     open_span,
                     override_span,
                     writable_span,
+                    consuming_span,
                     static_span,
                     start_span: self.span(member_start, start),
                     is_member: true,
@@ -1199,9 +1275,20 @@ impl Parser {
             return member;
         }
 
+        if let Some(span) = consuming_span {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`consuming` can modify only an instance method",
+                    span,
+                )
+                .with_title("Consuming Modifier Requires A Method"),
+            );
+        }
         let start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let (name, name_span) = self.expect_variable("expected property variable name")?;
+        let availability = self.parse_nominal_condition()?;
         let initializer = if self.match_kind(&TokenKind::Equals) {
             Some(self.parse_expression()?)
         } else {
@@ -1239,6 +1326,7 @@ impl Parser {
             ty,
             name,
             name_span,
+            availability,
             initializer,
             hooks,
             span: self.span(start.min(name_span.start), end),
@@ -1465,6 +1553,7 @@ impl Parser {
             open_span,
             override_span,
             writable_span,
+            consuming_span,
             static_span,
             start_span,
             is_member,
@@ -1472,7 +1561,11 @@ impl Parser {
         } = modifiers;
         let keyword_span = self.previous().span;
         let start = start_span.start;
-        let name = self.expect_callable_name("expected function name")?;
+        let name = if is_member && matches!(self.peek().kind, TokenKind::Reserved(_)) {
+            self.expect_member_name("expected function name")?
+        } else {
+            self.expect_callable_name("expected function name")?
+        };
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
         let parameters_open_span = self
@@ -1517,6 +1610,7 @@ impl Parser {
             None
         };
 
+        let availability = self.parse_nominal_condition()?;
         let body = if allow_requirement && self.match_kind(&TokenKind::Semicolon) {
             FunctionBody::Requirement {
                 semicolon_span: self.previous().span,
@@ -1534,6 +1628,8 @@ impl Parser {
             override_span,
             writable_this: writable_span.is_some(),
             writable_span,
+            consuming_this: consuming_span.is_some(),
+            consuming_span,
             is_static: static_span.is_some(),
             static_span,
             name,
@@ -1542,6 +1638,7 @@ impl Parser {
             params,
             return_type,
             throws,
+            availability,
             body,
             syntax: Box::new(FunctionSyntax {
                 keyword_span,
@@ -1600,16 +1697,7 @@ impl Parser {
                     // parameter. Without that second `implements`,
                     // `<T implements A, U>` remains the documented
                     // comma-separated constraint list for `T`.
-                    if !self.check(&TokenKind::Comma)
-                        || self
-                            .tokens
-                            .get(self.current + 1)
-                            .zip(self.tokens.get(self.current + 2))
-                            .is_some_and(|(name, implements)| {
-                                matches!(name.kind, TokenKind::Identifier(_))
-                                    && matches!(implements.kind, TokenKind::Implements)
-                            })
-                    {
+                    if !self.check(&TokenKind::Comma) || self.comma_starts_nominal_subject() {
                         break;
                     }
                     self.advance();
@@ -1730,6 +1818,101 @@ impl Parser {
         Some((types, spans, commas))
     }
 
+    fn parse_conformance_list(
+        &mut self,
+    ) -> Option<(Vec<InterfaceConformance>, Vec<Span>, Vec<Span>)> {
+        let mut entries = Vec::new();
+        let mut spans = Vec::new();
+        let mut commas = Vec::new();
+        loop {
+            let start = self.peek().span.start;
+            let ty = self.parse_type_ref()?;
+            spans.push(self.span(start, self.previous().span.end));
+            entries.push(InterfaceConformance {
+                ty,
+                condition: self.parse_nominal_condition()?,
+            });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+            commas.push(self.previous().span);
+        }
+        Some((entries, spans, commas))
+    }
+
+    fn parse_nominal_condition(&mut self) -> Option<Option<NominalCondition>> {
+        if !matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "where") {
+            return Some(None);
+        }
+        let keyword_span = self.advance().span;
+        let open_span = self
+            .expect(TokenKind::LeftParen, "expected `(` after `where`")?
+            .span;
+        let mut bounds = Vec::new();
+        let mut comma_spans = Vec::new();
+        loop {
+            let name = self.expect_identifier("expected type-parameter subject in condition")?;
+            let subject = NameRef {
+                text: name,
+                span: self.previous().span,
+            };
+            let implements_span = self
+                .expect(
+                    TokenKind::Implements,
+                    "expected `implements` after condition subject",
+                )?
+                .span;
+            let mut interfaces = Vec::new();
+            let mut type_spans = Vec::new();
+            loop {
+                let start = self.peek().span.start;
+                interfaces.push(self.parse_type_ref()?);
+                type_spans.push(self.span(start, self.previous().span.end));
+                if !self.check(&TokenKind::Comma) || self.comma_starts_nominal_subject() {
+                    break;
+                }
+                comma_spans.push(self.advance().span);
+            }
+            bounds.push(NominalBound {
+                span: subject.span.merge(*type_spans.last().unwrap()),
+                subject,
+                implements_span,
+                interfaces,
+                type_spans,
+            });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+            comma_spans.push(self.previous().span);
+        }
+        let close_span = self
+            .expect(
+                TokenKind::RightParen,
+                "expected `)` after nominal condition",
+            )?
+            .span;
+        Some(Some(NominalCondition {
+            keyword_span,
+            bounds,
+            delimiters: DelimitedListSpans {
+                open_span,
+                comma_spans,
+                close_span,
+            },
+            span: keyword_span.merge(close_span),
+        }))
+    }
+
+    fn comma_starts_nominal_subject(&self) -> bool {
+        self.tokens
+            .get(self.current + 1)
+            .zip(self.tokens.get(self.current + 2))
+            .is_some_and(|(name, implements)| {
+                matches!(name.kind, TokenKind::Identifier(_))
+                    && matches!(implements.kind, TokenKind::Implements)
+            })
+    }
+
     fn parse_declaration_members(&mut self, allow_requirement: bool) -> Vec<ClassMember> {
         let mut members = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
@@ -1774,6 +1957,7 @@ impl Parser {
                 | TokenKind::Function
                 | TokenKind::Internal
                 | TokenKind::Writable
+                | TokenKind::Consuming
                 | TokenKind::Static
                 | TokenKind::Open
                 | TokenKind::Override
@@ -3635,6 +3819,31 @@ impl Parser {
             None
         };
 
+        if self.match_kind(&TokenKind::Take) {
+            let take = self.previous().span;
+            let mut expr = self.parse_postfix()?;
+            match &mut expr {
+                Expr::PropertyAccess {
+                    take_span, span, ..
+                } => {
+                    *take_span = Some(take);
+                    *span = take.merge(*span);
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "`take` in an expression moves a stored property out of `$this`",
+                            take.merge(expr.span()),
+                        )
+                        .with_title("Take Requires A Property")
+                        .with_help("write `take $this->field` inside a `consuming function`; other values move without `take`"),
+                    );
+                }
+            }
+            return Some(expr);
+        }
+
         if let Some(op) = op {
             let op_span = self.previous().span;
             let expr = self.parse_unary()?;
@@ -3730,6 +3939,7 @@ impl Parser {
                         property,
                         member_span,
                         null_safe,
+                        take_span: None,
                         span,
                     };
                 }
@@ -4146,7 +4356,7 @@ impl Parser {
     ) -> Option<Expr> {
         let token = self.advance().clone();
         let (member, member_sigil_span) = match token.kind {
-            TokenKind::Identifier(name) => (name, None),
+            TokenKind::Identifier(name) | TokenKind::Reserved(name) => (name, None),
             TokenKind::Variable(name) => (
                 name,
                 Some(self.span(token.span.start, token.span.start + 1)),
@@ -5068,7 +5278,9 @@ impl Parser {
                             self.parse_type_ref_inner()?,
                         ));
                     }
-                    if !self.match_kind(&TokenKind::Comma) {
+                    if self.pending_type_argument_close.is_some()
+                        || !self.match_kind(&TokenKind::Comma)
+                    {
                         break;
                     }
                 }
@@ -5244,10 +5456,13 @@ impl Parser {
         }
     }
 
+    /// Member names follow `->`, `?->`, `::` or a method's `function`, where a
+    /// reserved future keyword (`async`, `await`, `spawn`, `scope`) can never
+    /// begin its own syntax, so it remains a valid member name.
     fn expect_member_name(&mut self, message: &str) -> Option<String> {
         let token = self.advance().clone();
         match token.kind {
-            TokenKind::Identifier(name) => Some(name),
+            TokenKind::Identifier(name) | TokenKind::Reserved(name) => Some(name),
             TokenKind::Use => Some("use".to_string()),
             TokenKind::Not => Some("not".to_string()),
             _ => {
@@ -5575,6 +5790,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Take => "take",
         TokenKind::Borrow => "borrow",
         TokenKind::Once => "once",
+        TokenKind::Consuming => "consuming",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",
         TokenKind::Return => "return",

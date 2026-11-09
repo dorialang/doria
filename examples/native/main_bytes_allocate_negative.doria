@@ -1,0 +1,11 @@
+class Marker {
+    function __destruct() {
+        try { echo "unexpected cleanup\n"; } catch (Doria\Std\Io\IoError) {}
+    }
+}
+function main(): void {
+    let $marker = new Marker();
+    echo "before\n";
+    let $bytes = Bytes::allocate(-7);
+    echo "unexpected continuation\n";
+}

@@ -1,5 +1,8 @@
 use doriac::mir;
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
 
@@ -129,17 +132,9 @@ function main(): void
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
     assert!(output.runtime_diagnostic.is_none());
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Fast,
-        "4;8;done;",
-    );
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &program,
-        doriac::backend::NativeProfile::Release,
-        "4;8;done;",
-    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, "4;8;done;");
+    }
 }
 
 #[test]
@@ -170,16 +165,24 @@ class Application
     }
 }
 "#,
-        r#"
-class Application
-{
-    writable Counter $counter = new Counter();
-    function __destruct() { $this->counter->add(1); }
-}
-"#,
     ] {
         assert_diagnostic(&format!("{declarations}{body}"), "E0203");
     }
+    // A destructor has writable access to the dying object (decision log
+    // entry 42), so it may mutate its fields.
+    doriac::check_source(
+        "destructor-writes.doria",
+        format!(
+            r#"{declarations}
+class Application
+{{
+    writable Counter $counter = new Counter();
+    function __destruct() {{ $this->counter->add(1); }}
+}}
+"#
+        ),
+    )
+    .expect("destructors may mutate the dying object");
     assert_diagnostic(
         &format!(
             r#"{declarations}

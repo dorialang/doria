@@ -1,0 +1,47 @@
+use Doria\Std\Io\{ByteRegion, WritableStream, WriteOutcome, IoError};
+
+class PartialWriter implements WritableStream
+{
+    writable int $attempt = 0;
+
+    writable function write(ByteRegion $source): WriteOutcome throws IoError
+    {
+        if ($source->length == 0) { return WriteOutcome::Accepted(0); }
+        echo "suffix {$source->length}:{$source[0]}\n";
+        if ($this->attempt == 0) {
+            $this->attempt = 1;
+            return WriteOutcome::Accepted(2);
+        }
+        if ($this->attempt == 1) {
+            $this->attempt = 2;
+            return WriteOutcome::WouldBlock;
+        }
+        return WriteOutcome::Accepted(1);
+    }
+}
+
+function writeNextPart(writable WritableStream $output, ByteRegion $message, int $offset): WriteOutcome throws IoError
+{
+    let $remaining = $message->getRegion($offset, $message->length - $offset);
+    return $output->write($remaining);
+}
+
+function main(): void
+{
+    let writable $buffer = Bytes::allocate(3);
+    $buffer[0] = 10;
+    $buffer[1] = 20;
+    $buffer[2] = 30;
+    let $message = $buffer->getRegion(0, 3);
+    let writable $output = new PartialWriter();
+    let writable $offset = 0;
+    foreach (0..<4 as int $attempt) {
+        let $result = writeNextPart($output, $message, $offset);
+        ?int $accepted = match ($result) {
+            WriteOutcome::Accepted($byteCount) => $byteCount,
+            WriteOutcome::WouldBlock => null,
+        };
+        if ($accepted != null) { $offset += $accepted; }
+        echo "attempt {$attempt}; offset {$offset}; accepted {$accepted ?? -1}\n";
+    }
+}

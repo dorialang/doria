@@ -48,9 +48,12 @@ fn ownership_transfer_fixes_are_review_only_and_preserve_trivia() {
     let capture_source = r#"
 function main(): void
 {
-    let $value = 1;
-    let $borrowed = fn() with (/* keep capture */ $value) => $value;
-    List<function(): int> $items = [$borrowed];
+    writable List<function(): int> $items = [];
+    {
+        let $value = 1;
+        let $borrowed = fn() with (/* keep capture */ $value) => $value;
+        $items->add($borrowed);
+    }
 }
 "#;
     let capture = analyze(capture_source);
@@ -90,6 +93,79 @@ class Store
                 && !edit.replacement.contains("SharedReference")
                 && !edit.replacement.contains("lifetime")
         }));
+    }
+}
+
+#[test]
+fn returned_local_captures_offer_review_only_transfer_fixes() {
+    for closure in [
+        "fn() with (/* keep capture */ $value) => $value",
+        "function (): int with (/* keep capture */ $value) { return $value; }",
+    ] {
+        for result in [closure.to_string(), "$borrowed".to_string()] {
+            let source = format!(
+                "function make(): function(): int {{ let $value = 1; {} return {result}; }}",
+                if result == "$borrowed" {
+                    format!("let $borrowed = {closure};")
+                } else {
+                    String::new()
+                },
+            );
+            let analysis = analyze(&source);
+            let error = diagnostic(&analysis.diagnostics, "E0658");
+            assert_eq!(error.fixes.len(), 1, "{source}: {error:#?}");
+            assert_eq!(
+                error.fixes[0].applicability,
+                FixApplicability::RequiresReview
+            );
+            assert_eq!(error.fixes[0].edits.len(), 1);
+            assert_eq!(error.fixes[0].edits[0].replacement, "take ");
+            let rewritten = apply_current_source_fix(&source, error);
+            assert!(rewritten.contains("/* keep capture */ take $value"));
+            assert!(analyze(&rewritten).diagnostics.is_empty(), "{rewritten}");
+        }
+    }
+
+    let source = r#"
+function make(): function(): int {
+    let writable $value = 1;
+    return function (): int with (writable $value) { return $value; };
+}
+"#;
+    let analysis = analyze(source);
+    assert!(diagnostic(&analysis.diagnostics, "E0658").fixes.is_empty());
+
+    let declarations = r#"
+class Item { int $value = 1; }
+class Owner {
+    Item $item = new Item();
+    function view(): Item { return $this->item; }
+}
+"#;
+    for body in [
+        r#"
+function make(): function(): int {
+    let $owner = new Owner();
+    let $view = $owner->view();
+    return fn() with ($view) => $view->value;
+}
+"#,
+        r#"
+function store(): void {
+    writable List<function(): int> $items = [];
+    {
+        let $owner = new Owner();
+        let $view = $owner->view();
+        let $read = fn() with ($view) => $view->value;
+        $items->add($read);
+    }
+    echo $items[0]();
+}
+"#,
+    ] {
+        let source = format!("{declarations}{body}");
+        let analysis = analyze(&source);
+        assert!(diagnostic(&analysis.diagnostics, "E0658").fixes.is_empty());
     }
 }
 
@@ -328,17 +404,17 @@ fn borrow_bound_closures_cannot_enter_owned_storage() {
         r#"
 function main(): void
 {
-    let $value = 1;
-    let $borrowed = fn() with ($value) => $value;
-    List<function(): int> $items = [$borrowed];
+    writable List<function(): int> $items = [];
+    {
+        let $value = 1;
+        let $borrowed = fn() with ($value) => $value;
+        $items->add($borrowed);
+    }
 }
 "#,
     );
     let escape = diagnostic(&analysis.diagnostics, "E0658");
-    assert_eq!(
-        escape.title,
-        "Borrow-Bound Closure Cannot Enter Owned Storage"
-    );
+    assert_eq!(escape.title, "Closure Cannot Outlive Captured Value");
 }
 
 #[test]
@@ -475,17 +551,17 @@ function bind(int $value): function(): int
 
 function main(): void
 {
-    let $root = 1;
-    let $callback = bind($root);
-    List<function(): int> $callbacks = [$callback];
+    writable List<function(): int> $callbacks = [];
+    {
+        let $root = 1;
+        let $callback = bind($root);
+        $callbacks->add($callback);
+    }
 }
 "#,
     );
     let escape = diagnostic(&analysis.diagnostics, "E0658");
-    assert_eq!(
-        escape.title,
-        "Borrow-Bound Closure Cannot Enter Owned Storage"
-    );
+    assert_eq!(escape.title, "Closure Cannot Outlive Captured Value");
 }
 
 #[test]

@@ -6,9 +6,7 @@ use crate::build_plan::{
     source_is_active, BuildPlanDocument, DependencyKind, GeneratedFor, Package, SourceOrigin,
     SourceScope, TargetKind,
 };
-use crate::diagnostics::{
-    Diagnostic, DiagnosticLabel, DiagnosticResult, DiagnosticSource, LabelRole,
-};
+use crate::diagnostics::{Diagnostic, DiagnosticResult, DiagnosticSource, LabelRole};
 use crate::names::{
     CompilationContext, Edition, GlobalSymbolDeclaration, GlobalSymbolFacts,
     NameResolutionEnvironment, PackageIdentity, SourceIdentity,
@@ -558,10 +556,7 @@ fn stable_source_ids<'a>(
         let mut candidate = u32::from_str_radix(&digest[..8], 16)
             .expect("SHA-256 hexadecimal prefix is a u32")
             & 0x7fff_ffff;
-        while candidate == crate::compiler_known_contracts::SOURCE_ID.0
-            || candidate == crate::compiler_known_io::SYNTHETIC_SOURCE_ID.0
-            || !allocated.insert(candidate)
-        {
+        while SourceId(candidate).is_compiler_owned() || !allocated.insert(candidate) {
             candidate = candidate.wrapping_add(1) & 0x7fff_ffff;
         }
         result.insert(identity.clone(), SourceId(candidate));
@@ -681,12 +676,10 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             .with_title("Duplicate Fully Qualified Declaration")
             .with_primary_label("The First Deterministic Declaration Is Here");
             for declaration in group.iter().skip(1) {
-                diagnostic.labels.push(DiagnosticLabel {
-                    source: diagnostic_source_for_span(graph, declaration.name_span),
-                    span: declaration.name_span,
-                    role: LabelRole::Secondary,
-                    message: format!("Another {:?} Declaration Is Here", declaration.kind),
-                });
+                diagnostic = diagnostic.with_related(
+                    declaration.name_span,
+                    format!("Another {:?} Declaration Is Here", declaration.kind),
+                );
             }
             diagnostics.push(diagnostic);
         }
@@ -857,8 +850,19 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         }
     }
 
-    if uses_compiler_known_io || crate::compiler_known_io::resolved_facts_use_canonical_io(&facts) {
+    if uses_compiler_known_io
+        || crate::compiler_known_io::resolved_program_uses_canonical_io(&facts, &combined)
+    {
         combined = crate::compiler_known_io::augment_program(&combined);
+    }
+    if crate::compiler_known_stream::resolved_facts_use_streams(&facts) {
+        combined = crate::compiler_known_stream::augment_program_for(&combined, &facts);
+    }
+    if crate::compiler_known_time::resolved_facts_use_time(&facts) {
+        combined = crate::compiler_known_time::augment_program(&combined);
+    }
+    if crate::compiler_known_concurrency::resolved_facts_use_concurrency(&facts) {
+        combined = crate::compiler_known_concurrency::augment_program(&combined);
     }
     if crate::compiler_known_test::resolved_facts_use_assertion_surface(&facts) {
         combined = crate::compiler_known_test::augment_program(&combined);
@@ -876,6 +880,18 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             crate::compiler_known_contracts::SOURCE_ID,
             crate::compiler_known_contracts::SOURCE_TEXT,
         )))
+        .chain(std::iter::once((
+            crate::compiler_known_stream::SOURCE_ID,
+            crate::compiler_known_stream::SOURCE_TEXT,
+        )))
+        .chain(std::iter::once((
+            crate::compiler_known_time::SOURCE_ID,
+            crate::compiler_known_time::SOURCE_TEXT,
+        )))
+        .chain(std::iter::once((
+            crate::compiler_known_concurrency::SOURCE_ID,
+            crate::compiler_known_concurrency::SOURCE_TEXT,
+        )))
         .collect::<HashMap<_, _>>();
     let compiler_known_context = selected_context(graph);
     contexts.insert(
@@ -892,6 +908,30 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_time::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_time::SOURCE_NAME.to_string()),
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_stream::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_stream::SOURCE_NAME.to_string()),
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_concurrency::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_concurrency::SOURCE_NAME.to_string()),
         },
     );
     let mut semantic = crate::semantics::analyze_program_for_ide_with_graph_and_test_context(
@@ -943,7 +983,9 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             ))
     });
     semantic_dependency_edges.dedup();
-    retarget_graph_diagnostics(graph, &mut diagnostics);
+    // The analysis is published with its source map, so its locations are
+    // resolved by the same rule presentation uses.
+    crate::diagnostics::resolve_diagnostic_sources(&graph.source_map, &mut diagnostics);
     sort_graph_diagnostics(graph, &mut diagnostics);
 
     GraphSemanticAnalysis {
@@ -1037,31 +1079,6 @@ fn dependency_paths(graph: &CompilationGraph, start: &str) -> BTreeMap<String, V
     }
     paths.remove(start);
     paths
-}
-
-fn diagnostic_source_for_span(graph: &CompilationGraph, span: Span) -> DiagnosticSource {
-    graph
-        .source_map
-        .by_id(span.source)
-        .map(|record| DiagnosticSource::Path(record.display_path.clone()))
-        .unwrap_or(DiagnosticSource::Unavailable)
-}
-
-pub fn retarget_graph_diagnostics(graph: &CompilationGraph, diagnostics: &mut [Diagnostic]) {
-    for diagnostic in diagnostics {
-        for label in &mut diagnostic.labels {
-            if label.source == DiagnosticSource::Current {
-                label.source = diagnostic_source_for_span(graph, label.span);
-            }
-        }
-        for fix in &mut diagnostic.fixes {
-            for edit in &mut fix.edits {
-                if edit.source == DiagnosticSource::Current {
-                    edit.source = diagnostic_source_for_span(graph, edit.span);
-                }
-            }
-        }
-    }
 }
 
 fn sort_graph_diagnostics(graph: &CompilationGraph, diagnostics: &mut [Diagnostic]) {

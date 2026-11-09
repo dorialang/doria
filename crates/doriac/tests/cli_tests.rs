@@ -51,10 +51,18 @@ fn version_json_exposes_the_baton_compiler_contract() {
     let commit = identity["commit"]
         .as_str()
         .expect("compiler commit should be a string");
-    assert_eq!(commit.len(), 40, "compiler commit should be a full Git SHA");
+    assert_eq!(commit, doriac::BUILD_COMMIT);
+    let (digest, length) = commit
+        .strip_prefix("dev-")
+        .map_or((commit, 40), |digest| (digest, 64));
+    assert_eq!(
+        digest.len(),
+        length,
+        "compiler source identity should be a Git SHA or development fingerprint"
+    );
     assert!(
-        commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "compiler commit should be hexadecimal"
+        digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "compiler source identity digest should be hexadecimal"
     );
 }
 

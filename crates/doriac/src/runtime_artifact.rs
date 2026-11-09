@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::backend::{BackendError, NativeProfile};
 use crate::diagnostics::Diagnostic;
 use crate::runtime_digest::sha256_hex;
@@ -27,6 +29,7 @@ struct EmbeddedRuntimeSet {
 }
 
 static EMBEDDED_RUNTIMES: OnceLock<EmbeddedRuntimeSet> = OnceLock::new();
+static EMBEDDED_SHARED_RUNTIME: OnceLock<EmbeddedRuntimeProfile> = OnceLock::new();
 static NEXT_EMBEDDED_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Register the runtime archives compiled into the standalone `doriac` binary.
@@ -51,6 +54,21 @@ pub fn register_embedded_runtimes(
             metadata: release_metadata,
         },
     });
+}
+
+pub fn register_embedded_shared_runtime(library: &'static [u8], metadata: &'static str) {
+    let _ = EMBEDDED_SHARED_RUNTIME.set(EmbeddedRuntimeProfile {
+        archive: library,
+        metadata,
+    });
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeArtifactKind {
+    #[default]
+    Static,
+    Shared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,15 +115,184 @@ impl RuntimeOrigin {
 }
 
 /// Identity recorded beside a runtime archive by the build script.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeMetadata {
     pub schema_version: u32,
     pub abi_version: String,
     pub runtime_revision: String,
     pub target_triple: String,
     pub profile: String,
+    #[serde(default)]
+    pub artifact_kind: RuntimeArtifactKind,
+    #[serde(default)]
+    pub feature_set: Vec<String>,
     pub bytes: u64,
     pub sha256: String,
+}
+
+/// Verified bytes and their portable publication location, never a build-cache reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedRuntimeDependency {
+    metadata: RuntimeMetadata,
+    metadata_document: String,
+    library: Vec<u8>,
+    relative_library_path: PathBuf,
+}
+
+impl SharedRuntimeDependency {
+    pub fn metadata(&self) -> &RuntimeMetadata {
+        &self.metadata
+    }
+
+    pub fn metadata_json(&self) -> &str {
+        &self.metadata_document
+    }
+
+    pub fn relative_library_path(&self) -> &Path {
+        &self.relative_library_path
+    }
+
+    pub fn relative_metadata_path(&self) -> PathBuf {
+        metadata_path(&self.relative_library_path)
+    }
+
+    pub fn publish(&self, output_directory: &Path) -> Result<(), BackendError> {
+        let library = materialize_runtime_asset(
+            &self.library,
+            &self.metadata_document,
+            shared_runtime_filename(),
+            &output_directory.join(".doria-runtime"),
+            false,
+        )?;
+        if library != output_directory.join(&self.relative_library_path) {
+            return Err(BackendError::new(
+                "shared runtime publication changed its verified relative path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared artifacts are selected only from an explicit override or this compiler's own build.
+pub fn shared_runtime_dependency() -> Result<SharedRuntimeDependency, BackendError> {
+    if let Some(override_path) = env::var_os("DORIA_RT_PATH") {
+        let path = PathBuf::from(override_path);
+        let path = if path.is_dir() {
+            path.join(shared_runtime_filename())
+        } else {
+            path
+        };
+        return read_shared_runtime(&path, RuntimeOrigin::ExplicitOverride);
+    }
+    if let Some(embedded) = EMBEDDED_SHARED_RUNTIME.get() {
+        return verify_shared_runtime(
+            Path::new("<compiler-bundled shared runtime>"),
+            RuntimeOrigin::CompilerBundled,
+            embedded.archive.to_vec(),
+            embedded.metadata.to_string(),
+            &RuntimeExpectation::current(NativeProfile::Release),
+        );
+    }
+    let path = option_env!("DORIA_RT_BUILT_SHARED_PATH").ok_or_else(|| BackendError::new(
+        "this compiler does not contain a shared Doria runtime; rebuild it with bundled-runtime support to publish native-backed PHP output",
+    ))?;
+    read_shared_runtime(Path::new(path), RuntimeOrigin::CompilerBundled)
+}
+
+fn read_shared_runtime(
+    path: &Path,
+    origin: RuntimeOrigin,
+) -> Result<SharedRuntimeDependency, BackendError> {
+    let library = fs::read(path).map_err(|error| {
+        invalid_metadata_error(
+            path,
+            origin,
+            &format!("shared library unavailable: {error}"),
+        )
+    })?;
+    let document = fs::read_to_string(metadata_path(path)).map_err(|error| {
+        invalid_metadata_error(
+            path,
+            origin,
+            &format!("shared library identity sidecar unavailable: {error}"),
+        )
+    })?;
+    verify_shared_runtime(
+        path,
+        origin,
+        library,
+        document,
+        &RuntimeExpectation::current(NativeProfile::Release),
+    )
+}
+
+fn verify_shared_runtime(
+    path: &Path,
+    origin: RuntimeOrigin,
+    library: Vec<u8>,
+    document: String,
+    expectation: &RuntimeExpectation,
+) -> Result<SharedRuntimeDependency, BackendError> {
+    let metadata = parse_metadata(&document).ok_or_else(|| {
+        invalid_metadata_error(
+            path,
+            origin,
+            "shared library metadata is malformed or incomplete",
+        )
+    })?;
+    let mut mismatches = incompatibility(&metadata, expectation).unwrap_or_default();
+    if metadata.artifact_kind != RuntimeArtifactKind::Shared {
+        mismatches.push(Mismatch {
+            field: "artifact kind",
+            expected: "shared".into(),
+            found: "static".into(),
+        });
+    }
+    if metadata.feature_set != ["hosted-shared-runtime"] {
+        mismatches.push(Mismatch {
+            field: "feature set",
+            expected: "hosted-shared-runtime".into(),
+            found: metadata.feature_set.join(", "),
+        });
+    }
+    for (field, value) in [
+        ("ABI", &expectation.abi_version),
+        ("target", &expectation.target_triple),
+        ("revision", &expectation.revision),
+    ] {
+        if value.is_empty() || value == "unknown" {
+            return Err(invalid_metadata_error(
+                path,
+                origin,
+                &format!("compiler has no verified {field} expectation for a shared runtime"),
+            ));
+        }
+    }
+    mismatches.extend(integrity_mismatches(&library, &metadata));
+    if !mismatches.is_empty() {
+        return Err(incompatible_runtime_error(path, origin, &mismatches));
+    }
+    // Integrity passed, so the recorded digest is the library's own.
+    let identity = runtime_cache_identity(&metadata.sha256, &document);
+    Ok(SharedRuntimeDependency {
+        metadata,
+        metadata_document: document,
+        library,
+        relative_library_path: Path::new(".doria-runtime")
+            .join(identity)
+            .join(shared_runtime_filename()),
+    })
+}
+
+fn shared_runtime_filename() -> &'static str {
+    if cfg!(windows) {
+        "doria_rt.dll"
+    } else if cfg!(target_os = "macos") {
+        "libdoria_rt.dylib"
+    } else {
+        "libdoria_rt.so"
+    }
 }
 
 /// What this compiler build requires of a runtime archive.
@@ -212,14 +399,31 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
         .expect("doriac must live under the workspace crates directory");
     let target_override = env::var_os("CARGO_TARGET_DIR");
     let explicit_override = env::var_os("DORIA_RT_PATH");
-    let embedded_runtime = embedded_runtime_candidate(profile, explicit_override.as_deref())?;
-    let compiler_runtime = embedded_runtime
-        .as_deref()
-        .or_else(|| compiler_built_runtime(profile));
+    let expectation = RuntimeExpectation::current(profile);
+    if let Some((path, document)) =
+        embedded_runtime_candidate(profile, explicit_override.as_deref())?
+    {
+        // Materialization proved these bytes are the embedded archive and
+        // that they match this document; only compatibility remains to check.
+        let metadata = parse_metadata(document).ok_or_else(|| {
+            invalid_metadata_error(
+                &path,
+                RuntimeOrigin::CompilerBundled,
+                "embedded identity metadata is malformed or incomplete",
+            )
+        })?;
+        return accept_checked(
+            path,
+            RuntimeOrigin::CompilerBundled,
+            &expectation,
+            Some(metadata),
+            false,
+        );
+    }
     resolve(
         explicit_override.as_deref(),
         &current_executable,
-        compiler_runtime,
+        compiler_built_runtime(profile),
         workspace,
         target_override.as_deref(),
         if cfg!(all(windows, target_env = "msvc")) {
@@ -228,21 +432,23 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
             ArchiveFormat::Gnu
         },
         profile_directory(profile),
-        &RuntimeExpectation::current(profile),
+        &expectation,
     )
 }
 
 fn embedded_runtime_candidate(
     profile: NativeProfile,
     explicit_override: Option<&OsStr>,
-) -> Result<Option<PathBuf>, BackendError> {
+) -> Result<Option<(PathBuf, &'static str)>, BackendError> {
     if explicit_override.is_some() {
         return Ok(None);
     }
     materialize_embedded_runtime(profile)
 }
 
-fn materialize_embedded_runtime(profile: NativeProfile) -> Result<Option<PathBuf>, BackendError> {
+fn materialize_embedded_runtime(
+    profile: NativeProfile,
+) -> Result<Option<(PathBuf, &'static str)>, BackendError> {
     let Some(runtimes) = EMBEDDED_RUNTIMES.get() else {
         return Ok(None);
     };
@@ -251,81 +457,141 @@ fn materialize_embedded_runtime(profile: NativeProfile) -> Result<Option<PathBuf
         NativeProfile::Release => runtimes.release,
     };
     let cache_root = env::temp_dir().join(EMBEDDED_RUNTIME_CACHE_DIRECTORY);
-    materialize_embedded_runtime_at(embedded, &cache_root).map(Some)
+    materialize_embedded_runtime_at(embedded, &cache_root)
+        .map(|path| Some((path, embedded.metadata)))
 }
 
 fn materialize_embedded_runtime_at(
     embedded: EmbeddedRuntimeProfile,
     cache_root: &Path,
 ) -> Result<PathBuf, BackendError> {
-    let metadata = parse_metadata(embedded.metadata).ok_or_else(|| {
-        BackendError::new("compiler-bundled doria-rt identity metadata is malformed or incomplete")
-    })?;
-    let actual_sha256 = sha256_hex(embedded.archive);
-    if metadata.bytes != embedded.archive.len() as u64 || metadata.sha256 != actual_sha256 {
-        return Err(BackendError::new(
-            "compiler-bundled doria-rt bytes do not match their embedded identity metadata",
-        ));
-    }
-
-    fs::create_dir_all(cache_root).map_err(|error| {
-        BackendError::new(format!(
-            "compiler-bundled doria-rt could not create its materialization directory: {error}"
-        ))
-    })?;
-    // The sidecar is part of the artifact identity. Two compiler revisions can
-    // legitimately produce identical archive bytes while recording different
-    // revision/profile facts, so key the cache by both inputs.
-    let cache_identity = sha256_hex(format!("{actual_sha256}\n{}", embedded.metadata).as_bytes());
-    let final_directory = cache_root.join(&cache_identity);
     let filename = runtime_filename(if cfg!(all(windows, target_env = "msvc")) {
         ArchiveFormat::Msvc
     } else {
         ArchiveFormat::Gnu
     });
+    materialize_runtime_asset(
+        embedded.archive,
+        embedded.metadata,
+        filename,
+        cache_root,
+        true,
+    )
+}
+
+/// The cache key of an archive whose SHA-256 is `digest`. Callers pass a
+/// digest they have verified, so the archive is hashed at most once.
+fn runtime_cache_identity(digest: &str, metadata: &str) -> String {
+    sha256_hex(format!("{digest}\n{metadata}").as_bytes())
+}
+
+fn materialize_runtime_asset(
+    bytes: &[u8],
+    document: &str,
+    filename: &str,
+    cache_root: &Path,
+    allow_private_copy: bool,
+) -> Result<PathBuf, BackendError> {
+    let metadata = parse_metadata(document).ok_or_else(|| {
+        BackendError::new("doria-rt identity metadata is malformed or incomplete")
+    })?;
+    if metadata.bytes != bytes.len() as u64 {
+        return Err(BackendError::new(
+            "doria-rt bytes do not match their identity metadata",
+        ));
+    }
+
+    fs::create_dir_all(cache_root).map_err(|error| {
+        BackendError::new(format!(
+            "doria-rt could not create its materialization directory: {error}"
+        ))
+    })?;
+    if !allow_private_copy && !is_regular_directory(cache_root) {
+        return Err(publication_conflict_error(cache_root));
+    }
+    // The sidecar is part of the artifact identity. Two compiler revisions can
+    // legitimately produce identical archive bytes while recording different
+    // revision/profile facts, so key the cache by both inputs.
+    // Entries are named by the identity the document claims and published
+    // only after their bytes were verified against it. An entry holding
+    // exactly these bytes and this document therefore proves the pair, so
+    // only a miss hashes the archive (24 MB for the debug runtime).
+    let cache_identity = runtime_cache_identity(&metadata.sha256, document);
+    let final_directory = cache_root.join(&cache_identity);
     let final_archive = final_directory.join(filename);
-    if materialized_runtime_matches(&final_archive, embedded.archive, embedded.metadata) {
+    if materialized_runtime_matches(&final_archive, bytes, document) {
         return Ok(final_archive);
+    }
+    if sha256_hex(bytes) != metadata.sha256 {
+        return Err(BackendError::new(
+            "doria-rt bytes do not match their identity metadata",
+        ));
+    }
+    if !allow_private_copy {
+        match fs::symlink_metadata(&final_directory) {
+            Ok(_) => return Err(publication_conflict_error(&final_directory)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(BackendError::new(format!(
+                    "could not inspect shared runtime destination {}: {error}",
+                    final_directory.display()
+                )));
+            }
+        }
     }
 
     let staging_directory = unique_materialization_directory(cache_root, &cache_identity);
     fs::create_dir(&staging_directory).map_err(|error| {
         BackendError::new(format!(
-            "compiler-bundled doria-rt could not create a private materialization directory: {error}"
+            "doria-rt could not create a private materialization directory: {error}"
         ))
     })?;
     let staging_archive = staging_directory.join(filename);
-    let write_result = fs::write(&staging_archive, embedded.archive)
-        .and_then(|()| fs::write(metadata_path(&staging_archive), embedded.metadata));
+    let write_result = fs::write(&staging_archive, bytes)
+        .and_then(|()| fs::write(metadata_path(&staging_archive), document));
     if let Err(error) = write_result {
         let _ = fs::remove_dir_all(&staging_directory);
         return Err(BackendError::new(format!(
-            "compiler-bundled doria-rt could not be materialized: {error}"
+            "doria-rt could not be materialized: {error}"
         )));
     }
 
     match fs::rename(&staging_directory, &final_directory) {
         Ok(()) => Ok(final_archive),
-        Err(_)
-            if materialized_runtime_matches(
-                &final_archive,
-                embedded.archive,
-                embedded.metadata,
-            ) =>
-        {
+        Err(_) if materialized_runtime_matches(&final_archive, bytes, document) => {
             let _ = fs::remove_dir_all(&staging_directory);
             Ok(final_archive)
         }
         // Never replace an unexpected existing cache entry. The private
         // staging directory already contains verified compiler-owned bytes and
         // is safe to use for this invocation.
-        Err(_) => Ok(staging_archive),
+        Err(_) if allow_private_copy => Ok(staging_archive),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_directory);
+            Err(BackendError::new(format!("could not publish verified shared runtime at {}: {error}; an existing incompatible companion is never replaced", final_directory.display())))
+        }
     }
 }
 
 fn materialized_runtime_matches(path: &Path, archive: &[u8], metadata: &str) -> bool {
-    fs::read(path).is_ok_and(|bytes| bytes == archive)
-        && fs::read_to_string(metadata_path(path)).is_ok_and(|contents| contents == metadata)
+    let sidecar = metadata_path(path);
+    path.parent().is_some_and(is_regular_directory)
+        && [path, sidecar.as_path()].into_iter().all(|path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+        && fs::read(path).is_ok_and(|bytes| bytes == archive)
+        && fs::read_to_string(sidecar).is_ok_and(|contents| contents == metadata)
+}
+
+fn is_regular_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn publication_conflict_error(path: &Path) -> BackendError {
+    BackendError::new(format!(
+        "could not publish verified shared runtime at {}; an existing incompatible companion is never replaced",
+        path.display()
+    ))
 }
 
 fn unique_materialization_directory(cache_root: &Path, digest: &str) -> PathBuf {
@@ -480,9 +746,30 @@ fn accept(
     expectation: &RuntimeExpectation,
     metadata: Option<RuntimeMetadata>,
 ) -> Result<RuntimeArtifact, BackendError> {
+    accept_checked(path, origin, expectation, metadata, true)
+}
+
+/// `verify_integrity` is false only for an archive whose bytes were already
+/// proven to match `metadata`, so the archive is not read and hashed again.
+fn accept_checked(
+    path: PathBuf,
+    origin: RuntimeOrigin,
+    expectation: &RuntimeExpectation,
+    metadata: Option<RuntimeMetadata>,
+    verify_integrity: bool,
+) -> Result<RuntimeArtifact, BackendError> {
     if let Some(metadata) = &metadata {
         let mut mismatches = incompatibility(metadata, expectation).unwrap_or_default();
-        mismatches.extend(archive_integrity_mismatches(&path, origin, metadata)?);
+        if metadata.artifact_kind != RuntimeArtifactKind::Static {
+            mismatches.push(Mismatch {
+                field: "artifact kind",
+                expected: "static".into(),
+                found: "shared".into(),
+            });
+        }
+        if verify_integrity {
+            mismatches.extend(archive_integrity_mismatches(&path, origin, metadata)?);
+        }
         if !mismatches.is_empty() {
             return Err(incompatible_runtime_error(&path, origin, &mismatches));
         }
@@ -546,8 +833,12 @@ fn archive_integrity_mismatches(
             &format!("failed to read archive bytes: {error}"),
         )
     })?;
+    Ok(integrity_mismatches(&archive, metadata))
+}
+
+fn integrity_mismatches(archive: &[u8], metadata: &RuntimeMetadata) -> Vec<Mismatch> {
     let actual_bytes = archive.len() as u64;
-    let actual_sha256 = sha256_hex(&archive);
+    let actual_sha256 = sha256_hex(archive);
     let mut mismatches = Vec::new();
     if metadata.bytes != actual_bytes {
         mismatches.push(Mismatch {
@@ -563,7 +854,7 @@ fn archive_integrity_mismatches(
             found: actual_sha256,
         });
     }
-    Ok(mismatches)
+    mismatches
 }
 
 #[derive(Debug, Clone)]
@@ -599,7 +890,7 @@ fn incompatible_runtime_error(
             "the runtime artifact disagrees with this compiler on: {summary}"
         ))
         .with_help(
-            "rebuild the compiler so it bundles a matching runtime, or set DORIA_RT_PATH to an archive built from this revision",
+            "rebuild the compiler so it bundles a matching runtime, or set DORIA_RT_PATH to a runtime artifact built from this revision",
         )])
 }
 
@@ -613,9 +904,9 @@ fn invalid_metadata_error(path: &Path, origin: RuntimeOrigin, detail: &str) -> B
         ),
         Span::default(),
     )
-    .with_note("runtime identity must be readable and complete before the archive is linked")
+    .with_note("runtime identity must be readable and complete before the artifact is used")
     .with_help(
-        "rebuild the compiler so it bundles a matching runtime, or replace the archive and its .doria-runtime.json sidecar together",
+        "rebuild the compiler so it bundles a matching runtime, or replace the runtime artifact and its .doria-runtime.json sidecar together",
     )])
 }
 
@@ -643,39 +934,8 @@ pub fn metadata_path(archive: &Path) -> PathBuf {
     archive.with_file_name(name)
 }
 
-/// Parse the flat sidecar document.
-///
-/// Deliberately minimal: the document is written by this repository's build
-/// script with a fixed shape, and a full JSON reader is not worth adding to the
-/// compiler for it. Anything unexpected yields `None`, which is treated as
-/// absent identity rather than as a compatible archive.
 fn parse_metadata(raw: &str) -> Option<RuntimeMetadata> {
-    let schema_version = field(raw, "schemaVersion")?.parse().ok()?;
-    let bytes = field(raw, "bytes")?.parse().ok()?;
-    Some(RuntimeMetadata {
-        schema_version,
-        abi_version: field(raw, "abiVersion")?,
-        runtime_revision: field(raw, "runtimeRevision")?,
-        target_triple: field(raw, "targetTriple")?,
-        profile: field(raw, "profile")?,
-        bytes,
-        sha256: field(raw, "sha256")?,
-    })
-}
-
-fn field(raw: &str, name: &str) -> Option<String> {
-    let key = format!("\"{name}\"");
-    let start = raw.find(&key)? + key.len();
-    let rest = raw.get(start..)?.trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    if let Some(quoted) = rest.strip_prefix('"') {
-        let end = quoted.find('"')?;
-        return Some(quoted[..end].to_string());
-    }
-    let end = rest
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(rest.len());
-    (end > 0).then(|| rest[..end].to_string())
+    serde_json::from_str(raw).ok()
 }
 
 fn runtime_filename(archive_format: ArchiveFormat) -> &'static str {
@@ -1087,6 +1347,55 @@ mod tests {
     }
 
     #[test]
+    fn materialization_hashes_on_a_miss_and_rejects_bytes_their_document_does_not_describe() {
+        let directory = temp_directory("embedded-integrity");
+        let document = |archive: &[u8], digest: String| -> &'static str {
+            Box::leak(
+                format!(
+                    "{{\n  \"schemaVersion\": 1,\n  \"abiVersion\": \"1\",\n  \"runtimeRevision\": \"cafebabe\",\n  \"targetTriple\": \"aarch64-apple-darwin\",\n  \"profile\": \"debug\",\n  \"featureSet\": [],\n  \"bytes\": {},\n  \"sha256\": \"{digest}\"\n}}\n",
+                    archive.len(),
+                )
+                .into_boxed_str(),
+            )
+        };
+        let genuine = b"embedded archive";
+        let metadata = document(genuine, sha256_hex(genuine));
+        let first = materialize_embedded_runtime_at(
+            EmbeddedRuntimeProfile {
+                archive: genuine,
+                metadata,
+            },
+            &directory,
+        )
+        .expect("verified bytes materialize");
+        // The same pair reuses the published entry.
+        let second = materialize_embedded_runtime_at(
+            EmbeddedRuntimeProfile {
+                archive: genuine,
+                metadata,
+            },
+            &directory,
+        )
+        .expect("a verified entry is reused");
+        assert_eq!(first, second);
+        // Same length, same claimed digest, different bytes: the entry does
+        // not hold these bytes, so the miss hashes them and rejects the pair.
+        let corrupted = b"embedded archivE";
+        let error = materialize_embedded_runtime_at(
+            EmbeddedRuntimeProfile {
+                archive: corrupted,
+                metadata,
+            },
+            &directory,
+        )
+        .expect_err("bytes that disagree with their document are rejected");
+        assert!(error
+            .message
+            .contains("do not match their identity metadata"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn explicit_override_skips_embedded_runtime_materialization() {
         assert_eq!(
             embedded_runtime_candidate(NativeProfile::Fast, Some(OsStr::new("runtime")))
@@ -1238,5 +1547,254 @@ mod tests {
         assert_eq!(parsed.sha256, "ff");
         assert_eq!(parsed.profile, "release");
         assert!(parse_metadata("not json").is_none());
+    }
+
+    fn shared_document(bytes: &[u8]) -> serde_json::Value {
+        let expected = expectation();
+        serde_json::json!({
+            "schemaVersion": 1,
+            "abiVersion": expected.abi_version,
+            "runtimeRevision": expected.revision,
+            "targetTriple": expected.target_triple,
+            "profile": expected.profile,
+            "artifactKind": "shared",
+            "featureSet": ["hosted-shared-runtime"],
+            "bytes": bytes.len(),
+            "sha256": sha256_hex(bytes),
+        })
+    }
+
+    fn shared_dependency(
+        bytes: &[u8],
+        document: &serde_json::Value,
+    ) -> Result<SharedRuntimeDependency, BackendError> {
+        verify_shared_runtime(
+            Path::new("fixture-library"),
+            RuntimeOrigin::ExplicitOverride,
+            bytes.to_vec(),
+            document.to_string(),
+            &expectation(),
+        )
+    }
+
+    #[test]
+    fn shared_runtime_checks_every_identity_and_integrity_field() {
+        let bytes = b"shared library fixture";
+        let document = shared_document(bytes);
+        assert!(shared_dependency(bytes, &document).is_ok());
+        for (field, wrong) in [
+            ("schemaVersion", serde_json::json!(2)),
+            ("abiVersion", serde_json::json!("999")),
+            ("runtimeRevision", serde_json::json!("other")),
+            ("targetTriple", serde_json::json!("other-target")),
+            ("profile", serde_json::json!("debug")),
+            ("artifactKind", serde_json::json!("static")),
+            (
+                "featureSet",
+                serde_json::json!(["standalone-windows-support"]),
+            ),
+            ("bytes", serde_json::json!(0)),
+            ("sha256", serde_json::json!("bad-digest")),
+        ] {
+            let mut changed = document.clone();
+            changed[field] = wrong;
+            let error = shared_dependency(bytes, &changed).expect_err(field);
+            assert_eq!(error.diagnostics.unwrap()[0].code, "B0003", "{field}");
+            let mut missing = document.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                shared_dependency(bytes, &missing).is_err(),
+                "missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn unidentified_shared_override_is_rejected() {
+        let directory = temp_directory("shared-unidentified");
+        let path = directory.join(shared_runtime_filename());
+        fs::write(&path, b"unidentified library").unwrap();
+        let error = read_shared_runtime(&path, RuntimeOrigin::ExplicitOverride).unwrap_err();
+        assert!(error.message.contains("identity sidecar unavailable"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn published_php_and_shared_runtime_are_relocatable_and_self_contained() {
+        let directory = temp_directory("shared-relocation");
+        let bytes = b"verified shared library";
+        let dependency = shared_dependency(bytes, &shared_document(bytes)).unwrap();
+        assert!(!dependency.relative_library_path().is_absolute());
+        let original = directory.join("original");
+        crate::backend::publish_output(
+            &original.join("main.php"),
+            crate::backend::BackendOutput::TextWithRuntime {
+                extension: "php".into(),
+                contents: "<?php // portable fixture".into(),
+                runtime: Box::new(dependency.clone()),
+            },
+        )
+        .unwrap();
+        let relocated = directory.join("relocated");
+        fs::rename(&original, &relocated).unwrap();
+        assert_eq!(
+            fs::read(relocated.join(dependency.relative_library_path())).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read_to_string(relocated.join(dependency.relative_metadata_path())).unwrap(),
+            dependency.metadata_json()
+        );
+        dependency.publish(&relocated).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incompatible_companion_is_not_overwritten_and_php_is_not_published() {
+        let directory = temp_directory("shared-conflict");
+        let bytes = b"verified shared library";
+        let dependency = shared_dependency(bytes, &shared_document(bytes)).unwrap();
+        dependency.publish(&directory).unwrap();
+        let path = directory.join(dependency.relative_library_path());
+        fs::write(&path, b"unrelated existing contents").unwrap();
+        let php = directory.join("main.php");
+        let error = crate::backend::publish_output(
+            &php,
+            crate::backend::BackendOutput::TextWithRuntime {
+                extension: "php".into(),
+                contents: "<?php // must not appear".into(),
+                runtime: Box::new(dependency),
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("never replaced"));
+        assert!(!php.exists());
+        assert_eq!(fs::read(path).unwrap(), b"unrelated existing contents");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shared_publication_preserves_existing_non_runtime_entries() {
+        for directory_entry in [false, true] {
+            let directory = temp_directory("shared-existing-entry");
+            let bytes = b"verified shared library";
+            let dependency = shared_dependency(bytes, &shared_document(bytes)).unwrap();
+            let destination = directory
+                .join(dependency.relative_library_path())
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            if directory_entry {
+                fs::create_dir(&destination).unwrap();
+            } else {
+                fs::write(&destination, b"existing file").unwrap();
+            }
+            assert!(dependency.publish(&directory).is_err());
+            if directory_entry {
+                assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+            } else {
+                assert_eq!(fs::read(&destination).unwrap(), b"existing file");
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_publication_does_not_reuse_symlinked_companions() {
+        use std::os::unix::fs::symlink;
+        for entry in ["root", "directory", "library", "metadata"] {
+            let directory = temp_directory("shared-symlink");
+            let output = directory.join("output");
+            let bytes = b"verified shared library";
+            let dependency = shared_dependency(bytes, &shared_document(bytes)).unwrap();
+            dependency.publish(&output).unwrap();
+            let library = output.join(dependency.relative_library_path());
+            let path = match entry {
+                "root" => output.join(".doria-runtime"),
+                "directory" => library.parent().unwrap().to_path_buf(),
+                "library" => library,
+                "metadata" => output.join(dependency.relative_metadata_path()),
+                _ => unreachable!(),
+            };
+            let external = directory.join("external");
+            fs::rename(&path, &external).unwrap();
+            symlink(&external, &path).unwrap();
+            assert!(dependency.publish(&output).is_err(), "symlinked {entry}");
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_publication_preserves_permissions_when_adding_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = temp_directory("executable-permissions");
+        let output = directory.join("main");
+        fs::write(&output, b"old executable").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o640)).unwrap();
+        crate::backend::publish_output(
+            &output,
+            crate::backend::BackendOutput::Executable {
+                extension: String::new(),
+                bytes: b"new executable".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_publication_replaces_the_file_a_symlink_names() {
+        // Outputs are renamed into place (decision log entry 50); a symlinked
+        // destination still receives the bytes in the file it points to.
+        use std::os::unix::fs::symlink;
+        let directory = temp_directory("symlinked-output");
+        let target = directory.join("real");
+        let link = directory.join("main");
+        fs::write(&target, b"old executable").unwrap();
+        symlink(&target, &link).unwrap();
+        crate::backend::publish_output(
+            &link,
+            crate::backend::BackendOutput::Executable {
+                extension: String::new(),
+                bytes: b"new executable".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"new executable");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pure_text_output_does_not_publish_a_runtime() {
+        let directory = temp_directory("pure-text");
+        let php = directory.join("pure.php");
+        crate::backend::publish_output(
+            &php,
+            crate::backend::BackendOutput::Text {
+                extension: "php".into(),
+                contents: "<?php echo 'pure';".into(),
+            },
+        )
+        .unwrap();
+        assert!(php.is_file());
+        assert!(!directory.join(".doria-runtime").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

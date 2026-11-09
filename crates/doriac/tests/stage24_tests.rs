@@ -1,5 +1,12 @@
 use doriac::ast::{ClassMember, Item};
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+#[path = "common/native_execution.rs"]
+mod native_execution;
+#[path = "common/php_execution.rs"]
+mod php_execution;
+
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage24.doria", source).expect_err("source should be rejected")
 }
@@ -131,6 +138,82 @@ function main(): void { let $value = first([]); }
                 .as_deref()
                 .is_some_and(|help| help.contains("typed declaration"))
     }));
+}
+
+#[test]
+fn expected_results_preserve_argument_inference_and_allow_ordinary_upcasts() {
+    let source = r#"
+interface Named { function getValue(): int; }
+class Entry implements Named { function getValue(): int { return 7; } }
+class Relay {
+    function pass<T>(T $value): T { return $value; }
+    static function passStatic<T>(take T $value): T { return $value; }
+}
+function identity<T>(T $value): T { return $value; }
+function owned<T>(take T $value): T { return $value; }
+function accept(Named $value): int { return $value->getValue(); }
+function main(): int {
+    let $entry = new Entry();
+    let $relay = new Relay();
+    Named $first = owned(new Entry());
+    ?Named $second = Relay::passStatic(new Entry());
+    return accept($relay->pass($entry)) + accept(identity($entry));
+}
+"#;
+    let program = doriac::lower_source_to_mir("generic-upcast.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(output.exit_status, 14);
+
+    let errors = diagnostics(&source.replace(
+        "Named $first = owned(new Entry());",
+        "List<Named> $first = owned([new Entry()]);",
+    ));
+    assert!(
+        errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("List<")),
+        "{errors:?}"
+    );
+    let errors = diagnostics(
+        r#"
+function pair<T>(T $first, T $second): T { return $first; }
+function main(): int { return pair(1, "different"); }
+"#,
+    );
+    assert!(
+        errors.iter().any(|diagnostic| diagnostic.code == "E0532"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn result_context_does_not_rebind_argument_inferred_outer_type_parameters() {
+    let source = r#"
+class Relay {
+    function pass<T>(T $value): T { return $value; }
+    static function passStatic<T>(T $value): T { return $value; }
+}
+function identity<T>(T $value): T { return $value; }
+function count<T>(List<T> $items): int { return $items->count; }
+function wrong(List<string> $items): int { return $items->count; }
+function relay<T>(List<T> $items): int {
+    let $relay = new Relay();
+    return count(identity($items)) + count($relay->pass($items)) + count(Relay::passStatic($items));
+}
+function main(): int { return relay([42]); }
+"#;
+    let program = doriac::lower_source_to_mir("generic-outer-context.doria", source).unwrap();
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(output.exit_status, 3);
+    assert!(doriac::check_source(
+        "wrong-context.doria",
+        source.replace(
+            "return count(identity($items))",
+            "return wrong(identity($items))"
+        )
+    )
+    .is_err());
 }
 
 #[test]
@@ -395,4 +478,83 @@ function main(): int { identity(true); return identity(42); }
     assert!(php.contains("$value): bool"));
     assert!(php.contains("$value): int"));
     assert!(!php.contains("(T $value)"));
+}
+#[test]
+fn inherited_generic_calls_keep_owner_arguments_out_of_method_inference() {
+    let source = r#"
+open class Parent<T> {
+    function first<U>(T $owner, U $value): T { return $owner; }
+    function second<U>(T $owner, U $value): U { return $value; }
+}
+class Child<U> extends Parent<U> {
+    function inspect(U $owner): U { return $this->first($owner, 7); }
+    function inspectSecond(U $owner): int { return $this->second($owner, 7); }
+}
+function main(): void {
+    let $value = new Child<string>();
+    echo $value->inspect("owner");
+    echo $value->inspectSecond("owner");
+}
+"#;
+    let mir = doriac::lower_source_to_mir("inherited-generic-identities.doria", source)
+        .unwrap_or_else(|findings| panic!("{findings:#?}"));
+    let output = doriac::mir_interpreter::interpret(&mir).unwrap();
+    assert_eq!(output.stdout, b"owner7");
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stderr, b"");
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, "owner7");
+    }
+    let php = doriac::compile_source_to_php("inherited-generic-identities.doria", source).unwrap();
+    let body = format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").unwrap()
+    );
+    let script = php_execution::Script::new(&body);
+    let output = script.command(&[]).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.stdout, b"owner7");
+}
+
+#[test]
+fn virtual_generic_overrides_keep_concrete_owner_families_and_body_dependencies() {
+    let source = r#"
+class Box<T> {}
+open class Base<T> {
+    open function inspect<U>(T $owner, U $value): int { return 1; }
+}
+class Child<V> extends Base<V> {
+    override function inspect<W>(V $owner, W $value): int {
+        let $box = new Box<W>();
+        return 2;
+    }
+}
+function inspectInt(Base<int> $source): int { return $source->inspect(1, 7); }
+function inspectString(Base<string> $source): int { return $source->inspect("source", true); }
+function main(): void {
+    echo inspectInt(new Child<int>());
+    echo inspectString(new Child<string>());
+}
+"#;
+    let mir = doriac::lower_source_to_mir("generic-virtual-owner-families.doria", source)
+        .unwrap_or_else(|findings| panic!("{findings:#?}"));
+    let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap();
+    assert_eq!(interpreted.exit_status, 0);
+    assert_eq!(interpreted.stderr, b"");
+    assert_eq!(interpreted.stdout, b"22");
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, "22");
+    }
+    let php =
+        doriac::compile_source_to_php("generic-virtual-owner-families.doria", source).unwrap();
+    let body = format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").unwrap()
+    );
+    let script = php_execution::Script::new(&body);
+    let output = script.command(&["-d", "ffi.enable=0"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.stdout, b"22");
 }

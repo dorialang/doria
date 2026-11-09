@@ -88,6 +88,46 @@ fn local_named<'a>(function: &'a Function, name: &str) -> (LocalId, &'a Local) {
         .unwrap_or_else(|| panic!("MIR should contain local `${name}`"))
 }
 
+fn string_snapshot(function: &Function, source: LocalId) -> LocalId {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| {
+            if let Statement::AssignLocal {
+                target,
+                value: Rvalue::String(StringExpression::Local(local)),
+            } = statement
+            {
+                if *local == source && function.locals[target.0].synthetic {
+                    assert_eq!(function.locals[target.0].ty, Type::String);
+                    return Some(*target);
+                }
+            }
+            None
+        })
+        .expect("concatenation snapshots its source before later operands execute")
+}
+
+// Operation-shape assertions are independent of the separately tested source sites.
+fn operational_statements(block: &BasicBlock) -> Vec<Statement> {
+    block
+        .statements
+        .iter()
+        .filter(|statement| !matches!(statement, Statement::SetDiagnosticSite { .. }))
+        .cloned()
+        .collect()
+}
+
+fn operational_program(mut program: Program) -> Program {
+    for function in &mut program.functions {
+        for block in &mut function.blocks {
+            block.statements = operational_statements(block);
+        }
+    }
+    program
+}
+
 fn checked_stdout_writes(function: &Function) -> Vec<&IoContents> {
     function
         .blocks
@@ -139,8 +179,11 @@ fn checked_string_results_have_statement_lifetime_cleanup() {
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
-    // Deliberately bypass semantic checking to exercise MIR's defensive checks.
-    let hir = doriac::lowering::lower_program_with_semantics(&ast, Default::default())
+    // Deliberately bypass semantic rejection to exercise MIR's defensive
+    // checks. The facts are still needed: monomorphization rejects HIR that
+    // has none (I2401) before MIR lowering would see the construct.
+    let analysis = doriac::semantics::analyze_program_for_ide(&ast);
+    let hir = doriac::lowering::lower_program_with_semantics(&ast, analysis.info)
         .expect("AST without interface declarations should lower structurally");
     doriac::mir_lowering::lower_program(&hir)
         .expect_err("HIR should be outside native compilation coverage")
@@ -200,6 +243,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -275,7 +319,7 @@ fn lowers_main_int_return_42() {
     assert_eq!(function.blocks[0].terminator, int_return(int_constant(42)));
     assert_eq!(
         program.to_string(),
-        "function main(): int {\nblock0:\n    return 42: int\n}\n"
+        "function main(): int {\nblock0:\n    diagnostic_site 0:27..37\n    return 42: int\n}\n"
     );
 }
 
@@ -291,7 +335,7 @@ fn lowers_return_add_42_to_mir_arithmetic() {
 
     let function = &program.functions[0];
     assert!(function.locals.is_empty());
-    assert!(function.blocks[0].statements.is_empty());
+    assert!(operational_statements(&function.blocks[0]).is_empty());
     assert_eq!(
         function.blocks[0].terminator,
         Terminator::Return(Rvalue::Value(ValueExpression::Integer(
@@ -307,7 +351,7 @@ fn lowers_return_add_42_to_mir_arithmetic() {
     );
     assert_eq!(
         program.to_string(),
-        "function main(): int {\nblock0:\n    return (40: int + 2: int): int\n}\n"
+        "function main(): int {\nblock0:\n    diagnostic_site 0:27..41\n    return (40: int + 2: int): int\n}\n"
     );
 }
 
@@ -329,7 +373,7 @@ fn lowers_readonly_int_local_to_slot_assignment() {
     assert!(!function.locals[0].writable);
     assert!(!function.locals[0].synthetic);
     assert_eq!(
-        function.blocks[0].statements,
+        operational_statements(&function.blocks[0]),
         vec![Statement::AssignLocal {
             target: LocalId(0),
             value: int_rvalue(40),
@@ -378,7 +422,7 @@ fn lowers_writable_int_local_to_writable_slot_assignment() {
     assert!(function.locals[0].writable);
     assert!(!function.locals[0].synthetic);
     assert_eq!(
-        function.blocks[0].statements,
+        operational_statements(&function.blocks[0]),
         vec![Statement::AssignLocal {
             target: LocalId(0),
             value: int_rvalue(40),
@@ -420,7 +464,7 @@ fn lowers_plain_assignment_to_local_assignment() {
     );
 
     assert_eq!(
-        program.functions[0].blocks[0].statements,
+        operational_statements(&program.functions[0].blocks[0]),
         vec![
             Statement::AssignLocal {
                 target: LocalId(0),
@@ -449,18 +493,24 @@ fn lowers_add_assign_to_read_add_write() {
     );
 
     assert_eq!(
-        program.functions[0].blocks[0].statements[1],
-        Statement::AssignLocal {
-            target: LocalId(0),
-            value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
-                span: Default::default(),
-                right_span: Default::default(),
-                ty: DEFAULT_INT,
-                op: IntegerBinaryOp::Add,
-                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
-                right: Box::new(integer_expression(int_operand(2))),
-            })),
-        }
+        operational_statements(&program.functions[0].blocks[0])[1..],
+        [
+            Statement::AssignLocal {
+                target: LocalId(1),
+                value: Rvalue::Value(int_expression_value(local_integer_expression(LocalId(0)))),
+            },
+            Statement::AssignLocal {
+                target: LocalId(0),
+                value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                    span: Default::default(),
+                    right_span: Default::default(),
+                    ty: DEFAULT_INT,
+                    op: IntegerBinaryOp::Add,
+                    left: Box::new(integer_expression(Operand::Local(LocalId(1)))),
+                    right: Box::new(integer_expression(int_operand(2))),
+                })),
+            },
+        ]
     );
 }
 
@@ -479,18 +529,24 @@ fn lowers_sub_assign_to_read_subtract_write() {
     );
 
     assert_eq!(
-        program.functions[0].blocks[0].statements[1],
-        Statement::AssignLocal {
-            target: LocalId(0),
-            value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
-                span: Default::default(),
-                right_span: Default::default(),
-                ty: DEFAULT_INT,
-                op: IntegerBinaryOp::Subtract,
-                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
-                right: Box::new(integer_expression(int_operand(1))),
-            })),
-        }
+        operational_statements(&program.functions[0].blocks[0])[1..],
+        [
+            Statement::AssignLocal {
+                target: LocalId(1),
+                value: Rvalue::Value(int_expression_value(local_integer_expression(LocalId(0)))),
+            },
+            Statement::AssignLocal {
+                target: LocalId(0),
+                value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                    span: Default::default(),
+                    right_span: Default::default(),
+                    ty: DEFAULT_INT,
+                    op: IntegerBinaryOp::Subtract,
+                    left: Box::new(integer_expression(Operand::Local(LocalId(1)))),
+                    right: Box::new(integer_expression(int_operand(1))),
+                })),
+            },
+        ]
     );
 }
 
@@ -521,7 +577,7 @@ fn lowers_post_and_pre_increment_equivalently() {
 
     assert_eq!(post, pre);
     assert_eq!(
-        post.functions[0].blocks[0].statements[1],
+        operational_statements(&post.functions[0].blocks[0])[1],
         Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
@@ -563,7 +619,7 @@ fn lowers_post_and_pre_decrement_equivalently() {
 
     assert_eq!(post, pre);
     assert_eq!(
-        post.functions[0].blocks[0].statements[1],
+        operational_statements(&post.functions[0].blocks[0])[1],
         Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
@@ -899,6 +955,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -1270,7 +1327,7 @@ fn lowers_echo_and_assignment_inside_if_branches() {
         "../../../examples/debug/main_if_assignment_42.doria"
     ));
     assert_eq!(
-        assignment.functions[0].blocks[1].statements,
+        operational_statements(&assignment.functions[0].blocks[1]),
         vec![Statement::AssignLocal {
             target: LocalId(0),
             value: int_rvalue(42),
@@ -1323,7 +1380,10 @@ fn lowers_word_and_symbol_condition_operators_equivalently() {
             )
         };
 
-        assert_eq!(lower(&word_source), lower(&symbol_source));
+        assert_eq!(
+            operational_program(lower(&word_source)),
+            operational_program(lower(&symbol_source))
+        );
     }
 
     let xor = lower(
@@ -1582,6 +1642,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -1699,7 +1760,7 @@ fn lowers_assignment_and_echo_inside_while() {
         "../../../examples/debug/main_while_count_42.doria"
     ));
     assert_eq!(
-        count.functions[0].blocks[2].statements,
+        operational_statements(&count.functions[0].blocks[2]),
         vec![Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
@@ -2116,7 +2177,7 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
 
     assert_eq!(blocks.len(), 5);
     assert_eq!(
-        blocks[0].statements,
+        operational_statements(&blocks[0]),
         vec![
             Statement::AssignLocal {
                 target: LocalId(0),
@@ -2142,22 +2203,28 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         }
     );
     assert_eq!(
-        blocks[2].statements,
-        vec![Statement::AssignLocal {
-            target: LocalId(0),
-            value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
-                span: Default::default(),
-                right_span: Default::default(),
-                ty: DEFAULT_INT,
-                op: IntegerBinaryOp::Add,
-                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
-                right: Box::new(integer_expression(int_operand(1))),
-            })),
-        }]
+        operational_statements(&blocks[2]),
+        vec![
+            Statement::AssignLocal {
+                target: LocalId(2),
+                value: Rvalue::Value(int_expression_value(local_integer_expression(LocalId(0)))),
+            },
+            Statement::AssignLocal {
+                target: LocalId(0),
+                value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                    span: Default::default(),
+                    right_span: Default::default(),
+                    ty: DEFAULT_INT,
+                    op: IntegerBinaryOp::Add,
+                    left: Box::new(integer_expression(Operand::Local(LocalId(2)))),
+                    right: Box::new(integer_expression(int_operand(1))),
+                })),
+            },
+        ]
     );
     assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
     assert_eq!(
-        blocks[3].statements,
+        operational_statements(&blocks[3]),
         vec![Statement::AssignLocal {
             target: LocalId(1),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
@@ -2730,6 +2797,7 @@ fn stage_11f_lowers_int_calls_in_returns_and_arithmetic() {
         main.blocks[0].terminator,
         Terminator::Return(Rvalue::Value(ValueExpression::Integer(
             IntegerExpression::Call {
+                span: main.source_span,
                 ty: DEFAULT_INT,
                 function: FunctionId(0),
                 args: vec![
@@ -2768,6 +2836,7 @@ fn stage_11f_lowers_int_calls_in_comparisons() {
             condition: Condition::Compare {
                 op: CompareOp::Equal,
                 left: Box::new(ValueExpression::Integer(IntegerExpression::Call {
+                    span: main.source_span,
                     ty: DEFAULT_INT,
                     function: FunctionId(0),
                     args: Vec::new(),
@@ -3006,6 +3075,93 @@ function main(): int
 }
 
 #[test]
+fn cleanup_after_a_structured_exit_uses_the_whole_authored_statement() {
+    for statement in ["return produce();", "throw new Failure(\"retry\");"] {
+        let source = format!(
+            "class Failure implements Error {{ function __construct(string $message) {{}} }}\n\
+             class Marker {{ function __destruct() {{ panic(\"cleanup\"); }} }}\n\
+             function produce(): int {{ return 7; }}\n\
+             function attempt(): int throws Failure {{ let $marker = new Marker(); {statement} }}\n\
+             function main(): void throws Failure {{ let $result = attempt(); }}"
+        );
+        let program = doriac::lower_source_to_mir("exit-site.doria", &source).unwrap();
+        let output = doriac::mir_interpreter::interpret(&program).unwrap();
+        let diagnostic = output.runtime_diagnostic.unwrap();
+        let caller = diagnostic
+            .runtime_outcome
+            .as_ref()
+            .unwrap()
+            .path
+            .iter()
+            .find(|frame| frame.function == "attempt")
+            .unwrap();
+        let start = source.find(statement).unwrap();
+        assert_eq!(
+            caller.span,
+            doriac::source::Span::new(start, start + statement.len()),
+            "{statement}"
+        );
+        assert_eq!(output.exit_status, 101);
+    }
+}
+
+#[test]
+fn authored_call_sites_survive_argument_evaluation_across_return_carriers() {
+    for ty in [
+        "int",
+        "float",
+        "bool",
+        "string",
+        "?int",
+        "?float",
+        "?bool",
+        "?string",
+        "mixed",
+        "?mixed",
+        "Token",
+        "?Token",
+        "List<int>",
+        "?List<int>",
+        "function(): int",
+        "?function(): int",
+        "Doria\\Std\\Time\\Duration",
+        "Doria\\Std\\Time\\Deadline",
+        "State",
+        "Packet",
+        "?Packet",
+        "ByteRegion",
+        "WritableByteRegion",
+        "?ByteRegion",
+        "?WritableByteRegion",
+    ] {
+        let source = format!(
+            "use Doria\\Std\\Io\\{{ByteRegion, WritableByteRegion}};\n\
+             class Token {{}}\nenum State {{ case Ready; }}\nenum Packet {{ case Value(int $value); }}\n\
+             function argument(): int {{ return 7; }}\n\
+             function fail(int $value): {ty} {{ panic(\"carrier\"); }}\n\
+             function main(): void {{ let $result = fail(argument()); }}"
+        );
+        let program = doriac::lower_source_to_mir("call-carrier.doria", &source)
+            .unwrap_or_else(|errors| panic!("{ty}\n{errors:#?}"));
+        let output = doriac::mir_interpreter::interpret(&program).unwrap();
+        let diagnostic = output.runtime_diagnostic.unwrap();
+        let outcome = diagnostic.runtime_outcome.as_ref().unwrap();
+        let caller = outcome
+            .path
+            .iter()
+            .find(|frame| frame.function == "main")
+            .unwrap();
+        let start = source.find("fail(argument())").unwrap();
+        assert_eq!(
+            caller.span,
+            doriac::source::Span::new(start, start + "fail(argument())".len()),
+            "{ty}"
+        );
+        assert_eq!(output.exit_status, 101, "{ty}");
+    }
+}
+
+#[test]
 fn stage_11f_helper_ints_are_not_process_status_bounded() {
     let output = interpret(include_str!(
         "../../../examples/debug/main_function_big_int_helper.doria"
@@ -3083,6 +3239,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -3106,6 +3263,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 statements: vec![Statement::AssignLocal {
                     target: LocalId(0),
                     value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Call {
+                        span: Default::default(),
                         ty: DEFAULT_INT,
                         function: FunctionId(0),
                         args: Vec::new(),
@@ -3172,12 +3330,23 @@ fn stage_11g_lowers_explicit_string_locals_and_local_concat_in_source_order() {
     let (hello, _) = local_named(main, "hello");
     let (name, _) = local_named(main, "name");
     let (bang, _) = local_named(main, "bang");
+    let snapshots = [hello, name, bang].map(|source| string_snapshot(main, source));
+    let ordered = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            Statement::AssignLocal { target, .. } if snapshots.contains(target) => Some(*target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ordered, snapshots);
     assert_eq!(
         checked_stdout_writes(main),
         vec![&IoContents::String(StringExpression::Concat(vec![
-            StringExpression::Local(hello),
-            StringExpression::Local(name),
-            StringExpression::Local(bang),
+            StringExpression::Local(snapshots[0]),
+            StringExpression::Local(snapshots[1]),
+            StringExpression::Local(snapshots[2]),
         ]))]
     );
 }
@@ -3192,11 +3361,12 @@ fn stage_11g_lowers_string_concat_inside_void_helpers() {
     assert_eq!(helper.name, "hello");
     let (name, local) = local_named(helper, "name");
     assert_eq!(local.ty, Type::String);
+    let snapshot = string_snapshot(helper, name);
     assert_eq!(
         checked_stdout_writes(helper),
         vec![&IoContents::String(StringExpression::Concat(vec![
             StringExpression::Literal("Hello ".to_string()),
-            StringExpression::Local(name),
+            StringExpression::Local(snapshot),
             StringExpression::Literal("!".to_string()),
         ]))]
     );
@@ -3494,7 +3664,18 @@ fn stage_18_expression_interpolation_reuses_ordered_display_mir() {
     let first = lower(source);
     let second = lower(source);
     assert_eq!(first.to_string(), second.to_string());
-    assert!(first.to_string().contains("Display("));
+    assert!(first
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.statements)
+        .any(|statement| matches!(
+            statement,
+            Statement::AssignLocal {
+                value: Rvalue::String(StringExpression::Display(_)),
+                ..
+            }
+        )));
 
     let output = doriac::mir_interpreter::interpret(&first).expect("MIR should interpret");
     assert_eq!(output.exit_status, 0);

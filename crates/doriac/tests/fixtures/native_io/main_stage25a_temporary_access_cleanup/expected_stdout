@@ -3,3 +3,5 @@ direct 3
 nullable 4
 list 6
 box 1:2
+nullable box 2:3
+shared factory 1 -1

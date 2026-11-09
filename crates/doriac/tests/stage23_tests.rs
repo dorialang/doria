@@ -421,17 +421,21 @@ function main(): void throws Doria\Std\Io\IoError
 
 #[test]
 fn bytes_rejects_implicit_conversion_readonly_writes_and_unauthored_methods() {
-    let wrong_source = diagnostic(
-        r#"
+    let source = r#"
 function main(): void
 {
     int[] $values = [1];
     Bytes $bytes = Bytes::fromArray($values);
 }
-"#,
-        "E0403",
+"#;
+    let wrong_source = diagnostic(source, "E0408");
+    assert_eq!(
+        wrong_source.message,
+        "argument 1 of Bytes::fromArray expects `uint8[]`, got `int[]`"
     );
-    assert!(wrong_source.message.contains("uint8[]"));
+    let argument_start = source.rfind("$values").unwrap();
+    assert_eq!(wrong_source.span.start, argument_start);
+    assert_eq!(wrong_source.span.end, argument_start + "$values".len());
 
     let readonly_write = diagnostic(
         r#"

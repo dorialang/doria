@@ -12,13 +12,21 @@ use crate::types::ResolvedType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub usize);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum CollectionKey {
+    Integer(i128),
+    String(String),
+    Bool(bool),
+    Enum(crate::enums::EnumValue),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     Expression(Span),
     Binding(BindingId),
     EnumPayload {
         scrutinee: Span,
-        case: crate::enums::EnumCaseId,
+        case: crate::enums::EnumCaseSource,
         field: usize,
     },
     CallbackReturn {
@@ -135,6 +143,7 @@ pub enum Slot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     values: HashSet<ValueId>,
+    borrows: Vec<super::ActiveBorrow>,
     depth: usize,
 }
 
@@ -169,8 +178,62 @@ impl State {
         if values.is_empty() {
             self.slots.remove(&slot);
         } else {
-            self.slots.insert(slot, Entry { values, depth });
+            self.slots.insert(
+                slot,
+                Entry {
+                    values,
+                    borrows: Vec::new(),
+                    depth,
+                },
+            );
         }
+    }
+
+    pub(super) fn put_borrows(
+        &mut self,
+        slot: Slot,
+        borrows: Vec<super::ActiveBorrow>,
+        depth: usize,
+    ) {
+        if borrows.is_empty() {
+            return;
+        }
+        self.slots
+            .entry(slot)
+            .or_insert_with(|| Entry {
+                values: HashSet::new(),
+                borrows: Vec::new(),
+                depth,
+            })
+            .borrows = borrows;
+    }
+
+    pub(super) fn take_borrows(&mut self, slot: &Slot) -> Vec<super::ActiveBorrow> {
+        self.slots
+            .get_mut(slot)
+            .map(|entry| std::mem::take(&mut entry.borrows))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn borrows(&self) -> Vec<super::ActiveBorrow> {
+        let mut borrows = self
+            .slots
+            .values()
+            .flat_map(|entry| entry.borrows.iter().cloned())
+            .collect::<Vec<_>>();
+        borrows.sort_by_key(|borrow| borrow.span);
+        borrows
+    }
+
+    fn borrows_outliving_depth(&self, depth: usize) -> Vec<super::ActiveBorrow> {
+        let mut borrows = self
+            .slots
+            .values()
+            .filter(|entry| entry.depth < depth)
+            .flat_map(|entry| entry.borrows.iter().cloned())
+            .collect::<Vec<_>>();
+        borrows.sort_by_key(|borrow| borrow.span);
+        borrows
     }
 
     pub fn merge_from(&mut self, left: &Self, right: &Self) {
@@ -180,6 +243,11 @@ impl State {
                 .entry(*slot)
                 .and_modify(|entry| {
                     entry.values.extend(&incoming.values);
+                    for borrow in &incoming.borrows {
+                        if !entry.borrows.contains(borrow) {
+                            entry.borrows.push(borrow.clone());
+                        }
+                    }
                     entry.depth = entry.depth.min(incoming.depth);
                 })
                 .or_insert_with(|| incoming.clone());
@@ -417,6 +485,15 @@ impl super::Checker<'_> {
         scopes: &mut super::Scopes,
         site: Span,
     ) {
+        let borrows = expression
+            .map(|expression| {
+                self.pending_result_borrows(
+                    expression,
+                    self.current_return_borrow.unwrap_or(super::UseMode::Give),
+                    scopes,
+                )
+            })
+            .unwrap_or_default();
         let values = expression
             .map(|expression| self.cleanup_take_expr(expression, scopes))
             .unwrap_or_default();
@@ -425,6 +502,7 @@ impl super::Checker<'_> {
         let previous_error = scopes.1.take_pending_errors();
         self.cleanup_release(site, previous_error, Cause::SupersededReturn);
         scopes.1.put(Slot::PendingReturn(site), values, 0);
+        scopes.1.put_borrows(Slot::PendingReturn(site), borrows, 0);
     }
 
     pub(super) fn cleanup_superseded_control_exit(&mut self, flow: &mut super::Flow, site: Span) {
@@ -443,8 +521,48 @@ impl super::Checker<'_> {
         let Some((region, depth)) = self.cleanup_yield_regions.last().copied() else {
             return;
         };
+        let mode = *self.when_result_modes.last().expect("when result mode");
+        let borrows = self.pending_result_borrows(expression, mode, scopes);
         let values = self.cleanup_take_expr(expression, scopes);
         scopes.1.put(Slot::PendingYield(region), values, depth);
+        scopes
+            .1
+            .put_borrows(Slot::PendingYield(region), borrows, depth);
+    }
+
+    fn pending_result_borrows(
+        &self,
+        expression: &crate::ast::Expr,
+        mode: super::UseMode,
+        scopes: &mut super::Scopes,
+    ) -> Vec<super::ActiveBorrow> {
+        let mut borrows = scopes.1.take_borrows(&Slot::Temporary(expression.span()));
+        if mode != super::UseMode::Give && self.expr_is_move_value(expression, scopes) {
+            borrows.extend(
+                self.borrow_root_keys(expression, scopes)
+                    .into_iter()
+                    .map(|root| super::ActiveBorrow {
+                        root,
+                        mode,
+                        span: expression.span(),
+                    }),
+            );
+        }
+        if let Some(value) = self.retained_value_from_expr(expression, scopes) {
+            for loan in value.leases {
+                for (root, access) in loan.places() {
+                    borrows.push(super::ActiveBorrow {
+                        root: root.clone(),
+                        mode: match access {
+                            super::BorrowAccess::Readonly => super::UseMode::Read,
+                            super::BorrowAccess::Writable => super::UseMode::Write,
+                        },
+                        span: loan.capture_span,
+                    });
+                }
+            }
+        }
+        borrows
     }
 
     pub(super) fn cleanup_pop_scope(
@@ -453,6 +571,28 @@ impl super::Checker<'_> {
         site: Span,
         cause: Cause,
     ) {
+        let pending = scopes.1.borrows_outliving_depth(scopes.lexical_depth());
+        if let Some(scope) = scopes.0.last() {
+            for (name, binding) in scope {
+                let Some(binding) = binding else {
+                    continue;
+                };
+                let Some(id) = binding.canonical_id else {
+                    continue;
+                };
+                if scopes.1.values(&Slot::Binding(id)).is_empty() {
+                    continue;
+                }
+                let root = super::binding_identity_key(binding.id, name);
+                if let Some(borrow) = pending.iter().find(|borrow| borrow.root.owner == root) {
+                    self.diagnostics.push(crate::diagnostics::Diagnostic::new(
+                        "E0478",
+                        format!("borrowed result outlives its owner `${name}`"),
+                        borrow.span,
+                    ).with_help("keep the borrowed owner outside the result-producing scope, or return an independently owned value"));
+                }
+            }
+        }
         let values = scopes.1.drain_from_depth(scopes.lexical_depth());
         self.cleanup_release(site, values, cause);
         scopes.pop();

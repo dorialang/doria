@@ -48,6 +48,10 @@ pub(super) fn validate(program: &mir::Program) -> Result<(), BackendError> {
                         let carries = state.contains(error);
                         assign(&mut state, *target, carries);
                     }
+                    mir::Statement::TakeProperty { target, object, .. } => {
+                        let carries = state.contains(object);
+                        assign(&mut state, *target, carries);
+                    }
                     mir::Statement::AssignProperty { .. }
                     | mir::Statement::AssignStatic { .. }
                     | mir::Statement::CollectionAdd { .. }
@@ -55,12 +59,12 @@ pub(super) fn validate(program: &mir::Program) -> Result<(), BackendError> {
                     | mir::Statement::AssignCollectionIndex { .. }
                         if contains(program, &accesses, &state) =>
                     {
-                        return Err(escape())
+                        return Err(escape());
                     }
                     _ if !accesses.collection_mutations.is_empty()
                         && contains(program, &accesses, &state) =>
                     {
-                        return Err(escape())
+                        return Err(escape());
                     }
                     _ => {}
                 }
@@ -69,10 +73,10 @@ pub(super) fn validate(program: &mir::Program) -> Result<(), BackendError> {
             validate_calls(program, &accesses, &state)?;
             match &block.terminator {
                 mir::Terminator::Return(value) if carries(program, value, &state) => {
-                    return Err(escape())
+                    return Err(escape());
                 }
                 mir::Terminator::PropagateError { error } if state.contains(error) => {
-                    return Err(escape())
+                    return Err(escape());
                 }
                 mir::Terminator::CheckedCall {
                     function: callee,

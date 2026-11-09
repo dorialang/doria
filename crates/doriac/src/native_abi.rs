@@ -2,10 +2,88 @@
 
 use crate::mir;
 
+pub(crate) fn call_return_type(
+    function: &mir::Function,
+    virtual_dispatch: bool,
+) -> mir::ReturnType {
+    if virtual_dispatch {
+        function
+            .method
+            .as_ref()
+            .and_then(|method| method.virtual_family.as_ref())
+            .expect("validated virtual call has a canonical family")
+            .return_type
+    } else {
+        function.return_type
+    }
+}
+
+pub(crate) fn call_result_uses_same_carrier(
+    physical: mir::ReturnType,
+    logical: mir::ReturnType,
+) -> bool {
+    if physical == logical {
+        return true;
+    }
+    let (mir::ReturnType::Value(source), mir::ReturnType::Value(target)) = (physical, logical)
+    else {
+        return false;
+    };
+    nullable_payload_type(source) == Some(target)
+        && matches!(
+            source,
+            mir::Type::NullableClass(_)
+                | mir::Type::NullableInterface(_)
+                | mir::Type::NullableCollection(_)
+                | mir::Type::NullableMixed
+                | mir::Type::NullableFunction(_)
+                | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
+        )
+}
+
+/// Multi-word collection values use the shared aggregate slot ABI in both
+/// native backends, including inline descriptors that do not own their bytes.
+pub fn collection_uses_aggregate_storage(program: &mir::Program, ty: mir::Type) -> bool {
+    ty.shared_interface().is_some()
+        || matches!(ty, mir::Type::Scalar(mir::ScalarType::Inline(ty)) if ty.storage_bytes() > 8)
+        || matches!(ty, mir::Type::NullableScalar(mir::ScalarType::Inline(_)))
+        || matches!(
+            ty,
+            mir::Type::Interface(_)
+                | mir::Type::NullableInterface(_)
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
+                | mir::Type::ByteRegion(_)
+                | mir::Type::NullableByteRegion(_)
+        )
+        || match ty {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => program
+                .classes
+                .get(class.0)
+                .is_some_and(|class| class.is_open),
+            _ => false,
+        }
+}
+
 pub const ASSERTION_ERROR_DESCRIPTOR_MAGIC: u64 = 0xA557_0004;
-pub const INTERFACE_VTABLE_HEADER_WORDS: usize = 10;
+pub const IO_ERROR_PROGRESS_DESCRIPTOR_MAGIC: u64 = 0x10E0_0005;
+pub const INTERFACE_VTABLE_HEADER_WORDS: usize = 12;
 pub const INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD: u32 = 8;
+pub const INTERFACE_VTABLE_IO_TRANSFERRED_COUNT_WORD: u32 = 10;
+pub const INTERFACE_VTABLE_IO_PROGRESS_MAGIC_WORD: u32 = 11;
 pub const CLASS_DESCRIPTOR_INTERFACE_WORD: u32 = 5;
+
+/// Target C layout for the runtime's three independent I/O status records and
+/// four byte-sized control flags. Both emitters use the same scratch contract.
+pub(crate) fn transfer_control_size(pointer_bytes: u32) -> u32 {
+    let status = (16 + pointer_bytes + 3).next_multiple_of(8);
+    (3 * status + 4).next_multiple_of(8)
+}
 
 pub const STRING_FROM_UTF8: &str = "dr_v1_string_from_utf8";
 pub const PROCESS_EXIT: &str = "dr_v1_exit_process";
@@ -65,11 +143,21 @@ pub const READ_FILE: &str = "dr_v2_read_file";
 pub const WRITE_FILE: &str = "dr_v2_write_file";
 pub const APPEND_FILE: &str = "dr_v2_append_file";
 pub const BYTES_COPY: &str = "dr_v1_bytes_copy";
+pub const BYTES_ALLOCATE: &str = "dr_v2_bytes_allocate";
 pub const BYTES_FREE: &str = "dr_v1_bytes_free";
 pub const BYTES_LENGTH: &str = "dr_v1_bytes_length";
 pub const BYTES_DATA: &str = "dr_v1_bytes_data";
 pub const BYTES_GET: &str = "dr_v2_bytes_get";
 pub const BYTES_SET: &str = "dr_v2_bytes_set";
+pub const BYTES_REGION: &str = "dr_v2_bytes_region";
+pub const BYTE_REGION_SUBREGION: &str = "dr_v2_byte_region_subregion";
+pub const BYTE_REGION_GET: &str = "dr_v2_byte_region_get";
+pub const BYTE_REGION_SET: &str = "dr_v2_byte_region_set";
+pub const BYTE_REGION_COPY: &str = "dr_v1_byte_region_copy";
+pub const BYTE_REGION_COPY_WITHIN: &str = "dr_v1_byte_region_copy_within";
+/// Decision 0110 child processes: one checked transport for every `Child`
+/// intrinsic (operation tag, child payload, operand words, checked outputs).
+pub const CHECKED_PROCESS: &str = "dr_v1_checked_process";
 pub const BYTES_EQUAL: &str = "dr_v1_bytes_equal";
 pub const BYTES_FROM_COLLECTION: &str = "dr_v1_bytes_from_collection";
 pub const BYTES_TO_COLLECTION: &str = "dr_v1_bytes_to_collection";
@@ -79,7 +167,41 @@ pub const APPEND_FILE_BYTES: &str = "dr_v2_append_file_bytes";
 pub const READ_STDIN_BYTES: &str = "dr_v2_read_stdin_bytes";
 pub const WRITE_STDOUT_BYTES: &str = "dr_v2_write_stdout_bytes";
 pub const WRITE_STDERR_BYTES: &str = "dr_v2_write_stderr_bytes";
-pub const CHECKED_IO: &str = "dr_v3_checked_io";
+pub const CHECKED_IO: &str = "dr_v4_checked_io";
+pub const CHECKED_STANDARD_STREAM_IO: &str = "dr_v1_checked_standard_stream_io";
+pub const FILE_READINESS_SOURCE: &str = "dr_v1_file_object_readiness_source";
+pub const FILE_READINESS_SOURCE_HOME: &str = "dr_v1_file_object_readiness_source_home";
+pub const STANDARD_READINESS_SOURCE: &str = "dr_v1_standard_stream_readiness_source";
+pub const STANDARD_READINESS_SOURCE_HOME: &str = "dr_v1_standard_stream_readiness_source_home";
+pub const PENDING_REQUEST_CONFIGURE_FILE: &str = "dr_v1_checked_pending_request_configure_file";
+pub const PENDING_REQUEST_CONFIGURE_STANDARD: &str =
+    "dr_v1_checked_pending_request_configure_standard";
+pub const PENDING_REQUEST_COMPLETE: &str = "dr_v1_pending_request_complete";
+pub const CHECKED_PENDING_REQUEST_OUTCOME: &str = "dr_v1_checked_pending_request_outcome";
+pub const DEADLINE_FROM_NOW: &str = "dr_v1_deadline_from_now";
+pub const CANCELLATION_NEW: &str = "dr_v2_cancellation_new";
+pub const CANCELLATION_RETAIN: &str = "dr_v2_cancellation_retain";
+pub const CANCELLATION_RELEASE: &str = "dr_v1_cancellation_release";
+pub const CANCELLATION_IS_REQUESTED: &str = "dr_v1_cancellation_is_requested";
+pub const CHECKED_CANCELLATION_REQUEST: &str = "dr_v2_checked_cancellation_request";
+
+pub const fn inline_copy_retain_symbol(
+    ty: crate::inline_value::InlineValueType,
+) -> Option<&'static str> {
+    match ty.lifecycle() {
+        crate::inline_value::InlineValueLifecycle::Trivial => None,
+        crate::inline_value::InlineValueLifecycle::SharedCancellation => Some(CANCELLATION_RETAIN),
+    }
+}
+
+pub const fn inline_copy_release_symbol(
+    ty: crate::inline_value::InlineValueType,
+) -> Option<&'static str> {
+    match ty.lifecycle() {
+        crate::inline_value::InlineValueLifecycle::Trivial => None,
+        crate::inline_value::InlineValueLifecycle::SharedCancellation => Some(CANCELLATION_RELEASE),
+    }
+}
 
 pub const CHECKED_IO_READ_LINE: u8 = 0;
 pub const CHECKED_IO_READ_FILE_TEXT: u8 = 1;
@@ -89,6 +211,7 @@ pub const CHECKED_IO_WRITE_FILE: u8 = 4;
 pub const CHECKED_IO_APPEND_FILE: u8 = 5;
 pub const CHECKED_IO_WRITE_STDOUT: u8 = 6;
 pub const CHECKED_IO_WRITE_STDERR: u8 = 7;
+pub const CHECKED_IO_NEW_READINESS_SET: u8 = 8;
 
 pub const CHECKED_IO_META_OPERATION_SHIFT: u32 = 0;
 pub const CHECKED_IO_META_TARGET_SHIFT: u32 = 8;
@@ -96,6 +219,7 @@ pub const CHECKED_IO_META_REASON_SHIFT: u32 = 16;
 pub const CHECKED_IO_META_KIND_SHIFT: u32 = 24;
 pub const CHECKED_IO_META_HAS_SYSTEM_CODE_SHIFT: u32 = 32;
 pub const CHECKED_IO_META_HAS_INVALID_COUNT_SHIFT: u32 = 33;
+pub const CHECKED_IO_META_HAS_TRANSFERRED_COUNT_SHIFT: u32 = 34;
 pub const CHECKED_IO_ERROR_IO: u8 = 0;
 pub const CHECKED_IO_ERROR_INVALID_UTF8: u8 = 1;
 pub const STRING_FROM_I64: &str = "dr_v1_string_from_i64";
@@ -276,7 +400,8 @@ pub const fn collection_borrow_access_code(
 pub const COLLECTION_STAGE26_FINALIZE: &str = "dr_v2_collection_finalize";
 pub const COLLECTION_STAGE26_FROM_COPY: &str = "dr_v2_collection_from_copy";
 pub const COLLECTION_FILL_WORD: &str = "dr_v2_collection_fill_word";
-pub const COLLECTION_CONSTRUCTION_CAPACITY: &str = "dr_v5_collection_construction_capacity";
+pub const COLLECTION_CONSTRUCTION_CAPACITY: &str = "dr_v6_collection_construction_capacity";
+pub const COLLECTION_FILL_VALUE: &str = "dr_v6_collection_fill_value";
 pub const COLLECTION_INITIALIZE_KEY: &str = "dr_v5_collection_initialize_key";
 pub const COLLECTION_FILL_STRING: &str = "dr_v2_collection_fill_string";
 pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
@@ -399,6 +524,7 @@ pub const MIXED_TAG_ENUM: u8 = 14;
 pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
 pub const MIXED_TAG_INTERFACE: u8 = 16;
 pub const MIXED_TAG_FUNCTION: u8 = 17;
+pub const MIXED_TAG_INLINE: u8 = 18;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     if ty.shared_interface().is_some() {
@@ -410,6 +536,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float32)) => Some(4),
         mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float64)) => Some(8),
         mir::Type::Scalar(mir::ScalarType::Enum(_)) => Some(4),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => Some(ty.storage_bytes() as u8),
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
@@ -431,8 +558,19 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
         mir::Type::Interface(_) | mir::Type::NullableInterface(_) => pointer_width.checked_mul(2),
+        mir::Type::ByteRegion(_) => pointer_width.checked_mul(2),
+        // An empty region may have a null data pointer and is still present.
+        mir::Type::NullableByteRegion(_) => pointer_width.checked_mul(3),
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
         mir::Type::ClosureEnvironment(_) => Some(pointer_width),
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            let payload_width = ty.storage_bytes() as u8;
+            Some(if payload_width > pointer_width {
+                payload_width * 2
+            } else {
+                pointer_width * 2
+            })
+        }
         mir::Type::NullableScalar(_) => Some(16),
         mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => None,
     }
@@ -460,7 +598,9 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
             Some(mir::Type::WritableSharedReferenceAccess(value))
         }
         mir::Type::NullableCollection(value) => Some(mir::Type::Collection(value)),
+        mir::Type::NullableByteRegion(kind) => Some(mir::Type::ByteRegion(kind)),
         mir::Type::NullableFunction(value) => Some(mir::Type::Function(value)),
+        mir::Type::NullablePayloadEnum(value) => Some(mir::Type::PayloadEnum(value)),
         _ => None,
     }
 }
@@ -484,6 +624,112 @@ pub fn function_symbol(function: &mir::Function) -> String {
 mod tests {
     use super::{collection_header_size, collection_value_width, nullable_payload_type};
     use crate::mir::{InterfaceTypeId, Type};
+
+    #[test]
+    fn nullable_call_results_only_reuse_identical_carrier_layouts() {
+        use crate::class_layout::ClassId;
+        use crate::mir::{ReturnType, ScalarType};
+        let value = ReturnType::Value;
+        let payload_enum = crate::mir::PayloadEnumType {
+            id: crate::enums::EnumId(0),
+            capabilities: crate::enums::EnumCapabilities {
+                copy: true,
+                trivial_copy: false,
+                needs_drop: true,
+                equality: true,
+            },
+            size: 16,
+            align: 8,
+            nullable_size: 24,
+            nullable_payload_offset: 8,
+        };
+        assert_eq!(
+            nullable_payload_type(Type::NullablePayloadEnum(payload_enum)),
+            Some(Type::PayloadEnum(payload_enum))
+        );
+        for ty in [
+            Type::Class(ClassId(0)),
+            Type::Interface(InterfaceTypeId(1)),
+            Type::Mixed,
+        ] {
+            assert!(super::call_result_uses_same_carrier(value(ty), value(ty)));
+        }
+        for (source, target) in [
+            (Type::NullableClass(ClassId(0)), Type::Class(ClassId(0))),
+            (
+                Type::NullableInterface(InterfaceTypeId(1)),
+                Type::Interface(InterfaceTypeId(1)),
+            ),
+            (Type::NullableMixed, Type::Mixed),
+        ] {
+            assert!(super::call_result_uses_same_carrier(
+                value(source),
+                value(target)
+            ));
+            assert!(!super::call_result_uses_same_carrier(
+                value(target),
+                value(source)
+            ));
+        }
+        for (source, target) in [
+            (
+                Type::NullableScalar(ScalarType::Bool),
+                Type::Scalar(ScalarType::Bool),
+            ),
+            (Type::NullableString, Type::String),
+            (
+                Type::NullablePayloadEnum(payload_enum),
+                Type::PayloadEnum(payload_enum),
+            ),
+            (Type::Interface(InterfaceTypeId(1)), Type::Class(ClassId(0))),
+            (Type::Class(ClassId(0)), Type::Class(ClassId(1))),
+        ] {
+            assert!(!super::call_result_uses_same_carrier(
+                value(source),
+                value(target)
+            ));
+        }
+    }
+
+    #[test]
+    fn inline_copy_claim_operations_share_one_lifecycle_owner() {
+        use crate::class_layout::ClassId;
+        use crate::inline_value::InlineValueType;
+        let token = InlineValueType::CancellationToken(ClassId(7));
+        assert_eq!(
+            super::inline_copy_retain_symbol(token),
+            Some(super::CANCELLATION_RETAIN)
+        );
+        assert_eq!(
+            super::inline_copy_release_symbol(token),
+            Some(super::CANCELLATION_RELEASE)
+        );
+        for value in [
+            InlineValueType::Duration,
+            InlineValueType::Deadline,
+            InlineValueType::RegistrationKey(ClassId(7)),
+            InlineValueType::ReadTransferKey(ClassId(7)),
+            InlineValueType::WriteTransferKey(ClassId(7)),
+        ] {
+            assert_eq!(super::inline_copy_retain_symbol(value), None);
+            assert_eq!(super::inline_copy_release_symbol(value), None);
+        }
+    }
+
+    #[test]
+    fn transfer_control_scratch_matches_runtime_layout() {
+        extern "C" {
+            fn dr_v1_transfer_outcome_layout(size: *mut usize, align: *mut usize);
+        }
+        let (mut size, mut align) = (0, 0);
+        // The runtime writes only these two disjoint scalar output slots.
+        unsafe { dr_v1_transfer_outcome_layout(&mut size, &mut align) };
+        assert_eq!(
+            size,
+            super::transfer_control_size(std::mem::size_of::<usize>() as u32) as usize
+        );
+        assert_eq!(align, 8);
+    }
 
     #[test]
     fn borrowed_collection_slots_only_accept_readonly_accesses() {
@@ -515,6 +761,9 @@ mod tests {
             doria_rt::DR_INTERFACE_VTABLE_HEADER_SIZE,
             size_of::<usize>() * super::INTERFACE_VTABLE_HEADER_WORDS
         );
+        assert_eq!(super::INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD, 8);
+        assert_eq!(super::INTERFACE_VTABLE_IO_TRANSFERRED_COUNT_WORD, 10);
+        assert_eq!(super::INTERFACE_VTABLE_IO_PROGRESS_MAGIC_WORD, 11);
         for interface in [
             InterfaceTypeId::ERROR,
             InterfaceTypeId(1),

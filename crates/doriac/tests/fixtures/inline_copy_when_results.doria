@@ -1,0 +1,74 @@
+enum Packet { case Number(int $count); case Pair(int $left, int $right); case Empty; }
+class State {
+    static writable int $order = 0;
+    static writable int $drops = 0;
+    static writable int $seen = 0;
+    static writable int $finalizations = 0;
+}
+class Watch {
+    function __construct() {}
+    function __destruct(): void { State::drops++; }
+}
+class Failure implements Error { function __construct(string $message) {} }
+function gate(int $event, bool $accepted): bool {
+    State::order = State::order * 10 + $event;
+    return $accepted;
+}
+function optional(bool $present): ?Packet {
+    return when ($present): ?Packet { return Packet::Number(0); }
+        else { return null; };
+}
+function hot(): int {
+    State::order = 0;
+    let $first = when (true): Packet {
+        let $inner = when (true): Packet { return Packet::Pair(1, 2); }
+            else { return Packet::Empty; };
+        return $inner;
+    } else { return Packet::Number(0); };
+    let $second = given { let $ready = gate(1, false); $ready; }
+        when (gate(2, true)): Packet { return Packet::Number(99); }
+        else when (gate(3, true)) { return Packet::Empty; }
+        else { return Packet::Number(4); }
+        finally { let $noise = Packet::Number(77); };
+    let $absent = optional(false);
+    let $zero = optional(true);
+    let $a = match ($first) { Packet::Number($number) => $number, Packet::Pair($left, $right) => $left + $right, Packet::Empty => -100, };
+    let $b = match ($second) { Packet::Number($number) => $number, Packet::Pair($left, $right) => -100, Packet::Empty => -100, };
+    let $c = match ($absent) { null => 0, default => -100, };
+    let $d = match ($zero) { Packet::Number($number) => $number, default => -100, };
+    return $a + $b + $c + $d + State::order * 10;
+}
+function readCount(Watch $value): int { return 7; }
+function lifetime(): int {
+    State::drops = 0;
+    State::seen = 0;
+    let $value = given { let $setup = new Watch(); }
+        when (true): Packet {
+            let $local = new Watch();
+            return Packet::Number(readCount(new Watch()));
+        } else { return Packet::Empty; }
+        finally {
+            State::seen = State::drops;
+            let $noise = Packet::Number(99);
+        };
+    let $count = match ($value) { Packet::Number($number) => $number, default => -100, };
+    return $count + State::seen * 10 + State::drops;
+}
+function replaced(): Packet throws Failure {
+    return when (true): Packet { return Packet::Number(7); }
+        else { return Packet::Empty; }
+        finally {
+            let $noise = when (true): Packet { return Packet::Number(99); }
+                else { return Packet::Empty; };
+            throw new Failure("replacement");
+        };
+}
+function replacement(): int {
+    let writable $value = when (false): Packet { return Packet::Number(1); }
+        else { return Packet::Number(9); };
+    try { $value = replaced(); } catch (Failure) {}
+    return match ($value) { Packet::Number($number) => $number, default => -100, };
+}
+function main(): void {
+    echo hot() . "|" . lifetime() . "|" . replacement() . "\n";
+}

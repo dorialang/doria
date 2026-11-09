@@ -1,0 +1,71 @@
+use Doria\Std\Io\{File, ReadableFile, ReadableStream, ReadinessStream, ReadinessSource,
+    ReadinessSet, ReadOutcome, WritableByteRegion, IoError, IoOperation, IoTarget};
+
+interface ReadyReader extends ReadableStream, ReadinessStream {
+    function getReadCount(): int;
+}
+
+class MeteredFile implements ReadyReader {
+    internal writable ReadableFile $file;
+    writable int $reads = 0;
+    function __construct(parameter take ReadableFile $file) { $this->file = $file; }
+    ReadinessSource $readinessSource { borrowed get => $this->file->readinessSource; }
+    function getReadCount(): int { return $this->reads; }
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError {
+        $this->reads += 1;
+        return $this->file->read($destination);
+    }
+    function __destruct() {
+        try { echo "drop {$this->reads}\n"; } catch (IoError) {}
+    }
+}
+
+function erased(take MeteredFile $stream): ReadyReader { return $stream; }
+function readOne(writable ReadyReader $stream, writable Bytes $bytes): void throws IoError {
+    let writable $region = $bytes->getWritableRegion(0, 1);
+    $stream->read($region);
+    echo "byte {$bytes[0]} reads {$stream->getReadCount()}\n";
+}
+
+function readCaptured(writable ReadyReader $stream, writable Bytes $bytes): void throws IoError {
+    let writable $read = function (writable Bytes $output): void with (writable $stream) {
+        readOne($stream, $output);
+    };
+    $read($bytes);
+}
+
+function main(): void {
+    write_file("access.txt", "abc\n");
+    writable Bytes $bytes = Bytes::allocate(1);
+    {
+        writable ReadinessSet $set = new ReadinessSet();
+        writable ReadinessSet $other = new ReadinessSet();
+        let $key = $set->register(new MeteredFile(File::openRead("access.txt")));
+        {
+            let writable $stream = $set->getWritableStream($key);
+            readCaptured($stream, $bytes);
+        }
+        echo "count {$set->getStream($key)->reads}\n";
+        readOne($set->getWritableStream($key), $bytes);
+        try { let $foreign = $other->getStream($key); }
+        catch (IoError $error) {
+            echo "foreign " . ($error->operation == IoOperation::Access) . " "
+                . ($error->target == IoTarget::ReadinessSet) . " "
+                . ($error->transferredByteCount == null) . "\n";
+        }
+        let $returned = $set->unregister($key);
+        echo "returned {$returned->reads}\n";
+        try { let $stale = $set->getWritableStream($key); }
+        catch (IoError $error) {
+            echo "stale " . ($error->operation == IoOperation::Access) . " "
+                . ($error->target == IoTarget::ReadinessSet) . " "
+                . ($error->transferredByteCount == null) . "\n";
+        }
+    }
+    {
+        writable ReadinessSet $set = new ReadinessSet();
+        let $key = $set->register(erased(new MeteredFile(File::openRead("access.txt"))));
+        readCaptured($set->getWritableStream($key), $bytes);
+        echo "erased {$set->getStream($key)->getReadCount()}\n";
+    }
+}

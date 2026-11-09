@@ -46,7 +46,7 @@ Every primitive has a companion, and the set is a **complete, symmetric matrix**
 - **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width checked conversion families such as `Int32::from` (panics on overflow) / `Int32::tryFrom` (returns `?int32`). Each accepts one fixed-width integer expression; their callable declaration surface is TBD with conversion-overload work rather than published as an untyped Doria parameter.
 - **`Float`, `Float32`/`Float64`** — `Float::parse(string): ?float`, `Float::toInt(float): int` (checked, panics on NaN/out-of-range), `Float::pow(...)`. `float` is neither `Hashable` nor totally `Comparable` (0096).
 - **`Bool`** — `Bool::parse(string): ?bool` (returns `true`/`false` for exactly `"true"`/`"false"`, case-sensitive, no whitespace tolerance; `null` otherwise). No `MIN`/`MAX`/`pow`/wrapping (N/A for a two-valued type); `Bool::toInt` is a named v1.0+ furnishing (0104).
-- **`String`** — executable intrinsic properties are `$s->length` (Unicode grapheme clusters), `$s->byteLength` (UTF-8 bytes), `$s->isEmpty`, and `$s->bytes` (copy in v1.0). Executable companion operations are trimming/casing (`trim`, `trimStart`, `trimEnd`, `lower`, `upper`, `lowerFirst`, `upperFirst`); predicates (`contains`, `startsWith`, `endsWith`, `equalsIgnoreCase`, `containsIgnoreCase`, `startsWithIgnoreCase`, `endsWithIgnoreCase`); grapheme-indexed search (`indexOf`, `lastIndexOf`, `indexOfIgnoreCase`, `lastIndexOfIgnoreCase`); `countOccurrences`; `replace`; `split`/`join`; `slice`; `repeat`; `padStart`/`padEnd`; and UTF-8-validating `fromBytes` (decision 0103). The `$s->graphemes` / `$s->codePoints` views await the public traversal protocol, and `compare` / `compareIgnoreCase` await their String ordering implementation. There is no public `str_*` family, `$s->chars`, integer string indexing, or duplicate instance-method spelling.
+- **`String`** — executable intrinsic properties are `$s->length` (Unicode grapheme clusters), `$s->byteLength` (UTF-8 bytes), `$s->isEmpty`, `$s->bytes` (copy in v1.0), and `$s->byteRegion`, a readonly `ByteRegion` view of the UTF-8 bytes that borrows the string without copying (native backends; PHP output rejects string intrinsic properties). Pass it to any byte writer to write text; use the region's `getRegion` for a byte range. Executable companion operations are trimming/casing (`trim`, `trimStart`, `trimEnd`, `lower`, `upper`, `lowerFirst`, `upperFirst`); predicates (`contains`, `startsWith`, `endsWith`, `equalsIgnoreCase`, `containsIgnoreCase`, `startsWithIgnoreCase`, `endsWithIgnoreCase`); grapheme-indexed search (`indexOf`, `lastIndexOf`, `indexOfIgnoreCase`, `lastIndexOfIgnoreCase`); `countOccurrences`; `replace`; `split`/`join`; `slice`; `repeat`; `padStart`/`padEnd`; and UTF-8-validating `fromBytes` (decision 0103). The `$s->graphemes` / `$s->codePoints` views await the public traversal protocol, and `compare` / `compareIgnoreCase` await their String ordering implementation. There is no public `str_*` family, `$s->chars`, integer string indexing, or duplicate instance-method spelling.
 
 ### Value interfaces (core contracts)
 Details: decisions 0096 (primitive conformance), 0134 (interfaces, traits, value
@@ -141,6 +141,9 @@ Decision 0134's `borrow` receiving mode on an iterator's promoted constructor
 parameter retains readonly source access instead of ownership. Cursor state
 remains independently owned; releasing the cursor does not destroy its source.
 This is an iterator-carrier facility, not general borrowed class fields.
+Taking such a carrier into a newly constructed owner's owning property forwards
+its existing source loans through that owner until cleanup. It does not turn
+the property into a borrowed field or allow the owner to outlive those sources.
 
 ### Ranges and math basics
 - **Range types** — `a..b` (inclusive) / `a..<b` (exclusive-end); `int` endpoints; used with `foreach` (SPEC control flow).
@@ -174,7 +177,8 @@ Owned move types with a growable/fixed distinction. The complete family and nami
 Sequence literals also have the repeat form **`[value; count]`** (decision 0102). It contextually constructs either a runtime-sized `T[]` or a one-shot-filled `List<T>` and defaults to `List<T>` without an expected type. `value` is evaluated once before the runtime-`int` `count`; zero produces an empty sequence, a constant-negative count is rejected, and a runtime-negative count panics with `fill count is negative`. Copy values use the direct fill path; a Move value must implement Decision 0134's `Cloneable`, is evaluated once, and is cloned once per output slot in ascending order. The form is sequence-only: it does not construct `Set` or `Dictionary`.
 
 - **`T[]`** (typed arrays) — contiguous, fixed-length-after-creation; `length` property, indexing (panics OOB), `foreach`, and `contains`; the engine-grade buffer. Its optional first `foreach` binding is a readonly zero-based canonical-`int` sequence index. `[value; count]` is its only runtime-sized constructor. Slicing is a future addition.
-- **`Bytes`** — owned mutable byte buffer for binary work; `uint8[]`↔`Bytes` interconvert only through explicit `Bytes::fromArray`/`->toArray` (copy in v1.0). Slice 2 provides `length`, indexed `uint8` reads/writes and RMW, and byte-wise `==`/`!=`; growable/slice/search members await a future method-surface record.
+- **`Bytes`** — owned mutable byte buffer for binary work; `uint8[]`↔`Bytes` interconvert only through explicit `Bytes::fromArray`/`->toArray` (copy in v1.0). Executable members are `length`, indexed `uint8` reads/writes and RMW, and byte-wise `==`/`!=`. Decision 0110's Stage 36a appendix adds executable `Bytes::allocate(int $length): Bytes` (zero-initialized), readonly `getRegion(int $offset, int $length): Doria\Std\Io\ByteRegion`, and writable `getWritableRegion(int $offset, int $length): Doria\Std\Io\WritableByteRegion`. Growable/search members remain outside that appendix; the complete stream foundation is still in progress.
+- **`Doria\Std\Io\ByteRegion` / `Doria\Std\Io\WritableByteRegion`** — Stage 36a's executable bounded borrowed byte views, not owned copies. Both expose readonly `int length`, indexed `uint8` reads, and readonly `getRegion(int $offset, int $length): ByteRegion`. The writable region also permits indexed mutation through a writable binding and writable `getWritableRegion(int $offset, int $length): WritableByteRegion`, plus two bulk copies: writable `copyFrom(ByteRegion $source): int` copies the leading bytes of another region and returns the count, the smaller of the two lengths; writable `copyWithin(int $offset, int $length, int $destination): void` moves bytes inside the region, the ranges may overlap, and invalid bounds panic (P1304, source range first). Both lower to one memmove on every backend. Readonly views are borrowed Copy carriers; writable views are borrowed move carriers. Nullable byte containers and regions use narrowing or null-safe `?->` member access without changing source loans or writable authority. Bounds, source lifetime, and conflicting access are checked. No region operation allocates, copies bytes, or retains a runtime reference count. The complete stream foundation is not delivered yet.
 - **`List<T>`** — the everyday growable sequence and default workhorse: `add`, `insertAt`, `removeAt` (returns the owned element), `pop` (`?T`), `contains`, `indexOf(T): ?int` (first equal position, `null` when absent), writable `remove(T): bool` (first equal element only), writable `clear(): void` (in-place emptying), `first`/`last` (`?T` properties), `count`, and `isEmpty` (properties). Stage 30g implements `map<U>(function(T): U $transform): List<U>`, preserving `filter(function(T): bool $predicate): List<T>`, and writable-accumulator `reduce<A>(take A $initial, function(writable A, T): void $reducer): A`. Each also accepts the corresponding `writable function writable(...)` callback through an exclusive function-value borrow; readonly callbacks use readonly borrows, callbacks never escape, and once callbacks are rejected. The source is visited in insertion order and remains unchanged. `map` owns its new results and supports Move results; Decision 0134 widens `filter` from Copy to Copy-or-Cloneable elements, invoking author-provided clone for retained Move values; `reduce` owns its initial accumulator and supports Copy or Move accumulators. Each method throws exactly the checked Errors declared by its callback's structural function type. Checked failure destroys the partial result or accumulator before propagating. No other collection family receives these algorithms in Stage 30.
 - **`Dictionary<K, V>` / `SortedDictionary<K, V>`** — `get` returning `?V`, `set`, `remove` returning `?V`, `containsKey` (key membership), executable O(n) `containsValue(V): bool` (value membership), writable `clear(): void` (in-place emptying), `keys`/`values` (`foreach`-only projections, not storable in v1.0), and `count`/`isEmpty` (properties). `Dictionary` iterates in insertion order, `SortedDictionary` by ascending `Comparable` key. The optional first main-loop binding is the actual readonly key, never an ordinal; values may be writable through the main iteration form. Projections remain value-only.
 - **`Set<T>` / `SortedSet<T>`** — `::from`, `add` (`bool`), `remove` (`bool`), `contains`, `union`, `intersect`, `difference`, writable `clear(): void` (in-place emptying), executable readonly `first: ?T` / `last: ?T` properties, and `count`/`isEmpty` (properties). `Set` endpoints follow insertion order; `SortedSet` endpoints are the ascending minimum and maximum. All endpoints are O(1), return `null` when empty, and borrow the retained element. Iteration is readonly: replacement is remove plus add. Existing-source construction and algebra preserve every input and require Copy-or-Cloneable elements.
@@ -200,18 +204,149 @@ unconstrained element or value positions, but supply no null hash or ordering.
 ## Standard library modules (`Doria\Std\*`)
 Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only in the plan today; each links to its owning section/record and is marked *(surface TBD)* where its decision is unauthored.
 
-- **`Doria\Std\Io`** — Stage 29 implements exactly six compiler-known public identities, and Stage 31 Slice 1 integrates them into general namespace resolution: `IoOperation`, `IoTarget`, `IoErrorReason`, `Utf8InputSource`, `IoError`, and `InvalidUtf8Error`. They have no temporary unqualified aliases and cannot be redeclared. `IoOperation` cases are `Open`, `Read`, `Write`, `Append`, `Flush`; `IoTarget` cases are `File(string $path)`, `StandardInput`, `StandardOutput`, `StandardError`; `IoErrorReason` cases are `NotFound`, `PermissionDenied`, `InvalidInput`, `Interrupted`, `ResourceExhausted`, `Unsupported`, `Closed`, `Other`; `Utf8InputSource` cases are `File(string $path)`, `StandardInput`. `IoError` implements `Error` and exposes readonly `message`, `operation`, `target`, `reason`, and `?int systemCode`. `InvalidUtf8Error` implements `Error` and exposes readonly `message`, `source`, `int validByteCount`, and `?int invalidByteCount`; these are byte counts. Stable messages are Doria-owned, while raw platform prose is never exposed. Ordinary closed stdout/stderr pipes still exit cleanly with status 0; allocation remains panic. An unhandled Error is R1000/status 70 after cleanup. **Stage 36a scheduled and not implemented; semantics and performance contract accepted, public spellings deferred.** It will use small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities with owned handles, reusable buffers, and first-class standard streams. Exact interfaces, handles, readiness, buffering, adapters, files, and processes still await its bounded surface appendix. The current free functions are intrinsics, not proof that the Stage 36a layer exists.
+- **`Doria\Std\Io`** — Stage 29 implements exactly six compiler-known public identities, and Stage 31 Slice 1 integrates them into general namespace resolution: `IoOperation`, `IoTarget`, `IoErrorReason`, `Utf8InputSource`, `IoError`, and `InvalidUtf8Error`. They have no temporary unqualified aliases and cannot be redeclared.
+
+`IoOperation` cases are `Open`, `Read`, `Write`, `Append`, `Flush`, `Close`,
+`Register`, `Unregister`, `Wait`, `Configure`, `Access`, `Seek`, `SynchronizeData`,
+`SynchronizeMetadata`, `Resize`, `Lock`, `Unlock`, `Spawn`, `Terminate`; `IoTarget` cases are
+`File(string $path)`, `StandardInput`, `StandardOutput`, `StandardError`, `ReadinessSet`,
+`TransferPlan`, `TransferGroup`, `Process(string $program)`, `ProcessInput(string $program)`,
+`ProcessOutput(string $program)` and `ProcessErrors(string $program)`. The process targets name
+the program actually launched: the executable path, or the platform shell (`/bin/sh`,
+`cmd.exe`) for `Command::shell`; for example "failed to spawn process `/bin/ls`: not found" or
+"failed to write process `cat` input: closed". Process waits reuse `Wait`.
+`IoErrorReason` cases are `NotFound`, `PermissionDenied`, `InvalidInput`,
+`Interrupted`, `ResourceExhausted`, `Unsupported`, `Closed`, `Other`;
+`Utf8InputSource` cases are `File(string $path)`, `StandardInput`, `Stream`
+(a text adapter over a byte stream with no path).
+
+`IoError` implements `Error` and exposes readonly `message`, `operation`,
+`target`, `reason`, `?int systemCode`, and `?int transferredByteCount`.
+The trailing `transferredByteCount` constructor parameter defaults to `null`,
+preserving existing construction and catches. It records known byte progress
+in the failing operation: `null` is unavailable or inapplicable, `0` is known
+zero progress, and a positive count is partial or completed transfer progress
+before failure; none implies rollback or disk durability.
+`InvalidUtf8Error` implements `Error` and exposes readonly `message`, `source`,
+`int validByteCount`, and `?int invalidByteCount`; these are byte counts.
+
+Consuming file close uses `IoOperation::Close`, including a checked close
+failure; it does not introduce another Error type. Readiness infrastructure
+uses `IoOperation::Register`, `IoOperation::Unregister`, or `IoOperation::Wait`
+with `IoTarget::ReadinessSet` and `null` byte progress. The added cases preserve
+existing tags but require new exhaustive-match arms. Original transfer Errors
+retain their identity and optional progress, not a reconstructed readiness
+error. Wait expiry and cancellation are typed observations, not infrastructure
+failures: expiry ends only the wait, whereas cancellation retires the transfers.
+Transfer-plan configuration uses `IoOperation::Configure` with
+`IoTarget::TransferPlan` and `null` byte progress, preserving existing `IoError`
+catches and optional system codes without creating another Error type.
+Registered-stream lookup failures use `IoOperation::Access`, `IoTarget::ReadinessSet`,
+and `null` byte progress. Stale or foreign keys fail before stream access.
+Stable messages are Doria-owned, while raw platform prose is never
+exposed. Ordinary closed stdout/stderr pipes still exit cleanly with status 0;
+allocation remains panic. An unhandled Error is R1000/status 70 after cleanup.
+
+**Stage 36a complete; semantics and performance contract accepted, remaining
+public spellings deferred.** It uses small
+readable/writable/duplex/seekable/flushable/blocking/readiness capabilities with
+owned handles, reusable buffers, and first-class standard streams. The bounded
+appendix names byte-transfer interfaces, inline outcomes, and owned file
+factories. Readable, writable, and duplex files pass native and PHP compatibility
+validation on macOS; PHP file owners use the approved shared native runtime
+through FFI. Readiness and standard views have targeted functional parity;
+buffering, adapters, remaining file controls, processes and the complete
+allocation/performance gate remain work. The current free functions are intrinsics, not proof
+that the Stage 36a layer exists.
+
+Decision 0138 fixes standard-device views as non-owning, nonclosable inline Copy
+values sharing intrinsic device coordination, with no allocation or new handle
+on access or copy. Andrew's S-A ruling in Decision 0110 names
+`Doria\Std\Io\StandardStreams` with readonly static `input`, `output`, and
+`error` properties returning `StandardInput`, `StandardOutput`, and
+`StandardError` respectively in `Doria\Std\Io`.
+Use `StandardStreams::output` after import. Public getters, transfers and
+readiness/pending groups pass targeted macOS interpreter/Cranelift/LLVM/PHP
+functional validation. Native PHP standard operations and all six byte-I/O
+intrinsics require enabled FFI and the compiler-published matching shared
+runtime. A native program shares one line/byte input queue from its first
+operation; getter-only and userland-stream programs remain FFI-free. Native
+Windows/Linux execution and the full allocation/performance gate remain open.
+Under Decision 0138's C-B ruling, Copy-to-interface erasure owns an
+independent snapshot. Immediate borrowed calls are valid; a stored returned
+borrow requires an explicitly declared interface owner, such as
+`ReadinessStream $owner = $input; let $view = borrowInput($owner);`.
+The original Copy binding stays independent.
+
+Line reading (Decision 0110, Text Adapters): `LineReader<S implements
+ReadableStream>` owns its source, and `BorrowedLineReader<S>` borrows it.
+`new LineReader<S>($source, $capacity)` bounds a line at `$capacity` bytes;
+`readLine()` returns `LineOutcome::Line($text)` (without `\n` or a preceding
+`\r`), `WouldBlock`, `EndOfStream`, `TimedOut` or `TooLong`, and throws
+`IoError` or `InvalidUtf8Error` (source `Utf8InputSource::Stream`, with exact
+stream offsets). `finish()` returns the owned source and discards buffered
+bytes.
+
+File locks (Decision 0138, Public Lock Declarations) are whole-file native locks:
+`flock` on Linux/macOS, `LockFileEx` on Windows. `ReadableFile`, `WritableFile`
+and `DuplexFile` each provide `lock(FileLockMode)` (waits) and
+`tryLock(FileLockMode)` returning a borrowed `FileLock<F>`, plus consuming
+`lockOwned` and `tryLockOwned` returning a `LockedFile<F>` that owns the file.
+`FileLockMode` is `Shared` or `Exclusive`. Contention is a typed outcome:
+`BorrowedLockOutcome::Contended`, or `LockOutcome::Contended($file)`, which
+returns the file. A `FileLock` holds the caller's file under an exclusive loan,
+so the file is reachable only through `$guard->file` until the guard ends; it
+never closes the file. `unlock()` reports failures with `IoOperation::Unlock`;
+destroying a guard releases best-effort and reports nothing. `LockedFile::unlock()`
+returns the file. Acquisition failures use `IoOperation::Lock`, including a
+second acquisition through a file that already holds a lock (InvalidInput):
+a held mode is never silently converted. Locks belong to each open file, so two
+opens of one path in one process contend. Unsupported platforms report
+`IoErrorReason::Unsupported`. Locks are advisory on Unix; network filesystems
+follow their own semantics.
+
+Decision 0110 specifies inline Copy `Doria\Std\Concurrency\CancellationToken`:
+assignment leaves both bindings usable with the same explicitly shared
+cancellation state. Each owned
+copy retains and releases one claim without allocating; borrowed arguments do
+not acquire a claim. Tokens may outlive their source, and neither copying nor
+releasing a source or token requests cancellation.
+`==` compares shared cancellation-state identity and `!=` is its inverse:
+tokens from the same source compare equal even after cancellation or source
+destruction.
+Equality does not acquire a claim or initialize native resources; nullable
+tokens retain ordinary nullable equality. No public address, ordering, integer
+conversion, or hashing contract is provided.
+
+- **`Doria\Std\Concurrency\CancellationSource`** is a Move owner, constructed
+  with `new CancellationSource()`. Its readonly `token` property returns an
+  independently owned Copy token and readonly `cancellationRequested` reports
+  the shared state. Writable `cancel(): void throws CancellationError` requests
+  cancellation; destruction does not. This lifecycle executes in the development
+  compiler through interpreter, both native profiles and PHP/FFI; complete
+  cancellation/wait-control integration remains Stage 36a work.
+- **`Doria\Std\Concurrency\CancellationError`** implements `Error`, with
+  `__construct(string $message, ?int $systemCode = null)` and readonly stored
+  `message` and `systemCode`. Cancellation remains requested after notification
+  failure. Missing system code is null, not known zero; no I/O operation, target,
+  or byte progress is attached.
+
 - **`Doria\Std\Test`** — development-source-only compiler declarations. Slice 1 implements exact compiler-known `describe`, `it`, and `test`, const-evaluable descriptions, nested suites, deterministic generated test callables, and one schema-version-3 table shared with `#[Test]`; there is no runtime registry. Baton consumes that table and never parses Doria. Slice 2 implements `expect`, `fail`, `AssertionError`, the separate automatic `TestAssertion` effect, and core scalar/null/bool/order/string matchers. Slice 3 completes collection/dictionary expectations, `toThrow` and typed Error inspectors, bounded failure differences, strict outcome classification and hierarchy reporting, and compiler-fact-based tooling.
 - **`Doria\Std\Fs`** — filesystem/namespace operations without an open handle: existence, size/metadata, permissions, timestamps, rename, delete, `mkdir`, directory listing, and path manipulation. Decision 0110 fixes the `Io`/`Fs` boundary while deferring the exact `Path` representation to the filesystem design; Stage 36a must preserve typed-path evolution. *(Surface TBD.)*
 - **`Doria\Std\Env`** — environment variables. *(Surface TBD.)*
-- **`Doria\Std\Process`** — process facts (exit code, process id, executable path) and decision-0110 owned child processes with typed stdin/stdout/stderr pipes, stdin half-close, explicit wait/detach/terminate lifetime resolution, concurrent bounded output drainage, and shared timeout/readiness/cancellation integration. Destruction does not silently wait, detach, or terminate. Exact process and type-state spellings remain deferred to the process owner. The pipe capability depends on Stage 36a and is not currently executable. Command-line arguments arrive through `main(List<string> $args)` (decision 0099), not here.
-- **`Doria\Std\Time`** — clock and time. Decision 0110 requires duration and absolute-deadline concepts, explicit immediate/indefinite waiting, and no mutable process-global stream timeout; exact public types remain owned by the Time design no later than Stage 36a surface finalization. *(Surface TBD.)*
+- **`Doria\Std\Process`** — Decision 0110 child processes, executable on every backend (the MIR interpreter runs scripted children from its sandbox, never a host process). `Command::executable(string $path)` runs a program directly, found on the child's own `PATH` when the name has no separator; `Command::shell(string $script)` runs the platform shell on one script and takes no arguments. Writable `argument`, `environment`, `removeEnvironment` (the last edit of a variable wins) and `directory` build the request; invalid strings (a NUL byte, or a variable name that is empty or contains `=`) fail at `spawn` as `InvalidInput`. `spawn(ChildCleanup $cleanup): Child throws IoError` requires `Wait`, `Terminate` or `Detach` with no default. `Child` is a runtime-owned value: writable `getInput(): ChildInput`, `getOutput(): ChildOutput` and `getErrors(): ChildOutput` lend its pipes, and different pipes of one child may be lent at the same time; `getId(): int`; writable `waitUntil(Deadline $deadline): WaitOutcome` keeps the child on `TimedOut`; consuming `wait(): ExitStatus` closes the input, drains and discards both outputs concurrently and waits; consuming `terminate(): ExitStatus` kills (Unix `SIGKILL`, Windows exit code 1) without draining; consuming `detach(): void` stops the policy; consuming `collect(int $limit): CollectedOutput` drains both outputs concurrently, keeping at most `$limit` bytes of each (`truncated`), then waits. `ChildInput::closeInput()` half-closes the input and is idempotent; transfers on a closed pipe fail as `Closed`. Pipes are `PendingReadableStream`/`PendingWritableStream`, so they join a `ReadinessSet` and `TransferPlan` through `BorrowedBufferedReader`/`BorrowedBufferedWriter`; a plain `read` or `write` waits for the child as any blocking pipe does and never reports `WouldBlock`. `ExitStatus` is `Exited(int $code)` or `Signaled(int $signal)` (Unix only). Destruction closes the pipes first, then applies the policy once unless the child was resolved, so a `Wait` policy cannot deadlock on a full pipe. Command-line arguments of the current program arrive through `main(List<string> $args)` (decision 0099), not here.
+- **`Doria\Std\Time`** — clock and time. Decision 0110 requires duration and absolute-deadline concepts, explicit immediate/indefinite waiting, and no mutable process-global stream timeout. Standalone clock-read failures use Time-owned `ClockError`; readiness-wait failures remain `IoError`. Exact Time members remain owned by the bounded appendix no later than Stage 36a surface finalization. Stage 40a adds calendar/timestamp parsing without replacing that duration/deadline model. *(Remaining surface TBD.)*
+  - **`ClockError`** implements `Error`, with `__construct(string $message, ?int $systemCode = null)` and readonly stored properties `message` and `systemCode`. Missing platform code stays `null`, distinct from known zero. Ordinary checked propagation preserves this owned error; it carries no I/O target or byte progress. Use its qualified name or an explicit import.
+  - **`Duration` and `Deadline`** are distinct compiler-known inline Copy values. Assignment and argument passing preserve the original without a heap object or reference count. Nullable forms remain Copy; neither type implicitly converts to integers or to the other. Use qualified names or explicit imports, not prelude aliases.
+  - **`Duration`** represents signed `int64` nanoseconds across the full range, including negative intervals. Static `fromNanoseconds(int64 $nanoseconds): Duration` constructs an interval; readonly `int64 $nanoseconds` returns it exactly. A negative interval used for a timed wait or relative deadline is already expired, not invalid, an immediate poll, or an indefinite wait. Completion-fetch expiry does not cancel transfers. Remaining Time arithmetic members are owned by the bounded appendix.
+  - **`Deadline`** preserves its exact instant after expiry. Static `fromNow(Duration $duration): Deadline throws ClockError` samples the monotonic clock once and adds the exact signed interval, without timer/readiness initialization. Different past instants remain distinguishable; expiry never replaces the value with a marker. Native carrier bits and the monotonic epoch are private ABI, not public integers.
+  - **`Doria\Std\Io\Wait`** has `Immediate`, `For(Duration $duration)`, `Until(Deadline $deadline)`, and `Indefinite` cases. This ordinary inline Copy enum requires no heap container. Completion observation uses `getNextCompletion(Wait $wait)`; relative waits freeze one deadline at observation start, while expiry stops only observation and preserves transfers. Import or qualify it; there is no prelude alias.
 - **`Doria\Std\Random`** — random-number generation. *(Surface TBD.)*
-- **`Doria\Std\Json`** — JSON encode/decode; drives enum/match/mixed ergonomics and the PHP bridge. *(Surface TBD.)*
-- **`Doria\Std\Net`** — networking, TCP first. Stage 44 builds its client/listener/socket and HTTP maturation on decision 0110's duplex byte streams, readiness, duration/deadline timing, cancellation, partial writes, backpressure, and async integration; socket streams do not define a second I/O contract. TLS is a typed network-adapter boundary over that shared foundation whose exact configuration remains Stage 44 work. *(Surface TBD.)*
-- **`Doria\Std\Http`** — HTTP, later than `Net`. *(Surface TBD.)*
+- **`Doria\Std\Json`** — JSON encode/decode; drives enum/match/mixed ergonomics and the PHP bridge. Stage 40a owns its first practical data-pipeline contract. *(Surface TBD.)*
+- **`Doria\Std\Net`** — networking, TCP first. Stage 40a owns the first typed TCP/TLS and HTTP-client foundation over decision 0110 streams, readiness, duration/deadline timing, cancellation, partial writes, backpressure, and reusable buffers. Stage 44 matures and hardens it; socket streams do not define a second I/O contract. Exact TLS configuration belongs to the Stage 40a network design. *(Surface TBD.)*
+- **`Doria\Std\Http`** — HTTP client foundation alongside `Net` in Stage 40a; further maturation in Stage 44. *(Surface TBD.)*
 - **`Doria\Std\Data`** — **DDO**, the batteries-included database layer: decomposed `Connection` / `Statement` / `Transaction` / typed rows, the `Sql` provenance newtype, RAII transactions with consuming `commit`, capability-based drivers, typed fetches. Direction: plan §9 (DDO); prerequisites checked errors (Stage 29) + `Net`. *(The authoritative DDO record is unauthored; 0007 is a superseded sketch.)*
-- **`Doria\Std\Term`** — the portable terminal layer for product 5, surfaced through the `Console` static facade. It reuses decision 0110's standard-stream views, readiness, blocking substrate, duration/deadline timing, cancellation, and platform-device abstraction; generic stream readiness is not reimplemented here. Raw mode and terminal events remain Term-owned, and mode changes require exclusive control plus a restoring guard. See "The terminal layer" in plan §9 and the Console/terminal decision. Surface (planned):
+- **`Doria\Std\Term`** — the portable terminal layer for the TUI product in plan §2, surfaced through the `Console` static facade. It reuses decision 0110's standard-stream views, readiness, blocking substrate, duration/deadline timing, cancellation, and platform-device abstraction; generic stream readiness is not reimplemented here. Raw mode and terminal events remain Term-owned, and mode changes require exclusive control plus a restoring guard. See "The terminal layer" in plan §9 and the Console/terminal decision. Surface (planned):
   - **terminal info** — size, interactivity, colour capability;
   - **screen** — clear, title (alternate-screen later);
   - **cursor** — position, move, show/hide;
@@ -220,6 +355,445 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
   - **raw mode** — entered through an ownership guard whose `__destruct` restores the terminal on every structured exit.
   Capability-based (no escape sequences or platform encodings in any public value); stateless (no `ScreenBuffer` std type). *(Method inventory settled in the Console/terminal decision, TermUtil-informed; lands Stage 46.)*
 - **`Doria\Std\Math`** — batteries-included game/graphics math as built-in Copy value types: `Vector2`/`Vector3`/`Vector4`, `Quaternion`, `Euler`, `Matrix3x3`/`Matrix4x4`, plus `lerp`/`clamp`/easing helpers. Compiler-known arithmetic operators; `$v->length` / `$v->normalized` properties, `$v->dot`/`$v->cross` methods. Direction: plan §9 (math); lands Stage 47. *(Geometry-math record unauthored.)*
+
+### Byte Transfer Contracts
+
+Decision 0110's Stage 36a appendix specifies these nominal `Doria\Std\Io`
+contracts; the full native stream foundation is still in progress.
+
+- **`ReadOutcome`**: `Data(int $byteCount)`, `WouldBlock`, `EndOfStream`, and
+  `TimedOut`. An ordinary inline Copy enum; `Data(0)` is distinct from EOF.
+- **`WriteOutcome`**: `Accepted(int $byteCount)` and `WouldBlock`. An ordinary
+  inline Copy enum; partial progress does not copy the unwritten suffix.
+- **`FlushOutcome`**: `Complete` and `Pending`. An ordinary inline Copy enum;
+  it owns no buffer storage and requires no result allocation.
+- **`FinishOutcome<S, R>`**: `Complete(S $source)` and `Pending(R $writer)`.
+  A generic payload enum, specialized per application. A consuming owned writer
+  returns its source on completion or the same writer retaining pending bytes
+  for retry. General generic enum layout and payload ownership apply; no extra
+  result allocation is introduced.
+- **`BorrowedFinishOutcome<R>`**: `Complete` and `Pending(R $writer)`.
+  A pending writer carries its source loan through the payload. Completion releases the
+  source loan without transferring its owner; pending retains it in the writer.
+  Finish performs one non-waiting attempt. Checked I/O failure uses ordinary
+  consuming cleanup without promising recovery of the consumed writer.
+- **`ReadableStream`**: `writable function read(writable WritableByteRegion
+  $destination): ReadOutcome throws IoError`.
+- **`WritableStream`**: `writable function write(ByteRegion $source):
+  WriteOutcome throws IoError`.
+- **`DuplexStream`**: extends `ReadableStream` and `WritableStream`, adding no
+  unrelated capability.
+- **`FlushableStream`**: `writable function flush(): FlushOutcome throws IoError`.
+  `Complete` reports completed drainage. `Pending` may follow partial drainage;
+  the adapter retains the remainder for retry without repeating accepted bytes.
+  No automatic readiness wait or busy polling is inserted. Buffer flushing is
+  not durable synchronization; checked failures still throw `IoError`.
+- **`BufferedReader<S implements ReadableStream>`**: `new BufferedReader($source,
+  $capacity)` takes the source and a required capacity. `read`, `fill():
+  ReadOutcome`, readonly `ByteRegion $buffered { borrowed get; }` (the unread
+  window, not a copy), `consume(int $byteCount)` and `consuming finish(): S`,
+  which discards unread bytes. A request at least as large as the buffer reads
+  straight into the caller's region. `BorrowedBufferedReader<S>` retains
+  `borrow writable S $source` instead and has no `finish`.
+- **`BufferedWriter<S implements WritableStream>`**: implements `WritableStream`
+  and `FlushableStream`. `write` copies into the bounded buffer or, when the
+  buffer is empty, passes a large write straight through; a full buffer that
+  cannot drain reports `WouldBlock`. `flush` drains the buffer into the source
+  without waiting. `consuming finish(): FinishOutcome<S, BufferedWriter<S>>`
+  makes one drainage attempt. `BorrowedBufferedWriter<S>` retains
+  `borrow writable S $source`, and its `finish` returns
+  `BorrowedFinishOutcome<BorrowedBufferedWriter<S>>`. Dropping either writer
+  flushes what it can; failures cannot escape a destructor, so call `flush` or
+  `finish` to observe them. Capacity below 1, and a `consume` beyond the
+  buffered bytes, panic.
+- **Buffered adapter tiers**: each adapter also implements `ReadinessStream`
+  and the pending tier of its direction (`PendingReadableStream` or
+  `PendingWritableStream`) when its source does, forwarding the source's
+  `readinessSource`. A pending read completes immediately from buffered bytes
+  and otherwise passes through to the source in plan order; a read prepared
+  after the buffered bytes run out in the same plan completes with
+  `WouldBlock`. A writer carries one pending write at a time: free space
+  accepts it immediately, a full buffer drains through one transfer first, and
+  a second concurrent write on the same writer fails at preparation with
+  `IoError` (`Configure`, `TransferGroup`, `InvalidInput`).
+
+Transfers borrow regions only for the call. Successful byte counts lie between
+zero and region length; empty requests succeed with zero progress. The writable
+receiver permits position and buffer-state changes without consuming ownership.
+These interfaces grant neither close nor mode control; nonclosable standard
+views can implement them. Concrete generic paths and deliberate erasure use
+ordinary interface machinery, not another stream object model.
+
+### Typed Registration Keys
+
+`Doria\Std\Io\RegistrationKey<T>` is an opaque inline Copy value identifying
+a registration, not owning its stream. Assignment, argument passing, and return
+leave the original key usable; nullable keys are Copy too. The set retains the
+complete registered value and its static type `T`. Copying a key allocates
+nothing and acquires no handle, reference count, or independent stream loan.
+Keys do not implicitly convert between registered types or to integers.
+Stale and foreign keys are rejected before registration access. Key copies do
+not bypass ordinary set/group borrowing or keep a destroyed set alive. Public
+registration/group member declarations remain in Decision 0110's appendix.
+`register` transfers the complete stream into the set and returns its typed
+key; `unregister` returns the same owned `T`, making other key copies stale.
+Both require writable set access and retain the checked `IoError` contract.
+`getStream` borrows the same registered `T` readonly; `getWritableStream`
+requires writable set access and returns a writable loan. The set keeps the
+complete owner, and either loan prevents incompatible set mutation or teardown.
+Under Decision 0089, `let writable $stream = $set->getWritableStream($key);`
+retains that proved writable loan as a nonowning exclusive local. Plain `let`
+remains readonly; a readonly lookup cannot be upgraded by adding `writable`.
+Registration follows that adapter's current readiness source. Replacing its
+underlying file keeps the same key and complete adapter; future waits and
+transfers use the new source. An already-started operation retains its selected
+source and native resources until retirement. Unchanged sources reuse their
+native association. The public readiness view remains borrowed, not owning.
+These member names are approved; their executable integration remains Stage 36a work.
+`new ReadinessSet()` constructs an empty owning set, with checked `IoError`
+setup failures. Construction registers no stream, performs no transfer, and
+does not eagerly associate a native handle.
+
+```doria
+class ReadinessSet {
+    function __construct() throws IoError;
+    writable function register<T implements ReadinessStream>(take T $stream): RegistrationKey<T> throws IoError;
+    writable function unregister<T>(RegistrationKey<T> $key): T throws IoError;
+    function getStream<T>(RegistrationKey<T> $key): T throws IoError;
+    writable function getWritableStream<T>(RegistrationKey<T> $key): T throws IoError;
+    writable function begin(
+        take TransferPlan $plan,
+        ?Doria\Std\Time\Deadline $deadline = null,
+        ?Doria\Std\Concurrency\CancellationToken $cancellation = null
+    ): TransferGroup throws IoError;
+}
+```
+
+Registration requires the explicit readiness capability, not a byte-transfer
+or pending-transfer capability. Concurrent plan operations separately require
+their applicable pending-transfer contract.
+The optional `deadline` and `cancellation` parameters control the group's
+lifetime, not an individual completion wait. Null omits the control; the group
+retains shared cancellation state without a source loan. Cancellation or a
+group deadline cancels and drains before storage release. A reused set does
+not inherit an earlier group's controls. No `TransferControl` type is added.
+The development signature executes through the interpreter, Cranelift, LLVM,
+and PHP/FFI. macOS validation covers default and named controls, exact deadline
+copying, detached-token retention, control replacement, stopped groups, and set
+reuse; Linux/Windows execution remains unverified.
+
+### Retained Transfer Plans
+
+Decision 0110 names `Doria\Std\Io\TransferPlan` as the consuming configuration
+carrier for concurrent transfers. `TransferPlan::read` starts a read plan;
+consuming `andReadFrom` adds a read without losing earlier destination loans.
+`writeTo` starts a write plan and consuming `andWriteTo` adds a write while
+retaining shared readonly source loans. Either append follows either factory
+and preserves all earlier loans. Each operation requires its exact registered
+pending capability and declares checked `IoError` setup failures:
+
+```doria
+class TransferPlan {
+    static function read<T implements PendingReadableStream>(RegistrationKey<T> $key, writable WritableByteRegion $destination): self throws IoError;
+    consuming function andReadFrom<T implements PendingReadableStream>(RegistrationKey<T> $key, writable WritableByteRegion $destination): self throws IoError;
+    static function writeTo<T implements PendingWritableStream>(RegistrationKey<T> $key, ByteRegion $source): self throws IoError;
+    consuming function andWriteTo<T implements PendingWritableStream>(RegistrationKey<T> $key, ByteRegion $source): self throws IoError;
+    function getReadKey(int $position): ReadTransferKey throws IoError;
+    function getWriteKey(int $position): WriteTransferKey throws IoError;
+}
+```
+
+The readonly key lookups use zero-based positions across the entire mixed plan.
+Negative, out-of-range, or wrong-direction positions throw `IoError` without I/O.
+Those failures use `IoOperation::Access`, `IoTarget::TransferPlan`, and
+`IoErrorReason::InvalidInput`, with a payload-free `TransferPlan` target and null
+`systemCode` and `transferredByteCount`.
+Keys remain stable through consuming appends; repeated operations on one stream
+and operations in separate plans have distinct identities. Key copies retain no
+plan, buffer, or stream loan.
+
+Configuration does no I/O. `begin` consumes the plan through a `take` parameter,
+borrows the set exclusively, and forwards all plan loans into the transfer group.
+Its own checked setup failures use `IoOperation::Configure` and
+`IoTarget::TransferGroup`, preserving reason and system-code details. An
+adapter's original owned checked error propagates unchanged. Failed setup
+consumes the plan, releases its loans, and leaves no active group or submitted work.
+The canonical group retains the set's exclusive borrow and all inherited plan
+loans until cleanup, including through helpers that return the group. Failed
+preparation retires each earlier successful preparation exactly once before
+releasing its selected source; it never submits those prepared operations.
+Generic calls and interface erasure preserve an owned carrier's earlier loans;
+consumption cannot lend the carrier's own storage beyond its destruction.
+Owned-result callback retention is a permitted upper bound: nullable forwarding
+and loan-free null/empty results share the same annotation. Known body proofs
+preserve actual loans without inventing loans for fresh results; opaque calls
+retain the bound. Returned borrowed aliases retain their distinct contract.
+The source bindings stay unavailable until teardown cancels and drains pending
+operations. Completed storage is processed and reused through the group.
+Dropping an unstarted plan releases its loans without submitting operations.
+Competing operations on one stream follow plan order. Independent duplex
+read/write directions may overlap; operations sharing a file cursor compete.
+This orders access to stream bytes, not completion observation across
+independent streams. Partial-transfer outcomes remain unchanged.
+The group returns the next completion identifying the finished read or write,
+without requiring callers to scan transfers or allocate for each observation.
+No available completion and a completed operation with no transfer outcome are
+distinct. Observation retains the group-wide loans; completed storage remains
+accessible through the group, not the original bindings.
+Fetching a failed completion raises the original checked error, rather than
+deferring failure to a completion outcome getter. Its catch can identify the
+failed read or write without scanning; the owned error transfers exactly once
+with optional byte progress preserved. Catching it neither releases the group
+loans nor cancels the other operations.
+If wait infrastructure also fails, the fetch reports that failure first without
+taking a queued transfer result. A later fetch still observes the completed
+bytes or original owned transfer Error exactly once; both observed keys are null
+for the infrastructure failure, which has no transfer identity or byte progress.
+The reusable owner is `Doria\Std\Io\TransferGroup`. Its readonly properties
+`observedReadKey` (`?ReadTransferKey`) and `observedWriteKey`
+(`?WriteTransferKey`) publish the fetched operation's original plan identity
+before raising its error. Only the matching direction is present; both are
+null before the first fetch and after timeout or exhaustion. Resubmission keeps
+the same key, and copying an observed key retains no owner or loan.
+Readonly `getReadRegion(ReadTransferKey $key): ?ByteRegion throws IoError`
+returns null for active work or an unknown completed byte range, but
+a present empty readonly region for known zero-byte completion, including EOF.
+Invalid or foreign keys throw `IoError` with `IoOperation::Access`, appended
+`IoTarget::TransferGroup`, and `IoErrorReason::InvalidInput`, without a path,
+system code or byte progress. The view covers only the completed
+prefix, retains the group loan, and prevents conflicting mutation or access
+after group destruction. Lookup performs no I/O or allocation; resubmission
+makes the previous prefix unavailable. Public group execution is not yet delivered.
+An immediately completed read retires at submission: its known prefix can be
+inspected with the saved original key before fetching. This does not repeat the
+completion callback, take the queued original outcome or Error, publish an
+observed key, or permit reuse before the previous result has been fetched.
+`resubmitRead` / `resubmitWrite` are the approved reuse names: they retain the
+original typed operation key and reuse a checked range of its retained buffer,
+after conflicting region loans end and the previous result has been observed.
+Both require writable group access:
+
+```doria
+writable function resubmitRead(ReadTransferKey $key, int $offset, int $length): void throws IoError;
+writable function resubmitWrite(WriteTransferKey $key, int $offset, int $length): void throws IoError;
+```
+
+They do not create new operations or keys; `begin` submits the initial transfers.
+Invalid resubmission keys or ranges, active operations and unobserved results
+use existing `IoError` with
+`IoOperation::Configure`, `IoTarget::TransferGroup`, and
+`IoErrorReason::InvalidInput`, without a path, system code or byte progress.
+Validation submits no work and consumes no stored transfer Error; actual
+transfer failures still propagate unchanged at `getNextCompletion`.
+`getNextCompletion(Wait $wait)` returns `TransferWaitResult`. Both result types
+are ordinary nominal inline Copy enums in `Doria\Std\Io`:
+
+```doria
+enum TransferCompletion {
+    case Read(ReadTransferKey $key, ?ReadOutcome $outcome);
+    case Write(WriteTransferKey $key, ?WriteOutcome $outcome);
+}
+enum TransferWaitResult {
+    case Completed(TransferCompletion $completion);
+    case TimedOut;
+    case Exhausted;
+}
+```
+
+`Completed(Read($key, null))` identifies a retired read with no transfer outcome,
+not a timeout or exhaustion observation. Actual zero-byte success, would-block,
+EOF, and timed-out read outcomes retain their existing meaning. Copying either
+enum retains no group, stream, or buffer and grants no buffer access. Failed
+fetches still throw the original owned checked Error, not an error-bearing case.
+Timeout and exhaustion observations do not permanently prevent resubmission.
+
+Completion-fetch budgets are separate from group deadlines. Expiry stops only
+the wait; transfers remain active. A typed timeout observation is distinct from
+a completion or exhausted group. Expiry retains loans, identities, and progress,
+allowing another wait and resubmission through the same group without fabricating
+a checked error or transfer outcome.
+Cancellation or an explicit group deadline cancels and drains outstanding transfers.
+Untimed waits require no clock sampling or per-wait allocation.
+`ReadTransferKey` and `WriteTransferKey` are distinct opaque inline Copy
+identifiers for read and write operations, not stream registrations or integer
+indexes. Neither has a public constructor, converts to an integer, or substitutes
+for the other key family. Their transport adds no separate allocation or owner.
+Public group execution and the remaining readiness-member spellings are still
+in-progress Stage 36a work, not a delivered API.
+
+### Owned File Family
+
+Decision 0110 fixes the `Doria\\Std\\Io` names below. `File` is a factory
+companion; its results are owned Move handles, not capability-parameterized
+`File<Capability>` values. Public execution remains in-progress Stage 36a work.
+
+| Factory               | Owned Result   | Transfer Capability |
+|-----------------------|----------------|---------------------|
+| `File::openRead`      | `ReadableFile` | `ReadableStream`    |
+| `File::openWrite`     | `WritableFile` | `WritableStream`    |
+| `File::openReadWrite` | `DuplexFile`   | `DuplexStream`      |
+
+`FileCreation` has cases `OpenExisting`, `OpenOrCreate`, `CreateNew`,
+`TruncateExisting`, and `CreateOrTruncate`. Writable opens require an explicit
+creation choice, with no default. Readable opens use existing files without
+creation/truncation. `FileWriteMode` has exactly `Positioned` and `Append`.
+Both writable factories require an explicit mode with no default, independently
+of creation. Positioned writes use and advance the handle's cursor; every
+`FileWriteMode::Append` write goes to the then current end of the file. Each open has its own
+cursor initially at zero. Each owned file exposes `consuming function close(): void throws
+IoError`; success and checked failure both consume it. Close uses
+`IoOperation::Close`, retains the opening path for errors, and is not retried by
+ordinary nonthrowing destruction. Remaining metadata/option controls reopen through Decision
+0110 before implementation.
+Public owners permit simultaneous readers and writers, with independent cursors.
+Windows shares read and write access but not deletion access; the existing free
+file helpers retain their established sharing contracts.
+
+All three file owners also implement `SeekableStream`, whose writable
+`seek(int $offset, SeekOrigin $origin): int throws IoError` returns the new byte
+position. `SeekOrigin` has exactly `Start`, `Current`, and `End`; origin has no
+default. Each file exposes readonly `getPosition(): int throws IoError` and
+`getLength(): int throws IoError` methods. Seeking requires writable access; inspection requires only
+readonly access and changes neither cursor nor contents. A seek beyond EOF
+does not itself extend the file, and append writes remain placed at the then
+current EOF. Seek uses appended `IoOperation::Seek`; inspection uses `Access`.
+Both preserve the opening-path File target, null byte progress and optional
+system code. Unrepresentable canonical-int results throw `InvalidInput` rather
+than truncating. These declarations are approved Stage 36a contracts; execution
+validation is tracked in the pipeline note, not a claim of complete stage delivery.
+These methods replace the proposed position/length properties. Fresh inspection
+may block; Decision 0135's nonblocking hooks remain unchanged and cannot call
+these methods, including through helpers. There are no property aliases.
+
+WritableFile and DuplexFile expose writable
+`synchronizeData(): void throws IoError` and
+`synchronizeMetadata(): void throws IoError`. The first requests durable data;
+the second full data plus metadata, not runtime-buffer flushing. Neither changes
+position, length or contents. Both may block and are forbidden in property hooks
+directly or through helpers. Failures use appended
+`IoOperation::SynchronizeData` / `IoOperation::SynchronizeMetadata`,
+opening-path File targets, optional system codes and null byte progress.
+Platforms may strengthen data-only synchronization, never weaken either
+guarantee. ReadableFile exposes neither method. Successful controls allocate
+nothing or initialize readiness/async infrastructure.
+
+WritableFile and DuplexFile also expose writable
+`setLength(int $length): void throws IoError`, with a required nonnegative byte
+length. Shrinking discards the tail; growth reads as zero and preserves supported
+sparse behavior. The cursor is unchanged, even beyond EOF; other opens retain
+their cursors and observe fresh length. Append still writes at current EOF.
+Errors use appended `IoOperation::Resize`, the opening-path File target,
+optional system code and null progress. Negative lengths are InvalidInput.
+The call neither consumes the file nor flushes/synchronizes it. It may block and
+is forbidden in property hooks, including through helpers. ReadableFile has
+no resizing method; there is no truncate alias or new interface.
+
+Read-only signatures are `File::openRead(string $path): ReadableFile throws
+IoError`, writable `ReadableFile.read(writable WritableByteRegion
+$destination): ReadOutcome throws IoError`, and consuming
+`ReadableFile.close(): void throws IoError`. Users do not construct either
+`File` or `ReadableFile` directly. Each open has its own position. Reads borrow
+the destination only for the call without copying or allocating another buffer;
+an empty region returns `Data(0)` even at EOF, while a nonempty read at EOF
+returns `EndOfStream`. Read-only integration passes validation; the complete
+file family is not delivered.
+
+Writable signatures are `File::openWrite(string $path, FileCreation $creation,
+FileWriteMode $mode): WritableFile throws IoError` and
+`File::openReadWrite(string $path, FileCreation $creation, FileWriteMode $mode):
+DuplexFile throws IoError`. `WritableFile` implements `WritableStream`;
+`DuplexFile` implements `DuplexStream`. Both expose writable
+`write(ByteRegion $source): WriteOutcome throws IoError`, and the duplex owner
+also exposes the same writable `read` as `ReadableFile`. Neither transfer
+retains its region or consumes its owner. Each owned file has consuming checked
+`close`; direct construction of any file owner remains unavailable.
+Writable native integration passes interpreter/Cranelift/LLVM validation on
+macOS. PHP readable, writable, and duplex files use the same native runtime through
+FFI, including the complete creation/write-placement matrix. Generated native-backed
+PHP must be deployed with its compiler-published `.doria-runtime` directory on a
+matching platform with FFI enabled. Missing, disabled, or mismatched dependencies
+report `B3602`; there is no PHP host-file fallback. Pure PHP stream implementations
+do not require FFI. These local results are not Linux/Windows execution evidence.
+
+`ReadableFile` also implements `PendingReadableStream`, `WritableFile`
+implements `PendingWritableStream`, and `DuplexFile` implements both. Their
+preparation and completion signatures are the exact pending contracts below.
+Preparation selects the supplied region without submitting I/O; completion
+observes the retired request's nullable outcome without another transfer.
+These typed implementation operations are not yet public group execution.
+
+### Readiness Ownership
+
+Decision 0110 requires persistent readiness sets to own registered streams.
+Registration transfers ownership, access goes through the registration, and
+removal returns ownership. Set destruction cleans up remaining streams.
+Registration preserves the registered static type `T`; a typed key identifies
+the registration without owning its stream. Removal returns owned `T`, without
+automatic capability erasure or runtime type discovery. A registered
+`ReadableFile` retains its checked `close()`; an intentionally erased
+`ReadableStream` remains that interface type. Failed registration follows
+ordinary `take` cleanup, not restoration of the caller's moved binding.
+Temporary one-stream waits may borrow for the call. Public readiness spellings
+and execution remain part of the in-progress Stage 36a surface.
+`ReadinessStream` exposes `ReadinessSource $readinessSource { borrowed get; }`.
+Custom adapters expose an opaque borrowed readiness source explicitly, forwarding
+the receiver's loan without acquiring ownership or a public platform handle.
+Waiting uses the shared native core, while transfers dispatch through the
+complete registered adapter. A transfer interface alone does not imply readiness;
+erased values must retain the capability statically. `ReadinessSource` has no
+public constructor or operations. Formation performs no I/O or allocation, and
+native association is lazy rather than part of synchronous file opening.
+Concurrent transfers use one exclusively borrowing group. Original set and
+buffer bindings remain unavailable until that group releases its loans;
+completed buffers may be processed and reused through it while other operations
+remain pending. Teardown drains pending operations before releasing storage.
+This does not add independent registration borrowing or general borrowed fields.
+Decision 0136 allows an adapter's separately owned stored file and buffer paths
+to be borrowed independently. Their lifetime owner and containing properties
+cannot be moved, replaced, or destroyed during either loan. Selected storage
+remains protected until retirement; different indices or ranges of one buffer
+do not establish independent ownership.
+Concurrent adapters require an explicit pending-transfer capability rather than
+only a readiness source. Preparation and completion dispatch through the complete
+adapter using group-owned stable request slots; ordinary synchronous method
+bodies are not suspended. Completion runs exactly once after retirement,
+including actual progress that wins cancellation. Ordinary synchronous adapters
+retain their existing contract. Public execution remains in-progress Stage 36a
+work.
+
+### Pending Adapter Capabilities
+
+Decision 0110 fixes these `Doria\Std\Io` members:
+
+- **`PendingReadableStream`** extends `ReadableStream` and `ReadinessStream`:
+  writable `prepareRead(writable ReadRequest $request, writable
+  WritableByteRegion $destination): void throws IoError` and writable
+  `completeRead(ReadRequest $request, writable WritableByteRegion
+  $destination): ?ReadOutcome throws IoError`.
+- **`PendingWritableStream`** extends `WritableStream` and `ReadinessStream`:
+  writable `prepareWrite(writable WriteRequest $request, ByteRegion
+  $source): void throws IoError` and writable `completeWrite(WriteRequest
+  $request, ByteRegion $source): ?WriteOutcome throws IoError`.
+- **`ReadRequest`**: opaque call-scoped view of a reusable group slot;
+  readonly `?ReadOutcome $outcome { get throws IoError; }` and writable
+  `complete(ReadOutcome $outcome): void` for immediate preparation.
+- **`WriteRequest`**: corresponding write slot with readonly
+  `?WriteOutcome $outcome { get throws IoError; }` and writable
+  `complete(WriteOutcome $outcome): void`.
+
+Neither request is constructible, consumable, or independently retained.
+Preparation selects group/registered-owner storage without submitting I/O;
+completion receives the original group region after retirement. `outcome`
+preserves checked failures, and `complete` cannot retire an active native request.
+Both adapter operations are nonblocking, including helpers and cleanup. See
+Decision 0110 for exact-once completion and cancellation progress.
+
+Pending getters and completion returns are nullable only when no transfer
+outcome exists. Completion still releases prepared storage if cancellation or
+later setup failure prevents submission. Buffered/in-memory immediate outcomes
+are retained even without native submission; zero-byte success and `WouldBlock`
+are actual outcomes, not absence. Ordinary transfer enums and synchronous
+`read`/`write` returns remain unchanged.
 
 ## Invalidated elsewhere
 
@@ -231,4 +805,6 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
 - Decision 0114 replaces the unauthored enum subject. Unit, backed, and payload
   enums are executable core-language values, and implemented Decision 0115
   completes core `match`, `if` pattern guards, and explicit whole-scrutinee
-  consumption. Generic enums remain deferred.
+  consumption. The approved general generic-enum extension belongs to Stage 36a;
+  its implementation remains pending. Website versioned guide/API reference and
+  playground synchronization for the finish result declarations remains open.

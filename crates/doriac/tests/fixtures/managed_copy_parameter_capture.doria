@@ -1,0 +1,21 @@
+use Doria\Std\Concurrency\{CancellationSource, CancellationToken};
+enum Packet { case Token(CancellationToken $token); }
+class Owner { function __construct(writable CancellationToken $value) {} }
+function capture(writable CancellationToken $value): function(): CancellationToken {
+    return fn() with (take $value) => $value;
+}
+function capturePacket(writable Packet $value): function(): Packet {
+    return fn() with (take $value) => $value;
+}
+function main(): void {
+    let $source = new CancellationSource();
+    let writable $token = $source->token;
+    let $callback = capture($token);
+    if ($callback() != $token || $token != $source->token) { panic("managed Copy capture"); }
+    let writable $packet = Packet::Token($token);
+    let $packetCallback = capturePacket($packet);
+    if ($packetCallback() != $packet || $packet != Packet::Token($token)) { panic("managed Copy enum capture"); }
+    let $owner = new Owner($token);
+    if ($owner->value != $token || $token != $source->token) { panic("managed Copy promotion"); }
+    echo "managed copy captures passed";
+}

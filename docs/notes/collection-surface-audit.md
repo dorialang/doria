@@ -35,6 +35,11 @@ duplication independently. Non-Cloneable Move inputs remain rejected rather
 than consumed. Public Iterable execution borrows Move elements; optimized
 built-in loops and foreach-only projections retain their existing contracts.
 
+The original PHP refusal finding in section 6 is historical, not a current
+coverage matrix. Compatibility lowering now supports selected default-collection
+operations, including owned `List::removeAt`; unsupported members retain B2301.
+The compiler backend tests own the current operation-by-operation evidence.
+
 ## 1. Correction to the reported symptom
 
 The audit was prompted by the report that `Dictionary` and `SortedDictionary`

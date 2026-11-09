@@ -28,6 +28,29 @@ pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
+    let declarations = crate::semantics::conditional_capabilities::check_declarations(program);
+    if !declarations.diagnostics.is_empty() {
+        return Err(declarations.diagnostics);
+    }
+    if let Some(span) = declarations.first_condition {
+        if matches!(
+            semantic_info.callable_admissions,
+            crate::semantics::CallableAdmissions::Unprepared
+        ) {
+            return Err(vec![Diagnostic::internal_compiler_error(
+                "conditional callable admissions are missing",
+                "conditional lowering requires checked source admission facts",
+                span,
+            )]);
+        }
+    }
+    lower_checked_program_with_semantics(program, semantic_info)
+}
+
+fn lower_checked_program_with_semantics(
+    program: &ast::Program,
+    semantic_info: crate::semantics::SemanticInfo,
+) -> DiagnosticResult<hir::Program> {
     if let Err(details) = semantic_info.composition.validate(program) {
         let span = program
             .items
@@ -230,6 +253,18 @@ fn apply_global_identities(
             .find(|declaration| declaration.declaration_span == span)
         {
             *global_id = Some(declaration.id.clone());
+        }
+        if let hir::Item::Class(class) = item {
+            for method in class
+                .members
+                .iter_mut()
+                .flat_map(hir::ClassMember::callables_mut)
+            {
+                if let Some(context) = semantic_info.compilation_contexts.get(&method.span.source) {
+                    method.source_identity = context.source.clone();
+                    method.package = context.package.clone();
+                }
+            }
         }
     }
 }
@@ -522,6 +557,7 @@ fn apply_expr_checked_error_semantics(
                     object,
                     property: method,
                     null_safe,
+                    take: false,
                     span: call.callee_span,
                 }),
                 args,
@@ -740,7 +776,7 @@ fn lower_class(class_decl: &ast::ClassDecl) -> Result<hir::ClassDecl, Diagnostic
         implements: class_decl
             .implements
             .iter()
-            .map(ToString::to_string)
+            .map(|entry| entry.ty.to_string())
             .collect(),
         members: class_decl
             .members
@@ -842,14 +878,27 @@ fn lower_function(
     function: &ast::FunctionDecl,
     class_name: Option<ClassContext<'_>>,
 ) -> Result<hir::FunctionDecl, Diagnostic> {
-    let body = function.body.as_block().ok_or_else(|| {
-        Diagnostic::new(
-            "E0749",
-            "an executable function must have a body",
-            function.body.span(),
-        )
-        .with_title("Function Body Is Required")
-    })?;
+    let (body, intrinsic) = match &function.body {
+        ast::FunctionBody::Block(body) => (lower_block(body, class_name), None),
+        ast::FunctionBody::Intrinsic {
+            implementation,
+            span,
+        } if span.source == implementation.source_id() => (
+            hir::Block {
+                statements: Vec::new(),
+                span: *span,
+            },
+            Some(*implementation),
+        ),
+        _ => {
+            return Err(Diagnostic::new(
+                "E0749",
+                "an executable function must have a body",
+                function.body.span(),
+            )
+            .with_title("Function Body Is Required"))
+        }
+    };
     Ok(hir::FunctionDecl {
         global_id: None,
         source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
@@ -860,7 +909,8 @@ fn lower_function(
         open_span: function.open_span,
         is_override: function.is_override,
         override_span: function.override_span,
-        writable_this: function.writable_this,
+        writable_this: function.has_writable_receiver(),
+        consuming_this: function.consuming_this,
         is_static: function.is_static,
         name: function.name.clone(),
         type_params: function
@@ -894,7 +944,8 @@ fn lower_function(
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
         test_assertion_checked_effects: Vec::new(),
-        body: lower_block(body, class_name),
+        body,
+        intrinsic,
         modifier_prefix_span: function.modifier_prefix_span,
         span: function.span,
     })
@@ -1338,12 +1389,14 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             object,
             property,
             null_safe,
+            take_span,
             span,
             ..
         } => hir::Expr::PropertyAccess {
             object: Box::new(lower_expr(object, class_name)),
             property: property.clone(),
             null_safe: *null_safe,
+            take: take_span.is_some(),
             span: *span,
         },
         ast::Expr::MethodCall {

@@ -1,5 +1,11 @@
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
+
+#[path = "common/php_execution.rs"]
+mod php_execution;
 
 fn lower_hook_integration_hir(source: &str) -> doriac::hir::Program {
     doriac::lower_source("hooks.doria", source)
@@ -17,12 +23,44 @@ fn assert_hook_execution(source: &str, stdout: &str) {
     assert_eq!(result.stderr, b"");
     assert_eq!(result.exit_status, 0);
     assert!(result.runtime_diagnostic.is_none());
-    native_execution::assert_native_execution(&mir, doriac::backend::NativeProfile::Fast, stdout);
-    #[cfg(feature = "llvm-backend")]
-    native_execution::assert_native_execution(
-        &mir,
-        doriac::backend::NativeProfile::Release,
-        stdout,
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, stdout);
+    }
+}
+
+#[test]
+fn generic_type_formation_preserves_declared_owned_factory_results() {
+    assert_hook_php_execution(
+        include_str!("fixtures/generic_type_formation_factory.doria"),
+        "box;item;box;item;formed;",
+    );
+}
+
+#[test]
+fn nominal_error_message_reads_support_generic_and_nullable_receivers() {
+    assert_hook_php_execution(
+        r#"
+class Failure implements Error { function __construct(string $message) {} }
+function message<T implements Error>(T $error): string { return $error->message; }
+function nullableMessage<T implements Error>(?T $error): ?string { return $error?->message; }
+function optionalMessage(?Failure $error): ?string { return nullableMessage($error); }
+function main(): void {
+    let $error = new Failure("ordinary;");
+    echo message($error);
+    let $present = new Failure("nullable;");
+    echo optionalMessage($present) ?? "missing;";
+    echo optionalMessage(null) ?? "none;";
+}
+"#,
+        "ordinary;nullable;none;",
+    );
+}
+
+#[test]
+fn nongeneric_trait_method_parameters_remain_independent_during_execution() {
+    assert_hook_php_execution(
+        include_str!("fixtures/nongeneric_trait_method_parameters.doria"),
+        "box;7;plain;",
     );
 }
 
@@ -68,8 +106,8 @@ fn assert_hook_php_execution(source: &str, stdout: &str) {
         "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").unwrap()
     );
-    let run = std::process::Command::new("php")
-        .args(["-r", &script])
+    let run = php_execution::Script::new(&script)
+        .command(&[])
         .output()
         .unwrap();
     assert!(
@@ -258,6 +296,27 @@ function main(): void {
     echo ($first->value ?? -1) . " " . ($second->value ?? -1) . "\n";
 }
 "#;
+    let hir = lower_hook_integration_hir(source);
+    for kind in [
+        doriac::ast::PropertyHookKind::Get,
+        doriac::ast::PropertyHookKind::Set,
+    ] {
+        let name = doriac::property_hooks::accessor_name("value", kind);
+        let root = hir
+            .semantic_info
+            .method_hierarchy
+            .values()
+            .find(|method| method.declaring_class == "Base" && method.name == name)
+            .expect("generic property accessor has a canonical hierarchy root");
+        let derived = hir
+            .semantic_info
+            .method_hierarchy
+            .values()
+            .find(|method| method.declaring_class == "Derived" && method.name == name)
+            .expect("overridden accessor has canonical hierarchy metadata");
+        assert_eq!(derived.virtual_root, Some(root.declaration));
+        assert_eq!(derived.overridden_declaration, Some(root.declaration));
+    }
     assert_hook_php_execution(source, "42 -1\n");
 }
 
@@ -626,19 +685,23 @@ fn cached_validated_and_temperature_properties_execute_through_public_backends()
     for (source, stdout, php_boundary) in [
         (include_str!("../../../examples/native/main_stage36_temperature.doria"),
          "freezing: 32.0 F\nboiling: 100.0 C; 212.0 F\n",
-         "canonical `%f` float formatting"),
+         Some("canonical `%f` float formatting")),
         (include_str!("../../../examples/native/main_stage36_cached_property.doria"),
          "first: 39\nagain: 39\ncalculations: 1\n",
-         "checked integer overflow"),
+         None),
         (include_str!("../../../examples/native/main_stage36_validated_property.doria"),
          "price: choose a price before reading the total\ntotal: 36\nquantity: quantity must be positive\nkept: 3; total: 36\n",
-         "checked integer overflow"),
+         None),
     ] {
-        assert_hook_execution(source, stdout);
-        let diagnostics = doriac::compile_source_to_php("hook-numeric-compatibility.doria", source)
-            .expect_err("PHP must retain its numeric compatibility boundaries inside hooks");
-        assert!(diagnostics.iter().all(|diagnostic| diagnostic.code == "B1301"
-            && diagnostic.message.contains(php_boundary)), "{diagnostics:?}");
+        if let Some(php_boundary) = php_boundary {
+            assert_hook_execution(source, stdout);
+            let diagnostics = doriac::compile_source_to_php("hook-numeric-compatibility.doria", source)
+                .expect_err("PHP retains its canonical float formatting boundary");
+            assert!(diagnostics.iter().all(|diagnostic| diagnostic.code == "B1301"
+                && diagnostic.message.contains(php_boundary)), "{diagnostics:?}");
+        } else {
+            assert_hook_php_execution(source, stdout);
+        }
     }
 }
 
@@ -843,6 +906,47 @@ function main(): void {
             "receiver\nget\nrhs\nset 3\ndrop 1\ncaught set\n"
         ),
     );
+}
+
+#[test]
+fn setter_backing_replacement_rejects_blocking_destruction_in_concrete_and_generic_owners() {
+    for (declaration, parameter, constructor) in [
+        ("Store", "Item", "new Store()"),
+        ("Store<T>", "T", "new Store<Item>()"),
+    ] {
+        let source = format!(
+            r#"
+class Item {{
+    function __destruct() {{ try {{ echo "drop"; }} catch (Error) {{}} }}
+}}
+class {declaration} {{
+    writable ?{parameter} $item = null {{
+        borrowed get => $this->item;
+        set (take ?{parameter} $next) => $this->item = $next;
+    }}
+}}
+function main(): void {{ let writable $store = {constructor}; $store->item = new Item(); }}
+"#
+        );
+        let (_, analysis) =
+            doriac::analyze_source_for_ide("blocking-setter.doria", &source).unwrap();
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0770"),
+            "{source}: {:?}",
+            analysis.diagnostics
+        );
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == "E0770"),
+            "{source}: {:?}",
+            analysis.diagnostics
+        );
+    }
 }
 
 #[test]
@@ -1150,7 +1254,7 @@ function inspect(Container<int> $container): int { return $container->computed; 
             let getter = hooks.getter.as_ref().unwrap();
             assert_eq!(
                 getter.receiver_mode,
-                doriac::symbols::ReceiverMode::Readonly
+                Some(doriac::symbols::ReceiverMode::Readonly)
             );
             assert_eq!(Some(&getter.signature.return_type), property.ty.as_ref());
             assert!(getter.return_borrow.is_none(), "specialized Copy result");
@@ -1203,7 +1307,7 @@ function inspect(Child $child, Base<int> $copy): void {}
         .getter
         .as_ref()
         .unwrap();
-    assert_eq!(getter.receiver_mode, ReceiverMode::Readonly);
+    assert_eq!(getter.receiver_mode, Some(ReceiverMode::Readonly));
     assert_eq!(
         getter.signature.return_type,
         ResolvedType::Class(ClassType::new("Item", Vec::new()))
@@ -1219,6 +1323,7 @@ function inspect(Child $child, Base<int> $copy): void {}
             source: BorrowSource::Receiver,
             writable: false,
             kind: doriac::types::ReturnBorrowKind::Value,
+            lifetime: doriac::types::RetainedLifetime::LastUse,
         })
     );
     assert_eq!(member("item").declaring_class.name, "Base");
@@ -1226,14 +1331,14 @@ function inspect(Child $child, Base<int> $copy): void {}
     let cached = member("cached").hooks.as_ref().unwrap();
     assert_eq!(
         cached.getter.as_ref().unwrap().receiver_mode,
-        ReceiverMode::Writable
+        Some(ReceiverMode::Writable)
     );
     assert!(cached.setter.is_none());
     assert!(!member("cached").writable);
     let sink = member("sink").hooks.as_ref().unwrap();
     assert!(sink.getter.is_none());
     let setter = sink.setter.as_ref().unwrap();
-    assert_eq!(setter.receiver_mode, ReceiverMode::Writable);
+    assert_eq!(setter.receiver_mode, Some(ReceiverMode::Writable));
     assert_eq!(setter.signature.return_type, ResolvedType::Void);
     assert_eq!(setter.signature.parameters.len(), 1);
     assert_eq!(
@@ -1566,7 +1671,10 @@ function generic<T implements Counter>(writable T $counter): int {
             }
             if let Some(parameter) = &call.parameter {
                 assert_eq!(parameter.r#type, ResolvedType::Integer(IntegerType::Int64));
-                assert!(call.receiver_mode.is_writable());
+                assert_eq!(
+                    call.receiver_mode,
+                    Some(doriac::symbols::ReceiverMode::Writable)
+                );
             } else {
                 assert_eq!(call.return_type, ResolvedType::Integer(IntegerType::Int64));
             }
@@ -1885,7 +1993,10 @@ function inspect<T implements {constraints}>(T $value): int {{ return $value->va
             .getter
             .as_ref()
             .unwrap();
-        assert!(!call.receiver_mode.is_writable());
+        assert_eq!(
+            call.receiver_mode,
+            Some(doriac::symbols::ReceiverMode::Readonly)
+        );
     }
     for constraints in ["Number, Text", "Text, Number"] {
         let source = format!(
@@ -1943,7 +2054,7 @@ function main(): void {}
     assert_eq!(both.requirements[0].accessor, Some(PropertyHookKind::Get));
     assert_eq!(both.requirements[0].origins.len(), 2);
     assert_eq!(both.requirements[1].accessor, Some(PropertyHookKind::Set));
-    assert!(both.requirements[1].writable_receiver);
+    assert!(both.requirements[1].receiver_mode.is_writable());
     assert!(analysis
         .info
         .contracts
@@ -2919,6 +3030,7 @@ class Example {
                     source: BorrowSource::Receiver,
                     writable: false,
                     kind: doriac::types::ReturnBorrowKind::Value,
+                    lifetime: doriac::types::RetainedLifetime::LastUse,
                 }),
                 "{}",
                 property.name
@@ -3062,6 +3174,7 @@ class Example {
                         source: BorrowSource::Receiver,
                         writable: false,
                         kind: doriac::types::ReturnBorrowKind::Value,
+                        lifetime: doriac::types::RetainedLifetime::LastUse,
                     })
                 );
             }
@@ -3175,6 +3288,7 @@ class Example {
                         } else {
                             doriac::types::ReturnBorrowKind::Retained
                         },
+                        lifetime: doriac::types::RetainedLifetime::LastUse,
                     }),
                     "{}",
                     property.name
@@ -3215,11 +3329,25 @@ class Source {
                 .then_some(summary)
         })
         .expect("getter is included in retained-source analysis");
+    let values = analysis
+        .info
+        .classes
+        .iter()
+        .find(|class| class.name == "Source")
+        .unwrap()
+        .properties
+        .iter()
+        .find(|property| property.name == "values")
+        .unwrap()
+        .id;
     assert_eq!(
         summary.returns,
         [doriac::ownership::RetainedSource {
             source: doriac::symbols::BorrowSource::Receiver,
             inherited: false,
+            writable: false,
+            lifetime: doriac::types::RetainedLifetime::Cleanup,
+            owned_path: vec![values],
         }]
     );
 }

@@ -1,0 +1,1 @@
+new token argument;new resource readonly;inspect readonly argument;drop resource readonly;answer 42;new resource temporary;new product temporary;drop resource temporary;product temporary;new resource chain;pass chain;set 7;pass chain;chain live 7;close chain;drop resource chain;closed;drop product temporary;argument live argument;drop token argument;

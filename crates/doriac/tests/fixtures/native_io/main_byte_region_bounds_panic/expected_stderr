@@ -1,0 +1,16 @@
+Panic[P1301]: Byte Index Is Out Of Bounds
+
+Where
+examples/native/main_byte_region_bounds_panic.doria · line 19 · main
+
+ 19          echo $view[index()];
+                  ^^^^^^^^^^^^^^
+                  Invalid Byte Index
+
+Why
+The byte index is outside the valid range of this byte buffer or region.
+
+Call Path
+main · examples/native/main_byte_region_bounds_panic.doria:19
+
+Process Exited With Status 101

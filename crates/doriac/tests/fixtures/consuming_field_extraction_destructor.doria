@@ -1,0 +1,33 @@
+class Drops {
+    static writable int $sources = 0;
+    static writable int $owners = 0;
+    static writable int $buffers = 0;
+}
+
+class Source {
+    function __construct(int $id) {}
+    function __destruct(): void { Drops::sources++; }
+}
+
+class Buffer {
+    function __construct(int $size) {}
+    function __destruct(): void { Drops::buffers++; }
+}
+
+class Owner {
+    function __construct(take Source $source, take Buffer $buffer) {}
+    function __destruct(): void { Drops::owners++; }
+    consuming function release(): Source {
+        return take $this->source;
+    }
+}
+
+function main(): void {
+    let $owner = new Owner(new Source(1), new Buffer(2));
+    let $source = $owner->release();
+    echo Drops::owners . ":" . Drops::buffers . ":" . Drops::sources . ";";
+    {
+        let $other = new Owner(new Source(3), new Buffer(4));
+    }
+    echo Drops::owners . ":" . Drops::buffers . ":" . Drops::sources . "\n";
+}

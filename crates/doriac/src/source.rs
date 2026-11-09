@@ -1,6 +1,22 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SourceId(pub u32);
 
+impl SourceId {
+    /// Sources embedded in the compiler. Authored sources never receive these
+    /// identities, and no editor or report can open them.
+    pub const COMPILER_OWNED: [SourceId; 5] = [
+        crate::compiler_known_contracts::SOURCE_ID,
+        crate::compiler_known_io::SYNTHETIC_SOURCE_ID,
+        crate::compiler_known_stream::SOURCE_ID,
+        crate::compiler_known_time::SOURCE_ID,
+        crate::compiler_known_concurrency::SOURCE_ID,
+    ];
+
+    pub fn is_compiler_owned(self) -> bool {
+        Self::COMPILER_OWNED.contains(&self)
+    }
+}
+
 /// A compiler-owned expansion of authored syntax. Zero denotes source syntax.
 /// Locations remain real byte ranges; this identity separates semantic facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

@@ -18,6 +18,14 @@ Answer the literal question at the level requested.
 
 ## Stage, Slice, Beat, And Status Questions
 
+Lead progress reports with an estimated overall completion percentage. Base it
+on the full requested scope, including implementation, verification and required
+integration. Label estimates clearly; test counts are supporting evidence and
+must not be presented as the completion percentage. Follow with a brief account
+of the remaining work. Use a fixed, explicit scope and weighting across reports;
+explain any changed scope or accounting before revising the percentage. Never
+invent a numerical baseline to make an earlier estimate appear consistent.
+
 When Andrew asks about a stage, slice, beat, dependency, or implementation state,
 report:
 
@@ -87,23 +95,37 @@ Do not broaden a narrow question into a redesign unless he asks for one.
 
 ## Decision Requests Must Be Self-Contained
 
-Whenever Andrew's input is needed, restate each issue, the meaningful choices,
-their practical tradeoffs, and the recommendation in the current reply. Use a
-short numbered summary in plain language, with a small example where useful.
+Whenever Andrew's input is needed, give a short numbered summary in plain
+language. For each issue, state the actual question, a concrete example,
+explicitly labelled **Pros** and **Cons** for each viable option, and the
+recommendation with its reason. A compact comparison table is appropriate.
+An abbreviated recommendation with one cost mentioned is not this breakdown.
 Do not refer him to questions "above", earlier messages, another chat, or tool
 question cards as a substitute. He must be able to decide from that reply alone.
 This also applies to blocked-status reports and repeated decision requests.
 Keep the summary concise; do not bury the choices in a progress report.
+Do not repeatedly post unchanged decision reminders while independent work
+continues; repetition is not a substitute for the requested explanation.
 
 Keep a pending decision visible when reporting stalled work; unrelated monitor
 updates are not progress on the implementation. When Andrew answers, apply the
 ruling and resume. Do not re-request established workflow authorization unless
 the repository, destination, or action is outside its actual approved scope.
 
+A pending question holds only the action that needs its answer. Keep the goal
+active and continue useful authorized work elsewhere. Repeated mentions of a
+question during productive turns do not establish a persistent impasse. Mark a
+goal blocked only when no meaningful authorized work remains and the applicable
+consecutive-turn threshold is met. Use structured input requests when available;
+do not claim a chat-list attention indicator appeared without verifying it.
+
 Interpret short cancellations in their conversational context. "Never mind"
 after a question cancels that question, not unrelated implementation work.
 Read the original exchange before repeating another agent's claim that work
 was stopped; do not broaden the cancellation beyond its actual referent.
+Compacted histories may reorder an older reply around fresh policy or
+environment text. Verify the original timestamp, message identity, and preceding
+question before treating that reply as a new cancellation.
 
 ## Codex Prompt Delivery
 

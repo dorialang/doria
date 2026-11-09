@@ -43,17 +43,18 @@ fn package_graph_executes_identically_across_all_enabled_backends() {
         if host_linker_is_available() {
             let mut native_graph = graph.clone();
             native_graph.build_plan.compiler.target = CompilerTarget::Native;
-            native_graph.build_plan.compiler.native_profile = Some(BuildNativeProfile::Fast);
-            let native =
-                doriac::compile_compilation_graph(&native_graph).expect("Cranelift package graph");
-            assert_native_output(&fixture, "cranelift", native, &root, &expected_stdout);
-
-            #[cfg(feature = "llvm-backend")]
-            {
-                native_graph.build_plan.compiler.native_profile = Some(BuildNativeProfile::Release);
-                let llvm =
-                    doriac::compile_compilation_graph(&native_graph).expect("LLVM package graph");
-                assert_native_output(&fixture, "llvm", llvm, &root, &expected_stdout);
+            for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+                if !profile.native().is_available() {
+                    continue;
+                }
+                let backend = match profile {
+                    BuildNativeProfile::Fast => "cranelift",
+                    BuildNativeProfile::Release => "llvm",
+                };
+                native_graph.build_plan.compiler.native_profile = Some(profile);
+                let native = doriac::compile_compilation_graph(&native_graph)
+                    .unwrap_or_else(|error| panic!("{backend} package graph: {error:?}"));
+                assert_native_output(&fixture, backend, native, &root, &expected_stdout);
             }
         }
 

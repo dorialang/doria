@@ -1,0 +1,119 @@
+enum Packet { case Number(int $value); case Empty; }
+
+function make(int $value): Packet { return Packet::Number($value); }
+function number(Packet $value): int {
+    return match ($value) { Packet::Number($number) => $number, Packet::Empty => -1, };
+}
+function replace(writable Packet $value, int $number): int {
+    $value = make($number);
+    return number($value);
+}
+
+function localStorage(int $iterations): int {
+    let writable $value = Packet::Empty;
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $value = make($index);
+        $sum += number($value);
+        $index++;
+    }
+    return $sum;
+}
+
+function parameterStorage(int $iterations): int {
+    let writable $value = Packet::Empty;
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $sum += replace($value, $index);
+        $index++;
+    }
+    if (number($value) != -1) { panic("private Copy parameter changed its caller"); }
+    return $sum;
+}
+
+function capturedStorage(int $iterations): int {
+    let writable $value = Packet::Empty;
+    let $snapshot = $value;
+    let writable $replace = function(int $number): int with (writable $value) {
+        $value = make($number);
+        return number($value);
+    };
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $sum += $replace($index);
+        $index++;
+    }
+    if (number($snapshot) != -1 || number($value) != $iterations - 1) {
+        panic("captured home or independent Copy snapshot changed");
+    }
+    return $sum;
+}
+
+function callbackStorage(int $iterations): int {
+    let writable $value = Packet::Empty;
+    let $snapshot = $value;
+    let $replace = function(writable Packet $value, int $number): int {
+        $value = make($number);
+        return number($value);
+    };
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $sum += $replace($value, $index);
+        $index++;
+    }
+    if (number($snapshot) != -1 || number($value) != $iterations - 1) {
+        panic("writable callback changed its home or Copy snapshot");
+    }
+    return $sum;
+}
+
+function ownedCapture(Packet $value): function writable(int): int {
+    return function(int $number): int with (take $value) {
+        $value = make($number);
+        return number($value);
+    };
+}
+
+function ownedCaptureStorage(int $iterations): int {
+    let writable $value = Packet::Empty;
+    let writable $replace = ownedCapture($value);
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $sum += $replace($index);
+        $index++;
+    }
+    if (number($value) != -1) { panic("owned Copy capture changed its source"); }
+    return $sum;
+}
+
+class Failure implements Error { function __construct(string $message) {} }
+function fail(): Packet throws Failure { throw new Failure("failed replacement"); }
+function failedReplacement(): int {
+    let writable $value = make(7);
+    let writable $replace = function(): void with (writable $value) { $value = fail(); };
+    try { $replace(); } catch (Failure) {}
+    return number($value);
+}
+
+class Holder { writable Packet $value = Packet::Empty; }
+
+function propertyStorage(int $iterations): int {
+    let writable $holder = new Holder();
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        $holder->value = make($index);
+        $sum += number($holder->value);
+        $index++;
+    }
+    return $sum;
+}
+
+function main(): void {
+    echo localStorage(4) . ";" . parameterStorage(4) . ";" . capturedStorage(4) . ";" . callbackStorage(4) . ";" . ownedCaptureStorage(4) . ";" . propertyStorage(4) . ";" . failedReplacement();
+}

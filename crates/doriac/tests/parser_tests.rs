@@ -573,7 +573,7 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable
         class
             .implements
             .iter()
-            .map(ToString::to_string)
+            .map(|entry| entry.ty.to_string())
             .collect::<Vec<_>>(),
         ["Vendor\\Contracts\\Printable"]
     );
@@ -1846,6 +1846,32 @@ fn rejects_unsupported_visibility_member_syntax() {
         assert!(
             err.iter().any(|diagnostic| diagnostic.code == "P0001"),
             "expected parse diagnostic for source `{source}`"
+        );
+    }
+}
+
+#[test]
+fn reserved_words_name_members_but_not_free_functions() {
+    // Decision log entry 39: after `->`, `?->`, `::` or a member `function`, a
+    // reserved future keyword can never begin its own syntax.
+    let source = r#"
+class Worker {
+    function spawn(): int { return 1; }
+    static function scope(): int { return 2; }
+    function async(): int { return 3; }
+    function await(): int { return 4; }
+}
+function main(): void {
+    let $worker = new Worker();
+    echo $worker->spawn() + Worker::scope() + $worker?->async() + $worker->await();
+}
+"#;
+    doriac::parse_source("reserved-members.doria", source).expect("reserved member names parse");
+    for word in ["spawn", "async", "await", "scope"] {
+        let source = format!("function {word}(): void {{}}");
+        assert!(
+            doriac::parse_source("reserved-function.doria", &source).is_err(),
+            "free function named {word} must stay reserved"
         );
     }
 }

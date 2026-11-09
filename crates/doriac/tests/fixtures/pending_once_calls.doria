@@ -1,0 +1,57 @@
+class Events { static writable string $text = ""; }
+function note(string $value): void { Events::text = Events::text . $value . ";"; }
+class Token {
+    function __construct(string $name) { note("new " . $this->name); }
+    function __destruct() { note("drop " . $this->name); }
+}
+class Failure implements Error { function __construct(string $message) {} }
+function drop(take Token $value): void {}
+function failNumber(): int throws Failure { note("fail"); throw new Failure("argument"); }
+function failToken(): Token throws Failure { note("fail token"); throw new Failure("argument"); }
+function makeOnce(string $name): function once(take Token, int): int throws Failure {
+    let $token = new Token($name);
+    return function(take Token $argument, int $mode): int with (take $token) {
+        note("enter " . $mode);
+        if ($mode == 0) { throw new Failure("body"); }
+        drop($argument);
+        drop($token);
+        return $mode;
+    };
+}
+function makeRepeat(string $name): function(take Token, int): int {
+    let $token = new Token($name);
+    return function(take Token $argument, int $mode): int with (take $token) {
+        note($token->name);
+        drop($argument);
+        return $mode;
+    };
+}
+function main(): void {
+    try {
+        let $once = makeOnce("local");
+        $once(new Token("arg"), failNumber());
+    } catch (Failure) { note("caught local"); }
+    try {
+        let $once = makeOnce("nested");
+        if ($once(new Token("nested arg"), failNumber()) == 0) { panic("failed argument returned"); }
+    } catch (Failure) { note("caught nested"); }
+    try {
+        makeOnce("temporary")(new Token("temp arg"), failNumber());
+    } catch (Failure) { note("caught temporary"); }
+    try {
+        makeOnce("first")(failToken(), 1);
+    } catch (Failure) { note("caught first"); }
+    try {
+        makeRepeat("repeat")(new Token("repeat arg"), failNumber());
+    } catch (Failure) { note("caught repeat"); }
+    try {
+        let $once = makeOnce("success");
+        let $result = $once(new Token("success arg"), 1);
+        note("success " . $result);
+    } catch (Failure) { panic("successful once call failed"); }
+    try {
+        let $once = makeOnce("body");
+        $once(new Token("body arg"), 0);
+    } catch (Failure) { note("caught body"); }
+    echo Events::text;
+}

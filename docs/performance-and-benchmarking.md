@@ -495,4 +495,10 @@ are reused; synchronous startup initializes no async infrastructure; and bounded
 operations remain bounded. Timing thresholds run on curated, controlled runners
 because shared CI noise is not a reliable regression signal. Thresholds, runner
 identity, compiler revision, build flags, sample count, and raw results are
-versioned with the harness before the Stage 36a gate can pass.
+versioned with the harness whenever controlled measurements are made. The
+portable Stage 36a gate requires correctness, structural baselines, provenance,
+commands, and report schemas; Decision 0112's binding `1.30` native acceptance
+rule is unchanged. Without an eligible runner, record `Measurement Status:
+Pending Available Runner`, not Pass. Hardware availability must not block
+Stage 36a completion or later language development. Pending evidence permits
+neither timing-baseline promotion nor comparative performance claims.

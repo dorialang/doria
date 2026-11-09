@@ -1,0 +1,7 @@
+suffix 3:10
+attempt 0; offset 2; accepted 2
+suffix 1:30
+attempt 1; offset 2; accepted -1
+suffix 1:30
+attempt 2; offset 3; accepted 1
+attempt 3; offset 3; accepted 0

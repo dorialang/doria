@@ -1,0 +1,14 @@
+trait Identity {
+    function identity<U>(U $value): U { return $value; }
+}
+class Box<U> { uses Identity; }
+class Plain { uses Identity; }
+
+function main(): void {
+    let $box = new Box<int>();
+    echo $box->identity("box;");
+    echo $box->identity(7);
+    echo ";";
+    let $plain = new Plain();
+    echo $plain->identity("plain;");
+}

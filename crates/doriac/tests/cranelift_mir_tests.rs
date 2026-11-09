@@ -64,6 +64,40 @@ fn readonly_metadata_detection_preserves_object_format_contracts() {
 }
 
 #[test]
+fn static_enum_strings_use_word_aligned_objects_including_nested_payloads() {
+    let program = doriac::lower_source_to_mir(
+        "static-string-alignment.doria",
+        r#"
+enum Text { case Value(string $first, ?string $second); }
+enum Envelope { case Value(Text $text); }
+class Settings {
+    static Text $plain = Text::Value("first", "second");
+    static ?Envelope $nested = Envelope::Value(Text::Value("third", "fourth"));
+}
+function main(): void {}
+"#,
+    )
+    .unwrap();
+    let bytes = doriac::codegen_cranelift::lower_mir_to_object(&program).unwrap();
+    let object = cranelift_object::object::File::parse(bytes.as_slice()).unwrap();
+    let word = std::mem::size_of::<usize>() as u64;
+    let mut strings = 0;
+    for symbol in object.symbols().filter(|symbol| {
+        symbol
+            .name()
+            .is_ok_and(|name| name.contains("__doria_static_init_") && name.ends_with("_string"))
+    }) {
+        let section = object
+            .section_by_index(symbol.section_index().unwrap())
+            .unwrap();
+        assert!(section.align() >= word);
+        assert_eq!(symbol.address() % word, 0, "{:?}", symbol.name());
+        strings += 1;
+    }
+    assert_eq!(strings, 4);
+}
+
+#[test]
 fn interface_upcasts_and_trait_dispatch_need_only_static_metadata() {
     // Borrowed inputs isolate dispatch from the caller's object allocation.
     let program = doriac::lower_source_to_mir(
@@ -511,6 +545,7 @@ fn rejects_mixed_width_float_binary_operands() {
         name: "mixedWidth".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: Vec::new(),
@@ -582,6 +617,7 @@ fn void_program() -> Program {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),

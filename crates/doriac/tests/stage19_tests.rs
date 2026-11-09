@@ -66,6 +66,31 @@ fn promoted_move_parameter_requires_take_with_an_insertion_fix() {
 }
 
 #[test]
+fn taking_copy_promotions_preserve_parameter_use_but_move_promotions_do_not() {
+    doriac::check_source(
+        "copy-promotion.doria",
+        r#"
+class Values {
+    function __construct(take int $count, take string $name) { echo "{$count}:{$name}"; }
+}
+function main(): void {
+    let $count = 7;
+    let $name = "copy";
+    let $values = new Values($count, $name);
+    echo "{$count}:{$name}";
+}
+"#,
+    )
+    .expect("Copy promotion must not consume a parameter or its caller's binding");
+    let errors = doriac::check_source(
+        "move-promotion.doria",
+        "class Item {} class Holder { function __construct(take Item $item) { let $given = $item; } }",
+    )
+    .expect_err("Move promotion transfers the parameter into its property");
+    assert!(errors.iter().any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
 fn explicit_then_promoted_property_order_has_stable_ids() {
     let hir = doriac::lower_source(
         "order.doria",
@@ -337,13 +362,13 @@ fn unreachable_false_for_body_does_not_move_its_owner() {
 }
 
 #[test]
-fn inferred_mixed_returns_are_move_values_for_functions_and_methods() {
+fn declared_mixed_returns_are_move_values_for_functions_and_methods() {
     for source in [
-        "function make() { mixed $value = 1; return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
-        "class Factory { function make() { mixed $value = 1; return $value; } } function duplicate(Factory $factory): void { let $first = $factory->make(); let $second = $first; let $third = $first; }",
+        "function make(): mixed { mixed $value = 1; return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+        "class Factory { function make(): mixed { mixed $value = 1; return $value; } } function duplicate(Factory $factory): void { let $first = $factory->make(); let $second = $first; let $third = $first; }",
     ] {
-        let diagnostics = doriac::check_source("inferred-mixed-move.doria", source)
-            .expect_err("an inferred mixed return must not create multiple owners");
+        let diagnostics = doriac::check_source("declared-mixed-move.doria", source)
+            .expect_err("a declared mixed return must not create multiple owners");
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0470"));
@@ -351,16 +376,16 @@ fn inferred_mixed_returns_are_move_values_for_functions_and_methods() {
 }
 
 #[test]
-fn inferred_move_returns_cover_classes_collections_methods_and_forward_calls() {
+fn declared_move_returns_cover_classes_collections_methods_and_forward_calls() {
     for source in [
-        "class Guard {} function make() { return new Guard(); } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
-        "class Guard {} class Factory { function make() { return new Guard(); } } function duplicate(Factory $factory): void { let $first = $factory->make(); let $second = $first; let $third = $first; }",
-        "class Guard {} function forward() { return make(); } function make() { return new Guard(); } function duplicate(): void { let $first = forward(); let $second = $first; let $third = $first; }",
-        "class Guard {} function make() { Guard[] $items = []; return $items; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
-        "class Box<T> { function __construct(take T $value) {} } function make() { Box<int> $value = new Box<int>(42); return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+        "class Guard {} function make(): Guard { return new Guard(); } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+        "class Guard {} class Factory { function make(): Guard { return new Guard(); } } function duplicate(Factory $factory): void { let $first = $factory->make(); let $second = $first; let $third = $first; }",
+        "class Guard {} function forward(): Guard { return make(); } function make(): Guard { return new Guard(); } function duplicate(): void { let $first = forward(); let $second = $first; let $third = $first; }",
+        "class Guard {} function make(): Guard[] { Guard[] $items = []; return $items; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+        "class Box<T> { function __construct(take T $value) {} } function make(): Box<int> { Box<int> $value = new Box<int>(42); return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
     ] {
-        let diagnostics = doriac::check_source("inferred-move-return.doria", source)
-            .expect_err("every inferred move return must retain one-owner semantics");
+        let diagnostics = doriac::check_source("declared-move-return.doria", source)
+            .expect_err("every declared move return must retain one-owner semantics");
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0470"));
@@ -368,15 +393,28 @@ fn inferred_move_returns_cover_classes_collections_methods_and_forward_calls() {
 }
 
 #[test]
-fn inferred_mixed_return_transfers_the_return_expression() {
+fn unannotated_mixed_return_is_rejected_before_ownership_inference() {
     let diagnostics = doriac::check_source(
-        "inferred-mixed-return.doria",
+        "unannotated-mixed-return.doria",
         "function forward(mixed $value) { return $value; }",
     )
-    .expect_err("returning a borrowed inferred-mixed value would create a second owner");
+    .expect_err("D20 requires a written return type");
     assert!(diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "E0474"));
+        .any(|diagnostic| diagnostic.code == "E0617"));
+}
+
+#[test]
+fn declared_mixed_return_preserves_the_borrowed_input() {
+    let source = "function forward(mixed $value): mixed { return $value; }";
+    doriac::check_source("borrowed-mixed-return.doria", source)
+        .expect("a written mixed result may lend its borrowed input");
+    let diagnostics = doriac::check_source(
+        "consumed-mixed-borrow.doria",
+        format!("{source} function consume(take mixed $value): void {{}} function inspect(mixed $value): void {{ consume(forward($value)); }}"),
+    )
+    .expect_err("the returned borrow cannot become a new owner");
+    assert!(diagnostics.iter().any(|finding| finding.code == "E0474"));
 }
 
 #[test]

@@ -31,13 +31,17 @@ fn main() {
     let runtime_manifest = runtime_dir.join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", runtime_source_dir.display());
     println!("cargo:rerun-if-changed={}", runtime_manifest.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime_dir.join("build.rs").display()
+    );
 
     // The bundled archive is now built from `doria-rt`'s whole dependency graph,
     // so every input to that graph has to retrigger this script. Watching only
     // the runtime's own sources would leave a stale archive bundled after an edit
     // to a crate the runtime links, which is the same class of mistake as
     // selecting a stale rlib.
-    for sibling in ["doria-unicode", "doria-diagnostic-catalogue"] {
+    for sibling in ["doria-unicode", "doria-diagnostic-catalogue", "doria-time"] {
         println!(
             "cargo:rerun-if-changed={}",
             manifest_dir.join("..").join(sibling).join("src").display()
@@ -126,6 +130,7 @@ fn main() {
             &output,
             &runtime_abi_version,
             &build_commit,
+            false,
         );
         println!(
             "cargo:rustc-env=DORIA_RT_BUILT_{}_PATH={}",
@@ -133,6 +138,33 @@ fn main() {
             output.display()
         );
     }
+    let shared_filename = if target.contains("windows") {
+        "doria_rt.dll"
+    } else if target.contains("apple") {
+        "libdoria_rt.dylib"
+    } else {
+        "libdoria_rt.so"
+    };
+    let shared_output = out_dir
+        .join("doria-rt")
+        .join("shared")
+        .join(shared_filename);
+    build_runtime_profile(
+        &cargo,
+        &runtime_manifest,
+        &runtime_target_dir,
+        &target,
+        "release",
+        shared_filename,
+        &shared_output,
+        &runtime_abi_version,
+        &build_commit,
+        true,
+    );
+    println!(
+        "cargo:rustc-env=DORIA_RT_BUILT_SHARED_PATH={}",
+        shared_output.display()
+    );
 }
 
 /// Keep the nested Cargo target separate from the outer build's lock while
@@ -166,10 +198,11 @@ fn build_runtime_profile(
     output: &Path,
     runtime_abi_version: &str,
     build_commit: &str,
+    shared: bool,
 ) {
     let mut command = Command::new(cargo);
     command
-        .arg("build")
+        .arg(if shared { "rustc" } else { "build" })
         .arg("--manifest-path")
         .arg(runtime_manifest)
         .arg("--package")
@@ -177,6 +210,7 @@ fn build_runtime_profile(
         .arg("--locked")
         .arg("--target")
         .arg(target)
+        .env("DORIA_BUILD_COMMIT", build_commit)
         // A nested cargo must not share the target directory of the build that
         // invoked it: cargo takes an exclusive lock on it and the two would
         // deadlock waiting for each other.
@@ -198,16 +232,36 @@ fn build_runtime_profile(
         // leaves incremental off there; this extends the guarantee to every
         // profile rather than to the one that happened to be safe.
         .env("CARGO_INCREMENTAL", "0");
+    if shared {
+        command.args([
+            "--lib",
+            "--crate-type",
+            "cdylib",
+            "--no-default-features",
+            "--features",
+            "hosted-shared-runtime",
+        ]);
+    }
     if profile == "release" {
         command.arg("--release");
     }
     if env::var("CARGO_NET_OFFLINE").is_ok_and(|value| value == "true") {
         command.arg("--offline");
     }
+    if shared && target.contains("apple") {
+        command.args([
+            "--",
+            "-C",
+            "link-arg=-Wl,-install_name,@rpath/libdoria_rt.dylib",
+        ]);
+    }
     let status = command
         .status()
         .expect("failed to invoke cargo for doria-rt");
-    assert!(status.success(), "failed to build doria-rt static library");
+    assert!(
+        status.success(),
+        "failed to build doria-rt runtime artifact"
+    );
 
     // Exactly one path, derived from what was asked for rather than searched
     // for. If cargo did not put the archive here, that is a fact worth failing
@@ -215,7 +269,7 @@ fn build_runtime_profile(
     let built = runtime_target_dir.join(target).join(profile).join(filename);
     assert!(
         built.is_file(),
-        "cargo did not produce the doria-rt static library at {}",
+        "cargo did not produce the doria-rt runtime artifact at {}",
         built.display()
     );
     std::fs::create_dir_all(
@@ -251,6 +305,7 @@ fn build_runtime_profile(
         profile,
         archive.len(),
         &sha256_hex(&archive),
+        shared,
     );
     std::fs::write(&metadata_path, document).unwrap_or_else(|error| {
         panic!(
@@ -276,6 +331,7 @@ fn runtime_metadata_document(
     profile: &str,
     bytes: usize,
     sha256: &str,
+    shared: bool,
 ) -> String {
     format!(
         concat!(
@@ -285,7 +341,8 @@ fn runtime_metadata_document(
             "  \"runtimeRevision\": \"{}\",\n",
             "  \"targetTriple\": \"{}\",\n",
             "  \"profile\": \"{}\",\n",
-            "  \"featureSet\": [\"standalone-windows-support\"],\n",
+            "  \"artifactKind\": \"{}\",\n",
+            "  \"featureSet\": [\"{}\"],\n",
             "  \"bytes\": {},\n",
             "  \"sha256\": \"{}\"\n",
             "}}\n"
@@ -295,6 +352,12 @@ fn runtime_metadata_document(
         escape_json(runtime_revision),
         escape_json(target_triple),
         escape_json(profile),
+        if shared { "shared" } else { "static" },
+        if shared {
+            "hosted-shared-runtime"
+        } else {
+            "standalone-windows-support"
+        },
         bytes,
         escape_json(sha256),
     )

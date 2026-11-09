@@ -276,10 +276,10 @@ fn build_plan_reports_use_the_project_pipeline_and_protect_every_input() {
             .output()
             .unwrap()
     };
-    for profile in ["fast", "release"] {
-        if profile == "release" && !cfg!(feature = "llvm-backend") {
-            continue;
-        }
+    for profile in doriac::backend::NativeProfile::AVAILABLE
+        .iter()
+        .map(|profile| profile.name())
+    {
         plan["compiler"]["nativeProfile"] = profile.into();
         fs::write(
             directory.join("plan.json"),

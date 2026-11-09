@@ -1,0 +1,67 @@
+use Doria\Std\Io\IoError;
+
+class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+interface Forwarder
+{
+    consuming function forward(): Iterator<int>;
+}
+
+class Cursor implements Iterator<int>, Forwarder
+{
+    List<int> $owned = [1];
+    function __construct(borrow List<int> $left, borrow List<int> $right) {}
+    function hasCurrent(): bool { return $this->right[0] == 7; }
+    function getCurrent(): int { return $this->left[0]; }
+    writable function advance(): void {}
+
+    consuming function pass(bool $fail): self throws Failure
+    {
+        if ($fail) { throw new Failure("stopped"); }
+        return $this;
+    }
+
+    consuming function forward(): Iterator<int> { return $this; }
+
+    function __destruct(): void
+    {
+        try { echo "drop cursor\n"; } catch (IoError) {}
+    }
+}
+
+function forward(take Cursor $cursor): Cursor throws Failure
+{
+    return $cursor->pass(false);
+}
+
+function identity<T implements Forwarder>(take T $cursor): T { return $cursor; }
+
+function forwardErased(take Forwarder $cursor): Iterator<int>
+{
+    return $cursor->forward();
+}
+
+function main(): void
+{
+    writable List<int> $left = [3];
+    writable List<int> $right = [7];
+    {
+        let $cursor = new Cursor($left, $right);
+        let $forwarded = identity(forward($cursor)->pass(false));
+        Forwarder $next = $forwarded;
+        let $last = forwardErased($next);
+        echo "value {$last->getCurrent()} {$last->hasCurrent()}\n";
+    }
+    $left[0] = 5;
+    $right[0] = 9;
+    try {
+        let $cursor = new Cursor($left, $right);
+        $cursor->pass(true);
+    } catch (Failure) { echo "stopped\n"; }
+    $left[0] = 11;
+    $right[0] = 13;
+    echo "released {$left[0]} {$right[0]}\n";
+}

@@ -306,13 +306,13 @@ failure.
   release is compiler-emitted drop glue. `clear()` therefore needs an
   element-release loop in each of the four backends plus the interpreter, and
   must release exactly once.
-- **The PHP backend inherits its current behavior; this record does not change
-  it.** `is_stage23_runtime_type` in `codegen_php.rs` blanket-refuses every
-  member on `List`, `Dictionary`, `Set`, `T[]`, and `Bytes` with B2301, while
-  the Stage 26 ordered types are fully implemented as hand-written PHP classes.
-  New members on the ordered types must be implemented there; new members on the
-  default types inherit the existing refusal. An implementer must not read the
-  B2301s as a regression they introduced.
+- **PHP coverage is an implementation boundary, not a language restriction.**
+  The original audit recorded default-collection B2301 refusals alongside
+  implemented ordered collections. Later compatibility work implements selected
+  default-collection operations, including `List::removeAt` with owned-element
+  return and bounds checks. Unsupported operations still report B2301; this
+  record neither mandates retaining an old refusal nor claims complete PHP
+  collection parity. Backend coverage must be verified operation by operation.
 
 ## Alternatives considered
 

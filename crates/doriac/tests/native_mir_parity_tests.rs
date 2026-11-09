@@ -4,9 +4,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use doriac::backend::NativeProfile;
+
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+use execution_directory::ExecutionDirectory;
 
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
 const NATIVE_CLOSURE_MANIFEST: &str = include_str!("fixtures/native_closures/manifest.txt");
@@ -22,6 +26,59 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     let $line = read_line("Name: ");
 }
 "#;
+
+#[test]
+fn chunked_utf8_lines_preserve_errors_recovery_and_raw_handoff() {
+    let source = r#"
+function main(): void
+{
+    foreach (0..<5 as int $index) {
+        try {
+            let $line = read_line() ?? "";
+            echo "data {$line->byteLength}\n";
+        } catch (Doria\Std\Io\InvalidUtf8Error $error) {
+            echo "bad {$error->validByteCount}:{$error->invalidByteCount ?? -1}\n";
+        }
+    }
+    let $remaining = read_stdin_bytes();
+    echo "raw {$remaining->length}\n";
+}
+"#;
+    let mut stdin = vec![b'a'; 4095];
+    stdin.extend_from_slice(b"\xe2\x82\xac\r\n");
+    stdin.extend_from_slice(&[b'b'; 8190]);
+    stdin.extend_from_slice(b"\xe2\r\nok\r\n");
+    stdin.extend_from_slice(&[b'c'; 16383]);
+    stdin.extend_from_slice(b"\xf0\x90\x80z\nfinal\r\n\xff\0tail");
+    let fixture = IoFixture {
+        stdin,
+        expected_stdout: Some(
+            b"data 4098\nbad 8190:-1\ndata 2\nbad 16383:3\ndata 5\nraw 6\n".to_vec(),
+        ),
+        expected_stderr: Some(Vec::new()),
+        expected_status: Some(0),
+        ..IoFixture::default()
+    };
+    let name = "chunked-utf8-lines.doria";
+    let mir = doriac::lower_source_to_mir(name, source).unwrap();
+    let interpreted = doriac::mir_interpreter::interpret_with_io(
+        &mir,
+        doriac::mir_interpreter::MirIo {
+            stdin: fixture.stdin.clone(),
+            ..doriac::mir_interpreter::MirIo::default()
+        },
+    )
+    .unwrap();
+    fixture.assert_expected(name, &interpreted);
+    for &profile in NativeProfile::AVAILABLE {
+        let backend = match profile {
+            NativeProfile::Fast => "Cranelift",
+            NativeProfile::Release => "LLVM",
+        };
+        let native = compile_and_run(&mir, profile, name, backend, &fixture);
+        assert_matches_interpreter(name, backend, profile, &interpreted, &native);
+    }
+}
 
 #[test]
 fn release_panic_projection_preserves_output_and_omits_only_frames() {
@@ -95,6 +152,29 @@ fn interpreter_matches_every_durable_io_fixture() {
     }
 }
 
+/// `DORIA_PARITY_SHARD=index/count` keeps every `count`-th manifest entry
+/// starting at `index`, so a run under a time cap can split the matrix across
+/// invocations; unset keeps every entry.
+fn shard(paths: impl IntoIterator<Item = String>) -> Vec<String> {
+    let paths = paths.into_iter();
+    let Some(value) = std::env::var_os("DORIA_PARITY_SHARD") else {
+        return paths.collect();
+    };
+    let value = value.to_string_lossy();
+    let (index, count) = value
+        .split_once('/')
+        .and_then(|(index, count)| Some((index.parse::<usize>().ok()?, count.parse::<usize>().ok()?)))
+        .filter(|(index, count)| index < count)
+        .unwrap_or_else(|| {
+            panic!("DORIA_PARITY_SHARD must be `index/count` with index < count, found `{value}`; for example `0/3`")
+        });
+    paths
+        .enumerate()
+        .filter(|(position, _)| position % count == index)
+        .map(|(_, path)| path)
+        .collect()
+}
+
 #[test]
 fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest() {
     if !host_linker_is_available() {
@@ -107,7 +187,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
     }
 
     let workspace = workspace_root();
-    for relative_path in manifest_paths() {
+    for relative_path in shard(manifest_paths()) {
         let path = workspace.join(&relative_path);
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!("failed to read parity source {relative_path}: {error}")
@@ -135,37 +215,13 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
         });
         fixture.assert_expected(&relative_path, &interpreted);
 
-        let fast = compile_and_run(
-            &mir,
-            NativeProfile::Fast,
-            &relative_path,
-            "Cranelift",
-            &fixture,
-        );
-        assert_matches_interpreter(
-            &relative_path,
-            "Cranelift fast",
-            NativeProfile::Fast,
-            &interpreted,
-            &fast,
-        );
-
-        #[cfg(feature = "llvm-backend")]
-        {
-            let release = compile_and_run(
-                &mir,
-                NativeProfile::Release,
-                &relative_path,
-                "LLVM",
-                &fixture,
-            );
-            assert_matches_interpreter(
-                &relative_path,
-                "LLVM release",
-                NativeProfile::Release,
-                &interpreted,
-                &release,
-            );
+        for &profile in NativeProfile::AVAILABLE {
+            let (backend, label) = match profile {
+                NativeProfile::Fast => ("Cranelift", "Cranelift fast"),
+                NativeProfile::Release => ("LLVM", "LLVM release"),
+            };
+            let native = compile_and_run(&mir, profile, &relative_path, backend, &fixture);
+            assert_matches_interpreter(&relative_path, label, profile, &interpreted, &native);
         }
     }
 }
@@ -219,7 +275,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_native_closures() {
         fixture.assert_expected(&name, &interpreted);
 
         for profile in native_closure_profiles(&fixture_root) {
-            if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
+            if !profile.is_available() {
                 continue;
             }
             let backend = match profile {
@@ -288,9 +344,9 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
             "{name} fixture must exceed a typical pipe buffer"
         );
 
-        assert_closed_output_pipe(&mir, NativeProfile::Fast, name, closed_stream, stdin);
-        #[cfg(feature = "llvm-backend")]
-        assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream, stdin);
+        for &profile in NativeProfile::AVAILABLE {
+            assert_closed_output_pipe(&mir, profile, name, closed_stream, stdin);
+        }
     }
 }
 
@@ -310,21 +366,15 @@ fn prompted_read_line_exits_cleanly_when_stdout_closes_before_stdin() {
         BROKEN_PIPE_READ_LINE_PROMPT,
     )
     .expect("prompted read_line broken-pipe fixture should lower");
-    assert_closed_output_pipe(
-        &mir,
-        NativeProfile::Fast,
-        "read-line-prompt",
-        ClosedStream::Stdout,
-        b"must not be read\n",
-    );
-    #[cfg(feature = "llvm-backend")]
-    assert_closed_output_pipe(
-        &mir,
-        NativeProfile::Release,
-        "read-line-prompt",
-        ClosedStream::Stdout,
-        b"must not be read\n",
-    );
+    for &profile in NativeProfile::AVAILABLE {
+        assert_closed_output_pipe(
+            &mir,
+            profile,
+            "read-line-prompt",
+            ClosedStream::Stdout,
+            b"must not be read\n",
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -346,9 +396,8 @@ fn assert_closed_output_pipe(
     };
     let bytes = doriac::codegen_native::generate_executable(mir, profile)
         .unwrap_or_else(|error| panic!("{backend} rejected broken-pipe {name} fixture: {error:?}"));
-    let directory = temp_working_directory(&format!("broken-pipe-{backend}-{name}"));
-    fs::create_dir_all(&directory).expect("broken-pipe working directory should be created");
-    let executable = directory.join(if cfg!(windows) {
+    let directory = ExecutionDirectory::new();
+    let executable = directory.path().join(if cfg!(windows) {
         "program.exe"
     } else {
         "program"
@@ -358,7 +407,7 @@ fn assert_closed_output_pipe(
 
     let mut child = doriac::native_process::spawn(
         Command::new(&executable)
-            .current_dir(&directory)
+            .current_dir(directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
@@ -383,7 +432,6 @@ fn assert_closed_output_pipe(
     );
     assert!(output.stdout.is_empty(), "{backend} {name} wrote stdout");
     assert!(output.stderr.is_empty(), "{backend} {name} wrote stderr");
-    fs::remove_dir_all(directory).expect("broken-pipe working directory should be removed");
 }
 
 fn compile_and_run(
@@ -396,12 +444,9 @@ fn compile_and_run(
     let bytes = doriac::codegen_native::generate_executable(mir, profile).unwrap_or_else(|error| {
         panic!("{backend} backend rejected parity source {relative_path}: {error:?}")
     });
-    let working_directory = temp_working_directory(&format!("{backend}-{relative_path}"));
-    fs::create_dir_all(&working_directory).unwrap_or_else(|error| {
-        panic!("failed to create isolated directory for {relative_path}: {error}")
-    });
-    fixture.seed_native_files(&working_directory, relative_path);
-    let executable = working_directory.join(if cfg!(windows) {
+    let working_directory = ExecutionDirectory::new();
+    fixture.seed_native_files(working_directory.path(), relative_path);
+    let executable = working_directory.path().join(if cfg!(windows) {
         "program.exe"
     } else {
         "program"
@@ -412,21 +457,18 @@ fn compile_and_run(
     make_executable(&executable);
     let output = run_native_executable(
         &executable,
-        &working_directory,
+        working_directory.path(),
         &fixture.stdin,
         &fixture.args,
     )
     .unwrap_or_else(|error| {
         panic!("failed to run {backend} parity executable for {relative_path}: {error}")
     });
-    let mut files = read_tree(&working_directory);
+    let mut files = read_tree(working_directory.path());
     files.remove(if cfg!(windows) {
         "program.exe"
     } else {
         "program"
-    });
-    fs::remove_dir_all(&working_directory).unwrap_or_else(|error| {
-        panic!("failed to clean isolated directory for {relative_path}: {error}")
     });
     NativeRun { output, files }
 }
@@ -596,27 +638,6 @@ fn default_linker() -> &'static str {
     } else {
         "cc"
     }
-}
-
-fn temp_working_directory(source: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let stem = source
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    std::env::temp_dir().join(format!(
-        "doriac-native-parity-{stem}-{}-{nanos}",
-        std::process::id()
-    ))
 }
 
 fn run_native_executable(
@@ -889,12 +910,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     let mir = doriac::lower_source_to_mir("prompt-timing.doria", source)
         .expect("prompted read_line should lower");
 
-    #[cfg(feature = "llvm-backend")]
-    let profiles = vec![NativeProfile::Fast, NativeProfile::Release];
-    #[cfg(not(feature = "llvm-backend"))]
-    let profiles = vec![NativeProfile::Fast];
-
-    for profile in profiles {
+    for &profile in NativeProfile::AVAILABLE {
         let backend = match profile {
             NativeProfile::Fast => "Cranelift",
             NativeProfile::Release => "LLVM",
@@ -903,9 +919,8 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
             doriac::codegen_native::generate_executable(&mir, profile).unwrap_or_else(|error| {
                 panic!("{backend} rejected the prompt-timing fixture: {error:?}")
             });
-        let directory = temp_working_directory(&format!("prompt-timing-{backend}"));
-        fs::create_dir_all(&directory).expect("prompt-timing working directory should be created");
-        let executable = directory.join(if cfg!(windows) {
+        let directory = ExecutionDirectory::new();
+        let executable = directory.path().join(if cfg!(windows) {
             "program.exe"
         } else {
             "program"
@@ -915,7 +930,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 
         let mut child = doriac::native_process::spawn(
             Command::new(&executable)
-                .current_dir(&directory)
+                .current_dir(directory.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
@@ -1109,16 +1124,11 @@ fn native_profiles_keep_loop_body_stack_use_constant() {
         ),
     ];
 
-    #[cfg(feature = "llvm-backend")]
-    let profiles = [NativeProfile::Fast, NativeProfile::Release];
-    #[cfg(not(feature = "llvm-backend"))]
-    let profiles = [NativeProfile::Fast];
-
     for (name, source, expected) in cases {
         let mir = doriac::lower_source_to_mir(format!("{name}.doria"), source)
             .unwrap_or_else(|error| panic!("stack-growth fixture {name} should lower: {error:?}"));
 
-        for profile in profiles {
+        for &profile in NativeProfile::AVAILABLE {
             let backend = match profile {
                 NativeProfile::Fast => "Cranelift fast",
                 NativeProfile::Release => "LLVM release",
@@ -1157,10 +1167,8 @@ fn run_stack_growth_fixture(
     let bytes = doriac::codegen_native::generate_executable(mir, profile).unwrap_or_else(|error| {
         panic!("{backend} rejected stack-growth fixture {name}: {error:?}")
     });
-    let directory = temp_working_directory(&format!("stack-growth-{name}-{backend}"));
-    fs::create_dir_all(&directory)
-        .unwrap_or_else(|error| panic!("failed to create working directory for {name}: {error}"));
-    let executable = directory.join(if cfg!(windows) {
+    let directory = ExecutionDirectory::new();
+    let executable = directory.path().join(if cfg!(windows) {
         "program.exe"
     } else {
         "program"
@@ -1169,12 +1177,59 @@ fn run_stack_growth_fixture(
         .unwrap_or_else(|error| panic!("failed to write {backend} executable for {name}: {error}"));
     make_executable(&executable);
 
-    let output = run_native_executable(&executable, &directory, &[], &[iterations.to_string()])
-        .unwrap_or_else(|error| panic!("failed to run {backend} executable for {name}: {error}"));
+    run_native_executable(
+        &executable,
+        directory.path(),
+        &[],
+        &[iterations.to_string()],
+    )
+    .unwrap_or_else(|error| panic!("failed to run {backend} executable for {name}: {error}"))
+}
 
-    fs::remove_dir_all(&directory)
-        .unwrap_or_else(|error| panic!("failed to clean working directory for {name}: {error}"));
-    output
+#[test]
+fn execution_directory_cleans_nested_files_on_return() {
+    let path = {
+        let directory = ExecutionDirectory::new();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("program"), b"temporary executable").unwrap();
+        directory.path().to_path_buf()
+    };
+    assert!(!path.exists());
+}
+
+#[test]
+fn execution_directory_cleans_files_when_a_test_unwinds() {
+    let directory = ExecutionDirectory::new();
+    let path = directory.path().to_path_buf();
+    let result = std::panic::catch_unwind(move || {
+        fs::write(directory.path().join("program"), b"temporary executable").unwrap();
+        panic!("simulated test assertion failure");
+    });
+    assert!(result.is_err());
+    assert!(!path.exists());
+}
+
+#[test]
+fn execution_directory_reports_cleanup_failure_after_normal_return() {
+    let directory = ExecutionDirectory::new();
+    fs::remove_dir(directory.path()).unwrap();
+    assert!(std::panic::catch_unwind(|| drop(directory)).is_err());
+}
+
+#[test]
+fn execution_directory_cleanup_failure_preserves_an_existing_test_failure() {
+    let directory = ExecutionDirectory::new();
+    fs::remove_dir(directory.path()).unwrap();
+    let failure = std::panic::catch_unwind(|| {
+        let _directory = directory;
+        panic!("original test failure");
+    })
+    .unwrap_err();
+    assert_eq!(
+        failure.downcast_ref::<&str>(),
+        Some(&"original test failure")
+    );
 }
 
 /// Names the way a process ended. A stack-exhausted program dies by signal and

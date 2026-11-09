@@ -77,7 +77,7 @@ This placement consumes:
 - Stage 33's exercised and frozen Baton product contract;
 - Stage 36a filesystem, standard I/O, path-facing, and child-process foundations;
 - Stage 40 FFI and native-library integration where a portable library needs it;
-- Stage 44 network and HTTP foundations for Git and remote package workflows.
+- Stage 40a network/HTTP/data foundations, with Stage 44 maturation, for Git and remote package workflows.
 
 Environment access, path manipulation, TOML, JSON, cryptographic hashing,
 archive handling, and any remaining implementation necessities are explicit

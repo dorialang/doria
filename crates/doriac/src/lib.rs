@@ -1,3 +1,16 @@
+#[cfg(test)]
+extern crate self as doriac;
+
+#[cfg(test)]
+#[path = "../tests/common/execution_directory.rs"]
+mod execution_directory;
+#[cfg(test)]
+#[path = "../tests/common/native_execution.rs"]
+mod native_execution;
+#[cfg(test)]
+#[path = "../tests/common/php_execution.rs"]
+mod php_execution;
+
 pub mod arg_binding;
 pub mod assertions;
 pub mod ast;
@@ -5,7 +18,9 @@ pub mod attributes;
 pub mod backend;
 pub mod build_plan;
 pub mod builtins;
+pub mod byte_intrinsics;
 mod checked_effects;
+mod generic_inference;
 pub use checked_effects::{CheckedEffectClass, CheckedEffectProfile};
 pub mod class_layout;
 pub mod codegen_cranelift;
@@ -15,9 +30,12 @@ pub mod codegen_native;
 pub mod codegen_php;
 pub mod collection_diagnostics;
 pub mod compilation_graph;
+pub mod compiler_known_concurrency;
 pub mod compiler_known_contracts;
 pub mod compiler_known_io;
+pub mod compiler_known_stream;
 pub mod compiler_known_test;
+pub mod compiler_known_time;
 pub mod const_eval;
 mod constructor_init;
 pub mod control_flow;
@@ -27,6 +45,7 @@ pub mod enums;
 pub mod format_string;
 pub mod hir;
 pub mod incremental;
+pub mod inline_value;
 pub mod lexer;
 pub mod lowering;
 pub mod mir;
@@ -143,10 +162,27 @@ pub fn analyze_source_for_ide_with_source_context(
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
     let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(&source)?
-        || compiler_known_io::resolved_facts_use_canonical_io(&resolution.resolved.facts);
+        || compiler_known_io::resolved_program_uses_canonical_io(
+            &resolution.resolved.facts,
+            &resolution.resolved.program,
+        );
     if uses_compiler_known_io {
         resolution.resolved.program =
             compiler_known_io::augment_program(&resolution.resolved.program);
+    }
+    if compiler_known_stream::resolved_facts_use_streams(&resolution.resolved.facts) {
+        resolution.resolved.program = compiler_known_stream::augment_program_for(
+            &resolution.resolved.program,
+            &resolution.resolved.facts,
+        );
+    }
+    if compiler_known_time::resolved_facts_use_time(&resolution.resolved.facts) {
+        resolution.resolved.program =
+            compiler_known_time::augment_program(&resolution.resolved.program);
+    }
+    if compiler_known_concurrency::resolved_facts_use_concurrency(&resolution.resolved.facts) {
+        resolution.resolved.program =
+            compiler_known_concurrency::augment_program(&resolution.resolved.program);
     }
     if compiler_known_test::resolved_facts_use_assertion_surface(&resolution.resolved.facts) {
         resolution.resolved.program =
@@ -198,12 +234,15 @@ pub fn analyze_source_for_ide_with_source_context(
     Ok((authored, analysis))
 }
 
+/// Inspect generated PHP text. Deployable native-backed PHP must retain the
+/// dependency from `compile_source` and use `backend::publish_output`.
 pub fn compile_source_to_php(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<String> {
     match compile_source(path, text, BackendTarget::Php)? {
-        backend::BackendOutput::Text { contents, .. } => Ok(contents),
+        backend::BackendOutput::Text { contents, .. }
+        | backend::BackendOutput::TextWithRuntime { contents, .. } => Ok(contents),
         _ => Err(vec![Diagnostic::new(
             "B0002",
             "PHP backend did not return text output",
@@ -311,6 +350,9 @@ pub(crate) fn complete_standalone_hir(
         normal_dependencies: Vec::new(),
         development_dependencies: Vec::new(),
     }];
+    compiler_known_stream::append_hir_source(&mut hir);
+    compiler_known_time::append_hir_source(&mut hir);
+    compiler_known_concurrency::append_hir_source(&mut hir);
     hir.source_path = source.path;
     hir.source_text = source.text;
     hir
@@ -495,6 +537,9 @@ pub fn lower_compilation_graph(
                 span: namespace.span,
             });
     }
+    compiler_known_stream::append_hir_source(&mut hir);
+    compiler_known_time::append_hir_source(&mut hir);
+    compiler_known_concurrency::append_hir_source(&mut hir);
     Ok(hir)
 }
 
@@ -588,11 +633,8 @@ pub(crate) fn compilation_graph_options(
     ) {
         (build_plan::CompilerTarget::Debug, _) => CompileOptions::new(BackendTarget::Debug),
         (build_plan::CompilerTarget::Php, _) => CompileOptions::new(BackendTarget::Php),
-        (build_plan::CompilerTarget::Native, Some(build_plan::BuildNativeProfile::Fast)) => {
-            CompileOptions::native(backend::NativeProfile::Fast)
-        }
-        (build_plan::CompilerTarget::Native, Some(build_plan::BuildNativeProfile::Release)) => {
-            CompileOptions::native(backend::NativeProfile::Release)
+        (build_plan::CompilerTarget::Native, Some(profile)) => {
+            CompileOptions::native(profile.native())
         }
         (build_plan::CompilerTarget::Native, None) => {
             unreachable!("validated native plan has a profile")
@@ -652,6 +694,42 @@ fn append_compiler_known_semantic_context(
     contexts: &mut std::collections::HashMap<source::SourceId, CompilationContext>,
 ) {
     source_texts.insert(
+        compiler_known_concurrency::SOURCE_ID,
+        compiler_known_concurrency::SOURCE_TEXT,
+    );
+    contexts.insert(
+        compiler_known_concurrency::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_concurrency::SOURCE_NAME.to_string()),
+        },
+    );
+    source_texts.insert(
+        compiler_known_time::SOURCE_ID,
+        compiler_known_time::SOURCE_TEXT,
+    );
+    contexts.insert(
+        compiler_known_time::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_time::SOURCE_NAME.to_string()),
+        },
+    );
+    source_texts.insert(
+        compiler_known_stream::SOURCE_ID,
+        compiler_known_stream::SOURCE_TEXT,
+    );
+    contexts.insert(
+        compiler_known_stream::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_stream::SOURCE_NAME.to_string()),
+        },
+    );
+    source_texts.insert(
         compiler_known_contracts::SOURCE_ID,
         compiler_known_contracts::SOURCE_TEXT,
     );
@@ -707,9 +785,22 @@ pub(crate) fn prepare_parsed_source(
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolved = names::resolve_program(&authored, &context)?;
     let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(source)?
-        || compiler_known_io::resolved_facts_use_canonical_io(&resolved.facts);
+        || compiler_known_io::resolved_program_uses_canonical_io(
+            &resolved.facts,
+            &resolved.program,
+        );
     if uses_compiler_known_io {
         resolved.program = compiler_known_io::augment_program(&resolved.program);
+    }
+    if compiler_known_stream::resolved_facts_use_streams(&resolved.facts) {
+        resolved.program =
+            compiler_known_stream::augment_program_for(&resolved.program, &resolved.facts);
+    }
+    if compiler_known_time::resolved_facts_use_time(&resolved.facts) {
+        resolved.program = compiler_known_time::augment_program(&resolved.program);
+    }
+    if compiler_known_concurrency::resolved_facts_use_concurrency(&resolved.facts) {
+        resolved.program = compiler_known_concurrency::augment_program(&resolved.program);
     }
     if compiler_known_test::resolved_facts_use_assertion_surface(&resolved.facts) {
         resolved.program = compiler_known_test::augment_program(&resolved.program);

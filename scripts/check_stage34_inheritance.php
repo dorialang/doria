@@ -40,10 +40,12 @@ function check_stage34_inheritance(string $root): array
         'ast' => 'crates/doriac/src/ast.rs',
         'parser' => 'crates/doriac/src/parser.rs',
         'semantics' => 'crates/doriac/src/semantics.rs',
+        'virtualPlan' => 'crates/doriac/src/semantics/virtual_dispatch.rs',
         'hir' => 'crates/doriac/src/hir.rs',
         'mir' => 'crates/doriac/src/mir.rs',
         'lowering' => 'crates/doriac/src/mir_lowering.rs',
         'validation' => 'crates/doriac/src/mir_validation.rs',
+        'retained' => 'crates/doriac/src/mir_validation/retained.rs',
         'interpreter' => 'crates/doriac/src/mir_interpreter.rs',
         'cranelift' => 'crates/doriac/src/codegen_cranelift.rs',
         'llvm' => 'crates/doriac/src/codegen_llvm.rs',
@@ -51,6 +53,7 @@ function check_stage34_inheritance(string $root): array
         'runtime' => 'crates/doria-rt/src/lib.rs',
         'incremental' => 'crates/doriac/src/incremental.rs',
         'tests' => 'crates/doriac/tests/stage34_inheritance_tests.rs',
+        'slotTests' => 'crates/doriac/src/monomorphization/tests.rs',
         'mirTests' => 'crates/doriac/tests/mir_validation_tests.rs',
         'nativeTests' => 'crates/doriac/tests/native_testing_slice1_tests.rs',
         'parity' => 'crates/doriac/tests/fixtures/native_parity_examples.txt',
@@ -147,21 +150,48 @@ function check_stage34_inheritance(string $root): array
         'pub is_open: bool',
         'pub parent: Option<ClassId>',
         'pub ancestors: Vec<ClassId>',
-        'pub virtual_methods: Vec<FunctionId>',
+        'pub virtual_methods: Vec<VirtualMethodSlot>',
+        'pub struct VirtualMethodFamily',
+        'pub family: VirtualMethodFamily',
+        'pub implementation: Option<FunctionId>',
+        'pub virtual_family: Option<VirtualMethodFamily>',
         'pub virtual_slot: Option<u32>',
         'ClassIs {',
         'DropClass {',
     ]);
     $require($paths['lowering'], $files['lowering'], [
         'function_virtual_slots',
-        'class.ancestors.iter().rev()',
+        'raw_virtual_tables',
+        'virtual_dispatch',
+        'materialized_instances.get(&slot.implementation).copied()',
         'call_target_is_direct_parent',
         'checked_effect_for_resolved',
+    ]);
+    $require($paths['virtualPlan'], $files['virtualPlan'], [
+        'pub declaration: Span',
+        'pub owner: ClassType<ResolvedType>',
+        'pub arguments: Vec<ResolvedType>',
+        'checked virtual-slot plan is unavailable',
+        'slots.push(Slot {',
+    ]);
+    if (preg_match('/class\s*\.\s*ancestors\s*\.\s*iter\s*\(\s*\)\s*\.\s*rev\s*\(\s*\)/', $files['virtualPlan']) !== 1) {
+        $failures[] = "{$paths['virtualPlan']}: canonical slots must retain root-to-parent hierarchy order";
+    }
+    $require($paths['retained'], $files['retained'], [
+        'virtual call can enter an inactive method slot',
+        'virtual call selects another canonical family',
+        'static_receiver_class()',
     ]);
     $require($paths['validation'], $files['validation'], [
         'class.ancestors.contains(&target)',
         'without a dominating hierarchy `is` proof',
-        'has no explicit borrowed receiver',
+        'has no explicit receiver',
+        'receiver.owned != mode.is_consuming()',
+        'function.parameter_modes.first() != Some(&mode.parameter_mode())',
+        'if receiver_mode.is_consuming()',
+        'require_owned_class_expression(receiver, "consuming method receiver")?',
+        'else if class_expression_transfers_receiver(receiver)',
+        'virtual method slot changes its receiver or parameter ownership contract',
     ]);
     $require($paths['interpreter'], $files['interpreter'], [
         'class_is_subtype',
@@ -201,6 +231,13 @@ function check_stage34_inheritance(string $root): array
         'covariant_virtual_returns_and_shadowed_initializers_execute_in_mir',
         'automatic_effects_are_closed_over_the_entire_virtual_family',
         'deep_hierarchies_and_many_virtual_slots_have_stable_linear_metadata',
+    ]);
+    $require($paths['slotTests'], $files['slotTests'], [
+        'inactive_parent_methods_reserve_their_canonical_slots',
+        'generic_virtual_families_reserve_roots_without_instantiating_unused_bodies',
+        'virtual_slot_validation_rejects_inactive_targets_and_forged_families',
+        'virtual_slots_require_the_shared_checked_plan_for_native_and_php',
+        'lifecycle_calls_on_other_objects_keep_normal_virtual_dispatch',
     ]);
     $require($paths['mirTests'], $files['mirTests'], [
         'shared_validator_requires_a_dominating_hierarchy_proof_for_narrowed_class_locals',

@@ -1,0 +1,56 @@
+class Events { static writable string $text = ""; }
+function note(string $event): void { Events::text = Events::text . $event . ";"; }
+class Token {
+    function __construct(string $label) { note("new " . $this->label); }
+    function __destruct() { note("drop " . $this->label); }
+}
+class Failure implements Error {
+    function __construct(string $message) { note("new error"); }
+    function __destruct() { note("drop error"); }
+}
+class Resource {
+    function __construct(take Token $child) { note("new receiver"); }
+    function __destruct() { note("drop receiver"); }
+    consuming function finish(bool $fail): int throws Failure {
+        let $local = new Token("local");
+        note("finish " . $this->child->label);
+        if ($fail) { throw new Failure("failed"); }
+        return 42;
+    }
+    consuming function pass(bool $fail): self throws Failure {
+        if ($fail) { throw new Failure("pass"); }
+        note("pass receiver");
+        return $this;
+    }
+}
+function failArgument(): bool throws Failure {
+    note("argument failure");
+    throw new Failure("argument");
+}
+function main(): void {
+    {
+        let $outer = new Token("outer");
+        try {
+            let $receiver = new Resource(new Token("child"));
+            $receiver->finish(true);
+        } catch (Failure $error) {
+            note("caught " . $error->message);
+        }
+        note("after failure");
+        try {
+            let $pending = new Resource(new Token("pending child"));
+            $pending->finish(failArgument());
+        } catch (Failure $error) {
+            note("caught " . $error->message);
+        }
+        try {
+            let $retained = (new Resource(new Token("success child")))->pass(false);
+            note("owned self returned");
+            let $answer = $retained->finish(false);
+            note("answer " . $answer);
+        } catch (Failure) {
+            note("unexpected success failure");
+        }
+    }
+    echo Events::text . "\n";
+}

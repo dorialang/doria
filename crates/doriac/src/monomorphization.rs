@@ -3,13 +3,14 @@
 use crate::class_layout::ClassId;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::hir;
-use crate::semantics::{CallableTarget, GenericArgument, GenericSpecialization, SemanticInfo};
+pub(crate) use crate::semantics::InterfaceGenericCall;
+use crate::semantics::{GenericArgument, SemanticInfo};
 use crate::source::Span;
-use crate::types::{
-    resolved_type_complexity, resolved_type_is_symbolic, substitute_resolved_type, ClassType,
-    ResolvedType,
-};
+use crate::types::{substitute_resolved_type, ClassType, ResolvedType};
 use std::collections::HashMap;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CallableInstance {
@@ -17,15 +18,15 @@ pub(crate) struct CallableInstance {
     pub(crate) arguments: Vec<GenericArgument>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct InterfaceGenericCall {
-    pub interface: crate::types::InterfaceType<ResolvedType>,
-    pub requirement: Span,
-    pub arguments: Vec<GenericArgument>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallableOrigin {
+    Source,
+    SyntheticConstructor,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct CallableDecl<'a> {
+    pub(crate) origin: CallableOrigin,
     pub(crate) function: &'a hir::FunctionDecl,
     pub(crate) class: Option<ClassId>,
     pub(crate) receiver: Option<ClassId>,
@@ -86,6 +87,7 @@ pub(crate) fn synthetic_constructors(program: &hir::Program) -> Vec<(String, hir
                     is_override: false,
                     override_span: None,
                     writable_this: false,
+                    consuming_this: false,
                     is_static: false,
                     name: "__construct".to_string(),
                     type_params: Vec::new(),
@@ -100,6 +102,7 @@ pub(crate) fn synthetic_constructors(program: &hir::Program) -> Vec<(String, hir
                         statements: Vec::new(),
                         span,
                     },
+                    intrinsic: None,
                     modifier_prefix_span: span,
                     span,
                 },
@@ -117,6 +120,7 @@ pub(crate) fn callable_declarations<'a>(
     for item in &program.items {
         match item {
             hir::Item::Function(function) => declarations.push(CallableDecl {
+                origin: CallableOrigin::Source,
                 function,
                 class: None,
                 receiver: None,
@@ -133,6 +137,7 @@ pub(crate) fn callable_declarations<'a>(
                     for member in &class_decl.members {
                         for method in member.callables() {
                             declarations.push(CallableDecl {
+                                origin: CallableOrigin::Source,
                                 function: method,
                                 class: Some(class_info.id),
                                 receiver: (!method.is_static).then_some(class_info.id),
@@ -146,6 +151,7 @@ pub(crate) fn callable_declarations<'a>(
                         .find(|(name, _)| name == &class_decl.name)
                     {
                         declarations.push(CallableDecl {
+                            origin: CallableOrigin::SyntheticConstructor,
                             function: constructor,
                             class: Some(class_info.id),
                             receiver: Some(class_info.id),
@@ -159,132 +165,129 @@ pub(crate) fn callable_declarations<'a>(
             hir::Item::Enum(_) | hir::Item::Constant(_) => {}
         }
     }
+    declarations.retain(|declaration| {
+        !matches!(
+            declaration.function.name.as_str(),
+            "__construct" | "__destruct"
+        ) || declaration.class.is_none_or(|id| {
+            crate::inline_value::InlineValueKind::for_name(
+                &program.semantic_info.classes[id.0].declaration_name,
+            )
+            .is_none()
+        })
+    });
     declarations
 }
 
-#[allow(clippy::too_many_arguments)]
-fn specialize_callable_instances(
-    span: &Span,
-    specialization: &GenericSpecialization,
-    substitutions: &HashMap<String, ResolvedType>,
-    functions: &HashMap<String, usize>,
-    methods: &HashMap<(ClassId, String), usize>,
-    class_ids: &HashMap<ClassType<ResolvedType>, ClassId>,
-    semantic_info: &SemanticInfo,
+fn checked_instance(
+    target: &crate::semantics::CallableInstanceKey,
     declarations: &[CallableDecl<'_>],
-    interface_calls: &mut Vec<InterfaceGenericCall>,
-) -> DiagnosticResult<Vec<CallableInstance>> {
-    let Some(target) = semantic_info
-        .call_targets
-        .get(span)
-        .and_then(|target| target.specialize(|ty| substitute_resolved_type(ty, substitutions)))
-    else {
-        return Err(vec![Diagnostic::new(
-            "I2401",
-            "checked generic call has no callable target",
-            *span,
-        )]);
-    };
-    let direct = match &target {
-        CallableTarget::Function { name } => functions.get(name).copied(),
-        CallableTarget::Method {
-            class_type,
-            method_name,
-            ..
-        } => class_ids
-            .get(class_type)
-            .and_then(|class| methods.get(&(*class, method_name.clone())))
-            .copied(),
-        CallableTarget::ConstrainedMethod { .. } => None,
-        CallableTarget::InterfaceMethod { .. } => None,
-    };
-    let arguments = specialization
-        .arguments
-        .iter()
-        .map(|argument| substitute_generic_argument(argument, substitutions))
-        .collect::<Vec<_>>();
-    if arguments.iter().any(generic_argument_is_symbolic) {
-        return Err(vec![Diagnostic::new(
-            "I2401",
-            "generic specialization retained an unresolved type parameter",
-            *span,
-        )]);
-    }
-    if let Some(declaration) = direct {
-        return Ok(vec![CallableInstance {
-            declaration,
-            arguments,
-        }]);
-    }
-    let CallableTarget::InterfaceMethod {
-        interface,
-        requirement,
-        method_name,
-    } = target
-    else {
-        return Err(vec![Diagnostic::new(
-            "I2401",
-            "checked generic call has no callable declaration",
-            *span,
-        )]);
-    };
-    let mut instances = Vec::new();
-    let call = InterfaceGenericCall {
-        interface: interface.clone(),
-        requirement,
-        arguments: arguments.clone(),
-    };
-    if !interface_calls.contains(&call) {
-        interface_calls.push(call);
-    }
-    for conformance in &semantic_info.contracts.conformances {
-        if conformance.interface != interface
-            || conformance.status != crate::semantics::contracts::ConformanceStatus::Checked
-            || resolved_type_is_symbolic(&conformance.implementing_type)
+    site: Span,
+) -> DiagnosticResult<CallableInstance> {
+    let mut selected = None;
+    for (index, declaration) in declarations.iter().enumerate() {
+        if declaration.function.span != target.declaration()
+            || declaration.origin != CallableOrigin::Source
         {
             continue;
         }
-        let ResolvedType::Class(class) = &conformance.implementing_type else {
-            continue;
-        };
-        let Some(class) = class_ids.get(class).copied() else {
-            continue;
-        };
-        let implementation = conformance
-            .implementations
+        if declaration.class_type_params.len() != declaration.class_arguments.len() {
+            return Err(vec![Diagnostic::new(
+                "I2401",
+                "checked class has incomplete specialization arguments",
+                site,
+            )]);
+        }
+        if !declaration
+            .class_type_params
             .iter()
-            .find(|implementation| {
-                implementation
-                    .requirement_origins
-                    .iter()
-                    .any(|origin| origin.declaration == requirement)
+            .zip(declaration.class_arguments)
+            .all(|(parameter, argument)| target.binding(&parameter.name) == Some(argument))
+        {
+            continue;
+        }
+        let Some(arguments) = declaration
+            .function
+            .type_params
+            .iter()
+            .map(|parameter| {
+                target
+                    .binding(&parameter.name)
+                    .cloned()
+                    .map(GenericArgument::Type)
             })
-            .and_then(|implementation| implementation.implementation);
-        let declaration = std::iter::once(class)
-            .chain(
-                semantic_info.classes[class.0]
-                    .ancestors
-                    .iter()
-                    .filter_map(|class| class_ids.get(class).copied()),
-            )
-            .find_map(|class| methods.get(&(class, method_name.clone())).copied())
-            .filter(|index| Some(declarations[*index].function.span) == implementation)
-            .ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "I2401",
-                    "checked interface method has no concrete implementation declaration",
-                    *span,
-                )]
-            })?;
-        let instance = CallableInstance {
-            declaration,
-            arguments: arguments.clone(),
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
         };
-        if !instances.contains(&instance) {
-            instances.push(instance);
+        if target.binding_count()
+            != declaration.class_type_params.len() + declaration.function.type_params.len()
+        {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(vec![Diagnostic::new(
+                "I2401",
+                "checked callable instance has ambiguous declarations",
+                site,
+            )]);
+        }
+        selected = Some(CallableInstance {
+            declaration: index,
+            arguments,
+        });
+    }
+    selected.ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I2401",
+            "checked callable instance has no declaration with its exact bindings",
+            site,
+        )]
+    })
+}
+
+fn enqueue_checked_calls(
+    calls: &[crate::semantics::CheckedGenericCall],
+    declarations: &[CallableDecl<'_>],
+    semantic_info: &SemanticInfo,
+    instances: &mut Vec<CallableInstance>,
+    ids: &mut HashMap<CallableInstance, usize>,
+    interface_calls: &mut Vec<InterfaceGenericCall>,
+) -> DiagnosticResult<()> {
+    for call in calls {
+        if let Some(interface) = &call.interface {
+            if !interface_calls.contains(interface) {
+                interface_calls.push(interface.clone());
+            }
+        } else if call.targets.is_empty() {
+            return Err(vec![Diagnostic::new(
+                "I2401",
+                "checked generic call has no concrete callable target",
+                call.site,
+            )]);
+        }
+        for target in &call.targets {
+            let target = checked_instance(target, declarations, call.site)?;
+            if !callable_available(
+                declarations[target.declaration],
+                &target.arguments,
+                semantic_info,
+                call.site,
+            )? {
+                let message = if call.interface.is_some() {
+                    "checked interface call selects an unavailable implementation"
+                } else {
+                    "checked generic call selects an unavailable callable"
+                };
+                return Err(vec![Diagnostic::new("I2401", message, call.site)]);
+            }
+            if !ids.contains_key(&target) {
+                ids.insert(target.clone(), instances.len());
+                instances.push(target);
+            }
         }
     }
-    Ok(instances)
+    Ok(())
 }
 
 pub(crate) fn collect_callable_instances(
@@ -293,48 +296,40 @@ pub(crate) fn collect_callable_instances(
     class_ids: &HashMap<ClassType<ResolvedType>, ClassId>,
     semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<(Vec<CallableInstance>, Vec<InterfaceGenericCall>)> {
-    let functions = declarations
-        .iter()
-        .enumerate()
-        .filter(|(_, declaration)| declaration.is_top_level())
-        .map(|(index, declaration)| (declaration.function.name.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let methods = declarations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, declaration)| {
-            declaration
-                .class
-                .map(|class| ((class, declaration.function.name.clone()), index))
-        })
-        .collect::<HashMap<_, _>>();
-
+    validate_witness_admissions(declarations, class_ids, semantic_info)?;
     let mut instances = Vec::new();
     let mut interface_calls = Vec::new();
-    let mut parents = Vec::new();
     let mut ids = HashMap::new();
     for (declaration, callable) in declarations.iter().enumerate() {
         if callable.function.type_params.is_empty() {
+            if !callable_available(*callable, &[], semantic_info, callable.function.span)? {
+                continue;
+            }
             let instance = CallableInstance {
                 declaration,
                 arguments: Vec::new(),
             };
             ids.insert(instance.clone(), instances.len());
             instances.push(instance);
-            parents.push(None);
         }
     }
-
-    let mut calls = semantic_info
-        .generic_call_specializations
-        .iter()
-        .collect::<Vec<_>>();
-    calls.sort_by_key(|(span, _)| **span);
-
+    enqueue_checked_calls(
+        semantic_info
+            .generic_call_graph
+            .calls(None, Span::default())?,
+        declarations,
+        semantic_info,
+        &mut instances,
+        &mut ids,
+        &mut interface_calls,
+    )?;
     for item in &program.items {
         let hir::Item::Class(class) = item else {
             continue;
         };
+        if !class.members.iter().any(|member| matches!(member, hir::ClassMember::Property(property) if property.initializer.is_some())) {
+            continue;
+        }
         for class_info in semantic_info
             .classes
             .iter()
@@ -345,131 +340,126 @@ pub(crate) fn collect_callable_instances(
                 .iter()
                 .zip(&class_info.arguments)
                 .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
-                .collect::<HashMap<_, _>>();
-            for member in &class.members {
-                let hir::ClassMember::Property(hir::PropertyDecl {
-                    is_static: false,
-                    initializer: Some(initializer),
-                    ..
-                }) = member
-                else {
-                    continue;
-                };
-                for (span, specialization) in &calls {
-                    if !initializer.span().contains(**span) {
-                        continue;
-                    }
-                    for target in specialize_callable_instances(
-                        span,
-                        specialization,
-                        &substitutions,
-                        &functions,
-                        &methods,
-                        class_ids,
-                        semantic_info,
-                        declarations,
-                        &mut interface_calls,
-                    )? {
-                        if !ids.contains_key(&target) {
-                            ids.insert(target.clone(), instances.len());
-                            instances.push(target);
-                            parents.push(None);
-                        }
-                    }
-                }
-            }
+                .collect();
+            let scope = crate::semantics::CallableInstanceKey::new(class.span, &substitutions);
+            enqueue_checked_calls(
+                semantic_info
+                    .generic_call_graph
+                    .calls(Some(scope), class.span)?,
+                declarations,
+                semantic_info,
+                &mut instances,
+                &mut ids,
+                &mut interface_calls,
+            )?;
         }
     }
-
     let mut cursor = 0;
     while cursor < instances.len() {
-        let instance_index = cursor;
         let instance = instances[cursor].clone();
         cursor += 1;
-        let callable = declarations[instance.declaration];
-        let substitutions = type_substitutions(callable, &instance.arguments)?;
-        for (span, specialization) in &calls {
-            let in_function = callable.function.span.contains(**span);
-            if !in_function {
-                continue;
-            }
-            for target in specialize_callable_instances(
-                span,
-                specialization,
-                &substitutions,
-                &functions,
-                &methods,
-                class_ids,
-                semantic_info,
-                declarations,
-                &mut interface_calls,
-            )? {
-                if !ids.contains_key(&target) {
-                    if specialization_expands_recursively(
-                        &instances,
-                        &parents,
-                        instance_index,
-                        &target,
-                    ) {
-                        let name = &declarations[target.declaration].function.name;
-                        return Err(vec![Diagnostic::new(
-                        "E0539",
-                        format!(
-                            "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
-                        ),
-                        **span,
-                    )
-                    .with_help(
-                        "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
-                    )]);
-                    }
-                    ids.insert(target.clone(), instances.len());
-                    instances.push(target);
-                    parents.push(Some(instance_index));
-                }
-            }
+        let declaration = declarations[instance.declaration];
+        if declaration.origin == CallableOrigin::SyntheticConstructor {
+            continue;
         }
+        let substitutions = type_substitutions(declaration, &instance.arguments)?;
+        let scope =
+            crate::semantics::CallableInstanceKey::new(declaration.function.span, &substitutions);
+        enqueue_checked_calls(
+            semantic_info
+                .generic_call_graph
+                .calls(Some(scope), declaration.function.span)?,
+            declarations,
+            semantic_info,
+            &mut instances,
+            &mut ids,
+            &mut interface_calls,
+        )?;
     }
-
     Ok((instances, interface_calls))
 }
 
-fn specialization_expands_recursively(
-    instances: &[CallableInstance],
-    parents: &[Option<usize>],
-    current: usize,
-    target: &CallableInstance,
-) -> bool {
-    // One type-changing recursive step can still converge (for example, T -> int).
-    // Two consecutive increases for the same declaration establish an expanding
-    // specialization chain while keeping bounded type changes valid.
-    let mut matching_ancestors = Vec::new();
-    let mut cursor = Some(current);
-    while let Some(index) = cursor {
-        if instances[index].declaration == target.declaration {
-            matching_ancestors.push(&instances[index]);
-            if matching_ancestors.len() == 2 {
-                break;
+fn validate_witness_admissions(
+    declarations: &[CallableDecl<'_>],
+    class_ids: &HashMap<ClassType<ResolvedType>, ClassId>,
+    semantic_info: &SemanticInfo,
+) -> DiagnosticResult<()> {
+    for conformance in &semantic_info.contracts.conformances {
+        if conformance.status != crate::semantics::contracts::ConformanceStatus::Checked {
+            continue;
+        }
+        let ResolvedType::Class(class) = &conformance.implementing_type else {
+            continue;
+        };
+        if !class_ids.contains_key(class) {
+            continue;
+        }
+        for witness in semantic_info.interface_witnesses.conformance(conformance)? {
+            // Generic implementations require the concrete call's method arguments.
+            if !witness.parameters.is_empty() {
+                continue;
+            }
+            let instance = witness.instance(&[], conformance.origin)?;
+            let target = checked_instance(&instance, declarations, conformance.origin)?;
+            if !callable_available(
+                declarations[target.declaration],
+                &[],
+                semantic_info,
+                conformance.origin,
+            )? {
+                return Err(vec![Diagnostic::new(
+                    "I2401",
+                    "checked interface witness selects an unavailable callable",
+                    conformance.origin,
+                )
+                .with_related(
+                    witness.declaration,
+                    "the implementation is declared here",
+                )]);
             }
         }
-        cursor = parents[index];
     }
-    let [nearest, previous] = matching_ancestors.as_slice() else {
-        return false;
-    };
-    specialization_complexity(&target.arguments) > specialization_complexity(&nearest.arguments)
-        && specialization_complexity(&nearest.arguments)
-            > specialization_complexity(&previous.arguments)
+    Ok(())
 }
 
-fn specialization_complexity(arguments: &[GenericArgument]) -> usize {
-    arguments
-        .iter()
-        .map(|argument| {
-            let GenericArgument::Type(ty) = argument;
-            resolved_type_complexity(ty)
-        })
-        .sum()
+fn callable_available(
+    declaration: CallableDecl<'_>,
+    arguments: &[GenericArgument],
+    semantic_info: &SemanticInfo,
+    site: Span,
+) -> DiagnosticResult<bool> {
+    let guarded = semantic_info
+        .contracts
+        .callable_conditions
+        .contains_key(&declaration.function.span);
+    let virtual_method = semantic_info
+        .method_hierarchy
+        .get(&declaration.function.span)
+        .is_some_and(|method| method.virtual_root.is_some());
+    if !guarded && !virtual_method {
+        return Ok(true);
+    }
+    let bindings = type_substitutions(declaration, arguments)?;
+    let available = if guarded {
+        semantic_info
+            .callable_available(declaration.function.span, &bindings)
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2401",
+                    "guarded callable has no checked admission inventory",
+                    site,
+                )]
+            })?
+    } else {
+        true
+    };
+    if available && virtual_method {
+        semantic_info.virtual_dispatch.family(
+            &crate::semantics::CallableInstanceKey::new(declaration.function.span, &bindings),
+            site,
+        )?;
+    }
+    Ok(available)
 }
 
 pub(crate) fn type_substitutions(
@@ -513,9 +503,4 @@ pub(crate) fn substitute_generic_argument(
             GenericArgument::Type(substitute_resolved_type(ty, substitutions))
         }
     }
-}
-
-fn generic_argument_is_symbolic(argument: &GenericArgument) -> bool {
-    let GenericArgument::Type(ty) = argument;
-    resolved_type_is_symbolic(ty)
 }

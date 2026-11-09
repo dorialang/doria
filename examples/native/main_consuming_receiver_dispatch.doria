@@ -1,0 +1,43 @@
+class Events { static writable string $text = ""; }
+function note(string $event): void { Events::text = Events::text . $event . ";"; }
+interface Finisher { consuming function finish(): string; }
+trait Finishing {
+    function identify(): string;
+    consuming function finish(): string {
+        note("finish " . $this->identify());
+        return $this->identify();
+    }
+}
+class Resource implements Finisher {
+    uses Finishing;
+    function __construct(string $label) { note("new " . $this->label); }
+    function identify(): string { return $this->label; }
+    function __destruct() { note("drop " . $this->label); }
+}
+function generic<T implements Finisher>(take T $value): string { return $value->finish(); }
+function erased(take Finisher $value): string { return $value->finish(); }
+open class Base {
+    function __construct(string $label) { note("new base " . $this->label); }
+    open consuming function finish(): string { note("base finish"); return $this->label; }
+    function __destruct() { note("drop base " . $this->label); }
+}
+class Child extends Base {
+    function __construct(parameter string $label) { parent::__construct($label); }
+    override consuming function finish(): string {
+        note("child finish " . $this->label);
+        return $this->label;
+    }
+    function __destruct() { note("drop child " . $this->label); }
+}
+function virtualCall(take Base $value): string { return $value->finish(); }
+function main(): void {
+    let $direct = (new Resource("trait"))->finish();
+    note("result " . $direct);
+    let $generic = generic(new Resource("generic"));
+    note("result " . $generic);
+    let $erased = erased(new Resource("erased"));
+    note("result " . $erased);
+    let $virtual = virtualCall(new Child("virtual"));
+    note("result " . $virtual);
+    echo Events::text . "\n";
+}

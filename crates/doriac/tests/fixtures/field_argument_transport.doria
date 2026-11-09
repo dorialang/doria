@@ -1,0 +1,99 @@
+enum Packet { case Number(int $count); case Empty; }
+enum ArgumentRoute {
+    case Direct; case Nested; case Generic; case StaticCall; case Virtual; case Erased; case Callback;
+    case NestedGeneric; case NestedStatic; case NestedVirtual; case NestedErased; case NestedCallback;
+    case DefaultProvided; case DefaultOmitted; case DefaultNamed;
+    case NullableAbsent; case NullableExplicit; case NullablePresent;
+    case DefaultGeneric; case DefaultStatic; case DefaultVirtual; case DefaultConcrete;
+    case DefaultResultProvided; case DefaultResultOmitted;
+}
+
+function make(int $count): Packet { return Packet::Number($count); }
+function consume(Packet $value): int {
+    return match ($value) { Packet::Number($count) => $count, Packet::Empty => -1, };
+}
+function consumeGeneric<T>(Packet $value, T $marker): int { return consume($value); }
+function consumeDefault(Packet $value = Packet::Number(0), int $offset = 0): int {
+    return consume($value) + $offset;
+}
+function consumeNullable(?Packet $value = null, int $offset = 0): int {
+    if ($value != null) { return consume($value) + $offset; }
+    return $offset;
+}
+function consumePresent(?Packet $value = Packet::Number(0), int $offset = 0): int {
+    if ($value != null) { return consume($value) + $offset; }
+    return -1;
+}
+function consumeGenericDefault<T>(T $marker, Packet $value = Packet::Number(0), int $offset = 0): int {
+    return consume($value) + $offset;
+}
+function withDefault(Packet $value = Packet::Number(0)): Packet { return $value; }
+
+interface Reader { function read(Packet $value): int; }
+open class BaseReader implements Reader {
+    open function read(Packet $value = Packet::Number(0)): int { return consume($value); }
+}
+class ConcreteReader extends BaseReader {
+    override function read(Packet $value): int { return consume($value); }
+}
+class StaticReader {
+    static function read(Packet $value): int { return consume($value); }
+    static function readDefault(Packet $value = Packet::Number(0), int $offset = 0): int {
+        return consume($value) + $offset;
+    }
+}
+
+function hot(int $iterations, ArgumentRoute $route): int {
+    BaseReader $virtual = new ConcreteReader();
+    Reader $erased = new ConcreteReader();
+    let $concrete = new ConcreteReader();
+    let $callback = function(Packet $value): int { return consume($value); };
+    let writable $index = 0;
+    let writable $sum = 0;
+    while ($index < $iterations) {
+        let $value = make($index);
+        $sum += match ($route) {
+            ArgumentRoute::Direct => consume($value),
+            ArgumentRoute::Nested => consume(make($index)),
+            ArgumentRoute::Generic => consumeGeneric($value, true),
+            ArgumentRoute::StaticCall => StaticReader::read($value),
+            ArgumentRoute::Virtual => $virtual->read($value),
+            ArgumentRoute::Erased => $erased->read($value),
+            ArgumentRoute::Callback => $callback($value),
+            ArgumentRoute::NestedGeneric => consumeGeneric(make($index), true),
+            ArgumentRoute::NestedStatic => StaticReader::read(make($index)),
+            ArgumentRoute::NestedVirtual => $virtual->read(make($index)),
+            ArgumentRoute::NestedErased => $erased->read(make($index)),
+            ArgumentRoute::NestedCallback => $callback(make($index)),
+            ArgumentRoute::DefaultProvided => consumeDefault($value),
+            ArgumentRoute::DefaultOmitted => consumeDefault(offset: $index),
+            ArgumentRoute::DefaultNamed => consumeDefault(offset: 0, value: $value),
+            ArgumentRoute::NullableAbsent => consumeNullable(offset: $index),
+            ArgumentRoute::NullableExplicit => consumeNullable(null, $index),
+            ArgumentRoute::NullablePresent => consumePresent(offset: $index),
+            ArgumentRoute::DefaultGeneric => consumeGenericDefault(true, offset: $index),
+            ArgumentRoute::DefaultStatic => StaticReader::readDefault(offset: $index),
+            ArgumentRoute::DefaultVirtual => $virtual->read() + $index,
+            ArgumentRoute::DefaultConcrete => $concrete->read() + $index,
+            ArgumentRoute::DefaultResultProvided => consume(withDefault($value)),
+            ArgumentRoute::DefaultResultOmitted => consume(withDefault()) + $index,
+        };
+        $index++;
+    }
+    return $sum;
+}
+
+function main(): void {
+    echo hot(4, ArgumentRoute::Direct) . ";" . hot(4, ArgumentRoute::Nested) . ";" .
+        hot(4, ArgumentRoute::Generic) . ";" . hot(4, ArgumentRoute::StaticCall) . ";" .
+        hot(4, ArgumentRoute::Virtual) . ";" . hot(4, ArgumentRoute::Erased) . ";" .
+        hot(4, ArgumentRoute::Callback) . ";" . hot(4, ArgumentRoute::NestedGeneric) . ";" .
+        hot(4, ArgumentRoute::NestedStatic) . ";" . hot(4, ArgumentRoute::NestedVirtual) . ";" .
+        hot(4, ArgumentRoute::NestedErased) . ";" . hot(4, ArgumentRoute::NestedCallback);
+    echo ";" . hot(4, ArgumentRoute::DefaultProvided) . ";" . hot(4, ArgumentRoute::DefaultOmitted) . ";" .
+        hot(4, ArgumentRoute::DefaultNamed) . ";" . hot(4, ArgumentRoute::NullableAbsent) . ";" .
+        hot(4, ArgumentRoute::NullableExplicit) . ";" . hot(4, ArgumentRoute::NullablePresent) . ";" .
+        hot(4, ArgumentRoute::DefaultGeneric) . ";" . hot(4, ArgumentRoute::DefaultStatic) . ";" .
+        hot(4, ArgumentRoute::DefaultVirtual) . ";" . hot(4, ArgumentRoute::DefaultConcrete) . ";" .
+        hot(4, ArgumentRoute::DefaultResultProvided) . ";" . hot(4, ArgumentRoute::DefaultResultOmitted);
+}

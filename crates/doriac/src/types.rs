@@ -1,6 +1,31 @@
 use std::collections::HashMap;
 use std::fmt;
 
+/// Access retained by a promoted non-owning field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetainedFieldAccess {
+    Readonly,
+    Writable,
+}
+
+impl RetainedFieldAccess {
+    pub fn promoted(borrow: bool, writable: bool) -> Option<Self> {
+        borrow.then_some(if writable {
+            Self::Writable
+        } else {
+            Self::Readonly
+        })
+    }
+
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Writable)
+    }
+
+    pub fn permits_write_through(access: Option<Self>, slot_writable: bool) -> bool {
+        access.map_or(slot_writable, Self::is_writable)
+    }
+}
+
 use crate::enums::EnumType;
 use crate::source::{QualifiedNameRef, Span};
 
@@ -48,77 +73,107 @@ impl CollectionFamily {
             _ => &[],
         }
     }
+
+    pub(crate) fn borrows_element(self, member: &str) -> bool {
+        matches!(
+            (self, member),
+            (Self::Dictionary, "get")
+                | (Self::List | Self::Set, "first" | "last")
+                | (Self::PriorityQueue, "peek")
+                | (Self::Deque, "peekFront" | "peekBack")
+        )
+    }
+
+    pub(crate) fn removes_element(self, method: &str) -> bool {
+        matches!(
+            (self, method),
+            (Self::List, "removeAt" | "pop")
+                | (Self::Dictionary, "remove")
+                | (Self::PriorityQueue, "pop")
+                | (Self::Deque, "popFront" | "popBack")
+        )
+    }
 }
 
 /// Preserve compiler-checked nominal kinds when substituting source type syntax.
 pub(crate) fn resolve_nominal_kinds<I>(
     ty: ResolvedType,
-    enums: &HashMap<String, crate::enums::EnumType>,
+    enums: &HashMap<ClassType<ResolvedType>, crate::enums::EnumType>,
     interfaces: &HashMap<crate::types::InterfaceType<ResolvedType>, I>,
+) -> ResolvedType {
+    resolve_nominal_kinds_with(ty, &|nominal| {
+        if let Some(definition) = enums.get(&nominal) {
+            ResolvedType::Enum(definition.clone())
+        } else if interfaces.contains_key(&nominal) {
+            ResolvedType::Interface(nominal)
+        } else {
+            ResolvedType::Class(nominal)
+        }
+    })
+}
+
+pub(crate) fn resolve_nominal_kinds_with(
+    ty: ResolvedType,
+    resolve: &impl Fn(ClassType<ResolvedType>) -> ResolvedType,
 ) -> ResolvedType {
     match ty {
         ResolvedType::Nullable(inner) => {
-            ResolvedType::Nullable(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::Nullable(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::TypedArray(inner) => {
-            ResolvedType::TypedArray(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::TypedArray(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::List(inner) => {
-            ResolvedType::List(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::List(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::Set(inner) => {
-            ResolvedType::Set(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::Set(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::SortedSet(inner) => {
-            ResolvedType::SortedSet(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::SortedSet(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::PriorityQueue(inner) => {
-            ResolvedType::PriorityQueue(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::PriorityQueue(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::Deque(inner) => {
-            ResolvedType::Deque(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+            ResolvedType::Deque(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::Dictionary(key, value) => ResolvedType::Dictionary(
-            Box::new(resolve_nominal_kinds(*key, enums, interfaces)),
-            Box::new(resolve_nominal_kinds(*value, enums, interfaces)),
+            Box::new(resolve_nominal_kinds_with(*key, resolve)),
+            Box::new(resolve_nominal_kinds_with(*value, resolve)),
         ),
         ResolvedType::SortedDictionary(key, value) => ResolvedType::SortedDictionary(
-            Box::new(resolve_nominal_kinds(*key, enums, interfaces)),
-            Box::new(resolve_nominal_kinds(*value, enums, interfaces)),
+            Box::new(resolve_nominal_kinds_with(*key, resolve)),
+            Box::new(resolve_nominal_kinds_with(*value, resolve)),
         ),
         ResolvedType::SharedHandle(kind, payload) => ResolvedType::SharedHandle(
             kind,
-            Box::new(resolve_nominal_kinds(*payload, enums, interfaces)),
+            Box::new(resolve_nominal_kinds_with(*payload, resolve)),
+        ),
+        ResolvedType::Enum(enum_type) => ResolvedType::Enum(
+            enum_type
+                .map_arguments(|argument| resolve_nominal_kinds_with(argument.clone(), resolve)),
         ),
         ResolvedType::Class(class) => {
-            if class.arguments.is_empty() {
-                if let Some(definition) = enums.get(&class.name) {
-                    return ResolvedType::Enum(definition.clone());
-                }
-            }
             let nominal = ClassType::new(
                 class.name,
                 class
                     .arguments
                     .into_iter()
-                    .map(|argument| resolve_nominal_kinds(argument, enums, interfaces))
+                    .map(|argument| resolve_nominal_kinds_with(argument, resolve))
                     .collect(),
             );
-            if interfaces.contains_key(&nominal) {
-                ResolvedType::Interface(nominal)
-            } else {
-                ResolvedType::Class(nominal)
-            }
+            resolve(nominal)
         }
         ResolvedType::Function(mut function) => {
             for parameter in &mut function.parameters {
-                parameter.ty = resolve_nominal_kinds(parameter.ty.clone(), enums, interfaces);
+                parameter.ty = resolve_nominal_kinds_with(parameter.ty.clone(), resolve);
             }
-            function.return_type = resolve_nominal_kinds(function.return_type, enums, interfaces);
+            function.return_type = resolve_nominal_kinds_with(function.return_type, resolve);
             function.checked_effects = function
                 .checked_effects
                 .into_iter()
-                .map(|effect| resolve_nominal_kinds(effect, enums, interfaces))
+                .map(|effect| resolve_nominal_kinds_with(effect, resolve))
                 .collect();
             ResolvedType::Function(function)
         }
@@ -126,13 +181,69 @@ pub(crate) fn resolve_nominal_kinds<I>(
     }
 }
 
-/// Substitute checked type syntax before a lowering consumer resolves nominal IDs.
+/// Resolve source type syntax for consumers that do not need inferred callable contracts.
+/// Execution lowering must use `resolved_type_ref_with_checked_functions` instead.
 pub(crate) fn resolved_type_ref_with_substitutions(
     ty: &crate::types::TypeRef,
     substitutions: &HashMap<String, ResolvedType>,
 ) -> Option<ResolvedType> {
+    resolve_type_ref(ty, substitutions, &|function| {
+        Some(ResolvedType::Function(Box::new(
+            crate::types::SemanticFunctionType {
+                invocation_mode: function.invocation_mode,
+                parameters: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        Some(crate::types::SemanticFunctionParameter {
+                            ownership_mode: parameter.ownership_mode,
+                            ty: resolved_type_ref_with_substitutions(&parameter.ty, substitutions)?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                return_type: resolved_type_ref_with_substitutions(
+                    &function.return_type,
+                    substitutions,
+                )?,
+                checked_effects: if let Some(clause) = &function.throws_clause {
+                    clause
+                        .entries
+                        .iter()
+                        .map(|effect| {
+                            resolved_type_ref_with_substitutions(&effect.ty, substitutions)
+                        })
+                        .collect::<Option<Vec<_>>>()?
+                        .into_iter()
+                        .filter(|effect| !crate::checked_effects::is_ambient_io_effect(effect))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                return_borrow: None,
+            },
+        )))
+    })
+}
+
+/// Lowering must preserve checked callable contracts rather than reconstruct them from syntax.
+pub(crate) fn resolved_type_ref_with_checked_functions(
+    ty: &TypeRef,
+    substitutions: &HashMap<String, ResolvedType>,
+    resolve_function: &impl Fn(Span) -> Option<ResolvedType>,
+) -> Option<ResolvedType> {
+    resolve_type_ref(ty, substitutions, &|function| {
+        let checked = resolve_function(function.span)?;
+        Some(substitute_resolved_type(&checked, substitutions))
+    })
+}
+
+fn resolve_type_ref(
+    ty: &TypeRef,
+    substitutions: &HashMap<String, ResolvedType>,
+    resolve_function: &impl Fn(&FunctionTypeRef) -> Option<ResolvedType>,
+) -> Option<ResolvedType> {
     if let Some(grouped) = &ty.grouped {
-        let resolved = resolved_type_ref_with_substitutions(&grouped.inner, substitutions)?;
+        let resolved = resolve_type_ref(&grouped.inner, substitutions, resolve_function)?;
         return Some(if ty.nullable {
             nullable_of(resolved)
         } else {
@@ -140,36 +251,7 @@ pub(crate) fn resolved_type_ref_with_substitutions(
         });
     }
     if let Some(function) = &ty.function {
-        let resolved = ResolvedType::Function(Box::new(crate::types::SemanticFunctionType {
-            invocation_mode: function.invocation_mode,
-            parameters: function
-                .parameters
-                .iter()
-                .map(|parameter| {
-                    Some(crate::types::SemanticFunctionParameter {
-                        ownership_mode: parameter.ownership_mode,
-                        ty: resolved_type_ref_with_substitutions(&parameter.ty, substitutions)?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
-            return_type: resolved_type_ref_with_substitutions(
-                &function.return_type,
-                substitutions,
-            )?,
-            checked_effects: if let Some(clause) = &function.throws_clause {
-                clause
-                    .entries
-                    .iter()
-                    .map(|effect| resolved_type_ref_with_substitutions(&effect.ty, substitutions))
-                    .collect::<Option<Vec<_>>>()?
-                    .into_iter()
-                    .filter(|effect| !crate::checked_effects::is_ambient_io_effect(effect))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            return_borrow: None,
-        }));
+        let resolved = resolve_function(function)?;
         return Some(if ty.nullable {
             nullable_of(resolved)
         } else {
@@ -190,6 +272,9 @@ pub(crate) fn resolved_type_ref_with_substitutions(
                 "void" => ResolvedType::Void,
                 "string" => ResolvedType::String,
                 "Bytes" => ResolvedType::Bytes,
+                name if ByteRegionKind::from_source_name(name).is_some() => {
+                    ResolvedType::ByteRegion(ByteRegionKind::from_source_name(name)?)
+                }
                 "bool" => ResolvedType::Bool,
                 "mixed" => ResolvedType::Mixed,
                 "Error" => ResolvedType::Error,
@@ -199,7 +284,7 @@ pub(crate) fn resolved_type_ref_with_substitutions(
     } else {
         let arguments = plain
             .type_arguments()
-            .map(|argument| resolved_type_ref_with_substitutions(argument, substitutions))
+            .map(|argument| resolve_type_ref(argument, substitutions, resolve_function))
             .collect::<Option<Vec<_>>>()?;
         match plain.name.as_str() {
             "[]" if arguments.len() == 1 => {
@@ -287,14 +372,14 @@ pub struct FunctionTypeParameterRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FunctionInvocationMode {
     Readonly,
     Writable,
     Once,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FunctionTypeParameterMode {
     Readonly,
     Writable,
@@ -595,13 +680,13 @@ impl fmt::Display for TypeRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SemanticFunctionParameter<T> {
     pub ownership_mode: FunctionTypeParameterMode,
     pub ty: T,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SemanticFunctionType<T> {
     pub invocation_mode: FunctionInvocationMode,
     pub parameters: Vec<SemanticFunctionParameter<T>>,
@@ -612,7 +697,29 @@ pub struct SemanticFunctionType<T> {
     pub return_borrow: Option<FunctionReturnBorrow>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RetainedLifetime {
+    /// The source is observed only while the returned value is used.
+    LastUse,
+    /// Destruction of an owned value can still observe the source.
+    Cleanup,
+}
+
+impl RetainedLifetime {
+    pub const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::LastUse, Self::LastUse) => Self::LastUse,
+            _ => Self::Cleanup,
+        }
+    }
+
+    /// An implementation cannot retain an input longer than its contract.
+    pub const fn accepts(self, actual: Self) -> bool {
+        matches!(self, Self::Cleanup) || matches!(actual, Self::LastUse)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ReturnBorrowKind {
     /// The returned value itself is lent by the source; callers do not own it.
     Value,
@@ -621,6 +728,10 @@ pub enum ReturnBorrowKind {
 }
 
 impl ReturnBorrowKind {
+    pub const fn applies_to_move_type(self, move_type: bool) -> bool {
+        matches!(self, Self::Retained) || move_type
+    }
+
     /// Branches promise their common value access, but retain every source loan
     /// that either branch can require.
     pub const fn join_writable(self, left: bool, right: bool) -> bool {
@@ -656,16 +767,30 @@ impl ReturnBorrowKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FunctionReturnBorrow {
     pub source: FunctionBorrowSource,
     pub writable: bool,
     pub kind: ReturnBorrowKind,
+    pub lifetime: RetainedLifetime,
 }
 
 #[cfg(test)]
 mod return_borrow_tests {
+    use super::RetainedLifetime::{Cleanup, LastUse};
     use super::ReturnBorrowKind::{Retained, Value};
+
+    #[test]
+    fn retained_lifetime_joins_preserve_cleanup_and_contracts_bound_demand() {
+        assert_eq!(LastUse.join(LastUse), LastUse);
+        assert_eq!(LastUse.join(Cleanup), Cleanup);
+        assert_eq!(Cleanup.join(LastUse), Cleanup);
+        assert_eq!(Cleanup.join(Cleanup), Cleanup);
+        assert!(LastUse.accepts(LastUse));
+        assert!(!LastUse.accepts(Cleanup));
+        assert!(Cleanup.accepts(LastUse));
+        assert!(Cleanup.accepts(Cleanup));
+    }
 
     #[test]
     fn returned_access_and_retained_loan_demand_compose_in_opposite_directions() {
@@ -687,12 +812,12 @@ mod return_borrow_tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FunctionBorrowSource {
     Parameter(usize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NominalType<T> {
     pub name: String,
     pub arguments: Vec<T>,
@@ -705,6 +830,10 @@ impl<T> NominalType<T> {
             arguments,
         }
     }
+
+    pub fn inline_copy_type(&self) -> Option<crate::inline_value::InlineValueKind> {
+        crate::inline_value::InlineValueKind::for_nominal(&self.name, self.arguments.len())
+    }
 }
 
 pub type ClassType<T> = NominalType<T>;
@@ -713,7 +842,7 @@ pub type InterfaceType<T> = NominalType<T>;
 /// The six compiler-known Stage 25a shared-ownership types (record 0106). Each
 /// takes exactly one type argument and belongs to one of two permanently disjoint
 /// families; the family is fixed at construction and never converts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SharedHandleKind {
     SharedReference,
     WeakReference,
@@ -835,6 +964,64 @@ impl SharedHandleKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ByteRegionKind {
+    Readonly,
+    Writable,
+}
+
+impl ByteRegionKind {
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Readonly => "Doria\\Std\\Io\\ByteRegion",
+            Self::Writable => "Doria\\Std\\Io\\WritableByteRegion",
+        }
+    }
+
+    pub fn from_source_name(name: &str) -> Option<Self> {
+        [Self::Readonly, Self::Writable]
+            .into_iter()
+            .find(|kind| kind.source_name() == name)
+    }
+
+    pub(crate) fn from_resolved(ty: &ResolvedType) -> Option<Self> {
+        match ty {
+            ResolvedType::ByteRegion(kind) => Some(*kind),
+            ResolvedType::Nullable(inner) => Self::from_resolved(inner),
+            _ => None,
+        }
+    }
+
+    pub const fn is_writable(self) -> bool {
+        matches!(self, Self::Writable)
+    }
+
+    /// The region kind of a compiler-known property that views its receiver,
+    /// such as `string->byteRegion` (decision log entry 49).
+    pub(crate) fn property_result(receiver: &ResolvedType, property: &str) -> Option<Self> {
+        let receiver = match receiver {
+            ResolvedType::Nullable(inner) => inner,
+            _ => receiver,
+        };
+        let member = crate::byte_intrinsics::member(receiver, property)?;
+        (member.kind == crate::byte_intrinsics::ByteMemberKind::Property
+            && matches!(receiver, ResolvedType::String))
+        .then(|| Self::from_resolved(&member.return_type))
+        .flatten()
+    }
+
+    pub(crate) fn method_result(receiver: &ResolvedType, method: &str) -> Option<Self> {
+        let receiver = match receiver {
+            ResolvedType::Nullable(inner) => inner,
+            _ => receiver,
+        };
+        let member = crate::byte_intrinsics::member(receiver, method)?;
+        (member.kind == crate::byte_intrinsics::ByteMemberKind::Method)
+            .then(|| Self::from_resolved(&member.return_type))
+            .flatten()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Void,
@@ -842,6 +1029,7 @@ pub enum TypeKind {
     Float(FloatType),
     String,
     Bytes,
+    ByteRegion(ByteRegionKind),
     Nullable(TypeId),
     Bool,
     Null,
@@ -853,7 +1041,7 @@ pub enum TypeKind {
     EmptyCollection,
     TypeParameter(String),
     Function(SemanticFunctionType<TypeId>),
-    Enum(EnumType),
+    Enum(EnumType<TypeId>),
     Class(ClassType<TypeId>),
     Interface(InterfaceType<TypeId>),
     /// Exact dynamic implementer, only in an interface's owned return contract.
@@ -869,13 +1057,14 @@ pub enum TypeKind {
     SharedHandle(SharedHandleKind, TypeId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ResolvedType {
     Void,
     Integer(IntegerType),
     Float(FloatType),
     String,
     Bytes,
+    ByteRegion(ByteRegionKind),
     Bool,
     Null,
     Mixed,
@@ -928,16 +1117,17 @@ pub(crate) fn resolved_type_is_symbolic(ty: &ResolvedType) -> bool {
         ResolvedType::Class(class) | ResolvedType::Interface(class) => {
             class.arguments.iter().any(resolved_type_is_symbolic)
         }
+        ResolvedType::Enum(enum_type) => enum_type.arguments.iter().any(resolved_type_is_symbolic),
         ResolvedType::Void
         | ResolvedType::Integer(_)
         | ResolvedType::Float(_)
         | ResolvedType::String
         | ResolvedType::Bytes
+        | ResolvedType::ByteRegion(_)
         | ResolvedType::Bool
         | ResolvedType::Null
         | ResolvedType::Mixed
         | ResolvedType::Error
-        | ResolvedType::Enum(_)
         | ResolvedType::InterfaceSelf(_)
         | ResolvedType::TraitSelf(_)
         | ResolvedType::Unsupported => false,
@@ -961,46 +1151,91 @@ pub fn substitute_resolved_type(
     ty: &ResolvedType,
     substitutions: &HashMap<String, ResolvedType>,
 ) -> ResolvedType {
+    substitute_resolved_type_impl(ty, substitutions, None)
+}
+
+/// Trait composition binds `self` to the composing class without rewriting
+/// parameters inside that receiver or other simultaneous replacements.
+pub(crate) fn substitute_trait_type(
+    ty: &ResolvedType,
+    substitutions: &HashMap<String, ResolvedType>,
+    receiver: &ResolvedType,
+) -> ResolvedType {
+    substitute_resolved_type_impl(ty, substitutions, Some(receiver))
+}
+
+fn substitute_resolved_type_impl(
+    ty: &ResolvedType,
+    substitutions: &HashMap<String, ResolvedType>,
+    trait_receiver: Option<&ResolvedType>,
+) -> ResolvedType {
     match ty {
         ResolvedType::TypeParameter(name) => substitutions
             .get(name)
             .cloned()
             .unwrap_or_else(|| ty.clone()),
-        ResolvedType::Nullable(inner) => {
-            nullable_of(substitute_resolved_type(inner, substitutions))
-        }
-        ResolvedType::TypedArray(inner) => {
-            ResolvedType::TypedArray(Box::new(substitute_resolved_type(inner, substitutions)))
-        }
-        ResolvedType::List(inner) => {
-            ResolvedType::List(Box::new(substitute_resolved_type(inner, substitutions)))
-        }
+        ResolvedType::TraitSelf(_) => trait_receiver.unwrap_or(ty).clone(),
+        ResolvedType::Nullable(inner) => nullable_of(substitute_resolved_type_impl(
+            inner,
+            substitutions,
+            trait_receiver,
+        )),
+        ResolvedType::TypedArray(inner) => ResolvedType::TypedArray(Box::new(
+            substitute_resolved_type_impl(inner, substitutions, trait_receiver),
+        )),
+        ResolvedType::List(inner) => ResolvedType::List(Box::new(substitute_resolved_type_impl(
+            inner,
+            substitutions,
+            trait_receiver,
+        ))),
         ResolvedType::Dictionary(key, value) => ResolvedType::Dictionary(
-            Box::new(substitute_resolved_type(key, substitutions)),
-            Box::new(substitute_resolved_type(value, substitutions)),
+            Box::new(substitute_resolved_type_impl(
+                key,
+                substitutions,
+                trait_receiver,
+            )),
+            Box::new(substitute_resolved_type_impl(
+                value,
+                substitutions,
+                trait_receiver,
+            )),
         ),
-        ResolvedType::Set(inner) => {
-            ResolvedType::Set(Box::new(substitute_resolved_type(inner, substitutions)))
-        }
+        ResolvedType::Set(inner) => ResolvedType::Set(Box::new(substitute_resolved_type_impl(
+            inner,
+            substitutions,
+            trait_receiver,
+        ))),
         ResolvedType::SortedDictionary(key, value) => ResolvedType::SortedDictionary(
-            Box::new(substitute_resolved_type(key, substitutions)),
-            Box::new(substitute_resolved_type(value, substitutions)),
+            Box::new(substitute_resolved_type_impl(
+                key,
+                substitutions,
+                trait_receiver,
+            )),
+            Box::new(substitute_resolved_type_impl(
+                value,
+                substitutions,
+                trait_receiver,
+            )),
         ),
-        ResolvedType::SortedSet(inner) => {
-            ResolvedType::SortedSet(Box::new(substitute_resolved_type(inner, substitutions)))
-        }
-        ResolvedType::PriorityQueue(inner) => {
-            ResolvedType::PriorityQueue(Box::new(substitute_resolved_type(inner, substitutions)))
-        }
-        ResolvedType::Deque(inner) => {
-            ResolvedType::Deque(Box::new(substitute_resolved_type(inner, substitutions)))
-        }
+        ResolvedType::SortedSet(inner) => ResolvedType::SortedSet(Box::new(
+            substitute_resolved_type_impl(inner, substitutions, trait_receiver),
+        )),
+        ResolvedType::PriorityQueue(inner) => ResolvedType::PriorityQueue(Box::new(
+            substitute_resolved_type_impl(inner, substitutions, trait_receiver),
+        )),
+        ResolvedType::Deque(inner) => ResolvedType::Deque(Box::new(substitute_resolved_type_impl(
+            inner,
+            substitutions,
+            trait_receiver,
+        ))),
         ResolvedType::Interface(interface) => ResolvedType::Interface(InterfaceType::new(
             interface.name.clone(),
             interface
                 .arguments
                 .iter()
-                .map(|argument| substitute_resolved_type(argument, substitutions))
+                .map(|argument| {
+                    substitute_resolved_type_impl(argument, substitutions, trait_receiver)
+                })
                 .collect(),
         )),
         ResolvedType::Function(function) => {
@@ -1011,28 +1246,47 @@ pub fn substitute_resolved_type(
                     .iter()
                     .map(|parameter| crate::types::SemanticFunctionParameter {
                         ownership_mode: parameter.ownership_mode,
-                        ty: substitute_resolved_type(&parameter.ty, substitutions),
+                        ty: substitute_resolved_type_impl(
+                            &parameter.ty,
+                            substitutions,
+                            trait_receiver,
+                        ),
                     })
                     .collect(),
-                return_type: substitute_resolved_type(&function.return_type, substitutions),
+                return_type: substitute_resolved_type_impl(
+                    &function.return_type,
+                    substitutions,
+                    trait_receiver,
+                ),
                 checked_effects: function
                     .checked_effects
                     .iter()
-                    .map(|effect| substitute_resolved_type(effect, substitutions))
+                    .map(|effect| {
+                        substitute_resolved_type_impl(effect, substitutions, trait_receiver)
+                    })
                     .collect(),
                 return_borrow: function.return_borrow,
             }))
         }
         ResolvedType::SharedHandle(kind, payload) => ResolvedType::SharedHandle(
             *kind,
-            Box::new(substitute_resolved_type(payload, substitutions)),
+            Box::new(substitute_resolved_type_impl(
+                payload,
+                substitutions,
+                trait_receiver,
+            )),
         ),
+        ResolvedType::Enum(enum_type) => ResolvedType::Enum(enum_type.map_arguments(|argument| {
+            substitute_resolved_type_impl(argument, substitutions, trait_receiver)
+        })),
         ResolvedType::Class(class) => ResolvedType::Class(ClassType::new(
             class.name.clone(),
             class
                 .arguments
                 .iter()
-                .map(|argument| substitute_resolved_type(argument, substitutions))
+                .map(|argument| {
+                    substitute_resolved_type_impl(argument, substitutions, trait_receiver)
+                })
                 .collect(),
         )),
         ResolvedType::Void
@@ -1040,13 +1294,12 @@ pub fn substitute_resolved_type(
         | ResolvedType::Float(_)
         | ResolvedType::String
         | ResolvedType::Bytes
+        | ResolvedType::ByteRegion(_)
         | ResolvedType::Bool
         | ResolvedType::Null
         | ResolvedType::Mixed
         | ResolvedType::Error
-        | ResolvedType::Enum(_)
         | ResolvedType::InterfaceSelf(_)
-        | ResolvedType::TraitSelf(_)
         | ResolvedType::Unsupported => ty.clone(),
     }
 }
@@ -1054,6 +1307,193 @@ pub fn substitute_resolved_type(
 #[cfg(test)]
 mod specialization_tests {
     use super::*;
+
+    #[test]
+    fn enum_arguments_preserve_identity_through_substitution_and_interning() {
+        let declaration = crate::enums::EnumId(3);
+        let symbolic = ResolvedType::Enum(EnumType::with_arguments(
+            declaration,
+            "Packet",
+            vec![
+                ResolvedType::TypeParameter("T".into()),
+                ResolvedType::Class(ClassType::new(
+                    "Box",
+                    vec![nullable_of(ResolvedType::TypeParameter("T".into()))],
+                )),
+            ],
+        ));
+        assert!(resolved_type_is_symbolic(&symbolic));
+        assert_eq!(resolved_type_complexity(&symbolic), 5);
+        let concrete = substitute_resolved_type(
+            &symbolic,
+            &HashMap::from([("T".into(), ResolvedType::String)]),
+        );
+        let expected = ResolvedType::Enum(EnumType::with_arguments(
+            declaration,
+            "Packet",
+            vec![
+                ResolvedType::String,
+                ResolvedType::Class(ClassType::new(
+                    "Box",
+                    vec![nullable_of(ResolvedType::String)],
+                )),
+            ],
+        ));
+        assert_eq!(concrete, expected);
+        assert!(!resolved_type_is_symbolic(&concrete));
+        let mut types = TypeRegistry::new();
+        let symbolic_id = types.intern_resolved(&symbolic);
+        let concrete_id = types.intern_resolved(&concrete);
+        assert_ne!(symbolic_id, concrete_id);
+        assert_eq!(types.resolved(symbolic_id), symbolic);
+        assert_eq!(types.resolved(concrete_id), concrete);
+        assert_eq!(types.intern_resolved(&expected), concrete_id);
+        assert_eq!(types.display(concrete_id), "Packet<string, Box<?string>>");
+        let other = ResolvedType::Enum(EnumType::with_arguments(
+            declaration,
+            "Packet",
+            vec![ResolvedType::Bool],
+        ));
+        assert_ne!(types.intern_resolved(&other), concrete_id);
+        let plain = ResolvedType::Enum(EnumType::new(declaration, "Packet"));
+        let plain_id = types.intern_resolved(&plain);
+        assert_ne!(plain_id, concrete_id);
+        assert_eq!(types.display(plain_id), "Packet");
+        assert_eq!(types.resolved(plain_id), plain);
+    }
+
+    #[test]
+    fn nominal_resolution_recurses_through_enum_arguments() {
+        let status = EnumType::new(crate::enums::EnumId(1), "Status");
+        let enums = HashMap::from([(ClassType::new("Status", Vec::new()), status.clone())]);
+        let readable = InterfaceType::new("Readable", Vec::new());
+        let interfaces = HashMap::from([(readable.clone(), ())]);
+        let outer = EnumType::with_arguments(
+            crate::enums::EnumId(2),
+            "Packet",
+            vec![
+                ResolvedType::List(Box::new(ResolvedType::Class(ClassType::new(
+                    "Status",
+                    Vec::new(),
+                )))),
+                ResolvedType::Class(readable.clone()),
+            ],
+        );
+        let actual = resolve_nominal_kinds(ResolvedType::Enum(outer), &enums, &interfaces);
+        let expected = ResolvedType::Enum(EnumType::with_arguments(
+            crate::enums::EnumId(2),
+            "Packet",
+            vec![
+                ResolvedType::List(Box::new(ResolvedType::Enum(status))),
+                ResolvedType::Interface(readable),
+            ],
+        ));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn nominal_enum_resolution_requires_the_recorded_type_application() {
+        let status = EnumType::new(crate::enums::EnumId(1), "Status");
+        let packet =
+            |argument| EnumType::with_arguments(crate::enums::EnumId(2), "Packet", vec![argument]);
+        let first = packet(ResolvedType::Bool);
+        let second = packet(ResolvedType::Enum(status.clone()));
+        let enums = [status, first.clone(), second.clone()]
+            .into_iter()
+            .map(|ty| (ClassType::new(ty.name.clone(), ty.arguments.clone()), ty))
+            .collect();
+        let interfaces = HashMap::<InterfaceType<ResolvedType>, ()>::new();
+        for (arguments, expected) in [
+            (vec![ResolvedType::Bool], first),
+            (
+                vec![ResolvedType::Class(ClassType::new("Status", Vec::new()))],
+                second,
+            ),
+        ] {
+            assert_eq!(
+                resolve_nominal_kinds(
+                    ResolvedType::Class(ClassType::new("Packet", arguments)),
+                    &enums,
+                    &interfaces,
+                ),
+                ResolvedType::Enum(expected),
+            );
+        }
+        for arguments in [Vec::new(), vec![ResolvedType::String]] {
+            let missing = ResolvedType::Class(ClassType::new("Packet", arguments));
+            assert_eq!(
+                resolve_nominal_kinds(missing.clone(), &enums, &interfaces),
+                missing,
+            );
+        }
+    }
+
+    #[test]
+    fn checked_callable_resolution_preserves_contracts_inside_type_wrappers() {
+        let span = Span::default();
+        let syntax = TypeRef::function(FunctionTypeRef {
+            keyword_span: span,
+            invocation_mode: FunctionInvocationMode::Writable,
+            invocation_modifier_span: Some(span),
+            parameter_list_open_span: span,
+            parameter_list_close_span: span,
+            parameter_list_span: span,
+            parameters: vec![FunctionTypeParameterRef {
+                ownership_mode: FunctionTypeParameterMode::Take,
+                ownership_modifier_span: Some(span),
+                ty: TypeRef::named("T"),
+                type_span: span,
+                span,
+            }],
+            colon_span: span,
+            return_type: Box::new(TypeRef::named("T")),
+            return_type_span: span,
+            throws_clause: None,
+            span,
+        });
+        let checked = ResolvedType::Function(Box::new(SemanticFunctionType {
+            invocation_mode: FunctionInvocationMode::Writable,
+            parameters: vec![SemanticFunctionParameter {
+                ownership_mode: FunctionTypeParameterMode::Take,
+                ty: ResolvedType::TypeParameter("T".to_string()),
+            }],
+            return_type: ResolvedType::TypeParameter("T".to_string()),
+            checked_effects: vec![ResolvedType::Error],
+            return_borrow: Some(FunctionReturnBorrow {
+                source: FunctionBorrowSource::Parameter(0),
+                writable: true,
+                kind: ReturnBorrowKind::Retained,
+                lifetime: RetainedLifetime::LastUse,
+            }),
+        }));
+        let substitutions = HashMap::from([(
+            "T".to_string(),
+            ResolvedType::ByteRegion(ByteRegionKind::Writable),
+        )]);
+        let expected = substitute_resolved_type(&checked, &substitutions);
+        let wrapped = TypeRef::generic(
+            "List",
+            vec![TypeRef::grouped(syntax.clone().nullable(), span, span).nullable()],
+        );
+        assert_eq!(
+            resolved_type_ref_with_checked_functions(&wrapped, &substitutions, &|at| {
+                assert_eq!(at, span);
+                Some(checked.clone())
+            }),
+            Some(ResolvedType::List(Box::new(nullable_of(expected))))
+        );
+        assert_eq!(
+            resolved_type_ref_with_checked_functions(&wrapped, &substitutions, &|_| None),
+            None
+        );
+        let ResolvedType::Function(syntactic) =
+            resolved_type_ref_with_substitutions(&syntax, &substitutions).unwrap()
+        else {
+            panic!("expected a syntactic function type");
+        };
+        assert_eq!(syntactic.return_borrow, None);
+        assert_eq!(syntactic.return_type, substitutions["T"]);
+    }
 
     #[test]
     fn substitutions_reach_every_runtime_type_constructor() {
@@ -1071,6 +1511,13 @@ mod specialization_tests {
             |inner| ResolvedType::Class(ClassType::new("Box", vec![inner])),
             |inner| ResolvedType::Interface(InterfaceType::new("Read", vec![inner])),
             |inner| {
+                ResolvedType::Enum(EnumType::with_arguments(
+                    crate::enums::EnumId(0),
+                    "Packet",
+                    vec![inner],
+                ))
+            },
+            |inner| {
                 ResolvedType::Function(Box::new(SemanticFunctionType {
                     invocation_mode: FunctionInvocationMode::Readonly,
                     parameters: vec![SemanticFunctionParameter {
@@ -1084,6 +1531,8 @@ mod specialization_tests {
             },
         ];
         let substitutions = HashMap::from([("T".to_string(), ResolvedType::String)]);
+        let trait_self = ResolvedType::TraitSelf("Inspection".into());
+        let receiver = ResolvedType::Class(ClassType::new("Record", vec![ResolvedType::String]));
         for outer in constructors {
             for inner in constructors {
                 let symbolic = outer(inner(parameter.clone()));
@@ -1093,6 +1542,15 @@ mod specialization_tests {
                     substitute_resolved_type(&outer(inner(ResolvedType::String)), &HashMap::new());
                 assert_eq!(concrete, expected);
                 assert!(!resolved_type_is_symbolic(&concrete), "{concrete:?}");
+                let authored = outer(inner(trait_self.clone()));
+                assert_eq!(
+                    substitute_resolved_type(&authored, &substitutions),
+                    substitute_resolved_type(&authored, &HashMap::new()),
+                );
+                assert_eq!(
+                    substitute_trait_type(&authored, &substitutions, &receiver),
+                    substitute_resolved_type(&outer(inner(receiver.clone())), &HashMap::new()),
+                );
             }
         }
         for kind in SharedHandleKind::ALL {
@@ -1103,7 +1561,37 @@ mod specialization_tests {
                 substitute_resolved_type(&symbolic, &substitutions),
                 ResolvedType::SharedHandle(kind, Box::new(constructors[10](ResolvedType::String)))
             );
+            let authored =
+                ResolvedType::SharedHandle(kind, Box::new(constructors[10](trait_self.clone())));
+            assert_eq!(
+                substitute_trait_type(&authored, &substitutions, &receiver),
+                ResolvedType::SharedHandle(kind, Box::new(constructors[10](receiver.clone())))
+            );
         }
+    }
+
+    #[test]
+    fn trait_receivers_preserve_owner_parameters_during_simultaneous_method_substitution() {
+        let owner = ResolvedType::TypeParameter("U".into());
+        let receiver = ResolvedType::Class(ClassType::new("Record", vec![owner]));
+        let bindings = HashMap::from([("U".into(), ResolvedType::String)]);
+        let self_type = ResolvedType::TraitSelf("Inspection".into());
+        let authored = ResolvedType::Interface(InterfaceType::new(
+            "Ready",
+            vec![self_type, ResolvedType::TypeParameter("U".into())],
+        ));
+        assert_eq!(
+            substitute_trait_type(&authored, &bindings, &receiver),
+            ResolvedType::Interface(InterfaceType::new(
+                "Ready",
+                vec![receiver.clone(), ResolvedType::String]
+            ))
+        );
+        let interface_self = ResolvedType::InterfaceSelf("Ready".into());
+        assert_eq!(
+            substitute_trait_type(&interface_self, &bindings, &receiver),
+            interface_self
+        );
     }
 }
 
@@ -1127,6 +1615,13 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
                 .map(resolved_type_complexity)
                 .sum::<usize>()
         }
+        ResolvedType::Enum(enum_type) => {
+            1 + enum_type
+                .arguments
+                .iter()
+                .map(resolved_type_complexity)
+                .sum::<usize>()
+        }
         ResolvedType::Function(function) => {
             1 + function
                 .parameters
@@ -1145,6 +1640,7 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::Bool
         | ResolvedType::String
         | ResolvedType::Bytes
+        | ResolvedType::ByteRegion(_)
         | ResolvedType::Mixed
         | ResolvedType::Error
         | ResolvedType::Void
@@ -1152,7 +1648,6 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::TypeParameter(_)
         | ResolvedType::InterfaceSelf(_)
         | ResolvedType::TraitSelf(_)
-        | ResolvedType::Enum(_)
         | ResolvedType::Unsupported => 1,
     }
 }
@@ -1204,6 +1699,22 @@ impl TypeRegistry {
         }
     }
 
+    fn display_nominal(&self, name: &str, arguments: &[TypeId]) -> String {
+        if arguments.is_empty() {
+            name.to_owned()
+        } else {
+            format!(
+                "{}<{}>",
+                name,
+                arguments
+                    .iter()
+                    .map(|argument| self.display(*argument))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+
     pub fn display(&self, id: TypeId) -> String {
         match self.kind(id) {
             TypeKind::Void => "void".to_string(),
@@ -1211,6 +1722,7 @@ impl TypeRegistry {
             TypeKind::Float(float) => float.source_name().to_string(),
             TypeKind::String => "string".to_string(),
             TypeKind::Bytes => "Bytes".to_string(),
+            TypeKind::ByteRegion(kind) => kind.source_name().to_string(),
             TypeKind::Nullable(inner) => format!("?{}", self.display(*inner)),
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
@@ -1224,22 +1736,11 @@ impl TypeRegistry {
                 crate::trait_composition::authored_type_parameter_name(name).to_owned()
             }
             TypeKind::Function(function) => self.display_function(function),
-            TypeKind::Enum(enum_type) => enum_type.name.clone(),
+            TypeKind::Enum(enum_type) => {
+                self.display_nominal(&enum_type.name, &enum_type.arguments)
+            }
             TypeKind::Class(class) | TypeKind::Interface(class) => {
-                if class.arguments.is_empty() {
-                    class.name.clone()
-                } else {
-                    format!(
-                        "{}<{}>",
-                        class.name,
-                        class
-                            .arguments
-                            .iter()
-                            .map(|argument| self.display(*argument))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }
+                self.display_nominal(&class.name, &class.arguments)
             }
             TypeKind::List(element) => format!("List<{}>", self.display(*element)),
             TypeKind::InterfaceSelf(_) | TypeKind::TraitSelf(_) => "self".to_string(),
@@ -1313,6 +1814,7 @@ impl TypeRegistry {
             TypeKind::Float(ty) => ResolvedType::Float(*ty),
             TypeKind::String => ResolvedType::String,
             TypeKind::Bytes => ResolvedType::Bytes,
+            TypeKind::ByteRegion(kind) => ResolvedType::ByteRegion(*kind),
             TypeKind::Bool => ResolvedType::Bool,
             TypeKind::Null => ResolvedType::Null,
             TypeKind::Mixed => ResolvedType::Mixed,
@@ -1338,7 +1840,9 @@ impl TypeRegistry {
                     return_borrow: function.return_borrow,
                 }))
             }
-            TypeKind::Enum(enum_type) => ResolvedType::Enum(enum_type.clone()),
+            TypeKind::Enum(enum_type) => {
+                ResolvedType::Enum(enum_type.map_arguments(|argument| self.resolved(*argument)))
+            }
             TypeKind::InterfaceSelf(name) => ResolvedType::InterfaceSelf(name.clone()),
             TypeKind::TraitSelf(name) => ResolvedType::TraitSelf(name.clone()),
             TypeKind::Interface(interface) => ResolvedType::Interface(InterfaceType::new(
@@ -1394,6 +1898,7 @@ impl TypeRegistry {
             ResolvedType::Float(ty) => TypeKind::Float(*ty),
             ResolvedType::String => TypeKind::String,
             ResolvedType::Bytes => TypeKind::Bytes,
+            ResolvedType::ByteRegion(kind) => TypeKind::ByteRegion(*kind),
             ResolvedType::Bool => TypeKind::Bool,
             ResolvedType::Null => TypeKind::Null,
             ResolvedType::Mixed => TypeKind::Mixed,
@@ -1422,7 +1927,9 @@ impl TypeRegistry {
                     return_borrow: function.return_borrow,
                 })
             }
-            ResolvedType::Enum(ty) => TypeKind::Enum(ty.clone()),
+            ResolvedType::Enum(ty) => {
+                TypeKind::Enum(ty.map_arguments(|argument| self.intern_resolved(argument)))
+            }
             ResolvedType::InterfaceSelf(name) => TypeKind::InterfaceSelf(name.clone()),
             ResolvedType::TraitSelf(name) => TypeKind::TraitSelf(name.clone()),
             ResolvedType::Interface(interface) => TypeKind::Interface(InterfaceType::new(

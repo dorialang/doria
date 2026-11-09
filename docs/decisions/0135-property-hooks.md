@@ -132,8 +132,12 @@ provenance, readonly defaults, and conformance rules remain binding. The earlier
 
 An ordinary getter, including an interface getter, may return a newly created
 callback that borrows `$this`. The caller owns that callback's environment but
-may not let it outlive the receiver. Environment ownership and retained-source
-lifetime are separate facts and must survive interface and override dispatch.
+must preserve the receiver through the callback's last use. If cleanup of an
+owned capture can observe the receiver, the dependency lasts through that
+cleanup instead. These are the ordinary closure lifetime rules from Decision
+0121; neither case changes reverse destruction order. Environment ownership and
+retained-source lifetime are separate facts and must survive interface and
+override dispatch.
 By contrast, `borrowed get` returning a stored callback lends the existing
 environment and transfers no cleanup obligation. Capturing `$this` in a new
 callback does not by itself make that callback a borrowed getter result.
@@ -197,8 +201,13 @@ Closure requires the computed Temperature case, backed validation, writable
 caching, checked failures, ownership/cleanup, interface and override dispatch,
 trait composition, and exactly-once read-modify-write to agree across the MIR
 interpreter, Cranelift, and LLVM. PHP executes the same hook contracts within
-its existing numeric compatibility boundaries; canonical float formatting and
-checked integer arithmetic still produce B1301, not host-semantic substitutes.
+its numeric compatibility boundaries. Checked integer addition, subtraction,
+multiplication, signed negation, compound updates, and increment/decrement now
+preserve every fixed-width type, source-aware overflow panics, stable places,
+and statement-temporary cleanup. Integer division, remainder, shifts, bitwise
+operations, conversions, and canonical float formatting retain their existing
+B1301 boundaries where not separately supported; no host-semantic substitutes
+are emitted.
 Negative cases cover readonly access,
 missing accessors, incompatible contracts, and forbidden blocking/async work.
 

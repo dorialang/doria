@@ -68,6 +68,156 @@ fn plan(packages: Vec<Package>) -> BuildPlanDocument {
 }
 
 #[test]
+fn group_defaults_inject_concurrency_once_without_a_user_concurrency_import() {
+    let document = plan(vec![package(
+        "acme/app",
+        &["main.doria", "start.doria"],
+        &[],
+    )]);
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert("acme/app", "main.doria", "function main(): void {}");
+    provider.insert(
+        "acme/app",
+        "start.doria",
+        r#"
+use Doria\Std\Io\{ReadinessSet, TransferPlan, TransferGroup, IoError};
+function start(writable ReadinessSet $set, take TransferPlan $plan): TransferGroup throws IoError {
+    return $set->begin($plan);
+}
+"#,
+    );
+    let mut session = CompilationSession::new();
+    let loaded = session.load_graph(&document, &provider).unwrap();
+    let analysis = session.analyze_graph(&loaded.graph);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let program = doriac::lower_compilation_graph_to_mir(&loaded.graph).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    assert_eq!(
+        program
+            .sources
+            .iter()
+            .filter(
+                |source| source.id == doriac::compiler_known_concurrency::SOURCE_ID
+                    && source.source.text == doriac::compiler_known_concurrency::SOURCE_TEXT
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        program
+            .classes
+            .iter()
+            .filter(|class| class.declaration_name
+                == doriac::compiler_known_concurrency::CANCELLATION_TOKEN)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn stream_contracts_resolve_once_across_multifile_graph_and_ide_analysis() {
+    let document = plan(vec![package(
+        "acme/app",
+        &["main.doria", "Reader.doria"],
+        &[],
+    )]);
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        "acme/app",
+        "Reader.doria",
+        r#"
+use Doria\Std\Io\{ReadableStream, ReadOutcome, WritableByteRegion, IoError};
+class Reader implements ReadableStream {
+    writable function read(writable WritableByteRegion $destination): ReadOutcome throws IoError {
+        if ($destination->length == 0) { return ReadOutcome::Data(0); }
+        $destination[0] = 42;
+        return ReadOutcome::Data(1);
+    }
+}
+function read(writable ReadableStream $stream, writable WritableByteRegion $destination): ReadOutcome throws IoError {
+    return $stream->read($destination);
+}
+"#,
+    );
+    provider.insert(
+        "acme/app",
+        "main.doria",
+        r#"
+use Doria\Std\Io\ReadOutcome as Progress;
+function main(): void {
+    let writable $stream = new Reader();
+    writable Bytes $bytes = Bytes::allocate(1);
+    {
+        let writable $destination = $bytes->getWritableRegion(0, 1);
+        let $outcome = read($stream, $destination);
+        echo match ($outcome) {
+            Progress::Data($byteCount) => "count {$byteCount}\n",
+            default => "unexpected outcome\n",
+        };
+    }
+    echo "byte {$bytes[0]}\n";
+}
+"#,
+    );
+    let mut session = CompilationSession::new();
+    let loaded = session.load_graph(&document, &provider).unwrap();
+    let analysis = session.analyze_graph(&loaded.graph);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    let program = doriac::lower_compilation_graph_to_mir(&loaded.graph)
+        .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert_eq!(
+        program
+            .sources
+            .iter()
+            .filter(|source| {
+                source.id == doriac::compiler_known_stream::SOURCE_ID
+                    && source.source.text == doriac::compiler_known_stream::SOURCE_TEXT
+            })
+            .count(),
+        1,
+        "{:?}",
+        program
+            .sources
+            .iter()
+            .map(|source| (
+                source.id,
+                source.display_path.as_str(),
+                source.source.text.len()
+            ))
+            .collect::<Vec<_>>()
+    );
+    // Programs include only the std declarations they reach (decision log
+    // entry 41): this one reads, so `WriteOutcome` is absent, never doubled.
+    for (name, expected) in [("ReadOutcome", 1), ("WriteOutcome", 0)] {
+        assert_eq!(
+            program
+                .enums
+                .iter()
+                .filter(|definition| definition.name == format!("Doria\\Std\\Io\\{name}"))
+                .count(),
+            expected
+        );
+    }
+    let result = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(result.stdout, b"count 1\nbyte 42\n");
+    assert!(result.stderr.is_empty());
+    assert_eq!(result.exit_status, 0);
+    let mut missing_source = program.clone();
+    missing_source
+        .sources
+        .retain(|source| source.id != doriac::compiler_known_stream::SOURCE_ID);
+    assert!(doriac::mir_validation::validate_program(&missing_source).is_err());
+}
+
+#[test]
 fn generic_diamond_edits_invalidate_transitive_cross_package_conformance() {
     let mut document = plan(vec![
         package(
@@ -307,5 +457,72 @@ fn trait_bodies_preserve_definition_site_names_across_packages_and_edits() {
         assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
         assert!(session.last_facts().invalidated_sources.contains("acme/app:Record.doria"));
         assert!(session.last_facts().invalidated_sources.contains("acme/app:main.doria"));
+    }
+}
+
+#[test]
+fn consuming_receiver_edits_invalidate_class_interface_and_trait_dependents() {
+    for (kind, dependent_file, dependent, main) in [
+        (
+            "class",
+            "Dependent.doria",
+            "function perform(take Contract $value): int { let writable $receiver = $value; return $receiver->finish(); }",
+            "function main(): void { let $answer = perform(new Contract()); }",
+        ),
+        (
+            "interface",
+            "ChildContract.doria",
+            "interface ChildContract extends Contract {}",
+            "function perform(take ChildContract $value): int { let writable $receiver = $value; return $receiver->finish(); } function main(): void {}",
+        ),
+        (
+            "trait",
+            "Resource.doria",
+            "class Resource { uses Contract; }",
+            "function main(): void { let writable $resource = new Resource(); let $answer = $resource->finish(); }",
+        ),
+    ] {
+        let document = plan(vec![package(
+            "acme/app",
+            &["main.doria", "Contract.doria", dependent_file, "Unrelated.doria"],
+            &[],
+        )]);
+        let mut provider = InMemorySourceProvider::new();
+        provider.insert("acme/app", dependent_file, dependent);
+        provider.insert("acme/app", "main.doria", main);
+        provider.insert("acme/app", "Unrelated.doria", "function unrelated(): int { return 7; }");
+        let dependent_identity = format!("acme/app:{dependent_file}");
+        let mut session = CompilationSession::new();
+        // This walk covers every ordered unequal readonly/writable/consuming pair.
+        for (revision, receiver) in ["", "writable ", "consuming ", "", "consuming ", "writable ", ""].into_iter().enumerate() {
+            let body = if kind == "interface" { ";" } else { " { return 42; }" };
+            provider.insert(
+                "acme/app",
+                "Contract.doria",
+                format!("{kind} Contract {{ {receiver}function finish(): int{body} }}"),
+            );
+            let loaded = session.load_graph(&document, &provider).unwrap();
+            let analysis = session.analyze_graph(&loaded.graph);
+            assert!(analysis.diagnostics.is_empty(), "{kind}, revision {revision}: {:?}", analysis.diagnostics);
+            if revision == 0 {
+                continue;
+            }
+            let facts = session.last_facts();
+            assert!(
+                facts.declaration_changed_sources.contains("acme/app:Contract.doria"),
+                "{kind}, revision {revision}: {facts:?}"
+            );
+            assert!(
+                !facts.body_only_changed_sources.contains("acme/app:Contract.doria"),
+                "receiver ownership is a declaration contract: {kind}, revision {revision}: {facts:?}"
+            );
+            for source in ["acme/app:Contract.doria", dependent_identity.as_str(), "acme/app:main.doria"] {
+                assert!(facts.invalidated_sources.contains(source), "{kind}, revision {revision}, {source}: {facts:?}");
+            }
+            assert!(
+                !facts.invalidated_sources.contains("acme/app:Unrelated.doria"),
+                "{kind}, revision {revision}: {facts:?}"
+            );
+        }
     }
 }

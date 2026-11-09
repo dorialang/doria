@@ -1,8 +1,20 @@
 use super::*;
 use crate::ast::PropertyHookKind;
 use crate::property_hooks::{declaration_facts, PropertyHookContext};
+use crate::symbols::PropertyHooksInfo;
 
 impl Checker<'_> {
+    pub(super) fn resolve_property_type(
+        &mut self,
+        property: &PropertyDecl,
+        owner: &str,
+        span: Span,
+    ) -> TypeId {
+        self.with_declaration_condition(property.span, |checker| {
+            checker.resolve_type_ref_with_class(&property.ty, span, Some(owner))
+        })
+    }
+
     pub(super) fn property_backing_fields(
         &mut self,
     ) -> HashMap<Span, crate::property_hooks::PropertyBackingField> {
@@ -94,6 +106,13 @@ impl Checker<'_> {
         ordered.sort_by_key(|(depth, _)| *depth);
         for (_, owner) in ordered {
             let class = self.classes[&owner.name].clone();
+            self.type_parameter_scopes.push(
+                class
+                    .type_params
+                    .iter()
+                    .map(|parameter| (parameter.name.clone(), parameter.constraints.clone()))
+                    .collect(),
+            );
             let mut properties = class.properties.iter().collect::<Vec<_>>();
             properties.sort_by_key(|(_, property)| property.declaration_span);
             for (name, property) in properties {
@@ -161,9 +180,10 @@ impl Checker<'_> {
                 let mut compatible = true;
                 for (kind, required) in required {
                     let actual = self.property_accessor_method(property, &owner, kind);
-                    if actual.as_ref().is_some_and(|method| {
-                        self.method_contract_failures(method, &required).is_empty()
-                    }) {
+                    let failures = actual
+                        .as_ref()
+                        .map(|method| self.method_contract_failures(method, &required));
+                    if failures.as_ref().is_some_and(Vec::is_empty) {
                         let method = actual.unwrap();
                         overrides.push((
                             method.declaration,
@@ -176,11 +196,23 @@ impl Checker<'_> {
                             PropertyHookKind::Get => "getter",
                             PropertyHookKind::Set => "setter",
                         };
+                        let origin = actual.as_ref().map_or(property.declaration_span, |method| {
+                            if failures.as_ref().is_some_and(|failures| {
+                                failures.contains(&contracts::ContractMismatch::Availability)
+                            }) {
+                                self.callable_condition(method)
+                                    .ok()
+                                    .flatten()
+                                    .map_or(method.declaration, |condition| condition.clause)
+                            } else {
+                                method.declaration
+                            }
+                        });
                         self.diagnostics.push(
-                            Diagnostic::new("E0729", format!("property `{}::{name}` does not preserve its inherited {accessor} contract", owner.name), actual.map_or(property.declaration_span, |method| method.declaration))
+                            Diagnostic::new("E0729", format!("property `{}::{name}` does not preserve its inherited {accessor} contract", owner.name), origin)
                                 .with_title("Override Contract Does Not Match")
                                 .with_related(required.declaration, "The Inherited Accessor Contract Is Declared Here")
-                                .with_help("preserve every inherited accessor's type, parameter name, ownership, receiver access, return provenance, and checked effects"),
+                                .with_help("preserve every inherited accessor's type, parameter name, ownership, receiver access, return provenance, checked effects, and availability"),
                         );
                     }
                 }
@@ -198,6 +230,7 @@ impl Checker<'_> {
                     }
                 }
             }
+            self.type_parameter_scopes.pop();
         }
         // Calls are checked before the post-body contract pass establishes
         // accessor families. Publish the final roots for both reads and writes.
@@ -482,7 +515,32 @@ impl Checker<'_> {
         owner: &ClassType<TypeId>,
         kind: PropertyHookKind,
     ) -> Option<MethodInfo> {
-        let hooks = property.hooks.as_ref()?;
+        self.accessor_method(
+            property.access,
+            property.hooks.as_ref()?,
+            owner,
+            kind,
+            false,
+        )
+    }
+
+    pub(super) fn static_property_accessor_method(
+        &mut self,
+        property: &StaticPropertyInfo,
+        owner: &ClassType<TypeId>,
+        kind: PropertyHookKind,
+    ) -> Option<MethodInfo> {
+        self.accessor_method(property.access, property.hooks.as_ref()?, owner, kind, true)
+    }
+
+    fn accessor_method(
+        &mut self,
+        access: MemberAccess,
+        hooks: &PropertyHooksInfo,
+        owner: &ClassType<TypeId>,
+        kind: PropertyHookKind,
+        is_static: bool,
+    ) -> Option<MethodInfo> {
         let accessor = match kind {
             PropertyHookKind::Get => hooks.getter?,
             PropertyHookKind::Set => hooks.setter?,
@@ -497,10 +555,10 @@ impl Checker<'_> {
                 .get(&accessor.declaration)
                 .copied()
                 .or_else(|| hooks.is_open.then_some(accessor.declaration)),
-            access: property.access,
-            receiver_mode: Some(accessor.receiver_mode),
+            access,
+            receiver_mode: (!is_static).then_some(accessor.receiver_mode),
             return_borrow: signature.return_borrow,
-            is_static: false,
+            is_static,
             enclosing_type_bindings: HashMap::new(),
             type_params: signature.type_params.clone(),
             params: signature.params.clone(),
@@ -606,7 +664,24 @@ impl Checker<'_> {
                 );
             }
         }
-        self.record_callable_dependency(method.declaration);
+        self.record_exact_receiver_dispatch(object, method, span);
+        self.record_accessor_call_facts(property_name, kind, method, declaring_type, span);
+    }
+
+    pub(super) fn record_accessor_call_facts(
+        &mut self,
+        property_name: &str,
+        kind: PropertyHookKind,
+        method: &MethodInfo,
+        declaring_type: TypeId,
+        span: Span,
+    ) {
+        self.defer_callable_availability(method, &method.enclosing_type_bindings, span);
+        self.record_method_effect_dependency(
+            method,
+            self.exact_method_calls
+                .contains(&(span, method.declaration)),
+        );
         let declaring_type = self.types.resolved(declaring_type);
         let target = match &declaring_type {
             ResolvedType::Class(class_type) => CallableTarget::Method {
@@ -626,14 +701,18 @@ impl Checker<'_> {
                 implementations: Vec::new(),
             },
         };
-        let effects = self.selected_contract_effects(&target, method, span);
-        self.record_checked_effects(effects.iter().copied(), span);
+        let effects = self.record_selected_effects(
+            &target,
+            method,
+            span,
+            super::executable_effects::SelectedUse::Accessor(kind),
+        );
         let call = PropertyAccessorCallSemanticInfo {
             target,
             declaring_type,
             declaration: method.declaration,
             virtual_root: method.virtual_root,
-            receiver_mode,
+            receiver_mode: method.receiver_mode,
             return_type: self.types.resolved(method.return_ty),
             return_borrow: method.return_borrow,
             checked_effects: effects
@@ -661,12 +740,11 @@ impl Checker<'_> {
 
     pub(super) fn specialize_constrained_property_accessors(
         &mut self,
-        callable: Span,
-        substitutions: &HashMap<String, TypeId>,
+        body: &super::callable_contracts::BodyInstance,
     ) {
         let mut calls = std::mem::take(&mut self.property_accessor_calls);
         for (span, accessors) in &mut calls {
-            if !callable.contains(*span) {
+            if !body.declaration.contains(*span) {
                 continue;
             }
             for (kind, call) in [
@@ -683,8 +761,7 @@ impl Checker<'_> {
                 else {
                     continue;
                 };
-                let receiver = self.types.intern_resolved(receiver);
-                let receiver = self.substitute_type_id(receiver, substitutions);
+                let receiver = self.types.intern_resolved(&body.substitute(receiver));
                 if self.type_is_symbolic(receiver) {
                     continue;
                 }
@@ -732,12 +809,7 @@ impl Checker<'_> {
         let Some(facts) = declaration_facts(property, context) else {
             return;
         };
-        let property_type = self.resolve_type_ref_in_position(
-            &property.ty,
-            property.name_span,
-            TypePosition::Value,
-            Some(owner),
-        );
+        let property_type = self.resolve_property_type(property, owner, property.name_span);
         for (accessor, callable) in facts.accessors().zip(facts.callables()) {
             let mut signature = self.resolve_function_signature(&callable, Some(owner));
             if accessor.hook.kind == PropertyHookKind::Set {
@@ -774,11 +846,22 @@ impl Checker<'_> {
                 } else {
                     None
                 };
-                signature.return_borrow = kind.map(|kind| ReturnBorrow {
-                    source: BorrowSource::Receiver,
-                    writable: false,
-                    kind,
-                });
+                // A region getter keeps the contract its requirement elided.
+                if crate::types::ByteRegionKind::from_resolved(
+                    &self.types.resolved(signature.return_ty),
+                )
+                .is_none()
+                {
+                    signature.return_borrow = kind.map(|kind| ReturnBorrow {
+                        source: BorrowSource::Receiver,
+                        writable: false,
+                        kind,
+                        lifetime: match kind {
+                            ReturnBorrowKind::Value => RetainedLifetime::LastUse,
+                            ReturnBorrowKind::Retained => RetainedLifetime::Cleanup,
+                        },
+                    });
+                }
             }
             self.function_signatures.insert(callable.span, signature);
         }
@@ -814,7 +897,7 @@ impl Checker<'_> {
         &mut self,
         return_borrows: &HashMap<Span, ReturnBorrow>,
     ) {
-        for item in &self.program.items {
+        for item in &self.callable_body_program().items {
             let members = match item {
                 Item::Class(class) => &class.members,
                 Item::Trait(declaration) => &declaration.members,

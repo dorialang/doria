@@ -4,15 +4,28 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/cargo_artifacts.php';
+require_once __DIR__ . '/cargo_artifact_cleanup.php';
+require_once __DIR__ . '/vet_commands.php';
 
 const CACHE_POLICY_VERSION = 1;
 const UNTRACKED_CACHE_BYTES = 256 * 1024 * 1024;
 const MINIMUM_FREE_BYTES = 5 * 1024 * 1024 * 1024;
 
+/**
+ * The tier-1 targets CI builds and tests natively. A local vet runs on one of
+ * them and type-checks the others, so a defect that only one platform's code
+ * contains is found before CI: Windows-only dead code in a test, a binding
+ * whose signature drifted, a cfg that leaves a helper unused.
+ */
+const TIER_ONE_TARGETS = ['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'];
+
 $root = dirname(__DIR__);
 $withLlvm = false;
 $plan = false;
 $reclaim = false;
+$reclaimObsolete = false;
+$reclaimInterrupted = false;
+$approvedPlan = null;
 $target = getenv('DORIA_VALIDATION_TARGET_DIR') ?: getenv('CARGO_TARGET_DIR') ?: $root . '/target';
 
 for ($index = 1; $index < count($argv); $index++) {
@@ -26,6 +39,18 @@ for ($index = 1; $index < count($argv); $index++) {
         case '--reclaim':
             $reclaim = true;
             break;
+        case '--reclaim-obsolete':
+            $reclaimObsolete = true;
+            break;
+        case '--reclaim-interrupted':
+            $reclaimInterrupted = true;
+            break;
+        case '--approve-plan':
+            if (!isset($argv[++$index])) {
+                fail('--approve-plan requires a selective cleanup plan identity');
+            }
+            $approvedPlan = $argv[$index];
+            break;
         case '--target-dir':
             if (!isset($argv[++$index])) {
                 fail('--target-dir requires a path');
@@ -35,6 +60,31 @@ for ($index = 1; $index < count($argv); $index++) {
         default:
             fail("unknown option `{$argv[$index]}`");
     }
+}
+
+if ($reclaimObsolete || $reclaimInterrupted) {
+    if ($reclaim || $withLlvm || ($reclaimObsolete && $reclaimInterrupted) || ($plan && $approvedPlan !== null)) {
+        fail('selective cleanup cannot be combined with validation, whole-target cleanup, or plan application');
+    }
+    try {
+        $metadata = json_decode(
+            capture(['cargo', 'metadata', '--no-deps', '--format-version', '1', '--offline', '--locked'], $root),
+            true,
+            512,
+            JSON_THROW_ON_ERROR | JSON_BIGINT_AS_STRING,
+        );
+        $selection = $reclaimInterrupted ? DoriaTestCleanupMode::Interrupted : DoriaTestCleanupMode::Obsolete;
+        $cleanup = $approvedPlan === null
+            ? doria_obsolete_test_plan($target, $root, $metadata, $selection)
+            : doria_reclaim_obsolete_tests($target, $root, $metadata, $approvedPlan, $selection);
+        fwrite(STDOUT, json_encode($cleanup, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . "\n");
+        exit(0);
+    } catch (Throwable $error) {
+        fail($error->getMessage());
+    }
+}
+if ($approvedPlan !== null) {
+    fail('--approve-plan requires --reclaim-obsolete or --reclaim-interrupted');
 }
 
 try {
@@ -77,6 +127,7 @@ if ($reclaim) {
 }
 
 $commands = default_commands($root, $target);
+array_push($commands, ...cross_target_commands($root, $target));
 if ($withLlvm) {
     array_push($commands, ...llvm_commands($llvmTarget));
 }
@@ -106,6 +157,7 @@ if ($freeAfterReclaim < MINIMUM_FREE_BYTES) {
     );
 }
 
+require_cross_targets($root);
 $failed = null;
 try {
     foreach ($commands as $command) {
@@ -148,6 +200,15 @@ function default_commands(string $root, string $target): array
 
     return [
         command(['php', 'scripts/check_build_artifact_policy.php'], $target),
+        command(['php', 'scripts/test_rust_toolchain_authority.php'], $target),
+        command(['php', 'scripts/check_rust_toolchain_authority.php'], $target),
+        command(['php', 'scripts/test_test_callback_guards.php'], $target),
+        command(['php', 'scripts/check_test_callback_guards.php'], $target),
+        command(['php', 'scripts/check_ci_timeouts.php'], $target),
+        command(['php', 'scripts/check_ci_shells.php'], $target),
+        command(['php', 'scripts/check_vet_covers_ci.php'], $target),
+        command(['php', 'scripts/test_cross_repo_pins.php'], $target),
+        command(['php', 'scripts/check_cross_repo_pins.php'], $target),
         command(['php', 'scripts/check_docs_authority.php'], $target),
         command(['php', 'scripts/check_diagnostic_style.php'], $target),
         command(['php', 'scripts/check_panic_catalogue.php'], $target),
@@ -158,12 +219,109 @@ function default_commands(string $root, string $target): array
         command(['cargo', 'build', '-p', 'doriac', '--bin', 'doriac', '--locked'], $target),
         command(['cargo', 'clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '--workspace', '--all-targets', '--locked'], $target),
+        command(['cargo', 'clippy', '-p', 'doria-rt', '--all-targets', '--no-default-features', '--features', 'hosted-shared-runtime', '--locked', '--', '-D', 'warnings'], $target),
+        command(['cargo', 'test', '-p', 'doria-rt', '--all-targets', '--no-default-features', '--features', 'hosted-shared-runtime', '--locked'], $target),
         command([$executable, 'check', 'examples/php/person.doria'], $target),
         command([$executable, 'hir', 'examples/php/person.doria'], $target, true),
         command([$executable, 'compile', 'examples/native/main_return_zero.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_zero'], $target),
         command([$executable, 'compile', 'examples/native/main_return_42.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_42'], $target),
         command([$executable, 'compile', 'examples/native/main_void_hello.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_void_hello'], $target),
     ];
+}
+
+/**
+ * Clippy for every tier-1 target except the host, with the pinned toolchain.
+ * doriac is checked without `bundled-runtime`, whose build script links a
+ * runtime library with the target's own linker, and without `llvm-backend`,
+ * which needs that target's LLVM; CI's native jobs cover both.
+ *
+ * @return list<array{command: list<string>, target: string, discardOutput: bool}>
+ */
+function cross_target_commands(string $root, string $target): array
+{
+    $commands = [];
+    foreach (cross_targets($root) as $triple) {
+        $clippy = ['cargo', 'clippy', '--target', $triple, '--locked'];
+        $commands[] = command([...$clippy, '-p', 'doria-rt', '--all-targets', '--', '-D', 'warnings'], $target);
+        $commands[] = command([
+            ...$clippy,
+            '-p',
+            'doria-rt',
+            '--all-targets',
+            '--no-default-features',
+            '--features',
+            'hosted-shared-runtime',
+            '--',
+            '-D',
+            'warnings',
+        ], $target);
+        $commands[] = command([
+            ...$clippy,
+            '-p',
+            'doriac',
+            '--all-targets',
+            '--no-default-features',
+            '--',
+            '-D',
+            'warnings',
+        ], $target);
+    }
+    return $commands;
+}
+
+/** @return list<string> The tier-1 targets other than the pinned toolchain's host. */
+function cross_targets(string $root): array
+{
+    $host = pinned_rustc_host($root);
+    return array_values(array_filter(TIER_ONE_TARGETS, static fn (string $triple): bool => $triple !== $host));
+}
+
+/** Fails, naming the command to run, when a cross target's standard library is missing. */
+function require_cross_targets(string $root): void
+{
+    $installed = installed_rust_targets($root);
+    foreach (cross_targets($root) as $triple) {
+        if (!in_array($triple, $installed, true)) {
+            fail(
+                "the cross-target checks need the {$triple} standard library for the pinned toolchain; "
+                    . "install it with: rustup target add {$triple}",
+            );
+        }
+    }
+}
+
+/** The pinned toolchain's host triple, read in the repository so rust-toolchain.toml applies. */
+function pinned_rustc_host(string $root): string
+{
+    foreach (captured_lines(['rustc', '-vV'], $root) as $line) {
+        if (str_starts_with($line, 'host: ')) {
+            return substr($line, strlen('host: '));
+        }
+    }
+    fail('rustc -vV reported no host triple; check the pinned toolchain with: rustup show');
+}
+
+/** @return list<string> The pinned toolchain's installed target triples. */
+function installed_rust_targets(string $root): array
+{
+    return captured_lines(['rustup', 'target', 'list', '--installed'], $root);
+}
+
+/** @param list<string> $command @return list<string> */
+function captured_lines(array $command, string $workingDirectory): array
+{
+    $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $workingDirectory);
+    if (!is_resource($process)) {
+        fail('could not run ' . display_command($command));
+    }
+    $output = (string) stream_get_contents($pipes[1]);
+    $errors = (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    if (proc_close($process) !== 0) {
+        fail(display_command($command) . ' failed: ' . trim($errors));
+    }
+    return array_values(array_filter(array_map('trim', explode("\n", $output)), static fn (string $line): bool => $line !== ''));
 }
 
 /** @return list<array{command: list<string>, target: string, discardOutput: bool}> */
@@ -175,27 +333,10 @@ function llvm_commands(string $target): array
         command(['cargo', 'clippy', '-p', 'doriac', '--all-targets', '--features', 'llvm-backend', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '-p', 'doriac', '--lib', '--features', 'llvm-backend', '--locked'], $target),
     ];
-    foreach ([
-        'mir_validation_tests',
-        'llvm_mir_tests',
-        'cli_tests',
-        'constructor_owned_property_tests',
-        'stage17_io_tests',
-        'stage18_tests',
-        'stage21_tests',
-        'stage22_tests',
-        'stage25a_tests',
-        'return_borrow_alias_tests',
-        'returned_closure_transport_tests',
-        'stage35_runtime_tests',
-        'stage35a_optimizer_tests',
-        'stage36_property_hook_tests',
-        'property_hook_initializer_tests',
-        'property_hook_cleanup_effect_tests',
-        'performance_report_tests',
-        'native_testing_slice1_tests',
-        'native_mir_parity_tests',
-    ] as $suite) {
+    foreach (release_runtime_tests() as $runtimeTest) {
+        $commands[] = command($runtimeTest, $target);
+    }
+    foreach (llvm_test_suites() as $suite) {
         $commands[] = command(
             ['cargo', 'test', '-p', 'doriac', '--test', $suite, '--features', 'llvm-backend', '--locked'],
             $target,
@@ -214,11 +355,7 @@ function command(array $arguments, string $target, bool $discardOutput = false):
 /** @return array<string, string> */
 function environment_for(string $target): array
 {
-    $environment = getenv();
-    $environment = is_array($environment) ? $environment : [];
-    $environment['CARGO_TARGET_DIR'] = $target;
-
-    return $environment;
+    return doria_build_environment($target);
 }
 
 /** @param list<string> $command @param array<string, string> $environment */
@@ -263,6 +400,7 @@ function reclaim_target(string $root, string $target, string $reason): void
     fwrite(STDOUT, "Reclaiming managed Cargo target because {$reason}.\n");
     run(['cargo', 'clean', '--target-dir', $target], $root, environment_for($target));
     doria_write_artifact_owner($target, $root);
+    write_stamp($target . DIRECTORY_SEPARATOR . '.doria-artifact-cache.json', cache_identity($root));
 }
 
 function cache_identity(string $root): string

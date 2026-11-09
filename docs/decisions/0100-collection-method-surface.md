@@ -50,6 +50,11 @@ through the Stage 22 flow model. Naming follows the §9.1 charter.
   can miss, the borrow is nullable (`?T`) and narrows via Stage 22 flow.
   Returning one through a readonly property or method preserves its transitive
   owner provenance under Decision 0089; it never silently becomes an owned `T`.
+- **Owning mixed bindings preserve the element.** The accepted Stage 23 mixed-box
+  correction permits `mixed $item = $items[$index]` to acquire an owned box and
+  payload claim without removing the collection element. This materialization
+  is distinct from an ordinary borrowed use, which acquires no ownership. It
+  does not make `mixed` or other move-type elements Copy.
 - **Indexed writes mutate the slot, not the containing property.** A complete
   writable path may be rooted through a local, parameter, writable `$this`,
   writable property path, or writable shared access object. For a move value,

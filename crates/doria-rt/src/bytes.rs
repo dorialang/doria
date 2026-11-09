@@ -1,9 +1,7 @@
 use core::mem;
 use core::ptr;
 
-use crate::{
-    allocate, deallocate, dr_v2_panic_code, dr_v2_panic_index_out_of_bounds, DrStackFrameV2,
-};
+use crate::{allocate, byte_region, deallocate, dr_v2_panic_code, DrStackFrameV2};
 
 #[repr(C)]
 pub struct DrBytesV1 {
@@ -15,6 +13,14 @@ pub unsafe fn copy(source: *const u8, length: usize) -> *mut DrBytesV1 {
     let data = allocate_data(length);
     if length != 0 {
         ptr::copy_nonoverlapping(source, data, length);
+    }
+    allocate_header(data, length)
+}
+
+pub unsafe fn zeroed(length: usize) -> *mut DrBytesV1 {
+    let data = allocate_data(length);
+    if length != 0 {
+        ptr::write_bytes(data, 0, length);
     }
     allocate_header(data, length)
 }
@@ -64,18 +70,21 @@ pub unsafe fn data(bytes: *const DrBytesV1) -> *const u8 {
     (*bytes).data
 }
 
-pub unsafe fn get(frame: *const DrStackFrameV2, bytes: *const DrBytesV1, index: usize) -> u8 {
-    if index >= (*bytes).length {
-        dr_v2_panic_index_out_of_bounds(frame, b"P1301".as_ptr(), 5, index as i64, (*bytes).length);
+/// The buffer as a slice. Empty buffers may have no allocation, and a null
+/// data pointer is not a valid slice even for length zero.
+pub unsafe fn contents<'a>(bytes: *const DrBytesV1) -> &'a [u8] {
+    match (*bytes).length {
+        0 => &[],
+        length => core::slice::from_raw_parts((*bytes).data, length),
     }
-    *(*bytes).data.add(index)
+}
+
+pub unsafe fn get(frame: *const DrStackFrameV2, bytes: *const DrBytesV1, index: usize) -> u8 {
+    byte_region::dr_v2_byte_region_get(frame, (*bytes).data, (*bytes).length, index as i64)
 }
 
 pub unsafe fn set(frame: *const DrStackFrameV2, bytes: *mut DrBytesV1, index: usize, value: u8) {
-    if index >= (*bytes).length {
-        dr_v2_panic_index_out_of_bounds(frame, b"P1301".as_ptr(), 5, index as i64, (*bytes).length);
-    }
-    *(*bytes).data.add(index) = value;
+    byte_region::dr_v2_byte_region_set(frame, (*bytes).data, (*bytes).length, index as i64, value)
 }
 
 pub unsafe fn equal(left: *const DrBytesV1, right: *const DrBytesV1) -> bool {
@@ -127,6 +136,28 @@ mod tests {
             assert!(equal(left, right));
             free(left);
             free(right);
+        }
+    }
+
+    #[test]
+    fn allocated_byte_buffers_are_zeroed_and_independently_owned() {
+        unsafe {
+            let empty = zeroed(0);
+            assert_eq!(length(empty), 0);
+            free(empty);
+
+            let left = zeroed(8193);
+            let right = zeroed(8193);
+            assert_eq!(length(left), 8193);
+            for index in 0..8193 {
+                assert_eq!(get(ptr::null(), left, index), 0);
+            }
+            assert!(equal(left, right));
+            set(ptr::null(), left, 8192, 255);
+            assert_eq!(get(ptr::null(), right, 8192), 0);
+            assert!(!equal(left, right));
+            free(right);
+            free(left);
         }
     }
 }

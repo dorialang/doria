@@ -1,0 +1,30 @@
+interface Fault extends Error {}
+interface SpecificFault extends Fault {}
+
+class Failure implements SpecificFault
+{
+    function __construct(string $message) {}
+}
+
+open class Root
+{
+    open function value(): int throws Fault { throw new Failure("r"); }
+}
+
+class InterfaceChild extends Root
+{
+    override function value(): int throws SpecificFault { throw new Failure("i"); }
+}
+
+class ConcreteChild extends Root
+{
+    override function value(): int throws Failure { throw new Failure("c"); }
+}
+
+function invoke(Root $source): int throws Fault { return $source->value(); }
+
+function main(): void
+{
+    try { echo invoke(new InterfaceChild()); } catch (Error $error) { echo $error->message; }
+    try { echo invoke(new ConcreteChild()); } catch (Error $error) { echo $error->message; }
+}

@@ -106,10 +106,12 @@ impl Checker<'_> {
             returns_move_type: resolved_type_is_move_type(&call.return_type, &self.move_enum_names)
                 && return_borrow.is_none_or(|borrow| borrow.kind == ReturnBorrowKind::Retained),
             return_borrow,
-            receiver: Some(if call.receiver_mode.is_writable() {
-                UseMode::Write
-            } else {
-                UseMode::Read
+            receiver: call.receiver_mode.map(|mode| {
+                if mode.is_writable() {
+                    UseMode::Write
+                } else {
+                    UseMode::Read
+                }
             }),
         }
     }

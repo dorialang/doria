@@ -372,6 +372,41 @@ fn mir_validation_rejects_corrupt_traversal_results_and_checked_cleanup() {
 }
 
 #[test]
+fn infallible_list_callbacks_share_ordinary_indirect_error_lowering() {
+    let source = r#"
+function main(): void {
+    List<int> $values = [1, 2];
+    let $mapped = $values->map(fn(int $value) => $value * 2);
+    let $filtered = $values->filter(fn(int $value) => $value > 1);
+    let $sum = $values->reduce(0, function (writable int $sum, int $value): void {
+        $sum += $value;
+    });
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage30g-infallible.doria", source)
+        .expect("infallible callbacks must not require an outer checked-error target");
+    let main = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .unwrap();
+    assert!(main.checked_effects.is_empty());
+    let plans = algorithm_plans(&program);
+    assert_eq!(plans.len(), 3);
+    for plan in plans {
+        let failure = plan
+            .callback_failure
+            .expect("the shared callback ABI carries errors");
+        assert!(matches!(
+            main.blocks[failure.0].terminator,
+            mir::Terminator::Unreachable
+        ));
+    }
+    doriac::mir_validation::validate_program(&program)
+        .expect("proved-impossible callback error edges need no partial-result cleanup");
+}
+
+#[test]
 fn ambient_list_callbacks_keep_checked_transport_and_validate_their_effect_profile() {
     let source = r#"
 function main(): void
@@ -557,23 +592,32 @@ function main(): void
 
 #[test]
 fn nullable_and_callback_ownership_boundaries_are_precise() {
-    let nullable = analyze(
-        r#"
-function inspect(?List<int> $values): void {
-    let $invalid = $values->map(fn(int $value) => $value);
-    if ($values != null) {
-        List<int> $valid = $values->map(fn(int $value) => $value);
+    for call in [
+        "map(fn(int $value) => $value)",
+        "filter(fn(int $value) => $value > 0)",
+        "reduce(0, function(writable int $sum, int $value): void { $sum += $value; })",
+    ] {
+        let source = format!(
+            r#"
+function inspect(?List<int> $values): void {{
+    let $invalid = $values->{call};
+    if ($values != null) {{
+        let $valid = $values->{call};
+    }}
+}}
+function main(): void {{}}
+"#
+        );
+        let nullable = analyze(&source);
+        assert_eq!(
+            nullable.info.list_algorithm_calls.len(),
+            1,
+            "only the narrowed receiver should produce an algorithm plan: {call}"
+        );
+        let call_span = nullable.info.list_algorithm_calls.keys().next().unwrap();
+        assert!(call_span.start > source.find("if ($values != null)").unwrap());
+        assert!(!error_codes(&nullable.diagnostics).is_empty());
     }
-}
-function main(): void {}
-"#,
-    );
-    assert_eq!(
-        nullable.info.list_algorithm_calls.len(),
-        1,
-        "only the narrowed receiver should produce an algorithm plan"
-    );
-    assert!(!error_codes(&nullable.diagnostics).is_empty());
 
     let borrowed_result = analyze(
         r#"

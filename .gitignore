@@ -9,6 +9,7 @@
 *.php
 !examples/**/*.php
 !scripts/*.php
+!crates/**/tests/fixtures/**/*.php
 vendor/
 *.log
 .idea

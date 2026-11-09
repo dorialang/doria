@@ -1,0 +1,22 @@
+open class Root
+{
+    open writable function value(): int { return 1; }
+    function __destruct() { try { echo "r"; } catch (Error) {} }
+}
+
+class Child extends Root
+{
+    int $number = 7;
+    override function value(): int { return $this->number; }
+    function __destruct() { try { echo "c"; } catch (Error) {} }
+}
+
+function throughRoot(writable Root $source): int { return $source->value(); }
+function throughChild(Child $source): int { return $source->value(); }
+
+function main(): void
+{
+    let writable $source = new Child();
+    echo throughRoot($source);
+    echo throughChild($source);
+}

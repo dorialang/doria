@@ -65,7 +65,8 @@ impl AccessorCallPlan {
     ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
         match self {
             Self::Direct(signature) => {
-                let expected = mir::Type::Class(signature.method_class.expect("instance accessor"));
+                let expected =
+                    context.class_receiver_type(signature.method_class.expect("instance accessor"));
                 let mut lowered = vec![convert_call_result(
                     receiver.0, receiver.1, expected, false, span, context,
                 )?];
@@ -99,6 +100,23 @@ pub(super) fn materialize_getter(
     consume_result: bool,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    if let hir::Expr::StaticMember { member, span, .. } = expression {
+        let call = context.semantic_info.property_accessor_calls[span]
+            .getter
+            .as_ref()
+            .expect("checked static getter call");
+        let AccessorCallPlan::Direct(signature) = AccessorCallPlan::resolve(
+            call,
+            member,
+            crate::ast::PropertyHookKind::Get,
+            *span,
+            context,
+        )?
+        else {
+            unreachable!("a static getter has a direct callable target")
+        };
+        return materialize_signature_call(signature, Vec::new(), *span, consume_result, context);
+    }
     let hir::Expr::PropertyAccess {
         object,
         property,
@@ -186,14 +204,14 @@ impl SetterPlace {
                 target.span(),
             )]);
         };
-        let mut setter = AccessorCallPlan::resolve(
+        let setter = AccessorCallPlan::resolve(
             setter,
             property,
             crate::ast::PropertyHookKind::Set,
             *span,
             context,
         )?;
-        let mut getter = calls
+        let getter = calls
             .getter
             .as_ref()
             .map(|call| {
@@ -227,17 +245,6 @@ impl SetterPlace {
         };
         let receiver_type = receiver.ty();
         let local = materialize_call_receiver(receiver, true, context);
-        if context.lifecycle_phase
-            && matches!(unparenthesized_place(object), hir::Expr::This { .. })
-        {
-            for plan in std::iter::once(&mut setter).chain(getter.iter_mut()) {
-                if let AccessorCallPlan::Direct(signature) = plan {
-                    if let Some(direct) = signature.direct_id {
-                        signature.id = direct;
-                    }
-                }
-            }
-        }
         Ok(Some(Self {
             receiver: (local, receiver_type),
             getter,
@@ -291,7 +298,6 @@ pub(super) fn lower_assignment(
         )?
     } else {
         let (operand, ty) = place.read(context)?;
-        materialize_nested_collection_places(&assignment.value, false, context)?;
         mir::Rvalue::Value(lower_compound_value(
             operand,
             ty,

@@ -38,6 +38,516 @@ fn assert_malformed(program: &Program, expected: &str) {
 }
 
 #[test]
+fn pending_once_callees_require_cleanup_and_consuming_invocation() {
+    let source = include_str!("fixtures/once_callable_argument_failure.doria");
+    let program = doriac::lower_source_to_mir("pending-once-cleanup.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let main = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .unwrap();
+    let callee = main
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            Terminator::IndirectCall {
+                callee,
+                invocation_mode: mir::FunctionInvocationMode::Once,
+                ..
+            }
+            | Terminator::CheckedIndirectCall {
+                callee,
+                invocation_mode: mir::FunctionInvocationMode::Once,
+                ..
+            } => match callee {
+                mir::IndirectCallee::Closure(mir::FunctionExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                }) => Some(*local),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap();
+    let mut missing_cleanup = program.clone();
+    let function = &mut missing_cleanup.functions[main.id.0];
+    let drops = function.blocks.iter().flat_map(|block| &block.statements).filter(|statement| matches!(statement, Statement::DropFunction { local, .. } if *local == callee)).count();
+    assert!(drops > 0, "pending callee needs guarded cleanup");
+    for block in &mut function.blocks {
+        block.statements.retain(|statement| !matches!(statement, Statement::DropFunction { local, .. } if *local == callee));
+    }
+    assert_malformed(
+        &missing_cleanup,
+        "pending once-call carrier is not consumed or released before exit",
+    );
+    let mut borrowed_invocation = program.clone();
+    for block in &mut borrowed_invocation.functions[main.id.0].blocks {
+        if let Terminator::IndirectCall {
+            callee:
+                mir::IndirectCallee::Closure(mir::FunctionExpression::Local {
+                    local, transfer, ..
+                }),
+            ..
+        }
+        | Terminator::CheckedIndirectCall {
+            callee:
+                mir::IndirectCallee::Closure(mir::FunctionExpression::Local {
+                    local, transfer, ..
+                }),
+            ..
+        } = &mut block.terminator
+        {
+            if *local == callee {
+                *transfer = false;
+            }
+        }
+    }
+    assert_malformed(
+        &borrowed_invocation,
+        "once indirect call does not consume its function carrier",
+    );
+    let mut borrowed_acquisition = program.clone();
+    let assignment = borrowed_acquisition.functions[main.id.0].blocks.iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| matches!(statement, Statement::AssignLocal { target, .. } if *target == callee))
+        .unwrap();
+    let Statement::AssignLocal {
+        value: Rvalue::Function(mir::FunctionExpression::Local { transfer, .. }),
+        ..
+    } = assignment
+    else {
+        panic!("pending carrier should stage a local move");
+    };
+    *transfer = false;
+    assert_malformed(&borrowed_acquisition, "has inconsistent ownership");
+}
+
+#[test]
+fn mixed_numeric_replacement_requires_dominating_exact_payload_proof() {
+    let program = doriac::lower_source_to_mir(
+        "mixed-numeric-place.doria",
+        r#"
+function bump(writable mixed $value): void {
+    if ($value is int) { $value += 2; }
+}
+function main(): void { writable mixed $value = 7; bump($value); }
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    for wrong_tag in [false, true] {
+        let mut corrupt = program.clone();
+        let function = corrupt
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "bump")
+            .unwrap();
+        let condition = function
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.terminator {
+                Terminator::Branch { condition, .. }
+                    if matches!(condition, BoolExpression::MixedIs { .. }) =>
+                {
+                    Some(condition)
+                }
+                _ => None,
+            })
+            .unwrap();
+        if wrong_tag {
+            let BoolExpression::MixedIs { tag, .. } = condition else {
+                unreachable!()
+            };
+            *tag = mir::MixedTag::String;
+        } else {
+            *condition = BoolExpression::Use {
+                operand: Operand::Scalar(ScalarValue::Bool(true)),
+            };
+        }
+        assert_malformed(&corrupt, "without a dominating exact `is` proof");
+    }
+}
+
+#[test]
+fn managed_copy_iteration_requires_owned_returns_and_exact_result_provenance() {
+    let program = doriac::lower_source_to_mir(
+        "managed-copy-iteration.doria",
+        r#"
+use Doria\Std\Concurrency\{CancellationSource, CancellationToken};
+function visit(Iterable<CancellationToken> $tokens, CancellationToken $other): void {
+    foreach ($tokens as CancellationToken $value) {}
+}
+function main(): void {
+    let $source = new CancellationSource();
+    let $token = $source->token;
+    List<CancellationToken> $tokens = [$token];
+    let $filtered = $tokens->filter(function(CancellationToken $value): bool { return true; });
+    visit($tokens, $token);
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let mut borrowed_return = program.clone();
+    let adapter = borrowed_return
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.name.starts_with("<collection#") && function.name.ends_with("::getCurrent")
+        })
+        .unwrap();
+    let Terminator::Return(Rvalue::Value(ValueExpression::Inline(
+        mir::InlineValueExpression::Use { mode, .. },
+    ))) = &mut adapter.blocks[0].terminator
+    else {
+        panic!("managed Copy iterator must return an explicit claim");
+    };
+    *mode = mir::InlineValueUseMode::Borrow;
+    assert_malformed(
+        &borrowed_return,
+        "owning inline Copy destination receives a borrowed claim",
+    );
+
+    let mut wrong_result = program.clone();
+    let function = wrong_result
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "visit")
+        .unwrap();
+    let plan = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::PublicForeach(plan)) => {
+                Some(plan.as_ref().clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let other = function.params[1];
+    let statement = function.blocks[plan.calls[2].success.0].statements.iter_mut().find(|statement| {
+        matches!(statement, Statement::AssignLocal { target, .. } if *target == plan.value_binding)
+    }).unwrap();
+    let Statement::AssignLocal {
+        value:
+            Rvalue::Value(ValueExpression::Inline(mir::InlineValueExpression::Use { operand, .. })),
+        ..
+    } = statement
+    else {
+        panic!("managed Copy binding must copy the current result");
+    };
+    *operand = Operand::Local(other);
+    assert_malformed(
+        &wrong_result,
+        "public foreach lost its cursor or current element result",
+    );
+
+    let mut borrowed_filter = program.clone();
+    let value = borrowed_filter.functions[borrowed_filter.entry.0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::CollectionAdd {
+                value:
+                    Rvalue::Value(ValueExpression::Inline(mir::InlineValueExpression::Use {
+                        mode, ..
+                    })),
+                ..
+            } => Some(mode),
+            _ => None,
+        })
+        .unwrap();
+    *value = mir::InlineValueUseMode::Borrow;
+    assert_malformed(
+        &borrowed_filter,
+        "owning inline Copy destination receives a borrowed claim",
+    );
+}
+
+#[test]
+fn repeated_managed_copy_pattern_bindings_reinitialize_but_do_not_revive_dropped_claims() {
+    let program = doriac::lower_source_to_mir(
+        "managed-copy-pattern-loop.doria",
+        r#"
+use Doria\Std\Concurrency\{CancellationSource, CancellationToken};
+enum Held { case Token(?CancellationToken $token); }
+function inspect(?CancellationToken $token): void {}
+function visit(Iterable<Held> $tokens): void {
+    foreach ($tokens as Held $value) {
+        let $selected = match ($value) { Held::Token($item) => $item, };
+    }
+}
+function main(): void {
+    let $source = new CancellationSource();
+    List<Held> $tokens = [Held::Token($source->token); 2];
+    visit($tokens);
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let mut invalid = program.clone();
+    let inspect = invalid
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap()
+        .id;
+    let function = invalid
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "visit")
+        .unwrap();
+    let binding = function
+        .locals
+        .iter()
+        .find(|local| local.name == "item")
+        .unwrap()
+        .id;
+    let block = function
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            block.statements.iter().any(|statement| {
+        matches!(statement, Statement::DropInlineValue { local, .. } if *local == binding)
+    })
+        })
+        .unwrap();
+    let copy = block.statements.iter().find_map(|statement| {
+        let Statement::AssignLocal { value: Rvalue::NullableScalar(NullableScalarExpression::InlineClaim { value, .. }), .. } = statement else {
+            return None;
+        };
+        matches!(value.as_ref(), NullableScalarExpression::Local { local, .. } if *local == binding).then(|| Rvalue::NullableScalar(value.as_ref().clone()))
+    }).unwrap();
+    let drop = block.statements.iter().position(|statement| {
+        matches!(statement, Statement::DropInlineValue { local, .. } if *local == binding)
+    }).unwrap();
+    block.statements.insert(
+        drop + 1,
+        Statement::CallVoid {
+            function: inspect,
+            args: vec![copy],
+            span: doriac::source::Span::new(0, 0),
+        },
+    );
+    assert_malformed(&invalid, "after its ownership ended");
+}
+
+#[test]
+fn owned_callback_retention_bound_preserves_independent_body_proofs() {
+    let program = doriac::lower_source_to_mir(
+        "owned-callback-bound.doria",
+        r#"
+class Cursor implements Iterator<int> {
+    function __construct(borrow List<int> $source) {}
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): int { return $this->source[0]; }
+    writable function advance(): void {}
+}
+function main(): void {
+    writable List<int> $source = [7];
+    {
+        function(take Cursor): ?Cursor $forward = function(take Cursor $value): ?Cursor { return $value; };
+        let $cursor = $forward(new Cursor($source));
+        if ($cursor != null) { echo $cursor->getCurrent(); }
+    }
+    function(take Cursor): ?Cursor $discard = function(take Cursor $value): ?Cursor { return null; };
+    let $absent = $discard(new Cursor($source));
+    $source->add(8);
+    echo $absent == null;
+}
+"#,
+    ).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let mut missing_loan = program.clone();
+    let entry = missing_loan.closure_descriptors[0].entry_function;
+    let plan = missing_loan.functions[entry.0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => Some(plan),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!plan.returns.is_empty());
+    plan.returns.clear();
+    assert_malformed(&missing_loan, "retained source loan");
+
+    let mut borrowed_alias = program.clone();
+    let descriptor = &borrowed_alias.closure_descriptors[1];
+    let entry = descriptor.entry_function;
+    let signature = descriptor.function_type;
+    borrowed_alias.functions[entry.0]
+        .return_borrow
+        .as_mut()
+        .unwrap()
+        .kind = mir::ReturnBorrowKind::Value;
+    borrowed_alias.function_types[signature.0]
+        .return_borrow
+        .as_mut()
+        .unwrap()
+        .kind = mir::ReturnBorrowKind::Value;
+    assert_malformed(
+        &borrowed_alias,
+        "result ownership disagrees with its returned-borrow contract",
+    );
+}
+
+#[test]
+fn diagnostic_frames_preserve_authored_calls_and_reject_forged_adapter_origins() {
+    let source = r#"
+interface Runner { function run(): void; }
+class Task implements Runner { function run(): void { panic("task"); } }
+function forward(Runner $runner): void { $runner->run(); }
+function main(): void { let $task = new Task(); forward($task); }
+"#;
+    let program = doriac::lower_source_to_mir("diagnostic-adapter.doria", source).unwrap();
+    let main = program.selected_entry.unwrap();
+    let (adapter, target) = program
+        .functions
+        .iter()
+        .find_map(|function| match function.diagnostic_frame {
+            mir::DiagnosticFrame::Forwarded(target) => Some((function.id, target)),
+            _ => None,
+        })
+        .expect("interface dispatch must identify its authored implementation");
+    assert!(program.functions[main.0].owns_diagnostic_frame());
+    assert!(program.functions[target.0].owns_diagnostic_frame());
+    doriac::mir_validation::validate_program(&program).unwrap();
+
+    let mut hidden_entry = program.clone();
+    hidden_entry.functions[main.0].diagnostic_frame = mir::DiagnosticFrame::Caller;
+    assert_malformed(&hidden_entry, "authored entry or closure cannot forward");
+
+    let mut wrong_target = program.clone();
+    wrong_target.functions[adapter.0].diagnostic_frame = mir::DiagnosticFrame::Forwarded(main);
+    assert_malformed(&wrong_target, "authored dispatch implementation");
+
+    let mut hidden_method = program;
+    hidden_method.functions[target.0].diagnostic_frame = mir::DiagnosticFrame::Caller;
+    assert_malformed(&hidden_method, "collection interface entry");
+}
+
+#[test]
+fn diagnostic_sites_require_active_sources_and_valid_utf8_offsets() {
+    let source = "function main(): void { echo \"\u{00e9}\"; }";
+    let program = doriac::lower_source_to_mir("diagnostic-site.doria", source).unwrap();
+    let main = program.selected_entry.unwrap();
+    let entry = program.functions[main.0].entry_block;
+    let text = source.find('\u{00e9}').unwrap();
+    for (span, expected) in [
+        (
+            doriac::source::Span::in_source(doriac::source::SourceId(12345), 0, 0),
+            "missing source",
+        ),
+        (doriac::source::Span::new(2, 1), "invalid source offsets"),
+        (
+            doriac::source::Span::new(0, source.len() + 1),
+            "invalid source offsets",
+        ),
+        (
+            doriac::source::Span::new(text + 1, text + 2),
+            "invalid source offsets",
+        ),
+    ] {
+        let mut forged = program.clone();
+        forged.functions[main.0].blocks[entry.0]
+            .statements
+            .insert(0, Statement::SetDiagnosticSite { span });
+        assert_malformed(&forged, expected);
+    }
+    let mut inactive = program;
+    inactive
+        .sources
+        .iter_mut()
+        .find(|source| source.id == doriac::source::SourceId(0))
+        .unwrap()
+        .active = false;
+    assert_malformed(&inactive, "inactive source");
+}
+
+#[test]
+fn collection_call_results_cannot_escalate_readonly_loans() {
+    for (collection, initializer) in [
+        ("Bytes", "Bytes::allocate(1)"),
+        ("List<int>", "[0]"),
+        ("int[]", "[0]"),
+    ] {
+        for nullable in [false, true] {
+            let ty = if nullable {
+                format!("?{collection}")
+            } else {
+                collection.to_string()
+            };
+            let source = format!(
+                "function same({ty} $source): {ty} {{ return $source; }} \
+                 function receive({ty} $source): void {{}} \
+                 function main(): void {{ writable {collection} $source = {initializer}; \
+                 receive(same($source)); }}"
+            );
+            let mut program = doriac::lower_source_to_mir("collection-loan-access.doria", &source)
+                .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+            let receive = program
+                .functions
+                .iter_mut()
+                .find(|function| function.name == "receive")
+                .unwrap();
+            receive.parameter_modes[0] = FunctionParameterMode::Writable;
+            receive.locals[receive.params[0].0].writable = true;
+            assert_malformed(
+                &program,
+                if nullable {
+                    "writable nullable collection borrow requires a writable source place"
+                } else {
+                    "writable collection borrow requires a writable source place"
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn collection_call_results_cannot_overlap_writable_storage() {
+    for (ty, initializer) in [
+        ("Bytes", "Bytes::allocate(1)"),
+        ("List<int>", "[0]"),
+        ("int[]", "[0]"),
+    ] {
+        let source = format!(
+            "function same(writable {ty} $source): {ty} {{ return $source; }} \
+             function receive(writable {ty} $first, writable {ty} $second): void {{}} \
+             function main(): void {{ writable {ty} $first = {initializer}; \
+             writable {ty} $second = {initializer}; receive(same($first), same($second)); }}"
+        );
+        let mut program = doriac::lower_source_to_mir("collection-loan-overlap.doria", &source)
+            .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        let receive = program
+            .functions
+            .iter()
+            .find(|function| function.name == "receive")
+            .unwrap()
+            .id;
+        let args = program
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.statements)
+            .find_map(|statement| match statement {
+                Statement::CallVoid { function, args, .. } if *function == receive => Some(args),
+                _ => None,
+            })
+            .unwrap();
+        args[1] = args[0].clone();
+        assert_malformed(&program, "overlapping writable borrows");
+    }
+}
+
+#[test]
 fn writable_class_aliases_cannot_escalate_readonly_source_access() {
     for nullable in [false, true] {
         let ty = if nullable { "?Box" } else { "Box" };
@@ -362,27 +872,33 @@ function main(): void {{ let $holder = new Holder(); $holder->inspect(); }}
         );
         assert_malformed(&before_initialization, "reads or exposes property");
 
-        for name in ["Holder::inspect", "Holder::__destruct"] {
-            let mut outside_constructor = base.clone();
-            let function = outside_constructor
-                .functions
-                .iter_mut()
-                .find(|function| function.name == name)
-                .expect("the readonly nonconstructor method should be lowered");
-            let object = function.params[0];
-            assert!(
-                !function.locals[object.0].writable,
-                "fixture receiver must be readonly"
-            );
-            let view = append_view(function);
-            function.blocks[function.entry_block.0]
-                .statements
-                .push(Statement::AssignLocal {
-                    target: view,
-                    value: property_value(object),
-                });
-            assert_malformed(&outside_constructor, expected_writable_error);
-        }
+        // A destructor's receiver is writable (decision log entry 42), so
+        // only the readonly method is a readonly-receiver fixture here.
+        let destructor = base
+            .functions
+            .iter()
+            .find(|function| function.name == "Holder::__destruct")
+            .expect("the destructor should be lowered");
+        assert!(destructor.locals[destructor.params[0].0].writable);
+        let mut outside_constructor = base.clone();
+        let function = outside_constructor
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Holder::inspect")
+            .expect("the readonly nonconstructor method should be lowered");
+        let object = function.params[0];
+        assert!(
+            !function.locals[object.0].writable,
+            "fixture receiver must be readonly"
+        );
+        let view = append_view(function);
+        function.blocks[function.entry_block.0]
+            .statements
+            .push(Statement::AssignLocal {
+                target: view,
+                value: property_value(object),
+            });
+        assert_malformed(&outside_constructor, expected_writable_error);
 
         let mut closure = base.clone();
         let function = closure
@@ -456,6 +972,143 @@ function main(): void {{
 }
 
 #[test]
+fn unused_move_returns_cannot_erase_or_forge_their_borrow_contract() {
+    for (input, output, value) in [
+        ("Book", "Book", "$source"),
+        ("?Book", "?Book", "$source"),
+        ("List<Book>", "Book", "$source[0]"),
+        ("List<Book>", "?Book", "$source[0]"),
+        ("List<?Book>", "?Book", "$source[0]"),
+        ("List<int>", "List<int>", "$source"),
+        ("?List<int>", "?List<int>", "$source"),
+        ("List<List<int>>", "List<int>", "$source[0]"),
+        ("List<List<int>>", "?List<int>", "$source[0]"),
+        ("List<List<int>>", "?List<int>", "$source->first"),
+        ("List<?List<int>>", "?List<int>", "$source->last"),
+        ("Deque<List<int>>", "?List<int>", "$source->peekFront"),
+        ("Deque<?List<int>>", "?List<int>", "$source->peekBack"),
+        (
+            "Dictionary<string, List<int>>",
+            "?List<int>",
+            "$source->get(\"slot\")",
+        ),
+        ("Bytes", "Bytes", "$source"),
+        ("mixed", "mixed", "$source"),
+        ("?mixed", "?mixed", "$source"),
+        ("List<mixed>", "?mixed", "$source->first"),
+        ("List<?mixed>", "?mixed", "$source->last"),
+        ("Deque<mixed>", "?mixed", "$source->peekFront"),
+        ("Deque<?mixed>", "?mixed", "$source->peekBack"),
+        (
+            "Dictionary<string, mixed>",
+            "?mixed",
+            "$source->get(\"slot\")",
+        ),
+    ] {
+        let source = format!(
+            "class Book {{}}\n\
+             function first({input} $source, int $other): {output} {{ return {value}; }}\n\
+             function main(): void {{}}"
+        );
+        let program = doriac::lower_source_to_mir("unused-return-borrow.doria", &source)
+            .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        doriac::mir_validation::validate_program(&program).unwrap();
+        let first = program
+            .functions
+            .iter()
+            .find(|function| function.name == "first")
+            .unwrap();
+        let borrow = first.return_borrow.unwrap();
+        assert_eq!(borrow.kind, mir::ReturnBorrowKind::Value, "{source}");
+        for forged in [
+            None,
+            Some(mir::ReturnBorrow {
+                source: mir::BorrowSource::Parameter(1),
+                ..borrow
+            }),
+            Some(mir::ReturnBorrow {
+                kind: mir::ReturnBorrowKind::Retained,
+                ..borrow
+            }),
+        ] {
+            let mut invalid = program.clone();
+            invalid.functions[first.id.0].return_borrow = forged;
+            assert_malformed(
+                &invalid,
+                "move-value return loses its declared borrow provenance",
+            );
+        }
+    }
+}
+
+#[test]
+fn collection_removal_returns_owned_values_without_borrowing_the_container() {
+    for element in [
+        "Book",
+        "Readable",
+        "function(): int",
+        "List<int>",
+        "?List<int>",
+        "mixed",
+        "?mixed",
+        "Parcel",
+    ] {
+        let nullable = format!("?{}", element.trim_start_matches('?'));
+        for (collection, output, operation) in [
+            (format!("List<{element}>"), nullable.clone(), "pop()"),
+            (
+                format!("List<{element}>"),
+                element.to_owned(),
+                "removeAt(0)",
+            ),
+            (
+                format!("Dictionary<string, {element}>"),
+                nullable.clone(),
+                "remove(\"slot\")",
+            ),
+            (
+                format!("SortedDictionary<string, {element}>"),
+                nullable.clone(),
+                "remove(\"slot\")",
+            ),
+            (format!("Deque<{element}>"), nullable.clone(), "popFront()"),
+            (format!("Deque<{element}>"), nullable.clone(), "popBack()"),
+        ] {
+            let source = format!(
+                "interface Readable {{ function read(): int; }}\n\
+                 class Book implements Readable {{ function read(): int {{ return 7; }} }}\n\
+                 enum Parcel {{ case Item(Book $book); }}\n\
+                 function remove(writable {collection} $source): {output} {{\n\
+                     return $source->{operation};\n\
+                 }}\n\
+                 function main(): void {{}}"
+            );
+            let program = doriac::lower_source_to_mir("owned-removal-return.doria", &source)
+                .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+            doriac::mir_validation::validate_program(&program)
+                .unwrap_or_else(|error| panic!("{source}\n{error:#?}"));
+            let remove = program
+                .functions
+                .iter()
+                .find(|function| function.name == "remove")
+                .unwrap();
+            assert_eq!(remove.return_borrow, None, "{source}");
+            let mut invalid = program.clone();
+            invalid.functions[remove.id.0].return_borrow = Some(mir::ReturnBorrow {
+                source: mir::BorrowSource::Parameter(0),
+                writable: false,
+                kind: mir::ReturnBorrowKind::Value,
+                lifetime: mir::RetainedLifetime::LastUse,
+            });
+            assert_malformed(
+                &invalid,
+                "move-value return loses its declared borrow provenance",
+            );
+        }
+    }
+}
+
+#[test]
 fn nullable_callable_absence_is_neutral_but_conflicting_provenance_is_rejected() {
     let mut program = doriac::lower_source_to_mir(
         "nullable-callable-provenance.doria",
@@ -481,7 +1134,7 @@ function main(): void {}
         .return_borrow = None;
     assert_malformed(
         &missing_provenance,
-        "function-value return loses its declared borrow provenance",
+        "move-value return loses its declared borrow provenance",
     );
 
     let independent = program
@@ -512,6 +1165,7 @@ function main(): void {}
         unreachable!();
     };
     *null_value = mir::NullableFunctionExpression::Present(mir::FunctionExpression::Call {
+        span: forward.source_span,
         function_type,
         function: independent,
         args: Vec::new(),
@@ -531,7 +1185,7 @@ function main(): void {}
         .kind = mir::ReturnBorrowKind::Value;
     assert_malformed(
         &program,
-        "function-value return loses its declared borrow provenance",
+        "move-value return loses its declared borrow provenance",
     );
 }
 
@@ -566,12 +1220,13 @@ function main(): void {{}}
                 kind: mir::ReturnBorrowKind::Retained,
                 source: mir::BorrowSource::Parameter(0),
                 writable: false,
+                lifetime: doriac::types::RetainedLifetime::LastUse,
             })
         );
         forward.return_borrow = None;
         assert_malformed(
             &missing_provenance,
-            "function-value return loses its declared borrow provenance",
+            "move-value return loses its declared borrow provenance",
         );
     }
 }
@@ -620,7 +1275,7 @@ function main(): void {
         };
         assert_malformed(
             &forged,
-            "function-value return loses its declared borrow provenance",
+            "move-value return loses its declared borrow provenance",
         );
     }
 
@@ -642,6 +1297,509 @@ function main(): void {
             doriac::mir_validation::validate_program(&forged).is_err(),
             "{name}"
         );
+    }
+}
+
+#[test]
+fn indirect_value_returns_allow_temporary_owner_cleanup_without_retained_loans() {
+    for nullable in [false, true] {
+        for checked in [false, true] {
+            let ty = if nullable { "?Guard" } else { "Guard" };
+            let (parameters, body, invocation) = if checked {
+                (
+                    format!("{ty} $guard, bool $fail"),
+                    "if ($fail) { throw new Failure(\"failed\"); } return $guard;",
+                    "try { inspect($identity(new Guard(), false)); } catch (Failure) {}",
+                )
+            } else {
+                (
+                    format!("{ty} $guard"),
+                    "return $guard;",
+                    "inspect($identity(new Guard()));",
+                )
+            };
+            let source = format!(
+                r#"
+class Guard {{}}
+class Failure implements Error {{ function __construct(string $message) {{}} }}
+function inspect({ty} $guard): void {{}}
+function main(): void {{
+    let $identity = function ({parameters}): {ty} {{ {body} }};
+    {invocation}
+}}
+"#
+            );
+            let program =
+                doriac::lower_source_to_mir("indirect-value-owner-cleanup.doria", &source).unwrap();
+            doriac::mir_validation::validate_program(&program).unwrap();
+            let main = program
+                .functions
+                .iter()
+                .find(|function| function.name == "main")
+                .unwrap();
+            let (function_type, result) = main
+                .blocks
+                .iter()
+                .find_map(|block| match block.terminator {
+                    Terminator::IndirectCall {
+                        function_type,
+                        result: Some(result),
+                        ..
+                    }
+                    | Terminator::CheckedIndirectCall {
+                        function_type,
+                        result: Some(result),
+                        ..
+                    } => Some((function_type, result)),
+                    _ => None,
+                })
+                .expect("identity invocation must use the indirect result path");
+            assert_eq!(
+                program.function_types[function_type.0]
+                    .return_borrow
+                    .unwrap()
+                    .kind,
+                mir::ReturnBorrowKind::Value
+            );
+            assert!(!main.locals[result.0].owned);
+            let guard = program
+                .classes
+                .iter()
+                .find(|class| class.name == "Guard")
+                .unwrap()
+                .id;
+            assert!(main.blocks.iter().flat_map(|block| &block.statements).any(
+                |statement| matches!(statement, Statement::DropClass { class, .. } if *class == guard)
+            ));
+        }
+    }
+}
+
+#[test]
+fn collection_mutations_cannot_erase_normal_or_exceptional_store_contracts() {
+    let program = doriac::lower_source_to_mir(
+        "stored-callback-contracts.doria",
+        r#"
+class Source { int $value = 7; }
+function capture(Source $source): function(): int { return fn() with ($source) => $source->value; }
+function install(writable List<function(): int> $items, Source $source): void {
+    $items->add(capture($source));
+    echo "stored;";
+}
+interface InstallerContract {
+    function install(writable List<function(): int> $items, Source $source): void;
+}
+class Installer implements InstallerContract {
+    function install(writable List<function(): int> $items, Source $source): void {
+        install($items, $source);
+    }
+}
+function main(): void {
+    let $source = new Source();
+    writable List<function(): int> $items = [];
+    InstallerContract $installer = new Installer();
+    $installer->install($items, $source);
+    let $callback = function (writable List<function(): int> $items, Source $source): void {
+        install($items, $source);
+    };
+    $callback($items, $source);
+    echo $items[0]();
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let entry = program
+        .interface_vtables
+        .iter()
+        .find(|table| program.interface_types[table.interface.0].name == "InstallerContract")
+        .unwrap()
+        .methods[0];
+    for function in [
+        program
+            .functions
+            .iter()
+            .find(|f| f.name == "install")
+            .unwrap()
+            .id,
+        program
+            .functions
+            .iter()
+            .find(|f| f.name == "Installer::install")
+            .unwrap()
+            .id,
+        entry,
+        program
+            .functions
+            .iter()
+            .find(|f| f.closure.is_some() && f.params.len() == 3)
+            .unwrap()
+            .id,
+    ] {
+        for exceptional in [false, true] {
+            let mut erased = program.clone();
+            let plan = erased.functions[function.0]
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.statements)
+                .find_map(|statement| match statement {
+                    Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => {
+                        Some(plan)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let stores = if exceptional {
+                &mut plan.exceptional_stores
+            } else {
+                &mut plan.stores
+            };
+            assert!(!stores.is_empty());
+            stores.clear();
+            assert_malformed(&erased, "stored owner loses or outlives");
+        }
+    }
+}
+
+#[test]
+fn core_collection_mutations_cannot_erase_their_storage_origins() {
+    let program = doriac::lower_source_to_mir(
+        "core-stored-origin.doria",
+        r#"
+class Key implements Equatable<Key>, Hashable {
+    function __construct(int $value) {}
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function hash(): uint64 { return 1; }
+}
+class Source { int $value = 7; }
+function capture(Source $source): function(): int { return fn() with ($source) => $source->value; }
+function install(writable Dictionary<Key, function(): int> $items, Source $source): void {
+    $items[new Key(1)] = capture($source);
+}
+function main(): void {
+    let $source = new Source();
+    writable Dictionary<Key, function(): int> $items = [];
+    install($items, $source);
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    for exchange in [false, true] {
+        let mut erased = program.clone();
+        let install = erased
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "install")
+            .unwrap();
+        let origin = install
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.statements)
+            .find_map(|statement| match statement {
+                Statement::CoreCollection {
+                    operation: mir::CoreCollectionOperation::Insert { storage_origin, .. },
+                    ..
+                } if !exchange => Some(storage_origin),
+                Statement::CoreCollection {
+                    operation: mir::CoreCollectionOperation::Exchange { storage_origin, .. },
+                    ..
+                } if exchange => Some(storage_origin),
+                _ => None,
+            })
+            .unwrap();
+        assert!(origin.take().is_some());
+        assert_malformed(&erased, "collection mutation loses its stored owner origin");
+    }
+}
+
+#[test]
+fn collection_literals_cannot_erase_element_loans_or_drop_their_sources_early() {
+    for (ty, literal) in [
+        ("List<Iterator<int>>", "[new Cursor($source)]"),
+        ("Iterator<int>[]", "[new Cursor($source)]"),
+        ("List<List<Iterator<int>>>", "[[new Cursor($source)]]"),
+    ] {
+        let source = format!(
+            r#"
+class Cursor implements Iterator<int> {{
+    function __construct(borrow List<int> $source) {{}}
+    function hasCurrent(): bool {{ return true; }}
+    function getCurrent(): int {{ return $this->source[0]; }}
+    writable function advance(): void {{}}
+}}
+function make(List<int> $source): {ty} {{ return {literal}; }}
+function main(): void {{ let $source = [7]; {ty} $items = make($source); }}
+"#
+        );
+        let program =
+            doriac::lower_source_to_mir("stored-element-lifetimes.doria", &source).unwrap();
+        doriac::mir_validation::validate_program(&program).unwrap();
+        let mut erased = program.clone();
+        let make = erased
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "make")
+            .unwrap();
+        for statement in make
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.statements)
+        {
+            if let Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) =
+                statement
+            {
+                plan.returns.clear();
+                plan.returned_storage = None;
+            }
+        }
+        assert_malformed(&erased, "retained source");
+
+        let mut early_drop = program.clone();
+        let main = early_drop
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .unwrap();
+        let source = main
+            .locals
+            .iter()
+            .find(|local| local.name == "source")
+            .unwrap()
+            .id;
+        let items = main
+            .locals
+            .iter()
+            .find(|local| local.name == "items")
+            .unwrap()
+            .id;
+        let drop = main.blocks.iter().flat_map(|block| &block.statements)
+            .find(|statement| matches!(statement, Statement::DropCollection { local, .. } if *local == source))
+            .unwrap().clone();
+        for block in &mut main.blocks {
+            block.statements.retain(|statement| !matches!(statement, Statement::DropCollection { local, .. } if *local == source));
+        }
+        let block = main.blocks.iter_mut().find(|block| block.statements.iter().any(|statement| matches!(statement, Statement::DropCollection { local, .. } if *local == items))).unwrap();
+        let index = block.statements.iter().position(|statement| matches!(statement, Statement::DropCollection { local, .. } if *local == items)).unwrap();
+        block.statements.insert(index, drop);
+        assert_malformed(&early_drop, "retains it");
+    }
+}
+
+#[test]
+fn indirect_retained_closure_keeps_its_source_through_last_use() {
+    let program = doriac::lower_source_to_mir(
+        "indirect-retained-carrier-cleanup.doria",
+        r#"
+class Source { writable int $value = 7; }
+function main(): void {
+    writable Source $source = new Source();
+    let $factory = function (Source $source): function(): int {
+        return fn() with ($source) => $source->value;
+    };
+    {
+        let $owned = $factory($source);
+        let $observed = $owned();
+        $source->value = 8;
+    }
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let main = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .unwrap();
+    let source = main
+        .locals
+        .iter()
+        .find(|local| local.name == "source")
+        .unwrap();
+    let Type::Class(class) = source.ty else {
+        panic!("retained source must be a class owner");
+    };
+    let owned = main
+        .locals
+        .iter()
+        .find(|local| local.name == "owned")
+        .unwrap();
+    assert!(owned.owned);
+    let mutation = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find(|statement| {
+            matches!(statement, Statement::AssignProperty { object, .. } if *object == source.id)
+        })
+        .expect("source mutation must be allowed after the callback's last use")
+        .clone();
+    let (block, invocation) = main
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .statements
+                .iter()
+                .position(|statement| {
+                    matches!(statement, Statement::AssignLocal {
+                        value: Rvalue::Function(mir::FunctionExpression::Local { local, transfer: false, .. }),
+                        ..
+                    } if *local == owned.id)
+                })
+                .map(|index| (block.id, index))
+        })
+        .expect("the callback must be borrowed for its invocation");
+    for invalid_access in [
+        Statement::DropClass {
+            local: source.id,
+            class,
+            runs_destructor: true,
+        },
+        mutation,
+    ] {
+        let mut invalid = program.clone();
+        let function = &mut invalid.functions[main.id.0];
+        let invocation = if matches!(invalid_access, Statement::DropClass { .. }) {
+            // Isolate the retained carrier's lifetime guard: no later ordinary
+            // source access or second source drop may mask the premature end.
+            for block in &mut function.blocks {
+                block.statements.retain(|statement| {
+                    !matches!(statement, Statement::AssignProperty { object, .. } if *object == source.id)
+                        && !matches!(statement, Statement::DropClass { local, .. } if *local == source.id)
+                });
+            }
+            function.blocks[block.0]
+                .statements
+                .iter()
+                .position(|statement| {
+                    matches!(statement, Statement::AssignLocal {
+                        value: Rvalue::Function(mir::FunctionExpression::Local { local, transfer: false, .. }),
+                        ..
+                    } if *local == owned.id)
+                })
+                .expect("the future callback invocation must remain in the early-source-drop fixture")
+        } else {
+            invocation
+        };
+        function.blocks[block.0]
+            .statements
+            .insert(invocation, invalid_access);
+        assert_malformed(&invalid, "retains it");
+    }
+}
+
+#[test]
+fn indirect_value_returned_iterator_preserves_inherited_source_loans() {
+    let mut program = doriac::lower_source_to_mir(
+        "indirect-iterator-value-provenance.doria",
+        r#"
+class Cursor implements Iterator<int> {
+    function __construct(borrow List<int> $source) {}
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): int { return $this->source[0]; }
+    writable function advance(): void {}
+}
+function relay(Cursor $cursor): Cursor {
+    let $identity = function (Cursor $value): Cursor { return $value; };
+    return $identity($cursor);
+}
+function main(): void {
+    writable List<int> $source = [7];
+    {
+        let $cursor = new Cursor($source);
+        let $borrowed = relay($cursor);
+        let $observed = $borrowed->getCurrent();
+    }
+    $source->add(8);
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let relay = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "relay")
+        .unwrap();
+    assert_eq!(
+        relay.return_borrow.unwrap().kind,
+        mir::ReturnBorrowKind::Value
+    );
+    let source = relay.params[0];
+    let plan = relay
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => Some(plan),
+            _ => None,
+        })
+        .expect("borrowed iterator forwarding must preserve its inherited source contract");
+    assert!(plan
+        .returns
+        .iter()
+        .any(|loan| loan.local == source && loan.inherited));
+    // Value-return aliasing must inherit existing loans, not erase them along
+    // with the spurious new loan that ordinary returned aliases used to gain.
+    plan.returns.clear();
+    assert_malformed(&program, "retained source loan");
+}
+
+#[test]
+fn indirect_value_returned_element_does_not_inherit_its_cursor_loans() {
+    for (result, observation) in [
+        ("Book", "let $observed = $borrowed->value;"),
+        (
+            "?Book",
+            "if ($borrowed != null) { let $observed = $borrowed->value; }",
+        ),
+    ] {
+        let source = format!(
+            r#"
+class Book {{ function __construct(int $value) {{}} }}
+class Cursor implements Iterator<Book> {{
+    function __construct(borrow List<Book> $source) {{}}
+    function hasCurrent(): bool {{ return true; }}
+    function getCurrent(): Book {{ return $this->source[0]; }}
+    writable function advance(): void {{}}
+}}
+function relay(Cursor $cursor): {result} {{
+    let $select = function (Cursor $value): {result} {{ return $value->getCurrent(); }};
+    return $select($cursor);
+}}
+function main(): void {{
+    writable List<Book> $source = [new Book(7)];
+    {{
+        let $cursor = new Cursor($source);
+        let $borrowed = relay($cursor);
+        {observation}
+    }}
+    $source->add(new Book(8));
+}}
+"#
+        );
+        let program = doriac::lower_source_to_mir("indirect-cursor-element.doria", &source)
+            .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        doriac::mir_validation::validate_program(&program).unwrap();
+        let relay = program
+            .functions
+            .iter()
+            .find(|function| function.name == "relay")
+            .unwrap();
+        assert_eq!(
+            relay.return_borrow.unwrap().kind,
+            mir::ReturnBorrowKind::Value
+        );
+        assert!(relay.blocks.iter().all(|block| {
+            block.statements.iter().all(|statement| match statement {
+                Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => {
+                    plan.returns.is_empty()
+                }
+                _ => true,
+            })
+        }));
     }
 }
 
@@ -738,7 +1896,7 @@ function main(): void {
         unreachable!()
     };
     args[0] = borrow(view);
-    assert_malformed(&stale, "is used after its source ownership ended");
+    assert_malformed(&stale, "source access conflicts with a live borrowed view");
 
     let mut ended = valid.clone();
     ended.functions[main].blocks[block_id.0].statements.insert(
@@ -746,9 +1904,10 @@ function main(): void {
         Statement::DropClass {
             class,
             local: owner,
+            runs_destructor: true,
         },
     );
-    assert_malformed(&ended, "is used after its source ownership ended");
+    assert_malformed(&ended, "source access conflicts with a live borrowed view");
 
     let mut conflicting = valid;
     conflicting.functions[main].blocks[block_id.0].statements[call_index + 2] =
@@ -757,7 +1916,94 @@ function main(): void {
             function: overlap,
             args: vec![borrow(view), borrow(passed)],
         };
-    assert_malformed(&conflicting, "takes overlapping writable borrows of");
+    assert_malformed(
+        &conflicting,
+        "source access conflicts with a live borrowed view",
+    );
+}
+
+#[test]
+fn redefining_a_borrow_carrier_preserves_other_readonly_views() {
+    let mut program = doriac::lower_source_to_mir(
+        "borrow-carrier-redefinition.doria",
+        r#"
+class Box { writable int $value = 0; }
+function inspect(Box $left, Box $right): void { echo $left->value; echo $right->value; }
+function main(): void { let writable $owner = new Box(); inspect($owner, $owner); }
+"#,
+    )
+    .unwrap();
+    let inspect = program
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap()
+        .id;
+    let main = program.entry.0;
+    let function = &mut program.functions[main];
+    let owner = function
+        .locals
+        .iter()
+        .find(|local| local.name == "owner")
+        .unwrap()
+        .id;
+    let Type::Class(class) = function.locals[owner.0].ty else {
+        unreachable!()
+    };
+    let left = LocalId(function.locals.len());
+    let right = LocalId(left.0 + 1);
+    function.locals.extend([
+        borrowed_class_local(left.0, class),
+        borrowed_class_local(right.0, class),
+    ]);
+    // Reusable compiler temporaries are not readonly source bindings.
+    function.locals[left.0].synthetic = true;
+    function.locals[right.0].synthetic = true;
+    let borrow = |local| {
+        Rvalue::Class(ClassExpression::Local {
+            class,
+            local,
+            transfer: false,
+        })
+    };
+    let block = function
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            matches!(&block.terminator, Terminator::CheckedCall { function, .. } if *function == inspect)
+        })
+        .unwrap();
+    let Terminator::CheckedCall { args, .. } = &mut block.terminator else {
+        unreachable!()
+    };
+    *args = vec![borrow(left), borrow(right)];
+    block.statements.extend([
+        Statement::AssignLocal {
+            target: left,
+            value: borrow(owner),
+        },
+        Statement::AssignLocal {
+            target: right,
+            value: borrow(owner),
+        },
+        Statement::AssignLocal {
+            target: left,
+            value: borrow(owner),
+        },
+    ]);
+    doriac::mir_validation::validate_program(&program)
+        .expect("redefining a borrowed carrier does not mutate its shared source");
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(output.stdout, b"00");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.exit_status, 0);
+
+    let mut conflicting = program;
+    conflicting.functions[main].locals[right.0].writable = true;
+    assert_malformed(
+        &conflicting,
+        "source access conflicts with a live borrowed view",
+    );
 }
 
 #[test]
@@ -925,6 +2171,57 @@ fn shared_validator_rejects_malformed_checked_error_metadata_and_origins() {
     };
     *origin = mir::ErrorOriginId(99);
     assert_malformed(&unknown_origin, "Error origin#99 does not exist");
+}
+
+#[test]
+fn shared_validator_rejects_missing_or_forged_io_progress_projections() {
+    let source = r#"
+class OtherFailure implements Error
+{
+    function __construct(string $message) {}
+}
+function main(): void
+{
+    let $error = new Doria\Std\Io\IoError(
+        "failed", Doria\Std\Io\IoOperation::Write,
+        Doria\Std\Io\IoTarget::StandardOutput, Doria\Std\Io\IoErrorReason::Other
+    );
+    let $other = new OtherFailure("other");
+}
+"#;
+    let valid = doriac::lower_source_to_mir("io-progress-projections.doria", source)
+        .expect("compatible IoError construction should lower");
+    doriac::mir_validation::validate_program(&valid).unwrap();
+    let index = valid
+        .error_descriptors
+        .iter()
+        .position(|descriptor| descriptor.type_name == doriac::compiler_known_io::IO_ERROR)
+        .unwrap();
+    let projection = valid.error_descriptors[index]
+        .io_transferred_byte_count_property
+        .expect("IoError owns the progress projection");
+
+    let mut missing = valid.clone();
+    missing.error_descriptors[index].io_transferred_byte_count_property = None;
+    assert_malformed(&missing, "progress metadata inconsistent");
+
+    let mut wrong_property = valid.clone();
+    wrong_property.error_descriptors[index].io_transferred_byte_count_property =
+        Some(valid.error_descriptors[index].message_property);
+    assert_malformed(&wrong_property, "invalid transferred-byte-count projection");
+
+    let mut writable = valid.clone();
+    writable.classes[projection.class.0].properties[projection.index].writable = true;
+    assert_malformed(&writable, "invalid transferred-byte-count projection");
+
+    let mut forged = valid.clone();
+    let other = forged
+        .error_descriptors
+        .iter_mut()
+        .find(|descriptor| descriptor.type_name == "OtherFailure")
+        .unwrap();
+    other.io_transferred_byte_count_property = Some(other.message_property);
+    assert_malformed(&forged, "progress metadata inconsistent");
 }
 
 #[test]
@@ -1796,6 +3093,15 @@ function main(): void
             name: "value".to_string(),
             ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
         });
+    // Keep storage valid so this fault exercises the scalar/aggregate mismatch.
+    payload_case.enums[0].layout = doriac::enums::compute_enum_layout(
+        EnumId(0),
+        &[
+            vec![doriac::enums::LayoutShape { size: 8, align: 8 }],
+            vec![],
+        ],
+    )
+    .unwrap();
     malformed(&payload_case, "represented as a scalar enum");
 
     let mut backing_on_unit = valid.clone();
@@ -1890,9 +3196,10 @@ function main(): void
 fn shared_validator_requires_a_dominating_proof_for_narrowed_payload_enum_locals() {
     let source = r#"
 enum Coordinate { case Point(int $x, int $y); }
+function getPoint(): ?Coordinate { return Coordinate::Point(20, 22); }
 function main(): void
 {
-    ?Coordinate $point = Coordinate::Point(20, 22);
+    ?Coordinate $point = getPoint();
     if ($point != null) {
         bool $same = $point == Coordinate::Point(20, 22);
     }
@@ -1927,6 +3234,46 @@ function main(): void
             .contains("assumed non-null without a dominating presence proof"),
         "unexpected malformed nullable payload enum diagnostic: {}",
         error.message
+    );
+}
+
+#[test]
+fn writable_nullable_payload_enum_calls_invalidate_the_previous_presence_proof() {
+    let source = r#"
+enum Coordinate { case Point(int $x, int $y); }
+function clear(writable ?Coordinate $point): void { $point = null; }
+function main(): void {
+    writable ?Coordinate $point = Coordinate::Point(20, 22);
+    clear($point);
+    if ($point != null) {
+        bool $same = $point == Coordinate::Point(20, 22);
+    }
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("nullable-enum-call-proof.doria", source)
+        .expect("a writable call followed by a fresh presence check should lower");
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let condition = program.functions[program.entry.0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: condition @ BoolExpression::NullablePayloadEnumIsPresent(_),
+                ..
+            } => Some(condition),
+            _ => None,
+        })
+        .expect("expected a fresh nullable guard after the writable call");
+    *condition = BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("the writable call must invalidate the initializer's presence proof");
+    assert!(
+        error
+            .message
+            .contains("without a dominating presence proof"),
+        "{error:?}"
     );
 }
 
@@ -2065,6 +3412,27 @@ function main(): void throws Doria\Std\Io\IoError
         "when branch terminates before assigning and merging its result",
     );
 
+    let mut when_ends_without_result_or_error = valid.clone();
+    let function = when_ends_without_result_or_error
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "choose")
+        .expect("choose should exist");
+    let branch = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::When(plan)) => Some(plan.branches[0]),
+            _ => None,
+        })
+        .expect("when plan should exist");
+    function.blocks[branch.0].terminator = Terminator::Unreachable;
+    malformed(
+        &when_ends_without_result_or_error,
+        "when branch cannot reach its result merge",
+    );
+
     let mut wrong_when_ownership = valid.clone();
     let function = wrong_when_ownership
         .functions
@@ -2197,6 +3565,45 @@ function main(): void throws Doria\Std\Io\IoError
         &non_bool_do_condition,
         "do-while condition is not bool control flow between its body and exit",
     );
+}
+
+#[test]
+fn enum_error_and_interface_fields_require_complete_carriers_including_nullable_fields() {
+    let valid = doriac::lower_source_to_mir(
+        "enum-interface-layout.doria",
+        r#"
+interface Source { function getValue(): int; }
+class Item implements Source { function getValue(): int { return 1; } }
+class Failure implements Error { function __construct(string $message) {} }
+enum Packet {
+    case Value(Error $failure, ?Error $optional, Source $source, ?Source $maybe);
+}
+function main(): void {
+    let $packet = Packet::Value(new Failure("same"), null, new Item(), null);
+}
+"#,
+    )
+    .expect("Error and user-interface enum fields must have complete typed layouts");
+    doriac::mir_validation::validate_program(&valid).unwrap();
+    let index = valid
+        .enums
+        .iter()
+        .position(|value| value.name == "Packet")
+        .unwrap();
+    let fields = &valid.enums[index].layout.cases[0].fields;
+    assert_eq!(fields.len(), 4);
+    for (field_index, field) in fields.iter().enumerate() {
+        assert_eq!((field.size, field.align), (16, 8));
+        let mut malformed = valid.clone();
+        malformed.enums[index].layout.cases[0].fields[field_index].size = 8;
+        let error = doriac::mir_validation::validate_program(&malformed).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("enum field layout cannot contain its typed value"),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]
@@ -2836,6 +4243,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
         name: "mixedWidth".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: Vec::new(),
@@ -2961,6 +4369,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
         name: "first".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: Vec::new(),
@@ -2986,6 +4395,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
                 FloatExpression::Use {
                     ty: FloatType::Float64,
                     operand: Operand::CollectionIndex {
+                        index_span: Default::default(),
                         positional: true,
                         collection: LocalId(0),
                         index: Box::new(Rvalue::Value(ValueExpression::Integer(
@@ -3837,7 +5247,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
         ty: Type::String,
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(ClassId(0), [(label, FieldType::String)], 8);
     let mut receiver = class_local(0, ClassId(0));
@@ -3851,10 +5261,12 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
         })
     };
     let display_call = StringExpression::Call {
+        span: Default::default(),
         function: FunctionId(1),
         args: vec![receiver_argument()],
     };
     let update_call = StringExpression::Call {
+        span: Default::default(),
         function: FunctionId(2),
         args: vec![receiver_argument()],
     };
@@ -3887,6 +5299,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
             name: name.to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: vec![LocalId(0)],
@@ -3933,8 +5346,10 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
         unreachable!()
     };
     format.arguments[0] = FormatArgument::ClassDisplay(StringExpression::Call {
+        span: Default::default(),
         function: FunctionId(1),
         args: vec![Rvalue::Class(ClassExpression::New {
+            span: Default::default(),
             class: ClassId(0),
             concrete_class: ClassId(0),
             properties: vec![PropertyValue {
@@ -3985,6 +5400,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
                 function: FunctionId(1),
                 args: vec![],
                 return_borrow: None,
+                span: Default::default(),
             }),
         });
     program.functions.push(Function {
@@ -3992,6 +5408,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         name: "makeOther".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![],
@@ -4033,6 +5450,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![],
@@ -4047,6 +5465,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
         name: "Message::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4097,7 +5516,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         ty: Type::Class(ClassId(1)),
         writable: false,
         promoted: true,
-        borrowed_source: false,
+        borrowed_source: None,
     }];
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -4111,6 +5530,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
@@ -4132,6 +5552,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         name: "Parent::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4191,6 +5612,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
         name: "borrowAndTake".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4243,6 +5665,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         name: "mutate".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4313,6 +5736,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             function: FunctionId(2),
             args: vec![
                 Rvalue::String(StringExpression::Call {
+                    span: Default::default(),
                     function: FunctionId(1),
                     args: vec![Rvalue::Class(ClassExpression::Local {
                         class: ClassId(0),
@@ -4332,6 +5756,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         name: "label".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4358,6 +5783,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         name: "sink".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4410,6 +5836,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
                         operand: Operand::Scalar(ScalarValue::Bool(false)),
                     }),
                     right: Box::new(doriac::mir::BoolExpression::Call {
+                        span: Default::default(),
                         function: FunctionId(1),
                         args: vec![Rvalue::Class(ClassExpression::Local {
                             class: ClassId(0),
@@ -4459,6 +5886,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         name: "probe".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4487,6 +5915,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         name: "consume".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4511,6 +5940,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         name: "inspect".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4551,6 +5981,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
                     transfer: false,
                 }),
                 Rvalue::String(StringExpression::Call {
+                    span: Default::default(),
                     function: FunctionId(2),
                     args: vec![Rvalue::Class(ClassExpression::Local {
                         class: ClassId(0),
@@ -4568,6 +5999,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         name: "inspectWithLabel".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4605,6 +6037,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         name: "consumeAndLabel".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4645,7 +6078,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -4680,6 +6113,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         name: "takeWithLabel".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4759,6 +6193,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         },
     };
     let writable_call = doriac::mir::IntegerExpression::Call {
+        span: Default::default(),
         ty: IntegerType::Int64,
         function: FunctionId(2),
         args: vec![Rvalue::Class(ClassExpression::Local {
@@ -4790,6 +6225,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         name: "update".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -4897,7 +6333,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: true,
-            borrowed_source: false,
+            borrowed_source: None,
         },
         Property {
             id: second,
@@ -4905,7 +6341,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: true,
-            borrowed_source: false,
+            borrowed_source: None,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -4923,6 +6359,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![
@@ -4948,6 +6385,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
         name: "Pair::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -4999,7 +6437,7 @@ fn shared_validator_rejects_reusing_a_class_local_for_properties() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         },
         Property {
             id: second,
@@ -5007,7 +6445,7 @@ fn shared_validator_rejects_reusing_a_class_local_for_properties() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -5024,6 +6462,7 @@ fn shared_validator_rejects_reusing_a_class_local_for_properties() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![
@@ -5078,7 +6517,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         },
         Property {
             id: second,
@@ -5086,7 +6525,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             ty: Type::Class(ClassId(1)),
             writable: false,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -5103,6 +6542,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: [first, second]
@@ -5119,6 +6559,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
                                     transfer: true,
                                 })],
                                 return_borrow: None,
+                                span: Default::default(),
                             },
                         )),
                     })
@@ -5132,6 +6573,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         name: "relay".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -5176,7 +6618,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         ty: Type::Class(ClassId(1)),
         writable: false,
         promoted: true,
-        borrowed_source: false,
+        borrowed_source: None,
     }];
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5190,6 +6632,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
@@ -5209,6 +6652,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         name: "Parent::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -5250,6 +6694,7 @@ fn shared_validator_invalidates_promoted_class_aliases_after_property_replacemen
             object: LocalId(0),
             property: child,
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(1),
                 concrete_class: ClassId(1),
                 properties: vec![],
@@ -5326,7 +6771,7 @@ fn shared_validator_keeps_initializer_borrows_live_through_constructor_arguments
         ty: Type::String,
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     }];
     program.classes[1].layout = compute_class_layout(ClassId(1), [(source, FieldType::String)], 8);
     program.functions[0].locals.push(class_local(1, ClassId(1)));
@@ -5406,7 +6851,7 @@ fn shared_validator_requires_class_properties_in_construction_order() {
         ty: Type::String,
         writable: false,
         promoted: true,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5463,7 +6908,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         ty: Type::String,
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5477,6 +6922,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
@@ -5506,6 +6952,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         name: "Message::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -5750,7 +7197,7 @@ function main(): void
         ty: Type::String,
         writable: true,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     outside_constructor.classes[0].layout =
         compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -5816,7 +7263,7 @@ fn shared_validator_rejects_property_assignments_that_transfer_the_receiver() {
         ty: Type::Class(ClassId(0)),
         writable: true,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -5846,7 +7293,10 @@ fn shared_validator_rejects_property_assignments_that_transfer_the_receiver() {
 }
 
 #[test]
-fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_target() {
+fn shared_validator_rejects_whole_receiver_uses_but_not_disjoint_fields_in_property_assignment() {
+    // Decision 0136: while a property's new value is evaluated, that property
+    // is the destination. Disjoint fields and the destination itself may be
+    // read; using the receiver as a whole overlaps the destination.
     let mut program = class_program();
     let target = PropertyId {
         class: ClassId(0),
@@ -5863,7 +7313,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
             ty: Type::String,
             writable: true,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         },
         Property {
             id: other,
@@ -5871,7 +7321,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
             ty: Type::String,
             writable: false,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         },
     ];
     program.classes[0].layout = compute_class_layout(
@@ -5895,9 +7345,8 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
             span: Default::default(),
         });
 
-    let error = doriac::mir_validation::validate_program(&program)
-        .expect_err("a property write cannot read another property on its receiver");
-    assert!(error.message.contains("borrows its receiver local0"));
+    doriac::mir_validation::validate_program(&program)
+        .expect("a property write may read a disjoint property on its receiver");
 
     let Statement::AssignProperty { value, .. } = &mut program.functions[0].blocks[0].statements[0]
     else {
@@ -5917,6 +7366,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         name: "update".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -5943,6 +7393,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         unreachable!("the fixture contains a property assignment")
     };
     *value = Rvalue::String(StringExpression::Call {
+        span: Default::default(),
         function: FunctionId(1),
         args: vec![Rvalue::Class(ClassExpression::Local {
             class: ClassId(0),
@@ -5952,8 +7403,10 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
     });
 
     let error = doriac::mir_validation::validate_program(&program)
-        .expect_err("a property write cannot borrow its receiver through a call");
-    assert!(error.message.contains("borrows its receiver local0"));
+        .expect_err("a property write cannot borrow its whole receiver through a call");
+    assert!(error
+        .message
+        .contains("uses its receiver local0 as a whole while that property is the destination"));
 }
 
 #[test]
@@ -5973,7 +7426,7 @@ fn shared_validator_enforces_property_and_receiver_mutability() {
             ty: Type::String,
             writable: property_writable,
             promoted: false,
-            borrowed_source: false,
+            borrowed_source: None,
         });
         program.classes[0].layout =
             compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -6081,6 +7534,176 @@ fn shared_validator_rejects_inconsistent_class_and_property_tables() {
 }
 
 #[test]
+fn constructors_and_inherited_fields_cannot_forge_retained_source_access() {
+    let source = r#"
+open class Cursor implements Iterator<int> {
+    function __construct(borrow List<int> $source) {}
+    function hasCurrent(): bool { return true; }
+    function getCurrent(): int { return $this->source[0]; }
+    writable function advance(): void {}
+}
+class Child extends Cursor {
+    function __construct(parameter List<int> $input) { parent::__construct($input); }
+}
+function main(): void {
+    let $source = [7];
+    let $child = new Child($source);
+    echo $child->getCurrent();
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("inherited-retained-access.doria", source)
+        .expect("valid inheritance should lower");
+    doriac::mir_validation::validate_program(&program).unwrap();
+
+    let mut forged_constructor = program.clone();
+    let constructor = program
+        .classes
+        .iter()
+        .find(|class| class.name == "Cursor")
+        .and_then(|class| class.constructor)
+        .expect("cursor constructor should exist");
+    let plan = forged_constructor.functions[constructor.0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => Some(plan),
+            _ => None,
+        })
+        .expect("cursor constructor should retain its input");
+    assert!(!plan.constructs[0].writable);
+    plan.constructs[0].writable = true;
+    assert_malformed(
+        &forged_constructor,
+        "constructed source must borrow an input",
+    );
+
+    let child = program
+        .classes
+        .iter_mut()
+        .find(|class| class.name == "Child")
+        .expect("child class should exist");
+    let field = &mut child.properties[0];
+    assert_eq!(
+        field.borrowed_source,
+        Some(doriac::types::RetainedFieldAccess::Readonly),
+    );
+    field.borrowed_source = Some(doriac::types::RetainedFieldAccess::Writable);
+    assert_malformed(
+        &program,
+        "inherited property changes its retained source access",
+    );
+}
+
+#[test]
+fn writable_retained_field_uses_caller_storage_and_leaves_source_live() {
+    let mut program = doriac::lower_source_to_mir(
+        "writable-retained-field.doria",
+        r#"
+class Holder {
+    function __construct(writable int $value) { $value = 2; }
+    function read(): int { return $this->value; }
+}
+function main(): void {
+    let writable $source = 1;
+    { let $holder = new Holder($source); echo $holder->read(); }
+    echo $source;
+}
+"#,
+    )
+    .unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+
+    // Exercise the checked MIR representation before source admission.
+    let class = program
+        .classes
+        .iter_mut()
+        .find(|class| class.name == "Holder")
+        .unwrap();
+    let field = &mut class.properties[0];
+    field.writable = false;
+    field.borrowed_source = Some(doriac::types::RetainedFieldAccess::Writable);
+    let property = field.id;
+    class.layout = compute_class_layout(
+        class.id,
+        [(property, FieldType::RetainedPlace)],
+        std::mem::size_of::<usize>() as u32,
+    );
+    let constructor = &mut program.functions[class.constructor.unwrap().0];
+    let input = constructor.params[1];
+    constructor.blocks[constructor.entry_block.0]
+        .statements
+        .insert(
+            0,
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(
+                mir::RetainedSourcesPlan {
+                    constructs: vec![mir::RetainedSource {
+                        local: input,
+                        inherited: false,
+                        writable: true,
+                        lifetime: mir::RetainedLifetime::Cleanup,
+                        owned_path: vec![],
+                    }],
+                    promotions: vec![(property, input)],
+                    ..Default::default()
+                },
+            )),
+        );
+    doriac::mir_validation::validate_program(&program).unwrap();
+    let result = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(result.stdout, b"22");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .unwrap()
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .unwrap()
+        .is_empty());
+
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .unwrap();
+    let source = main
+        .locals
+        .iter()
+        .find(|local| local.name == "source")
+        .unwrap()
+        .id;
+    let holder = main
+        .locals
+        .iter()
+        .find(|local| local.name == "holder")
+        .unwrap()
+        .id;
+    let target = LocalId(main.locals.len());
+    main.locals.push(Local {
+        id: target,
+        name: "_retained_read_probe".into(),
+        ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+        writable: false,
+        owned: false,
+        synthetic: true,
+    });
+    let entry = &mut main.blocks[main.entry_block.0];
+    let construction = entry.statements.iter().position(|statement| {
+        matches!(statement, Statement::AssignLocal { target, value: Rvalue::Class(ClassExpression::New { .. }) } if *target == holder)
+    }).expect("wrapper construction should be in the entry block");
+    entry.statements.insert(
+        construction + 1,
+        Statement::AssignLocal {
+            target,
+            value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Use {
+                ty: IntegerType::Int64,
+                operand: Operand::Local(source),
+            })),
+        },
+    );
+    assert_malformed(&program, "while a live value retains it");
+}
+
+#[test]
 fn shared_validator_rejects_unknown_property_class_references() {
     let mut program = class_program();
     let property = PropertyId {
@@ -6093,7 +7716,7 @@ fn shared_validator_rejects_unknown_property_class_references() {
         ty: Type::Class(ClassId(99)),
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -6120,6 +7743,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         name: "missingClassParameter".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6149,6 +7773,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         name: "missingClass".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![],
@@ -6184,6 +7809,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
         name: "Class0::__destruct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6252,6 +7878,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
         name: "inspect".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6299,6 +7926,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
         name: "consume".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6334,6 +7962,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
         name: "invalidBorrowReturn".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6378,6 +8007,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
                 Rvalue::Class(ClassExpression::Call {
                     class: ClassId(0),
                     function: FunctionId(1),
+                    span: Default::default(),
                     args: vec![Rvalue::Class(ClassExpression::Local {
                         class: ClassId(0),
                         local: LocalId(0),
@@ -6387,6 +8017,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
                         kind: mir::ReturnBorrowKind::Value,
                         source: doriac::mir::BorrowSource::Parameter(0),
                         writable: false,
+                        lifetime: doriac::types::RetainedLifetime::LastUse,
                     }),
                 }),
                 Rvalue::Class(ClassExpression::Local {
@@ -6401,6 +8032,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         name: "identity".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6410,6 +8042,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             kind: mir::ReturnBorrowKind::Value,
             source: mir::BorrowSource::Parameter(0),
             writable: false,
+            lifetime: doriac::types::RetainedLifetime::LastUse,
         }),
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
@@ -6433,6 +8066,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         name: "observeThenConsume".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -6497,6 +8131,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
         name: "consumeBoth".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -6540,7 +8175,7 @@ fn shared_validator_rejects_class_use_after_a_transfer_on_any_reachable_path() {
         ty: Type::String,
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout =
         compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -6617,6 +8252,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
         name: "borrowedReturn".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![],
@@ -6660,7 +8296,7 @@ fn shared_validator_requires_owned_nullable_class_property_values() {
         ty: Type::NullableClass(ClassId(1)),
         writable: true,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -6704,7 +8340,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         ty: Type::NullableClass(ClassId(1)),
         writable: false,
         promoted: true,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -6718,6 +8354,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
@@ -6739,6 +8376,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         name: "Holder::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -6792,7 +8430,7 @@ fn shared_validator_checks_nullable_class_property_references() {
         ty: Type::NullableClass(ClassId(99)),
         writable: false,
         promoted: false,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout = compute_class_layout(
         ClassId(0),
@@ -6816,6 +8454,7 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
         .push(Statement::DropClass {
             local: LocalId(0),
             class: ClassId(0),
+            runs_destructor: true,
         });
     let error = doriac::mir_validation::validate_program(&drop_program)
         .expect_err("borrowed locals have no cleanup obligation");
@@ -6828,6 +8467,7 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![],
@@ -6850,6 +8490,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         name: "wrongShare".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -6913,6 +8554,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
                 value: Box::new(SharedReferenceExpression::New {
                     payload: doriac::mir::SharedPayload::Class(ClassId(0)),
                     value: Box::new(Rvalue::Class(ClassExpression::New {
+                        span: Default::default(),
                         class: ClassId(0),
                         concrete_class: ClassId(0),
                         properties: vec![],
@@ -6939,6 +8581,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         name: "wrongAcquire".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -7077,6 +8720,7 @@ fn valid_void_program() -> Program {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
             virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -7108,6 +8752,8 @@ fn class_program() -> Program {
         .map(|id| Class {
             id,
             name: format!("Class{}", id.0),
+            declaration_name: format!("Class{}", id.0),
+            arguments: Vec::new(),
             source_span: Default::default(),
             is_open: false,
             parent: None,
@@ -7119,6 +8765,7 @@ fn class_program() -> Program {
             destructor: None,
             error_descriptor: None,
             error_origin_offset: None,
+            runtime_payload: None,
         })
         .collect();
     program
@@ -7159,7 +8806,7 @@ fn class_new_program() -> Program {
         ty: Type::String,
         writable: false,
         promoted: true,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout =
         compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
@@ -7170,6 +8817,7 @@ fn class_new_program() -> Program {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![],
@@ -7184,6 +8832,7 @@ fn class_new_program() -> Program {
         name: "Message::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -7231,7 +8880,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         ty: Type::Class(ClassId(1)),
         writable: true,
         promoted: true,
-        borrowed_source: false,
+        borrowed_source: None,
     });
     program.classes[0].layout =
         compute_class_layout(ClassId(0), [(child, FieldType::Class(ClassId(1)))], 8);
@@ -7242,6 +8891,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
+                span: Default::default(),
                 class: ClassId(0),
                 concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
@@ -7261,6 +8911,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         name: "Parent::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -7291,6 +8942,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         name: "inspect".to_string(),
         source_span: Default::default(),
         method: None,
+        diagnostic_frame: doriac::mir::DiagnosticFrame::Authored,
         virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],

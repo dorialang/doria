@@ -1,0 +1,31 @@
+class Drops {
+    static writable int $sources = 0;
+    static writable int $buffers = 0;
+}
+
+class Source {
+    function __construct(int $id) {}
+    function __destruct(): void { Drops::sources++; }
+}
+
+class Buffer {
+    function __construct(int $size) {}
+    function __destruct(): void { Drops::buffers++; }
+}
+
+class Writer {
+    function __construct(take Source $source, take Buffer $buffer, string $label) {}
+    consuming function finish(): Source {
+        return take $this->source;
+    }
+}
+
+function main(): void {
+    let $writer = new Writer(new Source(7), new Buffer(16), "w");
+    let $source = $writer->finish();
+    echo $source->id . ";" . Drops::sources . ":" . Drops::buffers . ";";
+    {
+        let $other = new Writer(new Source(8), new Buffer(4), "x");
+    }
+    echo Drops::sources . ":" . Drops::buffers . "\n";
+}

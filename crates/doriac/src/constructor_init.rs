@@ -392,6 +392,7 @@ fn project_partial_cleanups(
                 property: name,
                 member_span: declaration,
                 null_safe: false,
+                take_span: None,
                 span: declaration,
             },
             op: AssignOp::Assign,

@@ -5,22 +5,32 @@ use crate::class_layout::{
 };
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
+use crate::mir::return_adaptation::{adapt_return_value, build_virtual_return_adapter};
+use crate::mir::value_factory::{
+    call_result_is_writable, local_float_expression, local_integer_expression, local_rvalue,
+    nullable_present_rvalue, payload_enum_use_mode, pending_owned_rvalue,
+};
 use crate::monomorphization::{
     collect_callable_instances, substitute_generic_argument, type_substitutions,
     InterfaceGenericCall,
 };
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
+use crate::semantics::executable_effects::InstanceEffects;
 use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
 use crate::source::Span;
 use crate::types::{
-    resolve_nominal_kinds, resolved_type_is_symbolic, resolved_type_ref_with_substitutions,
-    substitute_resolved_type, ClassType, ResolvedType,
+    resolve_nominal_kinds, resolved_type_is_symbolic, substitute_resolved_type, ClassType,
+    ResolvedType,
 };
 use crate::{hir, mir};
 
+mod byte_region;
+#[cfg(test)]
+pub(crate) mod conditional_results;
 mod core_collection;
 mod core_ordered;
 mod core_value;
+mod inline_value;
 mod interface;
 mod iteration;
 mod property_hooks;
@@ -28,7 +38,8 @@ mod property_hooks;
 #[derive(Default)]
 struct ClassIds {
     classes: HashMap<ClassType<ResolvedType>, ClassId>,
-    enums: HashMap<String, crate::enums::EnumType>,
+    enums: HashMap<ClassType<ResolvedType>, crate::enums::EnumType>,
+    enum_instances: HashMap<crate::enums::EnumType, crate::enums::EnumId>,
     enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
 }
 
@@ -45,20 +56,231 @@ impl ClassIds {
         resolve_nominal_kinds(ty, &self.enums, &registry.interface_ids)
     }
 
-    fn mir_enum_type(&self, id: crate::enums::EnumId) -> mir::Type {
-        self.enum_types.get(&id).copied().map_or(
+    fn mir_enum_type(&self, source_type: &crate::enums::EnumType) -> Option<mir::Type> {
+        let id = *self.enum_instances.get(source_type)?;
+        Some(self.enum_types.get(&id).copied().map_or(
             mir::Type::Scalar(mir::ScalarType::Enum(id)),
             mir::Type::PayloadEnum,
+        ))
+    }
+}
+
+type NativeFunctionSignature = (
+    mir::FunctionInvocationMode,
+    Vec<mir::FunctionParameter>,
+    mir::ReturnType,
+    Vec<mir::CheckedEffect>,
+    Option<mir::ReturnBorrow>,
+);
+
+#[cfg(test)]
+mod enum_instance_tests {
+    use super::*;
+    use crate::enums::{EnumCapabilities, EnumId, EnumType};
+
+    #[test]
+    fn enum_constants_resolve_authored_cases_against_exact_checked_layouts() {
+        use crate::const_eval::{ConstEnumValue, ConstPayloadEnumValue, ConstValue};
+        use crate::enums::EnumCaseSource;
+        let program = crate::lower_source(
+            "enum-constant-layout.doria",
+            r#"
+enum Status { case Ready; }
+enum Packet { case Value(bool $value); case Empty; }
+function main(): void {}
+"#,
         )
+        .unwrap();
+        let mut enums = program.semantic_info.enums;
+        let scalar_id = enums.iter().position(|item| item.name == "Status").unwrap();
+        let payload_id = enums.iter().position(|item| item.name == "Packet").unwrap();
+        enums[scalar_id].source_type =
+            EnumType::with_arguments(EnumId(90), "Status", vec![ResolvedType::Bool]);
+        enums[payload_id].source_type =
+            EnumType::with_arguments(EnumId(91), "Packet", vec![ResolvedType::Bool]);
+        let scalar = ConstEnumValue {
+            enum_type: enums[scalar_id].source_type.clone(),
+            case: EnumCaseSource {
+                declaration: EnumId(90),
+                index: 0,
+            },
+        };
+        let scalar_type = mir::ScalarType::Enum(enums[scalar_id].id);
+        let mut resolve = |ty: &ResolvedType| match ty {
+            ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
+            _ => None,
+        };
+        let span = Span::default();
+        let expected_scalar = crate::enums::EnumValue {
+            enum_id: enums[scalar_id].id,
+            case_id: enums[scalar_id].cases[0].id,
+        };
+        assert_eq!(
+            lower_static_value(
+                &ConstValue::Enum(scalar.clone()),
+                mir::Type::Scalar(scalar_type),
+                span,
+                &enums,
+                &mut resolve
+            )
+            .unwrap(),
+            mir::StaticValue::Scalar(mir::ScalarValue::Enum(expected_scalar))
+        );
+        assert_eq!(
+            lower_const_rvalue(
+                &ConstValue::Enum(scalar),
+                mir::Type::NullableScalar(scalar_type),
+                span,
+                &enums,
+                &mut resolve
+            )
+            .unwrap(),
+            mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(
+                mir::ValueExpression::Enum(mir::EnumExpression::Case(expected_scalar))
+            ))
+        );
+
+        let definition = &enums[payload_id];
+        let nullable = crate::enums::nullable_enum_layout(&definition.layout).unwrap();
+        let ty = mir::PayloadEnumType {
+            id: definition.id,
+            capabilities: definition.capabilities,
+            size: definition.layout.size,
+            align: definition.layout.align,
+            nullable_size: nullable.size,
+            nullable_payload_offset: nullable.payload_offset,
+        };
+        let value = ConstPayloadEnumValue {
+            value: ConstEnumValue {
+                enum_type: definition.source_type.clone(),
+                case: EnumCaseSource {
+                    declaration: EnumId(91),
+                    index: 0,
+                },
+            },
+            fields: vec![ConstValue::Bool(true)],
+            // Native fields must use checked substitutions, never authored syntax.
+            field_types: vec![ResolvedType::TypeParameter("T".into())],
+        };
+        let constant = ConstValue::PayloadEnum(value.clone());
+        let mir::StaticValue::PayloadEnum(static_value) = lower_static_value(
+            &constant,
+            mir::Type::PayloadEnum(ty),
+            span,
+            &enums,
+            &mut resolve,
+        )
+        .unwrap() else {
+            panic!("payload static");
+        };
+        assert_eq!(static_value.case, definition.cases[0].id);
+        assert_eq!(
+            static_value.fields,
+            vec![mir::StaticValue::Scalar(mir::ScalarValue::Bool(true))]
+        );
+        let mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(
+            mir::PayloadEnumExpression::Construct { case, fields, .. },
+        )) = lower_const_rvalue(
+            &constant,
+            mir::Type::NullablePayloadEnum(ty),
+            span,
+            &enums,
+            &mut resolve,
+        )
+        .unwrap()
+        else {
+            panic!("nullable payload constant");
+        };
+        assert_eq!(case, definition.cases[0].id);
+        assert_eq!(fields.len(), 1);
+
+        for invalid in 0..4 {
+            let mut value = value.clone();
+            match invalid {
+                0 => value.value.enum_type.arguments = vec![ResolvedType::String],
+                1 => value.value.case.declaration = EnumId(90),
+                2 => value.value.case.index = usize::MAX,
+                _ => value.fields.clear(),
+            }
+            let value = ConstValue::PayloadEnum(value);
+            assert!(lower_static_value(
+                &value,
+                mir::Type::PayloadEnum(ty),
+                span,
+                &enums,
+                &mut resolve
+            )
+            .is_err());
+            assert!(lower_const_rvalue(
+                &value,
+                mir::Type::PayloadEnum(ty),
+                span,
+                &enums,
+                &mut resolve
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn native_enum_layouts_use_concrete_instances_and_reject_missing_applications() {
+        let application = |ty| EnumType::with_arguments(EnumId(99), "Packet", vec![ty]);
+        let first = application(ResolvedType::Bool);
+        let second = application(ResolvedType::String);
+        let unit = EnumType::new(EnumId(100), "Status");
+        let payload = |id, size, trivial_copy| mir::PayloadEnumType {
+            id: EnumId(id),
+            capabilities: EnumCapabilities {
+                copy: true,
+                trivial_copy,
+                needs_drop: !trivial_copy,
+                equality: true,
+            },
+            size,
+            align: 8,
+            nullable_size: size + 8,
+            nullable_payload_offset: 8,
+        };
+        let first_layout = payload(0, 16, true);
+        let second_layout = payload(1, 24, false);
+        let ids = ClassIds {
+            enum_instances: HashMap::from([
+                (first.clone(), EnumId(0)),
+                (second.clone(), EnumId(1)),
+                (unit.clone(), EnumId(2)),
+            ]),
+            enum_types: HashMap::from([(EnumId(0), first_layout), (EnumId(1), second_layout)]),
+            ..ClassIds::default()
+        };
+        assert_eq!(
+            ids.mir_enum_type(&first),
+            Some(mir::Type::PayloadEnum(first_layout))
+        );
+        assert_eq!(
+            ids.mir_enum_type(&second),
+            Some(mir::Type::PayloadEnum(second_layout))
+        );
+        assert_eq!(
+            ids.mir_enum_type(&unit),
+            Some(mir::Type::Scalar(mir::ScalarType::Enum(EnumId(2)))),
+        );
+        assert_eq!(ids.mir_enum_type(&application(ResolvedType::Mixed)), None);
+        assert_eq!(
+            ids.mir_enum_type(&EnumType::new(EnumId(99), "Packet")),
+            None
+        );
     }
 }
 
 #[derive(Clone, Default)]
 struct NativeTypeRegistry {
+    source_types: crate::ownership::SourceTypes,
     ids: HashMap<(mir::CollectionKind, Option<mir::Type>, mir::Type), mir::CollectionTypeId>,
     types: Vec<mir::CollectionType>,
     function_ids: HashMap<crate::types::SemanticFunctionType<ResolvedType>, mir::FunctionTypeId>,
+    function_signatures: HashMap<NativeFunctionSignature, mir::FunctionTypeId>,
     function_types: Vec<mir::FunctionType>,
+    checked_function_types: HashMap<Span, ResolvedType>,
     interface_ids: HashMap<crate::types::InterfaceType<ResolvedType>, mir::InterfaceTypeId>,
     interface_types: Vec<mir::InterfaceType>,
     interface_vtable_ids:
@@ -68,13 +290,62 @@ struct NativeTypeRegistry {
     error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
 }
 
+impl mir::return_adaptation::TypeFacts for NativeTypeRegistry {
+    fn interface_inherits(
+        &self,
+        source: mir::InterfaceTypeId,
+        target: mir::InterfaceTypeId,
+    ) -> bool {
+        self.interface_types
+            .get(source.0)
+            .is_some_and(|source| source.ancestors.contains(&target))
+    }
+    fn interface_vtable(
+        &self,
+        implementing: mir::ImplementingType,
+        target: mir::InterfaceTypeId,
+    ) -> Option<mir::InterfaceVtableId> {
+        self.interface_vtable_ids
+            .get(&(implementing, target))
+            .copied()
+    }
+}
+
 impl NativeTypeRegistry {
+    fn class_interface_vtable(
+        &self,
+        class: ClassId,
+        interface: mir::InterfaceTypeId,
+        span: Span,
+    ) -> DiagnosticResult<mir::InterfaceVtableId> {
+        self.interface_vtable_ids
+            .get(&(mir::ImplementingType::Class(class), interface))
+            .copied()
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2401",
+                    "interface conversion has no checked conformance plan",
+                    span,
+                )]
+            })
+    }
+
     fn with_error_descriptors(
         error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
         semantic_info: &SemanticInfo,
     ) -> DiagnosticResult<Self> {
         let mut registry = Self {
+            source_types: crate::ownership::SourceTypes::from_semantic_classes(
+                &semantic_info.classes,
+                &semantic_info.enums,
+                &semantic_info.contracts,
+            ),
             error_descriptor_ids,
+            checked_function_types: semantic_info
+                .function_types_by_span
+                .iter()
+                .map(|(span, info)| (*span, info.ty.clone()))
+                .collect(),
             ..Self::default()
         };
         registry.interface_types.push(mir::InterfaceType::error());
@@ -109,6 +380,14 @@ impl NativeTypeRegistry {
                     fact.specialization.clone(),
                 )),
                 ancestors: Vec::new(),
+                requirement_origins: fact
+                    .requirements
+                    .iter()
+                    .flat_map(|requirement| &requirement.origins)
+                    .map(|origin| origin.declaration)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
                 methods: Vec::new(),
             });
         }
@@ -356,9 +635,18 @@ fn argument_values(args: &[hir::Argument]) -> Vec<&hir::Expr> {
 }
 
 #[derive(Clone)]
+struct DirectMethodContract {
+    id: mir::FunctionId,
+    ambient: Vec<mir::CheckedEffect>,
+    test_assertion: Vec<mir::CheckedEffect>,
+    complete: Vec<mir::CheckedEffect>,
+}
+
+#[derive(Clone)]
 struct FunctionSignature {
     id: mir::FunctionId,
-    direct_id: Option<mir::FunctionId>,
+    source_declaration: Option<Span>,
+    direct: Option<DirectMethodContract>,
     return_type: mir::ReturnType,
     return_borrow: Option<mir::ReturnBorrow>,
     parameter_types: Vec<mir::Type>,
@@ -376,6 +664,25 @@ struct FunctionSignature {
     checked_effects: Vec<mir::CheckedEffect>,
 }
 
+impl FunctionSignature {
+    fn select_direct(&mut self) {
+        if let Some(contract) = &self.direct {
+            self.id = contract.id;
+            self.ambient_checked_effects = contract.ambient.clone();
+            self.test_assertion_checked_effects = contract.test_assertion.clone();
+            self.checked_effects = contract.complete.clone();
+        }
+    }
+
+    fn direct_signature(&self) -> Option<Self> {
+        self.direct.as_ref()?;
+        let mut signature = self.clone();
+        signature.select_direct();
+        signature.direct = None;
+        Some(signature)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FunctionInstanceKey {
     name: String,
@@ -389,17 +696,106 @@ struct MethodInstanceKey {
     arguments: Vec<GenericArgument>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct VirtualMethodSlotKey {
-    name: String,
-    arguments: Vec<GenericArgument>,
+fn lower_virtual_family(
+    family: &crate::semantics::VirtualMethodFamily,
+    semantic_info: &SemanticInfo,
+    classes: &ClassIds,
+    types: &mut NativeTypeRegistry,
+    declarations: &[crate::monomorphization::CallableDecl<'_>],
+) -> DiagnosticResult<mir::VirtualMethodFamily> {
+    let owner = classes.get(&family.owner).copied().ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I2401",
+            "virtual family has no concrete root owner",
+            family.declaration,
+        )]
+    })?;
+    let arguments = family
+        .arguments
+        .iter()
+        .map(|argument| {
+            intern_resolved_collection_types(argument, classes, types).ok_or_else(|| {
+                vec![unsupported(
+                    family.declaration,
+                    "virtual specialization argument has no native type",
+                )]
+            })
+        })
+        .collect::<DiagnosticResult<Vec<_>>>()?;
+    let (root, substitutions) = virtual_root_declaration(family, owner, declarations)?;
+    let ambient = semantic_info
+        .virtual_ambient_checked_effects
+        .get(&family.declaration)
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2401",
+                "virtual root has no checked ambient profile",
+                family.declaration,
+            )]
+        })?;
+    let signature = collect_function_signature(
+        root.function,
+        mir::FunctionId(0),
+        types,
+        SignatureContext {
+            class_ids: classes,
+            semantic_info,
+            substitutions: &substitutions,
+            executable_effects: None,
+        },
+        SignatureOptions {
+            lifecycle: false,
+            is_entry: false,
+        },
+    )?;
+    Ok(mir::VirtualMethodFamily {
+        declaration: family.declaration,
+        owner,
+        arguments,
+        return_type: signature.return_type,
+        return_borrow: signature.return_borrow,
+        receiver_mode: if root.function.consuming_this {
+            mir::ReceiverMode::Consuming
+        } else if root.function.writable_this {
+            mir::ReceiverMode::Writable
+        } else {
+            mir::ReceiverMode::Readonly
+        },
+        checked_transport: !root.function.required_checked_effects.is_empty()
+            || !root.function.ambient_checked_effects.is_empty()
+            || !root.function.test_assertion_checked_effects.is_empty()
+            || !ambient.is_empty(),
+    })
 }
 
-#[derive(Clone, Debug)]
-struct VirtualMethodSlot {
-    key: VirtualMethodSlotKey,
-    contract: mir::FunctionId,
-    implementation: mir::FunctionId,
+fn virtual_root_declaration<'a>(
+    family: &crate::semantics::VirtualMethodFamily,
+    owner: ClassId,
+    declarations: &[crate::monomorphization::CallableDecl<'a>],
+) -> DiagnosticResult<(
+    crate::monomorphization::CallableDecl<'a>,
+    HashMap<String, ResolvedType>,
+)> {
+    let root = declarations
+        .iter()
+        .find(|declaration| {
+            declaration.function.span == family.declaration && declaration.class == Some(owner)
+        })
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2401",
+                "virtual family has no concrete root declaration",
+                family.declaration,
+            )]
+        })?;
+    let substitutions = root
+        .class_type_params
+        .iter()
+        .zip(&family.owner.arguments)
+        .chain(root.function.type_params.iter().zip(&family.arguments))
+        .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+        .collect();
+    Ok((*root, substitutions))
 }
 
 #[derive(Clone)]
@@ -1038,10 +1434,19 @@ fn lower_program_impl(
             .iter()
             .map(|definition| {
                 (
-                    definition.name.clone(),
-                    crate::enums::EnumType::new(definition.id, definition.name.clone()),
+                    ClassType::new(
+                        definition.source_type.name.clone(),
+                        definition.source_type.arguments.clone(),
+                    ),
+                    definition.source_type.clone(),
                 )
             })
+            .collect(),
+        enum_instances: program
+            .semantic_info
+            .enums
+            .iter()
+            .map(|definition| (definition.source_type.clone(), definition.id))
             .collect(),
         enum_types: program
             .semantic_info
@@ -1077,7 +1482,7 @@ fn lower_program_impl(
                     .properties
                     .iter()
                     .find(|property| property.name == name)
-                    .expect("compiler-known assertion property is present")
+                    .expect("compiler-known Error property is present")
                     .id
             };
             mir::ErrorDescriptor {
@@ -1096,6 +1501,9 @@ fn lower_program_impl(
                             .map(property),
                     }
                 }),
+                io_transferred_byte_count_property: (class.name
+                    == crate::compiler_known_io::IO_ERROR)
+                    .then(|| property("transferredByteCount")),
             }
         })
         .collect::<Vec<_>>();
@@ -1151,7 +1559,11 @@ fn lower_program_impl(
             .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
             .collect::<HashMap<_, _>>();
         for property in class.members.iter().filter_map(|member| match member {
-            hir::ClassMember::Property(property) if property.is_static => Some(property),
+            hir::ClassMember::Property(property)
+                if property.is_static && property.has_storage() =>
+            {
+                Some(property)
+            }
             _ => None,
         }) {
             let id = mir::StaticId(statics.len());
@@ -1193,8 +1605,14 @@ fn lower_program_impl(
                 &evaluated.value,
                 ty,
                 property.span,
-                &class_ids.enum_types,
-                &program.semantic_info,
+                &program.semantic_info.enums,
+                &mut |field| {
+                    intern_resolved_collection_types(
+                        &substitute_resolved_type(field, &substitutions),
+                        &class_ids,
+                        &mut collection_registry,
+                    )
+                },
             )?;
             static_ids.insert((class_id, property.name.clone()), (id, ty));
             statics.push(mir::StaticProperty {
@@ -1336,10 +1754,21 @@ fn lower_program_impl(
     let mut method_signatures = HashMap::new();
     let mut callable_signatures = Vec::new();
     let mut instance_substitutions = Vec::new();
+    for argument in program
+        .semantic_info
+        .classes
+        .iter()
+        .flat_map(|class| &class.arguments)
+    {
+        let _ = intern_resolved_collection_types(argument, &class_ids, &mut collection_registry);
+    }
     for (index, instance) in instances.iter().enumerate() {
         let declaration = declarations[instance.declaration];
         let function = declaration.function;
         let substitutions = type_substitutions(declaration, &instance.arguments)?;
+        let signature_semantics = program
+            .semantic_info
+            .with_callable_ownership(function.span, &substitutions);
         let entry_body = main_indices
             .contains(&instance.declaration)
             .then(|| entry_process_body(function, &selected_entry_statements));
@@ -1349,7 +1778,12 @@ fn lower_program_impl(
             &mut collection_registry,
             &substitutions,
         );
-        for (span, ty) in &program.semantic_info.expression_types {
+        for (span, ty) in program
+            .semantic_info
+            .expression_types
+            .iter()
+            .chain(&program.semantic_info.collection_construction_types)
+        {
             if function.span.contains(*span) {
                 let specialized = substitute_resolved_type(ty, &substitutions);
                 let _ = intern_resolved_collection_types(
@@ -1375,18 +1809,71 @@ fn lower_program_impl(
             &mut collection_registry,
             SignatureContext {
                 class_ids: &class_ids,
-                semantic_info: &program.semantic_info,
+                semantic_info: &signature_semantics,
                 substitutions: &substitutions,
+                executable_effects: program
+                    .semantic_info
+                    .executable_effects
+                    .instance(function.span, &substitutions)
+                    .map(|effects| effects.as_ref()),
             },
             SignatureOptions {
                 lifecycle: matches!(function.name.as_str(), "__construct" | "__destruct"),
                 is_entry: main_indices.contains(&instance.declaration),
             },
         )?;
-        signature.direct_id = direct_method_ids.get(&signature.id).copied();
+        signature.direct = direct_method_ids
+            .get(&signature.id)
+            .map(|id| DirectMethodContract {
+                id: *id,
+                ambient: signature.ambient_checked_effects.clone(),
+                test_assertion: signature.test_assertion_checked_effects.clone(),
+                complete: signature.checked_effects.clone(),
+            });
+        if signature.direct.is_some() {
+            let ambient = program
+                .semantic_info
+                .virtual_ambient_checked_effects
+                .get(&function.span)
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I2401",
+                        "virtual method has no checked ambient profile",
+                        function.span,
+                    )]
+                })?;
+            for effect in ambient {
+                let native = checked_effect_for_resolved(effect, &class_ids, &collection_registry)
+                    .ok_or_else(|| {
+                        vec![unsupported(
+                            function.span,
+                            "virtual ambient effect has no registered native identity",
+                        )]
+                    })?;
+                let effects = match crate::checked_effects::classify_effect(effect) {
+                    crate::checked_effects::CheckedEffectClass::AmbientIo => {
+                        &mut signature.ambient_checked_effects
+                    }
+                    crate::checked_effects::CheckedEffectClass::TestAssertion => {
+                        &mut signature.test_assertion_checked_effects
+                    }
+                    crate::checked_effects::CheckedEffectClass::Required => {
+                        unreachable!("virtual ambient profile contains a required effect")
+                    }
+                };
+                if !effects.contains(&native) {
+                    effects.push(native);
+                }
+                if !signature.checked_effects.contains(&native) {
+                    signature.checked_effects.push(native);
+                }
+            }
+        }
         signature.method_class = declaration.class;
         signature.receiver_mode = declaration.receiver.map(|_| {
-            if function.writable_this {
+            if function.consuming_this {
+                mir::ReceiverMode::Consuming
+            } else if function.writable_this {
                 mir::ReceiverMode::Writable
             } else {
                 mir::ReceiverMode::Readonly
@@ -1419,7 +1906,12 @@ fn lower_program_impl(
         &mut method_signatures,
         &mut callable_signatures,
     );
-    for ty in program.semantic_info.expression_types.values() {
+    for ty in program
+        .semantic_info
+        .expression_types
+        .values()
+        .chain(program.semantic_info.collection_construction_types.values())
+    {
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
     for ty in program.semantic_info.type_test_types.values() {
@@ -1448,6 +1940,9 @@ fn lower_program_impl(
         instances.iter().zip(&instance_substitutions).enumerate()
     {
         let declaration = declarations[instance.declaration];
+        let semantic_info = program
+            .semantic_info
+            .with_callable_ownership(declaration.function.span, substitutions);
         let containing_name = inputs_method_name(
             declaration.function,
             declaration.class,
@@ -1468,7 +1963,7 @@ fn lower_program_impl(
                 source: program
                     .source(declaration.function.span.source)
                     .unwrap_or(&source),
-                semantic_info: &program.semantic_info,
+                semantic_info: &semantic_info,
                 substitutions,
                 class_ids: &class_ids,
                 registry: &mut collection_registry,
@@ -1521,7 +2016,7 @@ fn lower_program_impl(
     });
     let entry = selected_entry.unwrap_or(mir::FunctionId(usize::MAX));
     let mut functions = Vec::with_capacity(instances.len());
-    let mut function_instance_arguments = HashMap::new();
+    let mut direct_functions = Vec::with_capacity(direct_method_ids.len());
     for (((instance, signature), substitutions), closure_plans) in instances
         .iter()
         .zip(callable_signatures)
@@ -1534,21 +2029,30 @@ fn lower_program_impl(
             }
         }
         let declaration = declarations[instance.declaration];
+        let semantic_info = program
+            .semantic_info
+            .with_callable_ownership(declaration.function.span, substitutions);
         let inputs = FunctionLoweringInputs {
             signatures: &signatures,
             method_signatures: &method_signatures,
-            semantic_info: &program.semantic_info,
+            semantic_info: &semantic_info,
             property_initializers: &property_initializers,
             static_ids: &static_ids,
             collection_registry: &collection_registry,
             enum_types: &class_ids.enum_types,
+            enum_instances: &class_ids.enum_instances,
             type_substitutions: substitutions,
             error_descriptor_ids: &error_descriptor_ids,
             error_origin_ids: &error_origin_ids,
             closure_plans,
             closure_environment_layouts: &closure_environment_layouts,
+            executable_effects: program
+                .semantic_info
+                .executable_effects
+                .instance(declaration.function.span, substitutions)
+                .map(|effects| effects.as_ref()),
         };
-        let function_id = signature.id;
+        let direct = signature.direct_signature();
         functions.push(lower_function(
             declaration.function,
             signature,
@@ -1562,21 +2066,21 @@ fn lower_program_impl(
             },
             metrics.as_deref_mut(),
         )?);
-        function_instance_arguments.insert(function_id, instance.arguments.clone());
+        if let Some(direct) = direct {
+            let mut implementation = lower_function(
+                declaration.function,
+                direct,
+                inputs,
+                declaration.class,
+                declaration.receiver,
+                &[],
+                metrics.as_deref_mut(),
+            )?;
+            implementation.name = format!("{}::<direct>", implementation.name);
+            direct_functions.push(implementation);
+        }
     }
-
-    let mut direct_methods = direct_method_ids.iter().collect::<Vec<_>>();
-    direct_methods.sort_by_key(|(function, _)| function.0);
-    for (function, direct) in direct_methods {
-        let mut implementation = functions
-            .get(function.0)
-            .expect("virtual method implementation exists")
-            .clone();
-        implementation.id = *direct;
-        implementation.name = format!("{}::<direct>", implementation.name);
-        implementation.virtual_slot = None;
-        functions.push(implementation);
-    }
+    functions.extend(direct_functions);
 
     for ((instance, substitutions), closure_plans) in instances
         .iter()
@@ -1597,11 +2101,17 @@ fn lower_program_impl(
                     static_ids: &static_ids,
                     collection_registry: &collection_registry,
                     enum_types: &class_ids.enum_types,
+                    enum_instances: &class_ids.enum_instances,
                     type_substitutions: substitutions,
                     error_descriptor_ids: &error_descriptor_ids,
                     error_origin_ids: &error_origin_ids,
                     closure_plans,
                     closure_environment_layouts: &closure_environment_layouts,
+                    executable_effects: program
+                        .semantic_info
+                        .executable_effects
+                        .instance(declaration.function.span, substitutions)
+                        .map(|effects| effects.as_ref()),
                 },
                 declaration.class,
                 metrics.as_deref_mut(),
@@ -1627,108 +2137,205 @@ fn lower_program_impl(
                     static_ids: &static_ids,
                     collection_registry: &collection_registry,
                     enum_types: &class_ids.enum_types,
+                    enum_instances: &class_ids.enum_instances,
                     type_substitutions: &initializer.type_substitutions,
                     error_descriptor_ids: &error_descriptor_ids,
                     error_origin_ids: &error_origin_ids,
                     closure_plans: &initializer.closure_plans,
                     closure_environment_layouts: &closure_environment_layouts,
+                    executable_effects: None,
                 },
                 Some(initializer.class),
                 metrics.as_deref_mut(),
             )?);
         }
     }
-    let mut virtual_tables = HashMap::<ClassId, Vec<mir::FunctionId>>::new();
+    let mut materialized_instances = HashMap::new();
+    for (index, instance) in instances.iter().enumerate() {
+        let declaration = declarations[instance.declaration];
+        let key = crate::semantics::CallableInstanceKey::new(
+            declaration.function.span,
+            &instance_substitutions[index],
+        );
+        materialized_instances.insert(key.clone(), mir::FunctionId(index));
+        if !program
+            .semantic_info
+            .method_hierarchy
+            .get(&declaration.function.span)
+            .is_some_and(|method| method.virtual_root.is_some())
+        {
+            continue;
+        }
+        let family = program
+            .semantic_info
+            .virtual_dispatch
+            .family(&key, declaration.function.span)?;
+        let family = lower_virtual_family(
+            family,
+            &program.semantic_info,
+            &class_ids,
+            &mut collection_registry,
+            &declarations,
+        )?;
+        functions[index]
+            .method
+            .as_mut()
+            .expect("virtual method has an identity")
+            .virtual_family = Some(family);
+    }
+    let mut raw_virtual_tables = HashMap::new();
+    for class in &program.semantic_info.classes {
+        let receiver = ClassType::new(class.declaration_name.clone(), class.arguments.clone());
+        let slots = program
+            .semantic_info
+            .virtual_dispatch
+            .slots(&receiver, Span::default())?
+            .iter()
+            .map(|slot| {
+                let declaration = declarations
+                    .iter()
+                    .find(|declaration| {
+                        declaration.function.span == slot.implementation.declaration()
+                            && declaration
+                                .class_type_params
+                                .iter()
+                                .zip(declaration.class_arguments)
+                                .all(|(parameter, argument)| {
+                                    slot.implementation.binding(&parameter.name) == Some(argument)
+                                })
+                    })
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "I2401",
+                            "checked virtual slot has no concrete implementation declaration",
+                            slot.implementation.declaration(),
+                        )]
+                    })?;
+                let substitutions = declaration
+                    .class_type_params
+                    .iter()
+                    .chain(&declaration.function.type_params)
+                    .map(|parameter| {
+                        slot.implementation
+                            .binding(&parameter.name)
+                            .cloned()
+                            .map(|ty| (parameter.name.clone(), ty))
+                            .ok_or_else(|| {
+                                vec![Diagnostic::new(
+                                    "I2401",
+                                    "checked virtual implementation has incomplete bindings",
+                                    declaration.function.span,
+                                )]
+                            })
+                    })
+                    .collect::<DiagnosticResult<HashMap<_, _>>>()?;
+                let signature = collect_function_signature(
+                    declaration.function,
+                    mir::FunctionId(0),
+                    &mut collection_registry,
+                    SignatureContext {
+                        class_ids: &class_ids,
+                        semantic_info: &program.semantic_info,
+                        substitutions: &substitutions,
+                        executable_effects: None,
+                    },
+                    SignatureOptions {
+                        lifecycle: false,
+                        is_entry: false,
+                    },
+                )?;
+                Ok(mir::VirtualMethodSlot {
+                    family: lower_virtual_family(
+                        &slot.family,
+                        &program.semantic_info,
+                        &class_ids,
+                        &mut collection_registry,
+                        &declarations,
+                    )?,
+                    receiver_mode: slot.receiver_mode,
+                    return_type: signature.return_type,
+                    return_borrow: signature.return_borrow,
+                    implementation: materialized_instances.get(&slot.implementation).copied(),
+                })
+            })
+            .collect::<DiagnosticResult<Vec<_>>>()?;
+        raw_virtual_tables.insert(class.id, slots);
+    }
+    let mut virtual_tables = HashMap::<ClassId, Vec<mir::VirtualMethodSlot>>::new();
     let mut function_virtual_slots = HashMap::<mir::FunctionId, u32>::new();
     let mut virtual_return_adapters = HashMap::new();
     for class in &program.semantic_info.classes {
-        let mut hierarchy = class.ancestors.iter().rev().collect::<Vec<_>>();
-        let concrete = ClassType::new(class.declaration_name.clone(), class.arguments.clone());
-        hierarchy.push(&concrete);
-        let mut slots = Vec::<VirtualMethodSlot>::new();
-        for hierarchy_class in hierarchy {
-            let Some(class_id) = class_ids.get(hierarchy_class).copied() else {
+        let mut slots = raw_virtual_tables[&class.id].clone();
+        for (slot_index, slot) in slots.iter_mut().enumerate() {
+            let Some(function_id) = slot.implementation else {
                 continue;
             };
-            let Some(declaration) = program.items.iter().find_map(|item| match item {
-                hir::Item::Class(declaration) if declaration.name == hierarchy_class.name => {
-                    Some(declaration)
+            let contract = slot.family.return_type;
+            let implementation_id = if contract != functions[function_id.0].return_type {
+                let adapter_key = (contract, function_id);
+                if let Some(adapter) = virtual_return_adapters.get(&adapter_key) {
+                    *adapter
+                } else {
+                    let direct = direct_method_ids[&function_id];
+                    let adapter = mir::FunctionId(functions.len());
+                    let source_family = program.semantic_info.virtual_dispatch.family(
+                        &crate::semantics::CallableInstanceKey::new(
+                            declarations[instances[function_id.0].declaration]
+                                .function
+                                .span,
+                            &instance_substitutions[function_id.0],
+                        ),
+                        slot.family.declaration,
+                    )?;
+                    let (root, substitutions) =
+                        virtual_root_declaration(source_family, slot.family.owner, &declarations)?;
+                    let contract = collect_function_signature(
+                        root.function,
+                        mir::FunctionId(0),
+                        &mut collection_registry,
+                        SignatureContext {
+                            class_ids: &class_ids,
+                            semantic_info: &program.semantic_info,
+                            substitutions: &substitutions,
+                            executable_effects: None,
+                        },
+                        SignatureOptions {
+                            lifecycle: false,
+                            is_entry: false,
+                        },
+                    )?;
+                    let implementation = functions[function_id.0].clone();
+                    let direct = functions[direct.0].clone();
+                    functions.push(build_virtual_return_adapter(
+                        adapter,
+                        slot_index as u32,
+                        contract.return_type,
+                        contract.return_borrow,
+                        &implementation,
+                        &direct,
+                        &collection_registry,
+                    )?);
+                    virtual_return_adapters.insert(adapter_key, adapter);
+                    adapter
                 }
-                _ => None,
-            }) else {
-                continue;
+            } else {
+                function_id
             };
-            for method in declaration
-                .members
-                .iter()
-                .flat_map(hir::ClassMember::callables)
-            {
-                if !method.is_open && !method.is_override {
-                    continue;
-                }
-                let mut specializations = functions
-                    .iter()
-                    .filter(|function| {
-                        function.method.as_ref().is_some_and(|identity| {
-                            identity.class == class_id && identity.name == method.name
-                        }) && function_instance_arguments.contains_key(&function.id)
-                    })
-                    .map(|function| function.id)
-                    .collect::<Vec<_>>();
-                specializations.sort_by_key(|function| function.0);
-                for function_id in specializations {
-                    let key = VirtualMethodSlotKey {
-                        name: method.name.clone(),
-                        arguments: function_instance_arguments[&function_id].clone(),
-                    };
-                    let existing = method
-                        .is_override
-                        .then(|| slots.iter().position(|slot| slot.key == key))
-                        .flatten();
-                    let slot = existing.unwrap_or_else(|| {
-                        slots.push(VirtualMethodSlot {
-                            key: key.clone(),
-                            contract: function_id,
-                            implementation: function_id,
-                        });
-                        slots.len() - 1
-                    });
-                    let contract_id = slots[slot].contract;
-                    let implementation_id = if contract_id != function_id
-                        && functions[contract_id.0].return_type
-                            != functions[function_id.0].return_type
-                    {
-                        let adapter_key = (contract_id, function_id);
-                        if let Some(adapter) = virtual_return_adapters.get(&adapter_key) {
-                            *adapter
-                        } else {
-                            let direct = direct_method_ids[&function_id];
-                            let adapter = mir::FunctionId(functions.len());
-                            let contract = functions[contract_id.0].clone();
-                            let implementation = functions[function_id.0].clone();
-                            functions.push(build_virtual_return_adapter(
-                                adapter,
-                                slot as u32,
-                                &contract,
-                                &implementation,
-                                direct,
-                            )?);
-                            virtual_return_adapters.insert(adapter_key, adapter);
-                            adapter
-                        }
-                    } else {
-                        function_id
-                    };
-                    slots[slot].implementation = implementation_id;
-                    function_virtual_slots.insert(function_id, slot as u32);
-                    function_virtual_slots.insert(implementation_id, slot as u32);
+            slot.implementation = Some(implementation_id);
+            for function in [function_id, implementation_id] {
+                if function_virtual_slots
+                    .insert(function, slot_index as u32)
+                    .is_some_and(|previous| previous != slot_index as u32)
+                {
+                    return Err(vec![Diagnostic::new(
+                        "I2401",
+                        "canonical virtual family has inconsistent inherited slots",
+                        slot.family.declaration,
+                    )]);
                 }
             }
         }
-        virtual_tables.insert(
-            class.id,
-            slots.into_iter().map(|slot| slot.implementation).collect(),
-        );
+        virtual_tables.insert(class.id, slots);
     }
     for function in &mut functions {
         function.virtual_slot = function_virtual_slots.get(&function.id).copied();
@@ -1736,7 +2343,8 @@ fn lower_program_impl(
     interface::build_entries(
         &program.semantic_info,
         &class_ids,
-        &method_signatures,
+        &materialized_instances,
+        &direct_method_ids,
         &mut collection_registry,
         &mut functions,
     )?;
@@ -1782,8 +2390,12 @@ fn lower_program_impl(
                 properties.iter().map(|property| {
                     (
                         property.id,
-                        field_type(property.ty, &program.semantic_info)
-                            .expect("checked native property type"),
+                        if property.stores_retained_place() {
+                            FieldType::RetainedPlace
+                        } else {
+                            field_type(property.ty, &program.semantic_info)
+                                .expect("checked native property type")
+                        },
                     )
                 }),
                 std::mem::size_of::<usize>() as u32,
@@ -1816,6 +2428,24 @@ fn lower_program_impl(
             Ok(mir::Class {
                 id: class.id,
                 name: class.name.clone(),
+                declaration_name: class.declaration_name.clone(),
+                arguments: class
+                    .arguments
+                    .iter()
+                    .map(|argument| {
+                        intern_resolved_collection_types(
+                            argument,
+                            &class_ids,
+                            &mut collection_registry,
+                        )
+                        .ok_or_else(|| {
+                            vec![unsupported(
+                                source_span,
+                                "class specialization argument has no executable type",
+                            )]
+                        })
+                    })
+                    .collect::<DiagnosticResult<Vec<_>>>()?,
                 source_span,
                 is_open: class.is_open,
                 parent: class.parent.as_ref().and_then(|parent| class_ids.get(parent)).copied(),
@@ -1827,6 +2457,10 @@ fn lower_program_impl(
                 virtual_methods: virtual_tables.remove(&class.id).unwrap_or_default(),
                 properties,
                 layout,
+                runtime_payload: mir::RuntimeClassPayload::for_declaration(
+                    &class.name,
+                    source_span.source,
+                ),
                 constructor: lifecycle("__construct"),
                 destructor: lifecycle("__destruct"),
                 error_descriptor,
@@ -1840,16 +2474,7 @@ fn lower_program_impl(
         .enums
         .iter()
         .map(|enum_info| {
-            let source_span = program
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    hir::Item::Enum(declaration) if declaration.name == enum_info.name => {
-                        Some(declaration.span)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let source_span = enum_info.declaration;
             Ok(mir::EnumDefinition {
                 id: enum_info.id,
                 name: enum_info.name.clone(),
@@ -1903,7 +2528,7 @@ fn lower_program_impl(
         interface_vtables,
         ..
     } = collection_registry;
-    Ok(mir::Program {
+    let mut program = mir::Program {
         interface_types,
         interface_vtables,
         sources: program
@@ -1954,7 +2579,57 @@ fn lower_program_impl(
         functions,
         selected_entry,
         entry,
-    })
+    };
+    specialize_retained_sources(&mut program);
+    Ok(program)
+}
+
+fn specialize_retained_sources(program: &mut mir::Program) {
+    // Symbolic inputs may carry loans; their concrete instantiations need not.
+    let mut functions = std::mem::take(&mut program.functions);
+    for function in &mut functions {
+        let Some(plan) = function.blocks[function.entry_block.0]
+            .statements
+            .iter_mut()
+            .find_map(|statement| match statement {
+                mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => {
+                    Some(plan)
+                }
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let locals = function
+            .locals
+            .iter()
+            .map(|local| program.carries_retained_sources(local.ty))
+            .collect::<Vec<_>>();
+        let keep_source =
+            |source: &mir::RetainedSource| !source.inherited || locals[source.local.0];
+        plan.returns.retain(&keep_source);
+        plan.constructs.retain(&keep_source);
+        for store in plan.stores.iter_mut().chain(&mut plan.exceptional_stores) {
+            store.sources.retain(&keep_source);
+        }
+        if let Some(storage) = &mut plan.returned_storage {
+            // Specialize symbolic loan inputs without erasing proved ownership
+            // selections, such as removal from a generic owning container.
+            storage.inputs.retain(|input| locals[input.0]);
+            storage.direct.retain(&keep_source);
+            for member in &mut storage.members {
+                member.sources.retain(&keep_source);
+            }
+            if storage.inputs.is_empty()
+                && storage.members.is_empty()
+                && storage.selections.is_empty()
+                && storage.direct.is_empty()
+            {
+                plan.returned_storage = None;
+            }
+        }
+    }
+    program.functions = functions;
 }
 
 fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String> {
@@ -2022,6 +2697,7 @@ fn intern_resolved_collection_types(
         ResolvedType::Bool => mir::Type::Scalar(mir::ScalarType::Bool),
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
+        ResolvedType::ByteRegion(kind) => mir::Type::ByteRegion(*kind),
         ResolvedType::Mixed => mir::Type::Mixed,
         ResolvedType::Error => mir::Type::ERROR,
         ResolvedType::Function(function) => {
@@ -2066,6 +2742,57 @@ fn intern_resolved_collection_types(
                     .iter()
                     .map(|effect| checked_effect_for_resolved(effect, class_ids, collections))
                     .collect::<Option<Vec<_>>>()?;
+                let invocation_mode = match function.invocation_mode {
+                    crate::types::FunctionInvocationMode::Readonly => {
+                        mir::FunctionInvocationMode::Readonly
+                    }
+                    crate::types::FunctionInvocationMode::Writable => {
+                        mir::FunctionInvocationMode::Writable
+                    }
+                    crate::types::FunctionInvocationMode::Once => mir::FunctionInvocationMode::Once,
+                };
+                let return_borrow = function
+                    .return_borrow
+                    .filter(|borrow| {
+                        let crate::types::FunctionBorrowSource::Parameter(index) = borrow.source;
+                        return_borrow_applies(
+                            borrow.kind,
+                            return_type,
+                            parameters.get(index).map(|parameter| parameter.ty),
+                        )
+                    })
+                    .filter(|borrow| {
+                        let crate::types::FunctionBorrowSource::Parameter(index) = borrow.source;
+                        borrow.kind != mir::ReturnBorrowKind::Retained
+                            || function.parameters.get(index).is_none_or(|parameter| {
+                                parameter.ownership_mode
+                                    != crate::types::FunctionTypeParameterMode::Take
+                                    || collections.source_types.carries(&parameter.ty)
+                            })
+                    })
+                    .map(|borrow| mir::ReturnBorrow {
+                        kind: borrow.kind,
+                        lifetime: borrow.lifetime,
+                        source: match borrow.source {
+                            crate::types::FunctionBorrowSource::Parameter(index) => {
+                                mir::BorrowSource::Parameter(index)
+                            }
+                        },
+                        writable: borrow.writable,
+                    });
+                // Generic borrow facts may disappear for Copy specializations.
+                // Intern the concrete contract, retaining source types as aliases.
+                let signature = (
+                    invocation_mode,
+                    parameters,
+                    return_type,
+                    checked_effects,
+                    return_borrow,
+                );
+                if let Some(id) = collections.function_signatures.get(&signature).copied() {
+                    collections.function_ids.insert((**function).clone(), id);
+                    return Some(mir::Type::Function(id));
+                }
                 let ambient_checked_effects = ambient_mir_checked_effects(class_ids, collections)?;
                 let test_assertion_checked_effects = checked_effect_for_resolved(
                     &ResolvedType::Class(ClassType::new(
@@ -2080,38 +2807,26 @@ fn intern_resolved_collection_types(
                 let id = mir::FunctionTypeId(collections.function_types.len());
                 collections.function_types.push(mir::FunctionType {
                     id,
-                    invocation_mode: match function.invocation_mode {
-                        crate::types::FunctionInvocationMode::Readonly => {
-                            mir::FunctionInvocationMode::Readonly
-                        }
-                        crate::types::FunctionInvocationMode::Writable => {
-                            mir::FunctionInvocationMode::Writable
-                        }
-                        crate::types::FunctionInvocationMode::Once => {
-                            mir::FunctionInvocationMode::Once
-                        }
-                    },
-                    parameters,
+                    invocation_mode,
+                    parameters: signature.1.clone(),
                     return_type,
-                    checked_effects,
+                    checked_effects: signature.3.clone(),
                     ambient_checked_effects,
                     test_assertion_checked_effects,
-                    return_borrow: function.return_borrow.map(|borrow| mir::ReturnBorrow {
-                        kind: borrow.kind,
-                        source: match borrow.source {
-                            crate::types::FunctionBorrowSource::Parameter(index) => {
-                                mir::BorrowSource::Parameter(index)
-                            }
-                        },
-                        writable: borrow.writable,
-                    }),
+                    return_borrow,
                 });
+                collections.function_signatures.insert(signature, id);
                 collections.function_ids.insert((**function).clone(), id);
                 mir::Type::Function(id)
             }
         }
-        ResolvedType::Enum(enum_type) => class_ids.mir_enum_type(enum_type.id),
-        ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
+        ResolvedType::Enum(enum_type) => class_ids.mir_enum_type(enum_type)?,
+        ResolvedType::Class(class) => match class.inline_copy_type() {
+            Some(kind) => mir::Type::Scalar(mir::ScalarType::Inline(
+                kind.specialize(*class_ids.get(class)?),
+            )),
+            None => mir::Type::Class(*class_ids.get(class)?),
+        },
         ResolvedType::SharedHandle(kind, payload) => match kind {
             crate::types::SharedHandleKind::SharedReference => {
                 let payload = mir::SharedPayload::from_type(intern_resolved_collection_types(
@@ -2212,6 +2927,7 @@ fn intern_resolved_collection_types(
             match intern_resolved_collection_types(inner, class_ids, collections)? {
                 mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
                 mir::Type::String => mir::Type::NullableString,
+                mir::Type::ByteRegion(kind) => mir::Type::NullableByteRegion(kind),
                 mir::Type::Mixed => mir::Type::NullableMixed,
                 mir::Type::Interface(interface) => mir::Type::NullableInterface(interface),
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
@@ -2236,6 +2952,7 @@ fn intern_resolved_collection_types(
                     mir::Type::NullableCollection(collection)
                 }
                 mir::Type::NullableScalar(_)
+                | mir::Type::NullableByteRegion(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableInterface(_)
@@ -2399,12 +3116,37 @@ fn intern_if_collection_types(
     }
 }
 
+fn resolve_const_enum<'a>(
+    value: &crate::const_eval::ConstEnumValue,
+    expected: crate::enums::EnumId,
+    enums: &'a [crate::semantics::EnumSemanticInfo],
+    span: Span,
+) -> DiagnosticResult<&'a crate::semantics::EnumCaseSemanticInfo> {
+    enums
+        .iter()
+        .find(|definition| definition.id == expected)
+        .and_then(|definition| {
+            let case = definition.resolve_typed_case(&value.enum_type, value.case)?;
+            definition
+                .cases
+                .iter()
+                .find(|candidate| candidate.id == case)
+        })
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2701",
+                "enum constant does not belong to its concrete expression type",
+                span,
+            )]
+        })
+}
+
 fn lower_static_value(
     value: &crate::const_eval::ConstValue,
     ty: mir::Type,
     span: Span,
-    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
-    semantic_info: &SemanticInfo,
+    enums: &[crate::semantics::EnumSemanticInfo],
+    resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
 ) -> DiagnosticResult<mir::StaticValue> {
     match (value, ty) {
         (
@@ -2428,8 +3170,14 @@ fn lower_static_value(
             crate::const_eval::ConstValue::Enum(value),
             mir::Type::Scalar(mir::ScalarType::Enum(expected))
             | mir::Type::NullableScalar(mir::ScalarType::Enum(expected)),
-        ) if value.enum_id == expected => {
-            Ok(mir::StaticValue::Scalar(mir::ScalarValue::Enum(*value)))
+        ) => {
+            let case = resolve_const_enum(value, expected, enums, span)?;
+            Ok(mir::StaticValue::Scalar(mir::ScalarValue::Enum(
+                crate::enums::EnumValue {
+                    enum_id: expected,
+                    case_id: case.id,
+                },
+            )))
         }
         (
             crate::const_eval::ConstValue::String(value),
@@ -2445,25 +3193,31 @@ fn lower_static_value(
         (
             crate::const_eval::ConstValue::PayloadEnum(value),
             mir::Type::PayloadEnum(expected) | mir::Type::NullablePayloadEnum(expected),
-        ) if value.enum_id == expected.id => {
+        ) => {
+            let case = resolve_const_enum(&value.value, expected.id, enums, span)?;
+            if value.fields.len() != case.payload.len() {
+                return Err(vec![unsupported(
+                    span,
+                    "enum constant payload does not match its checked case",
+                )]);
+            }
             let fields = value
                 .fields
                 .iter()
-                .zip(&value.field_types)
+                .zip(&case.payload)
                 .map(|(field, field_ty)| {
-                    let field_ty = const_type_ref_to_mir(field_ty, enum_types, semantic_info)
-                        .ok_or_else(|| {
-                            vec![unsupported(
-                                span,
-                                "payload enum static field has no native constant representation",
-                            )]
-                        })?;
-                    lower_static_value(field, field_ty, span, enum_types, semantic_info)
+                    let field_ty = resolve_type(&field_ty.ty).ok_or_else(|| {
+                        vec![unsupported(
+                            span,
+                            "payload enum static field has no native constant representation",
+                        )]
+                    })?;
+                    lower_static_value(field, field_ty, span, enums, resolve_type)
                 })
                 .collect::<DiagnosticResult<Vec<_>>>()?;
             Ok(mir::StaticValue::PayloadEnum(mir::PayloadEnumConstant {
                 ty: expected,
-                case: value.case_id,
+                case: case.id,
                 fields,
             }))
         }
@@ -2472,6 +3226,51 @@ fn lower_static_value(
             "evaluated static initializer does not match its native type",
         )]),
     }
+}
+
+fn collect_function_return_type(
+    function: &hir::FunctionDecl,
+    class_ids: &ClassIds,
+    collection_registry: &mut NativeTypeRegistry,
+    substitutions: &HashMap<String, ResolvedType>,
+    lifecycle: bool,
+) -> DiagnosticResult<mir::ReturnType> {
+    Ok(match function.return_type.as_ref() {
+        Some(ty) => crate::types::resolved_type_ref_with_checked_functions(
+            ty,
+            substitutions,
+            &|span| collection_registry.checked_function_types.get(&span).cloned(),
+        )
+        .and_then(|resolved| {
+            if resolved == ResolvedType::Void {
+                Some(mir::ReturnType::Void)
+            } else {
+                let resolved = class_ids.resolve_nominal_kinds(resolved, collection_registry);
+                intern_resolved_collection_types(&resolved, class_ids, collection_registry)
+                    .map(mir::ReturnType::Value)
+            }
+        })
+        .ok_or_else(|| {
+            vec![unsupported_native_type(
+                ty,
+                function.span,
+                format!(
+                    "function `{}` has return type `{ty}`, which is not supported by native compilation",
+                    function.name
+                ),
+            )]
+        })?,
+        None if lifecycle => mir::ReturnType::Void,
+        None => {
+            return Err(vec![unsupported(
+                function.span,
+                format!(
+                    "function `{}` requires an explicit return type for native compilation",
+                    function.name
+                ),
+            )]);
+        }
+    })
 }
 
 fn collect_function_signature(
@@ -2485,51 +3284,38 @@ fn collect_function_signature(
         class_ids,
         semantic_info,
         substitutions,
+        executable_effects,
     } = context;
-    let return_type = match function.return_type.as_ref() {
-        Some(ty) if scalar_type_ref(ty).is_some() => mir::ReturnType::Value(mir::Type::Scalar(
-            scalar_type_ref(ty).expect("checked scalar type"),
-        )),
-        Some(ty) if is_plain_type(ty, "string") => mir::ReturnType::Value(mir::Type::String),
-        Some(ty) if is_nullable_string_type(ty) => {
-            mir::ReturnType::Value(mir::Type::NullableString)
-        }
-        Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
-        Some(ty)
-            if mir_type_ref_with_substitutions(
-                ty,
-                class_ids,
-                collection_registry,
-                substitutions,
+    let narrowed = executable_effects
+        .and_then(InstanceEffects::contract)
+        .map(|contract| {
+            (
+                crate::checked_effects::CheckedEffectProfile::classify(contract.iter().cloned()),
+                contract,
             )
-            .is_some() =>
-        {
-            mir::ReturnType::Value(
-                mir_type_ref_with_substitutions(ty, class_ids, collection_registry, substitutions)
-                    .expect("checked native return"),
-            )
-        }
-        Some(ty) => {
-            return Err(vec![unsupported_native_type(
-                ty,
-                function.span,
-                format!(
-                    "function `{}` has return type `{ty}`, which is not supported by native compilation",
-                    function.name
-                ),
-            )]);
-        }
-        None if options.lifecycle => mir::ReturnType::Void,
-        None => {
-            return Err(vec![unsupported(
-                function.span,
-                format!(
-                    "function `{}` requires an explicit return type for native compilation",
-                    function.name
-                ),
-            )]);
-        }
-    };
+        });
+    let (required_effects, ambient_effects, test_assertion_effects, complete_effects) =
+        match &narrowed {
+            Some((profile, contract)) => (
+                profile.required.as_slice(),
+                profile.ambient.as_slice(),
+                profile.test_assertion.as_slice(),
+                *contract,
+            ),
+            None => (
+                function.required_checked_effects.as_slice(),
+                function.ambient_checked_effects.as_slice(),
+                function.test_assertion_checked_effects.as_slice(),
+                function.checked_effects.as_slice(),
+            ),
+        };
+    let return_type = collect_function_return_type(
+        function,
+        class_ids,
+        collection_registry,
+        substitutions,
+        options.lifecycle,
+    )?;
 
     // Decision 0099: the entry function takes either no parameters or exactly
     // one `List<string>` that the entry glue owns and lends to `main`. Semantic
@@ -2595,8 +3381,7 @@ fn collect_function_signature(
                 ),
             )]);
         };
-        let transfer_capable = parameter_type.has_move_ownership();
-        let transfers = transfer_capable && param.take;
+        let transfers = parameter_type.requires_owned_cleanup() && param.take;
         let owns = transfers;
         let default = semantic_info
             .parameter_defaults
@@ -2619,12 +3404,38 @@ fn collect_function_signature(
 
     Ok(FunctionSignature {
         id,
-        direct_id: None,
+        source_declaration: Some(function.span),
+        direct: None,
         return_type,
         return_borrow: semantic_info
             .return_borrows
             .get(&function.span)
             .copied()
+            .filter(|borrow| {
+                let source = match borrow.source {
+                    crate::symbols::BorrowSource::Receiver => None,
+                    crate::symbols::BorrowSource::Parameter(index) => {
+                        parameter_types.get(index).copied()
+                    }
+                };
+                return_borrow_applies(borrow.kind, return_type, source)
+            })
+            .filter(|borrow| {
+                let crate::symbols::BorrowSource::Parameter(index) = borrow.source else {
+                    return true;
+                };
+                borrow.kind != mir::ReturnBorrowKind::Retained
+                    || function.params.get(index).is_none_or(|parameter| {
+                        !parameter.take
+                            || resolved_type_ref_with_substitutions(
+                                &parameter.ty,
+                                class_ids,
+                                collection_registry,
+                                substitutions,
+                            )
+                            .is_some_and(|ty| collection_registry.source_types.carries(&ty))
+                    })
+            })
             .map(mir_return_borrow),
         parameter_types,
         parameter_names: function
@@ -2637,8 +3448,7 @@ fn collect_function_signature(
         parameter_owns,
         method_class: None,
         receiver_mode: None,
-        required_checked_effects: function
-            .required_checked_effects
+        required_checked_effects: required_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -2654,8 +3464,7 @@ fn collect_function_signature(
                 })
             })
             .collect::<DiagnosticResult<Vec<_>>>()?,
-        ambient_checked_effects: function
-            .ambient_checked_effects
+        ambient_checked_effects: ambient_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -2671,8 +3480,7 @@ fn collect_function_signature(
                 })
             })
             .collect::<DiagnosticResult<Vec<_>>>()?,
-        test_assertion_checked_effects: function
-            .test_assertion_checked_effects
+        test_assertion_checked_effects: test_assertion_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -2688,8 +3496,7 @@ fn collect_function_signature(
                 })
             })
             .collect::<DiagnosticResult<Vec<_>>>()?,
-        checked_effects: function
-            .checked_effects
+        checked_effects: complete_effects
             .iter()
             .map(|effect| {
                 checked_effect_for_resolved(
@@ -2713,6 +3520,8 @@ struct SignatureContext<'a> {
     class_ids: &'a ClassIds,
     semantic_info: &'a SemanticInfo,
     substitutions: &'a HashMap<String, crate::types::ResolvedType>,
+    /// This specialization's executable effects, when it has its own.
+    executable_effects: Option<&'a InstanceEffects>,
 }
 
 #[derive(Clone, Copy)]
@@ -2721,9 +3530,24 @@ struct SignatureOptions {
     is_entry: bool,
 }
 
+fn return_borrow_applies(
+    kind: crate::types::ReturnBorrowKind,
+    return_type: mir::ReturnType,
+    source_type: Option<mir::Type>,
+) -> bool {
+    // A Copy parameter has independent value storage. Value loans cannot
+    // survive that call, even when erasure makes its result a Move carrier.
+    // Retained-source contracts remain independent of the result carrier.
+    kind.applies_to_move_type(
+        matches!(return_type, mir::ReturnType::Value(ty) if ty.has_move_ownership()),
+    ) && (kind != crate::types::ReturnBorrowKind::Value
+        || source_type.is_none_or(mir::Type::has_move_ownership))
+}
+
 fn mir_return_borrow(borrow: crate::symbols::ReturnBorrow) -> mir::ReturnBorrow {
     mir::ReturnBorrow {
         kind: borrow.kind,
+        lifetime: borrow.lifetime,
         source: match borrow.source {
             crate::symbols::BorrowSource::Receiver => mir::BorrowSource::Receiver,
             crate::symbols::BorrowSource::Parameter(index) => mir::BorrowSource::Parameter(index),
@@ -2738,11 +3562,26 @@ fn mir_type_ref_with_substitutions(
     collection_registry: &mut NativeTypeRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) -> Option<mir::Type> {
-    let resolved = class_ids.resolve_nominal_kinds(
-        resolved_type_ref_with_substitutions(ty, substitutions)?,
-        collection_registry,
-    );
+    let resolved =
+        resolved_type_ref_with_substitutions(ty, class_ids, collection_registry, substitutions)?;
     intern_resolved_collection_types(&resolved, class_ids, collection_registry)
+}
+
+fn resolved_type_ref_with_substitutions(
+    ty: &crate::types::TypeRef,
+    class_ids: &ClassIds,
+    collection_registry: &NativeTypeRegistry,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
+) -> Option<ResolvedType> {
+    Some(class_ids.resolve_nominal_kinds(
+        crate::types::resolved_type_ref_with_checked_functions(ty, substitutions, &|span| {
+            collection_registry
+                .checked_function_types
+                .get(&span)
+                .cloned()
+        })?,
+        collection_registry,
+    ))
 }
 
 fn intern_bytes_type(collections: &mut NativeTypeRegistry) -> mir::CollectionTypeId {
@@ -2756,9 +3595,15 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         return Some(FieldType::SharedInterface);
     }
     match ty {
+        mir::Type::ByteRegion(kind) => Some(FieldType::ByteRegion(kind)),
+        mir::Type::NullableByteRegion(kind) => Some(FieldType::NullableByteRegion(kind)),
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => Some(FieldType::Aggregate {
+            size: ty.storage_bytes(),
+            align: ty.storage_bytes(),
+        }),
         mir::Type::Scalar(mir::ScalarType::Enum(_)) => {
             Some(FieldType::Integer(IntegerType::UInt32))
         }
@@ -2770,6 +3615,10 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         }
         mir::Type::NullableScalar(mir::ScalarType::Float(ty)) => Some(FieldType::NullableFloat(ty)),
         mir::Type::NullableScalar(mir::ScalarType::Bool) => Some(FieldType::NullableBool),
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => Some(FieldType::Aggregate {
+            size: ty.storage_bytes() * 2,
+            align: ty.storage_bytes(),
+        }),
         mir::Type::NullableScalar(mir::ScalarType::Enum(_)) => {
             Some(FieldType::NullableInteger(IntegerType::UInt32))
         }
@@ -2841,39 +3690,7 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
     }
 }
 
-fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
-    (!ty.nullable).then_some(()).and_then(|()| {
-        ty.arguments
-            .is_empty()
-            .then(|| IntegerType::from_source_name(&ty.name))
-            .flatten()
-    })
-}
-
-fn float_type_ref(ty: &crate::types::TypeRef) -> Option<FloatType> {
-    (!ty.nullable).then_some(()).and_then(|()| {
-        ty.arguments
-            .is_empty()
-            .then(|| FloatType::from_source_name(&ty.name))
-            .flatten()
-    })
-}
-
-fn scalar_type_ref(ty: &crate::types::TypeRef) -> Option<mir::ScalarType> {
-    integer_type_ref(ty)
-        .map(mir::ScalarType::Integer)
-        .or_else(|| float_type_ref(ty).map(mir::ScalarType::Float))
-        .or_else(|| is_plain_type(ty, "bool").then_some(mir::ScalarType::Bool))
-}
-
-fn is_plain_type(ty: &crate::types::TypeRef, name: &str) -> bool {
-    !ty.nullable && ty.name == name && ty.arguments.is_empty()
-}
-
-fn is_nullable_string_type(ty: &crate::types::TypeRef) -> bool {
-    ty.nullable && ty.name == "string" && ty.arguments.is_empty()
-}
-
+#[derive(Clone, Copy)]
 struct FunctionLoweringInputs<'a> {
     signatures: &'a HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: &'a HashMap<MethodInstanceKey, FunctionSignature>,
@@ -2882,11 +3699,14 @@ struct FunctionLoweringInputs<'a> {
     static_ids: &'a HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: &'a NativeTypeRegistry,
     enum_types: &'a HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
+    enum_instances: &'a HashMap<crate::enums::EnumType, crate::enums::EnumId>,
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
     error_descriptor_ids: &'a HashMap<ClassId, mir::ErrorDescriptorId>,
     error_origin_ids: &'a HashMap<Span, mir::ErrorOriginId>,
     closure_plans: &'a HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     closure_environment_layouts: &'a [mir::ClosureEnvironmentLayout],
+    /// This specialization's catch routing, when it differs from the template.
+    executable_effects: Option<&'a InstanceEffects>,
 }
 
 fn lower_function(
@@ -2900,8 +3720,6 @@ fn lower_function(
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
     context.current_class = class;
-    context.lifecycle_phase =
-        class.is_some() && matches!(function.name.as_str(), "__construct" | "__destruct");
     context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
@@ -2909,8 +3727,8 @@ fn lower_function(
         params.push(context.declare_user_local_owned(
             "this",
             writable,
-            mir::Type::Class(class),
-            false,
+            context.class_receiver_type(class),
+            signature.receiver_mode == Some(mir::ReceiverMode::Consuming),
         ));
     }
     params.extend(
@@ -2920,7 +3738,20 @@ fn lower_function(
             .zip(signature.parameter_types.iter().copied())
             .zip(signature.parameter_owns.iter().copied())
             .map(|((param, ty), owned)| {
-                context.declare_user_local_owned(&param.name, param.writable, ty, owned)
+                let local =
+                    context.declare_user_local_owned(&param.name, param.writable, ty, owned);
+                if param.writable && ty.has_move_ownership() {
+                    context.replaceable_writable_bindings.insert(local);
+                } else if param.writable && ty.requires_owned_cleanup() && !owned {
+                    // Ordinary Copy parameters replace a private value. The ABI
+                    // input stays borrowed; this binding owns its copy and cleanup.
+                    let snapshot = context.declare_user_local(&param.name, true, ty);
+                    context.push_statement(mir::Statement::AssignLocal {
+                        target: snapshot,
+                        value: local_rvalue(local, ty, true),
+                    });
+                }
+                local
             })
             .collect::<Vec<_>>(),
     );
@@ -2942,7 +3773,150 @@ fn lower_function(
         lower_statement_sequence(entry_prelude, signature.return_type, &mut context)?;
         context.push_scope();
     }
-    if function.name == "__construct" {
+    if let Some(intrinsic) = function.intrinsic {
+        match intrinsic {
+            crate::ast::CompilerIntrinsic::TransferGroup(
+                crate::compiler_known_stream::TransferGroupFunction::NextCompletion,
+            ) => {
+                let mir::ReturnType::Value(mir::Type::PayloadEnum(outcome)) = signature.return_type
+                else {
+                    unreachable!("completion observation returns its inline wait result");
+                };
+                lower_checked_intrinsic(
+                    mir::CheckedIoOperation::ObserveTransferGroup {
+                        group: params[0],
+                        wait: params[1],
+                        outcome,
+                    },
+                    Some(mir::Type::PayloadEnum(outcome)),
+                    function.span,
+                    &mut context,
+                )?;
+            }
+            crate::ast::CompilerIntrinsic::TransferGroup(
+                crate::compiler_known_stream::TransferGroupFunction::ReadRegion,
+            ) => {
+                lower_checked_intrinsic(
+                    mir::CheckedIoOperation::TransferGroupReadRegion {
+                        group: params[0],
+                        key: params[1],
+                    },
+                    Some(mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly)),
+                    function.span,
+                    &mut context,
+                )?;
+            }
+            crate::ast::CompilerIntrinsic::TransferGroup(
+                intrinsic @ (crate::compiler_known_stream::TransferGroupFunction::ResubmitRead
+                | crate::compiler_known_stream::TransferGroupFunction::ResubmitWrite),
+            ) => {
+                lower_checked_intrinsic(
+                    mir::CheckedIoOperation::ResubmitTransfer {
+                        group: params[0],
+                        key: params[1],
+                        reading: intrinsic
+                            == crate::compiler_known_stream::TransferGroupFunction::ResubmitRead,
+                        offset: params[2],
+                        length: params[3],
+                    },
+                    None,
+                    function.span,
+                    &mut context,
+                )?;
+            }
+            crate::ast::CompilerIntrinsic::TransferGroup(_) => {
+                let mir::ReturnType::Value(mir::Type::NullableScalar(mir::ScalarType::Inline(key))) =
+                    signature.return_type
+                else {
+                    unreachable!("observed transfer key returns an optional inline key");
+                };
+                context.cleanup_scopes_from(0);
+                context.terminate_current(mir::Terminator::Return(mir::Rvalue::NullableScalar(
+                    mir::NullableScalarExpression::TransferGroupKey {
+                        group: params[0],
+                        key,
+                    },
+                )));
+            }
+            crate::ast::CompilerIntrinsic::TransferPlan(intrinsic) => {
+                let mir::ReturnType::Value(result_ty) = signature.return_type else {
+                    unreachable!("transfer-plan intrinsic returns a value");
+                };
+                let operation = if intrinsic.is_key_lookup() {
+                    let mir::Type::Scalar(mir::ScalarType::Inline(key)) = result_ty else {
+                        unreachable!("transfer key lookup returns an inline key");
+                    };
+                    mir::CheckedIoOperation::TransferPlanKey {
+                        plan: params[0],
+                        position: params[1],
+                        key,
+                    }
+                } else {
+                    let mir::Type::Class(class) = result_ty else {
+                        unreachable!("transfer configuration returns its owned plan");
+                    };
+                    let appending = intrinsic.is_appending();
+                    let offset = usize::from(appending);
+                    mir::CheckedIoOperation::ConfigureTransferPlan {
+                        class,
+                        previous: appending.then(|| params[0]),
+                        key: params[offset],
+                        region: params[offset + 1],
+                        reading: intrinsic.is_read(),
+                    }
+                };
+                lower_checked_intrinsic(operation, Some(result_ty), function.span, &mut context)?;
+            }
+            crate::ast::CompilerIntrinsic::File(intrinsic) => lower_file_intrinsic(
+                intrinsic,
+                function.span,
+                &params,
+                signature.return_type,
+                &mut context,
+            )?,
+            crate::ast::CompilerIntrinsic::Time(intrinsic) => {
+                inline_value::lower_intrinsic(intrinsic, function.span, &params, &mut context);
+            }
+            crate::ast::CompilerIntrinsic::Concurrency(intrinsic) => {
+                inline_value::lower_concurrency_intrinsic(
+                    intrinsic,
+                    function.span,
+                    &params,
+                    signature.return_type,
+                    &mut context,
+                );
+            }
+            crate::ast::CompilerIntrinsic::Readiness(intrinsic) => lower_readiness_intrinsic(
+                intrinsic,
+                function.span,
+                &params,
+                signature.return_type,
+                &mut context,
+            )?,
+            crate::ast::CompilerIntrinsic::Process(intrinsic) => {
+                use crate::compiler_known_stream::ProcessFunction;
+                let result_type = match signature.return_type {
+                    mir::ReturnType::Value(ty) => Some(ty),
+                    mir::ReturnType::Void => None,
+                };
+                let launch = intrinsic == ProcessFunction::Launch;
+                let operation = mir::CheckedIoOperation::Process {
+                    operation: intrinsic,
+                    process: (!launch).then(|| params[0]),
+                    arguments: params[usize::from(!launch)..].to_vec(),
+                    class: match result_type {
+                        Some(mir::Type::Class(class)) => Some(class),
+                        _ => None,
+                    },
+                };
+                if signature.checked_effects.is_empty() {
+                    lower_infallible_intrinsic(operation, result_type, function.span, &mut context);
+                } else {
+                    lower_checked_intrinsic(operation, result_type, function.span, &mut context)?;
+                }
+            }
+        }
+    } else if function.name == "__construct" {
         lower_constructor_function_body(function, signature.return_type, &mut context)?;
     } else {
         lower_function_body(
@@ -2977,7 +3951,8 @@ fn lower_function(
                 .properties
                 .iter()
                 .filter(|property| {
-                    property.borrowed_source && property.declaring_class == class.declaration_name
+                    property.borrowed_source.is_some()
+                        && property.declaring_class == class.declaration_name
                 })
                 .filter_map(|property| {
                     function
@@ -2989,49 +3964,104 @@ fn lower_function(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if retained.is_some() || !promotions.is_empty() {
-        blocks[0].statements.insert(
-            0,
-            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(
-                mir::RetainedSourcesPlan {
-                    returns: retained
-                        .into_iter()
-                        .flat_map(|info| &info.returns)
-                        .map(|source| mir::RetainedSource {
-                            local: source_parameter(source.source),
-                            inherited: source.inherited,
-                        })
-                        .collect(),
-                    constructs: retained
-                        .into_iter()
-                        .flat_map(|info| &info.constructs)
-                        .map(|source| mir::RetainedSource {
-                            local: source_parameter(source.source),
-                            inherited: source.inherited,
-                        })
-                        .collect(),
-                    independent_parameters: retained
-                        .into_iter()
-                        .flat_map(|info| &info.requires_independent)
-                        .map(|source| source_parameter(*source))
-                        .collect(),
-                    promotions,
+    insert_retained_sources_plan(
+        &mut blocks,
+        retained,
+        source_parameter,
+        promotions,
+        signature.return_type,
+        signature.return_borrow,
+        &[],
+    );
+    let membership_plan = match crate::compiler_known_stream::readiness_function(function.span) {
+        Some(crate::compiler_known_stream::ReadinessFunction::Register) => {
+            let identity = mir::RetainedStorageIdentity {
+                origin: function.span,
+                callers: Vec::new(),
+            };
+            Some(mir::RetainedSourcesPlan {
+                stores: vec![mir::RetainedStore {
+                    destination: params[0],
+                    path: Vec::new(),
+                    identity: identity.clone(),
+                    sources: vec![mir::RetainedSource {
+                        local: params[1],
+                        inherited: true,
+                        writable: false,
+                        lifetime: mir::RetainedLifetime::Cleanup,
+                        owned_path: Vec::new(),
+                    }],
+                }],
+                returned_selectors: vec![mir::RetainedStorageSelector::Member(identity)],
+                ..Default::default()
+            })
+        }
+        Some(crate::compiler_known_stream::ReadinessFunction::Unregister) => {
+            let selection = mir::RetainedStorageSelection {
+                destination: params[0],
+                path: Vec::new(),
+                selectors: vec![mir::RetainedStorageSelector::Input(params[1])],
+            };
+            let retains_sources = matches!(signature.return_type, mir::ReturnType::Value(ty) if ty.has_move_ownership());
+            Some(mir::RetainedSourcesPlan {
+                returns: if retains_sources {
+                    vec![mir::RetainedSource {
+                        local: params[0],
+                        inherited: true,
+                        writable: false,
+                        lifetime: mir::RetainedLifetime::Cleanup,
+                        owned_path: Vec::new(),
+                    }]
+                } else {
+                    Vec::new()
                 },
-            )),
-        );
+                removals: vec![selection.clone()],
+                returned_storage: retains_sources.then(|| mir::RetainedReturnedStorage {
+                    selections: vec![selection],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+        _ => None,
+    };
+    if let Some(plan) = membership_plan {
+        if let Some(existing) =
+            blocks[0]
+                .statements
+                .iter_mut()
+                .find_map(|statement| match statement {
+                    mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(
+                        plan,
+                    )) => Some(plan),
+                    _ => None,
+                })
+        {
+            *existing = plan;
+        } else {
+            blocks[0].statements.insert(
+                0,
+                mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)),
+            );
+        }
     }
 
     Ok(mir::Function {
         id: signature.id,
         name: inputs_method_name(function, class, inputs.semantic_info),
         source_span: function.span,
+        diagnostic_frame: mir::DiagnosticFrame::Authored,
         method: class.map(|class| mir::MethodIdentity {
             class,
             name: function.name.clone(),
+            return_adapter: None,
+            virtual_family: None,
         }),
         virtual_slot: None,
         receiver_mode: receiver.map(|_| {
-            if function.writable_this {
+            if function.consuming_this {
+                mir::ReceiverMode::Consuming
+            } else if function.writable_this {
                 mir::ReceiverMode::Writable
             } else {
                 mir::ReceiverMode::Readonly
@@ -3041,7 +4071,9 @@ fn lower_function(
         params,
         parameter_modes: receiver
             .map(|_| {
-                if function.writable_this {
+                if function.consuming_this {
+                    mir::FunctionParameterMode::Take
+                } else if function.writable_this {
                     mir::FunctionParameterMode::Writable
                 } else {
                     mir::FunctionParameterMode::Readonly
@@ -3062,228 +4094,6 @@ fn lower_function(
     })
 }
 
-fn build_virtual_return_adapter(
-    id: mir::FunctionId,
-    slot: u32,
-    contract: &mir::Function,
-    implementation: &mir::Function,
-    direct_implementation: mir::FunctionId,
-) -> DiagnosticResult<mir::Function> {
-    let mut locals = Vec::with_capacity(implementation.params.len() + 2);
-    let mut params = Vec::with_capacity(implementation.params.len());
-    for parameter in &implementation.params {
-        let source = implementation
-            .locals
-            .get(parameter.0)
-            .expect("method parameter has a local definition");
-        let local = mir::LocalId(locals.len());
-        let mut definition = source.clone();
-        definition.id = local;
-        locals.push(definition);
-        params.push(local);
-    }
-    let args = params
-        .iter()
-        .enumerate()
-        .map(|(index, local)| {
-            let ty = locals[local.0].ty;
-            let transfer = index != 0
-                && implementation.parameter_modes[index] == mir::FunctionParameterMode::Take
-                && ty.has_move_ownership();
-            local_rvalue(*local, ty, transfer)
-        })
-        .collect::<Vec<_>>();
-    let span = implementation.source_span;
-    let actual = match implementation.return_type {
-        mir::ReturnType::Value(ty) => ty,
-        mir::ReturnType::Void => {
-            return Err(vec![unsupported(
-                span,
-                "a virtual return adapter requires a value-returning implementation",
-            )]);
-        }
-    };
-    let target = match contract.return_type {
-        mir::ReturnType::Value(ty) => ty,
-        mir::ReturnType::Void => {
-            return Err(vec![unsupported(
-                span,
-                "a virtual return adapter requires a value-returning contract",
-            )]);
-        }
-    };
-
-    let blocks = if implementation.checked_effects.is_empty() {
-        vec![mir::BasicBlock {
-            id: mir::BlockId(0),
-            statements: Vec::new(),
-            terminator: mir::Terminator::Return(virtual_adapter_call_result(
-                target,
-                actual,
-                direct_implementation,
-                implementation.return_borrow,
-                args,
-                span,
-            )?),
-        }]
-    } else {
-        if contract.checked_effects.is_empty() {
-            return Err(vec![unsupported(
-                span,
-                "a checked virtual implementation requires checked transport on its root contract",
-            )]);
-        }
-        let result = mir::LocalId(locals.len());
-        let owned = !actual.borrows_returned_value(implementation.return_borrow)
-            && actual.has_move_ownership();
-        locals.push(mir::Local {
-            id: result,
-            name: "__virtual_result".to_string(),
-            ty: actual,
-            writable: call_result_is_writable(owned, implementation.return_borrow),
-            owned,
-            synthetic: true,
-        });
-        let error = mir::LocalId(locals.len());
-        locals.push(mir::Local {
-            id: error,
-            name: "__virtual_error".to_string(),
-            ty: mir::Type::ERROR,
-            writable: true,
-            owned: true,
-            synthetic: true,
-        });
-        vec![
-            mir::BasicBlock {
-                id: mir::BlockId(0),
-                statements: Vec::new(),
-                terminator: mir::Terminator::CheckedCall {
-                    function: direct_implementation,
-                    args,
-                    result: Some(result),
-                    error,
-                    success: mir::BlockId(1),
-                    failure: mir::BlockId(2),
-                    span,
-                },
-            },
-            mir::BasicBlock {
-                id: mir::BlockId(1),
-                statements: Vec::new(),
-                terminator: mir::Terminator::Return(virtual_adapter_local_result(
-                    result,
-                    target,
-                    actual,
-                    !actual.borrows_returned_value(implementation.return_borrow),
-                    span,
-                )?),
-            },
-            mir::BasicBlock {
-                id: mir::BlockId(2),
-                statements: Vec::new(),
-                terminator: mir::Terminator::PropagateError { error },
-            },
-        ]
-    };
-
-    Ok(mir::Function {
-        id,
-        name: format!("{}::<virtual-return-adapter>", implementation.name),
-        source_span: span,
-        method: implementation.method.clone(),
-        virtual_slot: Some(slot),
-        receiver_mode: implementation.receiver_mode,
-        closure: None,
-        params,
-        parameter_modes: implementation.parameter_modes.clone(),
-        return_type: contract.return_type,
-        return_borrow: contract.return_borrow,
-        required_checked_effects: contract.required_checked_effects.clone(),
-        ambient_checked_effects: contract.ambient_checked_effects.clone(),
-        test_assertion_checked_effects: contract.test_assertion_checked_effects.clone(),
-        checked_effects: contract.checked_effects.clone(),
-        locals,
-        blocks,
-        entry_block: mir::BlockId(0),
-    })
-}
-
-fn virtual_adapter_call_result(
-    target: mir::Type,
-    actual: mir::Type,
-    function: mir::FunctionId,
-    return_borrow: Option<mir::ReturnBorrow>,
-    args: Vec<mir::Rvalue>,
-    span: Span,
-) -> DiagnosticResult<mir::Rvalue> {
-    match (target, actual) {
-        (mir::Type::Class(target), mir::Type::Class(_)) => {
-            Ok(mir::Rvalue::Class(mir::ClassExpression::Call {
-                class: target,
-                function,
-                args,
-                return_borrow,
-            }))
-        }
-        (mir::Type::NullableClass(target), mir::Type::NullableClass(_)) => Ok(
-            mir::Rvalue::NullableClass(mir::NullableClassExpression::Call {
-                class: target,
-                function,
-                args,
-                return_borrow,
-            }),
-        ),
-        (mir::Type::NullableClass(target), mir::Type::Class(_)) => Ok(mir::Rvalue::NullableClass(
-            mir::NullableClassExpression::Class(mir::ClassExpression::Call {
-                class: target,
-                function,
-                args,
-                return_borrow,
-            }),
-        )),
-        _ => Err(vec![unsupported(
-            span,
-            "virtual return adaptation requires covariant class return types",
-        )]),
-    }
-}
-
-fn virtual_adapter_local_result(
-    local: mir::LocalId,
-    target: mir::Type,
-    actual: mir::Type,
-    transfer: bool,
-    span: Span,
-) -> DiagnosticResult<mir::Rvalue> {
-    match (target, actual) {
-        (mir::Type::Class(target), mir::Type::Class(_)) => {
-            Ok(mir::Rvalue::Class(mir::ClassExpression::Local {
-                class: target,
-                local,
-                transfer,
-            }))
-        }
-        (mir::Type::NullableClass(target), mir::Type::NullableClass(_)) => Ok(
-            mir::Rvalue::NullableClass(mir::NullableClassExpression::Local {
-                class: target,
-                local,
-                transfer,
-            }),
-        ),
-        (mir::Type::NullableClass(target), mir::Type::Class(_)) => Ok(mir::Rvalue::NullableClass(
-            mir::NullableClassExpression::Class(mir::ClassExpression::Local {
-                class: target,
-                local,
-                transfer,
-            }),
-        )),
-        _ => Err(vec![unsupported(
-            span,
-            "virtual return adaptation requires covariant class return types",
-        )]),
-    }
-}
-
 fn entry_process_body(function: &hir::FunctionDecl, prelude: &[hir::Stmt]) -> hir::Block {
     let mut statements = Vec::with_capacity(prelude.len() + function.body.statements.len());
     statements.extend_from_slice(prelude);
@@ -3299,6 +4109,166 @@ fn entry_process_body(function: &hir::FunctionDecl, prelude: &[hir::Stmt]) -> hi
                 }),
             function.body.span.end,
         ),
+    }
+}
+
+fn insert_retained_sources_plan(
+    blocks: &mut [mir::BasicBlock],
+    retained: Option<&crate::ownership::RetainedCallableInfo>,
+    source_parameter: impl Fn(crate::symbols::BorrowSource) -> mir::LocalId,
+    promotions: Vec<(PropertyId, mir::LocalId)>,
+    return_type: mir::ReturnType,
+    contract: Option<mir::ReturnBorrow>,
+    captures: &[(crate::symbols::BindingId, mir::LocalId)],
+) {
+    let sources = |sources: &[crate::ownership::RetainedSource]| {
+        sources
+            .iter()
+            .map(|source| mir::RetainedSource {
+                local: source_parameter(source.source),
+                inherited: source.inherited,
+                writable: source.writable,
+                lifetime: source.lifetime,
+                owned_path: source.owned_path.clone(),
+            })
+            .collect()
+    };
+    let stores = |stores: &[crate::ownership::owned_storage::Store]| {
+        stores
+            .iter()
+            .map(|store| mir::RetainedStore {
+                destination: source_parameter(store.destination),
+                path: store.path.clone(),
+                identity: mir::RetainedStorageIdentity {
+                    origin: store.identity.origin,
+                    callers: store.identity.callers.clone(),
+                },
+                sources: sources(&store.sources),
+            })
+            .collect()
+    };
+    let selector = |selector: &crate::ownership::owned_storage::Selector| match selector {
+        crate::ownership::owned_storage::Selector::Member(identity) => {
+            mir::RetainedStorageSelector::Member(mir::RetainedStorageIdentity {
+                origin: identity.origin,
+                callers: identity.callers.clone(),
+            })
+        }
+        crate::ownership::owned_storage::Selector::Input(source) => {
+            mir::RetainedStorageSelector::Input(source_parameter(*source))
+        }
+        crate::ownership::owned_storage::Selector::Capture(binding) => {
+            mir::RetainedStorageSelector::Input(
+                captures
+                    .iter()
+                    .find_map(|(capture, local)| (*capture == *binding).then_some(*local))
+                    .expect("key capture belongs to this environment"),
+            )
+        }
+        crate::ownership::owned_storage::Selector::All => mir::RetainedStorageSelector::All,
+        crate::ownership::owned_storage::Selector::Unknown => mir::RetainedStorageSelector::Unknown,
+    };
+    let selections = |selections: &[crate::ownership::owned_storage::Selection]| {
+        selections
+            .iter()
+            .map(|selection| {
+                let mut selectors = selection
+                    .selectors
+                    .iter()
+                    .map(&selector)
+                    .collect::<Vec<_>>();
+                selectors.sort();
+                mir::RetainedStorageSelection {
+                    destination: source_parameter(selection.destination),
+                    path: selection.path.clone(),
+                    selectors,
+                }
+            })
+            .collect()
+    };
+    let mut plan = mir::RetainedSourcesPlan {
+        returns: retained
+            .map(|info| sources(&info.returns))
+            .unwrap_or_default(),
+        constructs: retained
+            .map(|info| sources(&info.constructs))
+            .unwrap_or_default(),
+        independent_parameters: retained
+            .into_iter()
+            .flat_map(|info| &info.requires_independent)
+            .map(|source| source_parameter(*source))
+            .collect(),
+        promotions,
+        stores: retained
+            .map(|info| stores(&info.stored_sources))
+            .unwrap_or_default(),
+        exceptional_stores: retained
+            .map(|info| stores(&info.exceptional_stored_sources))
+            .unwrap_or_default(),
+        removals: retained
+            .map(|info| selections(&info.removals))
+            .unwrap_or_default(),
+        exceptional_removals: retained
+            .map(|info| selections(&info.exceptional_removals))
+            .unwrap_or_default(),
+        returned_storage: retained
+            .and_then(|info| info.returned_storage.as_ref())
+            .filter(|storage| {
+                !storage.inputs.is_empty()
+                    || !storage.members.is_empty()
+                    || !storage.selections.is_empty()
+            })
+            .map(|storage| mir::RetainedReturnedStorage {
+                inputs: storage
+                    .inputs
+                    .iter()
+                    .map(|input| source_parameter(*input))
+                    .collect(),
+                direct: sources(&storage.direct),
+                selections: selections(&storage.selections),
+                members: storage
+                    .members
+                    .iter()
+                    .map(|member| mir::RetainedReturnedMember {
+                        identity: mir::RetainedStorageIdentity {
+                            origin: member.identity.origin,
+                            callers: member.identity.callers.clone(),
+                        },
+                        path: member.path.clone(),
+                        sources: sources(&member.sources),
+                        repeated: member.repeated,
+                    })
+                    .collect(),
+            }),
+        returned_selectors: retained
+            .into_iter()
+            .filter(|_| {
+                matches!(
+                    return_type,
+                    mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Inline(
+                        crate::inline_value::InlineValueType::RegistrationKey(_)
+                    ))) | mir::ReturnType::Value(mir::Type::NullableScalar(
+                        mir::ScalarType::Inline(
+                            crate::inline_value::InlineValueType::RegistrationKey(_)
+                        )
+                    ))
+                )
+            })
+            .flat_map(|info| &info.returned_selectors)
+            .map(selector)
+            .collect(),
+    };
+    plan.state_region_contract(return_type, contract, |source| {
+        source_parameter(match source {
+            mir::BorrowSource::Receiver => crate::symbols::BorrowSource::Receiver,
+            mir::BorrowSource::Parameter(index) => crate::symbols::BorrowSource::Parameter(index),
+        })
+    });
+    if plan != mir::RetainedSourcesPlan::default() {
+        blocks[0].statements.insert(
+            0,
+            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)),
+        );
     }
 }
 
@@ -3363,13 +4333,13 @@ fn lower_closure_function(
                 .invocation_binding(definition.invocation_mode);
             let writable = binding == mir::ClosureEnvironmentStorage::WritableBorrow;
             let consumed = binding == mir::ClosureEnvironmentStorage::Owned;
-            // A writable lease temporarily transfers move ownership into the
-            // invocation frame. Backends restore it to the borrowed source on
-            // every non-aborting exit. Repeatable calls borrow owned captures;
-            // only a consuming call owns their lexical cleanup obligation.
-            let owned = (consumed && ty.has_move_ownership())
-                || (writable && ty.transfers_writable_capture_ownership());
+            // Writable captures alias the original owning place. Only a
+            // consuming call owns the captured value's cleanup obligation.
+            let owned = consumed && ty.requires_owned_cleanup();
             let local = context.declare_synthetic_named_local(name, writable, ty, owned, consumed);
+            if writable {
+                context.replaceable_writable_bindings.insert(local);
+            }
             capture_locals.push((field, local));
         }
         context.push_statement(mir::Statement::BindClosureEnvironment {
@@ -3390,12 +4360,10 @@ fn lower_closure_function(
             parameter.writable,
             definition.ty,
             matches!(definition.mode, mir::FunctionParameterMode::Take)
-                && definition.ty.has_move_ownership(),
+                && definition.ty.requires_owned_cleanup(),
         );
-        if definition.mode == mir::FunctionParameterMode::Writable
-            && definition.ty.has_move_ownership()
-        {
-            context.replaceable_writable_parameters.insert(local);
+        if definition.mode == mir::FunctionParameterMode::Writable {
+            context.replaceable_writable_bindings.insert(local);
         }
         params.push(local);
     }
@@ -3444,11 +4412,38 @@ fn lower_closure_function(
     if definition.has_checked_transport() {
         context.pop_error_target();
     }
-    let (locals, blocks) = context.finish(metrics);
+    let (locals, mut blocks) = context.finish(metrics);
+    let selector_captures = inputs
+        .semantic_info
+        .closures
+        .get(&plan.expression.closure_id)
+        .into_iter()
+        .flat_map(|environment| &environment.captures)
+        .zip(&capture_locals)
+        .map(|(capture, (_, local))| (capture.environment_binding_id, *local))
+        .collect::<Vec<_>>();
+    insert_retained_sources_plan(
+        &mut blocks,
+        inputs
+            .semantic_info
+            .retained_callables
+            .get(&plan.expression.span),
+        |source| match source {
+            crate::symbols::BorrowSource::Parameter(index) => params[index + 1],
+            crate::symbols::BorrowSource::Receiver => {
+                unreachable!("closure retained contracts have parameters, not method receivers")
+            }
+        },
+        Vec::new(),
+        definition.return_type,
+        definition.return_borrow,
+        &selector_captures,
+    );
     Ok(mir::Function {
         id: plan.function,
         name: format!("__doria_closure_{}", plan.descriptor.0),
         source_span: plan.expression.span,
+        diagnostic_frame: mir::DiagnosticFrame::Authored,
         method: None,
         virtual_slot: None,
         receiver_mode: None,
@@ -3526,6 +4521,390 @@ fn lower_function_body(
     Ok(())
 }
 
+fn lower_file_intrinsic(
+    intrinsic: crate::compiler_known_stream::FileFunction,
+    span: Span,
+    params: &[mir::LocalId],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<()> {
+    use crate::compiler_known_stream::FileFunction;
+    if intrinsic == FileFunction::UnavailableConstructor {
+        context.terminate_current(mir::Terminator::Unreachable);
+        return Ok(());
+    }
+    if matches!(
+        intrinsic,
+        FileFunction::StandardInput | FileFunction::StandardOutput | FileFunction::StandardError
+    ) {
+        let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Inline(ty))) = return_type
+        else {
+            unreachable!("standard getter returns its checked inline view")
+        };
+        context.cleanup_scopes_from(0);
+        context.terminate_current(mir::Terminator::Return(mir::Rvalue::Value(
+            mir::ValueExpression::Inline(mir::InlineValueExpression::Use {
+                ty,
+                operand: mir::Operand::Scalar(mir::ScalarValue::Inline(
+                    crate::inline_value::InlineValue { ty, bits: 0 },
+                )),
+                mode: mir::InlineValueUseMode::Borrow,
+            }),
+        )));
+        return Ok(());
+    }
+    let standard = params
+        .first()
+        .and_then(|receiver| match context.locals[receiver.0].ty {
+            mir::Type::Scalar(mir::ScalarType::Inline(ty)) => {
+                crate::compiler_known_stream::standard_device(ty.name())
+            }
+            _ => None,
+        });
+    if matches!(
+        intrinsic,
+        FileFunction::PrepareRead | FileFunction::PrepareWrite
+    ) {
+        return lower_checked_intrinsic(
+            match standard {
+                Some(stream) => mir::CheckedIoOperation::PreparePendingStandard {
+                    stream,
+                    request: params[1],
+                    region: params[2],
+                },
+                None => mir::CheckedIoOperation::PreparePendingFile {
+                    file: params[0],
+                    request: params[1],
+                    region: params[2],
+                },
+            },
+            None,
+            span,
+            context,
+        );
+    }
+    if matches!(
+        intrinsic,
+        FileFunction::CompleteReadRequest | FileFunction::CompleteWriteRequest
+    ) {
+        context.push_statement(mir::Statement::CompletePendingRequest {
+            request: params[0],
+            outcome: params[1],
+            span,
+        });
+        context.cleanup_scopes_from(0);
+        context.terminate_current(mir::Terminator::ReturnVoid);
+        return Ok(());
+    }
+    if intrinsic == FileFunction::ReadinessSource {
+        let mir::ReturnType::Value(mir::Type::Class(class)) = return_type else {
+            unreachable!("readiness getter returns its opaque nominal view")
+        };
+        context.cleanup_scopes_from(0);
+        context.terminate_current(mir::Terminator::Return(mir::Rvalue::Class(
+            match standard {
+                Some(stream) => mir::ClassExpression::StandardReadinessSource {
+                    class,
+                    stream,
+                    borrowed_from: params[0],
+                },
+                None => mir::ClassExpression::FileReadinessSource {
+                    class,
+                    file: params[0],
+                },
+            },
+        )));
+        return Ok(());
+    }
+    let result_type = match return_type {
+        mir::ReturnType::Value(ty) => Some(ty),
+        mir::ReturnType::Void => None,
+    };
+    let operation = match intrinsic {
+        FileFunction::OpenRead | FileFunction::OpenWrite | FileFunction::OpenReadWrite => {
+            let Some(mir::Type::Class(class)) = result_type else {
+                unreachable!()
+            };
+            mir::CheckedIoOperation::OpenOwnedFile {
+                path: mir::StringExpression::Local(params[0]),
+                class,
+                creation: (intrinsic != FileFunction::OpenRead).then(|| params[1]),
+                mode: (intrinsic != FileFunction::OpenRead).then(|| params[2]),
+            }
+        }
+        FileFunction::Read => {
+            let Some(mir::Type::PayloadEnum(outcome)) = result_type else {
+                unreachable!()
+            };
+            match standard {
+                Some(stream) => mir::CheckedIoOperation::TransferStandardBytes {
+                    stream,
+                    region: params[1],
+                    outcome,
+                },
+                None => mir::CheckedIoOperation::ReadOwnedFile {
+                    file: params[0],
+                    destination: params[1],
+                    outcome,
+                },
+            }
+        }
+        FileFunction::Write => {
+            let Some(mir::Type::PayloadEnum(outcome)) = result_type else {
+                unreachable!()
+            };
+            match standard {
+                Some(stream) => mir::CheckedIoOperation::TransferStandardBytes {
+                    stream,
+                    region: params[1],
+                    outcome,
+                },
+                None => mir::CheckedIoOperation::WriteOwnedFile {
+                    file: params[0],
+                    source: params[1],
+                    outcome,
+                },
+            }
+        }
+        FileFunction::Close => mir::CheckedIoOperation::CloseOwnedFile { file: params[0] },
+        FileFunction::Seek
+        | FileFunction::Position
+        | FileFunction::Length
+        | FileFunction::SynchronizeData
+        | FileFunction::SynchronizeMetadata
+        | FileFunction::SetLength => mir::CheckedIoOperation::ControlOwnedFile {
+            file: params[0],
+            control: match intrinsic {
+                FileFunction::Seek => mir::FileControlOperation::Seek {
+                    offset: params[1],
+                    origin: params[2],
+                },
+                FileFunction::Position => mir::FileControlOperation::Position,
+                FileFunction::Length => mir::FileControlOperation::Length,
+                FileFunction::SynchronizeData => mir::FileControlOperation::SynchronizeData,
+                FileFunction::SynchronizeMetadata => mir::FileControlOperation::SynchronizeMetadata,
+                FileFunction::SetLength => {
+                    mir::FileControlOperation::SetLength { length: params[1] }
+                }
+                _ => unreachable!(),
+            },
+        },
+        FileFunction::AcquireLock => mir::CheckedIoOperation::ControlOwnedFile {
+            file: params[0],
+            control: mir::FileControlOperation::Lock { mode: params[1] },
+        },
+        FileFunction::TryAcquireLock => mir::CheckedIoOperation::ControlOwnedFile {
+            file: params[0],
+            control: mir::FileControlOperation::TryLock { mode: params[1] },
+        },
+        // Guard primitives: the receiver is the guard, the file its argument.
+        FileFunction::ReleaseLock => mir::CheckedIoOperation::ControlOwnedFile {
+            file: params[1],
+            control: mir::FileControlOperation::Unlock,
+        },
+        FileFunction::AbandonLock => mir::CheckedIoOperation::ControlOwnedFile {
+            file: params[1],
+            control: mir::FileControlOperation::AbandonLock,
+        },
+        FileFunction::CloseInput => mir::CheckedIoOperation::ControlOwnedFile {
+            file: params[0],
+            control: mir::FileControlOperation::CloseInput,
+        },
+        FileFunction::ReadRequestOutcome
+        | FileFunction::WriteRequestOutcome
+        | FileFunction::CompleteRead
+        | FileFunction::CompleteWrite => {
+            let Some(mir::Type::NullablePayloadEnum(outcome)) = result_type else {
+                unreachable!("pending request observation returns its canonical nullable outcome")
+            };
+            mir::CheckedIoOperation::PendingRequestOutcome {
+                request: params[usize::from(matches!(
+                    intrinsic,
+                    FileFunction::CompleteRead | FileFunction::CompleteWrite
+                ))],
+                outcome,
+            }
+        }
+        FileFunction::UnavailableConstructor
+        | FileFunction::StandardInput
+        | FileFunction::StandardOutput
+        | FileFunction::StandardError
+        | FileFunction::ReadinessSource
+        | FileFunction::PrepareRead
+        | FileFunction::PrepareWrite
+        | FileFunction::CompleteReadRequest
+        | FileFunction::CompleteWriteRequest => unreachable!(),
+    };
+    lower_checked_intrinsic(operation, result_type, span, context)
+}
+
+fn lower_readiness_intrinsic(
+    intrinsic: crate::compiler_known_stream::ReadinessFunction,
+    span: Span,
+    params: &[mir::LocalId],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<()> {
+    use crate::compiler_known_stream::ReadinessFunction;
+    let mir::ReturnType::Value(ty) = return_type else {
+        // Construction is materialized at its allocation site, not through
+        // the ordinary constructor call body.
+        debug_assert_eq!(intrinsic, ReadinessFunction::New);
+        context.terminate_current(mir::Terminator::ReturnVoid);
+        return Ok(());
+    };
+    let operation = match intrinsic {
+        ReadinessFunction::Begin => {
+            let mir::Type::Class(class) = ty else {
+                unreachable!("begin returns its exact owned group")
+            };
+            mir::CheckedIoOperation::BeginTransferGroup {
+                class,
+                set: params[0],
+                plan: params[1],
+                deadline: params[2],
+                cancellation: params[3],
+            }
+        }
+        ReadinessFunction::Register => {
+            let mir::Type::Scalar(mir::ScalarType::Inline(key)) = ty else {
+                unreachable!("registration returns its exact inline key")
+            };
+            mir::CheckedIoOperation::RegisterReadinessStream {
+                set: params[0],
+                stream: params[1],
+                key,
+            }
+        }
+        ReadinessFunction::Unregister => mir::CheckedIoOperation::UnregisterReadinessStream {
+            set: params[0],
+            key: params[1],
+            stream_type: ty,
+        },
+        ReadinessFunction::GetStream | ReadinessFunction::GetWritableStream => {
+            mir::CheckedIoOperation::BorrowReadinessStream {
+                set: params[0],
+                key: params[1],
+                stream_type: ty,
+                writable: intrinsic == ReadinessFunction::GetWritableStream,
+            }
+        }
+        ReadinessFunction::New => unreachable!("construction has no value-returning call body"),
+    };
+    lower_checked_intrinsic(operation, Some(ty), span, context)
+}
+
+/// An intrinsic whose declaration has no `throws`: the runtime reports no
+/// failure for it, so the checked transport's failure edge is unreachable.
+fn lower_infallible_intrinsic(
+    operation: mir::CheckedIoOperation,
+    result_type: Option<mir::Type>,
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) {
+    let borrow = match &operation {
+        mir::CheckedIoOperation::Process { operation, .. } => {
+            operation.return_borrow().map(|borrow| mir::ReturnBorrow {
+                source: mir::BorrowSource::Parameter(0),
+                writable: borrow.writable,
+                kind: borrow.kind,
+                lifetime: borrow.lifetime,
+            })
+        }
+        _ => None,
+    };
+    let result = result_type.map(|ty| {
+        let owned = ty.requires_owned_cleanup() && borrow.is_none();
+        let local = context.declare_return_temp(ty, owned);
+        context.locals[local.0].writable = call_result_is_writable(owned, borrow);
+        (local, ty)
+    });
+    let error = context.declare_checked_call_slot(mir::Type::ERROR, true);
+    let success = context.create_block();
+    let failure = context.create_block();
+    context.terminate_current(mir::Terminator::CheckedIo {
+        operation,
+        result: result.map(|(local, _)| local),
+        error,
+        success,
+        failure,
+        span,
+    });
+    context.current_block = Some(failure);
+    context.terminate_current(mir::Terminator::Unreachable);
+    context.current_block = Some(success);
+    context.cleanup_scopes_from(0);
+    context.terminate_current(match result {
+        Some((local, ty)) => mir::Terminator::Return(pending_owned_rvalue(
+            local,
+            ty,
+            ty.requires_owned_cleanup() && borrow.is_none(),
+        )),
+        None => mir::Terminator::ReturnVoid,
+    });
+}
+
+fn lower_checked_intrinsic(
+    operation: mir::CheckedIoOperation,
+    result_type: Option<mir::Type>,
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<()> {
+    let borrow = match operation {
+        mir::CheckedIoOperation::TransferGroupReadRegion { .. } => Some(mir::ReturnBorrow {
+            source: mir::BorrowSource::Parameter(0),
+            writable: false,
+            kind: mir::ReturnBorrowKind::Retained,
+            lifetime: mir::RetainedLifetime::LastUse,
+        }),
+        mir::CheckedIoOperation::BorrowReadinessStream {
+            writable,
+            stream_type,
+            ..
+        } if stream_type.has_move_ownership() => Some(mir::ReturnBorrow {
+            source: mir::BorrowSource::Parameter(0),
+            writable,
+            kind: mir::ReturnBorrowKind::Value,
+            lifetime: mir::RetainedLifetime::LastUse,
+        }),
+        _ => None,
+    };
+    let result = result_type.map(|ty| {
+        // The intrinsic returns this slot directly. Its descriptor must not
+        // enter lexical cleanup before the return crosses the callable boundary.
+        let owned = ty.requires_owned_cleanup() && borrow.is_none();
+        let local = context.declare_return_temp(ty, owned);
+        context.locals[local.0].writable = call_result_is_writable(owned, borrow);
+        (local, ty)
+    });
+    let error = context.declare_checked_call_slot(mir::Type::ERROR, true);
+    let success = context.create_block();
+    let failure = context.create_block();
+    context.terminate_current(mir::Terminator::CheckedIo {
+        operation,
+        result: result.map(|(local, _)| local),
+        error,
+        success,
+        failure,
+        span,
+    });
+    context.current_block = Some(failure);
+    // The ordinary caller attaches its authored origin to a compiler-owned
+    // operation; the synthetic declaration is not a user error location.
+    context.route_checked_error(error);
+    context.current_block = Some(success);
+    context.cleanup_scopes_from(0);
+    context.terminate_current(match result {
+        Some((local, ty)) => mir::Terminator::Return(pending_owned_rvalue(
+            local,
+            ty,
+            ty.requires_owned_cleanup() && borrow.is_none(),
+        )),
+        None => mir::Terminator::ReturnVoid,
+    });
+    Ok(())
+}
+
 fn lower_constructor_function_body(
     function: &hir::FunctionDecl,
     return_type: mir::ReturnType,
@@ -3599,13 +4978,16 @@ fn lower_constructor_function_body(
         let destination = context.create_block();
         context.push_error_target(ErrorTarget {
             destination,
+            cleanup_depth: context.local_scopes.len(),
             ..outer
         });
         (destination, outer)
     });
+    context.push_scope();
     lower_constructor_phase_initializers(class, function.span, context)?;
     lower_statement_sequence(remaining, return_type, context)?;
     finish_function_fallthrough(&function.body, &function.name, return_type, context)?;
+    context.pop_scope();
     if let Some((destination, outer)) = phase_cleanup {
         context.pop_error_target();
         context.current_block = Some(destination);
@@ -3615,8 +4997,9 @@ fn lower_constructor_function_body(
                 .expect("constructor has a receiver"),
             class,
         });
-        // Locals and crossed finalizers were already cleaned while routing
-        // into this block. The caller alone owns the complete allocation.
+        // Body locals were cleaned before this phase; parameters predate its fields.
+        context.cleanup_scopes_from(outer.cleanup_depth);
+        // The caller alone owns the complete allocation.
         context.terminate_current(mir::Terminator::Jump(outer.destination));
     }
     Ok(())
@@ -3678,7 +5061,7 @@ fn lower_constructor_phase_initializers(
             let mut kind = mir::PropertyWriteKind::Initialize;
             let value = if property.promoted {
                 let parameter = context.lookup_local(&property.name, span)?;
-                read_local_as_rvalue(parameter, property_type, !property.borrowed_source)
+                read_local_as_rvalue(parameter, property_type, property.borrowed_source.is_none())
             } else {
                 let initializer = context
                     .property_initializers
@@ -3748,6 +5131,9 @@ fn lower_statement_sequence(
             break;
         }
 
+        let span = stmt_span(statement);
+        context.push_statement(mir::Statement::SetDiagnosticSite { span });
+
         match statement {
             hir::Stmt::Block(block) => {
                 context.push_scope();
@@ -3756,7 +5142,7 @@ fn lower_statement_sequence(
                 result?;
             }
             hir::Stmt::Echo { expr, span } => {
-                lower_with_statement_temporaries(context, |context| {
+                lower_with_statement_temporaries_at(context, *span, |context| {
                     let contents = match lower_echo(expr, context)? {
                         mir::Statement::EchoStringLiteral(value) => {
                             mir::IoContents::String(mir::StringExpression::Literal(value))
@@ -3778,7 +5164,7 @@ fn lower_statement_sequence(
                 })?;
             }
             hir::Stmt::Return { expr, span } => {
-                lower_with_statement_temporaries(context, |context| {
+                lower_with_statement_temporaries_at(context, *span, |context| {
                     if let Some(target) = context.when_targets.last().copied() {
                         lower_when_yield(expr.as_ref(), *span, target, context)
                     } else {
@@ -3787,15 +5173,17 @@ fn lower_statement_sequence(
                 })?;
             }
             hir::Stmt::VarDecl(decl) => {
-                lower_with_statement_temporaries(context, |context| lower_var_decl(decl, context))?;
+                lower_with_statement_temporaries_at(context, span, |context| {
+                    lower_var_decl(decl, context)
+                })?;
             }
             hir::Stmt::Assignment(assignment) => {
-                lower_with_statement_temporaries(context, |context| {
+                lower_with_statement_temporaries_at(context, span, |context| {
                     lower_assignment(assignment, context)
                 })?;
             }
             hir::Stmt::Increment(increment) => {
-                lower_with_statement_temporaries(context, |context| {
+                lower_with_statement_temporaries_at(context, span, |context| {
                     lower_increment(increment, context)
                 })?;
             }
@@ -3817,7 +5205,7 @@ fn lower_statement_sequence(
                 lower_loop_control(*span, LoopControl::Continue, context)?;
             }
             hir::Stmt::Throw(statement) => {
-                lower_with_statement_temporaries(context, |context| {
+                lower_with_statement_temporaries_at(context, span, |context| {
                     lower_throw_statement(statement, context)
                 })?;
             }
@@ -3825,7 +5213,7 @@ fn lower_statement_sequence(
                 lower_try_statement(statement, return_type, context)?;
             }
             hir::Stmt::Expr { expr, span } => {
-                lower_with_statement_temporaries(context, |context| {
+                lower_with_statement_temporaries_at(context, *span, |context| {
                     lower_expression_statement(expr, *span, context)
                 })?;
             }
@@ -3843,6 +5231,20 @@ fn lower_with_statement_temporaries(
     let result = lower(context);
     context.finish_statement_temporaries(result.is_ok());
     result
+}
+
+fn lower_with_statement_temporaries_at(
+    context: &mut LoweringContext,
+    span: Span,
+    lower: impl FnOnce(&mut LoweringContext) -> DiagnosticResult<()>,
+) -> DiagnosticResult<()> {
+    lower_with_statement_temporaries(context, |context| {
+        lower(context)?;
+        if context.current_block.is_some() {
+            context.push_statement(mir::Statement::SetDiagnosticSite { span });
+        }
+        Ok(())
+    })
 }
 
 fn lower_throw_statement(
@@ -3866,6 +5268,9 @@ fn lower_throw_statement(
         .copied()
         .expect("checked throw has deterministic origin metadata");
     context.push_statement(mir::Statement::EnsureErrorOrigin { error, origin });
+    context.push_statement(mir::Statement::SetDiagnosticSite {
+        span: statement.span,
+    });
     context.route_checked_error(error);
     Ok(())
 }
@@ -3913,14 +5318,20 @@ fn lower_try_statement(
         );
     }
 
-    let catch_entries = statement
+    // A handler this specialization can never enter is not part of its body:
+    // no Error reaching the dispatcher can match its type.
+    let handlers = statement
         .catches
+        .iter()
+        .filter(|clause| context.catch_reachable(clause.span))
+        .collect::<Vec<_>>();
+    let catch_entries = handlers
         .iter()
         .map(|_| context.create_block())
         .collect::<Vec<_>>();
     let fallback = context.create_block();
     context.current_block = Some(dispatcher);
-    for (clause, entry) in statement.catches.iter().zip(catch_entries.iter().copied()) {
+    for (clause, entry) in handlers.iter().zip(catch_entries.iter().copied()) {
         let ty = context
             .mir_resolved_type(&clause.error_type)
             .expect("checked catch type has executable MIR metadata");
@@ -3943,7 +5354,7 @@ fn lower_try_statement(
         context.terminate_current(mir::Terminator::Jump(fallback));
     }
 
-    for (clause, entry) in statement.catches.iter().zip(catch_entries) {
+    for (clause, entry) in handlers.iter().zip(catch_entries) {
         context.push_scope();
         context.current_block = Some(entry);
         let catch_ty = context
@@ -3989,7 +5400,7 @@ fn lower_try_statement(
     }
 
     context.current_block = Some(fallback);
-    if statement.uncovered_effects.is_empty() {
+    if context.try_has_no_uncovered_effects(statement) {
         context.terminate_current(mir::Terminator::Unreachable);
     } else {
         context.route_checked_error(protected_error);
@@ -4052,7 +5463,24 @@ fn lower_expression_statement(
             return Ok(());
         }
     }
+    if byte_region::copy_within(expr, context)? {
+        return Ok(());
+    }
+    if let Some(copy) = byte_region::copy_from(expr, context)? {
+        lower_discarded_rvalue(
+            mir::Rvalue::Value(mir::ValueExpression::Integer(copy)),
+            context,
+        );
+        return Ok(());
+    }
     materialize_nested_collection_places(expr, false, context)?;
+    if let Ok(ty) = context.expression_type(expr) {
+        if byte_region::is_type(ty) {
+            let value = lower_rvalue_as_expected(expr, ty, context)?;
+            lower_discarded_rvalue(value, context);
+            return Ok(());
+        }
+    }
     if let hir::Expr::MethodCall {
         object,
         method,
@@ -4488,6 +5916,7 @@ fn lower_assertion_statement(
                 properties,
                 constructor: Some(constructor.id),
                 args,
+                span: assertion.span,
             }),
             vtable: context.class_interface_vtable(
                 error_class,
@@ -4650,17 +6079,7 @@ fn lower_assertion_callable_operand(
         .clone();
     let transfer = definition.invocation_mode == mir::FunctionInvocationMode::Once;
     let value = lower_function_expression(expression, function_type, transfer, context)?;
-    let owned = !mir::function_expression_is_borrowed(&value);
-    let local = context.declare_checked_call_slot(mir::Type::Function(function_type), owned);
-    context.locals[local.0].writable =
-        definition.invocation_mode == mir::FunctionInvocationMode::Writable;
-    context.push_statement(mir::Statement::AssignLocal {
-        target: local,
-        value: mir::Rvalue::Function(value),
-    });
-    if owned && !transfer {
-        context.track_statement_owned_local(local, mir::Type::Function(function_type));
-    }
+    let local = stage_callable_operand(value, &definition, context);
     Ok(mir::AssertionOperandPlan::Local {
         local,
         ty: mir::Type::Function(function_type),
@@ -5000,7 +6419,7 @@ fn emit_assertion_call_result_drop(
 ) {
     if matches!(ty, mir::Type::String | mir::Type::NullableString) {
         context.emit_drop_obligations(&[DropObligation::String(local)]);
-    } else if ty.has_move_ownership() {
+    } else if ty.requires_owned_cleanup() {
         context.emit_drop_obligations(&[drop_obligation_for_owned_local(local, ty)]);
     }
 }
@@ -5024,7 +6443,7 @@ fn lower_assertion_operand(
     })?;
     let value = lower_rvalue_as_borrowed(expression, ty, context)?;
     let string_value = matches!(ty, mir::Type::String | mir::Type::NullableString);
-    let owned = !string_value && ty.has_move_ownership() && !value.borrows_move_value();
+    let owned = !string_value && ty.requires_owned_cleanup() && !value.borrows_move_value();
     let local = context.declare_checked_call_slot(ty, owned);
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
@@ -5075,7 +6494,10 @@ fn assertion_condition(
             }),
         ) = (actual, expected)
         {
-            if matches!(non_null_match_type(left_ty).0, mir::Type::Class(_)) {
+            if matches!(non_null_match_type(left_ty).0, mir::Type::Class(_))
+                || matches!(left_ty, mir::Type::NullableScalar(_))
+                || matches!(right_ty, mir::Type::NullableScalar(_))
+            {
                 return core_value::lower_local_equality(
                     (left, left_ty),
                     (right, right_ty),
@@ -5278,6 +6700,9 @@ fn assertion_condition(
 
 fn null_rvalue_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::Rvalue> {
     let value = match ty {
+        mir::Type::NullableByteRegion(kind) => {
+            mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Null { kind })
+        }
         mir::Type::NullableScalar(ty) => {
             mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Null(ty))
         }
@@ -6440,7 +7865,10 @@ fn lower_foreach_statement(
             )]);
         }
         if let Some(ty) = &foreach.value_binding.ty {
-            if integer_type_ref(ty).is_none() {
+            if !matches!(
+                context.native_type_ref(ty),
+                Some(mir::Type::Scalar(mir::ScalarType::Integer(_)))
+            ) {
                 return Err(vec![unsupported(
                     foreach.span,
                     format!("integer range foreach bindings require an integer type; got `{ty}`"),
@@ -6454,7 +7882,17 @@ fn lower_foreach_statement(
         return result;
     }
 
-    let (collection_expr, projection) = dictionary_foreach_projection(&foreach.iterable)
+    let (collection_expr, projection) = foreach
+        .dictionary_projection()
+        .map(|(collection, projection)| {
+            (
+                collection,
+                match projection {
+                    hir::DictionaryForeachProjection::Keys => CollectionForeachProjection::Keys,
+                    hir::DictionaryForeachProjection::Values => CollectionForeachProjection::Values,
+                },
+            )
+        })
         .unwrap_or((&foreach.iterable, CollectionForeachProjection::Main));
     context.push_scope();
     materialize_nested_collection_places(collection_expr, false, context)?;
@@ -6510,25 +7948,6 @@ impl From<CollectionForeachProjection> for mir::ForeachProjection {
             CollectionForeachProjection::Keys => Self::Keys,
             CollectionForeachProjection::Values => Self::Values,
         }
-    }
-}
-
-fn dictionary_foreach_projection(
-    expr: &hir::Expr,
-) -> Option<(&hir::Expr, CollectionForeachProjection)> {
-    match expr {
-        hir::Expr::Grouped { expr, .. } => dictionary_foreach_projection(expr),
-        hir::Expr::PropertyAccess {
-            object,
-            property,
-            null_safe: false,
-            ..
-        } => match property.as_str() {
-            "keys" => Some((object, CollectionForeachProjection::Keys)),
-            "values" => Some((object, CollectionForeachProjection::Values)),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -6599,13 +8018,13 @@ fn lower_collection_foreach_in_scope(
             return Err(vec![unsupported(
                 binding.span,
                 "checked value-only foreach plan retained an impossible first binding",
-            )])
+            )]);
         }
         (Some(binding), _, _) => {
             return Err(vec![unsupported(
                 binding.span,
                 "dictionary projection retained an impossible first binding",
-            )])
+            )]);
         }
     };
     let binding_type = match projection {
@@ -6653,7 +8072,15 @@ fn lower_collection_foreach_in_scope(
     {
         definition
             .key
-            .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type, context))
+            .map(|key_type| {
+                collection_key_at_rvalue(
+                    collection,
+                    offset.clone(),
+                    key_type,
+                    foreach.span,
+                    context,
+                )
+            })
             .transpose()?
     } else {
         None
@@ -6678,7 +8105,13 @@ fn lower_collection_foreach_in_scope(
             // an unordered one, once per element, for a value already known to
             // sit at this index: keys and values are parallel arrays and every
             // mutation moves them together.
-            core_collection::value_at(collection, index_local, definition.value, context)?
+            core_collection::value_at(
+                collection,
+                index_local,
+                definition.value,
+                foreach.span,
+                context,
+            )?
         }
     };
     context.push_statement(mir::Statement::AssignLocal {
@@ -6708,7 +8141,9 @@ fn lower_collection_foreach_in_scope(
     context.current_block = Some(update_block);
     if foreach.value_binding.writable && projection == CollectionForeachProjection::Main {
         match definition.value {
-            mir::Type::Scalar(_)
+            mir::Type::ByteRegion(_)
+            | mir::Type::NullableByteRegion(_)
+            | mir::Type::Scalar(_)
             | mir::Type::String
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
@@ -6724,6 +8159,7 @@ fn lower_collection_foreach_in_scope(
                 // to search with: `key` is None, so the offset would arrive
                 // where the key type is expected.
                 context.push_statement(mir::Statement::AssignCollectionIndex {
+                    index_span: foreach.span,
                     positional: true,
                     collection,
                     index: offset.clone(),
@@ -6754,7 +8190,7 @@ fn lower_collection_foreach_in_scope(
                 return Err(vec![unsupported(
                     foreach.span,
                     "nullable collection elements are deferred beyond Stage 23 Slice 1",
-                )])
+                )]);
             }
         }
     }
@@ -6820,6 +8256,7 @@ fn collection_key_at_rvalue(
     collection: mir::LocalId,
     offset: mir::Rvalue,
     ty: mir::Type,
+    index_span: Span,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::Rvalue> {
     let mir::Type::Collection(id) = context.local_type(collection) else {
@@ -6839,12 +8276,14 @@ fn collection_key_at_rvalue(
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::CollectionKeyAt {
+                index_span,
                 collection,
                 offset: Box::new(offset),
             },
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(
             mir::StringExpression::CollectionKeyAt {
+                index_span,
                 collection,
                 offset: Box::new(offset),
             },
@@ -6862,11 +8301,33 @@ fn collection_value_rvalue(
     offset: mir::Rvalue,
     ty: mir::Type,
     positional: bool,
+    index_span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
+        mir::Type::ByteRegion(kind) => Ok(mir::Rvalue::ByteRegion(
+            mir::ByteRegionExpression::CollectionIndex {
+                kind,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional,
+                remove: false,
+            },
+        )),
+        mir::Type::NullableByteRegion(kind) => Ok(mir::Rvalue::NullableByteRegion(
+            mir::NullableByteRegionExpression::CollectionIndex {
+                kind,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional,
+                remove: false,
+            },
+        )),
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::CollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index: Box::new(index),
@@ -6875,6 +8336,7 @@ fn collection_value_rvalue(
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(
             mir::StringExpression::CollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index: Box::new(index),
@@ -6884,6 +8346,7 @@ fn collection_value_rvalue(
         mir::Type::Interface(interface) => Ok(mir::Rvalue::interface(
             interface,
             mir::InterfaceValue::CollectionIndex {
+                index_span,
                 positional,
                 collection,
                 index: Box::new(index),
@@ -6893,6 +8356,7 @@ fn collection_value_rvalue(
         mir::Type::NullableInterface(interface) => Ok(mir::Rvalue::nullable_interface(
             interface,
             mir::NullableInterfaceValue::DictionaryGet {
+                index_span,
                 collection,
                 key: Box::new(offset),
                 access: mir::NullableCollectionAccess::At,
@@ -6900,6 +8364,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
             mir::NullableScalarExpression::DictionaryGet {
+                index_span,
                 ty,
                 collection,
                 key: Box::new(offset),
@@ -6908,12 +8373,14 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
             mir::NullableStringExpression::DictionaryGet {
+                index_span,
                 collection,
                 key: Box::new(offset),
                 access: mir::NullableCollectionAccess::At,
             },
         )),
         mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            index_span,
             positional,
             class,
             collection,
@@ -6922,6 +8389,7 @@ fn collection_value_rvalue(
         })),
         mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
             mir::NullableClassExpression::DictionaryGet {
+                index_span,
                 class,
                 collection,
                 key: Box::new(offset),
@@ -6930,6 +8398,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::SharedReference(class) => Ok(mir::Rvalue::SharedReference(
             mir::SharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -6939,6 +8408,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::WeakReference(class) => Ok(mir::Rvalue::WeakReference(
             mir::WeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -6948,6 +8418,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableSharedReference(class) => Ok(mir::Rvalue::NullableSharedReference(
             mir::NullableSharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -6957,6 +8428,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableWeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload: class,
                 collection,
@@ -6966,6 +8438,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::WritableSharedReference(payload) => Ok(mir::Rvalue::WritableSharedReference(
             mir::WritableSharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload,
                 collection,
@@ -6975,6 +8448,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::WritableWeakReference(payload) => Ok(mir::Rvalue::WritableWeakReference(
             mir::WritableWeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional,
                 payload,
                 collection,
@@ -6983,26 +8457,48 @@ fn collection_value_rvalue(
             },
         )),
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            index_span,
             positional,
             collection,
             index: Box::new(index),
             transfer: false,
             remove: false,
         })),
+        mir::Type::NullableMixed => Ok(mir::Rvalue::NullableMixed(
+            mir::NullableMixedExpression::CollectionIndex {
+                index_span,
+                positional,
+                collection,
+                index: Box::new(index),
+                transfer: false,
+                remove: false,
+            },
+        )),
         mir::Type::Collection(nested) => {
             Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
                 positional,
                 collection: nested,
                 source: collection,
                 index: Box::new(index),
-                index_span: Span::default(),
+                index_span,
                 transfer: false,
             }))
         }
+        mir::Type::NullableCollection(nested) => Ok(mir::Rvalue::NullableCollection(
+            mir::NullableCollectionExpression::Index {
+                positional,
+                collection: nested,
+                source: collection,
+                index: Box::new(index),
+                index_span,
+                transfer: false,
+            },
+        )),
         mir::Type::PayloadEnum(ty) => {
             Ok(mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::CollectionIndex {
+                    index_span,
                     collection,
                     index: Box::new(index),
                     positional,
@@ -7015,6 +8511,7 @@ fn collection_value_rvalue(
             mir::NullablePayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::CollectionIndex {
+                    index_span,
                     collection,
                     index: Box::new(index),
                     positional,
@@ -7025,6 +8522,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::Function(function_type) => Ok(mir::Rvalue::Function(
             mir::FunctionExpression::CollectionIndex {
+                index_span,
                 function_type,
                 collection,
                 index: Box::new(index),
@@ -7034,6 +8532,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableFunction(function_type) => Ok(mir::Rvalue::NullableFunction(
             mir::NullableFunctionExpression::CollectionIndex {
+                index_span,
                 function_type,
                 collection,
                 index: Box::new(index),
@@ -7044,9 +8543,7 @@ fn collection_value_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::NullableMixed
-        | mir::Type::NullableCollection(_)
-        | mir::Type::NullableWritableSharedReference(_)
+        mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
@@ -7060,6 +8557,9 @@ fn collection_value_rvalue(
 
 fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<mir::Rvalue> {
     match ty {
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            Ok(local_rvalue(local, ty, false))
+        }
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::Local(local),
@@ -7383,7 +8883,7 @@ struct PendingReturnValue {
 impl PendingReturnValue {
     fn rvalue(self) -> mir::Rvalue {
         match self.local {
-            Some(local) => local_rvalue(local, self.ty, self.transfer),
+            Some(local) => pending_owned_rvalue(local, self.ty, self.transfer),
             None if self.ty == mir::Type::Mixed => mir::Rvalue::Mixed(mir::MixedExpression::Null),
             None => null_rvalue_for_type(self.ty, Span::default())
                 .expect("an absent pending return has a nullable type"),
@@ -7480,19 +8980,20 @@ struct LoweringContext<'semantic> {
     signatures: HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'semantic SemanticInfo,
+    executable_effects: Option<&'semantic InstanceEffects>,
     property_initializers: HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
     static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: NativeTypeRegistry,
     enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
+    enum_instances: HashMap<crate::enums::EnumType, crate::enums::EnumId>,
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
     error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
     error_origin_ids: HashMap<Span, mir::ErrorOriginId>,
     closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     current_class: Option<ClassId>,
-    lifecycle_phase: bool,
     construction_root: Option<mir::LocalId>,
     locals: Vec<mir::Local>,
-    replaceable_writable_parameters: HashSet<mir::LocalId>,
+    replaceable_writable_bindings: HashSet<mir::LocalId>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<Span, mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
@@ -7513,6 +9014,7 @@ struct LoweringContext<'semantic> {
 
 #[derive(Clone, Copy)]
 enum DropObligation {
+    EndBorrow(mir::LocalId),
     String(mir::LocalId),
     Class(mir::LocalId, ClassId),
     Shared(mir::LocalId, mir::SharedPayload),
@@ -7524,55 +9026,12 @@ enum DropObligation {
     Error(mir::LocalId),
     Collection(mir::LocalId, mir::CollectionTypeId),
     PayloadEnum(mir::LocalId, mir::PayloadEnumType, bool),
+    InlineValue(mir::LocalId, crate::inline_value::InlineValueType, bool),
     Function(mir::LocalId, mir::FunctionTypeId, bool),
 }
 
 fn user_local_type_owns_value(ty: mir::Type) -> bool {
-    matches!(
-        ty,
-        mir::Type::Class(_)
-            | mir::Type::NullableClass(_)
-            | mir::Type::SharedReference(_)
-            | mir::Type::WeakReference(_)
-            | mir::Type::NullableSharedReference(_)
-            | mir::Type::NullableWeakReference(_)
-            | mir::Type::WritableSharedReference(_)
-            | mir::Type::WritableWeakReference(_)
-            | mir::Type::NullableWritableSharedReference(_)
-            | mir::Type::NullableWritableWeakReference(_)
-            | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_)
-            | mir::Type::Mixed
-            | mir::Type::NullableMixed
-            | mir::Type::Interface(_)
-            | mir::Type::NullableInterface(_)
-            | mir::Type::Collection(_)
-            | mir::Type::NullableCollection(_)
-            | mir::Type::PayloadEnum(mir::PayloadEnumType {
-                capabilities: crate::enums::EnumCapabilities {
-                    needs_drop: true,
-                    ..
-                },
-                ..
-            })
-            | mir::Type::NullablePayloadEnum(mir::PayloadEnumType {
-                capabilities: crate::enums::EnumCapabilities {
-                    needs_drop: true,
-                    ..
-                },
-                ..
-            })
-            | mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-    )
-}
-
-fn call_result_is_writable(owned: bool, return_borrow: Option<mir::ReturnBorrow>) -> bool {
-    owned
-        || return_borrow
-            .is_some_and(|borrow| borrow.kind == mir::ReturnBorrowKind::Value && borrow.writable)
+    ty.requires_owned_cleanup()
 }
 
 fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropObligation {
@@ -7580,6 +9039,9 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
         return DropObligation::SharedAccess(local, access.payload, access.writable);
     }
     match ty {
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            DropObligation::EndBorrow(local)
+        }
         mir::Type::Class(class) | mir::Type::NullableClass(class) => {
             DropObligation::Class(local, class)
         }
@@ -7604,11 +9066,17 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
         }
         mir::Type::PayloadEnum(ty) => DropObligation::PayloadEnum(local, ty, false),
         mir::Type::NullablePayloadEnum(ty) => DropObligation::PayloadEnum(local, ty, true),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => {
+            DropObligation::InlineValue(local, ty, false)
+        }
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            DropObligation::InlineValue(local, ty, true)
+        }
         mir::Type::Function(function_type) => DropObligation::Function(local, function_type, false),
         mir::Type::NullableFunction(function_type) => {
             DropObligation::Function(local, function_type, true)
         }
-        _ => unreachable!("only move locals may own native drop obligations"),
+        _ => unreachable!("only managed values may own native drop obligations"),
     }
 }
 
@@ -7623,7 +9091,7 @@ fn drop_obligation_for_pending_payload(
     if matches!(ty, mir::Type::String | mir::Type::NullableString) {
         return Some(DropObligation::String(local));
     }
-    ty.has_move_ownership()
+    ty.requires_owned_cleanup()
         .then(|| drop_obligation_for_owned_local(local, ty))
 }
 
@@ -7633,19 +9101,20 @@ impl<'semantic> LoweringContext<'semantic> {
             signatures: inputs.signatures.clone(),
             method_signatures: inputs.method_signatures.clone(),
             semantic_info: inputs.semantic_info,
+            executable_effects: inputs.executable_effects,
             property_initializers: inputs.property_initializers.clone(),
             static_ids: inputs.static_ids.clone(),
             collection_registry: inputs.collection_registry.clone(),
             enum_types: inputs.enum_types.clone(),
+            enum_instances: inputs.enum_instances.clone(),
             type_substitutions: inputs.type_substitutions.clone(),
             error_descriptor_ids: inputs.error_descriptor_ids.clone(),
             error_origin_ids: inputs.error_origin_ids.clone(),
             closure_plans: inputs.closure_plans.clone(),
             current_class: None,
-            lifecycle_phase: false,
             construction_root: None,
             locals: Vec::new(),
-            replaceable_writable_parameters: HashSet::new(),
+            replaceable_writable_bindings: HashSet::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],
@@ -7925,8 +9394,13 @@ impl<'semantic> LoweringContext<'semantic> {
     fn emit_drop_obligations(&mut self, cleanup: &[DropObligation]) {
         for obligation in cleanup.iter().rev().copied() {
             self.push_statement(match obligation {
+                DropObligation::EndBorrow(local) => mir::Statement::EndBorrow { local },
                 DropObligation::String(local) => mir::Statement::DropString { local },
-                DropObligation::Class(local, class) => mir::Statement::DropClass { local, class },
+                DropObligation::Class(local, class) => mir::Statement::DropClass {
+                    local,
+                    class,
+                    runs_destructor: true,
+                },
                 DropObligation::Shared(local, class) => mir::Statement::DropSharedReference {
                     local,
                     payload: class,
@@ -7955,6 +9429,13 @@ impl<'semantic> LoweringContext<'semantic> {
                 }
                 DropObligation::PayloadEnum(local, ty, nullable) => {
                     mir::Statement::DropPayloadEnum {
+                        local,
+                        ty,
+                        nullable,
+                    }
+                }
+                DropObligation::InlineValue(local, ty, nullable) => {
+                    mir::Statement::DropInlineValue {
                         local,
                         ty,
                         nullable,
@@ -8079,6 +9560,26 @@ impl<'semantic> LoweringContext<'semantic> {
 
     fn current_error_target(&self) -> Option<ErrorTarget> {
         self.error_targets.last().copied()
+    }
+
+    fn conditional_error_exit(&self) -> Option<mir::ConditionalErrorExit> {
+        self.current_error_target()
+            .map(|target| mir::ConditionalErrorExit {
+                error: target.error,
+                destination: target.destination,
+            })
+    }
+
+    fn catch_reachable(&self, catch: Span) -> bool {
+        self.executable_effects
+            .is_none_or(|effects| effects.catch_reachable(catch))
+    }
+
+    fn try_has_no_uncovered_effects(&self, statement: &hir::TryStmt) -> bool {
+        self.executable_effects
+            .and_then(|effects| effects.try_uncovered(statement.span))
+            .unwrap_or(&statement.uncovered_effects)
+            .is_empty()
     }
 
     fn route_checked_error(&mut self, source: mir::LocalId) {
@@ -8260,7 +9761,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .last_mut()
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
-        if owned {
+        if owned || byte_region::is_type(ty) {
             let obligation = drop_obligation_for_owned_local(id, ty);
             self.scope_owned_locals
                 .last_mut()
@@ -8303,7 +9804,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .last_mut()
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
-        if track_cleanup && owned && ty.has_move_ownership() {
+        if track_cleanup && (owned && ty.requires_owned_cleanup() || byte_region::is_type(ty)) {
             self.scope_owned_locals
                 .last_mut()
                 .expect("an owned synthetic local requires an active ownership scope")
@@ -8354,6 +9855,9 @@ impl<'semantic> LoweringContext<'semantic> {
             owned,
             synthetic: true,
         });
+        if byte_region::is_type(ty) {
+            self.track_region_temporary(id);
+        }
         id
     }
 
@@ -8389,11 +9893,28 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn track_statement_owned_local(&mut self, local: mir::LocalId, ty: mir::Type) {
+        // Region slots register descriptor lifetime at declaration, including
+        // readonly Copy slots which never enter the owned-value path.
+        if byte_region::is_type(ty) {
+            return;
+        }
         self.statement_owned_locals
             .last_mut()
             .expect("checked call result requires an active statement scope")
             .drops
             .push(drop_obligation_for_owned_local(local, ty));
+    }
+
+    fn track_region_temporary(&mut self, local: mir::LocalId) {
+        let obligation = DropObligation::EndBorrow(local);
+        if let Some(statement) = self.statement_owned_locals.last_mut() {
+            statement.drops.push(obligation);
+        } else {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("region has an active lexical scope")
+                .push(obligation);
+        }
     }
 
     fn declare_borrowed_temp(&mut self, ty: mir::Type, writable: bool) -> mir::LocalId {
@@ -8408,6 +9929,9 @@ impl<'semantic> LoweringContext<'semantic> {
             owned: false,
             synthetic: true,
         });
+        if byte_region::is_type(ty) {
+            self.track_region_temporary(id);
+        }
         id
     }
 
@@ -8436,7 +9960,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
                 .push(DropObligation::String(id));
-        } else if cleanup && owned {
+        } else if cleanup && (owned || byte_region::is_type(ty)) {
             self.scope_owned_locals
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
@@ -8543,7 +10067,7 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn local_may_replace_borrowed_value(&self, id: mir::LocalId) -> bool {
-        self.replaceable_writable_parameters.contains(&id)
+        self.replaceable_writable_bindings.contains(&id)
     }
 
     fn class_id_for_name(&self, name: &str) -> Option<ClassId> {
@@ -8582,16 +10106,7 @@ impl<'semantic> LoweringContext<'semantic> {
         span: Span,
     ) -> DiagnosticResult<mir::InterfaceVtableId> {
         self.collection_registry
-            .interface_vtable_ids
-            .get(&(mir::ImplementingType::Class(class), interface))
-            .copied()
-            .ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "I2401",
-                    "interface conversion has no checked conformance plan",
-                    span,
-                )]
-            })
+            .class_interface_vtable(class, interface, span)
     }
 
     fn call_target_class_id(&self, span: Span) -> Option<ClassId> {
@@ -8621,6 +10136,18 @@ impl<'semantic> LoweringContext<'semantic> {
             .classes
             .iter()
             .find(|class| class.id == id)
+    }
+
+    fn class_receiver_type(&self, class: ClassId) -> mir::Type {
+        crate::inline_value::InlineValueKind::for_name(
+            &self
+                .class_info(class)
+                .expect("checked receiver class")
+                .declaration_name,
+        )
+        .map_or(mir::Type::Class(class), |kind| {
+            mir::Type::Scalar(mir::ScalarType::Inline(kind.specialize(class)))
+        })
     }
 
     fn class_is_subtype(&self, value: ClassId, target: ClassId) -> bool {
@@ -8674,7 +10201,8 @@ impl<'semantic> LoweringContext<'semantic> {
         span: Span,
     ) -> DiagnosticResult<FunctionSignature> {
         let arguments = self.specialization_arguments(span);
-        self.method_signatures
+        let mut signature = self
+            .method_signatures
             .get(&MethodInstanceKey {
                 class,
                 name: name.to_string(),
@@ -8686,7 +10214,15 @@ impl<'semantic> LoweringContext<'semantic> {
                     span,
                     format!("call references unknown method `class#{}::{name}`", class.0),
                 )]
-            })
+            })?;
+        if signature.source_declaration.is_some_and(|declaration| {
+            self.semantic_info
+                .exact_method_calls
+                .contains(&(span, declaration))
+        }) {
+            signature.select_direct();
+        }
+        Ok(signature)
     }
 
     fn constant_decl(&self, expr: &hir::Expr) -> Option<&crate::const_eval::EvaluatedDecl> {
@@ -8763,15 +10299,27 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn native_type_ref(&self, ty: &crate::types::TypeRef) -> Option<mir::Type> {
-        let resolved = resolved_type_ref_with_substitutions(ty, &self.type_substitutions)?;
+        let resolved = crate::types::resolved_type_ref_with_checked_functions(
+            ty,
+            &self.type_substitutions,
+            &|span| {
+                self.collection_registry
+                    .checked_function_types
+                    .get(&span)
+                    .cloned()
+            },
+        )?;
         let enum_types = self
             .semantic_info
             .enums
             .iter()
             .map(|definition| {
                 (
-                    definition.name.clone(),
-                    crate::enums::EnumType::new(definition.id, definition.name.clone()),
+                    ClassType::new(
+                        definition.source_type.name.clone(),
+                        definition.source_type.arguments.clone(),
+                    ),
+                    definition.source_type.clone(),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -8844,10 +10392,15 @@ impl<'semantic> LoweringContext<'semantic> {
             })
     }
 
-    fn expression_type(&self, expr: &hir::Expr) -> DiagnosticResult<mir::Type> {
+    fn resolved_expression_type(&self, expr: &hir::Expr) -> DiagnosticResult<ResolvedType> {
         let resolved = self
             .semantic_info
-            .expression_type(expr.span())
+            .collection_construction_types
+            .get(&expr.span())
+            // The checker owns contextual collection storage. A literal's
+            // unconstrained inferred type is not its constructed representation
+            // (for example, Bytes::fromArray checks an ordinary literal as uint8[]).
+            .or_else(|| self.semantic_info.expression_type(expr.span()))
             .ok_or_else(|| {
                 vec![Diagnostic::new(
                     "I2201",
@@ -8855,7 +10408,31 @@ impl<'semantic> LoweringContext<'semantic> {
                     expr.span(),
                 )]
             })?;
-        let resolved = substitute_resolved_type(resolved, &self.type_substitutions);
+        Ok(substitute_resolved_type(resolved, &self.type_substitutions))
+    }
+
+    fn materialized_enum_case(
+        &self,
+        source: crate::enums::EnumCaseSource,
+        enum_id: crate::enums::EnumId,
+        span: Span,
+    ) -> DiagnosticResult<crate::enums::EnumCaseId> {
+        self.semantic_info
+            .enums
+            .iter()
+            .find(|definition| definition.id == enum_id)
+            .and_then(|definition| definition.resolve_case(source))
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2701",
+                    "resolved enum case does not belong to its concrete expression type",
+                    span,
+                )]
+            })
+    }
+
+    fn expression_type(&self, expr: &hir::Expr) -> DiagnosticResult<mir::Type> {
+        let resolved = self.resolved_expression_type(expr)?;
         self.mir_resolved_type(&resolved).ok_or_else(|| {
             if resolved_type_contains_shared_handle(&resolved) {
                 return vec![shared_ownership_runtime_unsupported(expr.span())];
@@ -8969,6 +10546,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
             ResolvedType::Error => Some(mir::Type::ERROR),
+            ResolvedType::ByteRegion(kind) => Some(mir::Type::ByteRegion(*kind)),
             ResolvedType::Function(_) => {
                 let ResolvedType::Function(function) =
                     substitute_resolved_type(ty, &self.type_substitutions)
@@ -8981,9 +10559,15 @@ impl<'semantic> LoweringContext<'semantic> {
                     .copied()
                     .map(mir::Type::Function)
             }
-            ResolvedType::Enum(enum_type) => {
-                Some(self.enum_types.get(&enum_type.id).copied().map_or(
-                    mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),
+            ResolvedType::Enum(_) => {
+                let ResolvedType::Enum(enum_type) =
+                    substitute_resolved_type(ty, &self.type_substitutions)
+                else {
+                    unreachable!("substituting an enum type preserves its outer type")
+                };
+                let id = *self.enum_instances.get(&enum_type)?;
+                Some(self.enum_types.get(&id).copied().map_or(
+                    mir::Type::Scalar(mir::ScalarType::Enum(id)),
                     mir::Type::PayloadEnum,
                 ))
             }
@@ -9001,7 +10585,12 @@ impl<'semantic> LoweringContext<'semantic> {
                 ))
                 .copied()
                 .map(mir::Type::Collection),
-            ResolvedType::Class(class) => self.class_id_for_type(class).map(mir::Type::Class),
+            ResolvedType::Class(class) => match class.inline_copy_type() {
+                Some(kind) => self
+                    .class_id_for_type(class)
+                    .map(|id| mir::Type::Scalar(mir::ScalarType::Inline(kind.specialize(id)))),
+                None => self.class_id_for_type(class).map(mir::Type::Class),
+            },
             ResolvedType::SharedHandle(kind, payload) => match kind {
                 crate::types::SharedHandleKind::SharedReference => {
                     let payload = self.mir_writable_shared_payload(payload)?;
@@ -9105,6 +10694,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Nullable(inner) => match self.mir_resolved_type(inner)? {
                 mir::Type::Scalar(ty) => Some(mir::Type::NullableScalar(ty)),
                 mir::Type::String => Some(mir::Type::NullableString),
+                mir::Type::ByteRegion(kind) => Some(mir::Type::NullableByteRegion(kind)),
                 mir::Type::Mixed => Some(mir::Type::NullableMixed),
                 mir::Type::Interface(interface) => Some(mir::Type::NullableInterface(interface)),
                 mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
@@ -9134,6 +10724,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
+                | mir::Type::NullableByteRegion(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableInterface(_)
@@ -9356,6 +10947,12 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
         }
         | mir::Terminator::CheckedIo {
             success, failure, ..
+        }
+        | mir::Terminator::CheckedDeadlineFromNow {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedCancellationRequest {
+            success, failure, ..
         } => vec![*success, *failure],
         mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
         mir::Terminator::ErrorSwitch {
@@ -9406,7 +11003,18 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         return lower_string_var_decl(decl, context);
     }
 
-    let value = lower_rvalue_as_expected(&decl.initializer, ty, context)?;
+    let bindings = &context.semantic_info.binding_resolution;
+    let borrowed = bindings
+        .declaration_by_span
+        .get(&decl.bindings[0].span)
+        .and_then(|id| bindings.declarations_by_id.get(id))
+        .is_some_and(|binding| binding.ownership != crate::symbols::BindingOwnership::Owned);
+    // Ownership analysis has already distinguished loan aliases from moves.
+    let value = if borrowed && ty.has_move_ownership() {
+        lower_rvalue_as_borrowed(&decl.initializer, ty, context)?
+    } else {
+        lower_rvalue_as_expected(&decl.initializer, ty, context)?
+    };
     let owned = user_local_type_owns_value(ty) && !value.borrows_move_value();
     let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
     context.push_statement(mir::Statement::AssignLocal {
@@ -9422,6 +11030,17 @@ fn lower_grouped_var_decl(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     let value = match ty {
+        mir::Type::Scalar(mir::ScalarType::Inline(inline)) => mir::Rvalue::Value(
+            mir::ValueExpression::Inline(inline_value::lower_expression_with_ownership(
+                &decl.initializer,
+                inline,
+                true,
+                context,
+            )?),
+        ),
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            lower_rvalue_as_expected(&decl.initializer, ty, context)?
+        }
         mir::Type::Scalar(scalar) => {
             let value = lower_value_expression(&decl.initializer, context)?;
             ensure_value_type(&value, scalar, decl.initializer.span())?;
@@ -9430,6 +11049,9 @@ fn lower_grouped_var_decl(
         mir::Type::String => {
             mir::Rvalue::String(lower_string_expression(&decl.initializer, context)?)
         }
+        mir::Type::NullableScalar(mir::ScalarType::Inline(inline)) => mir::Rvalue::NullableScalar(
+            lower_nullable_inline_expression(&decl.initializer, inline, true, context)?,
+        ),
         mir::Type::NullableScalar(scalar) => mir::Rvalue::NullableScalar(
             lower_nullable_scalar_expression(&decl.initializer, scalar, context)?,
         ),
@@ -9533,6 +11155,10 @@ fn lower_grouped_var_decl(
 
 fn inferred_class_type(expr: &hir::Expr, context: &mut LoweringContext) -> Option<ClassId> {
     match context.expression_type(expr).ok()? {
+        mir::Type::Scalar(mir::ScalarType::Inline(ty))
+        | mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            context.class_id_for_name(ty.name())
+        }
         mir::Type::Class(class)
         | mir::Type::NullableClass(class)
         | mir::Type::SharedReference(mir::SharedPayload::Class(class)) => Some(class),
@@ -9637,14 +11263,25 @@ fn lower_string_var_decl(
 enum ScalarPlace {
     Local(mir::LocalId),
     NullableLocal(mir::LocalId),
+    MixedLocal {
+        local: mir::LocalId,
+        tag: mir::MixedTag,
+        nullable: bool,
+    },
     Property {
         object: mir::LocalId,
         property: crate::class_layout::PropertyId,
     },
     Static(mir::StaticId),
+    ByteRegionIndex {
+        region: mir::LocalId,
+        index: mir::Rvalue,
+        index_span: Span,
+    },
     CollectionIndex {
         collection: mir::LocalId,
         index: mir::Rvalue,
+        index_span: Span,
     },
 }
 
@@ -9653,12 +11290,30 @@ impl ScalarPlace {
         match self {
             Self::Local(local) => mir::Operand::Local(*local),
             Self::NullableLocal(local) => mir::Operand::NullablePayload(*local),
+            Self::MixedLocal { local, tag, .. } => mir::Operand::MixedPayload {
+                mixed: *local,
+                tag: *tag,
+            },
             Self::Property { object, property } => mir::Operand::Property {
                 object: *object,
                 property: *property,
             },
             Self::Static(id) => mir::Operand::Static(*id),
-            Self::CollectionIndex { collection, index } => mir::Operand::CollectionIndex {
+            Self::ByteRegionIndex {
+                region,
+                index,
+                index_span,
+            } => mir::Operand::ByteRegionIndex {
+                region: *region,
+                index: Box::new(index.clone()),
+                index_span: *index_span,
+            },
+            Self::CollectionIndex {
+                collection,
+                index,
+                index_span,
+            } => mir::Operand::CollectionIndex {
+                index_span: *index_span,
                 positional: false,
                 collection: *collection,
                 index: Box::new(index.clone()),
@@ -9681,6 +11336,19 @@ impl ScalarPlace {
                 target,
                 value: mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)),
             },
+            Self::MixedLocal {
+                local, nullable, ..
+            } => {
+                let value = mir::MixedExpression::BoxValue(value);
+                mir::Statement::AssignLocal {
+                    target: local,
+                    value: if nullable {
+                        mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Mixed(value))
+                    } else {
+                        mir::Rvalue::Mixed(value)
+                    },
+                }
+            }
             Self::Property { object, property } => {
                 let (kind, span) = property_write
                     .expect("property scalar assignment requires semantic write info");
@@ -9696,7 +11364,22 @@ impl ScalarPlace {
                 target,
                 value: mir::Rvalue::Value(value),
             },
-            Self::CollectionIndex { collection, index } => mir::Statement::AssignCollectionIndex {
+            Self::ByteRegionIndex {
+                region,
+                index,
+                index_span,
+            } => mir::Statement::AssignByteRegionIndex {
+                region,
+                index,
+                value: mir::Rvalue::Value(value),
+                index_span,
+            },
+            Self::CollectionIndex {
+                collection,
+                index,
+                index_span,
+            } => mir::Statement::AssignCollectionIndex {
+                index_span,
                 positional: false,
                 collection,
                 index,
@@ -9744,6 +11427,24 @@ fn lower_scalar_place(
             match context.local_type(local) {
                 mir::Type::Scalar(ty) => Ok((ScalarPlace::Local(local), ty)),
                 mir::Type::NullableScalar(ty) => Ok((ScalarPlace::NullableLocal(local), ty)),
+                mir::Type::Mixed | mir::Type::NullableMixed => {
+                    let Some((_, mir::Type::Scalar(scalar))) = context.exact_mixed_local(expr)
+                    else {
+                        return Err(vec![unsupported(
+                            *span,
+                            "mixed mutation requires an exactly narrowed scalar",
+                        )]);
+                    };
+                    ensure_local_assignment_ownership(local, *span, context)?;
+                    Ok((
+                        ScalarPlace::MixedLocal {
+                            local,
+                            tag: mixed_tag_for_type(mir::Type::Scalar(scalar), *span)?,
+                            nullable: context.local_type(local) == mir::Type::NullableMixed,
+                        },
+                        scalar,
+                    ))
+                }
                 _ => Err(vec![unsupported(
                     *span,
                     "local is not a scalar mutation place",
@@ -9780,6 +11481,23 @@ fn lower_scalar_place(
             index,
             span,
         } => {
+            if matches!(
+                context.expression_type(collection)?,
+                mir::Type::ByteRegion(_)
+            ) {
+                let region = byte_region::local(collection, true, context)?;
+                let index_type = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+                let index = lower_rvalue_as_expected(index, index_type, context)?;
+                let (index, index_type) = core_value::materialize_value(index, context);
+                return Ok((
+                    ScalarPlace::ByteRegionIndex {
+                        region,
+                        index: local_rvalue(index, index_type, false),
+                        index_span: *span,
+                    },
+                    mir::ScalarType::Integer(IntegerType::UInt8),
+                ));
+            }
             let (collection, collection_type) = lower_collection_local(collection, context)?;
             let info = context.collection_type(collection_type).clone();
             let mir::Type::Scalar(scalar) = info.value else {
@@ -9793,10 +11511,16 @@ fn lower_scalar_place(
                 .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
                     IntegerType::Int64,
                 )));
+            // A mutation borrows one evaluated place through its read and write.
+            // Snapshot its index even when it is currently a local: evaluating
+            // the right-hand side may change the source used to select it.
+            let index = lower_rvalue_as_expected(index, index_type, context)?;
+            let (index, index_type) = core_value::materialize_value(index, context);
             Ok((
                 ScalarPlace::CollectionIndex {
+                    index_span: *span,
                     collection,
-                    index: lower_rvalue_as_expected(index, index_type, context)?,
+                    index: local_rvalue(index, index_type, false),
                 },
                 scalar,
             ))
@@ -9816,7 +11540,6 @@ fn lower_assignment(
         return Ok(());
     }
     materialize_nested_collection_places(&assignment.target, true, context)?;
-    materialize_nested_collection_places(&assignment.value, false, context)?;
     if assignment.op != hir::AssignOp::Assign {
         let (place, scalar_type) = lower_scalar_place(&assignment.target, context)?;
         let property_write = matches!(place, ScalarPlace::Property { .. })
@@ -9834,6 +11557,7 @@ fn lower_assignment(
         return Ok(());
     }
 
+    materialize_nested_collection_places(&assignment.value, false, context)?;
     let target = unparenthesized_place(&assignment.target);
     if let hir::Expr::StaticMember {
         class_name,
@@ -9866,6 +11590,27 @@ fn lower_assignment(
         span,
     } = target
     {
+        if matches!(
+            context.expression_type(collection)?,
+            mir::Type::ByteRegion(_)
+        ) {
+            let region = byte_region::local(collection, true, context)?;
+            let index_type = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+            let index = lower_rvalue_as_expected(index, index_type, context)?;
+            let (index, index_type) = core_value::materialize_value(index, context);
+            let value = lower_rvalue_as_expected(
+                &assignment.value,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                context,
+            )?;
+            context.push_statement(mir::Statement::AssignByteRegionIndex {
+                region,
+                index: local_rvalue(index, index_type, false),
+                value,
+                index_span: *span,
+            });
+            return Ok(());
+        }
         let (collection, collection_type) = lower_collection_local(collection, context)?;
         let info = context.collection_type(collection_type).clone();
         let index_type = info
@@ -9878,9 +11623,18 @@ fn lower_assignment(
         let value = lower_rvalue_as_expected(&assignment.value, info.value, context)?;
         let index = local_rvalue(index.0, index.1, true);
         if info.key.is_some() && info.uses_core_operations() {
-            return core_collection::set(collection, &info, index, value, *span, context);
+            return core_collection::set(
+                collection,
+                &info,
+                index,
+                value,
+                *span,
+                Some(*span),
+                context,
+            );
         }
         context.push_statement(mir::Statement::AssignCollectionIndex {
+            index_span: *span,
             positional: false,
             collection,
             index,
@@ -9891,6 +11645,18 @@ fn lower_assignment(
     }
     let target = lower_assignment_target(target, context)?;
     let target_type = context.local_type(target);
+    ensure_local_assignment_ownership(target, assignment.span, context)?;
+    let value = lower_rvalue_as_expected(&assignment.value, target_type, context)?;
+    context.push_statement(mir::Statement::AssignLocal { target, value });
+    Ok(())
+}
+
+fn ensure_local_assignment_ownership(
+    target: mir::LocalId,
+    span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<()> {
+    let target_type = context.local_type(target);
     if user_local_type_owns_value(target_type)
         && !context.local_owns(target)
         && !context.local_may_replace_borrowed_value(target)
@@ -9899,19 +11665,17 @@ fn lower_assignment(
             Diagnostic::new(
                 "E0505",
                 "this compiler version cannot replace the class value held through a borrowed parameter",
-                assignment.span,
+                span,
             )
             .with_help("mutate the object's writable properties, or use a `take` parameter when the callee should own a replacement")
         } else {
             unsupported(
-                assignment.span,
+                span,
                 format!("this compiler version cannot replace a borrowed {target_type} value"),
             )
         };
         return Err(vec![diagnostic]);
     }
-    let value = lower_rvalue_as_expected(&assignment.value, target_type, context)?;
-    context.push_statement(mir::Statement::AssignLocal { target, value });
     Ok(())
 }
 
@@ -9980,6 +11744,9 @@ fn lower_increment_value(
         }
         mir::ScalarType::Bool => Err(vec![unsupported(span, "bool increment is invalid")]),
         mir::ScalarType::Enum(_) => Err(vec![unsupported(span, "enum increment is invalid")]),
+        mir::ScalarType::Inline(_) => {
+            Err(vec![unsupported(span, "inline value increment is invalid")])
+        }
     }
 }
 
@@ -10065,6 +11832,7 @@ fn lower_string_expression(
             )]);
         }
         return Ok(mir::StringExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             collection,
             index: Box::new(index),
@@ -10149,6 +11917,7 @@ fn lower_string_expression(
             let (collection, index) =
                 lower_collection_index_operand(collection, index, mir::Type::String, context)?;
             Ok(mir::StringExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 collection,
                 index: Box::new(index),
@@ -10183,7 +11952,7 @@ fn lower_string_expression(
                         lowered.push(mir::StringExpression::Literal(text.clone()));
                     }
                     hir::InterpolatedStringPart::Expr(expr) => {
-                        lowered.push(lower_display_string_expression(expr, context)?);
+                        lowered.push(lower_display_string_argument(expr, context)?);
                     }
                 }
             }
@@ -10212,6 +11981,7 @@ fn lower_string_expression(
                 )]);
             }
             Ok(mir::StringExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args: lower_call_args(name, args, signature, *span, context)?,
             })
@@ -10239,6 +12009,7 @@ fn lower_string_expression(
                 return Err(vec![unsupported(*span, "method does not return string")]);
             }
             Ok(mir::StringExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
             })
@@ -10259,6 +12030,7 @@ fn lower_string_expression(
                 )]);
             }
             Ok(mir::StringExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
             })
@@ -10295,6 +12067,11 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if context.resolved_expression_type(expr)? == ResolvedType::String {
+        return Ok(mir::NullableStringExpression::String(
+            lower_string_expression(expr, context)?,
+        ));
+    }
     if let Some(mir::Rvalue::NullableString(value)) =
         materialize_checked_rvalue(expr, mir::Type::NullableString, false, context)?
     {
@@ -10337,6 +12114,7 @@ fn lower_nullable_string_expression(
             )]);
         }
         return Ok(mir::NullableStringExpression::DictionaryGet {
+            index_span: expr.span(),
             collection,
             key: Box::new(key),
             access,
@@ -10377,6 +12155,7 @@ fn lower_nullable_string_expression(
             property,
             null_safe: true,
             span,
+            ..
         } => {
             if property == "message"
                 && is_error_interface_receiver(context.expression_type(object)?, context)
@@ -10462,6 +12241,7 @@ fn lower_nullable_string_expression(
                 context,
             )?;
             Ok(mir::NullableStringExpression::DictionaryGet {
+                index_span: expr.span(),
                 collection,
                 key: Box::new(key),
                 access: mir::NullableCollectionAccess::Index,
@@ -10520,7 +12300,7 @@ fn lower_nullable_string_expression(
                     return Err(vec![unsupported(
                         *span,
                         "read_line expects at most 1 argument",
-                    )])
+                    )]);
                 }
             };
             Ok(mir::NullableStringExpression::ReadLine {
@@ -10533,6 +12313,7 @@ fn lower_nullable_string_expression(
             match signature.return_type {
                 mir::ReturnType::Value(mir::Type::NullableString) => {
                     Ok(mir::NullableStringExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         args: lower_call_args(name, args, signature, *span, context)?,
                     })
@@ -10565,6 +12346,7 @@ fn lower_nullable_string_expression(
                 )]);
             }
             Ok(mir::NullableStringExpression::NullSafeCall {
+                span: expr.span(),
                 object: Box::new(object),
                 function: signature.id,
                 args,
@@ -10587,6 +12369,7 @@ fn lower_nullable_string_expression(
                     )]);
                 }
                 return Ok(mir::NullableStringExpression::DictionaryGet {
+                    index_span: expr.span(),
                     collection,
                     key: Box::new(key),
                     access,
@@ -10597,12 +12380,14 @@ fn lower_nullable_string_expression(
             match signature.return_type {
                 mir::ReturnType::Value(mir::Type::NullableString) => {
                     Ok(mir::NullableStringExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         args,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::String) => Ok(
                     mir::NullableStringExpression::String(mir::StringExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         args,
                     }),
@@ -10625,12 +12410,14 @@ fn lower_nullable_string_expression(
             match signature.return_type {
                 mir::ReturnType::Value(mir::Type::NullableString) => {
                     Ok(mir::NullableStringExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         args,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::String) => Ok(
                     mir::NullableStringExpression::String(mir::StringExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         args,
                     }),
@@ -10651,14 +12438,68 @@ fn lower_nullable_string_expression(
     }
 }
 
+fn lower_nullable_inline_expression(
+    expr: &hir::Expr,
+    ty: crate::inline_value::InlineValueType,
+    owned: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableScalarExpression> {
+    let value = lower_nullable_scalar_expression(expr, mir::ScalarType::Inline(ty), context)?;
+    if !owned || !ty.requires_owned_cleanup() {
+        return Ok(value);
+    }
+    Ok(own_nullable_inline_expression(value, ty))
+}
+
+fn own_nullable_inline_expression(
+    value: mir::NullableScalarExpression,
+    ty: crate::inline_value::InlineValueType,
+) -> mir::NullableScalarExpression {
+    if value.owned_inline_temporary() || matches!(value, mir::NullableScalarExpression::Null(_)) {
+        return value;
+    }
+    match value {
+        mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+            mir::NullableScalarExpression::Coalesce {
+                ty: mir::ScalarType::Inline(ty),
+                left: Box::new(own_nullable_inline_expression(*left, ty)),
+                right: Box::new(own_nullable_inline_expression(*right, ty)),
+            }
+        }
+        value => mir::NullableScalarExpression::InlineClaim {
+            ty,
+            value: Box::new(value),
+            mode: mir::InlineValueUseMode::Copy,
+        },
+    }
+}
+
 fn lower_nullable_scalar_expression(
     expr: &hir::Expr,
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if expected == mir::ScalarType::Integer(IntegerType::Int64) {
+        if let Some(value) = byte_region::nullable_length(expr, context)? {
+            return Ok(value);
+        }
+    }
     if let Some(mir::Rvalue::NullableScalar(value)) =
         materialize_checked_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
     {
+        return Ok(value);
+    }
+    if let Some(value) = context.constant_value(expr).cloned() {
+        let mir::Rvalue::NullableScalar(value) = lower_const_rvalue(
+            &value,
+            mir::Type::NullableScalar(expected),
+            expr.span(),
+            &context.semantic_info.enums,
+            &mut |ty| context.mir_resolved_type(ty),
+        )?
+        else {
+            unreachable!("nullable scalar constant lowered to another MIR type");
+        };
         return Ok(value);
     }
     if is_branching_expr(expr) {
@@ -10710,6 +12551,7 @@ fn lower_nullable_scalar_expression(
             )]);
         }
         return Ok(mir::NullableScalarExpression::DictionaryGet {
+            index_span: expr.span(),
             ty: expected,
             collection,
             key: Box::new(key),
@@ -10792,6 +12634,7 @@ fn lower_nullable_scalar_expression(
             property,
             null_safe: true,
             span,
+            ..
         } => {
             let (object, property, ty) =
                 lower_null_safe_property(object, property, *span, context)?;
@@ -10843,6 +12686,7 @@ fn lower_nullable_scalar_expression(
                 context,
             )?;
             Ok(mir::NullableScalarExpression::DictionaryGet {
+                index_span: expr.span(),
                 ty: expected,
                 collection,
                 key: Box::new(key),
@@ -10893,6 +12737,7 @@ fn lower_nullable_scalar_expression(
                         ty: expected,
                         function: signature.id,
                         args: lower_call_args(name, args, signature, *span, context)?,
+                        span: *span,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Scalar(actual)) if actual == expected => {
@@ -10931,6 +12776,7 @@ fn lower_nullable_scalar_expression(
                 object: Box::new(object),
                 function: signature.id,
                 args,
+                span: *span,
             })
         }
         hir::Expr::MethodCall {
@@ -10950,6 +12796,7 @@ fn lower_nullable_scalar_expression(
                     )]);
                 }
                 return Ok(mir::NullableScalarExpression::DictionaryGet {
+                    index_span: expr.span(),
                     ty: expected,
                     collection,
                     key: Box::new(key),
@@ -10964,6 +12811,7 @@ fn lower_nullable_scalar_expression(
                         ty: expected,
                         function: signature.id,
                         args,
+                        span: *span,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Scalar(actual)) if actual == expected => {
@@ -10971,6 +12819,7 @@ fn lower_nullable_scalar_expression(
                         expected,
                         signature.id,
                         args,
+                        *span,
                     )))
                 }
                 _ => Err(vec![unsupported(
@@ -10994,6 +12843,7 @@ fn lower_nullable_scalar_expression(
                         ty: expected,
                         function: signature.id,
                         args,
+                        span: *span,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Scalar(actual)) if actual == expected => {
@@ -11001,6 +12851,7 @@ fn lower_nullable_scalar_expression(
                         expected,
                         signature.id,
                         args,
+                        *span,
                     )))
                 }
                 _ => Err(vec![unsupported(
@@ -11075,10 +12926,13 @@ fn lower_nullable_class_expression(
                 target: local,
                 value,
             });
-            return Ok(mir::NullableClassExpression::Local {
+            return Ok(mir::NullableClassExpression::Upcast {
                 class: expected,
-                local,
-                transfer: owned && transfer,
+                value: Box::new(mir::NullableClassExpression::Local {
+                    class: actual,
+                    local,
+                    transfer: owned && transfer,
+                }),
             });
         }
     }
@@ -11121,6 +12975,7 @@ fn lower_nullable_class_expression(
             )]);
         }
         return Ok(mir::NullableClassExpression::DictionaryGet {
+            index_span: expr.span(),
             class: expected,
             collection,
             key: Box::new(key),
@@ -11188,6 +13043,15 @@ fn lower_nullable_class_expression(
                         expr, expected, transfer, context,
                     )?))
                 }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context.exact_mixed_local(expr).is_some_and(|(_, narrowed)| {
+                        matches!(narrowed, mir::Type::Class(class) if context.class_is_subtype(class, expected))
+                    }) =>
+                {
+                    Ok(mir::NullableClassExpression::Class(lower_class_expression(
+                        expr, expected, transfer, context,
+                    )?))
+                }
                 _ => Err(vec![unsupported(
                     *span,
                     "expected nullable class expression",
@@ -11205,21 +13069,14 @@ fn lower_nullable_class_expression(
                     mir::SharedPayload::Class(expected),
                 )) =>
         {
-            Ok(mir::NullableClassExpression::SharedPayload {
-                class: expected,
-                reference: Box::new(lower_nullable_shared_reference_expression(
-                    object,
-                    mir::SharedPayload::Class(expected),
-                    false,
-                    context,
-                )?),
-            })
+            lower_nullable_payload_expression(object, expected, context)
         }
         hir::Expr::PropertyAccess {
             object,
             property,
             null_safe: true,
             span,
+            ..
         } => {
             let (object, property, ty) =
                 lower_null_safe_property(object, property, *span, context)?;
@@ -11267,7 +13124,7 @@ fn lower_nullable_class_expression(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
+        } if context.expression_type(expr)? == mir::Type::NullableClass(expected) => {
             if transfer {
                 return Err(vec![unsupported(
                     expr.span(),
@@ -11281,6 +13138,7 @@ fn lower_nullable_class_expression(
                 context,
             )?;
             Ok(mir::NullableClassExpression::DictionaryGet {
+                index_span: expr.span(),
                 class: expected,
                 collection,
                 key: Box::new(key),
@@ -11297,6 +13155,7 @@ fn lower_nullable_class_expression(
                         class: expected,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
+                        span: *span,
                         args: lower_call_args_with_ownership(
                             name, args, signature, *span, context,
                         )?,
@@ -11336,6 +13195,7 @@ fn lower_nullable_class_expression(
                 )]);
             }
             Ok(mir::NullableClassExpression::NullSafeCall {
+                span: expr.span(),
                 class: expected,
                 object: Box::new(object),
                 function: signature.id,
@@ -11360,6 +13220,7 @@ fn lower_nullable_class_expression(
                     )]);
                 }
                 return Ok(mir::NullableClassExpression::DictionaryGet {
+                    index_span: expr.span(),
                     class: expected,
                     collection,
                     key: Box::new(key),
@@ -11377,6 +13238,7 @@ fn lower_nullable_class_expression(
                         function: signature.id,
                         args,
                         return_borrow: signature.return_borrow,
+                        span: *span,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Class(actual))
@@ -11388,6 +13250,7 @@ fn lower_nullable_class_expression(
                             function: signature.id,
                             args,
                             return_borrow: signature.return_borrow,
+                            span: *span,
                         },
                     ))
                 }
@@ -11415,6 +13278,7 @@ fn lower_nullable_class_expression(
                         function: signature.id,
                         args,
                         return_borrow: signature.return_borrow,
+                        span: *span,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Class(actual))
@@ -11426,6 +13290,7 @@ fn lower_nullable_class_expression(
                             function: signature.id,
                             args,
                             return_borrow: signature.return_borrow,
+                            span: *span,
                         },
                     ))
                 }
@@ -11500,7 +13365,17 @@ fn lower_null_safe_method_call(
     Vec<mir::Rvalue>,
 )> {
     let (class, signature) = lookup_null_safe_method(object, method, span, context)?;
-    let object = lower_nullable_payload_expression(object, class, context)?;
+    let object = if signature.receiver_mode == Some(mir::ReceiverMode::Consuming) {
+        let value = lower_nullable_class_expression(object, class, true, context)?;
+        let local = materialize_call_receiver(mir::Rvalue::NullableClass(value), false, context);
+        mir::NullableClassExpression::Local {
+            class,
+            local,
+            transfer: true,
+        }
+    } else {
+        lower_nullable_payload_expression(object, class, context)?
+    };
     let args = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
     Ok((object, signature, args))
 }
@@ -11543,14 +13418,21 @@ fn lower_nullable_payload_expression(
         mir::Type::NullableSharedReference(mir::SharedPayload::Class(actual))
             if actual == class =>
         {
+            let reference = lower_nullable_shared_reference_expression(
+                object,
+                mir::SharedPayload::Class(class),
+                false,
+                context,
+            )?;
+            let mir::Rvalue::NullableSharedReference(reference) = stabilize_shared_payload_source(
+                mir::Rvalue::NullableSharedReference(reference),
+                context,
+            ) else {
+                unreachable!("nullable shared payload source retains its type")
+            };
             Ok(mir::NullableClassExpression::SharedPayload {
                 class,
-                reference: Box::new(lower_nullable_shared_reference_expression(
-                    object,
-                    mir::SharedPayload::Class(class),
-                    false,
-                    context,
-                )?),
+                reference: Box::new(reference),
             })
         }
         ty @ (mir::Type::NullableReadonlySharedReferenceAccess(mir::SharedPayload::Class(
@@ -11588,6 +13470,47 @@ fn lower_nullable_payload_expression(
     } else {
         Ok(value)
     }
+}
+
+fn stabilize_shared_payload_source(
+    value: mir::Rvalue,
+    context: &mut LoweringContext,
+) -> mir::Rvalue {
+    if value.owned_temporary_shared().is_none() {
+        return value;
+    }
+    // A payload view does not own its control block. Once that view crosses
+    // into a local or CFG continuation, retain the actual temporary owner for
+    // the complete statement, just as shared access registrations are retained.
+    let ty = value.ty();
+    let owner = context.declare_owned_temp(ty);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: owner,
+        value,
+    });
+    local_rvalue(owner, ty, false)
+}
+
+fn lower_shared_class_payload(
+    object: &hir::Expr,
+    class: ClassId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::ClassExpression> {
+    let reference = lower_shared_reference_expression(
+        object,
+        mir::SharedPayload::Class(class),
+        false,
+        context,
+    )?;
+    let mir::Rvalue::SharedReference(reference) =
+        stabilize_shared_payload_source(mir::Rvalue::SharedReference(reference), context)
+    else {
+        unreachable!("shared payload source retains its type")
+    };
+    Ok(mir::ClassExpression::SharedPayload {
+        class,
+        reference: Box::new(reference),
+    })
 }
 
 fn lower_nullable_access_class_payload(
@@ -11694,22 +13617,40 @@ fn lower_format_expression(
         .map(|argument| &argument.value)
         .zip(specs)
         .map(|(argument, spec)| {
-            materialize_nested_collection_places(argument, false, context)?;
             if spec.conversion == FormatConversion::Display {
-                let lowered = lower_display_string_expression(argument, context)?;
-                if inferred_class_type(argument, context).is_some() {
-                    Ok(mir::FormatArgument::ClassDisplay(lowered))
-                } else {
-                    Ok(mir::FormatArgument::String(lowered))
-                }
+                // Display conversion has already executed into a string slot.
+                lower_display_string_argument(argument, context).map(mir::FormatArgument::String)
             } else if is_string_local_initializer(argument, context) {
-                lower_string_expression(argument, context).map(mir::FormatArgument::String)
+                materialize_string_before_later_argument(argument, context)
+                    .map(mir::FormatArgument::String)
             } else {
-                lower_value_expression(argument, context).map(mir::FormatArgument::Value)
+                let ty = context.expression_type(argument)?;
+                let mir::Rvalue::Value(value) = lower_call_argument(
+                    argument,
+                    ty,
+                    mir::FunctionParameterMode::Readonly,
+                    context,
+                )?
+                else {
+                    unreachable!("checked numeric format argument must be scalar");
+                };
+                Ok(mir::FormatArgument::Value(value))
             }
         })
         .collect::<DiagnosticResult<Vec<_>>>()?;
     Ok(mir::FormatExpression { pieces, arguments })
+}
+
+fn lower_display_string_argument(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::StringExpression> {
+    materialize_nested_collection_places(expr, false, context)?;
+    let value = lower_display_string_expression(expr, context)?;
+    if matches!(value, mir::StringExpression::Literal(_)) {
+        return Ok(value);
+    }
+    Ok(materialize_string_value(value, context))
 }
 
 fn lower_display_string_expression(
@@ -11751,6 +13692,7 @@ fn lower_display_string_expression(
         }
         if signature.checked_effects.is_empty() {
             return Ok(mir::StringExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
             });
@@ -11761,6 +13703,10 @@ fn lower_display_string_expression(
         return Ok(mir::StringExpression::Local(local));
     }
     match ty {
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => Err(vec![unsupported(
+            expr.span(),
+            "byte regions do not have an implicit display representation",
+        )]),
         mir::Type::String => lower_string_expression(expr, context),
         mir::Type::Scalar(_) => {
             lower_value_expression(expr, context).map(mir::StringExpression::Display)
@@ -11844,19 +13790,8 @@ fn append_string_concat_parts(
             parts.push(mir::StringExpression::Literal(value.clone()));
             Ok(())
         }
-        hir::Expr::Variable { name, span } => {
-            let local = context.lookup_local(name, *span)?;
-            if context.local_type(local) == mir::Type::String {
-                parts.push(mir::StringExpression::Local(local));
-            } else if context.local_type(local) == mir::Type::NullableString {
-                parts.push(mir::StringExpression::NullableLocalAssumeNonNull(local));
-            } else {
-                parts.push(lower_display_string_expression(expr, context)?);
-            }
-            Ok(())
-        }
         _ => {
-            parts.push(lower_display_string_expression(expr, context)?);
+            parts.push(lower_display_string_argument(expr, context)?);
             Ok(())
         }
     }
@@ -11935,6 +13870,11 @@ fn lower_call_argument(
     mode: mir::FunctionParameterMode,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    materialize_nested_collection_places(
+        argument,
+        mode == mir::FunctionParameterMode::Writable,
+        context,
+    )?;
     let value = match mode {
         mir::FunctionParameterMode::Take => lower_rvalue_as_expected(argument, expected, context),
         mir::FunctionParameterMode::Readonly => {
@@ -11960,10 +13900,12 @@ fn lower_call_argument(
     // return a borrow that is consumed after its own continuation boundary.
     // Stage other observable arguments here too, in source order, so adding a
     // later owner cannot move its evaluation before an earlier inline call.
-    // Writable arguments retain their exact place; Take still transfers the
-    // staged value into the callee, with cleanup if a later argument fails.
+    // A staged Move borrow retains its original home while retiring traversal
+    // aliases. Copy writable arguments must keep their original place directly.
+    // Take transfers the staged value, with cleanup if a later argument fails.
     if rvalue_has_owned_temporary(&value)
-        || (mode != mir::FunctionParameterMode::Writable
+        || ((mode != mir::FunctionParameterMode::Writable
+            || (expected.has_move_ownership() && value.borrows_move_value()))
             && argument_evaluation_is_observable(argument))
     {
         Ok(hoist_argument_temporary(value, expected, mode, context))
@@ -12028,7 +13970,6 @@ fn lower_call_args_with_ownership(
         let expected = signature.parameter_types[param_index];
         let mode = signature.parameter_modes[param_index];
         let value = &arg.value;
-        materialize_nested_collection_places(value, false, context)?;
         let lowered = lower_call_argument(value, expected, mode, context)?;
         if lowered.ty() != expected {
             return Err(vec![Diagnostic::new(
@@ -12053,8 +13994,8 @@ fn lower_call_args_with_ownership(
         &signature,
         span,
         &mut lowered_args,
-        &context.enum_types,
-        context.semantic_info,
+        &context.semantic_info.enums,
+        &mut |ty| context.mir_resolved_type(ty),
     )?;
 
     Ok(lowered_args
@@ -12112,6 +14053,15 @@ fn hoist_argument_temporary(
 ) -> mir::Rvalue {
     let borrowed_move_value = value.borrows_move_value();
     let local = match ty {
+        mir::Type::ByteRegion(kind) | mir::Type::NullableByteRegion(kind) => {
+            let owned = kind.is_writable() && !borrowed_move_value;
+            context.declare_checked_call_slot(ty, owned)
+        }
+        mir::Type::Scalar(_) | mir::Type::NullableScalar(_)
+            if ty.requires_owned_cleanup() && !borrowed_move_value =>
+        {
+            context.declare_owned_temp(ty)
+        }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {
             context.declare_borrowed_temp(ty, false)
         }
@@ -12171,7 +14121,7 @@ fn hoist_argument_temporary(
         target: local,
         value,
     });
-    read_local_as_rvalue(local, ty, mode == mir::FunctionParameterMode::Take)
+    pending_owned_rvalue(local, ty, mode == mir::FunctionParameterMode::Take)
 }
 
 /// Read a temporary local back as an rvalue of its own type.
@@ -12180,7 +14130,7 @@ fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type, transfer_owned: bool
     // source-level Copy. Borrowing its storage would leave managed payloads
     // owned only by the source local.
     let transfer = transfer_owned
-        && (ty.has_move_ownership()
+        && (ty.requires_owned_cleanup()
             || matches!(
                 ty,
                 mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
@@ -12198,8 +14148,8 @@ fn splice_omitted_parameter_defaults(
     signature: &FunctionSignature,
     span: Span,
     args: &mut [Option<mir::Rvalue>],
-    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
-    semantic_info: &SemanticInfo,
+    enums: &[crate::semantics::EnumSemanticInfo],
+    resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
 ) -> DiagnosticResult<()> {
     for index in 0..signature.parameter_types.len() {
         if bound.param_to_arg[index].is_some() {
@@ -12221,8 +14171,8 @@ fn splice_omitted_parameter_defaults(
             value,
             signature.parameter_types[index],
             span,
-            enum_types,
-            semantic_info,
+            enums,
+            resolve_type,
         )?);
     }
     Ok(())
@@ -12232,8 +14182,8 @@ fn lower_const_rvalue(
     value: &crate::const_eval::ConstValue,
     expected: mir::Type,
     span: Span,
-    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
-    semantic_info: &SemanticInfo,
+    enums: &[crate::semantics::EnumSemanticInfo],
+    resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
 ) -> DiagnosticResult<mir::Rvalue> {
     if let (crate::const_eval::ConstValue::String(value), mir::Type::String) = (value, expected) {
         return Ok(mir::Rvalue::String(mir::StringExpression::Literal(
@@ -12271,32 +14221,32 @@ fn lower_const_rvalue(
                 )]);
             }
         };
-        if value.enum_id != expected.id {
+        let case = resolve_const_enum(&value.value, expected.id, enums, span)?;
+        if value.fields.len() != case.payload.len() {
             return Err(vec![Diagnostic::new(
                 "I2003",
-                "checked payload enum default has another enum type",
+                "enum constant payload does not match its checked case",
                 span,
             )]);
         }
         let fields = value
             .fields
             .iter()
-            .zip(&value.field_types)
-            .map(|(field, ty)| {
-                let expected =
-                    const_type_ref_to_mir(ty, enum_types, semantic_info).ok_or_else(|| {
-                        vec![Diagnostic::new(
-                            "I2003",
-                            "payload enum default field has no MIR constant type",
-                            span,
-                        )]
-                    })?;
-                lower_const_rvalue(field, expected, span, enum_types, semantic_info)
+            .zip(&case.payload)
+            .map(|(field, payload)| {
+                let expected = resolve_type(&payload.ty).ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I2003",
+                        "payload enum default field has no MIR constant type",
+                        span,
+                    )]
+                })?;
+                lower_const_rvalue(field, expected, span, enums, resolve_type)
             })
             .collect::<DiagnosticResult<Vec<_>>>()?;
         let value = mir::PayloadEnumExpression::Construct {
             ty: expected,
-            case: value.case_id,
+            case: case.id,
             fields,
             span,
         };
@@ -12307,7 +14257,11 @@ fn lower_const_rvalue(
         });
     }
 
-    let value = match (value, expected) {
+    let scalar_expected = match expected {
+        mir::Type::NullableScalar(ty) => mir::Type::Scalar(ty),
+        other => other,
+    };
+    let value = match (value, scalar_expected) {
         (
             crate::const_eval::ConstValue::Integer(value),
             mir::Type::Scalar(mir::ScalarType::Integer(integer)),
@@ -12328,8 +14282,12 @@ fn lower_const_rvalue(
         (
             crate::const_eval::ConstValue::Enum(value),
             mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
-        ) if value.enum_id == enum_id => {
-            mir::ValueExpression::Enum(mir::EnumExpression::Case(*value))
+        ) => {
+            let case = resolve_const_enum(value, enum_id, enums, span)?;
+            mir::ValueExpression::Enum(mir::EnumExpression::Case(crate::enums::EnumValue {
+                enum_id,
+                case_id: case.id,
+            }))
         }
         _ => {
             return Err(vec![Diagnostic::new(
@@ -12339,66 +14297,11 @@ fn lower_const_rvalue(
             )]);
         }
     };
-    Ok(mir::Rvalue::Value(value))
-}
-
-fn const_type_ref_to_mir(
-    ty: &crate::types::TypeRef,
-    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
-    semantic_info: &SemanticInfo,
-) -> Option<mir::Type> {
-    if !ty.arguments.is_empty() {
-        return None;
-    }
-    if let Some(integer) = IntegerType::from_source_name(&ty.name) {
-        let scalar = mir::ScalarType::Integer(integer);
-        return Some(if ty.nullable {
-            mir::Type::NullableScalar(scalar)
-        } else {
-            mir::Type::Scalar(scalar)
-        });
-    }
-    if let Some(float) = FloatType::from_source_name(&ty.name) {
-        let scalar = mir::ScalarType::Float(float);
-        return Some(if ty.nullable {
-            mir::Type::NullableScalar(scalar)
-        } else {
-            mir::Type::Scalar(scalar)
-        });
-    }
-    match ty.name.as_str() {
-        "bool" => Some(if ty.nullable {
-            mir::Type::NullableScalar(mir::ScalarType::Bool)
-        } else {
-            mir::Type::Scalar(mir::ScalarType::Bool)
-        }),
-        "string" => Some(if ty.nullable {
-            mir::Type::NullableString
-        } else {
-            mir::Type::String
-        }),
-        name => {
-            let id = semantic_info
-                .enums
-                .iter()
-                .find(|definition| definition.name == name)?
-                .id;
-            if let Some(payload) = enum_types.get(&id).copied() {
-                Some(if ty.nullable {
-                    mir::Type::NullablePayloadEnum(payload)
-                } else {
-                    mir::Type::PayloadEnum(payload)
-                })
-            } else {
-                let scalar = mir::ScalarType::Enum(id);
-                Some(if ty.nullable {
-                    mir::Type::NullableScalar(scalar)
-                } else {
-                    mir::Type::Scalar(scalar)
-                })
-            }
-        }
-    }
+    Ok(if matches!(expected, mir::Type::NullableScalar(_)) {
+        mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value))
+    } else {
+        mir::Rvalue::Value(value)
+    })
 }
 
 fn lower_string_intrinsic_call(
@@ -12711,7 +14614,8 @@ fn string_intrinsic_signature(
     let count = parameters.len();
     Ok(FunctionSignature {
         id: mir::FunctionId(usize::MAX),
-        direct_id: None,
+        source_declaration: None,
+        direct: None,
         return_type: mir::ReturnType::Value(result),
         return_borrow: None,
         parameter_types: parameters,
@@ -12779,6 +14683,18 @@ fn lower_instance_method_call(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
+    let signature = instance_method_signature(object, method, span, context)?;
+    lower_instance_call_with_signature(object, method, args, span, signature, context)
+}
+
+/// Selects an instance call's callee without evaluating its receiver or
+/// arguments.
+fn instance_method_signature(
+    object: &hir::Expr,
+    method: &str,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<FunctionSignature> {
     let receiver_class = inferred_class_type(object, context).ok_or_else(|| {
         vec![unsupported(
             object.span(),
@@ -12786,8 +14702,7 @@ fn lower_instance_method_call(
         )]
     })?;
     let class = context.call_target_class_id(span).unwrap_or(receiver_class);
-    let signature = context.lookup_method(class, method, span)?;
-    lower_instance_call_with_signature(object, method, args, span, signature, context)
+    context.lookup_method(class, method, span)
 }
 
 fn lower_instance_call_with_signature(
@@ -12795,7 +14710,7 @@ fn lower_instance_call_with_signature(
     method: &str,
     args: &[hir::Argument],
     span: Span,
-    mut signature: FunctionSignature,
+    signature: FunctionSignature,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
     let class = signature
@@ -12810,15 +14725,50 @@ fn lower_instance_call_with_signature(
             ),
         )]);
     }
-    let receiver = lower_class_call_receiver(object, class, context)?;
+    let receiver_type = context.class_receiver_type(class);
+    let receiver = if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) = receiver_type {
+        let value = mir::Rvalue::Value(mir::ValueExpression::Inline(
+            inline_value::lower_expression(object, ty, context)?,
+        ));
+        let local = materialize_call_receiver(
+            value,
+            signature.receiver_mode == Some(mir::ReceiverMode::Writable),
+            context,
+        );
+        mir::Rvalue::Value(value_expression_from_operand(
+            mir::ScalarType::Inline(ty),
+            mir::Operand::Local(local),
+        ))
+    } else if signature.receiver_mode == Some(mir::ReceiverMode::Consuming) {
+        let actual = inferred_class_type(object, context)
+            .filter(|actual| context.class_is_subtype(*actual, class))
+            .unwrap_or(class);
+        let value = lower_class_expression(object, actual, true, context)?;
+        // Acquire the receiver before evaluating arguments. A later argument's
+        // checked failure then cleans this pending owner through the ordinary
+        // statement-temporary path, without leaving ownership at the caller.
+        let mir::Rvalue::Class(receiver) = hoist_argument_temporary(
+            mir::Rvalue::Class(value),
+            mir::Type::Class(actual),
+            mir::FunctionParameterMode::Take,
+            context,
+        ) else {
+            unreachable!("a class receiver retains its MIR type")
+        };
+        mir::Rvalue::Class(if actual == class {
+            receiver
+        } else {
+            mir::ClassExpression::Upcast {
+                class,
+                value: Box::new(receiver),
+            }
+        })
+    } else {
+        mir::Rvalue::Class(lower_class_call_receiver(object, class, context)?)
+    };
     let mut lowered =
         lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
-    lowered.insert(0, mir::Rvalue::Class(receiver));
-    if context.lifecycle_phase && matches!(unparenthesized_place(object), hir::Expr::This { .. }) {
-        if let Some(direct) = signature.direct_id {
-            signature.id = direct;
-        }
-    }
+    lowered.insert(0, receiver);
     Ok((signature, lowered))
 }
 
@@ -12827,6 +14777,10 @@ fn lower_class_call_receiver(
     class: ClassId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    let expected = class;
+    let class = inferred_class_type(object, context)
+        .filter(|actual| context.class_is_subtype(*actual, expected))
+        .unwrap_or(expected);
     let receiver = lower_class_expression(object, class, false, context)?;
     let receiver = match receiver {
         mir::ClassExpression::SharedPayload { class, reference }
@@ -12877,7 +14831,14 @@ fn lower_class_call_receiver(
     } else {
         receiver
     };
-    Ok(receiver)
+    Ok(if class == expected {
+        receiver
+    } else {
+        mir::ClassExpression::Upcast {
+            class: expected,
+            value: Box::new(receiver),
+        }
+    })
 }
 
 // Source checking records a place's available capability before capture
@@ -12903,7 +14864,7 @@ fn property_view_source_allows_writable(
             class
                 .properties
                 .iter()
-                .any(|candidate| candidate.id == property && candidate.writable)
+                .any(|candidate| candidate.id == property && candidate.permits_write_through())
         })
 }
 
@@ -12912,6 +14873,9 @@ fn class_view_source_allows_writable(
     context: &LoweringContext,
 ) -> bool {
     match value {
+        mir::ClassExpression::Upcast { value, .. } => {
+            class_view_source_allows_writable(value, context)
+        }
         mir::ClassExpression::Local { local, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { local, .. }
         | mir::ClassExpression::InterfacePayload { local, .. } => context.locals[local.0].writable,
@@ -12932,9 +14896,10 @@ fn class_view_source_allows_writable(
                 && class_view_source_allows_writable(right, context)
         }
         mir::ClassExpression::SharedAccessPayload { writable, .. } => *writable,
-        mir::ClassExpression::SharedPayload { .. } | mir::ClassExpression::MixedPayload { .. } => {
-            false
-        }
+        mir::ClassExpression::FileReadinessSource { .. }
+        | mir::ClassExpression::StandardReadinessSource { .. }
+        | mir::ClassExpression::SharedPayload { .. }
+        | mir::ClassExpression::MixedPayload { .. } => false,
     }
 }
 
@@ -12943,6 +14908,9 @@ fn nullable_class_view_source_allows_writable(
     context: &LoweringContext,
 ) -> bool {
     match value {
+        mir::NullableClassExpression::Upcast { value, .. } => {
+            nullable_class_view_source_allows_writable(value, context)
+        }
         mir::NullableClassExpression::Class(value) => {
             class_view_source_allows_writable(value, context)
         }
@@ -12970,7 +14938,7 @@ fn materialize_call_receiver(
     context: &mut LoweringContext,
 ) -> mir::LocalId {
     let ty = value.ty();
-    let owned = !value.borrows_move_value();
+    let owned = user_local_type_owns_value(ty) && !value.borrows_move_value();
     let local = context.declare_checked_call_slot(ty, owned);
     context.locals[local.0].writable = writable;
     context.push_statement(mir::Statement::AssignLocal {
@@ -12990,35 +14958,59 @@ fn lower_static_method_call(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
+    let (class, signature) = static_method_signature(class_name, method, span, context)?;
+    let receiver = if signature.receiver_mode.is_some() {
+        let receiver = context.lookup_local("this", span)?;
+        let value = mir::Rvalue::Class(mir::ClassExpression::Local {
+            class,
+            local: receiver,
+            transfer: signature.receiver_mode == Some(mir::ReceiverMode::Consuming),
+        });
+        let value = if signature.receiver_mode == Some(mir::ReceiverMode::Consuming) {
+            hoist_argument_temporary(
+                value,
+                mir::Type::Class(class),
+                mir::FunctionParameterMode::Take,
+                context,
+            )
+        } else {
+            value
+        };
+        Some(value)
+    } else {
+        None
+    };
+    let mut lowered =
+        lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
+    if let Some(receiver) = receiver {
+        lowered.insert(0, receiver);
+    }
+    Ok((signature, lowered))
+}
+
+/// Selects a `::` call's class and callee without evaluating its receiver or
+/// arguments. A direct `parent::` call selects the parent's exact contract.
+fn static_method_signature(
+    class_name: &str,
+    method: &str,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<(ClassId, FunctionSignature)> {
     let class = context
         .call_target_class_id(span)
         .or_else(|| context.class_id_for_name(class_name))
         .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
     let mut signature = context.lookup_method(class, method, span)?;
-    let direct_parent = context.call_target_is_direct_parent(span);
-    let mut lowered =
-        lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
     if signature.receiver_mode.is_some() {
-        if !direct_parent {
+        if !context.call_target_is_direct_parent(span) {
             return Err(vec![unsupported(
                 span,
                 format!("instance method `{class_name}::{method}` requires a receiver"),
             )]);
         }
-        let receiver = context.lookup_local("this", span)?;
-        lowered.insert(
-            0,
-            mir::Rvalue::Class(mir::ClassExpression::Local {
-                class,
-                local: receiver,
-                transfer: false,
-            }),
-        );
-        if let Some(direct) = signature.direct_id {
-            signature.id = direct;
-        }
+        signature.select_direct();
     }
-    Ok((signature, lowered))
+    Ok((class, signature))
 }
 
 fn lower_function_return(
@@ -13076,7 +15068,7 @@ fn lower_function_return(
                 let local = if value.is_null_value() {
                     None
                 } else {
-                    let result_owns = expected.has_move_ownership() && !borrowed_move;
+                    let result_owns = expected.requires_owned_cleanup() && !borrowed_move;
                     let result = context.declare_return_temp(expected, result_owns);
                     context.push_statement(mir::Statement::AssignLocal {
                         target: result,
@@ -13089,6 +15081,7 @@ fn lower_function_return(
                     ty: expected,
                     transfer: !borrowed_move,
                 };
+                context.push_statement(mir::Statement::SetDiagnosticSite { span });
                 if context.active_finalizers.is_empty() {
                     context.cleanup_scopes_from(0);
                     context.terminate_current(mir::Terminator::Return(value.rvalue()));
@@ -13116,185 +15109,6 @@ fn lower_function_return(
             expr.span(),
             "a `void` function cannot return a value",
         )]),
-    }
-}
-
-fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rvalue {
-    match ty {
-        mir::Type::Scalar(mir::ScalarType::Integer(ty)) => mir::Rvalue::Value(
-            mir::ValueExpression::Integer(local_integer_expression(local, ty)),
-        ),
-        mir::Type::Scalar(mir::ScalarType::Float(ty)) => mir::Rvalue::Value(
-            mir::ValueExpression::Float(local_float_expression(local, ty)),
-        ),
-        mir::Type::Scalar(mir::ScalarType::Bool) => {
-            mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
-                operand: mir::Operand::Local(local),
-            }))
-        }
-        mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => {
-            mir::Rvalue::Value(mir::ValueExpression::Enum(mir::EnumExpression::Use {
-                enum_id,
-                operand: mir::Operand::Local(local),
-            }))
-        }
-        mir::Type::String => mir::Rvalue::String(mir::StringExpression::Local(local)),
-        mir::Type::NullableScalar(ty) => {
-            mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Local { ty, local })
-        }
-        mir::Type::NullableString => {
-            mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
-        }
-        mir::Type::Mixed => mir::Rvalue::Mixed(mir::MixedExpression::Local { local, transfer }),
-        mir::Type::NullableMixed => {
-            mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, transfer })
-        }
-        mir::Type::Interface(interface) => mir::Rvalue::Interface(mir::InterfaceExpression {
-            interface,
-            value: mir::InterfaceValue::Local { local, transfer },
-        }),
-        mir::Type::NullableInterface(interface) => {
-            mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression {
-                interface,
-                value: mir::NullableInterfaceValue::Local { local, transfer },
-            })
-        }
-        mir::Type::Class(class) => mir::Rvalue::Class(mir::ClassExpression::Local {
-            class,
-            local,
-            transfer,
-        }),
-        mir::Type::NullableClass(class) => {
-            mir::Rvalue::NullableClass(mir::NullableClassExpression::Local {
-                class,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::SharedReference(class) => {
-            mir::Rvalue::SharedReference(mir::SharedReferenceExpression::Local {
-                payload: class,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::WeakReference(class) => {
-            mir::Rvalue::WeakReference(mir::WeakReferenceExpression::Local {
-                payload: class,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::NullableSharedReference(class) => {
-            mir::Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Local {
-                payload: class,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::NullableWeakReference(class) => {
-            mir::Rvalue::NullableWeakReference(mir::NullableWeakReferenceExpression::Local {
-                payload: class,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::WritableSharedReference(payload) => {
-            mir::Rvalue::WritableSharedReference(mir::WritableSharedReferenceExpression::Local {
-                payload,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::WritableWeakReference(payload) => {
-            mir::Rvalue::WritableWeakReference(mir::WritableWeakReferenceExpression::Local {
-                payload,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::NullableWritableSharedReference(payload) => {
-            mir::Rvalue::NullableWritableSharedReference(
-                mir::NullableWritableSharedReferenceExpression::Local {
-                    payload,
-                    local,
-                    transfer,
-                },
-            )
-        }
-        mir::Type::NullableWritableWeakReference(payload) => {
-            mir::Rvalue::NullableWritableWeakReference(
-                mir::NullableWritableWeakReferenceExpression::Local {
-                    payload,
-                    local,
-                    transfer,
-                },
-            )
-        }
-        mir::Type::ReadonlySharedReferenceAccess(payload)
-        | mir::Type::WritableSharedReferenceAccess(payload) => {
-            mir::Rvalue::SharedReferenceAccess(mir::SharedReferenceAccessExpression::Local {
-                payload,
-                local,
-                writable: matches!(ty, mir::Type::WritableSharedReferenceAccess(_)),
-                transfer,
-            })
-        }
-        mir::Type::NullableReadonlySharedReferenceAccess(payload)
-        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
-            mir::Rvalue::NullableSharedReferenceAccess(
-                mir::NullableSharedReferenceAccessExpression::Local {
-                    payload,
-                    local,
-                    writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
-                    transfer,
-                },
-            )
-        }
-        mir::Type::Collection(collection) => {
-            mir::Rvalue::Collection(mir::CollectionExpression::Local {
-                collection,
-                local,
-                transfer,
-                assume_non_null: false,
-            })
-        }
-        mir::Type::NullableCollection(collection) => {
-            mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Local {
-                collection,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::PayloadEnum(ty) => mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
-            ty,
-            place: mir::PayloadEnumPlace::Local(local),
-            mode: payload_enum_use_mode(ty, transfer),
-        }),
-        mir::Type::NullablePayloadEnum(ty) => {
-            mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
-                ty,
-                place: mir::PayloadEnumPlace::Local(local),
-                mode: payload_enum_use_mode(ty, transfer),
-            })
-        }
-        mir::Type::Function(function_type) => {
-            mir::Rvalue::Function(mir::FunctionExpression::Local {
-                function_type,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::NullableFunction(function_type) => {
-            mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local {
-                function_type,
-                local,
-                transfer,
-            })
-        }
-        mir::Type::ClosureEnvironment(_) => {
-            unreachable!("closure environments are compiler-private and cannot be source rvalues")
-        }
     }
 }
 
@@ -13343,16 +15157,6 @@ fn lower_when_yield(
     Ok(())
 }
 
-fn payload_enum_use_mode(ty: mir::PayloadEnumType, transfer: bool) -> mir::PayloadEnumUseMode {
-    if !transfer {
-        mir::PayloadEnumUseMode::Borrow
-    } else if ty.capabilities.copy {
-        mir::PayloadEnumUseMode::Copy
-    } else {
-        mir::PayloadEnumUseMode::Move
-    }
-}
-
 fn is_branching_expr(expr: &hir::Expr) -> bool {
     matches!(
         expr,
@@ -13371,46 +15175,27 @@ fn lower_branching_rvalue(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
-    if matches!(
-        expected,
-        mir::Type::Interface(_) | mir::Type::NullableInterface(_)
-    ) {
-        let result = match expr {
-            hir::Expr::Match { span, .. } => context
-                .semantic_info
-                .matches
-                .get(span)
-                .map(|info| &info.result_type),
-            hir::Expr::When(when) => context
-                .semantic_info
-                .whens
-                .get(&when.span)
-                .map(|info| &info.result_type),
-            _ => None,
-        }
-        .and_then(|ty| context.mir_resolved_type(ty));
-        if let Some(result) = result.filter(|result| *result != expected) {
-            let value = lower_branching_rvalue(expr, result, transfer, context)?;
-            return interface::convert_value(value, expected, expr.span(), context);
-        }
-    }
-    match expr {
-        hir::Expr::Match { .. } => lower_match_rvalue(expr, expected, transfer, context),
-        hir::Expr::When(_) => lower_when_rvalue(expr, expected, transfer, context),
+    // Branch plans own their checked result type; destination conversion follows
+    // the merge so it cannot change branch ownership or result storage.
+    let result = context.expression_type(expr)?;
+    let value = match expr {
+        hir::Expr::Match { .. } => lower_match_rvalue(expr, result, transfer, context),
+        hir::Expr::When(_) => lower_when_rvalue(expr, result, transfer, context),
         hir::Expr::Binary {
             left,
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => lower_coalesce_rvalue(left, right, expected, transfer, context),
+        } => lower_coalesce_rvalue(left, right, expr.span(), result, transfer, context),
         hir::Expr::Binary {
             op: hir::BinaryOp::And | hir::BinaryOp::Or,
             ..
-        } => lower_short_circuit_bool_rvalue(expr, expected, context),
+        } => lower_short_circuit_bool_rvalue(expr, result, context),
         _ => unreachable!(
             "branching lowering requires match, when, coalesce, or a short-circuit boolean expression"
         ),
-    }
+    }?;
+    adapt_return_value(value, expected, expr.span(), &context.collection_registry)
 }
 
 fn lower_short_circuit_bool_rvalue(
@@ -13458,6 +15243,7 @@ fn lower_short_circuit_bool_rvalue(
 fn lower_coalesce_rvalue(
     left: &hir::Expr,
     right: &hir::Expr,
+    site: Span,
     expected: mir::Type,
     transfer: bool,
     context: &mut LoweringContext,
@@ -13502,7 +15288,7 @@ fn lower_coalesce_rvalue(
         )]);
     }
 
-    let left_transfer = transfer && left_type.has_move_ownership();
+    let left_transfer = transfer && left_type.requires_owned_cleanup();
     let left_value = if left_transfer {
         lower_rvalue_as_expected(left, left_type, context)?
     } else {
@@ -13512,7 +15298,13 @@ fn lower_coalesce_rvalue(
     let left_local = if left_owned {
         context.declare_owned_temp(left_type)
     } else {
-        context.declare_borrowed_temp(left_type, false)
+        context.declare_borrowed_temp(
+            left_type,
+            context
+                .semantic_info
+                .writable_borrow_sources
+                .contains(&left.span()),
+        )
     };
     context.push_statement(mir::Statement::AssignLocal {
         target: left_local,
@@ -13528,11 +15320,17 @@ fn lower_coalesce_rvalue(
         absent_block,
     );
 
-    let result_transfer = expected.has_move_ownership() && transfer;
+    let result_transfer = expected.requires_owned_cleanup() && transfer;
     let result_local = if result_transfer {
         context.declare_return_temp(expected, true)
     } else {
-        context.declare_borrowed_temp(expected, false)
+        context.declare_borrowed_temp(
+            expected,
+            context
+                .semantic_info
+                .writable_borrow_sources
+                .contains(&site),
+        )
     };
 
     context.current_block = Some(present_block);
@@ -13549,7 +15347,12 @@ fn lower_coalesce_rvalue(
         )?
     };
     let present_value = if present_value.ty() != expected && interface_conversion {
-        interface::convert_value(present_value, expected, left.span(), context)?
+        interface::convert_value(
+            present_value,
+            expected,
+            left.span(),
+            &context.collection_registry,
+        )?
     } else {
         present_value
     };
@@ -13583,7 +15386,11 @@ fn lower_coalesce_rvalue(
     context.terminate_current(mir::Terminator::Jump(merge_block));
 
     context.current_block = Some(merge_block);
-    Ok(local_rvalue(result_local, expected, result_transfer))
+    Ok(pending_owned_rvalue(
+        result_local,
+        expected,
+        result_transfer,
+    ))
 }
 
 fn stabilize_borrowed_branch_value(
@@ -13655,9 +15462,15 @@ fn lower_match_rvalue(
                 "match scrutinee type has no native representation",
             )]
         })?;
+    // `take` in a generic body consumes only a move specialization. A Copy
+    // specialization matches its value as every Copy match does.
     let ownership_mode = match mode {
-        hir::MatchMode::Borrowed => mir::MatchOwnershipMode::Borrowed,
-        hir::MatchMode::Consumed { .. } => mir::MatchOwnershipMode::Consumed,
+        hir::MatchMode::Consumed { .. } if scrutinee_type.has_move_ownership() => {
+            mir::MatchOwnershipMode::Consumed
+        }
+        hir::MatchMode::Borrowed | hir::MatchMode::Consumed { .. } => {
+            mir::MatchOwnershipMode::Borrowed
+        }
     };
     let scrutinee_value = match ownership_mode {
         mir::MatchOwnershipMode::Borrowed => {
@@ -13679,7 +15492,7 @@ fn lower_match_rvalue(
         value: scrutinee_value,
     });
 
-    let result_transfer = expected.has_move_ownership()
+    let result_transfer = expected.requires_owned_cleanup()
         && (transfer || matches!(ownership_mode, mir::MatchOwnershipMode::Consumed));
     let result_local = if result_transfer {
         context.declare_return_temp(expected, true)
@@ -13788,6 +15601,7 @@ fn lower_match_rvalue(
         context.current_block = Some(fallback);
         context.terminate_current(mir::Terminator::Unreachable);
     }
+    let error_exit = context.conditional_error_exit();
     context.blocks[plan_block.0]
         .statements
         .push(mir::Statement::MatchResultPlan {
@@ -13796,9 +15610,14 @@ fn lower_match_rvalue(
             result: result_local,
             arms: arm_plans,
             merge: merge_block,
+            error_exit,
         });
     context.current_block = Some(merge_block);
-    Ok(local_rvalue(result_local, expected, result_transfer))
+    Ok(pending_owned_rvalue(
+        result_local,
+        expected,
+        result_transfer,
+    ))
 }
 
 fn lower_when_rvalue(
@@ -13836,7 +15655,7 @@ fn lower_when_rvalue(
         )]);
     }
 
-    let result_transfer = expected.has_move_ownership() && transfer;
+    let result_transfer = expected.requires_owned_cleanup() && transfer;
     let result_local = if result_transfer {
         context.declare_return_temp(expected, true)
     } else {
@@ -13922,6 +15741,7 @@ fn lower_when_rvalue(
 
     context.current_block = Some(next_condition);
     context.terminate_current(mir::Terminator::Unreachable);
+    let error_exit = context.conditional_error_exit();
     context.blocks[plan_block.0]
         .statements
         .push(mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::When(
@@ -13934,6 +15754,7 @@ fn lower_when_rvalue(
                 },
                 branches: branch_blocks,
                 merge: merge_block,
+                error_exit,
             },
         )));
     if given.is_some() {
@@ -13962,7 +15783,11 @@ fn lower_when_rvalue(
     // unreachable, so enclosing expression lowering can finish structurally without inventing a
     // fallthrough path or losing its current MIR block.
     context.current_block = Some(merge_block);
-    Ok(local_rvalue(result_local, expected, result_transfer))
+    Ok(pending_owned_rvalue(
+        result_local,
+        expected,
+        result_transfer,
+    ))
 }
 
 fn match_scrutinee_binding_name(expr: &hir::Expr) -> Option<&str> {
@@ -13974,7 +15799,7 @@ fn match_scrutinee_binding_name(expr: &hir::Expr) -> Option<&str> {
 }
 
 fn rvalue_has_owned_temporary(value: &mir::Rvalue) -> bool {
-    (value.ty().has_move_ownership() && !value.is_null_value() && !value.borrows_move_value())
+    (value.ty().requires_owned_cleanup() && !value.is_null_value() && !value.borrows_move_value())
         || value
             .owned_temporary_payload_enum()
             .is_some_and(|(ty, _)| ty.capabilities.needs_drop)
@@ -14018,26 +15843,50 @@ fn lower_match_pattern_to_blocks(
             let present = match_presence_condition(scrutinee, scrutinee_type)?;
             context.terminate_condition(present, next_block, arm_block);
         }
-        ResolvedMatchPattern::EnumCase { enum_id, case_id } => {
-            if let Some(ty) = context.enum_types.get(enum_id).copied() {
+        ResolvedMatchPattern::EnumCase { case_id } => {
+            let enum_id = match scrutinee_type {
+                mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => ty.id,
+                mir::Type::Scalar(mir::ScalarType::Enum(id))
+                | mir::Type::NullableScalar(mir::ScalarType::Enum(id)) => id,
+                _ => {
+                    return Err(vec![Diagnostic::new(
+                        "I2801",
+                        "enum case requires an enum scrutinee",
+                        match_pattern_span(pattern),
+                    )])
+                }
+            };
+            let source_case = *case_id;
+            let case_id = context.materialized_enum_case(
+                source_case,
+                enum_id,
+                match_pattern_span(pattern),
+            )?;
+            if let Some(ty) = context.enum_types.get(&enum_id).copied() {
                 let nullable = matches!(scrutinee_type, mir::Type::NullablePayloadEnum(_));
                 context.terminate_condition(
                     mir::BoolExpression::PayloadEnumIsCase {
                         local: scrutinee,
                         ty,
-                        case: *case_id,
+                        case: case_id,
                         nullable,
                     },
                     arm_block,
                     next_block,
                 );
             } else {
+                let definition = context
+                    .semantic_info
+                    .enums
+                    .iter()
+                    .find(|definition| definition.id == enum_id)
+                    .expect("materialized enum case has a checked definition");
                 lower_match_constant_to_blocks(
                     scrutinee,
                     scrutinee_type,
-                    &crate::const_eval::ConstValue::Enum(crate::enums::EnumValue {
-                        enum_id: *enum_id,
-                        case_id: *case_id,
+                    &crate::const_eval::ConstValue::Enum(crate::const_eval::ConstEnumValue {
+                        enum_type: definition.source_type.clone(),
+                        case: source_case,
                     }),
                     arm_block,
                     next_block,
@@ -14160,8 +16009,8 @@ fn lower_match_constant_to_blocks(
         value,
         base,
         Span::default(),
-        &context.enum_types,
-        context.semantic_info,
+        &context.semantic_info.enums,
+        &mut |ty| context.mir_resolved_type(ty),
     )?;
     let condition = match (base, constant) {
         (mir::Type::Scalar(ty), mir::Rvalue::Value(right)) => {
@@ -14217,31 +16066,8 @@ fn lower_match_constant_to_blocks(
 }
 
 fn non_null_match_type(ty: mir::Type) -> (mir::Type, bool) {
-    match ty {
-        mir::Type::NullableScalar(ty) => (mir::Type::Scalar(ty), true),
-        mir::Type::NullableString => (mir::Type::String, true),
-        mir::Type::NullableMixed => (mir::Type::Mixed, true),
-        mir::Type::NullableInterface(interface) => (mir::Type::Interface(interface), true),
-        mir::Type::NullableClass(class) => (mir::Type::Class(class), true),
-        mir::Type::NullableCollection(collection) => (mir::Type::Collection(collection), true),
-        mir::Type::NullableSharedReference(class) => (mir::Type::SharedReference(class), true),
-        mir::Type::NullableWeakReference(class) => (mir::Type::WeakReference(class), true),
-        mir::Type::NullableWritableSharedReference(payload) => {
-            (mir::Type::WritableSharedReference(payload), true)
-        }
-        mir::Type::NullableWritableWeakReference(payload) => {
-            (mir::Type::WritableWeakReference(payload), true)
-        }
-        mir::Type::NullableReadonlySharedReferenceAccess(payload) => {
-            (mir::Type::ReadonlySharedReferenceAccess(payload), true)
-        }
-        mir::Type::NullableWritableSharedReferenceAccess(payload) => {
-            (mir::Type::WritableSharedReferenceAccess(payload), true)
-        }
-        mir::Type::NullablePayloadEnum(ty) => (mir::Type::PayloadEnum(ty), true),
-        mir::Type::NullableFunction(function_type) => (mir::Type::Function(function_type), true),
-        other => (other, false),
-    }
+    let payload = crate::native_abi::nullable_payload_type(ty);
+    (payload.unwrap_or(ty), payload.is_some())
 }
 
 fn match_presence_condition(
@@ -14249,6 +16075,13 @@ fn match_presence_condition(
     ty: mir::Type,
 ) -> DiagnosticResult<mir::BoolExpression> {
     let condition = match ty {
+        mir::Type::NullableByteRegion(kind) => mir::BoolExpression::NullableByteRegionIsPresent(
+            Box::new(mir::NullableByteRegionExpression::Local {
+                kind,
+                local,
+                transfer: false,
+            }),
+        ),
         mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
             mir::NullableScalarExpression::Local { ty, local },
         )),
@@ -14400,6 +16233,8 @@ fn bind_match_arm(
                     match_pattern_span(pattern),
                 )]);
             };
+            let case_id =
+                context.materialized_enum_case(case_id, ty.id, match_pattern_span(pattern))?;
             let targets = bindings
                 .iter()
                 .zip(&info.bindings)
@@ -14410,15 +16245,12 @@ fn bind_match_arm(
                             "match payload field has no native representation",
                         )]
                     })?;
-                    let copy_payload_cleanup = matches!(
-                        ty,
-                        mir::Type::PayloadEnum(payload)
-                            | mir::Type::NullablePayloadEnum(payload)
-                            if payload.capabilities.copy && payload.capabilities.needs_drop
-                    );
-                    let owned = (matches!(mode, mir::MatchBindingMode::ConsumedArm)
-                        && ty.has_move_ownership())
-                        || copy_payload_cleanup;
+                    let copy_payload_cleanup =
+                        ty.requires_owned_cleanup() && !ty.has_move_ownership();
+                    let owned = !matches!(mode, mir::MatchBindingMode::GuardView)
+                        && ((matches!(mode, mir::MatchBindingMode::ConsumedArm)
+                            && ty.has_move_ownership())
+                            || copy_payload_cleanup);
                     let cleanup = !matches!(mode, mir::MatchBindingMode::GuardView)
                         && (owned
                             || matches!(ty, mir::Type::String | mir::Type::NullableString)
@@ -14451,13 +16283,9 @@ fn bind_match_arm(
             })?;
             let transfer =
                 matches!(mode, mir::MatchBindingMode::ConsumedArm) && ty.has_move_ownership();
-            let copy_payload_cleanup = matches!(
-                ty,
-                mir::Type::PayloadEnum(payload)
-                    | mir::Type::NullablePayloadEnum(payload)
-                    if payload.capabilities.copy && payload.capabilities.needs_drop
-            );
-            let owned = transfer || copy_payload_cleanup;
+            let copy_payload_cleanup = ty.requires_owned_cleanup() && !ty.has_move_ownership();
+            let owned = !matches!(mode, mir::MatchBindingMode::GuardView)
+                && (transfer || copy_payload_cleanup);
             let cleanup = !matches!(mode, mir::MatchBindingMode::GuardView)
                 && (owned || matches!(ty, mir::Type::String | mir::Type::NullableString));
             let target = context.declare_pattern_local(&binding.name, ty, owned, cleanup);
@@ -14465,7 +16293,7 @@ fn bind_match_arm(
                 scrutinee,
                 scrutinee_type,
                 ty,
-                transfer,
+                owned,
                 binding.span,
                 context,
             )?;
@@ -14485,11 +16313,32 @@ fn narrowed_match_local_rvalue(
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
     let value = match (source, narrowed) {
+        (mir::Type::NullableByteRegion(source), mir::Type::ByteRegion(target))
+            if source == target =>
+        {
+            mir::Rvalue::ByteRegion(mir::ByteRegionExpression::AssumePresent {
+                kind: target,
+                value: Box::new(mir::NullableByteRegionExpression::Local {
+                    kind: target,
+                    local,
+                    transfer: transfer && target.is_writable(),
+                }),
+            })
+        }
         (mir::Type::NullableScalar(source), mir::Type::Scalar(target)) if source == target => {
-            mir::Rvalue::Value(value_expression_from_operand(
-                target,
-                mir::Operand::NullablePayload(local),
-            ))
+            let operand = mir::Operand::NullablePayload(local);
+            match target {
+                mir::ScalarType::Inline(ty) if transfer && ty.requires_owned_cleanup() => {
+                    mir::Rvalue::Value(mir::ValueExpression::Inline(
+                        mir::InlineValueExpression::Use {
+                            ty,
+                            operand,
+                            mode: mir::InlineValueUseMode::Copy,
+                        },
+                    ))
+                }
+                _ => mir::Rvalue::Value(value_expression_from_operand(target, operand)),
+            }
         }
         (mir::Type::NullableString, mir::Type::String) => {
             mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local))
@@ -14608,11 +16457,8 @@ fn narrowed_match_local_rvalue(
                 transfer,
             })
         }
-        (mir::Type::NullableMixed, mir::Type::Mixed) if !transfer => {
-            mir::Rvalue::Mixed(mir::MixedExpression::Local {
-                local,
-                transfer: false,
-            })
+        (mir::Type::NullableMixed, mir::Type::Mixed) => {
+            mir::Rvalue::Mixed(mir::MixedExpression::Local { local, transfer })
         }
         (mir::Type::NullablePayloadEnum(source), mir::Type::PayloadEnum(target))
             if source == target =>
@@ -14634,13 +16480,22 @@ fn narrowed_match_local_rvalue(
             })
         }
         (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Scalar(target)) => {
-            mir::Rvalue::Value(value_expression_from_operand(
-                target,
-                mir::Operand::MixedPayload {
-                    mixed: local,
-                    tag: mixed_tag_for_type(mir::Type::Scalar(target), span)?,
-                },
-            ))
+            let operand = mir::Operand::MixedPayload {
+                mixed: local,
+                tag: mixed_tag_for_type(mir::Type::Scalar(target), span)?,
+            };
+            match target {
+                mir::ScalarType::Inline(ty) if transfer && ty.requires_owned_cleanup() => {
+                    mir::Rvalue::Value(mir::ValueExpression::Inline(
+                        mir::InlineValueExpression::Use {
+                            ty,
+                            operand,
+                            mode: mir::InlineValueUseMode::Copy,
+                        },
+                    ))
+                }
+                _ => mir::Rvalue::Value(value_expression_from_operand(target, operand)),
+            }
         }
         (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::String) => {
             mir::Rvalue::String(mir::StringExpression::MixedPayload(local))
@@ -14766,6 +16621,12 @@ fn reroute_condition_target(
             success, failure, ..
         }
         | mir::Terminator::CheckedIo {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedDeadlineFromNow {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedCancellationRequest {
             success, failure, ..
         } => {
             if *success == from {
@@ -14958,7 +16819,7 @@ fn lower_condition(
             object, property, ..
         } => {
             if property == "isEmpty" {
-                if let Some((collection, _)) = lower_collection_receiver(object, context)? {
+                if let Some((collection, _)) = lower_collection_receiver(object, false, context)? {
                     return Ok(mir::BoolExpression::CollectionIsEmpty { collection });
                 }
             }
@@ -14979,6 +16840,7 @@ fn lower_condition(
             )?;
             Ok(mir::BoolExpression::Use {
                 operand: mir::Operand::CollectionIndex {
+                    index_span: expr.span(),
                     positional: false,
                     collection,
                     index: Box::new(index),
@@ -15017,11 +16879,16 @@ fn lower_condition(
             | hir::BinaryOp::Greater
             | hir::BinaryOp::GreaterEqual => {
                 if matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
+                    && !matches!(unparenthesized_place(left), hir::Expr::Null { .. })
                     && !matches!(unparenthesized_place(right), hir::Expr::Null { .. })
-                    && matches!(
+                    && (matches!(
                         non_null_match_type(context.expression_type(left)?).0,
                         mir::Type::Class(_)
-                    )
+                    ) || matches!(context.expression_type(left)?, mir::Type::NullableScalar(_))
+                        || matches!(
+                            context.expression_type(right)?,
+                            mir::Type::NullableScalar(_)
+                        ))
                 {
                     core_value::lower_equality(
                         left,
@@ -15121,8 +16988,8 @@ fn lower_condition(
                         left: Box::new(lower_nullable_string_expression(left, context)?),
                         right: Box::new(lower_nullable_string_expression(right, context)?),
                     })
-                } else if is_string_local_initializer(left, context)
-                    || is_string_local_initializer(right, context)
+                } else if context.expression_type(left)? == mir::Type::String
+                    || context.expression_type(right)? == mir::Type::String
                 {
                     Ok(mir::BoolExpression::StringCompare {
                         op: lower_compare_op(op),
@@ -15160,6 +17027,7 @@ fn lower_condition(
                 )]);
             }
             Ok(mir::BoolExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args: lower_call_args(name, args, signature, *span, context)?,
             })
@@ -15180,6 +17048,7 @@ fn lower_condition(
                 }
                 return Ok(mir::BoolExpression::Use {
                     operand: mir::Operand::CollectionIndex {
+                        index_span: expr.span(),
                         positional: false,
                         collection,
                         index: Box::new(index),
@@ -15187,7 +17056,8 @@ fn lower_condition(
                     },
                 });
             }
-            if let Some((collection, collection_type)) = lower_collection_receiver(object, context)?
+            if let Some((collection, collection_type)) =
+                lower_collection_receiver(object, collection_method_mutates(method), context)?
             {
                 let info = context.collection_type(collection_type).clone();
                 let op = match (info.kind, method.as_str()) {
@@ -15245,6 +17115,7 @@ fn lower_condition(
                 return Err(vec![unsupported(*span, "method does not return bool")]);
             }
             Ok(mir::BoolExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
             })
@@ -15267,6 +17138,7 @@ fn lower_condition(
                 )]);
             }
             Ok(mir::BoolExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
             })
@@ -15321,6 +17193,11 @@ fn lower_null_comparison(
         context.expression_type(value)?
     };
     let present = match value_type {
+        mir::Type::NullableByteRegion(kind) => {
+            mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
+                byte_region::nullable_expression(value, kind, false, context)?,
+            ))
+        }
         mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
             lower_nullable_scalar_presence_subject(value, ty, context)?,
         )),
@@ -15391,7 +17268,7 @@ fn lower_null_comparison(
         }
         mir::Type::NullablePayloadEnum(ty) => {
             mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
-                lower_nullable_payload_enum_expression(value, ty, false, context)?,
+                lower_nullable_payload_enum_presence_subject(value, ty, context)?,
             ))
         }
         mir::Type::NullableFunction(function_type) => {
@@ -15438,6 +17315,38 @@ fn lower_is_condition(
     } else {
         context.expression_type(expr)?
     };
+    let nominal_target = match tested_type {
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => ty.nominal_class().map(mir::Type::Class),
+        mir::Type::Class(_) | mir::Type::Interface(_) => Some(tested_type),
+        _ => None,
+    };
+    if let (
+        mir::Type::Scalar(mir::ScalarType::Inline(inline))
+        | mir::Type::NullableScalar(mir::ScalarType::Inline(inline)),
+        Some(mir::Type::Interface(interface)),
+    ) = (value_type, nominal_target)
+    {
+        if let Some(class) = inline.nominal_class() {
+            let conforms = context
+                .collection_registry
+                .interface_vtable_ids
+                .contains_key(&(mir::ImplementingType::Class(class), interface));
+            // Inline nominal values have an exact checked class. Their bits are
+            // payload, including zero; nullable carriers own presence separately.
+            let present = if let mir::Type::NullableScalar(ty) = value_type {
+                mir::BoolExpression::NullableScalarIsPresent(Box::new(
+                    lower_nullable_scalar_presence_subject(expr, ty, context)?,
+                ))
+            } else {
+                lower_concrete_is_presence(expr, value_type, context)?
+            };
+            return Ok(if conforms {
+                present
+            } else {
+                evaluate_then_false(present)
+            });
+        }
+    }
     if matches!(
         value_type,
         mir::Type::Class(_)
@@ -15446,14 +17355,14 @@ fn lower_is_condition(
             | mir::Type::NullableInterface(_)
             | mir::Type::Mixed
             | mir::Type::NullableMixed
-    ) && (matches!(tested_type, mir::Type::Interface(_))
+    ) && (matches!(nominal_target, Some(mir::Type::Interface(_)))
         || matches!(
             value_type,
             mir::Type::Interface(_)
                 | mir::Type::NullableInterface(_)
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
-        ) && matches!(tested_type, mir::Type::Class(_)))
+        ) && matches!(nominal_target, Some(mir::Type::Class(_))))
     {
         let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
             context.lookup_local(name, *span)?
@@ -15472,10 +17381,28 @@ fn lower_is_condition(
         };
         return Ok(mir::BoolExpression::NominalIs {
             local,
-            target: tested_type,
+            target: nominal_target.expect("checked nominal type-test target"),
         });
     }
     let result = match value_type {
+        mir::Type::ByteRegion(_) => {
+            let presence = lower_concrete_is_presence(expr, value_type, context)?;
+            if value_type == tested_type {
+                presence
+            } else {
+                evaluate_then_false(presence)
+            }
+        }
+        mir::Type::NullableByteRegion(kind) => {
+            let presence = mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
+                byte_region::nullable_expression(expr, kind, false, context)?,
+            ));
+            if tested_type == mir::Type::ByteRegion(kind) {
+                presence
+            } else {
+                evaluate_then_false(presence)
+            }
+        }
         mir::Type::NullableClass(class) => {
             let mir::Type::Class(target) = tested_type else {
                 return Ok(evaluate_then_false(
@@ -15581,22 +17508,28 @@ fn lower_is_condition(
             mixed: Box::new(lower_mixed_expression(expr, false, context)?),
             tag: mixed_tag_for_type(tested_type, type_test_span)?,
         },
-        mir::Type::NullableMixed => mir::BoolExpression::Binary {
-            op: mir::BoolBinaryOp::And,
-            left: Box::new(mir::BoolExpression::NullableMixedIsPresent(Box::new(
-                lower_nullable_mixed_presence_subject(expr, context)?,
-            ))),
-            right: Box::new(mir::BoolExpression::MixedIs {
-                mixed: Box::new(mir::MixedExpression::Local {
-                    local: lower_nullable_mixed_local(expr, context)?,
-                    transfer: false,
+        mir::Type::NullableMixed => {
+            let local = lower_nullable_mixed_local(expr, context)?;
+            mir::BoolExpression::Binary {
+                op: mir::BoolBinaryOp::And,
+                left: Box::new(mir::BoolExpression::NullableMixedIsPresent(Box::new(
+                    mir::NullableMixedExpression::Local {
+                        local,
+                        transfer: false,
+                    },
+                ))),
+                right: Box::new(mir::BoolExpression::MixedIs {
+                    mixed: Box::new(mir::MixedExpression::Local {
+                        local,
+                        transfer: false,
+                    }),
+                    tag: mixed_tag_for_type(tested_type, type_test_span)?,
                 }),
-                tag: mixed_tag_for_type(tested_type, type_test_span)?,
-            }),
-        },
+            }
+        }
         mir::Type::NullablePayloadEnum(ty) if tested_type == mir::Type::PayloadEnum(ty) => {
             mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
-                lower_nullable_payload_enum_expression(expr, ty, false, context)?,
+                lower_nullable_payload_enum_presence_subject(expr, ty, context)?,
             ))
         }
         mir::Type::NullableFunction(function_type)
@@ -15616,7 +17549,7 @@ fn lower_is_condition(
         }
         mir::Type::NullablePayloadEnum(ty) => {
             let present = mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
-                lower_nullable_payload_enum_expression(expr, ty, false, context)?,
+                lower_nullable_payload_enum_presence_subject(expr, ty, context)?,
             ));
             if tested_type == mir::Type::PayloadEnum(ty) {
                 present
@@ -15727,10 +17660,8 @@ fn lower_nullable_mixed_local(
             return Ok(local);
         }
     }
-    Err(vec![unsupported(
-        expr.span(),
-        "this nullable mixed expression cannot be used as a native presence subject",
-    )])
+    let value = lower_nullable_mixed_expression(expr, false, context)?;
+    Ok(core_value::materialize_value(mir::Rvalue::NullableMixed(value), context).0)
 }
 
 fn lower_nullable_mixed_presence_subject(
@@ -15774,6 +17705,24 @@ fn lower_nullable_string_presence_subject(
     lower_nullable_string_expression(expr, context)
 }
 
+fn lower_nullable_payload_enum_presence_subject(
+    expr: &hir::Expr,
+    expected: mir::PayloadEnumType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullablePayloadEnumExpression> {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullablePayloadEnum(expected) {
+            return Ok(mir::NullablePayloadEnumExpression::Use {
+                ty: expected,
+                place: mir::PayloadEnumPlace::Local(local),
+                mode: mir::PayloadEnumUseMode::Borrow,
+            });
+        }
+    }
+    lower_nullable_payload_enum_expression(expr, expected, false, context)
+}
+
 fn lower_nullable_class_presence_subject(
     expr: &hir::Expr,
     expected: ClassId,
@@ -15808,6 +17757,16 @@ fn lower_concrete_is_presence(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     match value_type {
+        mir::Type::ByteRegion(kind) => Ok(mir::BoolExpression::NullableByteRegionIsPresent(
+            Box::new(mir::NullableByteRegionExpression::Present(
+                byte_region::expression(expr, kind, false, context)?,
+            )),
+        )),
+        mir::Type::NullableByteRegion(kind) => {
+            Ok(mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
+                byte_region::nullable_expression(expr, kind, false, context)?,
+            )))
+        }
         mir::Type::Scalar(ty) => Ok(mir::BoolExpression::NullableScalarIsPresent(Box::new(
             mir::NullableScalarExpression::Value({
                 let value = lower_value_expression(expr, context)?;
@@ -15938,7 +17897,7 @@ fn lower_concrete_is_presence(
         }
         mir::Type::NullablePayloadEnum(ty) => {
             Ok(mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
-                lower_nullable_payload_enum_expression(expr, ty, false, context)?,
+                lower_nullable_payload_enum_presence_subject(expr, ty, context)?,
             )))
         }
         mir::Type::Function(function_type) => {
@@ -16036,6 +17995,10 @@ fn lower_value_expression(
         | mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) => {
             lower_enum_expression(expr, enum_id, context).map(mir::ValueExpression::Enum)
         }
+        mir::Type::Scalar(mir::ScalarType::Inline(ty))
+        | mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            inline_value::lower_expression(expr, ty, context).map(mir::ValueExpression::Inline)
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "this expression is not a scalar value",
@@ -16054,11 +18017,7 @@ fn materialize_callable_scalar_result(
                 "primitive contract must return a scalar",
             )]);
         };
-        let local = context.declare_checked_call_slot(value.ty(), false);
-        context.push_statement(mir::Statement::AssignLocal {
-            target: local,
-            value,
-        });
+        let (local, _) = core_value::materialize_value(value, context);
         return Ok(Some((local, scalar)));
     }
     let hir::Expr::CallableCall(call) = expr else {
@@ -16101,9 +18060,11 @@ fn lower_enum_expression(
         return Ok(value);
     }
     if let Some(crate::const_eval::ConstValue::Enum(value)) = context.constant_value(expr) {
-        if value.enum_id == enum_id {
-            return Ok(mir::EnumExpression::Case(*value));
-        }
+        let case = resolve_const_enum(value, enum_id, &context.semantic_info.enums, expr.span())?;
+        return Ok(mir::EnumExpression::Case(crate::enums::EnumValue {
+            enum_id,
+            case_id: case.id,
+        }));
     }
     if let Some(value) = context
         .semantic_info
@@ -16111,14 +18072,11 @@ fn lower_enum_expression(
         .get(&expr.span())
         .copied()
     {
-        if value.enum_id != enum_id {
-            return Err(vec![Diagnostic::new(
-                "I2701",
-                "resolved enum case does not match its expression type",
-                expr.span(),
-            )]);
-        }
-        return Ok(mir::EnumExpression::Case(value));
+        let case_id = context.materialized_enum_case(value, enum_id, expr.span())?;
+        return Ok(mir::EnumExpression::Case(crate::enums::EnumValue {
+            enum_id,
+            case_id,
+        }));
     }
 
     match expr {
@@ -16195,6 +18153,7 @@ fn lower_enum_expression(
             Ok(mir::EnumExpression::Use {
                 enum_id,
                 operand: mir::Operand::CollectionIndex {
+                    index_span: expr.span(),
                     collection,
                     index: Box::new(index),
                     positional: false,
@@ -16243,6 +18202,7 @@ fn lower_enum_expression(
                 )]);
             }
             Ok(mir::EnumExpression::Call {
+                span: expr.span(),
                 enum_id,
                 function: signature.id,
                 args: lower_call_args(name, args, signature, *span, context)?,
@@ -16267,6 +18227,7 @@ fn lower_enum_expression(
                 )]);
             }
             Ok(mir::EnumExpression::Call {
+                span: expr.span(),
                 enum_id,
                 function: signature.id,
                 args,
@@ -16291,6 +18252,7 @@ fn lower_enum_expression(
                 )]);
             }
             Ok(mir::EnumExpression::Call {
+                span: expr.span(),
                 enum_id,
                 function: signature.id,
                 args,
@@ -16307,22 +18269,42 @@ fn call_value_expression(
     ty: mir::ScalarType,
     function: mir::FunctionId,
     args: Vec<mir::Rvalue>,
+    span: Span,
 ) -> mir::ValueExpression {
     match ty {
         mir::ScalarType::Integer(ty) => {
-            mir::ValueExpression::Integer(mir::IntegerExpression::Call { ty, function, args })
+            mir::ValueExpression::Integer(mir::IntegerExpression::Call {
+                span,
+                ty,
+                function,
+                args,
+            })
         }
-        mir::ScalarType::Float(ty) => {
-            mir::ValueExpression::Float(mir::FloatExpression::Call { ty, function, args })
-        }
-        mir::ScalarType::Bool => {
-            mir::ValueExpression::Bool(mir::BoolExpression::Call { function, args })
-        }
+        mir::ScalarType::Float(ty) => mir::ValueExpression::Float(mir::FloatExpression::Call {
+            span,
+            ty,
+            function,
+            args,
+        }),
+        mir::ScalarType::Bool => mir::ValueExpression::Bool(mir::BoolExpression::Call {
+            span,
+            function,
+            args,
+        }),
         mir::ScalarType::Enum(enum_id) => mir::ValueExpression::Enum(mir::EnumExpression::Call {
+            span,
             enum_id,
             function,
             args,
         }),
+        mir::ScalarType::Inline(ty) => {
+            mir::ValueExpression::Inline(mir::InlineValueExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+            })
+        }
     }
 }
 
@@ -16340,6 +18322,13 @@ fn value_expression_from_operand(
         mir::ScalarType::Bool => mir::ValueExpression::Bool(mir::BoolExpression::Use { operand }),
         mir::ScalarType::Enum(enum_id) => {
             mir::ValueExpression::Enum(mir::EnumExpression::Use { enum_id, operand })
+        }
+        mir::ScalarType::Inline(ty) => {
+            mir::ValueExpression::Inline(mir::InlineValueExpression::Use {
+                ty,
+                operand,
+                mode: mir::InlineValueUseMode::Borrow,
+            })
         }
     }
 }
@@ -16429,6 +18418,16 @@ fn lower_interface_expression(
             });
         }
     }
+    if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) = context.expression_type(expr)? {
+        if let Some(class) = ty.nominal_class() {
+            return Ok(mir::InterfaceValue::FromValue {
+                value: Box::new(mir::Rvalue::Value(mir::ValueExpression::Inline(
+                    inline_value::lower_expression_with_ownership(expr, ty, transfer, context)?,
+                ))),
+                vtable: context.class_interface_vtable(class, interface, expr.span())?,
+            });
+        }
+    }
     if let Some(class) = inferred_class_type(expr, context) {
         let vtable = context.class_interface_vtable(class, interface, expr.span())?;
         return Ok(mir::InterfaceValue::FromClass {
@@ -16438,7 +18437,7 @@ fn lower_interface_expression(
     }
     if let mir::Type::Collection(collection) = context.expression_type(expr)? {
         let vtable = interface::collection_vtable(collection, interface, expr.span(), context)?;
-        return Ok(mir::InterfaceValue::FromCollection {
+        return Ok(mir::InterfaceValue::FromValue {
             value: Box::new(mir::Rvalue::Collection(lower_collection_expression(
                 expr, collection, transfer, context,
             )?)),
@@ -16466,6 +18465,7 @@ fn lower_interface_expression(
             )]);
         }
         return Ok(mir::InterfaceValue::CollectionIndex {
+            index_span: expr.span(),
             collection,
             index: Box::new(index),
             positional: false,
@@ -16533,6 +18533,7 @@ fn lower_interface_expression(
                 function: signature.id,
                 args: lower_call_args(name, args, signature.clone(), *span, context)?,
                 return_borrow: signature.return_borrow,
+                span: *span,
             })
         }
         hir::Expr::MethodCall {
@@ -16551,6 +18552,7 @@ fn lower_interface_expression(
                 function: signature.id,
                 args,
                 return_borrow: signature.return_borrow,
+                span: *span,
             })
         }
         hir::Expr::StaticCall {
@@ -16572,6 +18574,7 @@ fn lower_interface_expression(
                 function: signature.id,
                 args,
                 return_borrow: signature.return_borrow,
+                span: *span,
             })
         }
         hir::Expr::Index {
@@ -16580,6 +18583,7 @@ fn lower_interface_expression(
             let (collection, index) =
                 lower_collection_index_operand(collection, index, expected, context)?;
             Ok(mir::InterfaceValue::CollectionIndex {
+                index_span: expr.span(),
                 collection,
                 index: Box::new(index),
                 positional: false,
@@ -16762,6 +18766,7 @@ fn lower_nullable_interface_expression(
             )]);
         }
         return Ok(mir::NullableInterfaceValue::CollectionIndex {
+            index_span: expr.span(),
             collection,
             index: Box::new(index),
             positional: false,
@@ -16778,6 +18783,7 @@ fn lower_nullable_interface_expression(
             )]);
         }
         return Ok(mir::NullableInterfaceValue::DictionaryGet {
+            index_span: expr.span(),
             collection,
             key: Box::new(key),
             access,
@@ -16806,6 +18812,7 @@ fn lower_nullable_interface_expression(
                     function: signature.id,
                     args: lower_call_args(name, args, signature.clone(), *span, context)?,
                     return_borrow: signature.return_borrow,
+                    span: *span,
                 })
             }
             hir::Expr::MethodCall {
@@ -16828,6 +18835,7 @@ fn lower_nullable_interface_expression(
                         )]);
                     }
                     return Ok(mir::NullableInterfaceValue::DictionaryGet {
+                        index_span: expr.span(),
                         collection,
                         key: Box::new(key),
                         access,
@@ -16839,6 +18847,7 @@ fn lower_nullable_interface_expression(
                     function: signature.id,
                     args,
                     return_borrow: signature.return_borrow,
+                    span: *span,
                 })
             }
             hir::Expr::Index {
@@ -16847,6 +18856,7 @@ fn lower_nullable_interface_expression(
                 let (collection, key) =
                     lower_collection_index_operand(collection, index, expected, context)?;
                 Ok(mir::NullableInterfaceValue::DictionaryGet {
+                    index_span: expr.span(),
                     collection,
                     key: Box::new(key),
                     access: mir::NullableCollectionAccess::Index,
@@ -16865,6 +18875,7 @@ fn lower_nullable_interface_expression(
                     function: signature.id,
                     args,
                     return_borrow: signature.return_borrow,
+                    span: *span,
                 })
             }
             hir::Expr::Grouped { expr, .. } => {
@@ -16884,7 +18895,7 @@ fn lower_nullable_interface_expression(
             },
         )),
         mir::Type::Collection(collection) => Ok(mir::NullableInterfaceValue::Present(
-            mir::InterfaceValue::FromCollection {
+            mir::InterfaceValue::FromValue {
                 value: Box::new(mir::Rvalue::Collection(lower_collection_expression(
                     expr, collection, transfer, context,
                 )?)),
@@ -16892,13 +18903,32 @@ fn lower_nullable_interface_expression(
             },
         )),
         mir::Type::NullableCollection(collection) => Ok(mir::NullableInterfaceValue::Present(
-            mir::InterfaceValue::FromCollection {
+            mir::InterfaceValue::FromValue {
                 value: Box::new(mir::Rvalue::NullableCollection(
                     lower_nullable_collection_expression(expr, collection, transfer, context)?,
                 )),
                 vtable: interface::collection_vtable(collection, interface, expr.span(), context)?,
             },
         )),
+        mir::Type::Scalar(mir::ScalarType::Inline(_)) => Ok(mir::NullableInterfaceValue::Present(
+            lower_interface_expression(expr, interface, transfer, context)?,
+        )),
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            let class = ty.nominal_class().ok_or_else(|| {
+                vec![unsupported(
+                    expr.span(),
+                    "inline interface conversion requires a nominal implementation",
+                )]
+            })?;
+            Ok(mir::NullableInterfaceValue::Present(
+                mir::InterfaceValue::FromValue {
+                    value: Box::new(mir::Rvalue::NullableScalar(
+                        lower_nullable_inline_expression(expr, ty, transfer, context)?,
+                    )),
+                    vtable: context.class_interface_vtable(class, interface, expr.span())?,
+                },
+            ))
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "value is not assignable to ?Error",
@@ -16915,6 +18945,14 @@ fn lower_function_expression(
     if let Some(mir::Rvalue::Function(value)) =
         materialize_checked_rvalue(expr, mir::Type::Function(function_type), transfer, context)?
     {
+        return Ok(value);
+    }
+    if is_branching_expr(expr) {
+        let mir::Rvalue::Function(value) =
+            lower_branching_rvalue(expr, mir::Type::Function(function_type), transfer, context)?
+        else {
+            unreachable!("callable branch lowering returned another MIR type");
+        };
         return Ok(value);
     }
     match expr {
@@ -16983,7 +19021,7 @@ fn lower_function_expression(
                         }
                     }
                     crate::ownership::CaptureAcquisitionKind::CopyIntoEnvironment => {
-                        mir::ClosureCaptureOperand::CopyValue(local_rvalue(local, ty, false))
+                        mir::ClosureCaptureOperand::CopyValue(local_rvalue(local, ty, true))
                     }
                     crate::ownership::CaptureAcquisitionKind::MoveIntoEnvironment => {
                         mir::ClosureCaptureOperand::MoveValue(local_rvalue(local, ty, true))
@@ -17052,6 +19090,7 @@ fn lower_function_expression(
                 context,
             )?;
             Ok(mir::FunctionExpression::CollectionIndex {
+                index_span: expr.span(),
                 function_type,
                 collection,
                 index: Box::new(index),
@@ -17068,6 +19107,7 @@ fn lower_function_expression(
                 )]);
             }
             Ok(mir::FunctionExpression::Call {
+                span: expr.span(),
                 function_type,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -17090,6 +19130,7 @@ fn lower_function_expression(
                 )]);
             }
             Ok(mir::FunctionExpression::Call {
+                span: expr.span(),
                 function_type,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -17112,6 +19153,7 @@ fn lower_function_expression(
                 )]);
             }
             Ok(mir::FunctionExpression::Call {
+                span: expr.span(),
                 function_type,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -17166,6 +19208,18 @@ fn lower_nullable_function_expression(
     )? {
         return Ok(value);
     }
+    if is_branching_expr(expr) {
+        let mir::Rvalue::NullableFunction(value) = lower_branching_rvalue(
+            expr,
+            mir::Type::NullableFunction(function_type),
+            transfer,
+            context,
+        )?
+        else {
+            unreachable!("nullable callable branch lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableFunctionExpression::Null { function_type }),
         hir::Expr::Variable { name, span } => {
@@ -17210,6 +19264,7 @@ fn lower_nullable_function_expression(
                     )]);
                 }
                 return Ok(mir::NullableFunctionExpression::DictionaryGet {
+                    index_span: expr.span(),
                     function_type,
                     collection,
                     key: Box::new(key),
@@ -17234,6 +19289,7 @@ fn lower_nullable_function_expression(
                 context,
             )?;
             Ok(mir::NullableFunctionExpression::CollectionIndex {
+                index_span: expr.span(),
                 function_type,
                 collection,
                 index: Box::new(index),
@@ -17252,6 +19308,7 @@ fn lower_nullable_function_expression(
                 )]);
             }
             Ok(mir::NullableFunctionExpression::Call {
+                span: expr.span(),
                 function_type,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -17283,6 +19340,7 @@ fn lower_nullable_function_expression(
                     )]);
                 }
                 return Ok(mir::NullableFunctionExpression::DictionaryGet {
+                    index_span: expr.span(),
                     function_type,
                     collection,
                     key: Box::new(key),
@@ -17300,6 +19358,7 @@ fn lower_nullable_function_expression(
                 )]);
             }
             Ok(mir::NullableFunctionExpression::Call {
+                span: expr.span(),
                 function_type,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -17324,6 +19383,7 @@ fn lower_nullable_function_expression(
                 )]);
             }
             Ok(mir::NullableFunctionExpression::Call {
+                span: expr.span(),
                 function_type,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -17364,10 +19424,31 @@ fn lower_indirect_arguments(
         .iter()
         .zip(&function_type.parameters)
         .map(|(argument, parameter)| {
-            materialize_nested_collection_places(&argument.value, false, context)?;
             lower_call_argument(&argument.value, parameter.ty, parameter.mode, context)
         })
         .collect()
+}
+
+fn stage_callable_operand(
+    value: mir::FunctionExpression,
+    definition: &mir::FunctionType,
+    context: &mut LoweringContext,
+) -> mir::LocalId {
+    let owned = !mir::function_expression_is_borrowed(&value);
+    let ty = mir::Type::Function(definition.id);
+    let local = context.declare_checked_call_slot(ty, owned);
+    context.locals[local.0].writable =
+        definition.invocation_mode == mir::FunctionInvocationMode::Writable;
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::Function(value),
+    });
+    // The caller owns a staged carrier while later operands can fail. A once
+    // invocation empties this slot; its guarded cleanup then does nothing.
+    if owned {
+        context.track_statement_owned_local(local, ty);
+    }
+    local
 }
 
 fn materialize_indirect_call(
@@ -17409,25 +19490,7 @@ fn materialize_indirect_call(
         ),
         context,
     )?;
-    let callee_owned = !mir::function_expression_is_borrowed(&callee);
-    let callee_local =
-        context.declare_checked_call_slot(mir::Type::Function(function_type), callee_owned);
-    context.locals[callee_local.0].writable = matches!(
-        definition.invocation_mode,
-        mir::FunctionInvocationMode::Writable
-    );
-    context.push_statement(mir::Statement::AssignLocal {
-        target: callee_local,
-        value: mir::Rvalue::Function(callee),
-    });
-    if callee_owned
-        && !matches!(
-            definition.invocation_mode,
-            mir::FunctionInvocationMode::Once
-        )
-    {
-        context.track_statement_owned_local(callee_local, mir::Type::Function(function_type));
-    }
+    let callee_local = stage_callable_operand(callee, &definition, context);
     let callee = mir::FunctionExpression::Local {
         function_type,
         local: callee_local,
@@ -17537,7 +19600,7 @@ fn lower_rvalue_as_expected(
         return lower_branching_rvalue(expr, expected, true, context);
     }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
-        let value = collection_remove_at_rvalue(collection, index, value_type)?;
+        let value = collection_remove_at_rvalue(collection, index, value_type, expr.span())?;
         if non_null_match_type(expected) == (value_type, true) {
             return Ok(nullable_present_rvalue(value));
         }
@@ -17550,6 +19613,13 @@ fn lower_rvalue_as_expected(
         return Ok(value);
     }
     match expected {
+        mir::Type::ByteRegion(kind) => {
+            byte_region::expression(expr, kind, true, context).map(mir::Rvalue::ByteRegion)
+        }
+        mir::Type::NullableByteRegion(kind) => {
+            byte_region::nullable_expression(expr, kind, true, context)
+                .map(mir::Rvalue::NullableByteRegion)
+        }
         mir::Type::Interface(interface) => {
             lower_interface_expression(expr, interface, true, context)
                 .map(|value| mir::Rvalue::Interface(mir::InterfaceExpression { interface, value }))
@@ -17563,6 +19633,10 @@ fn lower_rvalue_as_expected(
             })
         }
         mir::Type::String => lower_string_expression(expr, context).map(mir::Rvalue::String),
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            lower_nullable_inline_expression(expr, ty, true, context)
+                .map(mir::Rvalue::NullableScalar)
+        }
         mir::Type::NullableScalar(ty) => {
             lower_nullable_scalar_expression(expr, ty, context).map(mir::Rvalue::NullableScalar)
         }
@@ -17572,6 +19646,10 @@ fn lower_rvalue_as_expected(
         mir::Type::Mixed => lower_mixed_expression(expr, true, context).map(mir::Rvalue::Mixed),
         mir::Type::NullableMixed => {
             lower_nullable_mixed_expression(expr, true, context).map(mir::Rvalue::NullableMixed)
+        }
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => {
+            inline_value::lower_expression_with_ownership(expr, ty, true, context)
+                .map(|value| mir::Rvalue::Value(mir::ValueExpression::Inline(value)))
         }
         mir::Type::Scalar(expected) => {
             let value = lower_value_expression(expr, context)?;
@@ -17668,10 +19746,15 @@ fn materialize_checked_call(
     if let Some(plan) = interface::call_plan(expr, context)? {
         return interface::materialize_call(expr, plan, consume_result, context);
     }
+    if let Some(result) = materialize_null_safe_stored_property(expr, context)? {
+        return Ok(Some(result));
+    }
     if let hir::Expr::MethodCall { object, .. } = expr {
         if matches!(
             context.expression_type(object)?,
             mir::Type::Collection(_)
+                | mir::Type::ByteRegion(_)
+                | mir::Type::NullableByteRegion(_)
                 | mir::Type::NullableCollection(_)
                 | mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Collection(_))
                 | mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Collection(_))
@@ -17742,6 +19825,14 @@ fn materialize_checked_call(
             let lowered = lower_call_args(name, args, signature.clone(), *span, context)?;
             (signature, lowered, *span)
         }
+        // A constrained call site records every effect its template may select.
+        // The selected callee owns this call's transport, so it is resolved
+        // before the receiver or any argument is evaluated: an effect-free
+        // selection then lowers once, on the ordinary path. Primitive core
+        // operations are intrinsics with no class callee and no checked Error.
+        hir::Expr::MethodCall {
+            null_safe: false, ..
+        } if core_value::selects_primitive_call(expr, context) => return Ok(None),
         hir::Expr::MethodCall {
             object,
             method,
@@ -17749,11 +19840,13 @@ fn materialize_checked_call(
             span,
             null_safe: false,
         } => {
-            let (signature, lowered) =
-                lower_instance_method_call(object, method, args, *span, context)?;
+            let signature = instance_method_signature(object, method, *span, context)?;
             if signature.checked_effects.is_empty() {
                 return Ok(None);
             }
+            let (signature, lowered) = lower_instance_call_with_signature(
+                object, method, args, *span, signature, context,
+            )?;
             (signature, lowered, *span)
         }
         hir::Expr::StaticCall {
@@ -17763,17 +19856,194 @@ fn materialize_checked_call(
             span,
             ..
         } => {
-            let (signature, lowered) =
-                lower_static_method_call(class_name, method, args, *span, context)?;
+            let (_, signature) = static_method_signature(class_name, method, *span, context)?;
             if signature.checked_effects.is_empty() {
                 return Ok(None);
             }
+            let (signature, lowered) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
             (signature, lowered, *span)
         }
         _ => return Ok(None),
     };
 
     materialize_checked_signature_call(signature, args, span, consume_result, context)
+}
+
+fn materialize_null_safe_stored_property(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    let hir::Expr::PropertyAccess {
+        object,
+        property,
+        null_safe: true,
+        span,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let object_type = context.expression_type(object)?;
+    let Some(class) = nullable_payload_class(object_type) else {
+        return Ok(None);
+    };
+    if matches!(object_type, mir::Type::NullableSharedReference(_))
+        && crate::types::SharedHandleKind::SharedReference.projects_payload_property(property)
+    {
+        // Intrinsics remain owned by the canonical handle contract, including
+        // collision projections when the payload also declares this name.
+        return Ok(None);
+    }
+    if context.property_info(class, property).is_none() {
+        return Ok(None);
+    }
+    let selection = context.coalesce_selection(object);
+    let result_type = context.expression_type(expr)?;
+    let (receiver, property, property_type) =
+        lower_null_safe_property(object, property, *span, context)?;
+    // A stored field lends its value. Use the same guarded projection as
+    // null-safe calls, rather than assuming a nullable receiver is present in
+    // the individual collection/function/shared-value lowering paths.
+    let borrow = mir::ReturnBorrow {
+        source: mir::BorrowSource::Receiver,
+        writable: false,
+        kind: mir::ReturnBorrowKind::Value,
+        lifetime: mir::RetainedLifetime::LastUse,
+    };
+    materialize_null_safe_call(
+        mir::Rvalue::NullableClass(receiver),
+        selection,
+        false,
+        Some(borrow),
+        *span,
+        Some((result_type, false)),
+        |receiver, context| {
+            let object = context.declare_borrowed_temp(mir::Type::Class(class), false);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: object,
+                value: mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
+                    class,
+                    local: receiver,
+                    transfer: false,
+                }),
+            });
+            let value = borrowed_stored_property_rvalue(object, property, property_type, *span)?;
+            let (local, ty) = core_value::materialize_value(value, context);
+            if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+                track_checked_result(local, ty, false, context);
+            }
+            Ok(Some((local, ty, false)))
+        },
+        context,
+    )
+}
+
+fn borrowed_stored_property_rvalue(
+    object: mir::LocalId,
+    property: PropertyId,
+    ty: mir::Type,
+    span: Span,
+) -> DiagnosticResult<mir::Rvalue> {
+    use mir::{Rvalue, Type};
+    macro_rules! field {
+        ($variant:ident, $expression:ident $(, $name:ident: $value:expr)* $(,)?) => {
+            Rvalue::$variant(mir::$expression::Property {
+                object, property, $($name: $value),*
+            })
+        };
+    }
+    Ok(match ty {
+        Type::Scalar(ty) => Rvalue::Value(value_expression_from_operand(
+            ty,
+            mir::Operand::Property { object, property },
+        )),
+        Type::NullableScalar(ty) => field!(NullableScalar, NullableScalarExpression, ty: ty),
+        Type::String => field!(String, StringExpression),
+        Type::NullableString => field!(NullableString, NullableStringExpression),
+        Type::Class(class) => field!(Class, ClassExpression, class: class),
+        Type::NullableClass(class) => field!(NullableClass, NullableClassExpression, class: class),
+        Type::Collection(collection) => field!(Collection, CollectionExpression,
+            collection: collection, assume_non_null: false),
+        Type::NullableCollection(collection) => field!(NullableCollection,
+            NullableCollectionExpression, collection: collection),
+        Type::Function(function_type) => field!(Function, FunctionExpression,
+            function_type: function_type),
+        Type::NullableFunction(function_type) => field!(NullableFunction,
+            NullableFunctionExpression, function_type: function_type),
+        Type::Mixed => field!(Mixed, MixedExpression),
+        Type::NullableMixed => field!(NullableMixed, NullableMixedExpression),
+        Type::Interface(interface) => Rvalue::Interface(mir::InterfaceExpression {
+            interface,
+            value: mir::InterfaceValue::Property {
+                object,
+                property,
+                transfer: false,
+            },
+        }),
+        Type::NullableInterface(interface) => {
+            Rvalue::NullableInterface(mir::NullableInterfaceExpression {
+                interface,
+                value: mir::NullableInterfaceValue::Property {
+                    object,
+                    property,
+                    transfer: false,
+                },
+            })
+        }
+        Type::PayloadEnum(ty) => Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            ty,
+            place: mir::PayloadEnumPlace::Property { object, property },
+            mode: payload_enum_use_mode(ty, false),
+        }),
+        Type::NullablePayloadEnum(ty) => {
+            Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Property { object, property },
+                mode: payload_enum_use_mode(ty, false),
+            })
+        }
+        Type::SharedReference(payload) => {
+            field!(SharedReference, SharedReferenceExpression, payload: payload)
+        }
+        Type::NullableSharedReference(payload) => {
+            field!(NullableSharedReference, NullableSharedReferenceExpression, payload: payload)
+        }
+        Type::WeakReference(payload) => {
+            field!(WeakReference, WeakReferenceExpression, payload: payload)
+        }
+        Type::NullableWeakReference(payload) => {
+            field!(NullableWeakReference, NullableWeakReferenceExpression, payload: payload)
+        }
+        Type::WritableSharedReference(payload) => {
+            field!(WritableSharedReference, WritableSharedReferenceExpression, payload: payload)
+        }
+        Type::NullableWritableSharedReference(payload) => {
+            field!(NullableWritableSharedReference, NullableWritableSharedReferenceExpression, payload: payload)
+        }
+        Type::WritableWeakReference(payload) => {
+            field!(WritableWeakReference, WritableWeakReferenceExpression, payload: payload)
+        }
+        Type::NullableWritableWeakReference(payload) => {
+            field!(NullableWritableWeakReference, NullableWritableWeakReferenceExpression, payload: payload)
+        }
+        Type::ReadonlySharedReferenceAccess(payload)
+        | Type::WritableSharedReferenceAccess(payload) => {
+            field!(SharedReferenceAccess, SharedReferenceAccessExpression,
+                payload: payload, writable: matches!(ty, Type::WritableSharedReferenceAccess(_)))
+        }
+        Type::NullableReadonlySharedReferenceAccess(payload)
+        | Type::NullableWritableSharedReferenceAccess(payload) => {
+            field!(NullableSharedReferenceAccess, NullableSharedReferenceAccessExpression,
+                payload: payload, writable: matches!(ty, Type::NullableWritableSharedReferenceAccess(_)))
+        }
+        Type::ByteRegion(_) | Type::NullableByteRegion(_) | Type::ClosureEnvironment(_) => {
+            return Err(vec![unsupported(
+                span,
+                "this type has no stored-property MIR representation",
+            )]);
+        }
+    })
 }
 
 fn builtin_has_checked_effects(builtin: crate::builtins::Builtin) -> bool {
@@ -17805,7 +20075,7 @@ fn materialize_checked_builtin_call(
                     return Err(vec![unsupported(
                         span,
                         "read_line expects at most 1 argument",
-                    )])
+                    )]);
                 }
             };
             (
@@ -17941,12 +20211,19 @@ fn materialize_string_before_later_argument(
 ) -> DiagnosticResult<mir::StringExpression> {
     materialize_nested_collection_places(expr, false, context)?;
     let value = lower_string_expression(expr, context)?;
+    Ok(materialize_string_value(value, context))
+}
+
+fn materialize_string_value(
+    value: mir::StringExpression,
+    context: &mut LoweringContext,
+) -> mir::StringExpression {
     let local = context.declare_statement_string_temp();
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value: mir::Rvalue::String(value),
     });
-    Ok(mir::StringExpression::Local(local))
+    mir::StringExpression::Local(local)
 }
 
 fn materialize_checked_io(
@@ -17991,14 +20268,101 @@ fn materialize_checked_io(
     }
 }
 
+/// `take $this->field` moves the field out of the consumed receiver, then
+/// destroys the rest of the receiver; its class has no destructor.
+fn lower_property_take(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let (object, property, ty) = lower_property_place(expr, context)?;
+    let mir::Type::Class(class) = context.locals[object.0].ty else {
+        return Err(vec![unsupported(
+            expr.span(),
+            "a taken property belongs to a class receiver",
+        )]);
+    };
+    let owned = user_local_type_owns_value(ty);
+    let target = context.declare_return_temp(ty, owned);
+    context.push_statement(mir::Statement::TakeProperty {
+        target,
+        object,
+        property,
+    });
+    // The take consumed the receiver; its destructor must not see the gap.
+    context.push_statement(mir::Statement::DropClass {
+        local: object,
+        class,
+        runs_destructor: false,
+    });
+    if owned && !consume_result {
+        context.track_statement_owned_local(target, ty);
+    }
+    convert_call_result(
+        target,
+        ty,
+        expected,
+        owned && consume_result,
+        expr.span(),
+        context,
+    )
+}
+
 fn materialize_checked_rvalue(
     expr: &hir::Expr,
     expected: mir::Type,
     consume_result: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if matches!(
+        unparenthesized_place(expr),
+        hir::Expr::PropertyAccess { take: true, .. }
+    ) {
+        return lower_property_take(
+            unparenthesized_place(expr),
+            expected,
+            consume_result,
+            context,
+        )
+        .map(Some);
+    }
     if let Some(value) = core_collection::expression(expr, expected, consume_result, context)? {
         return Ok(Some(value));
+    }
+    if matches!(
+        expr,
+        hir::Expr::MethodCall { .. } | hir::Expr::PropertyAccess { .. }
+    ) && crate::native_abi::nullable_payload_type(expected).is_some()
+        && context.expression_type(expr)? == expected
+    {
+        let accessor = match expr {
+            hir::Expr::MethodCall {
+                object,
+                method,
+                args,
+                null_safe: false,
+                ..
+            } if matches!(
+                method.as_str(),
+                "get" | "remove" | "pop" | "popFront" | "popBack"
+            ) =>
+            {
+                lower_dictionary_get(object, method, args, context)?
+            }
+            hir::Expr::PropertyAccess { .. } => lower_collection_nullable_property(expr, context)?,
+            _ => None,
+        };
+        if let Some((collection, key, value_type, access)) = accessor {
+            return nullable_collection_access_rvalue(
+                collection,
+                key,
+                value_type,
+                access,
+                expr.span(),
+            )
+            .map(Some);
+        }
     }
     if let Some(value) = iteration::builtin_acquire(expr, context)? {
         return Ok(Some(value));
@@ -18034,7 +20398,7 @@ fn convert_call_result(
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
     if source == target {
-        return Ok(local_rvalue(local, source, transfer));
+        return Ok(pending_owned_rvalue(local, source, transfer));
     }
     match (source, target) {
         (mir::Type::Class(actual), mir::Type::Class(expected))
@@ -18078,7 +20442,7 @@ fn convert_call_result(
             local_rvalue(local, source, transfer),
             target,
             span,
-            context,
+            &context.collection_registry,
         );
     }
     widen_checked_null_safe_result(local, source, target, transfer, span)
@@ -18316,7 +20680,6 @@ fn materialize_list_algorithm_call(
 
     let header = context.create_block();
     let body = context.create_block();
-    let after_callback = context.create_block();
     let update = context.create_block();
     let exit = context.create_block();
     let setup = context
@@ -18340,59 +20703,38 @@ fn materialize_list_algorithm_call(
 
     context.current_block = Some(body);
     let offset = collection_offset_rvalue(index);
-    let element = collection_value_rvalue(source, offset.clone(), offset, element_type, true)?;
+    let element = collection_value_rvalue(
+        source,
+        offset.clone(),
+        offset,
+        element_type,
+        true,
+        call.span,
+    )?;
     let mut callback_args = Vec::with_capacity(function.parameters.len());
     if let Some(accumulator) = accumulator {
         callback_args.push(local_rvalue(accumulator, result_type, false));
     }
     callback_args.push(element.clone());
-    let callback_result = match function.return_type {
-        mir::ReturnType::Void => None,
-        mir::ReturnType::Value(ty) => {
-            let owned = user_local_type_owns_value(ty);
-            let local = context.declare_checked_call_slot(ty, owned);
-            track_checked_result(local, ty, owned, context);
-            Some((local, ty))
-        }
-    };
     let callee = mir::FunctionExpression::Local {
         function_type,
         local: callback_local,
         transfer: false,
     };
-    let mut callback_failure = None;
-    if !function.has_checked_transport() {
-        context.terminate_current(mir::Terminator::IndirectCall {
-            callee: callee.into(),
-            function_type,
-            invocation_mode: function.invocation_mode,
-            args: callback_args,
-            result: callback_result.map(|(local, _)| local),
-            continuation: after_callback,
-            span: call.callback_span,
-        });
-    } else {
-        let error = context.declare_checked_call_slot(mir::Type::ERROR, true);
-        let failure = context.create_block();
-        callback_failure = Some(failure);
-        context.terminate_current(mir::Terminator::CheckedIndirectCall {
-            callee: callee.into(),
-            function_type,
-            invocation_mode: function.invocation_mode,
-            args: callback_args,
-            result: callback_result.map(|(local, _)| local),
-            error,
-            success: after_callback,
-            failure,
-            span: call.callback_span,
-        });
-        let statement_temporaries = context.statement_owned_locals.clone();
-        context.current_block = Some(failure);
-        context.route_checked_error(error);
-        context.statement_owned_locals = statement_temporaries;
-    }
-
-    context.current_block = Some(after_callback);
+    let callback_result = emit_indirect_call(
+        callee.into(),
+        &function,
+        callback_args,
+        call.span,
+        true,
+        context,
+    )?
+    .map(|(local, ty, _)| (local, ty));
+    let after_callback = context.current_block();
+    let callback_failure = match &context.blocks[body.0].terminator {
+        Some(mir::Terminator::CheckedIndirectCall { failure, .. }) => Some(*failure),
+        _ => None,
+    };
     let mut filter_selected = None;
     let mut filter_append = None;
     let mut filter_duplicate = None;
@@ -18401,6 +20743,7 @@ fn materialize_list_algorithm_call(
             let output = output.expect("map has an output List");
             let (result, result_ty) = callback_result.expect("map callback returns a value");
             context.push_statement(mir::Statement::CollectionAdd {
+                span: call.span,
                 collection: output,
                 value: local_rvalue(result, result_ty, true),
                 index: None,
@@ -18429,15 +20772,13 @@ fn materialize_list_algorithm_call(
                 else_block: update,
             });
             context.current_block = Some(selected);
-            let element = if element_type.has_move_ownership() {
-                let value = core_value::duplicate(element, call.span, context)?;
-                filter_duplicate = value.direct_place_local();
-                value
-            } else {
-                element
-            };
+            let element = core_value::duplicate(element, call.span, context)?;
+            if element_type.has_move_ownership() {
+                filter_duplicate = element.direct_place_local();
+            }
             filter_append = context.current_block;
             context.push_statement(mir::Statement::CollectionAdd {
+                span: call.span,
                 collection: output,
                 value: element,
                 index: None,
@@ -18542,8 +20883,13 @@ fn materialize_signature_call(
             Ok(None)
         }
         mir::ReturnType::Value(ty) => {
-            let value =
-                interface::direct_call_result(ty, signature.id, args, signature.return_borrow);
+            let value = interface::direct_call_result(
+                ty,
+                signature.id,
+                args,
+                signature.return_borrow,
+                span,
+            );
             let owned = !ty.borrows_returned_value(signature.return_borrow)
                 && user_local_type_owns_value(ty);
             let local = context.declare_call_result_slot(ty, owned, signature.return_borrow);
@@ -18620,11 +20966,30 @@ fn materialize_null_safe_signature_call(
         .writable_object_paths
         .contains(&object.span());
     let selection = context.coalesce_selection(object);
-    let object = lower_nullable_payload_expression(object, class, context)?;
-    let receiver_writable =
-        receiver_writable && nullable_class_view_source_allows_writable(&object, context);
+    let consuming = signature.receiver_mode == Some(mir::ReceiverMode::Consuming);
+    let receiver_type = context.class_receiver_type(class);
+    let (object, receiver_writable) =
+        if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) = receiver_type {
+            (
+                mir::Rvalue::NullableScalar(lower_nullable_scalar_expression(
+                    object,
+                    mir::ScalarType::Inline(ty),
+                    context,
+                )?),
+                false,
+            )
+        } else {
+            let object = if consuming {
+                lower_nullable_class_expression(object, class, true, context)?
+            } else {
+                lower_nullable_payload_expression(object, class, context)?
+            };
+            let writable =
+                receiver_writable && nullable_class_view_source_allows_writable(&object, context);
+            (mir::Rvalue::NullableClass(object), writable)
+        };
     materialize_null_safe_call(
-        mir::Rvalue::NullableClass(object),
+        object,
         selection,
         receiver_writable,
         signature.return_borrow,
@@ -18634,13 +20999,20 @@ fn materialize_null_safe_signature_call(
             let args =
                 lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
             let mut checked_args = Vec::with_capacity(args.len() + 1);
-            checked_args.push(mir::Rvalue::Class(
-                mir::ClassExpression::NullableLocalAssumeNonNull {
-                    class,
-                    local: receiver,
-                    transfer: false,
+            checked_args.push(
+                if let mir::Type::Scalar(mir::ScalarType::Inline(ty)) = receiver_type {
+                    mir::Rvalue::Value(value_expression_from_operand(
+                        mir::ScalarType::Inline(ty),
+                        mir::Operand::NullablePayload(receiver),
+                    ))
+                } else {
+                    mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
+                        class,
+                        local: receiver,
+                        transfer: consuming,
+                    })
                 },
-            ));
+            );
             checked_args.extend(args);
             materialize_signature_call(signature, checked_args, span, result.is_some(), context)
         },
@@ -18663,7 +21035,7 @@ fn materialize_null_safe_call(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
     let receiver_type = object.ty();
-    let receiver = if !object.borrows_move_value() {
+    let receiver = if user_local_type_owns_value(receiver_type) && !object.borrows_move_value() {
         let receiver = context.declare_owned_temp(receiver_type);
         context.locals[receiver.0].writable = receiver_writable;
         receiver
@@ -18782,47 +21154,6 @@ fn widen_checked_null_safe_result(
     )))
 }
 
-fn nullable_present_rvalue(value: mir::Rvalue) -> mir::Rvalue {
-    use mir::Rvalue;
-    match value {
-        Rvalue::Value(value) => Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)),
-        Rvalue::String(value) => {
-            Rvalue::NullableString(mir::NullableStringExpression::String(value))
-        }
-        Rvalue::Class(value) => Rvalue::NullableClass(mir::NullableClassExpression::Class(value)),
-        Rvalue::Interface(value) => Rvalue::nullable_interface(
-            value.interface,
-            mir::NullableInterfaceValue::Present(value.value),
-        ),
-        Rvalue::Collection(value) => {
-            Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(value))
-        }
-        Rvalue::Mixed(value) => Rvalue::NullableMixed(mir::NullableMixedExpression::Mixed(value)),
-        Rvalue::PayloadEnum(value) => {
-            Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(value))
-        }
-        Rvalue::Function(value) => {
-            Rvalue::NullableFunction(mir::NullableFunctionExpression::Present(value))
-        }
-        Rvalue::SharedReference(value) => {
-            Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Shared(value))
-        }
-        Rvalue::WeakReference(value) => {
-            Rvalue::NullableWeakReference(mir::NullableWeakReferenceExpression::Weak(value))
-        }
-        Rvalue::WritableSharedReference(value) => Rvalue::NullableWritableSharedReference(
-            mir::NullableWritableSharedReferenceExpression::Strong(value),
-        ),
-        Rvalue::WritableWeakReference(value) => Rvalue::NullableWritableWeakReference(
-            mir::NullableWritableWeakReferenceExpression::Weak(value),
-        ),
-        Rvalue::SharedReferenceAccess(value) => Rvalue::NullableSharedReferenceAccess(
-            mir::NullableSharedReferenceAccessExpression::Access(Box::new(value)),
-        ),
-        _ => unreachable!("validated non-null result type"),
-    }
-}
-
 fn lower_rvalue_as_borrowed(
     expr: &hir::Expr,
     expected: mir::Type,
@@ -18840,6 +21171,21 @@ fn lower_rvalue_as_borrowed(
         return lower_branching_rvalue(expr, expected, false, context);
     }
     match expected {
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => {
+            inline_value::lower_expression(expr, ty, context)
+                .map(|value| mir::Rvalue::Value(mir::ValueExpression::Inline(value)))
+        }
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
+            lower_nullable_inline_expression(expr, ty, false, context)
+                .map(mir::Rvalue::NullableScalar)
+        }
+        mir::Type::ByteRegion(kind) => {
+            byte_region::expression(expr, kind, false, context).map(mir::Rvalue::ByteRegion)
+        }
+        mir::Type::NullableByteRegion(kind) => {
+            byte_region::nullable_expression(expr, kind, false, context)
+                .map(mir::Rvalue::NullableByteRegion)
+        }
         mir::Type::Interface(interface) => {
             lower_interface_expression(expr, interface, false, context)
                 .map(|value| mir::Rvalue::Interface(mir::InterfaceExpression { interface, value }))
@@ -18980,16 +21326,10 @@ fn lower_payload_enum_expression(
         .get(&expr.span())
         .copied()
     {
-        if case.enum_id != ty.id {
-            return Err(vec![Diagnostic::new(
-                "I2702",
-                "payload enum case resolved to another enum type",
-                expr.span(),
-            )]);
-        }
+        let case = context.materialized_enum_case(case, ty.id, expr.span())?;
         return Ok(mir::PayloadEnumExpression::Construct {
             ty,
-            case: case.case_id,
+            case,
             fields: Vec::new(),
             span: expr.span(),
         });
@@ -19001,8 +21341,8 @@ fn lower_payload_enum_expression(
             &crate::const_eval::ConstValue::PayloadEnum(value),
             mir::Type::PayloadEnum(ty),
             expr.span(),
-            &context.enum_types,
-            context.semantic_info,
+            &context.semantic_info.enums,
+            &mut |ty| context.mir_resolved_type(ty),
         )?;
         let mir::Rvalue::PayloadEnum(value) = lowered else {
             unreachable!("payload enum constant lowering returned another MIR type");
@@ -19014,6 +21354,7 @@ fn lower_payload_enum_expression(
             return Ok(mir::PayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::CollectionIndex {
+                    index_span: expr.span(),
                     collection,
                     index: Box::new(index),
                     positional: false,
@@ -19063,6 +21404,25 @@ fn lower_payload_enum_expression(
             });
         }
     }
+    if let hir::Expr::StaticMember {
+        class_name,
+        member,
+        span,
+    } = expr
+    {
+        let (id, actual) = context.static_property(class_name, member, *span)?;
+        if actual != mir::Type::PayloadEnum(ty) {
+            return Err(vec![unsupported(
+                *span,
+                "static property has another payload enum type",
+            )]);
+        }
+        return Ok(mir::PayloadEnumExpression::Use {
+            ty,
+            place: mir::PayloadEnumPlace::Static(id),
+            mode: payload_enum_use_mode(ty, transfer),
+        });
+    }
     if let hir::Expr::Index {
         collection, index, ..
     } = unparenthesized_place(expr)
@@ -19072,6 +21432,7 @@ fn lower_payload_enum_expression(
         return Ok(mir::PayloadEnumExpression::Use {
             ty,
             place: mir::PayloadEnumPlace::CollectionIndex {
+                index_span: expr.span(),
                 collection,
                 index: Box::new(index),
                 positional: false,
@@ -19087,13 +21448,7 @@ fn lower_payload_enum_expression(
             .get(span)
             .copied()
         {
-            if case.enum_id != ty.id {
-                return Err(vec![Diagnostic::new(
-                    "I2702",
-                    "payload enum construction resolved to another enum type",
-                    *span,
-                )]);
-            }
+            let case = context.materialized_enum_case(case, ty.id, *span)?;
             let definition = context
                 .semantic_info
                 .enums
@@ -19121,7 +21476,8 @@ fn lower_payload_enum_expression(
                 .collect::<DiagnosticResult<Vec<_>>>()?;
             let signature = FunctionSignature {
                 id: mir::FunctionId(usize::MAX),
-                direct_id: None,
+                source_declaration: None,
+                direct: None,
                 return_type: mir::ReturnType::Value(mir::Type::PayloadEnum(ty)),
                 return_borrow: None,
                 parameter_names: case_definition
@@ -19133,7 +21489,7 @@ fn lower_payload_enum_expression(
                 parameter_modes: parameter_types
                     .iter()
                     .map(|field| {
-                        if field.has_move_ownership() {
+                        if field.requires_owned_cleanup() {
                             mir::FunctionParameterMode::Take
                         } else {
                             mir::FunctionParameterMode::Readonly
@@ -19142,7 +21498,7 @@ fn lower_payload_enum_expression(
                     .collect(),
                 parameter_owns: parameter_types
                     .iter()
-                    .map(|field| field.has_move_ownership())
+                    .map(|field| field.requires_owned_cleanup())
                     .collect(),
                 parameter_types,
                 method_class: None,
@@ -19171,6 +21527,7 @@ fn lower_payload_enum_expression(
         let signature = context.lookup_function(name, *span)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
             return Ok(mir::PayloadEnumExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -19189,6 +21546,7 @@ fn lower_payload_enum_expression(
         let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
             return Ok(mir::PayloadEnumExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -19207,6 +21565,7 @@ fn lower_payload_enum_expression(
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
             return Ok(mir::PayloadEnumExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -19282,6 +21641,7 @@ fn lower_nullable_payload_enum_expression(
             return Ok(mir::NullablePayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::CollectionIndex {
+                    index_span: expr.span(),
                     collection,
                     index: Box::new(index),
                     positional: false,
@@ -19311,6 +21671,7 @@ fn lower_nullable_payload_enum_expression(
                         | mir::NullableCollectionAccess::PopBack
                 );
                 return Ok(mir::NullablePayloadEnumExpression::CollectionGet {
+                    index_span: expr.span(),
                     ty,
                     collection,
                     key: Box::new(key),
@@ -19326,6 +21687,7 @@ fn lower_nullable_payload_enum_expression(
     {
         if nullable_collection_value_matches(value_type, mir::Type::PayloadEnum(ty)) {
             return Ok(mir::NullablePayloadEnumExpression::CollectionGet {
+                index_span: expr.span(),
                 ty,
                 collection,
                 key: Box::new(key),
@@ -19355,6 +21717,25 @@ fn lower_nullable_payload_enum_expression(
             });
         }
     }
+    if let hir::Expr::StaticMember {
+        class_name,
+        member,
+        span,
+    } = expr
+    {
+        let (id, actual) = context.static_property(class_name, member, *span)?;
+        if actual != mir::Type::NullablePayloadEnum(ty) {
+            return Err(vec![unsupported(
+                *span,
+                "static property has another nullable payload enum type",
+            )]);
+        }
+        return Ok(mir::NullablePayloadEnumExpression::Use {
+            ty,
+            place: mir::PayloadEnumPlace::Static(id),
+            mode: payload_enum_use_mode(ty, transfer),
+        });
+    }
     if let hir::Expr::Index {
         collection, index, ..
     } = unparenthesized_place(expr)
@@ -19368,6 +21749,7 @@ fn lower_nullable_payload_enum_expression(
         return Ok(mir::NullablePayloadEnumExpression::Use {
             ty,
             place: mir::PayloadEnumPlace::CollectionIndex {
+                index_span: expr.span(),
                 collection,
                 index: Box::new(index),
                 positional: false,
@@ -19380,6 +21762,7 @@ fn lower_nullable_payload_enum_expression(
         let signature = context.lookup_function(name, *span)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
             return Ok(mir::NullablePayloadEnumExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -19398,6 +21781,7 @@ fn lower_nullable_payload_enum_expression(
         let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
             return Ok(mir::NullablePayloadEnumExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -19416,6 +21800,7 @@ fn lower_nullable_payload_enum_expression(
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
             return Ok(mir::NullablePayloadEnumExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -19462,6 +21847,7 @@ fn lower_mixed_expression(
             )]);
         }
         return Ok(mir::MixedExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             collection,
             index: Box::new(index),
@@ -19474,14 +21860,11 @@ fn lower_mixed_expression(
         if context.local_type(local) == mir::Type::Mixed {
             return Ok(mir::MixedExpression::Local { local, transfer });
         }
+        // The checked non-null type proves presence for a move as for a borrow.
         if context.local_type(local) == mir::Type::NullableMixed
-            && !transfer
             && context.expression_type(expr)? == mir::Type::Mixed
         {
-            return Ok(mir::MixedExpression::Local {
-                local,
-                transfer: false,
-            });
+            return Ok(mir::MixedExpression::Local { local, transfer });
         }
     }
     if matches!(
@@ -19500,6 +21883,7 @@ fn lower_mixed_expression(
         let (collection, index) =
             lower_collection_index_operand(collection, index, mir::Type::Mixed, context)?;
         return Ok(mir::MixedExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             collection,
             index: Box::new(index),
@@ -19511,6 +21895,7 @@ fn lower_mixed_expression(
         let signature = context.lookup_function(name, *span)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
             return Ok(mir::MixedExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 return_borrow: signature.return_borrow,
                 args: lower_call_args(name, args, signature, *span, context)?,
@@ -19528,19 +21913,19 @@ fn lower_mixed_expression(
         let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
             return Ok(mir::MixedExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
                 return_borrow: signature.return_borrow,
             });
         }
     }
-    if let Some(case) = context
+    if context
         .semantic_info
         .enum_case_constructions
-        .get(&expr.span())
-        .copied()
+        .contains_key(&expr.span())
     {
-        if let Some(ty) = context.enum_types.get(&case.enum_id).copied() {
+        if let mir::Type::PayloadEnum(ty) = context.expression_type(expr)? {
             return Ok(mir::MixedExpression::BoxPayloadEnum {
                 value: Box::new(lower_payload_enum_expression(expr, ty, transfer, context)?),
             });
@@ -19557,6 +21942,7 @@ fn lower_mixed_expression(
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
             return Ok(mir::MixedExpression::Call {
+                span: expr.span(),
                 function: signature.id,
                 args,
                 return_borrow: signature.return_borrow,
@@ -19565,6 +21951,9 @@ fn lower_mixed_expression(
     }
 
     match context.expression_type(expr)? {
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            unreachable!("byte region boxing is rejected by semantic lifetime checking")
+        }
         mir::Type::Scalar(_) => Ok(mir::MixedExpression::BoxValue(lower_value_expression(
             expr, context,
         )?)),
@@ -19609,10 +21998,10 @@ fn lower_mixed_expression(
         )]),
         mir::Type::Collection(_) | mir::Type::NullableCollection(_) => {
             Err(vec![Diagnostic::unsupported_stage(
-            "M1101",
-            "boxing collections, typed arrays, or Bytes into `mixed` lands after Stage 23 Slice 3",
-            expr.span(),
-        )])
+                "M1101",
+                "boxing collections, typed arrays, or Bytes into `mixed` lands after Stage 23 Slice 3",
+                expr.span(),
+            )])
         }
         mir::Type::NullablePayloadEnum(_) => Err(vec![unsupported(
             expr.span(),
@@ -19656,10 +22045,14 @@ fn lower_mixed_expression(
 
 fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedTag> {
     match ty {
+        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            unreachable!("byte regions have no retained mixed representation")
+        }
         mir::Type::Scalar(mir::ScalarType::Bool) => Ok(mir::MixedTag::Bool),
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Ok(mir::MixedTag::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Ok(mir::MixedTag::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => Ok(mir::MixedTag::Enum(enum_id)),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => Ok(mir::MixedTag::Inline(ty)),
         mir::Type::PayloadEnum(ty) => Ok(mir::MixedTag::PayloadEnum(ty)),
         mir::Type::String => Ok(mir::MixedTag::String),
         mir::Type::Interface(interface) => Ok(mir::MixedTag::Interface(interface)),
@@ -19727,7 +22120,54 @@ fn lower_nullable_mixed_expression(
             )?),
         ));
     }
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        return match value_type {
+            mir::Type::NullableMixed => Ok(mir::NullableMixedExpression::CollectionIndex {
+                index_span: expr.span(),
+                collection,
+                index: Box::new(index),
+                positional: false,
+                transfer: true,
+                remove: true,
+            }),
+            mir::Type::Mixed => Ok(mir::NullableMixedExpression::Mixed(
+                mir::MixedExpression::CollectionIndex {
+                    index_span: expr.span(),
+                    collection,
+                    index: Box::new(index),
+                    positional: false,
+                    transfer: true,
+                    remove: true,
+                },
+            )),
+            _ => Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another type",
+            )]),
+        };
+    }
     match expr {
+        hir::Expr::Grouped { expr, .. } => lower_nullable_mixed_expression(expr, transfer, context),
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } if context.expression_type(expr)? == mir::Type::NullableMixed => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableMixed,
+                context,
+            )?;
+            Ok(mir::NullableMixedExpression::CollectionIndex {
+                index_span: *span,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                transfer,
+                remove: false,
+            })
+        }
         hir::Expr::Binary {
             left,
             op: hir::BinaryOp::Coalesce,
@@ -19775,6 +22215,7 @@ fn lower_nullable_mixed_expression(
             match signature.return_type {
                 mir::ReturnType::Value(mir::Type::NullableMixed) => {
                     Ok(mir::NullableMixedExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         return_borrow: signature.return_borrow,
                         args: lower_call_args(name, args, signature, *span, context)?,
@@ -19782,6 +22223,7 @@ fn lower_nullable_mixed_expression(
                 }
                 mir::ReturnType::Value(mir::Type::Mixed) => Ok(
                     mir::NullableMixedExpression::Mixed(mir::MixedExpression::Call {
+                        span: expr.span(),
                         function: signature.id,
                         return_borrow: signature.return_borrow,
                         args: lower_call_args(name, args, signature, *span, context)?,
@@ -19931,6 +22373,25 @@ fn lower_collection_expression(
             args,
             span,
             ..
+        } if class_name == "Bytes" && method == "allocate" => {
+            let [length] = argument_values(args)[..] else {
+                return Err(vec![unsupported(
+                    *span,
+                    "Bytes::allocate expects 1 argument",
+                )]);
+            };
+            Ok(mir::CollectionExpression::BytesAllocate {
+                collection: expected,
+                length: Box::new(lower_integer_expression(length, context)?),
+                length_span: length.span(),
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+            ..
         } if class_name == "Bytes" && method == "fromArray" => {
             let [source] = argument_values(args)[..] else {
                 return Err(vec![unsupported(
@@ -19969,6 +22430,7 @@ fn lower_collection_expression(
                 )]);
             }
             Ok(mir::CollectionExpression::Call {
+                span: expr.span(),
                 collection: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -19991,6 +22453,7 @@ fn lower_collection_expression(
                 )]);
             }
             Ok(mir::CollectionExpression::Call {
+                span: expr.span(),
                 collection: expected,
                 function: signature.id,
                 args,
@@ -20017,6 +22480,7 @@ fn lower_collection_expression(
                 )]);
             }
             Ok(mir::CollectionExpression::Call {
+                span: expr.span(),
                 collection: expected,
                 function: signature.id,
                 args,
@@ -20092,13 +22556,13 @@ fn lower_collection_expression(
                             return Err(vec![unsupported(
                                 element.value.span(),
                                 "dictionary literals require a key for every entry",
-                            )])
+                            )]);
                         }
                         (None, Some(key)) => {
                             return Err(vec![unsupported(
                                 key.span(),
                                 "sequence collection literals cannot contain keyed entries",
-                            )])
+                            )]);
                         }
                     };
                     Ok(mir::CollectionEntry {
@@ -20154,7 +22618,7 @@ fn lower_collection_expression(
                 collection: expected,
                 source,
                 index: Box::new(lower_rvalue_as_expected(index, index_type, context)?),
-                index_span: index.span(),
+                index_span: expr.span(),
                 transfer: false,
             })
         }
@@ -20175,6 +22639,7 @@ fn lower_collection_expression(
                     format!("{class_name}::from expects one argument"),
                 )]);
             };
+            let source = unparenthesized_place(source);
             if let Some(result) = core_value::preserving_from(source, expected, context)? {
                 return Ok(result);
             }
@@ -20197,7 +22662,7 @@ fn lower_collection_expression(
                                 return Err(vec![unsupported(
                                     element.value.span(),
                                     "SortedDictionary::from requires keyed entries",
-                                )])
+                                )]);
                             }
                             (None, _) => None,
                         };
@@ -20257,10 +22722,64 @@ fn lower_nullable_collection_expression(
         };
         return Ok(value);
     }
+    if let Some((source, index, value_type)) = lower_list_remove_at(expr, context)? {
+        return match value_type {
+            mir::Type::NullableCollection(collection) if collection == expected => {
+                Ok(mir::NullableCollectionExpression::Index {
+                    collection,
+                    source,
+                    index: Box::new(index),
+                    positional: false,
+                    index_span: expr.span(),
+                    transfer: true,
+                })
+            }
+            mir::Type::Collection(collection) if collection == expected => Ok(
+                mir::NullableCollectionExpression::Collection(mir::CollectionExpression::Index {
+                    collection,
+                    source,
+                    index: Box::new(index),
+                    positional: false,
+                    index_span: expr.span(),
+                    transfer: true,
+                }),
+            ),
+            _ => Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another collection type",
+            )]),
+        };
+    }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableCollectionExpression::Null(expected)),
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_collection_expression(expr, expected, transfer, context)
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } if context.expression_type(expr)? == mir::Type::NullableCollection(expected) => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed collection values are borrowed and cannot be moved out",
+                )]);
+            }
+            let (source, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableCollection(expected),
+                context,
+            )?;
+            Ok(mir::NullableCollectionExpression::Index {
+                collection: expected,
+                source,
+                index: Box::new(index),
+                positional: false,
+                index_span: *span,
+                transfer: false,
+            })
         }
         hir::Expr::Binary {
             left,
@@ -20351,6 +22870,7 @@ fn lower_nullable_collection_expression(
                     if collection == expected =>
                 {
                     Ok(mir::NullableCollectionExpression::Call {
+                        span: expr.span(),
                         collection: expected,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -20382,6 +22902,7 @@ fn lower_nullable_collection_expression(
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             Ok(mir::NullableCollectionExpression::Call {
+                span: expr.span(),
                 collection: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -20398,6 +22919,7 @@ fn lower_nullable_collection_expression(
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
             Ok(mir::NullableCollectionExpression::Call {
+                span: expr.span(),
                 collection: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -20433,7 +22955,8 @@ fn lower_list_remove_at(
     if method != "removeAt" {
         return Ok(None);
     }
-    let Some((collection, collection_type)) = lower_collection_receiver(object, context)? else {
+    let Some((collection, collection_type)) = lower_collection_receiver(object, true, context)?
+    else {
         return Ok(None);
     };
     let definition = context.collection_type(collection_type).clone();
@@ -20458,10 +22981,32 @@ fn collection_remove_at_rvalue(
     collection: mir::LocalId,
     index: mir::Rvalue,
     ty: mir::Type,
+    index_span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
+        mir::Type::ByteRegion(kind) => Ok(mir::Rvalue::ByteRegion(
+            mir::ByteRegionExpression::CollectionIndex {
+                kind,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional: false,
+                remove: true,
+            },
+        )),
+        mir::Type::NullableByteRegion(kind) => Ok(mir::Rvalue::NullableByteRegion(
+            mir::NullableByteRegionExpression::CollectionIndex {
+                kind,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional: false,
+                remove: true,
+            },
+        )),
         mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
             mir::NullableClassExpression::DictionaryGet {
+                index_span,
                 class,
                 collection,
                 key: Box::new(index),
@@ -20470,6 +23015,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
             mir::NullableScalarExpression::DictionaryGet {
+                index_span,
                 ty,
                 collection,
                 key: Box::new(index),
@@ -20478,14 +23024,31 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
             mir::NullableStringExpression::DictionaryGet {
+                index_span,
                 collection,
                 key: Box::new(index),
                 access: mir::NullableCollectionAccess::RemoveAt,
             },
         )),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) if ty.requires_owned_cleanup() => {
+            Ok(mir::Rvalue::Value(mir::ValueExpression::Inline(
+                mir::InlineValueExpression::Use {
+                    ty,
+                    operand: mir::Operand::CollectionIndex {
+                        index_span,
+                        positional: false,
+                        collection,
+                        index: Box::new(index),
+                        remove: true,
+                    },
+                    mode: mir::InlineValueUseMode::TransferOwnedCopy,
+                },
+            )))
+        }
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::CollectionIndex {
+                index_span,
                 positional: false,
                 collection,
                 index: Box::new(index),
@@ -20494,6 +23057,7 @@ fn collection_remove_at_rvalue(
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(
             mir::StringExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 collection,
                 index: Box::new(index),
@@ -20503,6 +23067,7 @@ fn collection_remove_at_rvalue(
         mir::Type::Interface(interface) => Ok(mir::Rvalue::interface(
             interface,
             mir::InterfaceValue::CollectionIndex {
+                index_span,
                 collection,
                 index: Box::new(index),
                 positional: false,
@@ -20512,6 +23077,7 @@ fn collection_remove_at_rvalue(
         mir::Type::NullableInterface(interface) => Ok(mir::Rvalue::nullable_interface(
             interface,
             mir::NullableInterfaceValue::CollectionIndex {
+                index_span,
                 collection,
                 index: Box::new(index),
                 positional: false,
@@ -20519,6 +23085,7 @@ fn collection_remove_at_rvalue(
             },
         )),
         mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            index_span,
             positional: false,
             class,
             collection,
@@ -20527,6 +23094,7 @@ fn collection_remove_at_rvalue(
         })),
         mir::Type::SharedReference(class) => Ok(mir::Rvalue::SharedReference(
             mir::SharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 payload: class,
                 collection,
@@ -20536,6 +23104,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::WeakReference(class) => Ok(mir::Rvalue::WeakReference(
             mir::WeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 payload: class,
                 collection,
@@ -20545,6 +23114,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableSharedReference(class) => Ok(mir::Rvalue::NullableSharedReference(
             mir::NullableSharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 payload: class,
                 collection,
@@ -20554,6 +23124,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableWeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 payload: class,
                 collection,
@@ -20563,6 +23134,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::WritableSharedReference(payload) => Ok(mir::Rvalue::WritableSharedReference(
             mir::WritableSharedReferenceExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 payload,
                 collection,
@@ -20572,6 +23144,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::WritableWeakReference(payload) => Ok(mir::Rvalue::WritableWeakReference(
             mir::WritableWeakReferenceExpression::CollectionIndex {
+                index_span,
                 positional: false,
                 payload,
                 collection,
@@ -20584,6 +23157,7 @@ fn collection_remove_at_rvalue(
             let writable = matches!(ty, mir::Type::WritableSharedReferenceAccess(_));
             Ok(mir::Rvalue::SharedReferenceAccess(
                 mir::SharedReferenceAccessExpression::CollectionIndex {
+                    index_span,
                     positional: false,
                     payload,
                     collection,
@@ -20598,6 +23172,7 @@ fn collection_remove_at_rvalue(
             let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
             Ok(mir::Rvalue::NullableSharedReferenceAccess(
                 mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    index_span,
                     positional: false,
                     payload,
                     collection,
@@ -20608,26 +23183,48 @@ fn collection_remove_at_rvalue(
             ))
         }
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            index_span,
             positional: false,
             collection,
             index: Box::new(index),
             transfer: true,
             remove: true,
         })),
+        mir::Type::NullableMixed => Ok(mir::Rvalue::NullableMixed(
+            mir::NullableMixedExpression::CollectionIndex {
+                index_span,
+                positional: false,
+                collection,
+                index: Box::new(index),
+                transfer: true,
+                remove: true,
+            },
+        )),
         mir::Type::Collection(nested) => {
             Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
                 positional: false,
                 collection: nested,
                 source: collection,
                 index: Box::new(index),
-                index_span: Span::default(),
+                index_span,
                 transfer: true,
             }))
         }
+        mir::Type::NullableCollection(nested) => Ok(mir::Rvalue::NullableCollection(
+            mir::NullableCollectionExpression::Index {
+                positional: false,
+                collection: nested,
+                source: collection,
+                index: Box::new(index),
+                index_span,
+                transfer: true,
+            },
+        )),
         mir::Type::PayloadEnum(ty) => {
             Ok(mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::CollectionIndex {
+                    index_span,
                     collection,
                     index: Box::new(index),
                     positional: false,
@@ -20640,6 +23237,7 @@ fn collection_remove_at_rvalue(
             mir::NullablePayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::CollectionIndex {
+                    index_span,
                     collection,
                     index: Box::new(index),
                     positional: false,
@@ -20650,6 +23248,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::Function(function_type) => Ok(mir::Rvalue::Function(
             mir::FunctionExpression::CollectionIndex {
+                index_span,
                 function_type,
                 collection,
                 index: Box::new(index),
@@ -20659,6 +23258,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableFunction(function_type) => Ok(mir::Rvalue::NullableFunction(
             mir::NullableFunctionExpression::CollectionIndex {
+                index_span,
                 function_type,
                 collection,
                 index: Box::new(index),
@@ -20669,9 +23269,7 @@ fn collection_remove_at_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::NullableMixed
-        | mir::Type::NullableCollection(_)
-        | mir::Type::NullableWritableSharedReference(_)
+        mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
             Span::new(0, 0),
             "removing nullable collection elements is deferred beyond Stage 23 Slice 3",
@@ -20684,6 +23282,11 @@ fn materialize_nested_collection_places(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    // Lazy operands are materialized only in the branch that consumes them.
+    // The shared collection-place resolver also covers their nested results.
+    if is_branching_expr(expr) {
+        return Ok(());
+    }
     match expr {
         hir::Expr::Assertion(assertion) => {
             for operand in [
@@ -20704,28 +23307,32 @@ fn materialize_nested_collection_places(
                 materialize_nested_collection_places(&argument.value, false, context)?;
             }
         }
-        hir::Expr::Array { elements, .. } => {
-            for element in elements {
-                if let Some(key) = &element.key {
-                    materialize_nested_collection_places(key, false, context)?;
-                }
-                materialize_nested_collection_places(&element.value, false, context)?;
-            }
-        }
-        hir::Expr::ArrayRepeat { value, count, .. } => {
-            materialize_nested_collection_places(value, false, context)?;
-            materialize_nested_collection_places(count, false, context)?;
-        }
+        // Elements and call arguments have their own ordered lowering. A
+        // prewalk of all of them can execute a later indexed factory before
+        // an earlier operand. Resolve each place when that operand is lowered.
+        hir::Expr::Array { .. } | hir::Expr::ArrayRepeat { .. } => {}
         hir::Expr::Index {
             collection, index, ..
         } => {
             materialize_nested_collection_places(collection, writable, context)?;
+            if writable {
+                // An indexed write needs the returned place's writable loan,
+                // even when that place comes from a direct or callable call.
+                materialize_collection_place(collection, true, context)?;
+            }
             materialize_nested_collection_places(index, false, context)?;
 
             let place = unparenthesized_place(collection);
-            if collection_place_is_borrowed(place) {
+            if collection_place_is_borrowed(place)
+                && matches!(context.expression_type(place)?, mir::Type::Collection(_))
+            {
                 let key = place.span();
-                if !context.materialized_collection_places.contains_key(&key) {
+                if let Some(local) = context.materialized_collection_places.get(&key) {
+                    // An expression prepass may stage the place before its call
+                    // parameter mode is known. Only these synthetic borrows
+                    // gain writable access; validation still proves the source.
+                    context.locals[local.0].writable |= writable;
+                } else {
                     let mir::Type::Collection(collection_type) = context.expression_type(place)?
                     else {
                         return Err(vec![unsupported(
@@ -20745,13 +23352,14 @@ fn materialize_nested_collection_places(
                 }
             }
         }
-        hir::Expr::InterpolatedString { parts, .. } => {
-            for part in parts {
-                if let hir::InterpolatedStringPart::Expr(expr) = part {
-                    materialize_nested_collection_places(expr, false, context)?;
-                }
-            }
-        }
+        // String operands are evaluated and staged in order by their lowerers.
+        // A whole-expression prewalk would hold traversal aliases too long and
+        // could evaluate a later indexed call before an earlier value is read.
+        hir::Expr::InterpolatedString { .. }
+        | hir::Expr::Binary {
+            op: hir::BinaryOp::Concat,
+            ..
+        } => {}
         hir::Expr::PropertyAccess { object, .. } => {
             materialize_nested_collection_places(object, false, context)?;
             if matches!(
@@ -20761,17 +23369,9 @@ fn materialize_nested_collection_places(
                 materialize_collection_place(object, false, context)?;
             }
         }
-        hir::Expr::MethodCall {
-            object,
-            method,
-            args,
-            ..
-        } => {
+        hir::Expr::MethodCall { object, method, .. } => {
             let receiver_writable = method_receiver_is_writable(object, method, context);
             materialize_nested_collection_places(object, receiver_writable, context)?;
-            for arg in args {
-                materialize_nested_collection_places(&arg.value, false, context)?;
-            }
             if matches!(
                 context.expression_type(object),
                 Ok(mir::Type::Collection(_))
@@ -20785,9 +23385,6 @@ fn materialize_nested_collection_places(
             materialize_nested_collection_places(expr, writable, context)?;
         }
         hir::Expr::FunctionCall { name, args, .. } => {
-            for arg in args {
-                materialize_nested_collection_places(&arg.value, false, context)?;
-            }
             let byte_argument = match name.as_str() {
                 "write_file_bytes" | "append_file_bytes" => args.get(1),
                 "write_stdout_bytes" | "write_stderr_bytes" => args.first(),
@@ -20803,9 +23400,6 @@ fn materialize_nested_collection_places(
             args,
             ..
         } => {
-            for arg in args {
-                materialize_nested_collection_places(&arg.value, false, context)?;
-            }
             if class_name == "Set" && method == "from" {
                 if let Some(source) = args.first() {
                     if !matches!(
@@ -20816,27 +23410,8 @@ fn materialize_nested_collection_places(
                     }
                 }
             }
-            if class_name == "Bytes" && method == "fromArray" {
-                if let Some(source) = args.first() {
-                    let byte_array = context
-                        .collection_registry
-                        .ids
-                        .get(&(
-                            mir::CollectionKind::TypedArray,
-                            None,
-                            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
-                        ))
-                        .copied()
-                        .expect("Bytes requires the canonical uint8[] MIR type");
-                    materialize_collection_place_as(&source.value, byte_array, false, context)?;
-                }
-            }
         }
-        hir::Expr::New { args, .. } => {
-            for arg in args {
-                materialize_nested_collection_places(&arg.value, false, context)?;
-            }
-        }
+        hir::Expr::New { .. } => {}
         hir::Expr::Binary {
             left, op, right, ..
         } => {
@@ -20871,6 +23446,7 @@ fn materialize_nested_collection_places(
 
 fn lower_collection_receiver(
     expr: &hir::Expr,
+    writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::CollectionTypeId)>> {
     // Intrinsic member names are not reserved on user classes. Select by the
@@ -20883,6 +23459,9 @@ fn lower_collection_receiver(
     ) {
         return Ok(None);
     }
+    if writable {
+        materialize_collection_place(expr, true, context)?;
+    }
     lower_collection_local(expr, context).map(Some)
 }
 
@@ -20890,6 +23469,33 @@ fn lower_collection_local(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
+    let expr = unparenthesized_place(expr);
+    if let Some(place) = materialized_collection_local(expr, false, context)? {
+        return Ok(place);
+    }
+    let mir::Type::Collection(collection) = context.expression_type(expr)? else {
+        return Err(vec![unsupported(
+            expr.span(),
+            "indexed value is not a collection",
+        )]);
+    };
+    // Every consumer of a collection place shares this boundary. A returned
+    // loan is as usable here as an owned factory result; the lowered value,
+    // not the source expression's syntax, determines ownership and cleanup.
+    materialize_collection_place_as(expr, collection, false, context)?;
+    materialized_collection_local(expr, false, context)?.ok_or_else(|| {
+        vec![unsupported(
+            expr.span(),
+            "collection access requires a materialized collection place",
+        )]
+    })
+}
+
+fn materialized_collection_local(
+    expr: &hir::Expr,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::CollectionTypeId)>> {
     let expr = unparenthesized_place(expr);
     if let Some(local) = context
         .materialized_collection_places
@@ -20899,7 +23505,8 @@ fn lower_collection_local(
         let mir::Type::Collection(collection) = context.local_type(local) else {
             unreachable!("materialized collection place must have collection type");
         };
-        return Ok((local, collection));
+        context.locals[local.0].writable |= writable;
+        return Ok(Some((local, collection)));
     }
     let access_payload = match context.expression_type(expr)? {
         mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Collection(collection))
@@ -20909,7 +23516,7 @@ fn lower_collection_local(
         _ => None,
     };
     if let Some(collection) = access_payload {
-        let Some((access, writable)) = lower_shared_access_payload_local(
+        let Some((access, source_writable)) = lower_shared_access_payload_local(
             expr,
             mir::SharedPayload::Collection(collection),
             context,
@@ -20917,19 +23524,20 @@ fn lower_collection_local(
         else {
             unreachable!("shared collection access type must produce an access local");
         };
+        let writable = writable && source_writable;
         let local = context.declare_borrowed_temp(mir::Type::Collection(collection), writable);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Collection(mir::CollectionExpression::SharedAccessPayload {
                 collection,
                 access,
-                writable,
+                writable: source_writable,
             }),
         });
         context
             .materialized_collection_places
             .insert(expr.span(), local);
-        return Ok((local, collection));
+        return Ok(Some((local, collection)));
     }
     match expr {
         hir::Expr::Variable { name, span } => {
@@ -20938,7 +23546,7 @@ fn lower_collection_local(
                 if context.expression_type(expr)? == mir::Type::Collection(collection) {
                     let narrowed = context.declare_borrowed_temp(
                         mir::Type::Collection(collection),
-                        context.locals[local.0].writable,
+                        writable && context.locals[local.0].writable,
                     );
                     context.push_statement(mir::Statement::AssignLocal {
                         target: narrowed,
@@ -20952,21 +23560,15 @@ fn lower_collection_local(
                     context
                         .materialized_collection_places
                         .insert(*span, narrowed);
-                    return Ok((narrowed, collection));
+                    return Ok(Some((narrowed, collection)));
                 }
             }
             let mir::Type::Collection(collection) = context.local_type(local) else {
-                return Err(vec![unsupported(
-                    *span,
-                    "indexed value is not a collection",
-                )]);
+                return Ok(None);
             };
-            Ok((local, collection))
+            Ok(Some((local, collection)))
         }
-        _ => Err(vec![unsupported(
-            expr.span(),
-            "collection access requires a materialized collection place",
-        )]),
+        _ => Ok(None),
     }
 }
 
@@ -21246,6 +23848,7 @@ impl NullableCollectionScalarOperation<'_> {
             )),
             Self::Property(property @ ("first" | "last" | "peek" | "peekFront" | "peekBack")) => {
                 Ok(mir::NullableScalarExpression::DictionaryGet {
+                    index_span: span,
                     ty: expected,
                     collection,
                     key: Box::new(zero_int_rvalue()),
@@ -21261,6 +23864,7 @@ impl NullableCollectionScalarOperation<'_> {
                     .key
                     .expect("dictionary collection has a key type");
                 Ok(mir::NullableScalarExpression::DictionaryGet {
+                    index_span: span,
                     ty: expected,
                     collection,
                     key: Box::new(lower_rvalue_as_borrowed(&key.value, key_type, context)?),
@@ -21273,6 +23877,7 @@ impl NullableCollectionScalarOperation<'_> {
             }
             Self::Method(method @ ("pop" | "popFront" | "popBack"), []) => {
                 Ok(mir::NullableScalarExpression::DictionaryGet {
+                    index_span: span,
                     ty: expected,
                     collection,
                     key: Box::new(zero_int_rvalue()),
@@ -21294,6 +23899,7 @@ impl NullableCollectionScalarOperation<'_> {
                     value_expression_from_operand(
                         expected,
                         mir::Operand::CollectionIndex {
+                            index_span: span,
                             positional: false,
                             collection,
                             index: Box::new(index),
@@ -21357,7 +23963,8 @@ fn lower_list_index_of(
     else {
         return Ok(None);
     };
-    let Some((collection, collection_type)) = lower_collection_receiver(object, context)? else {
+    let Some((collection, collection_type)) = lower_collection_receiver(object, false, context)?
+    else {
         return Ok(None);
     };
     let definition = context.collection_type(collection_type).clone();
@@ -21392,7 +23999,8 @@ fn materialize_collection_place(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    if lower_collection_local(expr, context).is_ok() {
+    let expr = unparenthesized_place(expr);
+    if materialized_collection_local(expr, writable, context)?.is_some() {
         return Ok(());
     }
     let mir::Type::Collection(collection) = context.expression_type(expr)? else {
@@ -21407,7 +24015,14 @@ fn materialize_collection_place_as(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    if lower_collection_local(expr, context).is_ok() {
+    let expr = unparenthesized_place(expr);
+    if let Some((_, actual)) = materialized_collection_local(expr, writable, context)? {
+        if actual != collection {
+            return Err(vec![unsupported(
+                expr.span(),
+                "materialized collection place has another checked storage type",
+            )]);
+        }
         return Ok(());
     }
     if let Some((local, ty, _)) = materialize_checked_call(expr, false, context)? {
@@ -21422,8 +24037,9 @@ fn materialize_collection_place_as(
             .insert(expr.span(), local);
         return Ok(());
     }
-    let borrowed = collection_place_is_borrowed(expr);
-    let value = lower_collection_expression(expr, collection, !borrowed, context)?;
+    // Accessing a collection does not consume it. Calls and branches may
+    // already have a tracked owner, or may return a loan; preserve that fact.
+    let value = lower_collection_expression(expr, collection, false, context)?;
     let local = if value.owned_temporary_collection().is_none() {
         context.declare_borrowed_temp(mir::Type::Collection(collection), writable)
     } else {
@@ -21463,10 +24079,20 @@ fn method_receiver_is_writable(
     context: &mut LoweringContext,
 ) -> bool {
     match context.expression_type(object) {
-        Ok(mir::Type::Collection(_)) => collection_method_mutates(method),
+        Ok(
+            mir::Type::Collection(_)
+            | mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Collection(_)),
+        ) => collection_method_mutates(method),
         Ok(mir::Type::Class(class) | mir::Type::NullableClass(class)) => context
             .lookup_method(class, method, object.span())
             .is_ok_and(|signature| signature.receiver_mode == Some(mir::ReceiverMode::Writable)),
+        Ok(mir::Type::Interface(interface) | mir::Type::NullableInterface(interface)) => {
+            context.collection_registry.interface_types[interface.0]
+                .methods
+                .iter()
+                .find(|requirement| requirement.name == method)
+                .is_some_and(|requirement| requirement.receiver_mode == mir::ReceiverMode::Writable)
+        }
         _ => false,
     }
 }
@@ -21521,7 +24147,9 @@ fn lower_collection_method_statement(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<bool> {
-    let Some((collection, collection_type)) = lower_collection_receiver(object, context)? else {
+    let Some((collection, collection_type)) =
+        lower_collection_receiver(object, collection_method_mutates(method), context)?
+    else {
         return Ok(false);
     };
     let info = context.collection_type(collection_type).clone();
@@ -21577,6 +24205,7 @@ fn lower_collection_method_statement(
                 _ => mir::CollectionMutationOp::Add,
             };
             let statement = mir::Statement::CollectionAdd {
+                span,
                 collection,
                 value: lower_rvalue_as_expected(&value.value, info.value, context)?,
                 index: None,
@@ -21585,20 +24214,24 @@ fn lower_collection_method_statement(
             context.push_statement(statement);
         }
         (mir::CollectionKind::List, "insertAt", [index, value]) => {
+            let index = lower_rvalue_as_expected(
+                &index.value,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                context,
+            )?;
+            let (index, index_type) = core_value::materialize_value(index, context);
             let statement = mir::Statement::CollectionAdd {
+                span,
                 collection,
                 value: lower_rvalue_as_expected(&value.value, info.value, context)?,
-                index: Some(lower_rvalue_as_expected(
-                    &index.value,
-                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
-                    context,
-                )?),
+                index: Some(local_rvalue(index, index_type, false)),
                 op: mir::CollectionMutationOp::InsertAt,
             };
             context.push_statement(statement);
         }
         (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "remove", [value]) => {
             let statement = mir::Statement::CollectionAdd {
+                span,
                 collection,
                 value: lower_rvalue_as_borrowed(&value.value, info.value, context)?,
                 index: None,
@@ -21629,10 +24262,11 @@ fn lower_collection_method_statement(
             let value = lower_rvalue_as_expected(&value.value, info.value, context)?;
             let key = local_rvalue(key.0, key.1, true);
             if info.uses_core_operations() {
-                core_collection::set(collection, &info, key, value, span, context)?;
+                core_collection::set(collection, &info, key, value, span, Some(span), context)?;
                 return Ok(true);
             }
             let statement = mir::Statement::CollectionSet {
+                index_span: span,
                 collection,
                 key,
                 value,
@@ -21645,7 +24279,7 @@ fn lower_collection_method_statement(
                 mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
                 context,
             )?;
-            let value = collection_remove_at_rvalue(collection, index, info.value)?;
+            let value = collection_remove_at_rvalue(collection, index, info.value, span)?;
             lower_discarded_rvalue(value, context);
         }
         (mir::CollectionKind::List | mir::CollectionKind::PriorityQueue, "pop", [])
@@ -21666,7 +24300,7 @@ fn lower_collection_method_statement(
                 return Ok(false);
             };
             let value =
-                nullable_collection_access_rvalue(collection, key, value_type, access, object)?;
+                nullable_collection_access_rvalue(collection, key, value_type, access, span)?;
             let value =
                 if info.kind == mir::CollectionKind::PriorityQueue && info.uses_core_operations() {
                     core_ordered::pop(collection, &info, value.ty(), span, true, context)?
@@ -21685,12 +24319,22 @@ fn nullable_collection_access_rvalue(
     key: mir::Rvalue,
     value_type: mir::Type,
     access: mir::NullableCollectionAccess,
-    object: &hir::Expr,
+    index_span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
     let key = Box::new(key);
     match value_type {
+        mir::Type::ByteRegion(kind) | mir::Type::NullableByteRegion(kind) => Ok(
+            mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::CollectionGet {
+                kind,
+                collection,
+                key,
+                index_span,
+                access,
+            }),
+        ),
         mir::Type::Scalar(ty) | mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
             mir::NullableScalarExpression::DictionaryGet {
+                index_span,
                 ty,
                 collection,
                 key,
@@ -21699,28 +24343,35 @@ fn nullable_collection_access_rvalue(
         )),
         mir::Type::String | mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
             mir::NullableStringExpression::DictionaryGet {
+                index_span,
                 collection,
                 key,
                 access,
             },
         )),
-        mir::Type::Interface(interface) | mir::Type::NullableInterface(interface) => Ok(mir::Rvalue::nullable_interface(interface,
-            mir::NullableInterfaceValue::DictionaryGet {
-                collection,
-                key,
-                access,
-            },
-        )),
-        mir::Type::Class(class) | mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
-            mir::NullableClassExpression::DictionaryGet {
+        mir::Type::Interface(interface) | mir::Type::NullableInterface(interface) => {
+            Ok(mir::Rvalue::nullable_interface(
+                interface,
+                mir::NullableInterfaceValue::DictionaryGet {
+                    index_span,
+                    collection,
+                    key,
+                    access,
+                },
+            ))
+        }
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => Ok(
+            mir::Rvalue::NullableClass(mir::NullableClassExpression::DictionaryGet {
+                index_span,
                 class,
                 collection,
                 key,
                 access,
-            },
-        )),
+            }),
+        ),
         mir::Type::SharedReference(class) => Ok(mir::Rvalue::NullableSharedReference(
             mir::NullableSharedReferenceExpression::DictionaryGet {
+                index_span,
                 payload: class,
                 collection,
                 key,
@@ -21730,6 +24381,7 @@ fn nullable_collection_access_rvalue(
         )),
         mir::Type::NullableSharedReference(class) => Ok(mir::Rvalue::NullableSharedReference(
             mir::NullableSharedReferenceExpression::DictionaryGet {
+                index_span,
                 payload: class,
                 collection,
                 key,
@@ -21739,6 +24391,7 @@ fn nullable_collection_access_rvalue(
         )),
         mir::Type::WeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::DictionaryGet {
+                index_span,
                 payload: class,
                 collection,
                 key,
@@ -21748,6 +24401,7 @@ fn nullable_collection_access_rvalue(
         )),
         mir::Type::NullableWeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::DictionaryGet {
+                index_span,
                 payload: class,
                 collection,
                 key,
@@ -21758,6 +24412,7 @@ fn nullable_collection_access_rvalue(
         mir::Type::WritableSharedReference(payload) => {
             Ok(mir::Rvalue::NullableWritableSharedReference(
                 mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                    index_span,
                     payload,
                     collection,
                     key,
@@ -21769,6 +24424,7 @@ fn nullable_collection_access_rvalue(
         mir::Type::NullableWritableSharedReference(payload) => {
             Ok(mir::Rvalue::NullableWritableSharedReference(
                 mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                    index_span,
                     payload,
                     collection,
                     key,
@@ -21780,6 +24436,7 @@ fn nullable_collection_access_rvalue(
         mir::Type::WritableWeakReference(payload) => {
             Ok(mir::Rvalue::NullableWritableWeakReference(
                 mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                    index_span,
                     payload,
                     collection,
                     key,
@@ -21791,6 +24448,7 @@ fn nullable_collection_access_rvalue(
         mir::Type::NullableWritableWeakReference(payload) => {
             Ok(mir::Rvalue::NullableWritableWeakReference(
                 mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                    index_span,
                     payload,
                     collection,
                     key,
@@ -21808,6 +24466,7 @@ fn nullable_collection_access_rvalue(
                 .expect("matched shared access collection element");
             Ok(mir::Rvalue::NullableSharedReferenceAccess(
                 mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                    index_span,
                     collection,
                     key,
                     access,
@@ -21815,11 +24474,14 @@ fn nullable_collection_access_rvalue(
                 },
             ))
         }
-        mir::Type::Mixed => Err(vec![Diagnostic::unsupported_stage(
-            "M1101",
-            "nullable accessors returning `?mixed` from collections land with the next mixed collection slice",
-            object.span(),
-        )]),
+        mir::Type::Mixed | mir::Type::NullableMixed => Ok(mir::Rvalue::NullableMixed(
+            mir::NullableMixedExpression::CollectionGet {
+                collection,
+                key,
+                index_span,
+                access,
+            },
+        )),
         mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => {
             let stored_nullable = matches!(value_type, mir::Type::NullablePayloadEnum(_));
             let mutating = matches!(
@@ -21831,6 +24493,7 @@ fn nullable_collection_access_rvalue(
             );
             Ok(mir::Rvalue::NullablePayloadEnum(
                 mir::NullablePayloadEnumExpression::CollectionGet {
+                    index_span,
                     ty,
                     collection,
                     key,
@@ -21840,23 +24503,27 @@ fn nullable_collection_access_rvalue(
                 },
             ))
         }
-        mir::Type::Function(function_type) | mir::Type::NullableFunction(function_type) => {
-            Ok(mir::Rvalue::NullableFunction(
-                mir::NullableFunctionExpression::DictionaryGet {
-                    function_type,
-                    collection,
-                    key,
-                    access,
-                },
-            ))
-        }
+        mir::Type::Function(function_type) | mir::Type::NullableFunction(function_type) => Ok(
+            mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::DictionaryGet {
+                index_span,
+                function_type,
+                collection,
+                key,
+                access,
+            }),
+        ),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::Collection(_) | mir::Type::NullableCollection(_) | mir::Type::NullableMixed => Err(vec![unsupported(
-            object.span(),
-            "discarding this nullable collection element type is not yet supported",
-        )]),
+        mir::Type::Collection(payload) | mir::Type::NullableCollection(payload) => Ok(
+            mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::CollectionGet {
+                collection: payload,
+                source: collection,
+                key,
+                index_span,
+                access,
+            }),
+        ),
     }
 }
 
@@ -21868,7 +24535,7 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         target: local,
         value,
     });
-    if owned {
+    if owned || byte_region::is_type(ty) {
         context.emit_drop_obligations(&[drop_obligation_for_owned_local(local, ty)]);
     }
 }
@@ -21886,7 +24553,9 @@ fn lower_dictionary_get(
         mir::NullableCollectionAccess,
     )>,
 > {
-    let Some((collection, collection_type)) = lower_collection_receiver(object, context)? else {
+    let Some((collection, collection_type)) =
+        lower_collection_receiver(object, collection_method_mutates(method), context)?
+    else {
         return Ok(None);
     };
     let definition = context.collection_type(collection_type).clone();
@@ -21965,7 +24634,8 @@ fn lower_collection_nullable_property(
         "last" | "peekBack" => mir::NullableCollectionAccess::Last,
         _ => return Ok(None),
     };
-    let Some((collection, collection_type)) = lower_collection_receiver(object, context)? else {
+    let Some((collection, collection_type)) = lower_collection_receiver(object, false, context)?
+    else {
         return Ok(None);
     };
     let definition = context.collection_type(collection_type).clone();
@@ -21995,6 +24665,14 @@ fn lower_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    if let Some(actual) = inferred_class_type(expr, context) {
+        if actual != expected && context.class_is_subtype(actual, expected) {
+            return Ok(mir::ClassExpression::Upcast {
+                class: expected,
+                value: Box::new(lower_class_expression(expr, actual, transfer, context)?),
+            });
+        }
+    }
     if let Some(local) = context.narrowed_nominal_local(expr, mir::Type::Class(expected)) {
         if matches!(
             context.local_type(local),
@@ -22059,15 +24737,7 @@ fn lower_class_expression(
             expected,
         )))
     {
-        return Ok(mir::ClassExpression::SharedPayload {
-            class: expected,
-            reference: Box::new(lower_shared_reference_expression(
-                expr,
-                mir::SharedPayload::Class(expected),
-                false,
-                context,
-            )?),
-        });
+        return lower_shared_class_payload(expr, expected, context);
     }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::Class(expected) {
@@ -22077,6 +24747,7 @@ fn lower_class_expression(
             )]);
         }
         return Ok(mir::ClassExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             class: expected,
             collection,
@@ -22200,10 +24871,13 @@ fn lower_class_expression(
             }
         }
         hir::Expr::This { span } => {
-            if transfer {
-                return Err(vec![unsupported(*span, "`$this` cannot be given away")]);
-            }
             let local = context.lookup_local("this", *span)?;
+            if transfer && !context.locals[local.0].owned {
+                return Err(vec![unsupported(
+                    *span,
+                    "borrowed `$this` cannot be given away",
+                )]);
+            }
             let mir::Type::Class(actual) = context.local_type(local) else {
                 return Err(vec![unsupported(
                     *span,
@@ -22219,7 +24893,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Local {
                 class: expected,
                 local,
-                transfer: false,
+                transfer,
             })
         }
         hir::Expr::PropertyAccess {
@@ -22233,15 +24907,7 @@ fn lower_class_expression(
                     expected,
                 ))) =>
         {
-            Ok(mir::ClassExpression::SharedPayload {
-                class: expected,
-                reference: Box::new(lower_shared_reference_expression(
-                    object,
-                    mir::SharedPayload::Class(expected),
-                    false,
-                    context,
-                )?),
-            })
+            lower_shared_class_payload(object, expected, context)
         }
         hir::Expr::PropertyAccess { span, .. } => {
             if transfer {
@@ -22287,6 +24953,7 @@ fn lower_class_expression(
                 context,
             )?;
             Ok(mir::ClassExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 class: expected,
                 collection,
@@ -22321,6 +24988,29 @@ fn lower_class_expression(
                     *span,
                     format!("constructor for `{class_name}` does not produce expected class"),
                 )]);
+            }
+            if context
+                .semantic_info
+                .method_call_targets
+                .get(span)
+                .is_some_and(|method| {
+                    crate::compiler_known_stream::readiness_function(method.declaration)
+                        == Some(crate::compiler_known_stream::ReadinessFunction::New)
+                })
+            {
+                let (result, _, transfer) = materialize_checked_io(
+                    mir::CheckedIoOperation::NewReadinessSet { class },
+                    Some(mir::Type::Class(class)),
+                    *span,
+                    transfer,
+                    context,
+                )?
+                .expect("readiness-set construction produces its owned result");
+                return Ok(mir::ClassExpression::Local {
+                    class: expected,
+                    local: result,
+                    transfer,
+                });
             }
             // Property initializers are source-ordered construction effects. Lower
             // and materialize them before constructor arguments so a checked
@@ -22376,6 +25066,7 @@ fn lower_class_expression(
                 properties,
                 constructor: constructor.map(|signature| signature.id),
                 args: constructor_args,
+                span: expr.span(),
             })
         }
         hir::Expr::FunctionCall { name, args, span } => {
@@ -22396,6 +25087,7 @@ fn lower_class_expression(
                 class: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
+                span: *span,
                 args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
             })
         }
@@ -22424,6 +25116,7 @@ fn lower_class_expression(
                 class: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
+                span: *span,
                 args,
             })
         }
@@ -22452,6 +25145,7 @@ fn lower_class_expression(
                 class: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
+                span: *span,
                 args,
             })
         }
@@ -22501,6 +25195,7 @@ fn lower_shared_reference_expression(
             )]);
         }
         return Ok(mir::SharedReferenceExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             payload: expected,
             collection,
@@ -22590,6 +25285,7 @@ fn lower_shared_reference_expression(
                 )]);
             }
             Ok(mir::SharedReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -22626,6 +25322,7 @@ fn lower_shared_reference_expression(
                 )]);
             }
             Ok(mir::SharedReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -22649,6 +25346,7 @@ fn lower_shared_reference_expression(
                 )]);
             }
             Ok(mir::SharedReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -22696,6 +25394,7 @@ fn lower_shared_reference_expression(
                 context,
             )?;
             Ok(mir::SharedReferenceExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 payload: expected,
                 collection,
@@ -22818,6 +25517,7 @@ fn lower_writable_shared_reference_expression(
                 )]);
             }
             Ok(mir::WritableSharedReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -22856,6 +25556,7 @@ fn lower_writable_shared_reference_expression(
                 )]);
             }
             Ok(mir::WritableSharedReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -22880,6 +25581,7 @@ fn lower_writable_shared_reference_expression(
                 )]);
             }
             Ok(mir::WritableSharedReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -22909,6 +25611,32 @@ fn lower_writable_shared_reference_expression(
                 transfer,
             }),
         },
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed writable shared references are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::WritableSharedReference(expected),
+                context,
+            )?;
+            Ok(mir::WritableSharedReferenceExpression::CollectionIndex {
+                index_span: *span,
+                payload: expected,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
+            })
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "this writable shared-reference expression is not supported by native compilation",
@@ -23014,10 +25742,37 @@ fn lower_writable_weak_reference_expression(
                 )]);
             }
             Ok(mir::WritableWeakReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
                 args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed writable weak references are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::WritableWeakReference(expected),
+                context,
+            )?;
+            Ok(mir::WritableWeakReferenceExpression::CollectionIndex {
+                index_span: *span,
+                payload: expected,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
             })
         }
         _ => Err(vec![unsupported(
@@ -23034,6 +25789,36 @@ fn lower_nullable_writable_shared_reference_expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableWritableSharedReferenceExpression> {
     match unparenthesized_place(expr) {
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } if context.expression_type(expr)?
+            == mir::Type::NullableWritableSharedReference(expected) =>
+        {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed nullable writable shared references are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableWritableSharedReference(expected),
+                context,
+            )?;
+            Ok(
+                mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                    index_span: *span,
+                    payload: expected,
+                    collection,
+                    key: Box::new(index),
+                    access: mir::NullableCollectionAccess::Index,
+                    stored_nullable: true,
+                },
+            )
+        }
         hir::Expr::Null { .. } => Ok(mir::NullableWritableSharedReferenceExpression::Null(
             expected,
         )),
@@ -23075,6 +25860,7 @@ fn lower_nullable_writable_shared_reference_expression(
                     if payload == expected =>
                 {
                     Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        span: expr.span(),
                         payload: expected,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -23168,6 +25954,7 @@ fn lower_nullable_writable_shared_reference_expression(
                     if payload == expected =>
                 {
                     Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        span: expr.span(),
                         payload: expected,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -23179,6 +25966,7 @@ fn lower_nullable_writable_shared_reference_expression(
                 {
                     Ok(mir::NullableWritableSharedReferenceExpression::Strong(
                         mir::WritableSharedReferenceExpression::Call {
+                            span: expr.span(),
                             payload: expected,
                             function: signature.id,
                             return_borrow: signature.return_borrow,
@@ -23213,6 +26001,7 @@ fn lower_nullable_writable_shared_reference_expression(
                     if payload == expected =>
                 {
                     Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        span: expr.span(),
                         payload: expected,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -23224,6 +26013,7 @@ fn lower_nullable_writable_shared_reference_expression(
                 {
                     Ok(mir::NullableWritableSharedReferenceExpression::Strong(
                         mir::WritableSharedReferenceExpression::Call {
+                            span: expr.span(),
                             payload: expected,
                             function: signature.id,
                             return_borrow: signature.return_borrow,
@@ -23275,6 +26065,36 @@ fn lower_nullable_writable_weak_reference_expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableWritableWeakReferenceExpression> {
     match unparenthesized_place(expr) {
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } if context.expression_type(expr)?
+            == mir::Type::NullableWritableWeakReference(expected) =>
+        {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed nullable writable weak references are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableWritableWeakReference(expected),
+                context,
+            )?;
+            Ok(
+                mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                    index_span: *span,
+                    payload: expected,
+                    collection,
+                    key: Box::new(index),
+                    access: mir::NullableCollectionAccess::Index,
+                    stored_nullable: true,
+                },
+            )
+        }
         hir::Expr::Null { .. } => Ok(mir::NullableWritableWeakReferenceExpression::Null(expected)),
         hir::Expr::Variable { name, span }
             if context.local_type(context.lookup_local(name, *span)?)
@@ -23373,6 +26193,7 @@ fn lower_shared_reference_access_expression(
             )]);
         }
         return Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             payload: expected,
             collection,
@@ -23470,6 +26291,7 @@ fn lower_shared_reference_access_expression(
             let (collection, index) =
                 lower_collection_index_operand(collection, index, expected_ty, context)?;
             Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 payload: expected,
                 collection,
@@ -23511,6 +26333,7 @@ fn lower_shared_reference_access_expression(
                 )]);
             }
             Ok(mir::SharedReferenceAccessExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23539,6 +26362,7 @@ fn lower_shared_reference_access_expression(
                 )]);
             }
             Ok(mir::SharedReferenceAccessExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23567,6 +26391,7 @@ fn lower_shared_reference_access_expression(
                 )]);
             }
             Ok(mir::SharedReferenceAccessExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23602,6 +26427,7 @@ fn lower_nullable_shared_reference_access_expression(
         }
         return Ok(
             mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 payload: expected,
                 collection,
@@ -23664,6 +26490,7 @@ fn lower_nullable_shared_reference_access_expression(
                 lower_collection_index_operand(collection, index, nullable_ty, context)?;
             Ok(
                 mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    index_span: expr.span(),
                     positional: false,
                     payload: expected,
                     collection,
@@ -23683,6 +26510,7 @@ fn lower_nullable_shared_reference_access_expression(
                 ));
             }
             Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23748,11 +26576,12 @@ fn lower_nullable_shared_reference_access_expression(
                         return Err(vec![unsupported(
                             *span,
                             "collection accessor has another shared access type",
-                        )])
+                        )]);
                     }
                 };
                 return Ok(
                     mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                        index_span: expr.span(),
                         collection,
                         key: Box::new(key),
                         access,
@@ -23780,6 +26609,7 @@ fn lower_nullable_shared_reference_access_expression(
                 )]);
             }
             Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23810,6 +26640,7 @@ fn lower_nullable_shared_reference_access_expression(
                 )]);
             }
             Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23844,6 +26675,7 @@ fn lower_weak_reference_expression(
             )]);
         }
         return Ok(mir::WeakReferenceExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             payload: expected,
             collection,
@@ -23924,6 +26756,7 @@ fn lower_weak_reference_expression(
                 )]);
             }
             Ok(mir::WeakReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23946,6 +26779,7 @@ fn lower_weak_reference_expression(
                 )]);
             }
             Ok(mir::WeakReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23968,6 +26802,7 @@ fn lower_weak_reference_expression(
                 )]);
             }
             Ok(mir::WeakReferenceExpression::Call {
+                span: expr.span(),
                 payload: expected,
                 function: signature.id,
                 return_borrow: signature.return_borrow,
@@ -23997,6 +26832,32 @@ fn lower_weak_reference_expression(
                 transfer,
             }),
         },
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed weak references are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::WeakReference(expected),
+                context,
+            )?;
+            Ok(mir::WeakReferenceExpression::CollectionIndex {
+                index_span: *span,
+                payload: expected,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
+            })
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "this weak-reference expression is not supported by native compilation",
@@ -24020,10 +26881,11 @@ fn lower_nullable_shared_reference_expression(
                 return Err(vec![unsupported(
                     expr.span(),
                     "collection property has another shared-reference value type",
-                )])
+                )]);
             }
         };
         return Ok(mir::NullableSharedReferenceExpression::DictionaryGet {
+            index_span: expr.span(),
             payload: expected,
             collection,
             key: Box::new(key),
@@ -24039,6 +26901,7 @@ fn lower_nullable_shared_reference_expression(
             )]);
         }
         return Ok(mir::NullableSharedReferenceExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             payload: expected,
             collection,
@@ -24143,6 +27006,7 @@ fn lower_nullable_shared_reference_expression(
                     if class == expected =>
                 {
                     Ok(mir::NullableSharedReferenceExpression::Call {
+                        span: expr.span(),
                         payload: class,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -24224,10 +27088,11 @@ fn lower_nullable_shared_reference_expression(
                         return Err(vec![unsupported(
                             *span,
                             "Dictionary accessor has another shared-reference value type",
-                        )])
+                        )]);
                     }
                 };
                 return Ok(mir::NullableSharedReferenceExpression::DictionaryGet {
+                    index_span: expr.span(),
                     payload: expected,
                     collection,
                     key: Box::new(key),
@@ -24242,6 +27107,7 @@ fn lower_nullable_shared_reference_expression(
                     if class == expected =>
                 {
                     Ok(mir::NullableSharedReferenceExpression::Call {
+                        span: expr.span(),
                         payload: class,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -24251,6 +27117,7 @@ fn lower_nullable_shared_reference_expression(
                 mir::ReturnType::Value(mir::Type::SharedReference(class)) if class == expected => {
                     Ok(mir::NullableSharedReferenceExpression::Shared(
                         mir::SharedReferenceExpression::Call {
+                            span: expr.span(),
                             payload: class,
                             function: signature.id,
                             return_borrow: signature.return_borrow,
@@ -24278,6 +27145,7 @@ fn lower_nullable_shared_reference_expression(
                     if class == expected =>
                 {
                     Ok(mir::NullableSharedReferenceExpression::Call {
+                        span: expr.span(),
                         payload: class,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -24287,6 +27155,7 @@ fn lower_nullable_shared_reference_expression(
                 mir::ReturnType::Value(mir::Type::SharedReference(class)) if class == expected => {
                     Ok(mir::NullableSharedReferenceExpression::Shared(
                         mir::SharedReferenceExpression::Call {
+                            span: expr.span(),
                             payload: class,
                             function: signature.id,
                             return_borrow: signature.return_borrow,
@@ -24318,6 +27187,7 @@ fn lower_nullable_shared_reference_expression(
                 context,
             )?;
             Ok(mir::NullableSharedReferenceExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 payload: expected,
                 collection,
@@ -24357,10 +27227,11 @@ fn lower_nullable_weak_reference_expression(
                 return Err(vec![unsupported(
                     expr.span(),
                     "collection property has another weak-reference value type",
-                )])
+                )]);
             }
         };
         return Ok(mir::NullableWeakReferenceExpression::DictionaryGet {
+            index_span: expr.span(),
             payload: expected,
             collection,
             key: Box::new(key),
@@ -24376,6 +27247,7 @@ fn lower_nullable_weak_reference_expression(
             )]);
         }
         return Ok(mir::NullableWeakReferenceExpression::CollectionIndex {
+            index_span: expr.span(),
             positional: false,
             payload: expected,
             collection,
@@ -24480,6 +27352,7 @@ fn lower_nullable_weak_reference_expression(
                     if class == expected =>
                 {
                     Ok(mir::NullableWeakReferenceExpression::Call {
+                        span: expr.span(),
                         payload: class,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -24535,10 +27408,11 @@ fn lower_nullable_weak_reference_expression(
                         return Err(vec![unsupported(
                             *span,
                             "Dictionary accessor has another weak-reference value type",
-                        )])
+                        )]);
                     }
                 };
                 return Ok(mir::NullableWeakReferenceExpression::DictionaryGet {
+                    index_span: expr.span(),
                     payload: expected,
                     collection,
                     key: Box::new(key),
@@ -24553,6 +27427,7 @@ fn lower_nullable_weak_reference_expression(
                     if class == expected =>
                 {
                     Ok(mir::NullableWeakReferenceExpression::Call {
+                        span: expr.span(),
                         payload: class,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -24562,6 +27437,7 @@ fn lower_nullable_weak_reference_expression(
                 mir::ReturnType::Value(mir::Type::WeakReference(class)) if class == expected => {
                     Ok(mir::NullableWeakReferenceExpression::Weak(
                         mir::WeakReferenceExpression::Call {
+                            span: expr.span(),
                             payload: class,
                             function: signature.id,
                             return_borrow: signature.return_borrow,
@@ -24589,6 +27465,7 @@ fn lower_nullable_weak_reference_expression(
                     if class == expected =>
                 {
                     Ok(mir::NullableWeakReferenceExpression::Call {
+                        span: expr.span(),
                         payload: class,
                         function: signature.id,
                         return_borrow: signature.return_borrow,
@@ -24598,6 +27475,7 @@ fn lower_nullable_weak_reference_expression(
                 mir::ReturnType::Value(mir::Type::WeakReference(class)) if class == expected => {
                     Ok(mir::NullableWeakReferenceExpression::Weak(
                         mir::WeakReferenceExpression::Call {
+                            span: expr.span(),
                             payload: class,
                             function: signature.id,
                             return_borrow: signature.return_borrow,
@@ -24629,6 +27507,7 @@ fn lower_nullable_weak_reference_expression(
                 context,
             )?;
             Ok(mir::NullableWeakReferenceExpression::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 payload: expected,
                 collection,
@@ -24746,7 +27625,7 @@ fn lower_property_place(
                 return Err(vec![unsupported(
                     object.span(),
                     "native class property access requires a class or shared-reference value",
-                )])
+                )]);
             }
         },
     };
@@ -24858,7 +27737,7 @@ fn lower_property_place(
             return Err(vec![unsupported(
                 object.span(),
                 "property access object is not a native class value",
-            )])
+            )]);
         }
     };
     let property_info = context.property_info(class, property).ok_or_else(|| {
@@ -24957,6 +27836,7 @@ fn lower_float_expression(
         return Ok(mir::FloatExpression::Use {
             ty,
             operand: mir::Operand::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 collection,
                 index: Box::new(index),
@@ -25049,6 +27929,7 @@ fn lower_float_expression(
             Ok(mir::FloatExpression::Use {
                 ty,
                 operand: mir::Operand::CollectionIndex {
+                    index_span: expr.span(),
                     positional: false,
                     collection,
                     index: Box::new(index),
@@ -25109,6 +27990,7 @@ fn lower_float_expression(
                 )]);
             }
             Ok(mir::FloatExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args: lower_call_args(name, args, signature, *span, context)?,
@@ -25132,6 +28014,7 @@ fn lower_float_expression(
                 )]);
             }
             Ok(mir::FloatExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -25173,6 +28056,7 @@ fn lower_float_expression(
                 )]);
             }
             Ok(mir::FloatExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -25242,6 +28126,9 @@ fn lower_integer_expression(
     if let Some(crate::const_eval::ConstValue::Integer(value)) = context.constant_value(expr) {
         return Ok(mir::IntegerExpression::constant(*value));
     }
+    if let Some(copy) = byte_region::copy_from(expr, context)? {
+        return Ok(copy);
+    }
     if let hir::Expr::FunctionCall { name, span, .. } = expr {
         if context.lookup_function(name, *span)?.return_type == mir::ReturnType::Void {
             return Err(vec![unsupported(
@@ -25274,6 +28161,7 @@ fn lower_integer_expression(
         return Ok(mir::IntegerExpression::Use {
             ty,
             operand: mir::Operand::CollectionIndex {
+                index_span: expr.span(),
                 positional: false,
                 collection,
                 index: Box::new(index),
@@ -25294,7 +28182,12 @@ fn lower_integer_expression(
                 *span,
             )]);
         }
-        return Ok(mir::IntegerExpression::Call { ty, function, args });
+        return Ok(mir::IntegerExpression::Call {
+            span: expr.span(),
+            ty,
+            function,
+            args,
+        });
     }
 
     if let hir::Expr::MethodCall {
@@ -25316,6 +28209,7 @@ fn lower_integer_expression(
             )]);
         }
         return Ok(mir::IntegerExpression::Call {
+            span: expr.span(),
             ty,
             function: signature.id,
             args,
@@ -25363,9 +28257,7 @@ fn lower_integer_expression(
                         },
                     })
                 }
-                mir::Type::NullableScalar(mir::ScalarType::Integer(local_ty))
-                    if local_ty == ty =>
-                {
+                mir::Type::NullableScalar(mir::ScalarType::Integer(local_ty)) if local_ty == ty => {
                     Ok(mir::IntegerExpression::Use {
                         ty,
                         operand: mir::Operand::NullablePayload(local),
@@ -25403,7 +28295,17 @@ fn lower_integer_expression(
                 }
             }
             if matches!(property.as_str(), "length" | "count") {
-                if let Some((collection, _)) = lower_collection_receiver(object, context)? {
+                if property == "length"
+                    && matches!(context.expression_type(object)?, mir::Type::ByteRegion(_))
+                {
+                    return Ok(mir::IntegerExpression::Use {
+                        ty,
+                        operand: mir::Operand::ByteRegionLength(byte_region::local(
+                            object, false, context,
+                        )?),
+                    });
+                }
+                if let Some((collection, _)) = lower_collection_receiver(object, false, context)? {
                     return Ok(mir::IntegerExpression::Use {
                         ty,
                         operand: mir::Operand::CollectionLength(collection),
@@ -25423,6 +28325,25 @@ fn lower_integer_expression(
         hir::Expr::Index {
             collection, index, ..
         } => {
+            if matches!(
+                context.expression_type(collection)?,
+                mir::Type::ByteRegion(_)
+            ) {
+                let region = byte_region::local(collection, false, context)?;
+                let index = lower_rvalue_as_expected(
+                    index,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                    context,
+                )?;
+                return Ok(mir::IntegerExpression::Use {
+                    ty,
+                    operand: mir::Operand::ByteRegionIndex {
+                        region,
+                        index: Box::new(index),
+                        index_span: expr.span(),
+                    },
+                });
+            }
             let (collection, index) = lower_collection_index_operand(
                 collection,
                 index,
@@ -25432,6 +28353,7 @@ fn lower_integer_expression(
             Ok(mir::IntegerExpression::Use {
                 ty,
                 operand: mir::Operand::CollectionIndex {
+                    index_span: expr.span(),
                     positional: false,
                     collection,
                     index: Box::new(index),
@@ -25566,6 +28488,7 @@ fn lower_integer_expression(
                 )]);
             }
             Ok(mir::IntegerExpression::Call {
+                span: expr.span(),
                 ty,
                 function: signature.id,
                 args,
@@ -25639,6 +28562,15 @@ fn lower_compound_value(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
+    // Reading the old value is part of evaluating the mutation place, before
+    // the right-hand side (including checked calls that introduce MIR blocks).
+    // This also makes a failing indexed read abort before RHS side effects.
+    let (target, _) = core_value::materialize_value(
+        mir::Rvalue::Value(value_expression_from_operand(ty, target)),
+        context,
+    );
+    let target = mir::Operand::Local(target);
+    materialize_nested_collection_places(right, false, context)?;
     match ty {
         mir::ScalarType::Integer(integer) => {
             let right_span = right.span();
@@ -25666,7 +28598,7 @@ fn lower_compound_value(
                     return Err(vec![unsupported(
                         Span::default(),
                         "invalid float compound assignment",
-                    )])
+                    )]);
                 }
             };
             Ok(mir::ValueExpression::Float(mir::FloatExpression::Binary {
@@ -25687,17 +28619,10 @@ fn lower_compound_value(
             Span::default(),
             "enum compound assignment is invalid",
         )]),
-    }
-}
-
-fn local_integer_expression(local: mir::LocalId, ty: IntegerType) -> mir::IntegerExpression {
-    mir::IntegerExpression::use_operand(ty, mir::Operand::Local(local))
-}
-
-fn local_float_expression(local: mir::LocalId, ty: FloatType) -> mir::FloatExpression {
-    mir::FloatExpression::Use {
-        ty,
-        operand: mir::Operand::Local(local),
+        mir::ScalarType::Inline(_) => Err(vec![unsupported(
+            span,
+            "inline value compound assignment is invalid",
+        )]),
     }
 }
 

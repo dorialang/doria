@@ -14,7 +14,7 @@ pub(super) fn builtin_receiver(
         _ => {
             return Err(malformed_mir(
                 "collection adapter has another implementing type",
-            ))
+            ));
         }
     };
     if function.params.first() != Some(&receiver)
@@ -62,7 +62,10 @@ pub(super) fn builtin_vtable(
     for (slot, operation) in operations.into_iter().enumerate() {
         let method = &interface.methods[slot];
         let signature = function_type_in(program, method.signature)?;
-        if Op::from_requirement(method.requirement) != Some(operation)
+        if !method
+            .requirement_origins
+            .iter()
+            .any(|origin| Op::from_requirement(*origin) == Some(operation))
             || signature.parameters.len() != 1
             || signature.parameters[0].ty != mir::Type::Interface(table.interface)
             || signature.parameters[0].mode
@@ -82,15 +85,15 @@ pub(super) fn builtin_vtable(
                 if signature.return_type
                     != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Bool)) =>
             {
-                return Err(malformed_mir("collection cursor presence must return bool"))
+                return Err(malformed_mir("collection cursor presence must return bool"));
             }
             Op::Advance if signature.return_type != mir::ReturnType::Void => {
-                return Err(malformed_mir("collection cursor advance must return void"))
+                return Err(malformed_mir("collection cursor advance must return void"));
             }
             Op::GetCurrent if signature.return_type != mir::ReturnType::Value(collection.value) => {
                 return Err(malformed_mir(
                     "collection iterator yields another element type",
-                ))
+                ));
             }
             Op::Acquire => {
                 let mir::ReturnType::Value(mir::Type::Interface(cursor)) = signature.return_type
@@ -117,6 +120,7 @@ pub(super) fn builtin_vtable(
             && collection.value.has_move_ownership())
         .then_some(mir::ReturnBorrow {
             kind: mir::ReturnBorrowKind::Value,
+            lifetime: mir::RetainedLifetime::LastUse,
             source: mir::BorrowSource::Parameter(0),
             writable: false,
         });
@@ -235,8 +239,43 @@ fn assigned_from(
     target: mir::LocalId,
     source: mir::LocalId,
 ) -> Result<bool, BackendError> {
-    Ok(block_in(function, block)?.statements.iter().any(|statement| matches!(statement,
-        mir::Statement::AssignLocal { target: assigned, value } if *assigned == target && value.direct_place_local() == Some(source))))
+    Ok(block_in(function, block)?
+        .statements
+        .iter()
+        .any(|statement| {
+            let mir::Statement::AssignLocal {
+                target: assigned,
+                value,
+            } = statement
+            else {
+                return false;
+            };
+            if *assigned != target {
+                return false;
+            }
+            // A copied claim preserves the protocol result's value, not its place.
+            let copied = match value {
+                mir::Rvalue::Value(mir::ValueExpression::Inline(
+                    mir::InlineValueExpression::Use {
+                        operand: mir::Operand::Local(local) | mir::Operand::NullablePayload(local),
+                        mode: mir::InlineValueUseMode::Copy,
+                        ..
+                    },
+                )) => Some(*local),
+                mir::Rvalue::NullableScalar(mir::NullableScalarExpression::InlineClaim {
+                    value,
+                    mode: mir::InlineValueUseMode::Copy,
+                    ..
+                }) => match value.as_ref() {
+                    mir::NullableScalarExpression::Local { local, .. } => Some(*local),
+                    _ => None,
+                },
+                _ => None,
+            };
+            value.direct_place_local() == Some(source)
+                || value.transferred_owned_local() == Some(source)
+                || copied == Some(source)
+        }))
 }
 
 fn dominates(
@@ -284,7 +323,14 @@ fn validate_call(
     block_in(function, plan.success)?;
     let receiver = local_in(function, plan.receiver)?;
     let writable = plan.operation == IterationOperation::Advance;
-    if method.writable_receiver != writable || (writable && !receiver.writable) {
+    if method.receiver_mode
+        != if writable {
+            mir::ReceiverMode::Writable
+        } else {
+            mir::ReceiverMode::Readonly
+        }
+        || (writable && !receiver.writable)
+    {
         return Err(malformed_mir(
             "iteration receiver mode disagrees with its requirement",
         ));
@@ -363,7 +409,7 @@ fn validate_call(
                     _ => {
                         return Err(malformed_mir(
                             "iteration proof does not describe its checked call",
-                        ))
+                        ));
                     }
                 }
             };
@@ -434,7 +480,7 @@ fn validate_call(
             return Err(malformed_mir("current Move element must borrow the cursor"));
         }
         if plan.operation == IterationOperation::Acquire
-            && (!local.owned || return_borrow.is_some())
+            && (!local.owned || local.ty.borrows_returned_value(return_borrow))
         {
             return Err(malformed_mir(
                 "iterator acquisition must own its cursor state",

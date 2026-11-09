@@ -1,0 +1,62 @@
+enum Label { case Text(string $value); }
+class Failure implements Error { string $message = "failure"; }
+
+open class Root
+{
+    open function number(): ?int { return null; }
+    open function decimal(): ?float { return null; }
+    open function flag(): ?bool { return null; }
+    open function text(): ?string { return null; }
+    open function label(): ?Label { return null; }
+    open function checkedLabel(): ?Label throws Failure { return null; }
+    open function values(): ?List<int> { return null; }
+    open function callback(): ?function(): int { return null; }
+}
+
+open class Child extends Root
+{
+    override function number(): int { return 7; }
+    override function decimal(): float { return 1.5; }
+    override function flag(): bool { return true; }
+    override function text(): string { return "s"; }
+    override function label(): Label { return Label::Text("x"); }
+    override function checkedLabel(): Label { return Label::Text("y"); }
+    override function values(): List<int> { return [8, 9]; }
+    override function callback(): function(): int { return fn() => 6; }
+}
+class Leaf extends Child {}
+
+function throughRoot(Root $source): void throws Failure
+{
+    echo $source->number() ?? 0;
+    echo ($source->decimal() ?? 0.0) == 1.5;
+    echo $source->flag() ?? false;
+    echo $source->text() ?? "";
+    echo ($source->label() ?? Label::Text("empty")) == Label::Text("x");
+    echo ($source->checkedLabel() ?? Label::Text("empty")) == Label::Text("y");
+    let $values = $source->values() ?? [];
+    echo $values->count;
+    let $callback = $source->callback() ?? fn() => 0;
+    echo $callback();
+}
+
+function throughChild(Child $source): void
+{
+    echo $source->number();
+    echo $source->decimal() == 1.5;
+    echo $source->flag();
+    echo $source->text();
+    echo $source->label() == Label::Text("x");
+    echo $source->checkedLabel() == Label::Text("y");
+    let $values = $source->values();
+    echo $values->count;
+    let $callback = $source->callback();
+    echo $callback();
+}
+
+function main(): void
+{
+    let $source = new Leaf();
+    throughRoot($source);
+    throughChild($source);
+}

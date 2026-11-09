@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
+use crate::ast::{self, Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
 use crate::checked_effects::{CatchCoverage, CatchCoverageMap, CatchTypeMap, EffectSiteMap};
 use crate::source::Span;
 use crate::types::ResolvedType;
@@ -48,6 +48,17 @@ pub struct Node {
     pub repeatable: bool,
     pub predecessors: Vec<NodeId>,
     pub successors: Vec<NodeId>,
+    /// Entry points for evaluating this action, including checked-error
+    /// continuations that branch before the action commits. These are a
+    /// projection of control flow, not additional control-flow edges.
+    pub evaluation_entries: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchBindingSource {
+    pub bindings: Vec<Span>,
+    pub scrutinee: Expr,
+    pub borrowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +66,12 @@ pub struct ControlFlowGraph {
     pub nodes: Vec<Node>,
     pub entry: NodeId,
     pub fallthrough_exit: NodeId,
+    /// Values selected before a conditional region's finalizers execute.
+    pub value_yields: HashMap<NodeId, (Span, Expr)>,
+    /// Normal completion after selection and all attached finalizers.
+    pub value_results: HashMap<Span, NodeId>,
+    /// Pattern bindings become available before their guard and arm evaluation.
+    pub match_bindings: HashMap<NodeId, MatchBindingSource>,
 }
 
 impl ControlFlowGraph {
@@ -69,9 +86,13 @@ impl ControlFlowGraph {
                 repeatable: false,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
+                evaluation_entries: vec![entry],
             }],
             entry,
             fallthrough_exit: entry,
+            value_yields: HashMap::new(),
+            value_results: HashMap::new(),
+            match_bindings: HashMap::new(),
         }
     }
 
@@ -91,6 +112,7 @@ impl ControlFlowGraph {
             repeatable,
             predecessors: Vec::new(),
             successors: Vec::new(),
+            evaluation_entries: vec![id],
         });
         id
     }
@@ -149,6 +171,7 @@ struct ExceptionHandler {
 }
 
 struct ValueRegion {
+    result: Span,
     finalizer_depth: usize,
     yields: Vec<NodeId>,
 }
@@ -164,6 +187,7 @@ struct Builder<'a> {
     terminal_expression_spans: &'a HashSet<Span>,
     exception_handlers: Vec<ExceptionHandler>,
     value_regions: Vec<ValueRegion>,
+    action_exceptions: Vec<Vec<NodeId>>,
 }
 
 pub fn build_function_cfg(body: &Block, function_span: Span) -> ControlFlowGraph {
@@ -230,6 +254,7 @@ pub(crate) fn build_function_cfg_with_checked_effects(
         terminal_expression_spans,
         exception_handlers: Vec::new(),
         value_regions: Vec::new(),
+        action_exceptions: Vec::new(),
     };
     let outgoing = builder.build_statements(&body.statements, vec![entry]);
     let fallthrough = builder.graph.add_node(
@@ -263,6 +288,29 @@ impl Builder<'_> {
     }
 
     fn build_statement(&mut self, statement: &Stmt, incoming: Vec<NodeId>) -> Vec<NodeId> {
+        // Structured statements have several action nodes, none of which
+        // represents their whole source span. Name their entry explicitly so
+        // binding liveness before the construct includes all reachable paths
+        // (and the continuation of an empty block), without a lexical fallback.
+        let incoming = if matches!(
+            statement,
+            Stmt::Block(_)
+                | Stmt::If(_)
+                | Stmt::While(_)
+                | Stmt::DoWhile(_)
+                | Stmt::For(_)
+                | Stmt::Foreach(_)
+                | Stmt::Try(_)
+        ) {
+            vec![self.normal_without_checked_effects(
+                NodeKind::Statement,
+                statement_span(statement),
+                NodeAction::None,
+                &incoming,
+            )]
+        } else {
+            incoming
+        };
         match statement {
             Stmt::Block(block) => self.build_statements(&block.statements, incoming),
             Stmt::Return { span, .. } => {
@@ -278,6 +326,19 @@ impl Builder<'_> {
                         _ => NodeAction::None,
                     };
                     let value = self.normal(NodeKind::Statement, *span, action, incoming);
+                    if let Stmt::Return {
+                        expr: Some(expr), ..
+                    } = statement
+                    {
+                        let result = self
+                            .value_regions
+                            .last()
+                            .expect("active value region")
+                            .result;
+                        self.graph
+                            .value_yields
+                            .insert(value, (result, expr.clone()));
+                    }
                     let routed = self.route_finalizers(vec![value], finalizer_depth);
                     self.value_regions
                         .last_mut()
@@ -297,6 +358,9 @@ impl Builder<'_> {
                 Vec::new()
             }
             Stmt::Throw(statement) => {
+                let entry_sources = incoming.clone();
+                let first_evaluation_node = self.graph.nodes.len();
+                self.action_exceptions.push(Vec::new());
                 let action = NodeAction::Expression(statement.expr.clone());
                 let exclusions = action_evaluation_exclusions(&action);
                 let incoming = self.prepare_action_evaluation(&action, incoming);
@@ -326,6 +390,7 @@ impl Builder<'_> {
                         routed,
                     );
                 }
+                self.finish_action_entries(value, &entry_sources, first_evaluation_node);
                 Vec::new()
             }
             Stmt::Try(statement) => {
@@ -875,21 +940,52 @@ impl Builder<'_> {
                 deduplicate(joined)
             }
             Expr::Match {
-                scrutinee, arms, ..
+                scrutinee,
+                arms,
+                mode,
+                ..
             } => {
                 let incoming = self.build_expression_evaluation(scrutinee, incoming);
                 let mut outgoing = Vec::new();
                 for arm in arms {
                     let mut incoming = incoming.clone();
+                    let borrowed = !matches!(mode, ast::MatchMode::Consumed { .. });
+                    incoming = self.build_match_bindings(
+                        scrutinee,
+                        &arm.pattern,
+                        borrowed || arm.guard.is_some(),
+                        incoming,
+                    );
                     if let Some(guard) = &arm.guard {
                         incoming = self.build_expression_evaluation(&guard.condition, incoming);
                         if constant_condition(&guard.condition) == ConstantCondition::AlwaysFalse {
                             continue;
                         }
+                        if !borrowed {
+                            incoming =
+                                self.build_match_bindings(scrutinee, &arm.pattern, false, incoming);
+                        }
                     }
-                    outgoing.extend(self.build_expression_evaluation(&arm.value, incoming));
+                    let evaluated = self.build_expression_evaluation(&arm.value, incoming);
+                    let value = self.normal_without_checked_effects(
+                        NodeKind::Statement,
+                        arm.value.span(),
+                        NodeAction::None,
+                        &evaluated,
+                    );
+                    self.graph
+                        .value_yields
+                        .insert(value, (expression.span(), arm.value.clone()));
+                    outgoing.push(value);
                 }
-                deduplicate(outgoing)
+                let result = self.normal_without_checked_effects(
+                    NodeKind::Statement,
+                    expression.span(),
+                    NodeAction::None,
+                    &deduplicate(outgoing),
+                );
+                self.graph.value_results.insert(expression.span(), result);
+                vec![result]
             }
             _ => expression_children(expression)
                 .into_iter()
@@ -905,6 +1001,38 @@ impl Builder<'_> {
         }
         self.connect_expression_effects(expression, &outgoing);
         outgoing
+    }
+
+    fn build_match_bindings(
+        &mut self,
+        scrutinee: &Expr,
+        pattern: &ast::MatchPattern,
+        borrowed: bool,
+        incoming: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let bindings = match pattern {
+            ast::MatchPattern::EnumCase {
+                bindings: Some(bindings),
+                ..
+            } => bindings.iter().map(|binding| binding.span).collect(),
+            ast::MatchPattern::TypeBinding { binding, .. } => vec![binding.span],
+            _ => return incoming,
+        };
+        let node = self.normal_without_checked_effects(
+            NodeKind::Statement,
+            scrutinee.span(),
+            NodeAction::None,
+            &incoming,
+        );
+        self.graph.match_bindings.insert(
+            node,
+            MatchBindingSource {
+                bindings,
+                scrutinee: scrutinee.clone(),
+                borrowed,
+            },
+        );
+        vec![node]
     }
 
     fn connect_expression_effects(&mut self, expression: &Expr, incoming: &[NodeId]) {
@@ -923,6 +1051,7 @@ impl Builder<'_> {
     ) -> Vec<NodeId> {
         let finalizer_depth = self.finalizers.len();
         self.value_regions.push(ValueRegion {
+            result: when.span,
             finalizer_depth,
             yields: Vec::new(),
         });
@@ -979,7 +1108,14 @@ impl Builder<'_> {
         }
         let region = self.value_regions.pop().expect("when value region");
         fallthrough.extend(region.yields);
-        deduplicate(fallthrough)
+        let result = self.normal_without_checked_effects(
+            NodeKind::Statement,
+            when.span,
+            NodeAction::None,
+            &deduplicate(fallthrough),
+        );
+        self.graph.value_results.insert(when.span, result);
+        vec![result]
     }
 
     fn normal(
@@ -989,11 +1125,37 @@ impl Builder<'_> {
         action: NodeAction,
         incoming: Vec<NodeId>,
     ) -> NodeId {
+        let entry_sources = incoming.clone();
+        let first_evaluation_node = self.graph.nodes.len();
+        self.action_exceptions.push(Vec::new());
         let exclusions = action_evaluation_exclusions(&action);
         let incoming = self.prepare_action_evaluation(&action, incoming);
         let node = self.normal_without_checked_effects(kind, span, action, &incoming);
         self.connect_checked_effects_except(span, &incoming, None, &exclusions);
+        self.finish_action_entries(node, &entry_sources, first_evaluation_node);
         node
+    }
+
+    fn finish_action_entries(
+        &mut self,
+        node: NodeId,
+        sources: &[NodeId],
+        first_evaluation_node: usize,
+    ) {
+        let mut entries = self.action_exceptions.pop().expect("active action");
+        // Keep the normal action itself even if it is unreachable. Structured
+        // value regions additionally have real evaluation nodes before it.
+        entries.push(node);
+        for source in sources {
+            entries.extend(
+                self.graph.nodes[source.0]
+                    .successors
+                    .iter()
+                    .filter(|target| target.0 >= first_evaluation_node)
+                    .copied(),
+            );
+        }
+        self.graph.nodes[node.0].evaluation_entries = deduplicate(entries);
     }
 
     fn normal_without_checked_effects(
@@ -1036,6 +1198,20 @@ impl Builder<'_> {
     }
 
     fn connect_checked_effect(&mut self, effect: &ResolvedType, span: Span, sources: &[NodeId]) {
+        // This no-op keeps the pre-action state used by constructor analysis,
+        // while naming the precise exceptional continuation for entry liveness.
+        // In particular, another successor of a source may be an opposite
+        // branch and must not be included in this action's liveness.
+        let entry = self.normal_without_checked_effects(
+            NodeKind::Statement,
+            span,
+            NodeAction::None,
+            sources,
+        );
+        for action in &mut self.action_exceptions {
+            action.push(entry);
+        }
+        let sources = [entry];
         let mut handlers = Vec::new();
         let mut fully_caught = false;
         'handlers: for handler in self.exception_handlers.iter().rev() {
@@ -1155,7 +1331,7 @@ fn collect_closure_exclusions(expression: &Expr, spans: &mut Vec<Span>) {
 }
 
 fn contains_value_region(expression: &Expr) -> bool {
-    matches!(expression, Expr::When(_))
+    matches!(expression, Expr::When(_) | Expr::Match { .. })
         || expression_children(expression)
             .into_iter()
             .any(contains_value_region)

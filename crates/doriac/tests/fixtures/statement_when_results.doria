@@ -1,0 +1,114 @@
+class Trace {
+    static writable string $log = "";
+    static writable int $conditions = 0;
+}
+class Watch {
+    function __construct(int $digit) {}
+    function __destruct(): void { Trace::log = Trace::log . $this->digit . ","; }
+}
+class Product {
+    function __construct(int $value) {}
+    function __destruct(): void { Trace::log = Trace::log . $this->value . ","; }
+}
+class Failure implements Error {
+    function __construct(string $message) {}
+}
+enum Packet { case Text(string $message); }
+
+function condition(): bool { Trace::conditions++; return true; }
+function number(Watch $watch): int { return 7; }
+
+function scalar(): int {
+    let $result = given {
+        let $watch = new Watch(1);
+        false;
+    } when (condition()): int {
+        return 99;
+    } else {
+        let $branch = new Watch(2);
+        return (when (true): int { return 23; } else { return 24; });
+    } finally {
+        Trace::log = Trace::log . "f,";
+    };
+    return $result;
+}
+
+function owned(): Product {
+    return when (true): Product {
+        let $watch = new Watch(3);
+        let $result = new Product(7);
+        return $result;
+    } else {
+        return new Product(99);
+    } finally {
+        Trace::log = Trace::log . "o,";
+    };
+}
+
+function managed(): string {
+    let $original = Packet::Text("owned" . " claim");
+    let $copy = when (true): Packet {
+        return $original;
+    } else {
+        return Packet::Text("unused");
+    };
+    return match ($copy) { Packet::Text($message) => $message, };
+}
+
+function temporary(): int {
+    let $result = when (true): int {
+        return number(new Watch(4));
+    } else {
+        return 0;
+    } finally {
+        Trace::log = Trace::log . "t,";
+    };
+    return $result;
+}
+
+function abandoned(): Product throws Failure {
+    return when (true): Product {
+        return new Product(8);
+    } else {
+        return new Product(99);
+    } finally {
+        Trace::log = Trace::log . "a,";
+        throw new Failure("replaced");
+    };
+}
+
+function outerAbandoned(): Product throws Failure {
+    try {
+        return when (true): Product {
+            return new Product(6);
+        } else {
+            return new Product(99);
+        } finally {
+            Trace::log = Trace::log . "i,";
+        };
+    } finally {
+        Trace::log = Trace::log . "r,";
+        throw new Failure("outer");
+    }
+}
+
+function main(): void {
+    let $scalar = scalar();
+    echo "{$scalar}|{Trace::conditions}|{Trace::log}\n";
+    Trace::log = "";
+    {
+        let $product = owned();
+        echo "{$product->value}|{Trace::log}\n";
+    }
+    echo Trace::log . "\n";
+    echo managed() . "\n";
+    Trace::log = "";
+    let $temporary = temporary();
+    echo "{$temporary}|{Trace::log}\n";
+    Trace::log = "";
+    try { let $unused = abandoned(); }
+    catch (Failure $error) { echo "{$error->message}|{Trace::log}\n"; }
+    Trace::log = "";
+    try { let $unused = outerAbandoned(); }
+    catch (Failure $error) { echo "{$error->message}|{Trace::log}\n"; }
+}

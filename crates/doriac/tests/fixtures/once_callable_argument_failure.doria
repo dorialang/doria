@@ -1,0 +1,22 @@
+enum Packet { case Number(int $value); }
+class Events { static writable string $text = ""; }
+function note(string $value): void { Events::text = Events::text . $value . ";"; }
+class Token {
+    function __construct(string $name) { note("new " . $this->name); }
+    function __destruct() { note("drop " . $this->name); }
+}
+class Failure implements Error { function __construct(string $message) {} }
+function make(): Packet { note("make"); return Packet::Number(1); }
+function fail(): Packet throws Failure { note("fail"); throw new Failure("argument"); }
+function drop(take Token $value): void { note("drop call"); }
+function main(): void {
+    try {
+        let $token = new Token("once");
+        let $once = function(Packet $first, Packet $last): int with (take $token) {
+            drop($token);
+            return 0;
+        };
+        $once(make(), fail());
+    } catch (Failure) { note("caught once"); }
+    echo Events::text;
+}

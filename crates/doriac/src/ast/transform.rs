@@ -59,6 +59,7 @@ macro_rules! leaves {
     })* };
 }
 leaves!(
+    CompilerIntrinsic,
     String,
     bool,
     MemberAccess,
@@ -164,6 +165,20 @@ structure!(GroupedTypeRef {
 });
 
 enumeration!(ClassMember { Property(value), Method(value), Constant(value), Uses(value) });
+structure!(InterfaceConformance { ty, condition });
+structure!(NominalCondition {
+    keyword_span,
+    bounds,
+    delimiters,
+    span
+});
+structure!(NominalBound {
+    subject,
+    implements_span,
+    interfaces,
+    type_spans,
+    span
+});
 structure!(InterfaceDecl {
     access,
     access_span,
@@ -194,6 +209,7 @@ structure!(PropertyDecl {
     ty,
     name,
     name_span,
+    availability,
     initializer,
     hooks,
     span
@@ -251,6 +267,8 @@ walk_struct!(FunctionDecl {
     override_span,
     writable_this,
     writable_span,
+    consuming_this,
+    consuming_span,
     is_static,
     static_span,
     name,
@@ -259,12 +277,13 @@ walk_struct!(FunctionDecl {
     params,
     return_type,
     throws,
+    availability,
     body,
     syntax,
     modifier_prefix_span,
     span
 });
-enumeration!(FunctionBody { Block(value), Requirement { semicolon_span } });
+enumeration!(FunctionBody { Block(value), Requirement { semicolon_span }, Intrinsic { implementation, span } });
 structure!(FunctionSyntax {
     keyword_span,
     type_parameters,
@@ -463,7 +482,7 @@ enumeration!(Expr {
     InterpolatedString { parts, span }, Int { value, span }, Float { value, span },
     Bool { value, span }, Null { span }, Array { elements, span },
     ArrayRepeat { value, count, span }, Index { collection, index, span },
-    PropertyAccess { object, property, member_span, null_safe, span },
+    PropertyAccess { object, property, member_span, null_safe, take_span, span },
     MethodCall { object, method, member_span, args, argument_list_span, null_safe, span },
     IsType { expr, ty, span }, FunctionCall { name, args, span },
     CallableCall { callee, open_span, args, close_span, argument_list_span, span },

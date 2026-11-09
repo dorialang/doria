@@ -1,0 +1,33 @@
+enum Packet { case Number(int $count); }
+class State { static writable int $order = 0; static writable bool $readFailure = false; }
+class Failure implements Error { function __construct(string $message) {} }
+class Target {
+    writable int $value = 10 {
+        get throws Failure {
+            State::order = State::order * 10 + 1;
+            if (State::readFailure) { throw new Failure("getter"); }
+            return $this->value;
+        }
+        set (int $next) { State::order = State::order * 10 + 3; $this->value = $next; }
+    }
+    function __destruct(): void { State::order = State::order * 10 + 5; }
+}
+class Operand { function __destruct(): void { State::order = State::order * 10 + 4; } }
+function target(): Target { return new Target(); }
+function right(Operand $operand): int { State::order = State::order * 10 + 2; return 3; }
+function failed(Operand $operand): int throws Failure { State::order = State::order * 10 + 2; throw new Failure("rhs"); }
+function main(): void {
+    State::order = 0;
+    try { target()->value += match (Packet::Number(1)) { Packet::Number($count) => right(new Operand()), }; }
+    catch (Failure) { panic("unexpected getter failure"); }
+    echo State::order . ";";
+    State::order = 0;
+    try { target()->value += match (Packet::Number(1)) { Packet::Number($count) => failed(new Operand()), }; }
+    catch (Failure) {}
+    echo State::order . ";";
+    State::order = 0;
+    State::readFailure = true;
+    try { target()->value += match (Packet::Number(1)) { Packet::Number($count) => right(new Operand()), }; }
+    catch (Failure) {}
+    echo State::order;
+}

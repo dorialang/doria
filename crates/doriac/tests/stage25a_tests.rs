@@ -1,6 +1,9 @@
 //! Stage 25a — shared-ownership grammar, type model, and readonly runtime family
 //! (record 0106).
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
 #[path = "common/native_execution.rs"]
 mod native_execution;
 
@@ -794,6 +797,64 @@ function main(): void throws Doria\Std\Io\IoError
     }
 }
 
+#[test]
+fn nullable_shared_factory_results_preserve_payload_access_capabilities() {
+    for (kind, initializer, writable) in [
+        ("SharedReference", "shared new Node()", false),
+        (
+            "ReadonlySharedReferenceAccess",
+            "(new WritableSharedReference(new Node()))->acquireReadonlyAccess()",
+            false,
+        ),
+        (
+            "WritableSharedReferenceAccess",
+            "(new WritableSharedReference(new Node()))->acquireWritableAccess()",
+            true,
+        ),
+    ] {
+        let prefix = format!(
+            "{NODE}\nfunction make(bool $present): ?{kind}<Node>\n{{\n\
+             if ($present) {{ return {initializer}; }}\nreturn null;\n}}\n\
+             function makePresent(): {kind}<Node> {{ return {initializer}; }}\n"
+        );
+        let source = format!(
+            "{prefix}\nfunction main(): void throws Doria\\Std\\Io\\IoError\n{{\n\
+             echo (make(true)?->count ?? -1) . \"\\n\";\n\
+             echo (make(false)?->count ?? -1) . \"\\n\";\n\
+             echo makePresent()->count . \"\\n\";\n}}\n"
+        );
+        let program = doriac::lower_source_to_mir("nullable-shared-factory.doria", &source)
+            .unwrap_or_else(|diagnostics| panic!("{kind}: {diagnostics:?}"));
+        let output =
+            doriac::mir_interpreter::interpret(&program).expect("shared factory execution");
+        assert_eq!(output.stdout, b"0\n-1\n0\n", "{kind}");
+        assert_eq!(output.stderr, b"", "{kind}");
+        assert_eq!(output.exit_status, 0, "{kind}");
+        for &profile in doriac::backend::NativeProfile::AVAILABLE {
+            native_execution::assert_native_execution(&program, profile, "0\n-1\n0\n");
+        }
+
+        let mutation = format!(
+            "{prefix}\nfunction main(): void {{ make(true)?->rename(); make(false)?->rename(); }}"
+        );
+        if writable {
+            doriac::lower_source_to_mir("nullable-writable-factory.doria", &mutation)
+                .expect("nullable writable access permits mutation");
+        } else {
+            let diagnostics = doriac::check_source("nullable-readonly-factory.doria", &mutation)
+                .expect_err("nullable readonly access must not become writable when owned");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|entry| entry.code == "E0203")
+                    .count(),
+                2,
+                "{kind}: {diagnostics:?}"
+            );
+        }
+    }
+}
+
 // --- Family disjointness -------------------------------------------------
 
 #[test]
@@ -905,6 +966,7 @@ function main(): void {}
             source: doriac::mir::BorrowSource::Parameter(0),
             writable: false,
             kind: doriac::types::ReturnBorrowKind::Value,
+            lifetime: doriac::types::RetainedLifetime::LastUse,
         })
     );
     let transferred = program

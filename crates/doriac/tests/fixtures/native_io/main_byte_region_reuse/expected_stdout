@@ -1,0 +1,9 @@
+zero 0:0
+length
+offset
+tail length
+tail offset
+tail 42:2
+whole 42:4
+copy 42:2
+owner 9

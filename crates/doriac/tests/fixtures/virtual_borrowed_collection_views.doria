@@ -1,0 +1,64 @@
+interface Values { function obtain(): Iterable<int>; }
+interface BorrowedValues { Iterable<int> $contents { borrowed get; } }
+
+class Source implements Values
+{
+    function obtain(): List<int> { return [3, 4]; }
+}
+
+class BorrowedSource implements BorrowedValues
+{
+    List<int> $items = [5, 6];
+    List<int> $contents { get { return $this->items; } }
+}
+
+open class Root
+{
+    List<int> $items = [1, 2];
+    open function values(): Iterable<int> { return $this->items; }
+}
+
+open class Child extends Root
+{
+    List<int> $other = [7, 8];
+    override function values(): List<int> { return $this->other; }
+}
+class Leaf extends Child {}
+
+function throughRoot(Root $source): void
+{
+    let $values = $source->values();
+    foreach ($values as int $value) { echo $value; }
+}
+
+function throughChild(Child $source): void
+{
+    let $values = $source->values();
+    echo $values->count;
+}
+
+function throughInterface(Values $source): void
+{
+    let $values = $source->obtain();
+    foreach ($values as int $value) { echo $value; }
+}
+
+function throughBorrowedInterface(BorrowedValues $source): void
+{
+    let $values = $source->contents;
+    foreach ($values as int $value) { echo $value; }
+}
+
+function main(): void
+{
+    let $root = new Root();
+    throughRoot($root);
+    let $source = new Leaf();
+    throughRoot($source);
+    throughRoot($source);
+    throughChild($source);
+    let $provider = new Source();
+    throughInterface($provider);
+    let $borrowed = new BorrowedSource();
+    throughBorrowedInterface($borrowed);
+}

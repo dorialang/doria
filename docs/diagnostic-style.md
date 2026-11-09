@@ -50,6 +50,17 @@ earlier ownership transfers, previous access sites, conflicting types, and
 causal locations. Every label carries its source identity; never encode a file
 name or a byte range only in prose.
 
+Every location names the source its span is in. Producers build labels, fix
+edits, and runtime locations without knowing which sources a consumer will
+present, so preparation gives them their identity: `prepare_diagnostics` for a
+single presented source, `prepare_diagnostics_with_source_map` for a project.
+No producer or consumer resolves locations on its own. A compiler-owned source
+(`SourceId::is_compiler_owned`) cannot be opened by any reader, so preparation
+removes a secondary label or fix in one, and a primary or runtime location in
+one keeps its message without a position. Producers still report such a site
+at the authored location that reached it. A location is never shown with
+another source's text.
+
 Prefer a small amount of relevant context. Rendering must remain correct for
 UTF-8, combining/wide characters, tabs, empty lines, long lines, narrow
 terminals, multi-line spans, and labels in another file. Byte offsets are the
@@ -102,7 +113,9 @@ ends with `Process Exited With Status <status>`.
 `--diagnostic-format json` writes one schema-version-1 envelope to stdout. It is
 deterministic, structured, and contains no ANSI. Consumers must use fields, not
 parse rendered prose. Schema changes that remove or reinterpret a field require
-a version increment.
+a version increment. A location whose source text is unavailable keeps its
+`source` and byte `span` and has a `null` `range` (call-path frames: `null`
+`line` and `column`).
 
 `--diagnostic-color auto` colors only an interactive stderr and honors
 `NO_COLOR`. `always` and `never` are explicit and testable.
@@ -122,12 +135,20 @@ model. Preserve its catalogue identity, precise source label, explanation
 facts, `Call Path`, abort-without-cleanup behavior, and status 101 across all
 backends. No consumer may parse human panic prose.
 
+Call paths identify authored functions, methods, hooks, and closures. Private
+direct-entry symbols and dispatch adapters are not additional authored calls.
+Shared MIR records adapter frame ownership explicitly; transparent entries retain
+the caller's source site. Closure names use their existing source identity, and
+method names use their nominal declaring class and member, not generated symbols.
+
 ## Review checklist
 
 - The code is catalogued and its default severity/kind are correct.
 - The title and every heading are Title Case.
 - The primary span identifies the actionable token.
 - Related source locations are structured secondary labels.
+- Consumers prepare diagnostics (with the source map for a project) and do not
+  resolve label sources themselves.
 - The explanation teaches one Doria rule in plain language.
 - Help is actionable and does not suggest unavailable syntax.
 - Fix applicability is honest and all edits carry source identities.

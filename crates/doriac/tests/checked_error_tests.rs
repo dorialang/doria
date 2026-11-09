@@ -15,6 +15,112 @@ class {name} implements Error
     )
 }
 
+#[test]
+fn user_interface_effects_separate_required_identity_from_automatic_transport() {
+    let source = format!(
+        r#"
+use Doria\Std\Io\{{IoError, InvalidUtf8Error}};
+{}
+interface Converter {{
+    function convert(): int throws IoError, InvalidUtf8Error, ConversionError;
+}}
+class Concrete implements Converter {{
+    function convert(): int throws IoError, InvalidUtf8Error, ConversionError {{ return 42; }}
+}}
+function convert(Converter $value): int throws ConversionError {{ return $value->convert(); }}
+function main(): int {{ let $value = new Concrete(); return convert($value); }}
+"#,
+        error_class("ConversionError")
+    );
+    let program = doriac::lower_source_to_mir("interface-effect-partitions.doria", source).unwrap();
+    let io_errors = program
+        .error_descriptors
+        .iter()
+        .filter(|descriptor| {
+            matches!(
+                descriptor.type_name.as_str(),
+                doriac::compiler_known_io::IO_ERROR | doriac::compiler_known_io::INVALID_UTF8_ERROR
+            )
+        })
+        .map(|descriptor| doriac::mir::CheckedEffect::Concrete(descriptor.id))
+        .collect::<Vec<_>>();
+    let conversion_error = program
+        .error_descriptors
+        .iter()
+        .find(|descriptor| descriptor.type_name == "ConversionError")
+        .unwrap()
+        .id;
+    assert_eq!(io_errors.len(), 2);
+    for signature in &program.function_types {
+        for effect in &io_errors {
+            assert!(!signature.checked_effects.contains(effect));
+            assert!(signature.ambient_checked_effects.contains(effect));
+        }
+    }
+    assert!(program
+        .function_types
+        .iter()
+        .any(|signature| signature.checked_effects
+            == [doriac::mir::CheckedEffect::Concrete(conversion_error)]));
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program)
+            .unwrap()
+            .exit_status,
+        42
+    );
+}
+
+#[test]
+fn canonical_io_progress_preserves_legacy_defaults_and_explicit_nullable_construction() {
+    let source = r#"
+function main(): int
+{
+    let $legacy = new Doria\Std\Io\IoError(
+        "legacy", Doria\Std\Io\IoOperation::Read,
+        Doria\Std\Io\IoTarget::StandardInput, Doria\Std\Io\IoErrorReason::Other
+    );
+    ?int $legacyProgress = $legacy->transferredByteCount;
+    if ($legacyProgress != null) { return 1; }
+    if ($legacy->systemCode != null) { return 2; }
+    let $zero = new Doria\Std\Io\IoError(
+        "zero", Doria\Std\Io\IoOperation::Write,
+        Doria\Std\Io\IoTarget::StandardOutput, Doria\Std\Io\IoErrorReason::Other,
+        28, 0
+    );
+    if (($zero->transferredByteCount ?? -1) != 0) { return 3; }
+    if (($zero->systemCode ?? -1) != 28) { return 4; }
+    let $partial = new Doria\Std\Io\IoError(
+        message: "partial", operation: Doria\Std\Io\IoOperation::Append,
+        target: Doria\Std\Io\IoTarget::File("data"),
+        reason: Doria\Std\Io\IoErrorReason::Other,
+        transferredByteCount: 3
+    );
+    if (($partial->transferredByteCount ?? -1) != 3) { return 5; }
+    if ($partial->systemCode != null) { return 6; }
+    return 0;
+}
+"#;
+    doriac::check_source("canonical-progress.doria", source)
+        .expect("trailing nullable progress must preserve old and named construction");
+    let mir = doriac::lower_source_to_mir("canonical-progress.doria", source).unwrap();
+    let output =
+        doriac::mir_interpreter::interpret_with_io(&mir, doriac::mir_interpreter::MirIo::default())
+            .unwrap();
+    assert_eq!(output.output.exit_status, 0, "{:?}", output.output);
+    let io = mir
+        .error_descriptors
+        .iter()
+        .find(|descriptor| descriptor.type_name == doriac::compiler_known_io::IO_ERROR)
+        .unwrap();
+    assert!(io.io_transferred_byte_count_property.is_some());
+    for descriptor in &mir.error_descriptors {
+        assert_eq!(
+            descriptor.io_transferred_byte_count_property.is_some(),
+            descriptor.type_name == doriac::compiler_known_io::IO_ERROR
+        );
+    }
+}
+
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("checked_error.doria", source)
         .expect_err("checked-error source should be rejected")

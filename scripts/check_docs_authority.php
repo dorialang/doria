@@ -831,10 +831,10 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Stage 29 Slice 2 — Complete')
         || !str_contains($pipeline, 'Corrective Beat: Native Collection Property Initializers — Complete')
         || !str_contains($pipeline, 'Stage 29 Slice 3 — Complete')
-        || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
-        || !str_contains($pipeline, 'Stage 36a — Not Implemented')
+        || !str_contains($pipeline, 'Stage 36a Remaining Public Spellings — Deferred')
+        || !str_contains($pipeline, 'Stage 36a — Complete')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 28a complete, performance measurement pending an available runner without blocking development, Stage 29 and its native collection property initializer corrective beat complete, the pre-Stage-30 grammar slice next, and Stage 36a scheduled but not implemented with public spellings deferred";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 28a complete, performance measurement pending an available runner without blocking development, Stage 29 and its native collection property initializer corrective beat complete, the pre-Stage-30 grammar slice next, and Stage 36a complete with remaining public spellings deferred";
     }
 
     if (

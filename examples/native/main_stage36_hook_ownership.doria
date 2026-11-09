@@ -1,6 +1,9 @@
+class Trace { static writable string $events = ""; }
+function trace(string $event): void { Trace::events = Trace::events . $event; }
+
 class Item {
     function __construct(int $id) {}
-    function __destruct() { try { echo "drop {$this->id}\n"; } catch (Error) {} }
+    function __destruct() { trace("drop {$this->id}\n"); }
 }
 
 interface Storage {
@@ -13,15 +16,18 @@ class Store implements Storage {
     }
     writable ?string $text = null { get => $this->text; set (?string $next) => $this->text = $next; }
     writable bool $flag = false { get => $this->flag; set (bool $next) => $this->flag = $next; }
-    function __destruct() { try { echo "drop store\n"; } catch (Error) {} }
+    function __destruct() { trace("drop store\n"); }
 }
 function replace(writable Storage $store, take Item $next): void { $store->item = $next; }
 function main(): void {
-    let writable $store = new Store();
-    replace($store, new Item(2));
-    $store->text = "hello";
-    $store->flag = true;
-    echo "{$store->item->id} " . ($store->text ?? "none") . " {$store->flag}\n";
-    $store->text = null;
-    echo ($store->text ?? "empty") . "\n";
+    {
+        let writable $store = new Store();
+        replace($store, new Item(2));
+        $store->text = "hello";
+        $store->flag = true;
+        trace("{$store->item->id} " . ($store->text ?? "none") . " {$store->flag}\n");
+        $store->text = null;
+        trace(($store->text ?? "empty") . "\n");
+    }
+    echo Trace::events;
 }
