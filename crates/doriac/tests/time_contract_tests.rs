@@ -327,7 +327,7 @@ function main(): void { echo Duration::fromNanoseconds(-1)->nanoseconds; }
             for block in &mut function.blocks {
                 match &mut block.terminator {
                     mir::Terminator::Return(mir::Rvalue::Value(mir::ValueExpression::Inline(
-                        mir::InlineValueExpression::DurationFromNanoseconds(value),
+                        mir::InlineValueExpression::FromWord { word: value, .. },
                     ))) if factory => {
                         **value =
                             mir::IntegerExpression::constant(doriac::numeric::IntegerValue::zero(
@@ -336,7 +336,7 @@ function main(): void { echo Duration::fromNanoseconds(-1)->nanoseconds; }
                         replaced = true;
                     }
                     mir::Terminator::Return(mir::Rvalue::Value(mir::ValueExpression::Integer(
-                        mir::IntegerExpression::DurationNanoseconds(value),
+                        mir::IntegerExpression::InlineWord(value),
                     ))) if !factory => {
                         **value = mir::InlineValueExpression::Use {
                             ty: InlineValueType::Deadline,
@@ -358,9 +358,9 @@ function main(): void { echo Duration::fromNanoseconds(-1)->nanoseconds; }
         );
         let error = doriac::mir_validation::validate_program(&invalid).unwrap_err();
         let expected = if factory {
-            "Duration factory requires int64 nanoseconds"
+            "word factory requires a one-word inline value and an int64 word"
         } else {
-            "nanoseconds getter requires Duration"
+            "word read requires a one-word inline value"
         };
         assert!(error.message.contains(expected), "{error:?}");
     }

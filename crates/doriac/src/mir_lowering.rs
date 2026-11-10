@@ -3877,6 +3877,15 @@ fn lower_function(
             crate::ast::CompilerIntrinsic::Time(intrinsic) => {
                 inline_value::lower_intrinsic(intrinsic, function.span, &params, &mut context);
             }
+            crate::ast::CompilerIntrinsic::Term(intrinsic) => {
+                inline_value::lower_term_intrinsic(
+                    intrinsic,
+                    function.span,
+                    &params,
+                    signature.return_type,
+                    &mut context,
+                );
+            }
             crate::ast::CompilerIntrinsic::Concurrency(intrinsic) => {
                 inline_value::lower_concurrency_intrinsic(
                     intrinsic,

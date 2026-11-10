@@ -1378,6 +1378,9 @@ fn validate_class(
             crate::inline_value::InlineValueType::CancellationToken(_) => {
                 crate::compiler_known_concurrency::SOURCE_ID
             }
+            crate::inline_value::InlineValueType::Terminal(..) => {
+                crate::compiler_known_term::SOURCE_ID
+            }
         };
         if class.source_span.source != source
             || class.arguments.len()
@@ -5939,9 +5942,9 @@ fn validate_integer_expression(
     expression: &mir::IntegerExpression,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::IntegerExpression::DurationNanoseconds(value) => {
-            if value.ty() != crate::inline_value::InlineValueType::Duration {
-                return Err(malformed_mir("nanoseconds getter requires Duration"));
+        mir::IntegerExpression::InlineWord(value) => {
+            if !value.ty().is_word() {
+                return Err(malformed_mir("word read requires a one-word inline value"));
             }
             validate_inline_value_expression(program, function, value)
         }
@@ -6036,7 +6039,66 @@ fn validate_integer_expression(
             validate_rvalue(program, function, destination)?;
             validate_rvalue(program, function, source)
         }
+        mir::IntegerExpression::Terminal { call, .. } => {
+            validate_terminal_call(program, function, *call)
+        }
     }
+}
+
+/// The operands are locals of the exact types the runtime entry receives.
+fn validate_terminal_call(
+    program: &mir::Program,
+    function: &mir::Function,
+    call: mir::TerminalCall,
+) -> Result<(), BackendError> {
+    let ty = |local: mir::LocalId| {
+        function
+            .locals
+            .get(local.0)
+            .map(|local| local.ty)
+            .ok_or_else(|| malformed_mir("terminal call names a missing local"))
+    };
+    let int = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+    match call {
+        mir::TerminalCall::Operate {
+            operation,
+            first,
+            second,
+            text,
+        } => {
+            if ty(operation)? != int
+                || ty(first)? != int
+                || ty(second)? != int
+                || ty(text)? != mir::Type::String
+            {
+                return Err(malformed_mir(
+                    "terminal operation needs three int operands and a string",
+                ));
+            }
+        }
+        mir::TerminalCall::AwaitEvent {
+            generation,
+            wait,
+            cancellation,
+        } => {
+            let waits = matches!(ty(wait)?, mir::Type::PayloadEnum(wait)
+            if program.enums.get(wait.id.0).is_some_and(|definition| {
+                definition.name == crate::compiler_known_stream::WAIT
+            }));
+            let cancels = matches!(
+                ty(cancellation)?,
+                mir::Type::NullableScalar(mir::ScalarType::Inline(
+                    crate::inline_value::InlineValueType::CancellationToken(_)
+                ))
+            );
+            if ty(generation)? != int || !waits || !cancels {
+                return Err(malformed_mir(
+                    "terminal event wait needs an int generation, a Wait and a nullable CancellationToken",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_value_expression(
@@ -6098,11 +6160,13 @@ fn validate_inline_value_expression(
             }
             validate_cancellation_source(program, function, *source)
         }
-        mir::InlineValueExpression::DurationFromNanoseconds(value) => {
-            if value.ty() != IntegerType::Int64 {
-                return Err(malformed_mir("Duration factory requires int64 nanoseconds"));
+        mir::InlineValueExpression::FromWord { ty, word } => {
+            if !ty.is_word() || word.ty() != IntegerType::Int64 {
+                return Err(malformed_mir(
+                    "word factory requires a one-word inline value and an int64 word",
+                ));
             }
-            validate_integer_expression(program, function, value)
+            validate_integer_expression(program, function, word)
         }
         mir::InlineValueExpression::Use { operand, .. } => match operand {
             mir::Operand::Scalar(value) if value.ty() == scalar => {
@@ -13304,8 +13368,8 @@ fn collect_inline_class_local_accesses<'a>(
             }
         }
         mir::InlineValueExpression::CancellationToken { source, .. } => accesses.borrow(*source),
-        mir::InlineValueExpression::DurationFromNanoseconds(value) => {
-            collect_integer_class_local_accesses(value, accesses);
+        mir::InlineValueExpression::FromWord { word, .. } => {
+            collect_integer_class_local_accesses(word, accesses);
         }
         mir::InlineValueExpression::Use { operand, mode, ty } => {
             collect_operand_class_local_accesses(operand, accesses);
@@ -13424,7 +13488,7 @@ fn collect_integer_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::IntegerExpression::DurationNanoseconds(value) => {
+        mir::IntegerExpression::InlineWord(value) => {
             collect_inline_class_local_accesses(value, accesses);
         }
         mir::IntegerExpression::Use { operand, .. } => {
@@ -13471,6 +13535,7 @@ fn collect_integer_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(destination, accesses);
             collect_rvalue_class_local_accesses(source, accesses);
         }
+        mir::IntegerExpression::Terminal { .. } => {}
     }
 }
 
@@ -20861,8 +20926,8 @@ fn inline_value_observes_property(
             receiver: source, ..
         } => *source == receiver,
         mir::InlineValueExpression::CancellationToken { source, .. } => *source == receiver,
-        mir::InlineValueExpression::DurationFromNanoseconds(value) => {
-            integer_observes_property(value, receiver, property)
+        mir::InlineValueExpression::FromWord { word, .. } => {
+            integer_observes_property(word, receiver, property)
         }
         mir::InlineValueExpression::Use { operand, .. } => {
             operand_observes_property(operand, receiver, property)
@@ -21127,7 +21192,7 @@ fn integer_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::IntegerExpression::DurationNanoseconds(value) => {
+        mir::IntegerExpression::InlineWord(value) => {
             inline_value_observes_property(value, receiver, property)
         }
         mir::IntegerExpression::Use { operand, .. } => {
@@ -21162,6 +21227,7 @@ fn integer_observes_property(
             rvalue_observes_property(destination, receiver, property)
                 || rvalue_observes_property(source, receiver, property)
         }
+        mir::IntegerExpression::Terminal { .. } => false,
     }
 }
 

@@ -36,6 +36,7 @@ mod shared;
 mod specialization;
 mod standard_io;
 mod streams;
+mod term;
 mod value_argument;
 mod value_result;
 
@@ -6614,6 +6615,9 @@ fn emit_function_instance_body(
         match intrinsic {
             crate::ast::CompilerIntrinsic::Concurrency(intrinsic) => {
                 concurrency::emit_body(intrinsic, output, indent + 1);
+            }
+            crate::ast::CompilerIntrinsic::Term(intrinsic) => {
+                term::emit_body(intrinsic, output, indent + 1);
             }
             crate::ast::CompilerIntrinsic::File(intrinsic) => streams::emit_body(
                 intrinsic,

@@ -549,6 +549,7 @@ pub fn standard_device(name: &str) -> Option<crate::mir::StandardIoStream> {
 pub const WRITABLE_FILE: &str = "Doria\\Std\\Io\\WritableFile";
 pub const DUPLEX_FILE: &str = "Doria\\Std\\Io\\DuplexFile";
 pub const READINESS_SOURCE: &str = "Doria\\Std\\Io\\ReadinessSource";
+pub const WAIT: &str = "Doria\\Std\\Io\\Wait";
 pub const REGISTRATION_KEY: &str = "Doria\\Std\\Io\\RegistrationKey";
 pub const READ_TRANSFER_KEY: &str = "Doria\\Std\\Io\\ReadTransferKey";
 pub const WRITE_TRANSFER_KEY: &str = "Doria\\Std\\Io\\WriteTransferKey";
@@ -2297,11 +2298,29 @@ pub fn declarations() -> &'static Program {
     &DECLARATIONS
 }
 
+/// The Term module is written over `Wait`, so a program that uses Term uses
+/// this source too.
 pub fn resolved_facts_use_streams(facts: &GlobalSymbolFacts) -> bool {
-    facts.references.iter().any(|reference| {
-        matches!(&reference.symbol_id.owner,
-            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
-                if CANONICAL_TYPES.contains(&name.as_str()))
+    crate::compiler_known_term::resolved_facts_use_term(facts)
+        || facts.references.iter().any(|reference| {
+            matches!(&reference.symbol_id.owner,
+                GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
+                    if CANONICAL_TYPES.contains(&name.as_str()))
+        })
+}
+
+/// The fully qualified standard names a piece of standard source mentions.
+/// Every cross-reference in compiler-known source is fully qualified, so
+/// scanning the text is exact.
+fn standard_names(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices("Doria\\Std\\").map(move |(start, _)| {
+        let rest = &text[start..];
+        let end = rest
+            .char_indices()
+            .skip("Doria\\Std\\".len())
+            .find(|(_, character)| !(character.is_alphanumeric() || *character == '\\'))
+            .map_or(rest.len(), |(end, _)| end);
+        &rest[..end]
     })
 }
 
@@ -2346,14 +2365,8 @@ fn declaration_dependencies() -> &'static [Vec<usize>] {
                 let span = item_span(item);
                 let text = &SOURCE_TEXT[span.start..span.end];
                 let mut dependencies = Vec::new();
-                for (start, _) in text.match_indices("Doria\\Std\\") {
-                    let rest = &text[start..];
-                    let end = rest
-                        .char_indices()
-                        .skip("Doria\\Std\\".len())
-                        .find(|(_, character)| !(character.is_alphanumeric() || *character == '\\'))
-                        .map_or(rest.len(), |(end, _)| end);
-                    if let Some(position) = index.get(&rest[..end]) {
+                for name in standard_names(text) {
+                    if let Some(position) = index.get(name) {
                         if !dependencies.contains(position) {
                             dependencies.push(*position);
                         }
@@ -2373,15 +2386,23 @@ pub fn augment_program_for(program: &Program, facts: &GlobalSymbolFacts) -> Prog
     let items = &declarations().items;
     let dependencies = declaration_dependencies();
     let mut reached = vec![false; items.len()];
+    // The Term source is added whole, so everything it names here is reached
+    // by any program that uses Term.
+    let named_by_term = if crate::compiler_known_term::resolved_facts_use_term(facts) {
+        standard_names(crate::compiler_known_term::SOURCE_TEXT).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut pending = items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            facts.references.iter().any(|reference| {
-                matches!(&reference.symbol_id.owner,
-                    GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
-                        if name == item_name(item))
-            })
+            named_by_term.contains(&item_name(item))
+                || facts.references.iter().any(|reference| {
+                    matches!(&reference.symbol_id.owner,
+                        GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
+                            if name == item_name(item))
+                })
         })
         .map(|(position, _)| position)
         .collect::<Vec<_>>();

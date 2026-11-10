@@ -12,9 +12,8 @@ use std::vec::Vec;
 use std::{eprintln, format, string::String};
 
 use super::wire::{self, operation, Color, Key, Observation, Style};
-use super::{dr_v1_terminal_await_event, dr_v1_terminal_operate};
+use super::{dr_v1_host_terminal_operate, dr_v1_terminal_await_event, dr_v1_terminal_operate};
 use crate::device_io::StandardStream;
-use crate::wait_budget::DrWaitBudgetV1;
 
 const SCENARIO: &str = "DORIA_RT_TERMINAL_SCENARIO";
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -56,6 +55,12 @@ impl Terminal {
             ws_ypixel: 0,
         };
         let (mut master, mut slave) = (-1, -1);
+        // `openpty` names the slave through a static buffer on macOS, so two
+        // tests opening terminals at once can be handed each other's.
+        static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _opening = OPENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe {
             assert_eq!(
                 libc::openpty(
@@ -102,6 +107,18 @@ impl Terminal {
             command.pre_exec(|| {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // A test run started in the background inherits ignored
+                // interrupt and quit signals. A program started from a
+                // terminal has the defaults, and that is what is under test.
+                for signal in [
+                    libc::SIGINT,
+                    libc::SIGQUIT,
+                    libc::SIGTERM,
+                    libc::SIGHUP,
+                    libc::SIGTSTP,
+                ] {
+                    libc::signal(signal, libc::SIG_DFL);
                 }
                 Ok(())
             });
@@ -255,7 +272,7 @@ fn printable(bytes: &[u8]) -> String {
 type Refused = (u8, Option<i64>);
 
 unsafe fn operate(operation: u32, first: i64, second: i64, text: &[u8]) -> Result<u64, Refused> {
-    let result = dr_v1_terminal_operate(operation, first, second, text.as_ptr(), text.len());
+    let result = dr_v1_host_terminal_operate(operation, first, second, text.as_ptr(), text.len());
     if wire::status(result) == wire::STATUS_OK {
         Ok(wire::payload(result))
     } else {
@@ -267,8 +284,13 @@ unsafe fn perform(operation: u32) {
     operate(operation, 0, 0, b"").unwrap();
 }
 
+/// Draws through the entry compiled Doria uses, with a real Doria string.
 unsafe fn draw(text: &[u8]) {
-    operate(operation::WRITE, 0, 0, text).unwrap();
+    let string = crate::allocate_string(text.len());
+    core::ptr::copy_nonoverlapping(text.as_ptr(), crate::string_bytes_mut(string), text.len());
+    let result = dr_v1_terminal_operate(operation::WRITE, 0, 0, string);
+    assert_eq!(wire::status(result), wire::STATUS_OK);
+    crate::dr_v1_string_release(string);
 }
 
 /// Draws a marker and makes sure the terminal has it.
@@ -277,20 +299,23 @@ unsafe fn announce(marker: &str) {
     perform(operation::FLUSH);
 }
 
-fn indefinite() -> DrWaitBudgetV1 {
-    DrWaitBudgetV1::indefinite()
+/// A `Doria\Std\Io\Wait` as compiled code passes it: kind and nanoseconds.
+type Wait = (u8, u64);
+
+fn indefinite() -> Wait {
+    (1, 0)
 }
 
-fn within(nanoseconds: u64) -> DrWaitBudgetV1 {
-    DrWaitBudgetV1::new(2, nanoseconds, crate::monotonic_clock::now).unwrap()
+fn within(nanoseconds: u64) -> Wait {
+    (2, nanoseconds)
 }
 
 unsafe fn next_event(
     generation: u64,
-    budget: DrWaitBudgetV1,
+    wait: Wait,
     cancellation: *mut crate::cancellation::DrCancellationV1,
 ) -> Observation {
-    let result = dr_v1_terminal_await_event(generation as u32, &budget, cancellation);
+    let result = dr_v1_terminal_await_event(generation as u32, wait.0, wait.1, 0, cancellation);
     assert_eq!(wire::status(result), wire::STATUS_OK, "event wait failed");
     Observation::from_payload(wire::payload(result)).unwrap()
 }
@@ -407,7 +432,7 @@ unsafe fn child_keys() {
 
 unsafe fn child_waits() {
     let generation = enter_raw_mode();
-    let immediate = DrWaitBudgetV1::new(0, 0, crate::monotonic_clock::now).unwrap();
+    let immediate: Wait = (0, 0);
     eprintln!(
         "immediate={:?}",
         next_event(generation, immediate, core::ptr::null_mut())

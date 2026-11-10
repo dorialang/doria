@@ -574,33 +574,19 @@ fn pending_adapter(
     Ok(adapter)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn observe(
+/// A `Doria\Std\Io\Wait` local as the three words every runtime wait takes:
+/// its kind (0 immediate, 1 indefinite, 2 a duration, 3 a deadline) and the
+/// low and high words of the duration or deadline.
+pub(super) fn wait_words(
     builder: &mut FunctionBuilder,
-    group: mir::LocalId,
     wait: mir::LocalId,
-    outcome: mir::PayloadEnumType,
-    result: Option<mir::LocalId>,
-    error: mir::LocalId,
-    success: Block,
-    failure: Block,
-    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
-) -> Result<(), BackendError> {
-    set_active_panic_site(builder, span, resources);
+) -> Result<Vec<Value>, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     let flags = cranelift_codegen::ir::MachMemFlags::trusted();
-    let slots = checked_io_output_slots(builder, pointer);
-    let group_id = group;
-    let group = builder.ins().stack_load(
-        pointer,
-        pointer,
-        local_slot(resources.local_slots, group)?,
-        0,
-    );
     let wait_type = local_definition(resources.program, resources.function_id, wait)?.ty;
     let mir::Type::PayloadEnum(wait_type) = wait_type else {
-        return Err(malformed_mir("observation has no Wait enum"));
+        return Err(malformed_mir("a runtime wait has no Wait enum"));
     };
     let wait_definition = enum_definition(resources.program, wait_type.id)?;
     let wait_address =
@@ -649,7 +635,34 @@ fn observe(
         .ins()
         .jump(wait_values, &[kind.into(), zero64.into(), zero64.into()]);
     builder.switch_to_block(wait_values);
-    let values = builder.block_params(wait_values).to_vec();
+    Ok(builder.block_params(wait_values).to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe(
+    builder: &mut FunctionBuilder,
+    group: mir::LocalId,
+    wait: mir::LocalId,
+    outcome: mir::PayloadEnumType,
+    result: Option<mir::LocalId>,
+    error: mir::LocalId,
+    success: Block,
+    failure: Block,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    set_active_panic_site(builder, span, resources);
+    let pointer = resources.module.target_config().pointer_type();
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let slots = checked_io_output_slots(builder, pointer);
+    let group_id = group;
+    let group = builder.ins().stack_load(
+        pointer,
+        pointer,
+        local_slot(resources.local_slots, group)?,
+        0,
+    );
+    let values = wait_words(builder, wait, resources)?;
     let output = [1, 1, 2, 1, 1].map(|words| scratch(builder, pointer, words));
     let control = scratch(
         builder,

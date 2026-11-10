@@ -1,0 +1,174 @@
+// Stage 46 acceptance program (Decision 0140).
+//
+// One source file, no platform conditionals, nothing but Doria\Std\Term:
+// a menu of any number of items, moved through with the arrow keys and
+// chosen with Enter. It must behave identically in a Linux terminal, a
+// macOS terminal and a native Windows console (PowerShell or cmd in
+// Windows Terminal or conhost, not WSL).
+namespace Demo\Menu;
+
+use Doria\Std\Io\Wait;
+use Doria\Std\Term\{Color, Console, Key, Style, TerminalError, TerminalEvent, TerminalWaitResult};
+
+class MenuItem {
+    function __construct(string $label) {}
+}
+
+enum MenuAction {
+    case None;
+    case MoveUp;
+    case MoveDown;
+    case MoveFirst;
+    case MoveLast;
+    case Choose;
+    case Cancel;
+    case Redraw;
+}
+
+class Menu {
+    internal writable List<MenuItem> $items = [];
+    internal writable int $focus = 0;
+    internal writable int $top = 0;
+
+    function __construct(string $title) {}
+
+    int $count { get => $this->items->count; }
+
+    writable function add(string $label): void {
+        $this->items->add(new MenuItem($label));
+    }
+
+    function getLabel(int $index): string {
+        return $this->items[$index]->label;
+    }
+
+    // Shows the menu on the alternate screen and returns the index of the
+    // chosen item, or null when the user cancels with Escape or `q`. The
+    // two guards put the terminal back when this function ends, however it
+    // ends.
+    writable function choose(): ?int throws TerminalError {
+        if ($this->items->count == 0) {
+            return null;
+        }
+        let $keys = Console::enterRawMode();
+        let $screen = Console::enterAlternateScreen();
+        Console::hideCursor();
+
+        let writable $chosen = -1;
+        let writable $open = true;
+        while ($open) {
+            $this->draw();
+            let $action = Menu::actionFor($keys->getNextEvent(Wait::Indefinite));
+            if ($action == MenuAction::MoveUp) {
+                $this->focus = ($this->focus + $this->items->count - 1) % $this->items->count;
+            } else if ($action == MenuAction::MoveDown) {
+                $this->focus = ($this->focus + 1) % $this->items->count;
+            } else if ($action == MenuAction::MoveFirst) {
+                $this->focus = 0;
+            } else if ($action == MenuAction::MoveLast) {
+                $this->focus = $this->items->count - 1;
+            } else if ($action == MenuAction::Choose) {
+                $chosen = $this->focus;
+                $open = false;
+            } else if ($action == MenuAction::Cancel) {
+                $open = false;
+            }
+        }
+
+        Console::showCursor();
+        if ($chosen < 0) {
+            return null;
+        }
+        return $chosen;
+    }
+
+    internal static function actionFor(TerminalWaitResult $result): MenuAction {
+        return match ($result) {
+            TerminalWaitResult::Event($event) => match ($event) {
+                TerminalEvent::Key($key, $modifiers) => match ($key) {
+                    Key::Up => MenuAction::MoveUp,
+                    Key::Down => MenuAction::MoveDown,
+                    Key::Home => MenuAction::MoveFirst,
+                    Key::End => MenuAction::MoveLast,
+                    Key::Enter => MenuAction::Choose,
+                    Key::Escape => MenuAction::Cancel,
+                    Key::Character($text) => Menu::actionForCharacter($text, $modifiers->control),
+                    default => MenuAction::None,
+                },
+                TerminalEvent::Resized($size) => MenuAction::Redraw,
+            },
+            TerminalWaitResult::Closed => MenuAction::Cancel,
+            default => MenuAction::None,
+        };
+    }
+
+    // `q` cancels, and so does Control+C, which raw mode delivers as a key.
+    internal static function actionForCharacter(string $text, bool $control): MenuAction {
+        if ($text == "q" || ($control && $text == "c")) {
+            return MenuAction::Cancel;
+        }
+        if ($text == "k") {
+            return MenuAction::MoveUp;
+        }
+        if ($text == "j") {
+            return MenuAction::MoveDown;
+        }
+        return MenuAction::None;
+    }
+
+    // Draws one frame. A menu longer than the window scrolls so the focused
+    // item is always visible.
+    internal writable function draw(): void throws TerminalError {
+        let $size = Console::getSize();
+        let $visible = $size->rows - 3;
+        if ($this->focus < $this->top) {
+            $this->top = $this->focus;
+        }
+        if ($this->focus >= $this->top + $visible) {
+            $this->top = $this->focus - $visible + 1;
+        }
+
+        let $heading = Style::plain->withForeground(Color::Cyan)->withBold();
+        let $focused = Style::plain->withReverse();
+        let $hint = Style::plain->withDim();
+
+        Console::clear();
+        Console::writeAt(0, 0, $this->title, $heading);
+        let writable $row = 0;
+        while ($row < $visible && $this->top + $row < $this->items->count) {
+            let $index = $this->top + $row;
+            let $label = $this->items[$index]->label;
+            if ($index == $this->focus) {
+                Console::writeAt(0, $row + 2, "> {$label}", $focused);
+            } else {
+                Console::writeAt(0, $row + 2, "  {$label}");
+            }
+            $row++;
+        }
+        Console::writeAt(0, $size->rows - 1, "Up/Down move, Enter chooses, Esc cancels", $hint);
+        Console::flush();
+    }
+}
+
+function main(): int {
+    let writable $menu = new Menu("Choose a build target");
+    $menu->add("Linux x86-64");
+    $menu->add("Linux arm64");
+    $menu->add("macOS arm64");
+    $menu->add("macOS x86-64");
+    $menu->add("Windows x86-64");
+    $menu->add("WebAssembly");
+
+    try {
+        let $choice = $menu->choose();
+        if ($choice == null) {
+            echo "Nothing chosen.\n";
+            return 1;
+        }
+        echo "You chose: " . $menu->getLabel($choice ?? 0) . "\n";
+        return 0;
+    } catch (TerminalError $error) {
+        echo "This program needs a terminal: {$error->message}\n";
+        return 2;
+    }
+}

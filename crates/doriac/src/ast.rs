@@ -502,6 +502,7 @@ pub enum CompilerIntrinsic {
     TransferGroup(crate::compiler_known_stream::TransferGroupFunction),
     Time(crate::compiler_known_time::TimeFunction),
     Concurrency(crate::compiler_known_concurrency::ConcurrencyFunction),
+    Term(crate::compiler_known_term::TermFunction),
     Process(crate::compiler_known_stream::ProcessFunction),
 }
 
@@ -515,6 +516,7 @@ impl CompilerIntrinsic {
             | Self::Process(_) => crate::compiler_known_stream::SOURCE_ID,
             Self::Time(_) => crate::compiler_known_time::SOURCE_ID,
             Self::Concurrency(_) => crate::compiler_known_concurrency::SOURCE_ID,
+            Self::Term(_) => crate::compiler_known_term::SOURCE_ID,
         }
     }
 
@@ -527,6 +529,9 @@ impl CompilerIntrinsic {
                     == crate::compiler_known_stream::TransferGroupFunction::NextCompletion
             }
             Self::Process(function) => function.may_block(),
+            Self::Term(function) => {
+                function == crate::compiler_known_term::TermFunction::AwaitEvent
+            }
             Self::Time(_) | Self::TransferPlan(_) | Self::Concurrency(_) => false,
         }
     }
@@ -538,7 +543,7 @@ impl CompilerIntrinsic {
             Self::TransferPlan(implementation) => implementation.return_borrow(),
             Self::TransferGroup(implementation) => implementation.return_borrow(),
             Self::Process(function) => function.return_borrow(),
-            Self::Time(_) | Self::Concurrency(_) => None,
+            Self::Time(_) | Self::Concurrency(_) | Self::Term(_) => None,
         }
     }
 
@@ -547,7 +552,11 @@ impl CompilerIntrinsic {
             Self::TransferPlan(function) => function.retained_sources(),
             Self::Readiness(function) => function.retained_sources(),
             Self::TransferGroup(function) => function.retained_sources(),
-            Self::File(_) | Self::Time(_) | Self::Concurrency(_) | Self::Process(_) => Vec::new(),
+            Self::File(_)
+            | Self::Time(_)
+            | Self::Concurrency(_)
+            | Self::Process(_)
+            | Self::Term(_) => Vec::new(),
         }
     }
 }

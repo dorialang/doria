@@ -244,12 +244,17 @@ name = "doria-rt"
 version = "2026.3.1-canary"
 dependencies = [
  "doria-diagnostic-catalogue",
+ "doria-terminal",
  "doria-time",
  "doria-unicode",
  "libc",
  "ryu",
  "unicode-width",
 ]
+
+[[package]]
+name = "doria-terminal"
+version = "2026.3.1-canary"
 
 [[package]]
 name = "doria-time"
@@ -280,6 +285,7 @@ dependencies = [
  "cranelift-object",
  "doria-diagnostic-catalogue",
  "doria-rt",
+ "doria-terminal",
  "doria-time",
  "doria-unicode",
  "inkwell",

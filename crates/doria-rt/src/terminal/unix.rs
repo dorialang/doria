@@ -280,6 +280,11 @@ fn interruption_handler() -> libc::sighandler_t {
 /// Set by the stop handler once it has undone the program's changes, and
 /// cleared by whichever handler makes them again.
 static GAVE_TERMINAL_BACK: AtomicBool = AtomicBool::new(false);
+/// Held by the one handler that is undoing the changes or making them again.
+static TAKING_TERMINAL: AtomicBool = AtomicBool::new(false);
+/// Set from the moment a stop starts undoing the changes until its end has
+/// made them again.
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
 /// The handlers block one another while they work, except that a continue
 /// may arrive inside the stop handler, which is where a stopped process is.
@@ -330,10 +335,54 @@ fn same_mode(left: &libc::termios, right: &libc::termios) -> bool {
 /// flagged: that is what tells a program to draw again. In the background
 /// this does nothing, and the continue that brings the program forward does
 /// it then.
-unsafe fn take_terminal_again() {
-    if !in_foreground() {
-        return;
+///
+/// A continue and the end of a stop can both arrive here, on different
+/// threads, in either order, and a continue can arrive late: while the next
+/// stop is already being honored. So one arrival works at a time, and while
+/// a stop is being honored only its own end takes the terminal. The end of a
+/// stop waits its turn, because the program runs on from there and must find
+/// its terminal ready. A continue never waits: it may have interrupted the
+/// very thread that is doing the work.
+unsafe fn take_terminal_again(stop_ended: bool) {
+    while TAKING_TERMINAL.swap(true, Ordering::AcqRel) {
+        if !stop_ended {
+            return;
+        }
+        core::hint::spin_loop();
     }
+    if stop_ended || !STOPPING.load(Ordering::SeqCst) {
+        // Stopping handed the stop signal back to its previous disposition.
+        if INTERRUPTION_WATCHED[STOP].load(Ordering::Acquire) {
+            libc::sigaction(libc::SIGTSTP, &interruption_action(), ptr::null_mut());
+        }
+        if in_foreground() {
+            make_changes_again();
+        }
+    }
+    if stop_ended {
+        STOPPING.store(false, Ordering::SeqCst);
+    }
+    TAKING_TERMINAL.store(false, Ordering::Release);
+}
+
+/// The stop handler's half: the program's changes are undone and the stop
+/// signal goes back to its previous disposition, as one step that no
+/// continue can interleave with. A late continue would otherwise put this
+/// handler back in the signal's way just before the stop is raised.
+unsafe fn give_terminal_back(previous: *const libc::sigaction) {
+    while TAKING_TERMINAL.swap(true, Ordering::AcqRel) {
+        core::hint::spin_loop();
+    }
+    STOPPING.store(true, Ordering::SeqCst);
+    if in_foreground() {
+        super::restore_on_interruption(false);
+        GAVE_TERMINAL_BACK.store(true, Ordering::SeqCst);
+    }
+    libc::sigaction(libc::SIGTSTP, previous, ptr::null_mut());
+    TAKING_TERMINAL.store(false, Ordering::Release);
+}
+
+unsafe fn make_changes_again() {
     let entries = super::changes();
     let mut changed = false;
     if entries & ledger::RAW_MODE != 0 {
@@ -359,12 +408,6 @@ unsafe fn take_terminal_again() {
     }
 }
 
-unsafe fn watch_stop_again() {
-    if INTERRUPTION_WATCHED[STOP].load(Ordering::Acquire) {
-        libc::sigaction(libc::SIGTSTP, &interruption_action(), ptr::null_mut());
-    }
-}
-
 /// Async-signal-safe throughout: atomics, `write`, `tcsetattr`, `sigaction`,
 /// `pthread_sigmask` and `raise`.
 extern "C" fn on_interruption(signal: c_int, info: *mut libc::siginfo_t, context: *mut c_void) {
@@ -377,19 +420,17 @@ extern "C" fn on_interruption(signal: c_int, info: *mut libc::siginfo_t, context
         let previous = (*PREVIOUS_INTERRUPTION[index].0.get()).as_ptr();
         match signal {
             libc::SIGCONT => {
-                watch_stop_again();
-                take_terminal_again();
+                take_terminal_again(false);
                 chain(previous, signal, info, context);
             }
             libc::SIGTSTP => {
-                if in_foreground() {
-                    super::restore_on_interruption(false);
-                    GAVE_TERMINAL_BACK.store(true, Ordering::SeqCst);
-                }
+                give_terminal_back(previous);
                 // The stop happens here, under the signal's previous
                 // disposition, and this handler is where the program finds
-                // itself when it runs again.
-                libc::sigaction(signal, previous, ptr::null_mut());
+                // itself when it runs again: continued, or never stopped
+                // because the system discards a stop for a process group
+                // with nobody to continue it. Either way the terminal is the
+                // program's again.
                 let mut stop: libc::sigset_t = mem::zeroed();
                 let mut blocked: libc::sigset_t = mem::zeroed();
                 libc::sigemptyset(&mut stop);
@@ -397,11 +438,7 @@ extern "C" fn on_interruption(signal: c_int, info: *mut libc::siginfo_t, context
                 libc::pthread_sigmask(libc::SIG_UNBLOCK, &stop, &mut blocked);
                 libc::raise(signal);
                 libc::pthread_sigmask(libc::SIG_SETMASK, &blocked, ptr::null_mut());
-                watch_stop_again();
-                // Running again: continued, or never stopped because the
-                // system discards a stop for a process group with nobody to
-                // continue it. Either way the terminal is the program's.
-                take_terminal_again();
+                take_terminal_again(true);
             }
             _ => {
                 if in_foreground() {

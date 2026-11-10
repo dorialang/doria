@@ -113,6 +113,7 @@ pub enum CompilerSymbolIdentity {
     StandardIo(String),
     StandardTime(String),
     StandardConcurrency(String),
+    StandardTerm(String),
     StandardTest(String),
     Attribute(String),
 }
@@ -124,6 +125,8 @@ pub(crate) fn standard_type_identity(canonical: &str) -> Option<CompilerSymbolId
         ))
     } else if crate::compiler_known_time::CANONICAL_TYPES.contains(&canonical) {
         Some(CompilerSymbolIdentity::StandardTime(canonical.to_string()))
+    } else if crate::compiler_known_term::CANONICAL_TYPES.contains(&canonical) {
+        Some(CompilerSymbolIdentity::StandardTerm(canonical.to_string()))
     } else if crate::compiler_known_io::is_canonical_type(canonical) {
         Some(CompilerSymbolIdentity::StandardIo(canonical.to_string()))
     } else {
@@ -226,6 +229,7 @@ pub enum CompilerKnownProvenance {
     StandardIo,
     StandardTime,
     StandardConcurrency,
+    StandardTerm,
     StandardTest,
     Attribute,
 }
@@ -2067,6 +2071,19 @@ pub fn compiler_known_symbol_facts(edition: Edition) -> Vec<CompilerKnownSymbolF
             kind: GlobalSymbolKind::CompilerKnownType,
             source_name: canonical.to_string(),
             provenance: CompilerKnownProvenance::StandardTime,
+        }),
+    );
+    facts.extend(
+        crate::compiler_known_term::CANONICAL_TYPES.map(|canonical| CompilerKnownSymbolFact {
+            id: GlobalSymbolId {
+                owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardTerm(
+                    canonical.to_string(),
+                )),
+                qualified_name: canonical.to_string(),
+            },
+            kind: GlobalSymbolKind::CompilerKnownType,
+            source_name: canonical.to_string(),
+            provenance: CompilerKnownProvenance::StandardTerm,
         }),
     );
     facts.extend(

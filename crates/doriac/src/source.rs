@@ -4,12 +4,13 @@ pub struct SourceId(pub u32);
 impl SourceId {
     /// Sources embedded in the compiler. Authored sources never receive these
     /// identities, and no editor or report can open them.
-    pub const COMPILER_OWNED: [SourceId; 5] = [
+    pub const COMPILER_OWNED: [SourceId; 6] = [
         crate::compiler_known_contracts::SOURCE_ID,
         crate::compiler_known_io::SYNTHETIC_SOURCE_ID,
         crate::compiler_known_stream::SOURCE_ID,
         crate::compiler_known_time::SOURCE_ID,
         crate::compiler_known_concurrency::SOURCE_ID,
+        crate::compiler_known_term::SOURCE_ID,
     ];
 
     pub fn is_compiler_owned(self) -> bool {

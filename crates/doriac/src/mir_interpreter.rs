@@ -21,7 +21,9 @@ mod file_stream;
 mod inline_value;
 mod readiness_set;
 mod standard_stream;
+mod terminal;
 use byte_region::ByteRegionValue;
+pub use terminal::MirTerminal;
 mod transfer_group;
 mod transfer_plan;
 
@@ -1193,6 +1195,7 @@ struct Interpreter<'program> {
     transfer_plans: BTreeMap<usize, transfer_plan::PlanOwner>,
     transfer_groups: BTreeMap<usize, transfer_group::GroupOwner>,
     cancellation_states: BTreeMap<u128, inline_value::CancellationState>,
+    terminal: terminal::State,
     pending_requests: BTreeMap<usize, file_stream::RequestView>,
     standard_claims: [Option<usize>; 3],
     standard_source_homes: [usize; 3],
@@ -1332,6 +1335,9 @@ pub struct MirIo {
     /// Deterministic host failures used to verify the shared standard-I/O
     /// contract without depending on platform-specific devices.
     pub faults: MirIoFaults,
+    /// The terminal behind standard input and output. `None` runs the
+    /// program as if both were redirected.
+    pub terminal: Option<MirTerminal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1464,6 +1470,7 @@ fn interpret_internal_with_clock(
         match interpreter.step()? {
             StepOutcome::Continue => {}
             StepOutcome::CleanExit => {
+                interpreter.terminal_ending();
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
@@ -1485,6 +1492,7 @@ fn interpret_internal_with_clock(
                 ));
             }
             StepOutcome::RuntimePanic(event) => {
+                interpreter.terminal_ending();
                 let output = interpreter.runtime_panic_output(event);
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
@@ -1502,6 +1510,7 @@ fn interpret_internal_with_clock(
                 ));
             }
             StepOutcome::EntryReturned(outcome) => {
+                interpreter.terminal_ending();
                 let output = interpreter.finish_entry(entry, outcome)?;
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
@@ -1639,6 +1648,7 @@ impl<'a> Interpreter<'a> {
             transfer_plans: BTreeMap::new(),
             transfer_groups: BTreeMap::new(),
             cancellation_states: BTreeMap::new(),
+            terminal: terminal::State::new(io.terminal),
             pending_requests: BTreeMap::new(),
             standard_claims: [None; 3],
             // Canonical process-owned opaque homes, matching the native static
@@ -7326,11 +7336,11 @@ impl<'a> Interpreter<'a> {
         expression: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::IntegerExpression::DurationNanoseconds(value) => {
+            mir::IntegerExpression::InlineWord(value) => {
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
-                    .push(EvaluationTask::Inline(inline_value::Task::Nanoseconds));
+                    .push(EvaluationTask::Inline(inline_value::Task::Word));
                 frame
                     .tasks
                     .push(EvaluationTask::Inline(inline_value::Task::Value(*value)));
@@ -7463,6 +7473,10 @@ impl<'a> Interpreter<'a> {
                     .push(EvaluationTask::ByteRegion(byte_region::Task::Copy));
                 frame.tasks.push(EvaluationTask::Rvalue(*source));
                 frame.tasks.push(EvaluationTask::Rvalue(*destination));
+            }
+            mir::IntegerExpression::Terminal { call, .. } => {
+                let result = self.terminal_call(call)?;
+                self.push_scalar(mir::ScalarValue::Integer(result))?;
             }
         }
         Ok(())

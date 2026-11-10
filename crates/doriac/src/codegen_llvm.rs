@@ -89,6 +89,7 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 mod process;
 mod readiness_set;
 mod stream_callbacks;
+mod terminal;
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     mir_validation::validate_program(program)?;
@@ -9124,8 +9125,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 self.retain_inline_value(state, ty)
             }
-            mir::InlineValueExpression::DurationFromNanoseconds(value) => {
-                self.lower_integer_expression(value)
+            mir::InlineValueExpression::FromWord { word, .. } => {
+                self.lower_integer_expression(word)
             }
             mir::InlineValueExpression::Use { operand, mode, .. } => {
                 let value = self.lower_inline_operand(ty, operand)?;
@@ -21779,9 +21780,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         expression: &mir::IntegerExpression,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match expression {
-            mir::IntegerExpression::DurationNanoseconds(value) => {
-                self.lower_inline_expression(value)
-            }
+            mir::IntegerExpression::InlineWord(value) => self.lower_inline_expression(value),
             mir::IntegerExpression::Use { ty, operand } => self.lower_integer_operand(*ty, operand),
             mir::IntegerExpression::Unary {
                 ty,
@@ -21874,6 +21873,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let tag = self.lower_enum_expression(value)?;
                 self.lower_integer_enum_backing_from_tag(*enum_id, tag)
             }
+            mir::IntegerExpression::Terminal { call, .. } => self.lower_terminal_call(*call),
         }
     }
 

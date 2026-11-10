@@ -671,32 +671,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     /// Same order as checked file/pending I/O: tag, value, message, path,
     /// system code, valid count, invalid count, transferred count, metadata.
-    #[allow(clippy::too_many_arguments)]
-    fn lower_transfer_observation(
+    /// A `Doria\Std\Io\Wait` local as the three words every runtime wait
+    /// takes: its kind (0 immediate, 1 indefinite, 2 a duration, 3 a deadline)
+    /// and the low and high words of the duration or deadline.
+    pub(super) fn wait_words(
         &mut self,
-        operation: &mir::CheckedIoOperation,
-        group: mir::LocalId,
         wait: mir::LocalId,
-        outcome: mir::PayloadEnumType,
-        result: Option<mir::LocalId>,
-        error: mir::LocalId,
-        success: BasicBlock<'ctx>,
-        failure: BasicBlock<'ctx>,
-        span: crate::source::Span,
-    ) -> Result<(), BackendError> {
-        self.set_active_panic_site(span)?;
-        let pointer = self.context.ptr_type(AddressSpace::default());
+    ) -> Result<[BasicValueEnum<'ctx>; 3], BackendError> {
         let byte = self.context.i8_type();
         let integer = self.context.i64_type();
-        let word = self.context.ptr_sized_int_type(self.target_data, None);
-        let slots = self.checked_io_output_slots()?;
-        let group = build(self.builder.build_load(
-            pointer,
-            local_slot(&self.local_slots, group)?,
-            "observe.group",
-        ))?;
         let mir::Type::PayloadEnum(wait_type) = local_in(self.function, wait)?.ty else {
-            return Err(malformed_mir("observation has no Wait enum"));
+            return Err(malformed_mir("a runtime wait has no Wait enum"));
         };
         let wait_definition = enum_definition(self.program, wait_type.id)?;
         let wait_address = local_slot(&self.local_slots, wait)?;
@@ -783,6 +768,35 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let kind = build(self.builder.build_load(byte, kind_slot, "observe.kind"))?;
         let low = build(self.builder.build_load(integer, low_slot, "observe.low"))?;
         let high = build(self.builder.build_load(integer, high_slot, "observe.high"))?;
+        Ok([kind, low, high])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_transfer_observation(
+        &mut self,
+        operation: &mir::CheckedIoOperation,
+        group: mir::LocalId,
+        wait: mir::LocalId,
+        outcome: mir::PayloadEnumType,
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: BasicBlock<'ctx>,
+        failure: BasicBlock<'ctx>,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let byte = self.context.i8_type();
+        let integer = self.context.i64_type();
+        let word = self.context.ptr_sized_int_type(self.target_data, None);
+        let slots = self.checked_io_output_slots()?;
+        let group = build(self.builder.build_load(
+            pointer,
+            local_slot(&self.local_slots, group)?,
+            "observe.group",
+        ))?;
+        let [kind, low, high] = self.wait_words(wait)?;
+        let function = current_function(&self.builder)?;
         let result_tag = self.entry_alloca(byte, "observe.result")?;
         let reading = self.entry_alloca(byte, "observe.reading")?;
         let key = self.entry_alloca(integer.array_type(2), "observe.key")?;

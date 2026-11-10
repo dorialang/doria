@@ -86,17 +86,78 @@ pub(super) fn lower_intrinsic(
             return;
         }
         TimeFunction::DurationFromNanoseconds => {
-            mir::ValueExpression::Inline(mir::InlineValueExpression::DurationFromNanoseconds(
-                Box::new(mir::IntegerExpression::use_operand(
+            mir::ValueExpression::Inline(mir::InlineValueExpression::FromWord {
+                ty: crate::inline_value::InlineValueType::Duration,
+                word: Box::new(mir::IntegerExpression::use_operand(
                     IntegerType::Int64,
                     mir::Operand::Local(params[0]),
                 )),
-            ))
+            })
         }
-        TimeFunction::DurationNanoseconds => {
-            mir::ValueExpression::Integer(mir::IntegerExpression::DurationNanoseconds(Box::new(
+        TimeFunction::DurationNanoseconds => mir::ValueExpression::Integer(
+            mir::IntegerExpression::InlineWord(Box::new(mir::InlineValueExpression::Use {
+                ty: crate::inline_value::InlineValueType::Duration,
+                operand: mir::Operand::Local(params[0]),
+                mode: mir::InlineValueUseMode::Borrow,
+            })),
+        ),
+    };
+    context.cleanup_scopes_from(0);
+    context.terminate_current(mir::Terminator::Return(mir::Rvalue::Value(value)));
+}
+
+/// The Term module's four intrinsic shapes: the two runtime primitives and
+/// the word read and word factory of its one-word values.
+pub(super) fn lower_term_intrinsic(
+    intrinsic: crate::compiler_known_term::TermFunction,
+    span: Span,
+    params: &[mir::LocalId],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) {
+    use crate::compiler_known_term::TermFunction;
+    let value = match intrinsic {
+        TermFunction::Operate => mir::ValueExpression::Integer(mir::IntegerExpression::Terminal {
+            call: mir::TerminalCall::Operate {
+                operation: params[0],
+                first: params[1],
+                second: params[2],
+                text: params[3],
+            },
+            span,
+        }),
+        TermFunction::AwaitEvent => {
+            mir::ValueExpression::Integer(mir::IntegerExpression::Terminal {
+                call: mir::TerminalCall::AwaitEvent {
+                    generation: params[0],
+                    wait: params[1],
+                    cancellation: params[2],
+                },
+                span,
+            })
+        }
+        TermFunction::FromWord(_) => {
+            let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Inline(ty))) =
+                return_type
+            else {
+                unreachable!("a Term word factory returns its checked inline value");
+            };
+            mir::ValueExpression::Inline(mir::InlineValueExpression::FromWord {
+                ty,
+                word: Box::new(mir::IntegerExpression::use_operand(
+                    IntegerType::Int64,
+                    mir::Operand::Local(params[0]),
+                )),
+            })
+        }
+        TermFunction::Word(_) => {
+            let mir::Type::Scalar(mir::ScalarType::Inline(ty)) = context.local_type(params[0])
+            else {
+                unreachable!("a Term word getter reads its checked inline receiver");
+            };
+            mir::ValueExpression::Integer(mir::IntegerExpression::InlineWord(Box::new(
                 mir::InlineValueExpression::Use {
-                    ty: crate::inline_value::InlineValueType::Duration,
+                    ty,
                     operand: mir::Operand::Local(params[0]),
                     mode: mir::InlineValueUseMode::Borrow,
                 },
@@ -212,6 +273,18 @@ pub(super) fn lower_expression_with_ownership(
                     )]);
                 }
             }
+        }
+        // The receiver of a method written in Doria on an inline value type:
+        // the Term values are the first such types (Decision 0140).
+        hir::Expr::This { span } => {
+            let local = context.lookup_local("this", *span)?;
+            if context.local_type(local) != expected {
+                return Err(vec![unsupported(
+                    *span,
+                    "`$this` has another inline value type",
+                )]);
+            }
+            mir::Operand::Local(local)
         }
         hir::Expr::PropertyAccess { .. } => {
             let (object, property) = lower_property_operand(expr, expected, context)?;

@@ -3,6 +3,34 @@
 
 use crate::class_layout::ClassId;
 
+/// The `Doria\Std\Term` values (Decision 0140). Each is one word whose
+/// bits the Term module packs and unpacks in Doria; see
+/// `doria_terminal::wire` for the layouts shared with the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TerminalValue {
+    Size,
+    Position,
+    KeyModifiers,
+    Style,
+}
+
+impl TerminalValue {
+    pub const ALL: [Self; 4] = [Self::Size, Self::Position, Self::KeyModifiers, Self::Style];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Size => crate::compiler_known_term::SIZE,
+            Self::Position => crate::compiler_known_term::POSITION,
+            Self::KeyModifiers => crate::compiler_known_term::KEY_MODIFIERS,
+            Self::Style => crate::compiler_known_term::STYLE,
+        }
+    }
+
+    fn for_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.name() == name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InlineValueKind {
     Duration,
@@ -14,6 +42,7 @@ pub enum InlineValueKind {
     StandardInput,
     StandardOutput,
     StandardError,
+    Terminal(TerminalValue),
 }
 
 impl InlineValueKind {
@@ -28,7 +57,7 @@ impl InlineValueKind {
             crate::compiler_known_stream::STANDARD_INPUT => Some(Self::StandardInput),
             crate::compiler_known_stream::STANDARD_OUTPUT => Some(Self::StandardOutput),
             crate::compiler_known_stream::STANDARD_ERROR => Some(Self::StandardError),
-            _ => None,
+            _ => TerminalValue::for_name(name).map(Self::Terminal),
         }
     }
 
@@ -45,7 +74,8 @@ impl InlineValueKind {
             | Self::CancellationToken
             | Self::StandardInput
             | Self::StandardOutput
-            | Self::StandardError => 0,
+            | Self::StandardError
+            | Self::Terminal(_) => 0,
             Self::RegistrationKey => 1,
         }
     }
@@ -61,6 +91,7 @@ impl InlineValueKind {
             Self::StandardInput => InlineValueType::StandardInput(class),
             Self::StandardOutput => InlineValueType::StandardOutput(class),
             Self::StandardError => InlineValueType::StandardError(class),
+            Self::Terminal(value) => InlineValueType::Terminal(value, class),
         }
     }
 
@@ -70,7 +101,8 @@ impl InlineValueKind {
             | Self::CancellationToken
             | Self::StandardInput
             | Self::StandardOutput
-            | Self::StandardError => 8,
+            | Self::StandardError
+            | Self::Terminal(_) => 8,
             Self::Deadline
             | Self::RegistrationKey
             | Self::ReadTransferKey
@@ -94,6 +126,7 @@ pub enum InlineValueType {
     StandardInput(ClassId),
     StandardOutput(ClassId),
     StandardError(ClassId),
+    Terminal(TerminalValue, ClassId),
 }
 
 /// Cleanup belongs to the value representation, independently of Copy capability.
@@ -123,7 +156,15 @@ impl InlineValueType {
             Self::StandardInput(_) => crate::compiler_known_stream::STANDARD_INPUT,
             Self::StandardOutput(_) => crate::compiler_known_stream::STANDARD_OUTPUT,
             Self::StandardError(_) => crate::compiler_known_stream::STANDARD_ERROR,
+            Self::Terminal(value, _) => value.name(),
         }
+    }
+
+    /// One 64-bit word that the declaring module builds from an integer and
+    /// reads back as one. `Duration` is its nanosecond count; the Term values
+    /// are packed fields.
+    pub const fn is_word(self) -> bool {
+        matches!(self, Self::Duration | Self::Terminal(..))
     }
 
     pub const fn storage_bytes(self) -> u32 {
@@ -132,7 +173,8 @@ impl InlineValueType {
             | Self::CancellationToken(_)
             | Self::StandardInput(_)
             | Self::StandardOutput(_)
-            | Self::StandardError(_) => 8,
+            | Self::StandardError(_)
+            | Self::Terminal(..) => 8,
             Self::Deadline
             | Self::RegistrationKey(_)
             | Self::ReadTransferKey(_)
@@ -150,7 +192,8 @@ impl InlineValueType {
             | Self::CancellationToken(class)
             | Self::StandardInput(class)
             | Self::StandardOutput(class)
-            | Self::StandardError(class) => u32::try_from(class.0)
+            | Self::StandardError(class)
+            | Self::Terminal(_, class) => u32::try_from(class.0)
                 .ok()
                 .and_then(|id| id.checked_add(2))
                 .expect("validated inline nominal type identity"),
@@ -165,7 +208,8 @@ impl InlineValueType {
             | Self::CancellationToken(class)
             | Self::StandardInput(class)
             | Self::StandardOutput(class)
-            | Self::StandardError(class) => Some(class),
+            | Self::StandardError(class)
+            | Self::Terminal(_, class) => Some(class),
             Self::Duration | Self::Deadline => None,
         }
     }
@@ -180,7 +224,8 @@ impl InlineValueType {
             | Self::WriteTransferKey(_)
             | Self::StandardInput(_)
             | Self::StandardOutput(_)
-            | Self::StandardError(_) => InlineValueLifecycle::Trivial,
+            | Self::StandardError(_)
+            | Self::Terminal(..) => InlineValueLifecycle::Trivial,
         }
     }
 

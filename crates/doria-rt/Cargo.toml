@@ -17,6 +17,7 @@ hosted-shared-runtime = []
 
 [dependencies]
 doria-diagnostic-catalogue = { path = "../doria-diagnostic-catalogue" }
+doria-terminal = { path = "../doria-terminal" }
 doria-time = { path = "../doria-time" }
 doria-unicode = { path = "../doria-unicode" }
 ryu.workspace = true

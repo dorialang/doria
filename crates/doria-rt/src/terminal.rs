@@ -1,16 +1,16 @@
 //! The terminal layer behind `Doria\Std\Term` (Decision 0140).
 //!
-//! `wire`, `render` and `decode` are pure and shared with the debug
-//! interpreter's scripted terminal, which is why they are public. This module
-//! owns what is common to every platform: the operations, the ledger of what
-//! the program changed, and putting it back when the process ends. A platform
-//! module owns the terminal's input mode, its size and the event wait.
+//! The transport, renderer, decoder and operation core are pure and live in
+//! `doria-terminal`, which the debug interpreter's scripted terminal shares.
+//! This module owns what is common to every platform's real terminal: the
+//! process-wide ledger of what the program changed, the device the output
+//! collects on, and putting the terminal back when the process ends. A
+//! platform module owns the input mode, the size and the event wait.
 
-pub mod decode;
+pub use doria_terminal::{console, decode, render, wire};
+
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod queue;
-pub mod render;
-pub mod wire;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
@@ -36,7 +36,8 @@ use crate::cancellation::DrCancellationV1;
 use crate::device_io::{standard_device, DeviceLoan, StandardStream};
 use crate::platform_io::{Failure, Reason};
 use crate::wait_budget::DrWaitBudgetV1;
-use wire::{operation, ColorSupport, Observation, Style};
+pub(crate) use console::{ledger, OutputClass, Refusal, Undo};
+use wire::{operation, ColorSupport, Observation};
 
 /// Platform state touched by one owner at a time, or written once before
 /// the ledger entry that publishes it.
@@ -78,50 +79,6 @@ impl Drop for Exclusive {
     }
 }
 
-/// Why an operation did not happen: a `TerminalErrorReason` and the native
-/// code behind it, when there is one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Refusal {
-    status: u8,
-    system_code: Option<i64>,
-}
-
-impl Refusal {
-    pub(crate) const fn not_a_terminal() -> Self {
-        Self {
-            status: wire::STATUS_NOT_A_TERMINAL,
-            system_code: None,
-        }
-    }
-
-    pub(crate) const fn in_use() -> Self {
-        Self {
-            status: wire::STATUS_IN_USE,
-            system_code: None,
-        }
-    }
-
-    pub(crate) const fn unsupported() -> Self {
-        Self {
-            status: wire::STATUS_UNSUPPORTED,
-            system_code: None,
-        }
-    }
-
-    /// The terminal went away while it was being asked something.
-    #[cfg(any(target_os = "linux", target_os = "macos", test))]
-    pub(crate) const fn device_failure() -> Self {
-        Self {
-            status: wire::STATUS_DEVICE_FAILURE,
-            system_code: None,
-        }
-    }
-
-    const fn to_result(self) -> i64 {
-        wire::failure(self.status, self.system_code)
-    }
-}
-
 impl From<Failure> for Refusal {
     fn from(failure: Failure) -> Self {
         Self {
@@ -131,42 +88,6 @@ impl From<Failure> for Refusal {
                 wire::STATUS_DEVICE_FAILURE
             },
             system_code: failure.system_code,
-        }
-    }
-}
-
-/// What standard output is, decided once: a redirected stream stays
-/// redirected for the life of the process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OutputClass {
-    pub(crate) terminal: bool,
-    /// The terminal accepts the renderer's sequences. Only an old Windows
-    /// console refuses them.
-    pub(crate) sequences: bool,
-    pub(crate) color: ColorSupport,
-}
-
-impl OutputClass {
-    pub(crate) const NOT_A_TERMINAL: Self = Self {
-        terminal: false,
-        sequences: false,
-        color: ColorSupport::None,
-    };
-
-    const KNOWN: u8 = 0x80;
-
-    const fn to_bits(self) -> u8 {
-        Self::KNOWN
-            | ((self.terminal as u8) << 3)
-            | ((self.sequences as u8) << 2)
-            | self.color as u8
-    }
-
-    const fn from_bits(bits: u8) -> Self {
-        Self {
-            terminal: bits & 8 != 0,
-            sequences: bits & 4 != 0,
-            color: ColorSupport::from_code(bits & 3),
         }
     }
 }
@@ -187,23 +108,6 @@ unsafe fn output_class() -> OutputClass {
     }
     OUTPUT_CLASS.store(class.to_bits(), Ordering::Release);
     class
-}
-
-/// The ledger: one bit for each terminal setting the program has moved away
-/// from the value it had at start. Cursor visibility, line wrap and the screen
-/// in use cannot be read back from a terminal, so their starting values are
-/// the ones every terminal starts a program with: visible, wrapping, main
-/// screen. The input mode and the Windows output mode are read before they
-/// are changed and kept by the platform module.
-pub(crate) mod ledger {
-    pub(crate) const CURSOR_HIDDEN: u32 = 1;
-    pub(crate) const LINE_WRAP_DISABLED: u32 = 1 << 1;
-    pub(crate) const ALTERNATE_SCREEN: u32 = 1 << 2;
-    pub(crate) const RAW_MODE: u32 = 1 << 3;
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) const OUTPUT_MODE: u32 = 1 << 4;
-    /// The entries undone by writing a sequence to the terminal.
-    pub(crate) const RENDERED: u32 = CURSOR_HIDDEN | LINE_WRAP_DISABLED | ALTERNATE_SCREEN;
 }
 
 static LEDGER: AtomicU32 = AtomicU32::new(0);
@@ -294,78 +198,11 @@ fn active(entry: u32) -> bool {
     LEDGER.load(Ordering::Acquire) & !UNDONE_WHEN_WRITTEN.load(Ordering::Acquire) & entry != 0
 }
 
-fn unmark_when_written(entry: u32) {
-    UNDONE_WHEN_WRITTEN.fetch_or(entry, Ordering::AcqRel);
-}
-
 /// The device wrote all waiting console output.
 pub(crate) fn console_output_written() {
     let undone = UNDONE_WHEN_WRITTEN.swap(0, Ordering::AcqRel);
     if undone != 0 {
         unmark(undone);
-    }
-}
-
-/// The sequences that undo `entries`, with room to spare for the abort
-/// prefix. Fixed storage: a signal handler builds this too.
-pub(crate) struct Undo {
-    bytes: [u8; 32],
-    length: usize,
-}
-
-impl Undo {
-    /// `interrupted` says a console write was cut short, so the terminal may
-    /// be inside an escape sequence or a styled run that must end first.
-    pub(crate) fn new(entries: u32, interrupted: bool) -> Self {
-        let mut undo = Self {
-            bytes: [0; 32],
-            length: 0,
-        };
-        if entries & ledger::RENDERED == 0 {
-            return undo;
-        }
-        if interrupted {
-            undo.push(render::ABORT_SEQUENCE);
-        }
-        if entries & ledger::ALTERNATE_SCREEN != 0 {
-            undo.push(render::LEAVE_ALTERNATE_SCREEN);
-        }
-        if entries & ledger::LINE_WRAP_DISABLED != 0 {
-            undo.push(render::ENABLE_LINE_WRAP);
-        }
-        if entries & ledger::CURSOR_HIDDEN != 0 {
-            undo.push(render::SHOW_CURSOR);
-        }
-        undo
-    }
-
-    /// The sequences that make `entries` again, for a program continued
-    /// after a stop that undid them.
-    #[cfg(any(target_os = "linux", target_os = "macos", test))]
-    pub(crate) fn again(entries: u32) -> Self {
-        let mut redo = Self {
-            bytes: [0; 32],
-            length: 0,
-        };
-        if entries & ledger::ALTERNATE_SCREEN != 0 {
-            redo.push(render::ENTER_ALTERNATE_SCREEN);
-        }
-        if entries & ledger::LINE_WRAP_DISABLED != 0 {
-            redo.push(render::DISABLE_LINE_WRAP);
-        }
-        if entries & ledger::CURSOR_HIDDEN != 0 {
-            redo.push(render::HIDE_CURSOR);
-        }
-        redo
-    }
-
-    fn push(&mut self, sequence: &[u8]) {
-        self.bytes[self.length..self.length + sequence.len()].copy_from_slice(sequence);
-        self.length += sequence.len();
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.length]
     }
 }
 
@@ -396,27 +233,46 @@ pub(crate) unsafe fn process_ending() {
     platform::restore_at_process_end(entries);
 }
 
-unsafe fn append(output: &DeviceLoan<'_>, bytes: &[u8]) -> Result<(), Refusal> {
-    output.append_console_output(bytes).map_err(Refusal::from)
+/// The runtime's terminal: output collects on the standard-output device and
+/// the ledger is the process-wide one a signal handler can read.
+struct Device<'a> {
+    output: DeviceLoan<'a>,
 }
 
-fn count(argument: i64) -> u32 {
-    argument.clamp(0, i64::from(wire::COORDINATE_LIMIT)) as u32
-}
-
-unsafe fn write(
-    output: &DeviceLoan<'_>,
-    class: OutputClass,
-    style: Style,
-    text: &[u8],
-) -> Result<(), Refusal> {
-    let prefix = render::style_prefix(style, class.color);
-    append(output, prefix.as_bytes())?;
-    append(output, text)?;
-    if !prefix.is_empty() {
-        append(output, render::STYLE_SUFFIX)?;
+impl console::Host for Device<'_> {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Refusal> {
+        unsafe { self.output.append_console_output(bytes) }.map_err(Refusal::from)
     }
-    Ok(())
+
+    fn mark(&mut self, entry: u32) {
+        mark(entry);
+    }
+
+    fn unmark(&mut self, entry: u32) {
+        unmark(entry);
+    }
+
+    fn unmark_when_written(&mut self, entry: u32) {
+        UNDONE_WHEN_WRITTEN.fetch_or(entry, Ordering::AcqRel);
+    }
+
+    fn active(&self, entry: u32) -> bool {
+        active(entry)
+    }
+
+    fn size(&mut self) -> Result<(u32, u32), Refusal> {
+        unsafe { platform::size() }
+    }
+
+    fn enter_screen(&mut self) -> u32 {
+        SCREEN_GENERATION
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn screen(&self) -> u32 {
+        SCREEN_GENERATION.load(Ordering::Acquire)
+    }
 }
 
 unsafe fn operate(operation: u32, first: i64, second: i64, text: &[u8]) -> Result<u64, Refusal> {
@@ -440,110 +296,14 @@ unsafe fn operate(operation: u32, first: i64, second: i64, text: &[u8]) -> Resul
     if let Some(failure) = output.take_console_failure() {
         return Err(failure.into());
     }
-    if operation == operation::WRITE {
-        write(&output, class, Style::from_bits(first), text)?;
-        return Ok(0);
-    }
-    if !class.terminal {
-        // Nothing to put back on a stream that was never a terminal.
-        return if operation == operation::RESET {
-            Ok(0)
-        } else {
-            Err(Refusal::not_a_terminal())
-        };
-    }
-    if !class.sequences {
-        return Err(Refusal::unsupported());
-    }
-    match operation {
-        operation::SIZE => {
-            let (columns, rows) = platform::size()?;
-            return Ok(wire::pair(columns, rows));
-        }
-        operation::WRITE_AT => {
-            let cell = render::move_to(wire::cell_column(first), wire::cell_row(first));
-            append(&output, cell.as_bytes())?;
-            write(&output, class, Style::from_bits(second), text)?;
-        }
-        operation::CLEAR => append(&output, render::CLEAR)?,
-        operation::CLEAR_LINE => append(&output, render::CLEAR_LINE)?,
-        operation::CLEAR_LINE_FROM_CURSOR => append(&output, render::CLEAR_LINE_FROM_CURSOR)?,
-        operation::ERASE_AT => {
-            let cell = render::move_to(wire::cell_column(first), wire::cell_row(first));
-            append(&output, cell.as_bytes())?;
-            append(&output, render::ERASE_CHARACTER)?;
-        }
-        operation::SET_TITLE => {
-            append(&output, render::TITLE_PREFIX)?;
-            for run in render::title_runs(text) {
-                append(&output, run)?;
-            }
-            append(&output, render::TITLE_SUFFIX)?;
-        }
-        operation::SET_LINE_WRAP => {
-            if first == 0 {
-                append(&output, render::ENABLE_LINE_WRAP)?;
-                unmark_when_written(ledger::LINE_WRAP_DISABLED);
-            } else {
-                mark(ledger::LINE_WRAP_DISABLED);
-                append(&output, render::DISABLE_LINE_WRAP)?;
-            }
-        }
-        operation::MOVE_TO => {
-            let cell = render::move_to(wire::cell_column(first), wire::cell_row(first));
-            append(&output, cell.as_bytes())?;
-        }
-        operation::MOVE_UP
-        | operation::MOVE_DOWN
-        | operation::MOVE_LEFT
-        | operation::MOVE_RIGHT => {
-            let direction = match operation {
-                operation::MOVE_UP => render::Direction::Up,
-                operation::MOVE_DOWN => render::Direction::Down,
-                operation::MOVE_LEFT => render::Direction::Left,
-                _ => render::Direction::Right,
-            };
-            append(&output, render::move_by(direction, count(first)).as_bytes())?;
-        }
-        operation::SHOW_CURSOR => {
-            append(&output, render::SHOW_CURSOR)?;
-            unmark_when_written(ledger::CURSOR_HIDDEN);
-        }
-        operation::HIDE_CURSOR => {
-            mark(ledger::CURSOR_HIDDEN);
-            append(&output, render::HIDE_CURSOR)?;
-        }
-        operation::ENTER_ALTERNATE_SCREEN => {
-            if active(ledger::ALTERNATE_SCREEN) {
-                return Err(Refusal::in_use());
-            }
-            mark(ledger::ALTERNATE_SCREEN);
-            if let Err(refusal) = append(&output, render::ENTER_ALTERNATE_SCREEN) {
-                unmark(ledger::ALTERNATE_SCREEN);
-                return Err(refusal);
-            }
-            let generation = SCREEN_GENERATION
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1);
-            return Ok(u64::from(generation));
-        }
-        operation::LEAVE_ALTERNATE_SCREEN => {
-            if active(ledger::ALTERNATE_SCREEN)
-                && SCREEN_GENERATION.load(Ordering::Acquire) == first as u32
-            {
-                append(&output, render::LEAVE_ALTERNATE_SCREEN)?;
-                unmark_when_written(ledger::ALTERNATE_SCREEN);
-            }
-        }
-        operation::RESET => {
-            append(&output, render::SHOW_CURSOR)?;
-            append(&output, render::ENABLE_LINE_WRAP)?;
-            append(&output, render::STYLE_SUFFIX)?;
-            unmark_when_written(ledger::CURSOR_HIDDEN | ledger::LINE_WRAP_DISABLED);
-        }
-        _ => return Err(Refusal::unsupported()),
-    }
-    Ok(0)
+    console::operate(
+        &mut Device { output },
+        class,
+        operation,
+        first,
+        second,
+        text,
+    )
 }
 
 unsafe fn enter_raw_mode() -> Result<u64, Refusal> {
@@ -588,13 +348,32 @@ unsafe fn await_event(
     platform::await_event(budget, cancellation)
 }
 
-/// One `Console`, `RawMode` or `AlternateScreen` operation. The result packs
-/// a status and a payload as `wire` defines.
+/// One `Console`, `RawMode` or `AlternateScreen` operation, as compiled Doria
+/// calls it. The result packs a status and a payload as `wire` defines.
+///
+/// # Safety
+/// `text` is null or a live Doria string.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_terminal_operate(
+    operation: u32,
+    first: i64,
+    second: i64,
+    text: *const crate::DrStringV1,
+) -> i64 {
+    let text = if text.is_null() || (*text).byte_length == 0 {
+        &[]
+    } else {
+        core::slice::from_raw_parts(crate::string_bytes(text), (*text).byte_length)
+    };
+    console::result(operate(operation, first, second, text))
+}
+
+/// [`dr_v1_terminal_operate`] for a host whose strings are not Doria strings.
 ///
 /// # Safety
 /// `text` is readable for `text_length` bytes, or `text_length` is zero.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_terminal_operate(
+pub unsafe extern "C" fn dr_v1_host_terminal_operate(
     operation: u32,
     first: i64,
     second: i64,
@@ -606,27 +385,29 @@ pub unsafe extern "C" fn dr_v1_terminal_operate(
     } else {
         core::slice::from_raw_parts(text, text_length)
     };
-    match operate(operation, first, second, text) {
-        Ok(payload) => wire::success(payload),
-        Err(refusal) => refusal.to_result(),
-    }
+    console::result(operate(operation, first, second, text))
 }
 
 /// Waits for the next key or resize of the raw mode `generation` entered.
+/// The wait arrives as every `Doria\Std\Io\Wait` does: 0 immediate,
+/// 1 indefinite, 2 a duration in `wait_low`, 3 a deadline in both words.
 ///
 /// # Safety
-/// `budget` is a live wait budget. `cancellation` is null or a live
-/// cancellation state.
+/// `cancellation` is null or a live cancellation state.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_terminal_await_event(
     generation: u32,
-    budget: *const DrWaitBudgetV1,
+    wait_kind: u8,
+    wait_low: u64,
+    wait_high: i64,
     cancellation: *mut DrCancellationV1,
 ) -> i64 {
-    match await_event(generation, &*budget, cancellation) {
-        Ok(observation) => wire::success(observation.to_payload()),
-        Err(refusal) => refusal.to_result(),
-    }
+    console::result(
+        DrWaitBudgetV1::from_wait(wait_kind, wait_low, wait_high)
+            .map_err(Refusal::from)
+            .and_then(|budget| await_event(generation, &budget, cancellation))
+            .map(Observation::to_payload),
+    )
 }
 
 /// The restore for a host that ends the process itself instead of leaving
@@ -637,78 +418,4 @@ pub unsafe extern "C" fn dr_v1_terminal_await_event(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_terminal_process_ending() {
     process_ending();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_refusal_keeps_its_reason_and_native_code_through_the_wire() {
-        let refusal = Refusal::from(Failure::from_system_code(5));
-        let result = refusal.to_result();
-        assert_eq!(wire::status(result), wire::STATUS_DEVICE_FAILURE);
-        assert_eq!(wire::system_code(result), Some(5));
-        let result = Refusal::from(Failure::unsupported()).to_result();
-        assert_eq!(wire::status(result), wire::STATUS_UNSUPPORTED);
-        assert_eq!(wire::system_code(result), None);
-        for (refusal, status) in [
-            (Refusal::not_a_terminal(), wire::STATUS_NOT_A_TERMINAL),
-            (Refusal::in_use(), wire::STATUS_IN_USE),
-            (Refusal::unsupported(), wire::STATUS_UNSUPPORTED),
-            (Refusal::device_failure(), wire::STATUS_DEVICE_FAILURE),
-        ] {
-            assert_eq!(wire::status(refusal.to_result()), status);
-        }
-    }
-
-    #[test]
-    fn an_output_class_survives_its_cached_form() {
-        for class in [
-            OutputClass::NOT_A_TERMINAL,
-            OutputClass {
-                terminal: true,
-                sequences: false,
-                color: ColorSupport::None,
-            },
-            OutputClass {
-                terminal: true,
-                sequences: true,
-                color: ColorSupport::TrueColor,
-            },
-            OutputClass {
-                terminal: true,
-                sequences: true,
-                color: ColorSupport::Basic,
-            },
-        ] {
-            assert_ne!(class.to_bits(), 0);
-            assert_eq!(OutputClass::from_bits(class.to_bits()), class);
-        }
-    }
-
-    #[test]
-    fn undo_writes_only_what_the_program_changed() {
-        assert!(Undo::new(0, true).as_bytes().is_empty());
-        assert!(Undo::new(ledger::RAW_MODE | ledger::OUTPUT_MODE, true)
-            .as_bytes()
-            .is_empty());
-        assert_eq!(
-            Undo::new(ledger::CURSOR_HIDDEN, false).as_bytes(),
-            b"\x1b[?25h"
-        );
-        assert_eq!(
-            Undo::new(ledger::RENDERED, false).as_bytes(),
-            b"\x1b[?1049l\x1b[?7h\x1b[?25h"
-        );
-        assert_eq!(
-            Undo::new(ledger::RENDERED | ledger::RAW_MODE, true).as_bytes(),
-            b"\x18\x1b[0m\x1b[?1049l\x1b[?7h\x1b[?25h"
-        );
-        assert!(Undo::again(ledger::RAW_MODE).as_bytes().is_empty());
-        assert_eq!(
-            Undo::again(ledger::RENDERED).as_bytes(),
-            b"\x1b[?1049h\x1b[?7l\x1b[?25l"
-        );
-    }
 }

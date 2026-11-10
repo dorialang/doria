@@ -1553,6 +1553,7 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
                     | crate::inline_value::InlineValueKind::StandardInput
                     | crate::inline_value::InlineValueKind::StandardOutput
                     | crate::inline_value::InlineValueKind::StandardError
+                    | crate::inline_value::InlineValueKind::Terminal(_)
             )
         )
     {

@@ -158,6 +158,8 @@ pub const BYTE_REGION_COPY_WITHIN: &str = "dr_v1_byte_region_copy_within";
 /// Decision 0110 child processes: one checked transport for every `Child`
 /// intrinsic (operation tag, child payload, operand words, checked outputs).
 pub const CHECKED_PROCESS: &str = "dr_v1_checked_process";
+pub const TERMINAL_OPERATE: &str = "dr_v1_terminal_operate";
+pub const TERMINAL_AWAIT_EVENT: &str = "dr_v1_terminal_await_event";
 pub const BYTES_EQUAL: &str = "dr_v1_bytes_equal";
 pub const BYTES_FROM_COLLECTION: &str = "dr_v1_bytes_from_collection";
 pub const BYTES_TO_COLLECTION: &str = "dr_v1_bytes_to_collection";

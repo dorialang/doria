@@ -88,6 +88,7 @@ mod readiness_set;
 #[cfg(test)]
 mod return_transport_tests;
 mod stream_callbacks;
+mod terminal;
 
 struct DeclaredNativeItems<'a> {
     function_ids: &'a [FuncId],
@@ -8590,8 +8591,8 @@ fn lower_inline_expression(
             };
             retain_inline_value(builder, state, ty, resources)
         }
-        mir::InlineValueExpression::DurationFromNanoseconds(value) => {
-            lower_integer_expression(builder, value, resources)
+        mir::InlineValueExpression::FromWord { word, .. } => {
+            lower_integer_expression(builder, word, resources)
         }
         mir::InlineValueExpression::Use { operand, mode, .. } => {
             let value = lower_inline_operand(builder, ty, operand, resources)?;
@@ -20124,7 +20125,7 @@ fn lower_integer_expression(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match expression {
-        mir::IntegerExpression::DurationNanoseconds(value) => {
+        mir::IntegerExpression::InlineWord(value) => {
             lower_inline_expression(builder, value, resources)
         }
         mir::IntegerExpression::Use { ty, operand } => {
@@ -20227,6 +20228,9 @@ fn lower_integer_expression(
         mir::IntegerExpression::EnumBacking { enum_id, value } => {
             let tag = lower_enum_expression(builder, value, resources)?;
             lower_integer_enum_backing_from_tag(builder, *enum_id, tag, resources)
+        }
+        mir::IntegerExpression::Terminal { call, .. } => {
+            terminal::lower_call(builder, *call, resources)
         }
     }
 }

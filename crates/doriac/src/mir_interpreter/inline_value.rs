@@ -879,8 +879,8 @@ pub(super) enum Task {
         mode: mir::InlineValueUseMode,
         local: Option<mir::LocalId>,
     },
-    FromNanoseconds,
-    Nanoseconds,
+    FromWord(InlineValueType),
+    Word,
     Coalesce {
         ty: InlineValueType,
         right: mir::InlineValueExpression,
@@ -1070,12 +1070,10 @@ impl Interpreter<'_> {
                     retain_claim(&mut self.cancellation_states, value)?;
                     self.push_scalar(mir::ScalarValue::Inline(value))?;
                 }
-                mir::InlineValueExpression::DurationFromNanoseconds(value) => {
+                mir::InlineValueExpression::FromWord { ty, word } => {
                     let frame = self.current_frame_mut()?;
-                    frame
-                        .tasks
-                        .push(EvaluationTask::Inline(Task::FromNanoseconds));
-                    frame.tasks.push(EvaluationTask::Integer(*value));
+                    frame.tasks.push(EvaluationTask::Inline(Task::FromWord(ty)));
+                    frame.tasks.push(EvaluationTask::Integer(*word));
                 }
                 mir::InlineValueExpression::Use { ty, operand, mode } => {
                     let local = match operand {
@@ -1124,27 +1122,27 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::NullableScalar(*left));
                 }
             },
-            Task::FromNanoseconds => {
+            Task::FromWord(ty) => {
                 let value = self.pop_integer()?;
-                if value.ty != IntegerType::Int64 {
+                if value.ty != IntegerType::Int64 || !ty.is_word() {
                     return Err(InterpreterError::new(
-                        "Duration factory requires int64 nanoseconds",
+                        "word factory requires a one-word inline value and an int64 word",
                     ));
                 }
                 self.push_scalar(mir::ScalarValue::Inline(crate::inline_value::InlineValue {
-                    ty: InlineValueType::Duration,
+                    ty,
                     bits: u128::from(value.bits),
                 }))?;
             }
-            Task::Nanoseconds => {
+            Task::Word => {
                 let mir::ScalarValue::Inline(value) = self.pop_scalar()? else {
                     return Err(InterpreterError::new(
-                        "nanoseconds getter requires Duration",
+                        "word read requires a one-word inline value",
                     ));
                 };
-                if value.ty != InlineValueType::Duration {
+                if !value.ty.is_word() {
                     return Err(InterpreterError::new(
-                        "nanoseconds getter requires Duration",
+                        "word read requires a one-word inline value",
                     ));
                 }
                 self.push_scalar(mir::ScalarValue::Integer(IntegerValue {
