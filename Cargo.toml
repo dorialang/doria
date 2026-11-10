@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/doria-diagnostic-catalogue",
+    "crates/doria-pseudo-terminal",
     "crates/doria-rt",
     "crates/doria-terminal",
     "crates/doria-time",

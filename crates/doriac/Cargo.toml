@@ -40,6 +40,7 @@ ryu.workspace = true
 # `doria-rt` from its own manifest instead.
 
 [dev-dependencies]
+doria-pseudo-terminal = { path = "../doria-pseudo-terminal" }
 doria-rt = { path = "../doria-rt", default-features = false }
 # Tests lower every durable native program for every tier-1 target, not only
 # the host's: a target's ABI limits (x86-64 returns two integer registers,

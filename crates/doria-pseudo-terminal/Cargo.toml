@@ -1,0 +1,14 @@
+[package]
+name = "doria-pseudo-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Test support only: a pseudo-terminal to run a program in (a pty on Unix,
+# ConPTY on Windows) and a screen model to read what it drew. Nothing that
+# ships depends on this crate.
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "=0.2.191", default-features = false }

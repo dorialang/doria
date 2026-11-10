@@ -341,6 +341,54 @@ jobs:
       - name: Smoke compile PHP compatibility example
         run: cargo run -p doriac -- compile examples/php/person.doria --target php --out build/php/person.php
 
+  # Decision 0140: the terminal layer is proven on each tier-1 platform by
+  # running real programs inside a pseudo-terminal, a pty on Linux and macOS
+  # and ConPTY on Windows. The acceptance program must show the same screens
+  # on all three.
+  terminal:
+    name: terminal-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Configure MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Select the MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = (Get-Command link.exe -ErrorAction Stop).Source
+          if ($linker -notmatch '\\VC\\Tools\\MSVC\\') {
+            throw "expected the MSVC linker after developer environment setup, found: $linker"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Test the shared terminal code and the pseudo-terminal harness
+        run: cargo test -p doria-terminal -p doria-pseudo-terminal --locked --verbose
+
+      - name: Test the runtime terminal layer
+        run: cargo test -p doria-rt --lib --locked --verbose -- terminal::
+
+      - name: Test Doria\Std\Term and the acceptance program in a pseudo-terminal
+        run: cargo test -p doriac --test term_contract_tests --test term_native_tests --locked --verbose
+
   llvm-release:
     name: llvm-release-${{ matrix.os }}
     strategy:

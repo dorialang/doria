@@ -240,6 +240,13 @@ name = "doria-diagnostic-catalogue"
 version = "2026.3.1-canary"
 
 [[package]]
+name = "doria-pseudo-terminal"
+version = "2026.3.1-canary"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "doria-rt"
 version = "2026.3.1-canary"
 dependencies = [
@@ -284,6 +291,7 @@ dependencies = [
  "cranelift-native",
  "cranelift-object",
  "doria-diagnostic-catalogue",
+ "doria-pseudo-terminal",
  "doria-rt",
  "doria-terminal",
  "doria-time",

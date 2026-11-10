@@ -50,14 +50,12 @@ pub fn execute_native_in_directory_with_env(
     execute_native_with_io(mir, profile, args, directory, environment, None)
 }
 
-fn execute_native_with_io(
+/// Builds `mir` with `profile` and puts the executable in `directory`.
+pub fn stage_executable(
     mir: &Program,
     profile: NativeProfile,
-    args: &[&str],
     directory: &ExecutionDirectory,
-    environment: &[(&str, &std::ffi::OsStr)],
-    input: Option<&[u8]>,
-) -> std::process::Output {
+) -> std::path::PathBuf {
     let bytes = doriac::codegen_native::generate_executable(mir, profile)
         .unwrap_or_else(|error| panic!("{profile:?}: {error:?}"));
     let executable = directory.path().join(if cfg!(windows) {
@@ -80,6 +78,18 @@ fn execute_native_with_io(
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::rename(&staged, &executable).unwrap();
+    executable
+}
+
+fn execute_native_with_io(
+    mir: &Program,
+    profile: NativeProfile,
+    args: &[&str],
+    directory: &ExecutionDirectory,
+    environment: &[(&str, &std::ffi::OsStr)],
+    input: Option<&[u8]>,
+) -> std::process::Output {
+    let executable = stage_executable(mir, profile, directory);
     let mut child = doriac::native_process::spawn(
         Command::new(&executable)
             .args(args)
