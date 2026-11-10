@@ -384,7 +384,8 @@ jobs:
         run: cargo test -p doria-terminal -p doria-pseudo-terminal --locked --verbose
 
       - name: Test the runtime terminal layer
-        run: cargo test -p doria-rt --lib --locked --verbose -- terminal::
+        run: |
+          cargo test -p doria-rt --lib --locked --verbose -- terminal::
 
       - name: Test Doria\Std\Term and the acceptance program in a pseudo-terminal
         run: cargo test -p doriac --test term_contract_tests --test term_native_tests --locked --verbose
