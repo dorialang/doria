@@ -59,6 +59,8 @@ const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 const STILL_ACTIVE: u32 = 259;
+const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+const INVALID_HANDLE: Handle = -1_isize as Handle;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -241,6 +243,14 @@ impl Session {
             let mut startup: StartupInfoEx = std::mem::zeroed();
             startup.startup.size = std::mem::size_of::<StartupInfoEx>() as u32;
             startup.attributes = attributes.as_mut_ptr().cast();
+            // A test runner's own output is redirected, and a child started
+            // without standard handles of its own would be given those
+            // redirected ones instead of the pseudo-console. Handles that are
+            // explicitly invalid make it open the console it is attached to.
+            startup.startup.flags = STARTF_USESTDHANDLES;
+            startup.startup.standard_input = INVALID_HANDLE;
+            startup.startup.standard_output = INVALID_HANDLE;
+            startup.startup.standard_error = INVALID_HANDLE;
             let mut information: ProcessInformation = std::mem::zeroed();
             if CreateProcessW(
                 std::ptr::null(),
