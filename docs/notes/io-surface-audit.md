@@ -343,7 +343,7 @@ TTY detection, standard-input readiness, blocking mode, and platform device
 abstraction are Stage 36a substrate. Portable key events additionally require raw
 mode, canonical-mode changes, escape/console-event decoding, resize events, and
 restoration, all exclusively Stage 46 `Console` work. Non-blocking stdin alone is
-not a portable `pollKey` implementation.
+not a portable key-event implementation.
 
 ### 16. Filters, wrappers, contexts, and adapters
 

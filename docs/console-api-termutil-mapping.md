@@ -1,5 +1,7 @@
 # TermUtil → Doria `Console`: API mapping reference (input to the future `Doria\Std\Term` decision)
 
+**Superseded where it differs by [Decision 0140](decisions/0140-terminal-layer-console-and-raw-mode.md).** This note was the source review that fed that decision and is kept as its input. The decision settles the names and the open questions below: events are read from the raw-mode guard, `Console::enterRawMode()` replaces `Console::rawMode()`, there is no ambient style, the alternate screen is in v0, and mouse events and scroll regions are later slices.
+
 **Source:** `atatusoft-ltd/termutil@main`, read directly from source. This note maps TermUtil's actual inventory onto the planned `Doria\Std\Term` `Console` surface (plan §9, Stage 46), with a disposition per item: **keep** (same concept, Doria spelling), **redesign** (concept survives, mechanism must change), or **defer/relocate** (not `Console` v1 scope).
 
 ## Structural validation

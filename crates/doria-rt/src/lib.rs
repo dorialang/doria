@@ -32,6 +32,7 @@ mod owned_interface;
 mod platform_io;
 mod process;
 mod string_ops;
+pub mod terminal;
 #[cfg(test)]
 mod test_callback;
 #[cfg(test)]
@@ -2004,7 +2005,7 @@ pub unsafe extern "C" fn dr_v2_main_int(
     source_span_start: usize,
     source_span_end: usize,
 ) -> i32 {
-    process_status(
+    finish_main(process_status(
         entry(ptr::null()),
         source_path,
         source_path_length,
@@ -2012,7 +2013,15 @@ pub unsafe extern "C" fn dr_v2_main_int(
         source_text_length,
         source_span_start,
         source_span_end,
-    )
+    ))
+}
+
+/// A `main` that returns leaves through the C runtime, not through
+/// `exit_process`, so the terminal is put back and waiting console output is
+/// written here.
+unsafe fn finish_main(status: i32) -> i32 {
+    terminal::process_ending();
+    status
 }
 
 /// Maps a Doria `main(): int` result to a process status, panicking outside the
@@ -2085,7 +2094,7 @@ pub unsafe extern "C" fn dr_v2_main_int_args(
         source_span_end,
     );
     entry_args::release(args);
-    status
+    finish_main(status)
 }
 
 /// Invokes a Doria `main(List<string> $args): void`.
@@ -2105,7 +2114,7 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
     let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     entry(ptr::null(), home.as_ptr(), args);
     entry_args::release(args);
-    0
+    finish_main(0)
 }
 
 /// Invokes a generated Doria void entry function.
@@ -2117,7 +2126,7 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v2_main_void(entry: DrMainVoidV2) -> i32 {
     entry(ptr::null());
-    0
+    finish_main(0)
 }
 
 /// Invokes a checked Doria `main(): int` and reports an escaping Error as R1000.
@@ -2136,7 +2145,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
 ) -> i32 {
     let mut value = 0_i64;
     let mut error = empty_error_carrier();
-    match entry(ptr::null(), &mut value, &mut error) {
+    finish_main(match entry(ptr::null(), &mut value, &mut error) {
         0 => process_status(
             value,
             source_path,
@@ -2148,7 +2157,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
         ),
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 /// Invokes a checked Doria `main(): void` and reports an escaping Error as R1000.
@@ -2158,11 +2167,11 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v3_main_checked_void(entry: DrMainCheckedVoidV3) -> i32 {
     let mut error = empty_error_carrier();
-    match entry(ptr::null(), &mut error) {
+    finish_main(match entry(ptr::null(), &mut error) {
         0 => 0,
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 /// Invokes a checked Doria `main(List<string> $args): int`.
@@ -2188,7 +2197,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
     let mut error = empty_error_carrier();
     let status = entry(ptr::null(), &mut value, &mut error, home.as_ptr(), args);
     entry_args::release(args);
-    match status {
+    finish_main(match status {
         0 => process_status(
             value,
             source_path,
@@ -2200,7 +2209,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
         ),
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 /// Invokes a checked Doria `main(List<string> $args): void`.
@@ -2219,11 +2228,11 @@ pub unsafe extern "C" fn dr_v3_main_checked_void_args(
     let mut error = empty_error_carrier();
     let status = entry(ptr::null(), &mut error, home.as_ptr(), args);
     entry_args::release(args);
-    match status {
+    finish_main(match status {
         0 => 0,
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 const fn empty_error_carrier() -> DrInterfaceCarrierV1 {
@@ -4594,6 +4603,9 @@ unsafe fn write_panic_fragment(bytes: &[u8]) {
 }
 
 unsafe fn write_panic_bytes(bytes: *const u8, byte_length: usize) {
+    // A panic message written to an alternate screen, or under a hidden
+    // cursor in raw mode, is a message nobody reads.
+    terminal::process_ending();
     // Panic diagnostics are best effort; their sink must not replace the fatal status.
     let _ = device_io::write_panic(bytes, byte_length);
 }
@@ -4629,11 +4641,13 @@ unsafe fn exit_process(status: i32) -> ! {
 
 #[cfg(unix)]
 unsafe fn abort_process(status: i32) -> ! {
+    terminal::process_ending();
     _exit(status)
 }
 
 #[cfg(windows)]
 unsafe fn abort_process(status: i32) -> ! {
+    terminal::process_ending();
     ExitProcess(status as u32)
 }
 

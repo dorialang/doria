@@ -557,6 +557,7 @@ fn exhausted() -> Failure {
 
 pub(crate) mod adapter;
 pub(crate) mod pending;
+pub(crate) mod terminal_watch;
 #[cfg(test)]
 mod tests;
 mod transfer;

@@ -207,6 +207,21 @@ unsafe extern "system" {
         written: *mut u32,
         reserved: *mut c_void,
     ) -> i32;
+    pub(crate) fn SetConsoleMode(handle: NativeHandle, mode: u32) -> i32;
+    pub(crate) fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+    pub(crate) fn ReadConsoleInputW(
+        handle: NativeHandle,
+        records: *mut InputRecord,
+        capacity: u32,
+        read: *mut u32,
+    ) -> i32;
+    pub(crate) fn GetConsoleScreenBufferInfo(
+        handle: NativeHandle,
+        info: *mut ConsoleScreenBufferInfo,
+    ) -> i32;
 
     // Byte transfer.
     pub(crate) fn ReadFile(
@@ -445,6 +460,71 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// `COORD`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Coord {
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+}
+
+/// `SMALL_RECT`. All four edges are inclusive.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct SmallRect {
+    pub(crate) left: i16,
+    pub(crate) top: i16,
+    pub(crate) right: i16,
+    pub(crate) bottom: i16,
+}
+
+/// `CONSOLE_SCREEN_BUFFER_INFO`. `window` is the visible part of the buffer
+/// and `cursor` is a buffer position, not a window position.
+#[cfg(windows)]
+#[repr(C)]
+pub(crate) struct ConsoleScreenBufferInfo {
+    pub(crate) size: Coord,
+    pub(crate) cursor: Coord,
+    pub(crate) attributes: u16,
+    pub(crate) window: SmallRect,
+    pub(crate) maximum_window_size: Coord,
+}
+
+/// `KEY_EVENT_RECORD`, with `uChar` read as its UTF-16 member.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct KeyEventRecord {
+    pub(crate) key_down: i32,
+    pub(crate) repeat_count: u16,
+    pub(crate) virtual_key_code: u16,
+    pub(crate) virtual_scan_code: u16,
+    pub(crate) character: u16,
+    pub(crate) control_key_state: u32,
+}
+
+/// The `Event` union of `INPUT_RECORD`. `other` gives it the size of its
+/// largest member; which member is live is `InputRecord::event_type`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) union InputEvent {
+    pub(crate) key: KeyEventRecord,
+    pub(crate) window_buffer_size: Coord,
+    pub(crate) other: [u32; 4],
+}
+
+/// `INPUT_RECORD`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct InputRecord {
+    pub(crate) event_type: u16,
+    pub(crate) event: InputEvent,
+}
+
 /// Win32 `INFINITE`: wait until the object is signaled.
 #[cfg(windows)]
 pub(crate) const INFINITE: u32 = u32::MAX;
@@ -452,7 +532,7 @@ pub(crate) const INFINITE: u32 = u32::MAX;
 /// `WAIT_TIMEOUT`, as `WaitForSingleObject` and `WaitForMultipleObjects`
 /// return it and as `GetQueuedCompletionStatus` reports it.
 #[cfg(windows)]
-const WAIT_TIMEOUT: u32 = 258;
+pub(crate) const WAIT_TIMEOUT: u32 = 258;
 
 /// `ERROR_TIMEOUT`, as `SleepConditionVariableSRW` reports it.
 #[cfg(windows)]

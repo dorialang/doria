@@ -4,9 +4,10 @@
 use core::{
     cell::UnsafeCell,
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use super::output::OutputBuffer;
 use super::{InputBuffer, StandardStream};
 use crate::native_handle::ReadinessProjection;
 use crate::platform_io::Failure;
@@ -15,6 +16,12 @@ pub(crate) struct StandardDevice {
     stream: StandardStream,
     borrowed: AtomicBool,
     input: UnsafeCell<InputBuffer>,
+    /// Console output not yet written. Only standard output ever holds any.
+    output: UnsafeCell<OutputBuffer>,
+    /// The waiting byte count, readable without the loan.
+    waiting: AtomicUsize,
+    /// Set while waiting console output is being written to the device.
+    settling: AtomicBool,
     source: ReadinessProjection,
 }
 
@@ -28,6 +35,9 @@ impl StandardDevice {
             stream,
             borrowed: AtomicBool::new(false),
             input: UnsafeCell::new(InputBuffer::new()),
+            output: UnsafeCell::new(OutputBuffer::new()),
+            waiting: AtomicUsize::new(0),
+            settling: AtomicBool::new(false),
             source: ReadinessProjection::standard(source, stream),
         }
     }
@@ -36,11 +46,44 @@ impl StandardDevice {
         &self.source
     }
 
+    /// Every loan but the console's own starts by writing waiting console
+    /// output, so a standard stream never overtakes it: `echo` lands after
+    /// the frame before it, a prompt is visible before the read that follows
+    /// it, and standard error keeps its place.
     pub(crate) fn try_borrow(&self) -> Option<DeviceLoan<'_>> {
+        let loan = self.try_borrow_for_console()?;
+        if STDOUT.waiting.load(Ordering::Acquire) != 0 {
+            unsafe { loan.settle_console_output() };
+        }
+        Some(loan)
+    }
+
+    /// The claim alone. Console operations add to the waiting output and must
+    /// not write it out first.
+    pub(crate) fn try_borrow_for_console(&self) -> Option<DeviceLoan<'_>> {
         self.borrowed
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| DeviceLoan { device: self })
+    }
+
+    /// Ends a loan kept by [`DeviceLoan::hold`].
+    ///
+    /// # Safety
+    /// The caller is the holder, and nothing still uses the held access.
+    pub(crate) unsafe fn end_hold(&self) {
+        self.borrowed.store(false, Ordering::Release);
+    }
+
+    /// True while waiting console output is partly written. A handler that
+    /// must write to the terminal regardless reads this to know the terminal
+    /// may be inside an escape sequence.
+    pub(crate) fn is_settling(&self) -> bool {
+        self.settling.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_waiting_output(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn try_borrow_for_io(&self) -> Result<DeviceLoan<'_>, Failure> {
@@ -72,6 +115,84 @@ pub(crate) struct DeviceLoan<'a> {
 }
 
 impl DeviceLoan<'_> {
+    /// Keeps the loan past this value's lifetime, for an owner whose access
+    /// outlives one call. [`StandardDevice::end_hold`] ends it.
+    pub(crate) fn hold(self) {
+        core::mem::forget(self);
+    }
+
+    unsafe fn settle_console_output(&self) {
+        if self.device.stream == StandardStream::Stdout {
+            self.write_console_output();
+        } else if let Some(output) = STDOUT.try_borrow_for_console() {
+            output.write_console_output();
+        }
+    }
+
+    /// Adds console output behind what already waits. Output past the limit
+    /// is written instead of kept.
+    pub(crate) unsafe fn append_console_output(&self, bytes: &[u8]) -> Result<(), Failure> {
+        debug_assert_eq!(self.device.stream, StandardStream::Stdout);
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let output = &mut *self.device.output.get();
+        if !output.append(bytes) {
+            self.write_console_output();
+            if !output.append(bytes) {
+                if let Some(failure) = output.take_failure() {
+                    return Err(failure);
+                }
+                return match self.write_text(bytes.as_ptr(), bytes.len()) {
+                    super::WriteOutcome::Success => Ok(()),
+                    super::WriteOutcome::BrokenPipe => crate::exit_process(0),
+                    super::WriteOutcome::OtherFailure(failure) => Err(failure),
+                };
+            }
+        }
+        self.device
+            .waiting
+            .store(output.length(), Ordering::Release);
+        Ok(())
+    }
+
+    /// A failure from a write nobody was waiting on, reported once.
+    pub(crate) unsafe fn take_console_failure(&self) -> Option<Failure> {
+        (*self.device.output.get()).take_failure()
+    }
+
+    /// Writes waiting console output and reports the first failure not yet
+    /// reported, including one from an earlier write nobody was waiting on.
+    pub(crate) unsafe fn flush_console_output(&self) -> Result<(), Failure> {
+        debug_assert_eq!(self.device.stream, StandardStream::Stdout);
+        self.write_console_output();
+        match (*self.device.output.get()).take_failure() {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
+
+    /// A closed pipe ends the program with status 0, as for every ordinary
+    /// write to standard output. Any other failure is kept for the next
+    /// console operation to report, and the output it belonged to is dropped.
+    unsafe fn write_console_output(&self) {
+        let output = &mut *self.device.output.get();
+        let (bytes, length) = output.waiting();
+        if length == 0 {
+            return;
+        }
+        self.device.settling.store(true, Ordering::Release);
+        let outcome = self.write_text(bytes, length);
+        self.device.settling.store(false, Ordering::Release);
+        output.clear();
+        self.device.waiting.store(0, Ordering::Release);
+        match outcome {
+            super::WriteOutcome::Success => crate::terminal::console_output_written(),
+            super::WriteOutcome::BrokenPipe => crate::exit_process(0),
+            super::WriteOutcome::OtherFailure(failure) => output.keep_failure(failure),
+        }
+    }
+
     pub(crate) unsafe fn write_text(&self, bytes: *const u8, length: usize) -> super::WriteOutcome {
         super::write_unclaimed(self.device.stream, bytes, length)
     }
