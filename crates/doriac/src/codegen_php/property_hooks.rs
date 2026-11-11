@@ -383,12 +383,13 @@ pub(super) fn assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> Opt
         if let Some(integer) = integers::ty(nested.expression_types.get(&assignment.value.span()))
             .or_else(|| integers::ty(nested.expression_types.get(&target.span())))
         {
-            integers::operation(
+            integers::operation_at(
                 integers::assignment_op(&assignment.op).expect("validated integer update"),
                 &format!("${value_name}"),
                 &rhs,
                 integer,
                 assignment.span,
+                Some(assignment.value.span()),
                 &nested,
             )
         } else {

@@ -3274,7 +3274,16 @@ fn validate_assignment(
         AssignOp::SubAssign if float_assignment => None,
         AssignOp::MulAssign if float_assignment => None,
         AssignOp::DivAssign if float_assignment => None,
-        AssignOp::AddAssign | AssignOp::SubAssign | AssignOp::MulAssign
+        AssignOp::AddAssign
+        | AssignOp::SubAssign
+        | AssignOp::MulAssign
+        | AssignOp::DivAssign
+        | AssignOp::ModAssign
+        | AssignOp::ShiftLeftAssign
+        | AssignOp::ShiftRightAssign
+        | AssignOp::BitwiseAndAssign
+        | AssignOp::BitwiseOrAssign
+        | AssignOp::BitwiseXorAssign
             if integers::ty(semantic_info.expression_type(assignment.value.span())).is_some() =>
         {
             None
@@ -3562,6 +3571,15 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             if php_widening_integer_conversion(class_name, method, args, semantic_info) {
                 return validate_arguments(args, semantic_info);
             }
+            // A conversion that can fail is checked against the target's
+            // range, from any source whose width the compiler knows.
+            if IntegerType::from_companion_name(class_name).is_some()
+                && method == "from"
+                && args.len() == 1
+                && integers::ty(semantic_info.expression_type(args[0].value.span())).is_some()
+            {
+                return validate_arguments(args, semantic_info);
+            }
             if IntegerType::from_companion_name(class_name).is_some() && method == "from" {
                 return Err(unsupported_integer_shape(
                     *span,
@@ -3606,6 +3624,11 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                     None
                 }
                 UnaryOp::Negate => Some("checked integer overflow behavior for unary `-`"),
+                UnaryOp::BitwiseNot
+                    if integers::ty(semantic_info.expression_type(expr.span())).is_some() =>
+                {
+                    None
+                }
                 UnaryOp::BitwiseNot => Some("fixed-width Doria bitwise semantics for `~`"),
             };
             if let Some(feature) = feature {
@@ -3652,7 +3675,16 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                 BinaryOp::Sub if float_operands => None,
                 BinaryOp::Mul if float_operands => None,
                 BinaryOp::Div if float_operands => None,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::BitwiseAnd
+                | BinaryOp::BitwiseXor
+                | BinaryOp::BitwiseOr
                     if integers::ty(semantic_info.expression_type(left.span())).is_some() =>
                 {
                     None
@@ -10469,12 +10501,14 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
                     );
                 }
             }
-            if IntegerType::from_companion_name(class_name).is_some()
-                && method == "from"
-                && args.len() == 1
-            {
-                // Validation admitted only widening conversions.
-                return format!("({})", emit_expr(&args[0].value, scopes));
+            if let (Some(target), "from", [argument]) = (
+                IntegerType::from_companion_name(class_name),
+                method.as_str(),
+                args.as_slice(),
+            ) {
+                let source = integers::ty(scopes.expression_types.get(&argument.value.span()))
+                    .expect("PHP capability validation admits typed integer conversions only");
+                return integers::convert(&argument.value, source, target, *span, scopes);
             }
             if class_name == "String" && method == "fromBytes" && args.len() == 1 {
                 return format!("{}->__doriaUtf8String()", emit_expr(&args[0].value, scopes));
@@ -10750,9 +10784,15 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 )
             }
             UnaryOp::Negate => format!("-({})", emit_expr(expr, scopes)),
-            UnaryOp::BitwiseNot => {
-                unreachable!("unsupported integer unary operator passed PHP capability validation")
-            }
+            UnaryOp::BitwiseNot => integers::operation(
+                "~",
+                &emit_expr(expr, scopes),
+                "0",
+                integers::ty(scopes.expression_types.get(&expr.span()))
+                    .expect("PHP capability validation admits `~` on a typed integer only"),
+                *span,
+                scopes,
+            ),
         },
         Expr::Binary {
             left,
@@ -10766,7 +10806,16 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
             {
                 numeric_place::float_binary(left, emit_binary_op(op), right, scopes)
             }
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseOr
                 if integers::ty(scopes.expression_types.get(&left.span())).is_some() =>
             {
                 integers::binary(

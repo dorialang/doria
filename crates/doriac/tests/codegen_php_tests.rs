@@ -2484,76 +2484,58 @@ function identity(int64 $value): int64
 }
 
 #[test]
-fn php_backend_rejects_stage_13_integer_shapes_it_cannot_preserve() {
-    let cases = [
-        (
-            "integer division",
-            r#"
-function divide(int $left, int $right): int
-{
-    return $left / $right;
-}
+fn php_backend_emits_every_integer_operator_through_the_width_aware_operation() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function divide(int $left, int $right): int { return $left / $right; }
+function remainder(int $left, int $right): int { return $left % $right; }
+function shift(uint8 $value, uint8 $count): uint8 { return $value << $count; }
+function mask(int16 $left, int16 $right): int16 { return ~($left & $right); }
+function narrow(int $value): int8 { return Int8::from($value); }
+function widen(int8 $value): int { return Int::from($value); }
 "#,
-            "Doria integer division semantics for `/`",
-        ),
-        (
-            "integer shift",
-            r#"
-function shift(int $value, int $count): int
-{
-    return $value << $count;
-}
-"#,
-            "Doria integer shift semantics for `<<`",
-        ),
-        (
-            "fixed-width bitwise",
-            r#"
-function mask(int $left, int $right): int
-{
-    return $left & $right;
-}
-"#,
-            "fixed-width Doria bitwise semantics for `&`",
-        ),
-        (
-            "checked conversion",
-            r#"
-function convert(): void
-{
-    let $value = Int8::from(1);
-}
-"#,
-            "checked Doria integer conversion semantics for `Int8::from(...)`",
-        ),
-    ];
+    )
+    .expect("typed integer operators are exact in PHP output");
 
-    for (name, source, expected) in cases {
-        let diagnostics = match doriac::compile_source_to_php("test.doria", source) {
-            Ok(php) => panic!("{name} unexpectedly generated PHP:\n{php}"),
-            Err(diagnostics) => diagnostics,
-        };
-
-        assert_eq!(diagnostics[0].code, "B1301", "{name}: {diagnostics:?}");
+    for (function, operation) in [
+        (
+            "divide",
+            r#"__doria_integer_operation("/", $left, $right, 64, true, "#,
+        ),
+        (
+            "remainder",
+            r#"__doria_integer_operation("%", $left, $right, 64, true, "#,
+        ),
+        (
+            "shift",
+            r#"__doria_integer_operation("<<", $value, $count, 8, false, "#,
+        ),
+        (
+            "mask",
+            r#"__doria_integer_operation("&", $left, $right, 16, true, "#,
+        ),
+        ("mask", r#"__doria_integer_operation("~", "#),
+        (
+            "narrow",
+            "__doria_integer_convert($value, 64, true, 8, true, ",
+        ),
+    ] {
         assert!(
-            diagnostics[0]
-                .message
-                .contains("PHP compatibility backend cannot preserve"),
-            "{name}: {diagnostics:?}"
-        );
-        assert!(
-            diagnostics[0].message.contains(expected),
-            "{name}: {diagnostics:?}"
+            php_function_body(&php, function).contains(operation),
+            "{function}: {php}"
         );
     }
+    // A conversion that cannot fail is the value itself.
+    assert!(!php_function_body(&php, "widen").contains("__doria_integer_convert"));
 }
 
 #[test]
 fn php_capability_failure_does_not_make_valid_doria_fail_check() {
     let source = r#"
-function divide(int $left, int $right): int
+function convert(float $value): int
 {
-    return $left / $right;
+    return Float::toInt($value);
 }
 "#;
 
@@ -2561,9 +2543,12 @@ function divide(int $left, int $right): int
         .expect("PHP compatibility limitations must not affect Doria checking");
 
     let diagnostics = doriac::compile_source_to_php("test.doria", source)
-        .expect_err("PHP generation must reject integer division rather than emit PHP `/`");
+        .expect_err("PHP generation must reject a conversion it cannot prove exact");
     assert_eq!(diagnostics[0].code, "B1301");
-    assert!(diagnostics[0].message.contains("integer division"));
+    assert!(diagnostics[0]
+        .message
+        .contains("PHP compatibility backend cannot preserve"));
+    assert!(diagnostics[0].message.contains("conversion semantics"));
 }
 
 #[test]

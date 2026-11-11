@@ -984,7 +984,7 @@ UInt64::from($value)
 
 `Int` and `Int64` target the same canonical `int64` type. Each `from` accepts exactly one integer expression. Same-type and exact widening conversions preserve the value; narrowing and signedness-changing conversions are checked and panic with `integer conversion out of range` when the value cannot be represented. Stage 13 adds no `as` cast and no wrapping, saturating, or unchecked conversion API.
 
-The exact operator, panic, and conversion rules are authoritative in decisions 0041 and 0042. The PHP compatibility backend supports only integer shapes it can preserve exactly; it emits a backend unsupported-feature diagnostic for precise Stage 13 behavior that PHP cannot represent rather than changing Doria semantics.
+The exact operator, panic, and conversion rules are authoritative in decisions 0041 and 0042. The PHP compatibility backend implements these rules exactly for operands whose integer types the compiler knows, and emits a backend unsupported-feature diagnostic for the remaining shapes rather than changing Doria semantics.
 
 ### Inline Time values
 
@@ -1715,7 +1715,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in decisions 0020, 0041, and 0072. Current compiler support includes typed scalar equality, rejection of `===` / `!==`, runtime bool locals/parameters/returns/calls, value- and condition-position short-circuit `not`/`and`/`or`, eager `xor`, fixed-width integer bitwise operators, typed MIR lowering, and native execution. PHP lowers only its exact supported subset.
+The accepted boolean/equality/bitwise operator direction is recorded in decisions 0020, 0041, and 0072. Current compiler support includes typed scalar equality, rejection of `===` / `!==`, runtime bool locals/parameters/returns/calls, value- and condition-position short-circuit `not`/`and`/`or`, eager `xor`, fixed-width integer bitwise operators, typed MIR lowering, and native execution. PHP output implements the fixed-width integer operators exactly for typed operands (section 13).
 
 ### Control-flow conditions
 
@@ -2712,9 +2712,9 @@ The PHP backend is currently implemented as a compatibility/debugging backend. I
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
 - Typed arrays and collection aliases are emitted as `array` for the current PHP backend only.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
-- `int`/`int64` remain the exact supported signed-integer alias subset.
-- `uint64` transport, constants/defaults, display/formatting, comparison, and collection ordering preserve all 64 bits on 64-bit PHP. The backend uses a private signed bit-pattern representation, not a floating-point conversion; this does not enable otherwise unsupported arithmetic or conversions.
-- Checked arithmetic, nondefault widths, unsigned semantics, division/remainder, shifts/bitwise operations, and integer companion conversions produce a clear backend unsupported-feature diagnostic whenever PHP cannot preserve the Doria behavior exactly.
+- Every integer width keeps its exact Doria behavior in PHP output when the operands' types are known to the compiler: checked `+`, `-`, `*` and unary `-`; `/` and `%` with their zero-divisor and overflow panics; `<<` and `>>` with the shift-count panic; `&`, `|`, `^` and `~`; their compound assignments; and `Target::from(value)` conversions between integer widths with the out-of-range panic. Panic codes, messages and the operand a panic points at match the native targets.
+- `uint64` uses all 64 bits of a PHP integer as a private bit pattern, never a floating-point conversion. Its arithmetic, division, shifts, comparison, display and collection ordering are computed on that pattern.
+- An integer operation whose operand types the backend cannot establish, and the `Int::toFloat` / `Float::toInt` conversions, produce a clear backend unsupported-feature diagnostic rather than PHP behavior that differs from Doria's.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
 

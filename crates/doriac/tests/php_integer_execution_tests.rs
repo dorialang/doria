@@ -538,3 +538,205 @@ function main(): void {
         "list 19;byte 19;",
     );
 }
+
+/// The interpreter's answer is the reference; the native profiles and PHP
+/// must print the same.
+fn assert_backends_agree(source: &str) -> String {
+    let program = doriac::lower_source_to_mir("checked-integers.doria", source)
+        .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+    let interpreted = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(interpreted.exit_status, 0, "{source}");
+    let expected = String::from_utf8(interpreted.stdout).unwrap();
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&program, profile, &expected);
+    }
+    let run = php(source);
+    assert_eq!(run.status.code(), Some(0), "{run:?}");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected, "{source}");
+    assert!(run.stderr.is_empty(), "{run:?}");
+    expected
+}
+
+#[test]
+fn division_remainder_shifts_and_bitwise_operators_preserve_every_integer_width() {
+    let mut source = String::new();
+    let mut main = String::from("function main(): void {\n");
+    for integer in IntegerType::ALL {
+        let ty = integer.source_name();
+        let bits = integer.bit_width();
+        let min = integer.min_value();
+        let max = integer.max_value();
+        source.push_str(&format!(
+            "function divide_{ty}({ty} $left, {ty} $right): void {{\n\
+             writable {ty} $quotient = $left; $quotient /= $right;\n\
+             writable {ty} $remainder = $left; $remainder %= $right;\n\
+             echo ($left / $right) . \",\" . ($left % $right) . \",\" . $quotient . \",\" . $remainder . \";\";\n\
+             }}\n\
+             function shift_{ty}({ty} $value, {ty} $count): void {{\n\
+             writable {ty} $left = $value; $left <<= $count;\n\
+             writable {ty} $right = $value; $right >>= $count;\n\
+             echo ($value << $count) . \",\" . ($value >> $count) . \",\" . $left . \",\" . $right . \";\";\n\
+             }}\n\
+             function mask_{ty}({ty} $left, {ty} $right): void {{\n\
+             writable {ty} $both = $left; $both &= $right;\n\
+             writable {ty} $either = $left; $either |= $right;\n\
+             writable {ty} $one = $left; $one ^= $right;\n\
+             echo ($left & $right) . \",\" . ($left | $right) . \",\" . ($left ^ $right) . \",\" . (~$left)\n\
+             . \",\" . $both . \",\" . $either . \",\" . $one . \";\";\n\
+             }}\n"
+        ));
+        let half = max / 2 + 1;
+        let mut values = vec![min, max, 0, 1, 7, half, max - 1];
+        if integer.is_signed() {
+            values.extend([-1, -7, min + 1]);
+        }
+        for &left in &values {
+            for &right in &values {
+                main.push_str(&format!("mask_{ty}({left}, {right});\n"));
+                if right != 0 && !(integer.is_signed() && left == min && right == -1) {
+                    main.push_str(&format!("divide_{ty}({left}, {right});\n"));
+                }
+            }
+            for count in [0, 1, bits / 2, bits - 1] {
+                main.push_str(&format!("shift_{ty}({left}, {count});\n"));
+            }
+        }
+    }
+    // The one remainder whose quotient does not exist is zero.
+    for integer in IntegerType::ALL.into_iter().filter(|ty| ty.is_signed()) {
+        let ty = integer.source_name();
+        source.push_str(&format!(
+            "function least_{ty}({ty} $left, {ty} $right): {ty} {{ return $left % $right; }}\n"
+        ));
+        main.push_str(&format!(
+            "echo least_{ty}({}, -1) . \";\";\n",
+            integer.min_value()
+        ));
+    }
+    main.push_str("}\n");
+    let program = source + &main;
+    let printed = assert_backends_agree(&program);
+    assert!(printed.ends_with("0;0;0;0;"), "{printed}");
+}
+
+#[test]
+fn division_and_shift_faults_use_catalogue_codes_in_php_output() {
+    for integer in IntegerType::ALL {
+        let ty = integer.source_name();
+        let bits = integer.bit_width();
+        let min = integer.min_value();
+        let mut operations = vec![
+            ("let $result = $value / $other;".to_string(), 7, 0, "P1105"),
+            ("$value /= $other;".to_string(), 7, 0, "P1105"),
+            ("let $result = $value % $other;".to_string(), 7, 0, "P1107"),
+            ("$value %= $other;".to_string(), 7, 0, "P1107"),
+            (
+                "let $result = $value << $other;".to_string(),
+                1,
+                i128::from(bits),
+                "P1108",
+            ),
+            (
+                "let $result = $value >> $other;".to_string(),
+                1,
+                integer.max_value(),
+                "P1108",
+            ),
+        ];
+        if integer.is_signed() {
+            operations.push((
+                "let $result = $value / $other;".to_string(),
+                min,
+                -1,
+                "P1106",
+            ));
+            operations.push((
+                "let $result = $value << $other;".to_string(),
+                1,
+                -1,
+                "P1108",
+            ));
+        }
+        for (operation, initial, other, code) in operations {
+            let source = format!(
+                r#"
+function fault({ty} $input, {ty} $other): void {{
+    writable {ty} $value = $input;
+    {operation}
+}}
+function main(): void {{ fault({initial}, {other}); }}
+"#
+            );
+            let program = doriac::lower_source_to_mir("checked-integers.doria", &source)
+                .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+            let interpreted = doriac::mir_interpreter::interpret(&program).unwrap();
+            assert_eq!(interpreted.exit_status, 101, "{ty} {operation}");
+            let reference = String::from_utf8(interpreted.stderr).unwrap();
+            assert!(reference.contains(&format!("Panic[{code}]")), "{reference}");
+            let run = php(&source);
+            assert_eq!(run.status.code(), Some(101), "{ty} {operation}: {run:?}");
+            assert!(run.stdout.is_empty(), "{ty} {operation}: {run:?}");
+            // The same report, down to the operand the panic points at.
+            assert_eq!(
+                String::from_utf8(run.stderr).unwrap(),
+                reference,
+                "{ty} {operation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_conversions_hold_every_pair_of_integer_widths() {
+    let mut source = String::new();
+    let mut main = String::from("function main(): void {\n");
+    let mut faults = Vec::new();
+    for from in IntegerType::ALL {
+        for to in IntegerType::ALL {
+            let (source_name, target_name) = (from.source_name(), to.source_name());
+            let companion = to.companion_name();
+            source.push_str(&format!(
+                "function {source_name}_to_{target_name}({source_name} $value): {target_name} {{ return {companion}::from($value); }}\n"
+            ));
+            for value in [from.min_value(), from.max_value(), 0, 1, 127, 128, 255, 256] {
+                if value < from.min_value() || value > from.max_value() {
+                    continue;
+                }
+                if value < to.min_value() || value > to.max_value() {
+                    faults.push((source_name, target_name, companion, value));
+                } else {
+                    main.push_str(&format!(
+                        "echo {source_name}_to_{target_name}({value}) . \";\";\n"
+                    ));
+                }
+            }
+        }
+    }
+    main.push_str("}\n");
+    assert_backends_agree(&(source + &main));
+
+    // One value outside each target, taken from each source that can hold it.
+    let mut seen = std::collections::HashSet::new();
+    for (source_name, target_name, companion, value) in faults {
+        if !seen.insert((source_name, target_name)) {
+            continue;
+        }
+        let program = format!(
+            "function convert({source_name} $value): {target_name} {{ return {companion}::from($value); }}\n\
+             function main(): void {{ let $converted = convert({value}); }}\n"
+        );
+        let mir = doriac::lower_source_to_mir("checked-integers.doria", &program)
+            .unwrap_or_else(|errors| panic!("{program}\n{errors:#?}"));
+        let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap();
+        assert_eq!(interpreted.exit_status, 101, "{program}");
+        let reference = String::from_utf8(interpreted.stderr).unwrap();
+        assert!(reference.contains("Panic[P1109]"), "{reference}");
+        let run = php(&program);
+        assert_eq!(run.status.code(), Some(101), "{program}: {run:?}");
+        assert_eq!(
+            String::from_utf8(run.stderr).unwrap(),
+            reference,
+            "{program}"
+        );
+    }
+}

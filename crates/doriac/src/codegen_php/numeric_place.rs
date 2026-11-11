@@ -247,12 +247,21 @@ fn emit_update_statement(
     };
     // Capture both the home and its previous value before the RHS can mutate
     // that storage. The enclosing statement retains target and operand owners.
+    let right_span = right.map(Expr::span);
     let right = right.map_or_else(
         || "1".to_string(),
         |right| value_result::stage_value(right, false, &mut body, 0, scopes),
     );
     let result = if let Some(integer) = integer {
-        integers::operation(op, &format!("${previous}"), &right, integer, span, scopes)
+        integers::operation_at(
+            op,
+            &format!("${previous}"),
+            &right,
+            integer,
+            span,
+            right_span,
+            scopes,
+        )
     } else {
         float_operation(op, &format!("${previous}"), &right)
     };
