@@ -223,3 +223,51 @@ fn the_menu_reports_a_missing_terminal_instead_of_drawing_garbage() {
     );
     assert!(!drawn.contains("ESC"), "{drawn}");
 }
+
+const INTERACTIVE: &str = r#"
+use Doria\Std\Io\StandardStreams;
+
+function main(): void {
+    let $input = StandardStreams::input;
+    let $output = StandardStreams::output;
+    let $error = StandardStreams::error;
+    echo "{$input->isInteractive} {$output->isInteractive} {$error->isInteractive}";
+}
+"#;
+
+#[test]
+fn the_standard_views_say_whether_they_are_attached_to_a_terminal() {
+    let attached = run(INTERACTIVE, Some(terminal(Vec::new())));
+    assert_eq!(drawn(&attached), "true true true");
+    let redirected = run(INTERACTIVE, None);
+    assert_eq!(drawn(&redirected), "false false false");
+}
+
+#[test]
+fn raw_mode_owns_standard_input_until_it_is_left() {
+    let output = run(
+        r#"
+use Doria\Std\Io\IoError;
+use Doria\Std\Term\{Console, TerminalError};
+
+function attempt(): string {
+    try {
+        let $line = read_line();
+        return "read";
+    } catch (IoError $error) {
+        return "refused";
+    }
+}
+
+function main(): void throws TerminalError {
+    let $raw = Console::enterRawMode();
+    echo attempt();
+    $raw->leave();
+    echo " ";
+    echo attempt();
+}
+"#,
+        Some(terminal(Vec::new())),
+    );
+    assert_eq!(drawn(&output), "refused read");
+}

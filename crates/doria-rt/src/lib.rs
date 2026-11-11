@@ -2611,23 +2611,6 @@ pub unsafe extern "C" fn dr_v2_flush_stderr(current_frame: *const DrStackFrameV2
     panic_catalogued(current_frame, b"P1407")
 }
 
-/// Returns whether one standard stream is attached to an interactive terminal.
-///
-/// Stream identifiers are 0=stdin, 1=stdout, and 2=stderr. Unknown identifiers return false.
-///
-/// # Safety
-/// This operation has no pointer preconditions.
-#[no_mangle]
-pub unsafe extern "C" fn dr_v1_stream_is_interactive(stream: u8) -> u8 {
-    let stream = match stream {
-        0 => StandardStream::Stdin,
-        1 => StandardStream::Stdout,
-        2 => StandardStream::Stderr,
-        _ => return 0,
-    };
-    u8::from(device_io::is_interactive(stream))
-}
-
 /// Reads one UTF-8 line from stdin, returning null only for EOF before bytes.
 ///
 /// The returned non-null string is owned. LF and CRLF endings are removed.

@@ -1368,7 +1368,7 @@ impl Interpreter<'_> {
         }
         for (index, claimed) in owner.standard_claims.into_iter().enumerate() {
             if claimed {
-                if self.standard_claims[index] != Some(group) {
+                if self.standard_claims[index] != Some(StandardClaim::Group(group)) {
                     return Err(InterpreterError::new(
                         "standard group claim has another owner",
                     ));

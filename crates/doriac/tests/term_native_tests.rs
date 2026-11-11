@@ -99,17 +99,63 @@ fn key_bytes(key: Key) -> &'static [u8] {
     }
 }
 
-/// Runs the natively compiled menu in a pseudo-terminal, types `keys` one
-/// frame at a time, and holds every screen to the interpreter's.
-fn menu_matches_the_interpreter(profile: NativeProfile, keys: &[Key]) {
+/// One way of running the compiled menu.
+struct Launch {
+    what: String,
+    program: std::path::PathBuf,
+    arguments: Vec<String>,
+    /// Keeps the built files in place until the run is over.
+    _directory: ExecutionDirectory,
+}
+
+fn native(program: &doriac::mir::Program, profile: NativeProfile) -> Launch {
+    let directory = ExecutionDirectory::new();
+    Launch {
+        what: format!("{profile:?}"),
+        program: stage_executable(program, profile, &directory),
+        arguments: Vec::new(),
+        _directory: directory,
+    }
+}
+
+/// PHP output beside the native runtime it loads.
+fn php() -> Launch {
+    let artifact = doriac::compile_source("menu.doria", MENU, doriac::backend::BackendTarget::Php)
+        .unwrap_or_else(|diagnostics| panic!("the menu does not compile to PHP: {diagnostics:#?}"));
+    let directory = ExecutionDirectory::new();
+    let script = directory.path().join("menu.php");
+    doriac::backend::publish_output(&script, artifact).unwrap();
+    Launch {
+        what: "PHP".into(),
+        program: "php".into(),
+        arguments: vec![
+            "-d".into(),
+            "ffi.enable=1".into(),
+            script.to_string_lossy().into_owned(),
+        ],
+        _directory: directory,
+    }
+}
+
+/// Runs the compiled menu in a pseudo-terminal, types `keys` one frame at a
+/// time, and holds every screen to the interpreter's.
+fn menu_matches_the_interpreter(
+    launch: impl FnOnce(&doriac::mir::Program) -> Launch,
+    keys: &[Key],
+) {
     let program = doriac::lower_source_to_mir("menu.doria", MENU)
         .unwrap_or_else(|diagnostics| panic!("the menu does not compile: {diagnostics:#?}"));
     let expected = expected(&program, keys);
-    let directory = ExecutionDirectory::new();
-    let executable = stage_executable(&program, profile, &directory);
+    let launch = launch(&program);
+    let what = &launch.what;
+    let arguments = launch
+        .arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let mut session = Session::start(
-        &executable,
-        &[],
+        &launch.program,
+        &arguments,
         &[("TERM", "xterm-256color")],
         COLUMNS,
         ROWS,
@@ -118,7 +164,7 @@ fn menu_matches_the_interpreter(profile: NativeProfile, keys: &[Key]) {
     let mut fed = 0;
     for (number, (frame, key)) in expected.frames.iter().zip(keys).enumerate() {
         session.wait_until(
-            &format!("frame {} ({profile:?}):\n{frame}", number + 1),
+            &format!("frame {} ({what}):\n{frame}", number + 1),
             |drawn| {
                 screen.feed(&drawn[fed..]);
                 fed = drawn.len();
@@ -127,36 +173,54 @@ fn menu_matches_the_interpreter(profile: NativeProfile, keys: &[Key]) {
         );
         assert!(
             !screen.cursor_is_visible(),
-            "{profile:?}: the menu hides the cursor"
+            "{what}: the menu hides the cursor"
         );
         session.type_bytes(key_bytes(*key));
     }
     let (exit, drawn) = session.finish();
     screen.feed(&drawn[fed..]);
-    assert_eq!(exit.code, Some(expected.status), "{profile:?}");
+    assert_eq!(exit.code, Some(expected.status), "{what}");
     assert!(
         !screen.on_alternate_screen(),
-        "{profile:?}: the first screen is back"
+        "{what}: the first screen is back"
     );
-    assert!(
-        screen.cursor_is_visible(),
-        "{profile:?}: the cursor is back"
-    );
-    assert_eq!(screen.text(), expected.ended, "{profile:?}");
+    assert!(screen.cursor_is_visible(), "{what}: the cursor is back");
+    assert_eq!(screen.text(), expected.ended, "{what}");
 }
 
 #[test]
 fn arrow_keys_move_the_menu_and_enter_chooses_on_every_platform() {
-    menu_matches_the_interpreter(NativeProfile::Fast, &[Key::Down, Key::Down, Key::Enter]);
+    menu_matches_the_interpreter(
+        |program| native(program, NativeProfile::Fast),
+        &[Key::Down, Key::Down, Key::Enter],
+    );
 }
 
 #[test]
 fn the_menu_wraps_at_its_ends_and_escape_cancels_on_every_platform() {
-    menu_matches_the_interpreter(NativeProfile::Fast, &[Key::Up, Key::Escape]);
+    menu_matches_the_interpreter(
+        |program| native(program, NativeProfile::Fast),
+        &[Key::Up, Key::Escape],
+    );
 }
 
 #[cfg(feature = "llvm-backend")]
 #[test]
 fn the_release_profile_shows_the_same_menu() {
-    menu_matches_the_interpreter(NativeProfile::Release, &[Key::Down, Key::Down, Key::Enter]);
+    menu_matches_the_interpreter(
+        |program| native(program, NativeProfile::Release),
+        &[Key::Down, Key::Down, Key::Enter],
+    );
+}
+
+/// PHP output drives the terminal through the same native runtime, so the
+/// same program shows the same screens when it is run by PHP.
+#[test]
+fn php_output_shows_the_same_menu() {
+    menu_matches_the_interpreter(|_| php(), &[Key::Down, Key::Down, Key::Enter]);
+}
+
+#[test]
+fn php_output_restores_the_terminal_when_the_menu_is_cancelled() {
+    menu_matches_the_interpreter(|_| php(), &[Key::Up, Key::Escape]);
 }

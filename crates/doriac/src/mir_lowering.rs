@@ -4562,6 +4562,16 @@ fn lower_file_intrinsic(
         )));
         return Ok(());
     }
+    if intrinsic == FileFunction::AskTerminal {
+        inline_value::lower_term_intrinsic(
+            crate::compiler_known_term::TermFunction::Operate,
+            span,
+            params,
+            return_type,
+            context,
+        );
+        return Ok(());
+    }
     let standard = params
         .first()
         .and_then(|receiver| match context.locals[receiver.0].ty {
@@ -4735,6 +4745,7 @@ fn lower_file_intrinsic(
             }
         }
         FileFunction::UnavailableConstructor
+        | FileFunction::AskTerminal
         | FileFunction::StandardInput
         | FileFunction::StandardOutput
         | FileFunction::StandardError

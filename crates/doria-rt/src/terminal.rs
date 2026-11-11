@@ -280,6 +280,17 @@ unsafe fn operate(operation: u32, first: i64, second: i64, text: &[u8]) -> Resul
         operation::ENTER_RAW_MODE => return enter_raw_mode(),
         operation::LEAVE_RAW_MODE => return leave_raw_mode(first as u32),
         operation::CURSOR_POSITION => return cursor_position(first as u32),
+        // A fact about the device itself, which a loan held elsewhere does
+        // not change, so it is answered without borrowing the stream.
+        operation::STREAM_IS_INTERACTIVE => {
+            let stream = match first {
+                0 => StandardStream::Stdin,
+                1 => StandardStream::Stdout,
+                2 => StandardStream::Stderr,
+                _ => return Err(Refusal::unsupported()),
+            };
+            return Ok(u64::from(crate::device_io::is_interactive(stream)));
+        }
         _ => {}
     }
     let output = standard_device(StandardStream::Stdout)

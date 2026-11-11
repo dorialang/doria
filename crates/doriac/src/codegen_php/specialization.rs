@@ -778,8 +778,10 @@ impl Plan {
                 break;
             }
         }
-        plan.native_standard_io =
-            super::standard_io::required(program, &plan, &declarations, &instances);
+        // Console output waits in the native device beside everything else
+        // the program writes, so a terminal program uses that one transport.
+        plan.native_standard_io = super::term::used(program)
+            || super::standard_io::required(program, &plan, &declarations, &instances);
         plan.prepare_dispatch(&mut result_names)?;
         let mut symbols = plan
             .callables

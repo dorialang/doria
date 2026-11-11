@@ -52,6 +52,15 @@ struct PayloadProjection {
     field: usize,
 }
 
+/// What holds a standard device against other access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandardClaim {
+    /// The transfer group with this identity has a pending transfer on it.
+    Group(usize),
+    /// Raw mode owns standard input until it is left.
+    RawMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterpreterPlaceStorage {
     Static(mir::StaticId),
@@ -1197,7 +1206,9 @@ struct Interpreter<'program> {
     cancellation_states: BTreeMap<u128, inline_value::CancellationState>,
     terminal: terminal::State,
     pending_requests: BTreeMap<usize, file_stream::RequestView>,
-    standard_claims: [Option<usize>; 3],
+    /// What holds each standard device against other access, as the
+    /// runtime's device loans do.
+    standard_claims: [Option<StandardClaim>; 3],
     standard_source_homes: [usize; 3],
     heap: BTreeMap<usize, ObjectValue>,
     interface_collections: BTreeMap<usize, CollectionValue>,

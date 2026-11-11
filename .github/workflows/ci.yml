@@ -363,6 +363,16 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
 
+      # The acceptance program is also run from PHP output, which loads the
+      # native runtime through FFI.
+      - name: Install PHP for the PHP-output terminal run
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: ffi
+          ini-values: ffi.enable=1
+          coverage: none
+
       - name: Configure MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1

@@ -24,7 +24,8 @@ pub(super) fn required(program: &Program) -> bool {
             _ => None,
         })
         .collect::<HashSet<_>>();
-    program.semantic_info.call_targets.values().any(|target| {
+    term::used(program)
+        || program.semantic_info.call_targets.values().any(|target| {
         matches!(target, crate::semantics::CallableTarget::Method { class_type, method_name, .. }
             if class_type.name == crate::compiler_known_time::DEADLINE && method_name == "fromNow")
     }) || program
@@ -315,6 +316,11 @@ uint8_t dr_v1_checked_transfer_plan_key(const void *frame, const void *plan,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_deadline_from_now(int64_t duration, uint64_t *low, int64_t *high,
     int64_t *system_code, uint8_t *has_system_code);
+int64_t dr_v1_host_terminal_operate(uint32_t operation, int64_t first, int64_t second,
+    const char *text, size_t length);
+int64_t dr_v1_terminal_await_event(uint32_t generation, uint8_t wait_kind, uint64_t wait_low,
+    int64_t wait_high, DrCancellationV1 *cancellation);
+void dr_v1_terminal_process_ending(void);
 DORIA_NATIVE_ABI, $path);
         } catch (Throwable) {
             // Configuration failures are backend diagnostics, never Doria IoError.

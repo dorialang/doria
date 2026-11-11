@@ -746,6 +746,7 @@ pub(super) fn emit_body(
                 &format!("$this->__doriaPendingRequest->{method}({outcome});"),
             );
         }
+        FileFunction::AskTerminal => term::emit_operate(output, indent),
         FileFunction::UnavailableConstructor if scopes.file_payload => {
             // Only the backend factory calls this private payload constructor.
             // The compiler-owned source constructor remains unavailable.

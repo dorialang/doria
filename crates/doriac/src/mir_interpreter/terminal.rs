@@ -172,9 +172,12 @@ impl Interpreter<'_> {
                 if state.script.is_none() {
                     return Err(Refusal::not_a_terminal());
                 }
-                if state.entries & ledger::RAW_MODE != 0 {
+                // Raw mode owns standard input: nothing else reads it, and
+                // a transfer already reading it keeps raw mode out.
+                if self.standard_claims[0].is_some() {
                     return Err(Refusal::in_use());
                 }
+                self.standard_claims[0] = Some(StandardClaim::RawMode);
                 state.entries |= ledger::RAW_MODE;
                 state.raw += 1;
                 Ok(u64::from(state.raw))
@@ -182,6 +185,7 @@ impl Interpreter<'_> {
             operation::LEAVE_RAW_MODE => {
                 if state.raw_mode_is(first as u32) {
                     state.entries &= !ledger::RAW_MODE;
+                    self.standard_claims[0] = None;
                 }
                 Ok(0)
             }
@@ -196,6 +200,8 @@ impl Interpreter<'_> {
                     .map(|(column, row)| wire::pair(column, row))
                     .ok_or_else(Refusal::unsupported)
             }
+            // A scripted terminal stands behind all three standard streams.
+            operation::STREAM_IS_INTERACTIVE => Ok(u64::from(state.script.is_some())),
             operation::COLOR_SUPPORT => Ok(state.class().color as u64),
             // Captured output has nowhere further to go.
             operation::FLUSH => Ok(0),
@@ -242,6 +248,9 @@ impl Interpreter<'_> {
     /// way the program found it.
     pub(super) fn terminal_ending(&mut self) {
         let entries = std::mem::take(&mut self.terminal.entries);
+        if entries & ledger::RAW_MODE != 0 {
+            self.standard_claims[0] = None;
+        }
         self.stdout
             .extend_from_slice(Undo::new(entries, false).as_bytes());
     }

@@ -507,6 +507,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
             ($differencePresent ? "\n\nDifference\n  " . __doria_safe_error_message($difference) : "") .
             "\n\nWhy\n  " . __doria_safe_error_message($error->message) .
             "\n\nProcess Exited With Status 70\n";
+        __doria_terminal_ending();
         @fwrite(STDERR, $message);
         $caught->dropError();
         exit(70);
@@ -523,6 +524,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
         $progress . "\n\nWhy\n  " .
         __doria_safe_error_message($error->message) .
         "\n\nProcess Exited With Status 70\n";
+    __doria_terminal_ending();
     @fwrite(STDERR, $message);
     $caught->dropError();
     exit(70);
@@ -1279,6 +1281,7 @@ fn emit_php_closure_runtime(
     output: &mut String,
 ) {
     output.push_str(PHP_CLOSURE_BASE_RUNTIME);
+    output.push_str(term::RUNTIME);
     if plan.descriptors.is_empty() {
         return;
     }
@@ -1839,6 +1842,7 @@ function __doria_panic(
         $__doria_panicking = true;
         exit(101);
     }
+    __doria_terminal_ending();
     @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
     @fwrite(STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n");
     @fwrite(STDERR, __doria_source_excerpt($site, $label));
@@ -6648,9 +6652,14 @@ fn emit_function_instance_body(
             crate::ast::CompilerIntrinsic::Concurrency(intrinsic) => {
                 concurrency::emit_body(intrinsic, output, indent + 1);
             }
-            crate::ast::CompilerIntrinsic::Term(intrinsic) => {
-                term::emit_body(intrinsic, output, indent + 1);
-            }
+            crate::ast::CompilerIntrinsic::Term(intrinsic) => term::emit_body(
+                intrinsic,
+                function,
+                &parameter_places,
+                output,
+                indent + 1,
+                &mut scopes,
+            ),
             crate::ast::CompilerIntrinsic::File(intrinsic) => streams::emit_body(
                 intrinsic,
                 function,

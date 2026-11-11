@@ -42,6 +42,9 @@ pub mod operation {
     pub const LEAVE_ALTERNATE_SCREEN: u32 = 21;
     pub const RESET: u32 = 22;
     pub const CURSOR_POSITION: u32 = 23;
+    /// Whether a standard stream (`first`: 0 input, 1 output, 2 error) is
+    /// attached to a terminal. The payload is 1 or 0; it never fails.
+    pub const STREAM_IS_INTERACTIVE: u32 = 24;
 }
 
 /// The largest column, row or movement count the layer transports. Larger

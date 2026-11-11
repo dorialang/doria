@@ -277,6 +277,10 @@ independent snapshot. Immediate borrowed calls are valid; a stored returned
 borrow requires an explicitly declared interface owner, such as
 `ReadinessStream $owner = $input; let $view = borrowInput($owner);`.
 The original Copy binding stays independent.
+Each view has a readonly `bool $isInteractive`: true when that standard
+stream is attached to a terminal (Decision 0140). It never throws, answers
+while a pending transfer holds the device, and in PHP output is asked of the
+native runtime like every other standard-view member.
 
 Line reading (Decision 0110, Text Adapters): `LineReader<S implements
 ReadableStream>` owns its source, and `BorrowedLineReader<S>` borrows it.
@@ -360,7 +364,7 @@ conversion, or hashing contract is provided.
   - **values** — inline Copy `Size` (`$columns`, `$rows`), `Position` (`$column`, `$row`), `KeyModifiers` (`$control`, `$alt`, `$shift`) and `Style`. A `Style` starts from static `Style::plain` and each of `withForeground(Color $color)`, `withBackground(Color $color)`, `withBold()`, `withDim()`, `withItalic()`, `withUnderline()`, `withReverse()`, `withStrikethrough()` returns a changed copy; `$foreground`, `$background`, `$isBold`, `$isDim`, `$isItalic`, `$isUnderlined`, `$isReversed`, `$isStruckThrough` read it back.
   - **enums** — `Color`: `Default`, `Black`, `Red`, `Green`, `Yellow`, `Blue`, `Magenta`, `Cyan`, `White`, the eight `Bright…` forms, `Indexed(int $index)`, `Rgb(int $red, int $green, int $blue)` (each 0 to 255; outside it panics when the color is used). `ColorSupport`: `None`, `Basic`, `Indexed`, `TrueColor`. `LineWrap`: `Enabled`, `Disabled`.
   - **`TerminalError`** implements `Error` with readonly `message`, `TerminalErrorReason $reason` (`NotATerminal`, `InUse`, `Unsupported`, `DeviceFailure`) and `?int $systemCode`.
-  Executable in the interpreter, which runs against a scripted terminal, and in both native profiles. PHP output, the join with a `Doria\Std\Io` transfer group and `$isInteractive` are not delivered yet; see the plan's Stage 46 entry.
+  Executable in the interpreter, which runs against a scripted terminal, and in both native profiles. PHP output drives the terminal through the native runtime (FFI), so it needs the compiler-published shared runtime beside the generated program. The join with a `Doria\Std\Io` transfer group is not delivered yet; see the plan's Stage 46 entry.
 - **`Doria\Std\Math`** — batteries-included game/graphics math as built-in Copy value types: `Vector2`/`Vector3`/`Vector4`, `Quaternion`, `Euler`, `Matrix3x3`/`Matrix4x4`, plus `lerp`/`clamp`/easing helpers. Compiler-known arithmetic operators; `$v->length` / `$v->normalized` properties, `$v->dot`/`$v->cross` methods. Direction: plan §9 (math); lands Stage 47. *(Geometry-math record unauthored.)*
 
 ### Byte Transfer Contracts

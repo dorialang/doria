@@ -462,6 +462,9 @@ pub enum FileFunction {
     WriteRequestOutcome,
     CompleteReadRequest,
     CompleteWriteRequest,
+    /// The terminal runtime's packed operation, for facts about a standard
+    /// device that `Doria\Std\Io` reports itself.
+    AskTerminal,
     UnavailableConstructor,
 }
 
@@ -470,6 +473,7 @@ impl FileFunction {
         !matches!(
             self,
             Self::UnavailableConstructor
+                | Self::AskTerminal
                 | Self::StandardInput
                 | Self::StandardOutput
                 | Self::StandardError
@@ -750,7 +754,9 @@ const PROCESS_DECLARATIONS: [&str; 8] = [
 /// the file's public lock methods construct the guards in Doria.
 fn authored_member(class: &str, member: &crate::ast::ClassMember) -> bool {
     let crate::ast::ClassMember::Method(method) = member else {
-        return AUTHORED_CLASSES.contains(&class);
+        return AUTHORED_CLASSES.contains(&class)
+            || matches!(member, crate::ast::ClassMember::Property(property)
+                if property.name == "isInteractive");
     };
     match class {
         "FileLock" | "LockedFile" => !matches!(method.name.as_str(), "releaseFile" | "abandonFile"),
@@ -1781,6 +1787,9 @@ class StandardStreams {
     static Doria\Std\Io\StandardInput $input { get {} }
     static Doria\Std\Io\StandardOutput $output { get {} }
     static Doria\Std\Io\StandardError $error { get {} }
+    // One call into the terminal runtime, which owns what a standard device
+    // is attached to. Its result packs as `Doria\Std\Term` results do.
+    internal static function askTerminal(int $operation, int $first, int $second, string $text): int {}
 }
 class StandardInput implements Doria\Std\Io\PendingReadableStream {
     internal function __construct() {}
@@ -1788,6 +1797,9 @@ class StandardInput implements Doria\Std\Io\PendingReadableStream {
     writable function prepareRead(writable Doria\Std\Io\ReadRequest $request, writable Doria\Std\Io\WritableByteRegion $destination): void throws Doria\Std\Io\IoError {}
     writable function completeRead(Doria\Std\Io\ReadRequest $request, writable Doria\Std\Io\WritableByteRegion $destination): ?Doria\Std\Io\ReadOutcome throws Doria\Std\Io\IoError {}
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get {} }
+    bool $isInteractive {
+        get { return (Doria\Std\Io\StandardStreams::askTerminal(24, 0, 0, "") >> 8) == 1; }
+    }
 }
 class StandardOutput implements Doria\Std\Io\PendingWritableStream {
     internal function __construct() {}
@@ -1795,6 +1807,9 @@ class StandardOutput implements Doria\Std\Io\PendingWritableStream {
     writable function prepareWrite(writable Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): void throws Doria\Std\Io\IoError {}
     writable function completeWrite(Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): ?Doria\Std\Io\WriteOutcome throws Doria\Std\Io\IoError {}
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get {} }
+    bool $isInteractive {
+        get { return (Doria\Std\Io\StandardStreams::askTerminal(24, 1, 0, "") >> 8) == 1; }
+    }
 }
 class StandardError implements Doria\Std\Io\PendingWritableStream {
     internal function __construct() {}
@@ -1802,6 +1817,9 @@ class StandardError implements Doria\Std\Io\PendingWritableStream {
     writable function prepareWrite(writable Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): void throws Doria\Std\Io\IoError {}
     writable function completeWrite(Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): ?Doria\Std\Io\WriteOutcome throws Doria\Std\Io\IoError {}
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get {} }
+    bool $isInteractive {
+        get { return (Doria\Std\Io\StandardStreams::askTerminal(24, 2, 0, "") >> 8) == 1; }
+    }
 }
 class File {
     internal function __construct() {}
@@ -2226,6 +2244,7 @@ pub fn declarations() -> &'static Program {
                     }
                     let implementation = match (declaration.name.as_str(), method.name.as_str()) {
                         (_, "__construct") => FileFunction::UnavailableConstructor,
+                        ("StandardStreams", "askTerminal") => FileFunction::AskTerminal,
                         ("ReadRequest", "complete") => FileFunction::CompleteReadRequest,
                         ("WriteRequest", "complete") => FileFunction::CompleteWriteRequest,
                         (_, "prepareRead") => FileFunction::PrepareRead,

@@ -1,9 +1,7 @@
 # Decision 0140: Terminal Layer, `Console`, And Raw Mode
 
 **Status:** Accepted. Delivery is tracked in the end-to-end plan and
-`docs/notes/current-pipeline.md`. The exact `Doria\Std\Io` spelling for a
-terminal joining a transfer group is still to be settled (see "Waiting On A
-Terminal And Other Sources").
+`docs/notes/current-pipeline.md`.
 
 ## Approval And Boundary
 
@@ -41,6 +39,14 @@ question:
   offline and locked afterwards.
 - A cancelled event wait: **"A `Cancelled` case (Recommended)"**.
 - Building a `Style`: **"Fluent `with…` methods (Recommended)"**.
+
+On 2026-11-11 Andrew asked to "finish the rest of Stage 46" and settled the
+group-wait spelling on its own question:
+
+- Terminal events in a group wait: **"Plan watches RawMode (Recommended)"**.
+  `TransferPlan::watch($raw)` and `->andWatch($raw)` borrow the `RawMode`; the
+  program keeps it. It is not registered with the `ReadinessSet`. See "Waiting
+  On A Terminal And Other Sources".
 
 This is the Console/terminal decision that plan §9 ("The terminal layer") and
 the Stage 46 entry refer to. It settles the `Doria\Std\Term` v0 surface and the
@@ -331,18 +337,43 @@ ends. These are the runtime's first signal handlers.
 A program that shows a child's output while it accepts keys, or later reads a
 socket while it accepts keys, has to wait for whichever is ready first. Stage
 36a's `ReadinessSet` and `TransferGroup` are the only multi-source wait until
-async exists, so terminal events join it in this stage:
+async exists, so terminal events join it in this stage.
 
-- A `RawMode` can be registered with a `ReadinessSet`, and a group wait
-  reports that terminal events are ready beside its transfer completions.
-- The program then takes the events with `getNextEvent(Wait::Immediate)`.
-  `getNextEvent` with any other `Wait` is the single-source form of the same
+Decision 0110 gives the group the readiness set, and every stream registered
+with it, exclusively for the group's lifetime. A `RawMode` moved into the set
+could not be asked for its events while the group runs. So the plan borrows
+the `RawMode` instead, and the program keeps it:
+
+```doria
+let $raw = Console::enterRawMode();
+let $plan = TransferPlan::read($outputKey, $region)->andWatch($raw);
+let writable $group = $set->begin($plan);
+```
+
+- `Doria\Std\Io\Watchable` marks a source a plan can watch. `RawMode`
+  implements it. Programs do not implement it: a watchable source is backed
+  by the runtime, and `Doria\Std\Io` names no `Doria\Std\Term` type.
+- `TransferPlan::watch($source)` starts a plan with a watch and consuming
+  `andWatch($source)` adds one, beside `read` / `andReadFrom` and `writeTo` /
+  `andWriteTo`. The plan, and then the group, hold a shared loan of the
+  source for their lifetime: the compiler rejects leaving raw mode while a
+  group still watches it, and the program can go on calling the source's
+  readonly members.
+- A watch is identified by a `WatchKey`, from `TransferPlan::getWatchKey` by
+  plan position and from `TransferGroup::$observedWatchKey`, as transfers
+  are by their keys.
+- A watch completes once, as `TransferCompletion::Ready(WatchKey $key)`,
+  when `getNextEvent(Wait::Immediate)` would return something other than
+  `TimedOut`: an event is waiting, or the terminal has closed. The program
+  then drains with `getNextEvent(Wait::Immediate)` until `TimedOut` and
+  re-arms the watch with `TransferGroup::resubmitWatch($key)`. A completed
+  watch that is not resubmitted is retired, and a group whose every
+  operation is retired reports `Exhausted`.
+- `getNextEvent` with any other `Wait` is the single-source form of the same
   runtime wait, not a second mechanism.
-- This needs a completion kind that is not a byte transfer, which is an
-  amendment to Decision 0110's group contract. The exact `Doria\Std\Io`
-  spelling is not settled here. It will be recorded as an amendment to this
-  record and to 0110 before the group work starts, and goes back to Andrew if
-  it has real alternatives.
+
+`Ready` is the completion kind that is not a byte transfer. Decision 0110's
+group contract is amended to match.
 
 ## Decisions Made During Implementation
 
@@ -396,6 +427,33 @@ behavior that keeps those sections true, and each is covered by a test.
   read from input.
 - `Closed` is reported once the terminal behind standard input has gone
   away, after every key already read.
+
+**Standard views**
+
+- `$isInteractive` asks the terminal runtime through the packed operation
+  the rest of the layer uses (`wire::operation::STREAM_IS_INTERACTIVE`), so
+  no backend needed a second mechanism. The older, unused runtime entry
+  `dr_v1_stream_is_interactive` is removed. It never fails and does not
+  borrow the stream, so it answers while a pending transfer holds the device.
+- In the interpreter a scripted terminal stands behind all three standard
+  streams; without one, none is interactive.
+- Raw mode owns standard input in the interpreter as it does natively: a
+  read from standard input while raw mode is held fails, and raw mode cannot
+  be entered while a transfer group holds standard input.
+
+**PHP output**
+
+- The two terminal primitives call the hosted runtime through FFI, so PHP
+  output shares the renderer, the decoder and the restore ledger. The
+  program's shutdown, its panic report and its unhandled-error report each
+  restore the terminal first, so the report lands on the screen the user
+  returns to.
+- The module is written in Doria with shifts, masks and narrowing
+  conversions, and the acceptance program uses `%`. PHP output rejected all
+  of these, so the stage added them to the PHP backend with the interpreter's
+  exact rules for every integer width: `/`, `%`, `<<`, `>>`, `&`, `|`, `^`,
+  `~`, their compound assignments and `Target::from(value)`, including the
+  panic codes and the operand each panic points at.
 
 **Restoring**
 
