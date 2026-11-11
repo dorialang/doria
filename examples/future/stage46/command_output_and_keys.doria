@@ -95,16 +95,6 @@ function describe(TerminalWaitResult $result): string {
     };
 }
 
-function isResize(TerminalWaitResult $result): bool {
-    return match ($result) {
-        TerminalWaitResult::Event($event) => match ($event) {
-            TerminalEvent::Key($key, $modifiers) => false,
-            TerminalEvent::Resized($size) => true,
-        },
-        default => false,
-    };
-}
-
 // `q`, Escape and a terminal that has gone away end the program.
 function ends(TerminalWaitResult $result): bool {
     return match ($result) {
@@ -168,8 +158,6 @@ function relay(List<string> $command): string throws TerminalError, IoError {
 
     let writable $journal = new Journal("Each character typed sends a mark. q or Escape ends.");
     $journal->draw();
-    let $size = Console::getSize();
-    let writable $window = windowLine($size->columns, $size->rows);
     let writable $emptyWakes = 0;
 
     // A command that copies its input answers this `>`, so its output is the
@@ -223,14 +211,6 @@ function relay(List<string> $command): string throws TerminalError, IoError {
                         let $event = $keys->getNextEvent(Wait::Immediate);
                         if ($event == TerminalWaitResult::TimedOut) {
                             $waiting = false;
-                        } else if (isResize($event)) {
-                            // A window may announce a size it already had.
-                            $taken++;
-                            let $line = describe($event);
-                            if ($line != $window) {
-                                $window = $line;
-                                $journal->add($line);
-                            }
                         } else {
                             $taken++;
                             $journal->add(describe($event));

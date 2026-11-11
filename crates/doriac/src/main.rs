@@ -1478,7 +1478,9 @@ fn decode_runtime_outcome_with_sources(
             ));
         }
     }
-    if code == "P1000" && !message.is_empty() {
+    // A user panic carries its message; a failed runtime check carries the
+    // check that failed.
+    if (code == "P1000" || code == "P1001") && !message.is_empty() {
         diagnostic.notes.push(message);
     }
     Ok(diagnostic)

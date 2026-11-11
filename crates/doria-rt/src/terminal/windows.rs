@@ -41,9 +41,15 @@ const RECORDS_PER_READ: usize = 32;
 struct Raw {
     queue: Queue,
     units: Utf16,
-    /// A size record arrived. Any number of them are one event carrying the
-    /// size the window has when it is reported.
+    /// The window has a size the program has not been told. Any number of
+    /// changes are one event carrying the size the window has when it is
+    /// reported.
     resized: bool,
+    /// The size the program was last told: the one the window had when raw
+    /// mode began, then each one reported. The console also sends size
+    /// records when nothing the program can see has changed (when a screen
+    /// buffer becomes active, for one), and those are not events.
+    known: (u32, u32),
 }
 
 static RAW: Shared<Option<Raw>> = Shared::new(None);
@@ -153,6 +159,8 @@ pub(super) unsafe fn enter_raw_mode() -> Result<(), Refusal> {
         queue: Queue::new(capacity).ok_or_else(exhausted)?,
         units: Utf16::default(),
         resized: false,
+        // An unreadable size is told by the first size record instead.
+        known: size().unwrap_or((0, 0)),
     };
     if length != 0 {
         raw.queue.push(core::slice::from_raw_parts(
@@ -256,7 +264,9 @@ unsafe fn read_records(raw: &mut Raw, input: NativeHandle) -> Result<(), Failure
                     return Err(failure);
                 }
             }
-            WINDOW_BUFFER_SIZE_EVENT => raw.resized = true,
+            // A size that cannot be read is reported when the event is
+            // taken, where its error has somewhere to go.
+            WINDOW_BUFFER_SIZE_EVENT => raw.resized = size().ok() != Some(raw.known),
             _ => {}
         }
     }
@@ -288,6 +298,7 @@ pub(super) unsafe fn await_event(
         }
         if mem::take(&mut raw.resized) {
             let (columns, rows) = size()?;
+            raw.known = (columns, rows);
             return Ok(Observation::Resized { columns, rows });
         }
         if expired {

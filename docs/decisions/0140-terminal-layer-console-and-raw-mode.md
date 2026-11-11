@@ -421,6 +421,13 @@ behavior that keeps those sections true, and each is covered by a test.
   `Resized` uses the one behind standard input when standard output is
   redirected. A terminal that reports no columns or no rows has no size, and
   the operation throws `TerminalError` (unsupported).
+- `Resized` means the window has a size the program has not been told: the
+  size it had when raw mode began, then each size reported. The Unix kernels
+  signal only real changes. The Windows console also sends size records when
+  nothing the program can see has changed, such as when a screen buffer
+  becomes active; the runtime compares and drops those. The one `Resized`
+  that follows a stop and continue is sent whatever the size, because the
+  program has to draw again.
 - `getCursorPosition()` waits one second for the terminal's answer and throws
   `TerminalError` (unsupported) without one. Keys typed around the answer stay
   queued in order. On Windows the console is asked directly and nothing is

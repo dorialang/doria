@@ -3141,7 +3141,7 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
     } else {
         write_panic_fragment(entry.explanation.as_bytes());
     }
-    if entry.code == "P1000" && message_length != 0 {
+    if (entry.code == "P1000" || entry.code == "P1001") && message_length != 0 {
         write_panic_fragment(b"\n\nNote\n");
         write_panic_bytes(message, message_length);
     }
@@ -4466,8 +4466,37 @@ unsafe fn string_result_too_large() -> ! {
     panic_catalogued(ptr::null(), b"P1205")
 }
 
+/// The runtime found its own state impossible. The report names the check
+/// that failed, since nothing in the program's source can.
+#[track_caller]
 unsafe fn runtime_invariant_panic() -> ! {
-    panic_catalogued(ptr::null(), b"P1001")
+    static mut NOTE: [u8; 192] = [0; 192];
+    let location = core::panic::Location::caller();
+    let note = &mut *ptr::addr_of_mut!(NOTE);
+    let mut length = 0;
+    let mut line = [0_u8; 10];
+    let mut digits = line.len();
+    let mut number = location.line();
+    loop {
+        digits -= 1;
+        line[digits] = b'0' + (number % 10) as u8;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    for part in [
+        &b"A runtime check failed at "[..],
+        location.file().as_bytes(),
+        b":",
+        &line[digits..],
+        b". This is a defect in Doria, not in the program; please report it.",
+    ] {
+        let taken = part.len().min(note.len() - length);
+        note[length..length + taken].copy_from_slice(&part[..taken]);
+        length += taken;
+    }
+    dr_v2_panic_code(ptr::null(), b"P1001".as_ptr(), 5, note.as_ptr(), length)
 }
 
 #[cfg(test)]
