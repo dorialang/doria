@@ -13,6 +13,51 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Stage 46, the terminal layer, delivered 2026-11-11 under Decision 0140.
+  `Doria\Std\Term` is one module authored in Doria over two runtime
+  primitives: `Console`, the `RawMode` and `AlternateScreen` guards, typed key
+  and resize events, `Style` and `Color`, `TerminalError`. The runtime keeps a
+  ledger of what a program changed and puts the terminal back on return,
+  closed pipe, panic and signals. Windows uses console modes and input
+  records behind the same VT renderer and decoder as Unix.
+  Also delivered with it: `$isInteractive` on the standard views; terminal
+  events in a transfer-group wait (`Watchable`, `TransferPlan::watch` and
+  `andWatch`, `WatchKey`, `TransferCompletion::Ready`, `resubmitWatch`,
+  Decision 0110 "Watched Sources"); PHP output for all of it through the
+  native runtime; integer `/ % << >> & | ^ ~`, their compound forms and
+  checked `Target::from` in PHP output, which the module itself needed; one
+  decoder for native I/O failures in PHP output; the runtime's self-check
+  panic (P1001) naming the check that failed; E0781 for a program class that
+  declares `Watchable`; standard modules reaching each other's `internal`
+  members.
+  Acceptance: `examples/terminal/menu.doria`, the `Menu` / `MenuItem` program
+  Andrew asked for, runs unchanged on Linux, macOS and native Windows. The
+  `terminal` CI job compiles it on each platform, drives it in a pty or
+  ConPTY (keys, a window resize, cancel) and holds every screen to the
+  interpreter's, with the fast profile, the release profile and PHP output.
+  The same harness runs a key and modifier probe, a return and panic restore
+  probe, a relay that waits on a command's output and the terminal together,
+  and a checked error leaving a group that reads and watches.
+  Evidence: CI run 43033980886 on `a2d19dc`, all three `terminal` jobs green.
+  Local validation on macOS at `bceee70`: `php scripts/validate_work_unit.php
+  --llvm` ran every step from an empty cache (the repository guards, format,
+  strict Clippy for the host and for the Windows and Linux targets, the
+  workspace tests, the hosted runtime profile, the release runtime tests and
+  the LLVM suites): 8,254 passing test executions in 169 suites, none failed
+  or ignored. The runner exited 1 only after its 22.79 GiB target exceeded
+  the separate 15 GiB cache cap and was reclaimed; this is not an overall
+  validator pass. Since the local vet gained the Windows and Linux lint
+  graphs, a run from an empty cache cannot stay under that cap; that is a
+  defect in the validator and is open.
+  Open, not closure conditions: the runtime's own pty tests (signals, stop
+  and continue, cursor query) run on Unix only, so those paths have Windows
+  coverage only through the probes; a cancelled pending read of a child's
+  pipe is reported as a failure on Windows and as no outcome on Unix, which
+  PHP output now decodes but nothing unifies; `codegen_php_tests` is not in
+  the Windows CI job; mouse events, a line editor and scroll regions are
+  later slices of Decision 0140; the build ledger was reconciled by hand once
+  on 2026-11-10 after its guard was killed.
+
 - Stage 36a push, 2026-11-05 (delivered 2026-11-08). Decisions and their
   alternatives are in `docs/notes/stage36a-decision-log.md` (entries 1-51).
   Landed: PHP generic payload enums (class per specialization, exact `mixed`
