@@ -57,6 +57,19 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   the Windows CI job; mouse events, a line editor and scroll regions are
   later slices of Decision 0140; the build ledger was reconciled by hand once
   on 2026-11-10 after its guard was killed.
+  After the completion commit `61e3145` the `rust` CI job reached its
+  90-minute limit: its test step had grown from 52 to 71 minutes in a day.
+  Ten of those minutes were one Stage 46 test, the PHP integer operator
+  parity test, whose generated `main` has about 1,366 statements. The cause
+  was the Stage 36a call-origin proof, which copied its whole per-local state
+  at every block and edge; `863949d` makes copies share unchanged values and
+  cut that proof's cost by about 28 times on that program. Still open from
+  the same measurements: the borrowed-views validator has the same dense
+  state and is now the larger cost (about 5 seconds for that function in a
+  release build); a fast-profile executable for that program is 74 MB, 66 MB
+  of it read-only data, and grows with the square of program size; the `rust`
+  job runs the durable parity suite twice, once in its workspace test step
+  and again in its own step, which costs about 14 minutes a run.
 
 - Stage 36a push, 2026-11-05 (delivered 2026-11-08). Decisions and their
   alternatives are in `docs/notes/stage36a-decision-log.md` (entries 1-51).
