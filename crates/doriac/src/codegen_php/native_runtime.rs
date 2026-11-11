@@ -147,6 +147,10 @@ final class __DoriaNativeIo
         global $__doria_native_failures;
         // The report belongs on the screen the user returns to.
         __doria_terminal_ending();
+        // Leaving through `exit` unwinds the callers, and nothing they hold
+        // may run a Doria drop against a runtime that has just failed.
+        global $__doria_shutting_down;
+        $__doria_shutting_down = true;
         fwrite(STDERR, $__doria_native_failures[$reason]);
         if ($reason === "protocol") {
             $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1] ?? [];

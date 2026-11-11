@@ -1219,20 +1219,13 @@ final class __DoriaPendingRequest
     private function throwFailure(): never
     {
         $meta = $this->meta[0];
-        $operation = match ($meta & 255) {
-            1 => __DoriaStdIoIoOperation::Read,
-            2 => __DoriaStdIoIoOperation::Write,
-            9 => __DoriaStdIoIoOperation::Configure,
-        };
         $path = $this->consumeString($this->path[0]);
         $this->consumeString($this->message[0]);
-        $target = match (($meta >> 8) & 255) {
-            0 => __DoriaStdIoIoTarget::File($path),
-            1 => __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
-            2 => __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
-            3 => __DoriaStdIoIoTarget::__doriaCaseStandardError(),
-        };
-        __doria_throw_io_facts($operation, $target, __doria_native_io_reason(($meta >> 16) & 255),
+        // A pending transfer fails on whatever it transfers: a file, a
+        // standard stream or a child's pipe.
+        __doria_throw_io_facts(__doria_native_io_operation($meta & 255),
+            __doria_native_io_target(($meta >> 8) & 255, $path),
+            __doria_native_io_reason(($meta >> 16) & 255),
             ($meta & (1 << 32)) === 0 ? null : $this->system[0],
             ($meta & (1 << 34)) === 0 ? null : $this->transferred[0], 0, "");
     }
@@ -1289,6 +1282,32 @@ final class __DoriaPendingRequest
     }
 }
 
+// What the native runtime says failed, decoded in one place: the operation,
+// and the target with the path or program name the runtime returned for it.
+function __doria_native_io_operation(int $code): __DoriaStdIoIoOperation
+{
+    return __DoriaStdIoIoOperation::cases()[$code]
+        ?? __DoriaNativeIo::fail('protocol', "the runtime named unknown I/O operation {$code}");
+}
+
+function __doria_native_io_target(int $tag, string $name): __DoriaStdIoIoTarget
+{
+    return match ($tag) {
+        0 => __DoriaStdIoIoTarget::File($name),
+        1 => __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
+        2 => __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
+        3 => __DoriaStdIoIoTarget::__doriaCaseStandardError(),
+        4 => __DoriaStdIoIoTarget::__doriaCaseReadinessSet(),
+        5 => __DoriaStdIoIoTarget::__doriaCaseTransferPlan(),
+        6 => __DoriaStdIoIoTarget::__doriaCaseTransferGroup(),
+        7 => __DoriaStdIoIoTarget::Process($name),
+        8 => __DoriaStdIoIoTarget::ProcessInput($name),
+        9 => __DoriaStdIoIoTarget::ProcessOutput($name),
+        10 => __DoriaStdIoIoTarget::ProcessErrors($name),
+        default => __DoriaNativeIo::fail('protocol', "the runtime named unknown I/O target {$tag}"),
+    };
+}
+
 function __doria_native_io_reason(int $reason): __DoriaStdIoIoErrorReason
 {
     return match ($reason) {
@@ -1300,6 +1319,7 @@ function __doria_native_io_reason(int $reason): __DoriaStdIoIoErrorReason
         5 => __DoriaStdIoIoErrorReason::Unsupported,
         6 => __DoriaStdIoIoErrorReason::Closed,
         7 => __DoriaStdIoIoErrorReason::Other,
+        default => __DoriaNativeIo::fail('protocol', "the runtime named unknown I/O failure reason {$reason}"),
     };
 }
 
@@ -1631,14 +1651,8 @@ final class __DoriaChildProcess
             if ($code !== 1) { __DoriaNativeIo::fail('protocol'); }
             $program = FFI::string($runtime->dr_v1_string_data($path[0]),
                 $runtime->dr_v1_string_length($path[0]));
-            $target = match (($meta[0] >> 8) & 255) {
-                7 => __DoriaStdIoIoTarget::Process($program),
-                8 => __DoriaStdIoIoTarget::ProcessInput($program),
-                9 => __DoriaStdIoIoTarget::ProcessOutput($program),
-                10 => __DoriaStdIoIoTarget::ProcessErrors($program),
-                default => __DoriaNativeIo::fail('protocol'),
-            };
-            __doria_throw_io_facts(__DoriaStdIoIoOperation::cases()[$meta[0] & 255], $target,
+            __doria_throw_io_facts(__doria_native_io_operation($meta[0] & 255),
+                __doria_native_io_target(($meta[0] >> 8) & 255, $program),
                 __doria_native_io_reason(($meta[0] >> 16) & 255),
                 ($meta[0] & (1 << 32)) === 0 ? null : $system[0],
                 ($meta[0] & (1 << 34)) === 0 ? null : $transferred[0], 0, '');

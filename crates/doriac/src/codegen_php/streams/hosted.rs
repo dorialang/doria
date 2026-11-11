@@ -709,7 +709,10 @@ final class __DoriaHostedTransferGroup
             // Ending a group raises nothing: a transfer's error stays with
             // the transfer. Anything thrown here would leave the native group
             // half ended behind a set that believes it is still in use.
-            __DoriaNativeIo::fail('protocol', get_class($problem) . ": " . $problem->getMessage());
+            $thrower = $problem->getTrace()[0] ?? [];
+            __DoriaNativeIo::fail('protocol', get_class($problem) . " in " .
+                ($thrower["class"] ?? "") . "::" . ($thrower["function"] ?? "") . ": " .
+                $problem->getMessage());
         } finally {
             $this->owner = null;
             $this->errors->sweep();

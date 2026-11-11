@@ -172,18 +172,7 @@ pub(super) fn emit_runtime(output: &mut String, native: bool) {
     } else {
         "const __DORIA_NATIVE_STANDARD_IO = false;\n"
     });
-    let operations = crate::compiler_known_io::IoOperation::ALL
-        .iter()
-        .map(|operation| {
-            format!(
-                "{} => __DoriaStdIoIoOperation::{},",
-                *operation as u8,
-                operation.case_name()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut runtime = RUNTIME.replace("__DORIA_OPERATIONS__", &operations);
+    let mut runtime = RUNTIME.to_string();
     for name in ["ReadOutcome", "WriteOutcome"] {
         runtime = runtime.replace(
             &format!("__Doria{name}"),
@@ -252,17 +241,8 @@ final class __DoriaNativeStandardIo
                 ($meta & (1 << 33)) === 0 ? null : $s['invalid'][0]),
                 __doria_checked_origin($start, $end), $callable);
         }
-        $operation = match ($meta & 255) { __DORIA_OPERATIONS__
-            default => __DoriaNativeIo::fail('protocol'),
-        };
-        $target = match ($targetTag) {
-            0 => __DoriaStdIoIoTarget::File($path),
-            1 => __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
-            2 => __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
-            3 => __DoriaStdIoIoTarget::__doriaCaseStandardError(),
-            default => __DoriaNativeIo::fail('protocol'),
-        };
-        __doria_throw(new __DoriaStdIoIoError($message, $operation, $target,
+        __doria_throw(new __DoriaStdIoIoError($message, __doria_native_io_operation($meta & 255),
+            __doria_native_io_target($targetTag, $path),
             __doria_native_io_reason(($meta >> 16) & 255),
             ($meta & (1 << 32)) === 0 ? null : $s['system'][0],
             ($meta & (1 << 34)) === 0 ? null : $s['transferred'][0]),
