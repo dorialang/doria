@@ -1672,6 +1672,41 @@ named above, together with standard-stream accessors and view types.
 Exact remaining public interface, member, readiness, file, adapter, and process spellings
 remain deferred under decision 0110; the accepted semantics above do not.
 
+### The terminal layer
+
+`Doria\Std\Term` is the portable terminal layer; decision 0140 is its
+authority. A program that uses it contains no escape sequence and no platform
+check, and behaves the same in a Linux terminal, a macOS terminal and a native
+Windows console.
+
+- `Console` writes styled text, moves the cursor, clears, sets the title and
+  line wrapping, and reports the terminal's size and color support. Its
+  output collects and reaches the terminal in order with every other write
+  to standard output. A `Style` belongs to one write and is built from
+  `Style::plain` with `with…` methods. Redirected output receives the text
+  alone.
+- `Console::enterRawMode()` returns a `RawMode` guard that owns standard
+  input until it ends. `getNextEvent(Wait, ?CancellationToken)` returns
+  `Event(TerminalEvent)`, `TimedOut`, `Cancelled` or `Closed`; an event is a
+  `Key` with `KeyModifiers`, or `Resized` with the new `Size`. A `Resized`
+  event means the window has a size the program has not been told.
+- `Console::enterAlternateScreen()` returns an `AlternateScreen` guard.
+- Whatever a program changed is put back when it ends: by the guards on
+  every structured exit, and by the runtime before the process ends on a
+  return from `main`, a closed output pipe, a panic (before its report is
+  written) and terminating or stop signals. A forced kill cannot be handled.
+- Failures are the checked `TerminalError`, whose `reason` is `NotATerminal`,
+  `InUse`, `Unsupported` or `DeviceFailure`. A negative position, movement
+  or color component is a panic.
+- Whether a standard stream is a terminal is `$isInteractive` on the
+  `Doria\Std\Io` standard views.
+- `RawMode` implements `Doria\Std\Io\Watchable`, so a `TransferPlan` can
+  watch it and one `TransferGroup` wait covers a program's transfers and its
+  terminal events (`TransferCompletion::Ready`).
+
+The interpreter runs terminal programs against a scripted terminal. PHP
+output reaches the terminal through the native runtime.
+
 ### Equality and boolean operators
 
 Doria equality is typed:
