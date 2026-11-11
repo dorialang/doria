@@ -55,6 +55,27 @@ impl Screen {
         }
     }
 
+    /// Changes the window size. What was drawn stays where it was, as far as
+    /// it still fits; nothing is reflowed. A program that draws its own
+    /// screen draws it again when it is told about the new size.
+    pub fn resize(&mut self, columns: u16, rows: u16) {
+        let (columns, rows) = (usize::from(columns), usize::from(rows));
+        let (old_columns, old_rows) = (self.columns, self.rows);
+        for grid in [&mut self.main, &mut self.alternate] {
+            let mut cells = vec![' '; columns * rows];
+            for row in 0..rows.min(old_rows) {
+                for column in 0..columns.min(old_columns) {
+                    cells[row * columns + column] = grid.cells[row * old_columns + column];
+                }
+            }
+            grid.cells = cells;
+            grid.column = grid.column.min(columns - 1);
+            grid.row = grid.row.min(rows - 1);
+        }
+        self.columns = columns;
+        self.rows = rows;
+    }
+
     pub fn on_alternate_screen(&self) -> bool {
         self.on_alternate
     }
@@ -417,5 +438,21 @@ mod tests {
             screen.feed(&[*byte]);
         }
         assert_eq!(screen.text(), "é🎮z");
+    }
+
+    #[test]
+    fn a_resize_keeps_what_still_fits_and_new_writes_use_the_new_size() {
+        let mut screen = shown(b"\x1b[1;1Habcdefgh\x1b[5;1Hlast");
+        screen.resize(4, 3);
+        assert_eq!(screen.text(), "abcd");
+        assert_eq!(screen.cursor(), (3, 2));
+        screen.feed(b"\x1b[3;1Hrow3");
+        assert_eq!(screen.text(), "abcd\n\nrow3");
+        screen.resize(30, 6);
+        screen.feed(b"\x1b[6;25Hwide");
+        assert_eq!(
+            screen.text(),
+            "abcd\n\nrow3\n\n\n                        wide"
+        );
     }
 }

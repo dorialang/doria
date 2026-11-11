@@ -231,17 +231,20 @@ impl Interpreter<'_> {
         if cancelled {
             return Observation::Cancelled;
         }
-        let next = state
-            .script
-            .as_ref()
-            .and_then(|script| script.events.get(state.observed).copied());
-        match next {
-            Some(observation) => {
-                state.observed += 1;
-                observation
-            }
-            None => Observation::Closed,
+        let Some(script) = state.script.as_mut() else {
+            return Observation::Closed;
+        };
+        let Some(observation) = script.events.get(state.observed).copied() else {
+            return Observation::Closed;
+        };
+        state.observed += 1;
+        // A resize is news about the window: the size asked for afterwards
+        // is the new one.
+        if let Observation::Resized { columns, rows } = observation {
+            script.columns = columns;
+            script.rows = rows;
         }
+        observation
     }
 
     /// What the runtime does when a process ends: the terminal goes back the

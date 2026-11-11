@@ -31,6 +31,18 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|found| found + from)
 }
 
+/// One thing that happens to the running menu.
+#[derive(Clone, Copy)]
+enum Step {
+    Press(Key),
+    /// The window changes to this many columns and rows.
+    Resize(u16, u16),
+}
+
+fn presses(keys: &[Key]) -> Vec<Step> {
+    keys.iter().copied().map(Step::Press).collect()
+}
+
 /// What the interpreter says the terminal shows: the alternate screen after
 /// each frame the menu draws, the main screen once it has ended, and the
 /// exit status.
@@ -40,7 +52,7 @@ struct Expected {
     status: i32,
 }
 
-fn expected(program: &doriac::mir::Program, keys: &[Key]) -> Expected {
+fn expected(program: &doriac::mir::Program, steps: &[Step]) -> Expected {
     let output = interpret_with_io(
         program,
         MirIo {
@@ -48,11 +60,14 @@ fn expected(program: &doriac::mir::Program, keys: &[Key]) -> Expected {
                 columns: u32::from(COLUMNS),
                 rows: u32::from(ROWS),
                 color_support: ColorSupport::Indexed,
-                events: keys
+                events: steps
                     .iter()
-                    .map(|key| Observation::Key {
-                        key: *key,
-                        modifiers: 0,
+                    .map(|step| match *step {
+                        Step::Press(key) => Observation::Key { key, modifiers: 0 },
+                        Step::Resize(columns, rows) => Observation::Resized {
+                            columns: u32::from(columns),
+                            rows: u32::from(rows),
+                        },
                     })
                     .collect(),
                 cursor: None,
@@ -69,12 +84,16 @@ fn expected(program: &doriac::mir::Program, keys: &[Key]) -> Expected {
         starts.push(start);
         from = start + FRAME.len();
     }
-    assert_eq!(starts.len(), keys.len(), "one frame before each key");
+    assert_eq!(starts.len(), steps.len(), "one frame before each step");
     let leave = find(&drawn, LEAVE, *starts.last().unwrap()).expect("the menu leaves");
     let mut screen = Screen::new(COLUMNS, ROWS);
     let mut frames = Vec::new();
     let mut fed = 0;
-    for end in starts[1..].iter().copied().chain([leave]) {
+    for (frame, end) in starts[1..].iter().copied().chain([leave]).enumerate() {
+        // The frame after a resize is drawn on the resized window.
+        if let Some(Step::Resize(columns, rows)) = frame.checked_sub(1).map(|step| steps[step]) {
+            screen.resize(columns, rows);
+        }
         screen.feed(&drawn[fed..end]);
         fed = end;
         assert!(screen.on_alternate_screen());
@@ -137,15 +156,15 @@ fn php() -> Launch {
     }
 }
 
-/// Runs the compiled menu in a pseudo-terminal, types `keys` one frame at a
+/// Runs the compiled menu in a pseudo-terminal, takes `steps` one frame at a
 /// time, and holds every screen to the interpreter's.
 fn menu_matches_the_interpreter(
     launch: impl FnOnce(&doriac::mir::Program) -> Launch,
-    keys: &[Key],
+    steps: &[Step],
 ) {
     let program = doriac::lower_source_to_mir("menu.doria", MENU)
         .unwrap_or_else(|diagnostics| panic!("the menu does not compile: {diagnostics:#?}"));
-    let expected = expected(&program, keys);
+    let expected = expected(&program, steps);
     let launch = launch(&program);
     let what = &launch.what;
     let arguments = launch
@@ -162,7 +181,7 @@ fn menu_matches_the_interpreter(
     );
     let mut screen = Screen::new(COLUMNS, ROWS);
     let mut fed = 0;
-    for (number, (frame, key)) in expected.frames.iter().zip(keys).enumerate() {
+    for (number, (frame, step)) in expected.frames.iter().zip(steps).enumerate() {
         session.wait_until(
             &format!("frame {} ({what}):\n{frame}", number + 1),
             |drawn| {
@@ -175,7 +194,13 @@ fn menu_matches_the_interpreter(
             !screen.cursor_is_visible(),
             "{what}: the menu hides the cursor"
         );
-        session.type_bytes(key_bytes(*key));
+        match *step {
+            Step::Press(key) => session.type_bytes(key_bytes(key)),
+            Step::Resize(columns, rows) => {
+                session.resize(columns, rows);
+                screen.resize(columns, rows);
+            }
+        }
     }
     let (exit, drawn) = session.finish();
     screen.feed(&drawn[fed..]);
@@ -192,7 +217,7 @@ fn menu_matches_the_interpreter(
 fn arrow_keys_move_the_menu_and_enter_chooses_on_every_platform() {
     menu_matches_the_interpreter(
         |program| native(program, NativeProfile::Fast),
-        &[Key::Down, Key::Down, Key::Enter],
+        &presses(&[Key::Down, Key::Down, Key::Enter]),
     );
 }
 
@@ -200,7 +225,7 @@ fn arrow_keys_move_the_menu_and_enter_chooses_on_every_platform() {
 fn the_menu_wraps_at_its_ends_and_escape_cancels_on_every_platform() {
     menu_matches_the_interpreter(
         |program| native(program, NativeProfile::Fast),
-        &[Key::Up, Key::Escape],
+        &presses(&[Key::Up, Key::Escape]),
     );
 }
 
@@ -209,7 +234,7 @@ fn the_menu_wraps_at_its_ends_and_escape_cancels_on_every_platform() {
 fn the_release_profile_shows_the_same_menu() {
     menu_matches_the_interpreter(
         |program| native(program, NativeProfile::Release),
-        &[Key::Down, Key::Down, Key::Enter],
+        &presses(&[Key::Down, Key::Down, Key::Enter]),
     );
 }
 
@@ -217,10 +242,28 @@ fn the_release_profile_shows_the_same_menu() {
 /// same program shows the same screens when it is run by PHP.
 #[test]
 fn php_output_shows_the_same_menu() {
-    menu_matches_the_interpreter(|_| php(), &[Key::Down, Key::Down, Key::Enter]);
+    menu_matches_the_interpreter(|_| php(), &presses(&[Key::Down, Key::Down, Key::Enter]));
 }
 
 #[test]
 fn php_output_restores_the_terminal_when_the_menu_is_cancelled() {
-    menu_matches_the_interpreter(|_| php(), &[Key::Up, Key::Escape]);
+    menu_matches_the_interpreter(|_| php(), &presses(&[Key::Up, Key::Escape]));
+}
+
+/// A window too short for the whole menu: the menu is told about the new
+/// size, draws again inside it, and scrolls to keep the focused item in view.
+#[test]
+fn the_menu_redraws_and_scrolls_when_the_window_is_resized_on_every_platform() {
+    menu_matches_the_interpreter(
+        |program| native(program, NativeProfile::Fast),
+        &[
+            Step::Press(Key::Down),
+            Step::Resize(40, 8),
+            Step::Press(Key::Down),
+            Step::Press(Key::Down),
+            Step::Press(Key::Down),
+            Step::Press(Key::Down),
+            Step::Press(Key::Enter),
+        ],
+    );
 }
