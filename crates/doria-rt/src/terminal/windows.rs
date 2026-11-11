@@ -349,9 +349,7 @@ pub(super) unsafe fn events_waiting() -> Result<Watched, Refusal> {
 
 /// The console input handle: signaled while the console has records to read.
 pub(super) unsafe fn event_handle() -> Option<NativeHandle> {
-    if (*RAW.0.get()).is_none() {
-        return None;
-    }
+    (*RAW.0.get()).as_ref()?;
     byte_handle(StandardStream::Stdin).ok()
 }
 

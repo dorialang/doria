@@ -18,7 +18,9 @@ mod execution_directory;
 mod native_execution;
 
 use doria_pseudo_terminal::{Screen, Session};
-use doria_terminal::wire::{ColorSupport, Key, Observation};
+use doria_terminal::wire::{
+    ColorSupport, Key, Observation, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_SHIFT,
+};
 use doriac::backend::NativeProfile;
 use doriac::mir_interpreter::{
     interpret_with_io, InterpreterOutput, MirExitStatus, MirIo, MirProgram, MirTerminal,
@@ -33,7 +35,9 @@ const COLUMNS: u16 = 80;
 const ROWS: u16 = 24;
 
 const FRAME: &[u8] = b"\x1b[2J";
-const LEAVE: &[u8] = b"\x1b[?25h";
+/// How a program's last frame ends: it shows the cursor again itself, or it
+/// ends and the runtime puts the terminal back, first screen first.
+const LEAVE: [&[u8]; 2] = [b"\x1b[?25h", b"\x1b[?1049l"];
 
 fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     haystack[from..]
@@ -46,6 +50,9 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 #[derive(Clone, Copy)]
 enum Step {
     Press(Key),
+    /// These bytes are typed, which a terminal reports as this key with
+    /// these modifiers.
+    Typed(&'static [u8], Key, u8),
     /// The window changes to this many columns and rows.
     Resize(u16, u16),
 }
@@ -67,6 +74,7 @@ struct Expected {
 fn observed(step: Step) -> Observation {
     match step {
         Step::Press(key) => Observation::Key { key, modifiers: 0 },
+        Step::Typed(_, key, modifiers) => Observation::Key { key, modifiers },
         Step::Resize(columns, rows) => Observation::Resized {
             columns: u32::from(columns),
             rows: u32::from(rows),
@@ -97,8 +105,12 @@ fn replayed(output: &InterpreterOutput, steps: &[Step], shown: &[usize]) -> Expe
         starts.push(start);
         from = start + FRAME.len();
     }
-    let leave =
-        find(drawn, LEAVE, *starts.last().expect("the program draws")).expect("the program leaves");
+    let last = *starts.last().expect("the program draws");
+    let leave = LEAVE
+        .iter()
+        .filter_map(|ending| find(drawn, ending, last))
+        .min()
+        .expect("the program leaves");
     let mut screen = Screen::new(COLUMNS, ROWS);
     let mut frames = Vec::new();
     let mut fed = 0;
@@ -114,6 +126,17 @@ fn replayed(output: &InterpreterOutput, steps: &[Step], shown: &[usize]) -> Expe
         frames.push(screen.text());
     }
     screen.feed(&drawn[fed..]);
+    // A report on standard error follows on the same terminal, which by then
+    // starts each new line at the left edge again.
+    for line in output.stderr.split_inclusive(|byte| *byte == b'\n') {
+        match line.strip_suffix(b"\n") {
+            Some(text) => {
+                screen.feed(text);
+                screen.feed(b"\r\n");
+            }
+            None => screen.feed(line),
+        }
+    }
     assert!(!screen.on_alternate_screen() && screen.cursor_is_visible());
     Expected {
         frames,
@@ -244,6 +267,7 @@ fn shows_the_expected_screens(launch: Launch, expected: &Expected, steps: &[Step
         assert!(!screen.cursor_is_visible(), "{what}: the cursor is hidden");
         match *step {
             Step::Press(key) => session.type_bytes(&key_bytes(key)),
+            Step::Typed(bytes, ..) => session.type_bytes(bytes),
             Step::Resize(columns, rows) => {
                 session.resize(columns, rows);
                 screen.resize(columns, rows);
@@ -252,28 +276,43 @@ fn shows_the_expected_screens(launch: Launch, expected: &Expected, steps: &[Step
     }
     let (exit, drawn) = session.finish();
     screen.feed(&drawn[fed..]);
-    assert_eq!(exit.code, Some(expected.status), "{what}");
+    assert_eq!(
+        exit.code,
+        Some(expected.status),
+        "{what}: the program ended showing\n{}",
+        screen.main_text()
+    );
     assert!(
         !screen.on_alternate_screen(),
         "{what}: the first screen is back"
     );
     assert!(screen.cursor_is_visible(), "{what}: the cursor is back");
+    assert!(screen.line_wrap_is_on(), "{what}: lines wrap again");
     assert_eq!(screen.text(), expected.ended, "{what}");
 }
 
-/// Runs the compiled menu in a pseudo-terminal, takes `steps` one frame at a
-/// time, and holds every screen to the interpreter's.
-fn menu_matches_the_interpreter(
+/// Runs a compiled program in a pseudo-terminal, takes `steps` one frame at
+/// a time, and holds every screen to the interpreter's.
+fn matches_the_interpreter(
+    path: &str,
+    source: &str,
     launch: impl FnOnce(&doriac::mir::Program) -> Launch,
     steps: &[Step],
 ) {
-    let program = lower(MENU_PATH, MENU);
+    let program = lower(path, source);
     let expected = interpreted(
         &program,
         steps.iter().copied().map(observed).collect(),
         steps,
     );
     shows_the_expected_screens(launch(&program), &expected, steps);
+}
+
+fn menu_matches_the_interpreter(
+    launch: impl FnOnce(&doriac::mir::Program) -> Launch,
+    steps: &[Step],
+) {
+    matches_the_interpreter(MENU_PATH, MENU, launch, steps);
 }
 
 #[test]
@@ -714,4 +753,90 @@ fn the_release_profile_watches_the_terminal_the_same_way() {
 #[test]
 fn php_output_watches_the_terminal_the_same_way() {
     the_lone_watch_matches_the_interpreter(|_| php(LONE_WATCH_PATH, LONE_WATCH));
+}
+
+const KEY_EVENTS_PATH: &str = "key_events.doria";
+const KEY_EVENTS: &str = include_str!("fixtures/terminal/key_events.doria");
+
+/// What a terminal sends for each key a program can be told about, with the
+/// key and modifiers it must be reported as. The Unix backend decodes these
+/// bytes itself; on Windows the console turns them into key records first.
+const EVERY_KEY: &[Step] = &[
+    Step::Typed(b"a", Key::Character('a'), 0),
+    Step::Typed("é".as_bytes(), Key::Character('é'), 0),
+    // Outside the Basic Multilingual Plane: two UTF-16 units on Windows.
+    Step::Typed("🎮".as_bytes(), Key::Character('🎮'), 0),
+    Step::Typed(b"\r", Key::Enter, 0),
+    Step::Typed(b"\t", Key::Tab, 0),
+    Step::Typed(b"\x7f", Key::Backspace, 0),
+    Step::Typed(b"\x1b[A", Key::Up, 0),
+    Step::Typed(b"\x1b[B", Key::Down, 0),
+    Step::Typed(b"\x1b[C", Key::Right, 0),
+    Step::Typed(b"\x1b[D", Key::Left, 0),
+    Step::Typed(b"\x1b[H", Key::Home, 0),
+    Step::Typed(b"\x1b[F", Key::End, 0),
+    Step::Typed(b"\x1b[5~", Key::PageUp, 0),
+    Step::Typed(b"\x1b[6~", Key::PageDown, 0),
+    Step::Typed(b"\x1b[2~", Key::Insert, 0),
+    Step::Typed(b"\x1b[3~", Key::Delete, 0),
+    Step::Typed(b"\x1bOP", Key::Function(1), 0),
+    Step::Typed(b"\x1b[15~", Key::Function(5), 0),
+    Step::Typed(b"\x1b[24~", Key::Function(12), 0),
+    // In raw mode Control+C is a key, not an interrupt.
+    Step::Typed(b"\x03", Key::Character('c'), MODIFIER_CONTROL),
+    Step::Typed(b"\x1b[1;5C", Key::Right, MODIFIER_CONTROL),
+    Step::Typed(b"\x1b[1;2A", Key::Up, MODIFIER_SHIFT),
+    Step::Typed(b"\x1b[1;3D", Key::Left, MODIFIER_ALT),
+    Step::Resize(60, 30),
+    Step::Typed(b"\x1b", Key::Escape, 0),
+    Step::Typed(b"q", Key::Character('q'), 0),
+];
+
+/// Every key, the modifiers and a resize arrive as the same typed events on
+/// each platform's own input path.
+#[test]
+fn every_key_and_modifier_is_reported_the_same_on_every_platform() {
+    matches_the_interpreter(
+        KEY_EVENTS_PATH,
+        KEY_EVENTS,
+        |program| native(program, NativeProfile::Fast),
+        EVERY_KEY,
+    );
+}
+
+const ENDINGS_PATH: &str = "endings.doria";
+const ENDINGS: &str = include_str!("fixtures/terminal/endings.doria");
+
+/// A program that changed the terminal and returns without putting anything
+/// back leaves it as it found it: the guards and the runtime do the rest.
+#[test]
+fn returning_from_main_puts_the_terminal_back_on_every_platform() {
+    matches_the_interpreter(
+        ENDINGS_PATH,
+        ENDINGS,
+        |program| native(program, NativeProfile::Fast),
+        &[Step::Press(Key::Character('r'))],
+    );
+}
+
+/// A panic runs no guard. The runtime puts the terminal back first, so the
+/// report is on the first screen, where the user can read it.
+#[test]
+fn a_panic_puts_the_terminal_back_before_its_report_on_every_platform() {
+    matches_the_interpreter(
+        ENDINGS_PATH,
+        ENDINGS,
+        |program| native(program, NativeProfile::Fast),
+        &[Step::Press(Key::Character('p'))],
+    );
+}
+
+#[test]
+fn php_output_puts_the_terminal_back_before_a_panic_report() {
+    matches_the_interpreter(
+        ENDINGS_PATH,
+        ENDINGS,
+        |_| php(ENDINGS_PATH, ENDINGS),
+        &[Step::Press(Key::Character('p'))],
+    );
 }

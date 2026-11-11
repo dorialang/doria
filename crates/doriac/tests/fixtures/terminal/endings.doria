@@ -1,0 +1,34 @@
+// Changes everything about the terminal a program can change, then ends the
+// way the first key says, without putting anything back itself. `p` panics;
+// any other key returns from `main` with status 7. The terminal tests check
+// that the terminal is as it was either way.
+use Doria\Std\Io\Wait;
+use Doria\Std\Term\{Console, Key, LineWrap, TerminalError, TerminalEvent, TerminalWaitResult};
+
+function isP(TerminalWaitResult $result): bool {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => match ($key) {
+                Key::Character($text) => $text == "p",
+                default => false,
+            },
+            TerminalEvent::Resized($size) => false,
+        },
+        default => false,
+    };
+}
+
+function main(): int throws TerminalError {
+    let $keys = Console::enterRawMode();
+    let $screen = Console::enterAlternateScreen();
+    Console::hideCursor();
+    Console::setLineWrap(LineWrap::Disabled);
+    Console::clear();
+    Console::writeAt(0, 0, "p panics, any other key returns 7");
+    Console::flush();
+
+    if (isP($keys->getNextEvent(Wait::Indefinite))) {
+        panic("ended by a panic while the terminal was changed");
+    }
+    return 7;
+}

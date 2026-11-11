@@ -1,0 +1,119 @@
+// Lists every key and resize the terminal reports, oldest first. `q` ends it.
+// The terminal tests type at this program on each platform and hold what it
+// shows to the interpreter's answer.
+use Doria\Std\Io\Wait;
+use Doria\Std\Term\{Console, Key, KeyModifiers, TerminalError, TerminalEvent, TerminalWaitResult};
+
+function keyName(Key $key): string {
+    return match ($key) {
+        Key::Character($text) => "Character {$text}",
+        Key::Enter => "Enter",
+        Key::Escape => "Escape",
+        Key::Backspace => "Backspace",
+        Key::Tab => "Tab",
+        Key::Up => "Up",
+        Key::Down => "Down",
+        Key::Left => "Left",
+        Key::Right => "Right",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::Insert => "Insert",
+        Key::Delete => "Delete",
+        Key::Function($number) => "F{$number}",
+    };
+}
+
+function modifierNames(KeyModifiers $modifiers): string {
+    let writable $names = "";
+    if ($modifiers->control) {
+        $names = $names . " +Control";
+    }
+    if ($modifiers->alt) {
+        $names = $names . " +Alt";
+    }
+    if ($modifiers->shift) {
+        $names = $names . " +Shift";
+    }
+    return $names;
+}
+
+function isPlainQ(Key $key, KeyModifiers $modifiers): bool {
+    let $isQ = match ($key) {
+        Key::Character($text) => $text == "q",
+        default => false,
+    };
+    return $isQ && !$modifiers->control && !$modifiers->alt;
+}
+
+// A plain `q` and a terminal that has gone away end the program.
+function ends(TerminalWaitResult $result): bool {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => isPlainQ($key, $modifiers),
+            TerminalEvent::Resized($size) => false,
+        },
+        TerminalWaitResult::Closed => true,
+        default => false,
+    };
+}
+
+function describe(TerminalWaitResult $result): string {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => keyName($key) . modifierNames($modifiers),
+            TerminalEvent::Resized($size) => "Resized {$size->columns}x{$size->rows}",
+        },
+        default => "nothing",
+    };
+}
+
+// Draws the list. A window too short for all of it shows the newest lines.
+function show(List<string> $lines): void throws TerminalError {
+    let $size = Console::getSize();
+    let $visible = $size->rows - 1;
+    let writable $first = 0;
+    if ($lines->count > $visible) {
+        $first = $lines->count - $visible;
+    }
+    Console::clear();
+    Console::writeAt(0, 0, "Keys and resizes, oldest first. q ends.");
+    let writable $row = 0;
+    while ($first + $row < $lines->count) {
+        Console::writeAt(0, $row + 1, $lines[$first + $row]);
+        $row++;
+    }
+    Console::flush();
+}
+
+function listen(): int throws TerminalError {
+    let $keys = Console::enterRawMode();
+    let $screen = Console::enterAlternateScreen();
+    Console::hideCursor();
+
+    writable List<string> $lines = [];
+    let writable $open = true;
+    while ($open) {
+        show($lines);
+        let $result = $keys->getNextEvent(Wait::Indefinite);
+        if (ends($result)) {
+            $open = false;
+        } else {
+            $lines->add(describe($result));
+        }
+    }
+    Console::showCursor();
+    return $lines->count;
+}
+
+function main(): int {
+    try {
+        let $count = listen();
+        echo "{$count} events\n";
+        return 0;
+    } catch (TerminalError $error) {
+        echo "This program needs a terminal: {$error->message}\n";
+        return 2;
+    }
+}
