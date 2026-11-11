@@ -1,14 +1,9 @@
-const FIXED_WIDTH_SOURCE: &str = r#"
-function answer(uint8 $base): uint8
-{
-    return $base + 2;
-}
-
-// Widening `Int::from(uint8)` runs on PHP (decision log entry 33); the
-// narrowing `UInt8::from(int)` is what PHP still rejects.
+// PHP output cannot prove a float-to-integer conversion exact, so it rejects
+// this valid program.
+const FLOAT_CONVERSION_SOURCE: &str = r#"
 function main(): int
 {
-    return Int::from(answer(UInt8::from(40)));
+    return Float::toInt(42.0);
 }
 "#;
 
@@ -69,12 +64,12 @@ function main(): int
 
 #[test]
 fn accepts_programs_the_php_backend_rejects() {
-    let php_diagnostics = doriac::compile_source_to_php("test.doria", FIXED_WIDTH_SOURCE)
-        .expect_err("narrowing integer conversions remain unsupported by the PHP backend");
+    let php_diagnostics = doriac::compile_source_to_php("test.doria", FLOAT_CONVERSION_SOURCE)
+        .expect_err("float-to-integer conversion remains unsupported by the PHP backend");
     assert_eq!(php_diagnostics[0].code, "B1301");
 
-    let debug = doriac::compile_source_to_debug("test.doria", FIXED_WIDTH_SOURCE)
-        .expect("fixed-width integers are valid Doria and must run on the debug target");
+    let debug = doriac::compile_source_to_debug("test.doria", FLOAT_CONVERSION_SOURCE)
+        .expect("the conversion is valid Doria and must run on the debug target");
 
     assert_eq!(debug, "exit_status: 42\nstdout:\n");
 }
