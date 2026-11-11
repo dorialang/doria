@@ -292,11 +292,11 @@ impl PendingSet {
         budget: &DrWaitBudgetV1,
         selection: FixedSlice<usize>,
     ) -> Result<PendingSetup<'s, 'b>, SetupFailure<AdapterTerminal>> {
+        // A set with no member has no native half yet, and so no policy.
         let cancellation = self
             .native
             .as_ref()
-            .ok_or_else(Failure::invalid_input)?
-            .cancellation_policy();
+            .map_or(core::ptr::null_mut(), |native| native.cancellation_policy());
         self.configure_selected_controlled(frame, buffers, budget, selection, cancellation)
     }
 
@@ -313,6 +313,11 @@ impl PendingSet {
     ) -> Result<PendingSetup<'s, 'b>, SetupFailure<AdapterTerminal>> {
         if selection.len() != buffers.len() {
             return Err(Failure::invalid_input().into());
+        }
+        // A plan that only watches may begin on a set with no member. Its
+        // native half is made here, as it is at a first registration.
+        if self.native.is_none() {
+            self.native = Some(NativeTransferSet::borrowed_new(core::ptr::null_mut())?);
         }
         for (position, index) in selection.as_slice().iter().enumerate() {
             if self.key(*index).is_none() {
@@ -439,6 +444,18 @@ impl PendingGroup<'_, '_> {
 
     pub(crate) fn stop(&self) -> Option<Stop> {
         self.inner.stop()
+    }
+
+    /// The plan's watched sources join this group's wait (Decision 0140).
+    pub(crate) fn watch(
+        &mut self,
+        sources: &[crate::transfer_group::WatchSource],
+    ) -> Result<(), Failure> {
+        self.inner.watch(sources)
+    }
+
+    pub(crate) fn rearm_watch(&mut self, index: usize) -> Result<(), Failure> {
+        self.inner.rearm_watch(index)
     }
 }
 

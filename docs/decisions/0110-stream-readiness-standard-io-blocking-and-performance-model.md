@@ -1206,6 +1206,73 @@ Subsequent fetches still observe the completed bytes or the original owned
 transfer Error, exactly once. The wait failure has no transfer identity or
 invented byte progress; its fetch leaves both observed-key properties null.
 
+### Watched Sources
+
+Andrew approved a completion that is not a byte transfer on 2026-11-11
+(`Plan watches RawMode (Recommended)`), so that terminal events can be waited
+for beside transfers. Decision 0140 owns the terminal side. This section
+amends the group contract above.
+
+A plan can watch a source as well as read and write. `Doria\Std\Io\Watchable`
+marks such a source. Its implementations are backed by the runtime and come
+from the standard library; `Doria\Std\Term\RawMode` is the first.
+`Doria\Std\Io` names no type of the modules that implement it.
+
+```doria
+interface Watchable {
+    WatchSource $watchSource { get; }
+}
+```
+
+`WatchSource` is an opaque inline Copy value with no public constructor or
+member. It carries what the runtime needs to find the source. Interface
+requirements are public, so the interface is sealed instead of hidden: a
+class outside the standard library that declares `Watchable`, directly or
+through an interface that extends it, is rejected (E0781).
+
+```doria
+enum TransferCompletion {
+    case Read(ReadTransferKey $key, ?ReadOutcome $outcome);
+    case Write(WriteTransferKey $key, ?WriteOutcome $outcome);
+    case Ready(WatchKey $key);
+}
+```
+
+- `TransferPlan::watch($source)` starts a plan with a watch and consuming
+  `andWatch($source)` adds one. Either may follow or precede any read or
+  write. The pair follows `read` / `andReadFrom` and `writeTo` / `andWriteTo`.
+- A watched source is borrowed, not registered. The plan, and then the group,
+  retain a shared loan of it, as a write retains a shared loan of its source
+  region. The group's exclusive hold on the readiness set does not cover it,
+  so the program keeps calling the source's readonly members while the group
+  runs. Consuming or dropping the source while it is watched is rejected by
+  the compiler.
+- `WatchKey` is the watch's identity: an inline Copy key like
+  `ReadTransferKey` and `WriteTransferKey`, obtained from
+  `TransferPlan::getWatchKey` by plan position and from
+  `TransferGroup::$observedWatchKey` under the rules of the two directional
+  properties.
+- A watch is armed when the group begins. It completes once, as
+  `Ready($key)`, when its source has something the program can take without
+  waiting. `Ready` carries no outcome: the program asks the source. A
+  completed watch is retired until `TransferGroup::resubmitWatch($key)` arms
+  it again, and a group whose every read, write and watch is retired reports
+  `Exhausted`.
+- At each fetch the order is: a wait-infrastructure failure, then ready
+  watches in plan order, then queued transfers. A watch reports once per
+  arming, so it cannot starve the transfers. The source is asked again at the
+  fetch, so a program that has already taken everything gets no `Ready`.
+- A source that fails when asked is reported as `Ready`. The program's own
+  call on the source then raises the source's error, with its type.
+- Wait budgets apply unchanged. When cancellation or the group deadline stops
+  the group, a watch that was armed is reported once as `Ready`, as a pending
+  read is reported once as `Read($key, null)`. Teardown retires watches
+  silently and leaves the source as it was.
+- `resubmitWatch` fails like `resubmitRead` in the same situations: a key
+  that is not a watch of this group, a watch still armed, a `Ready` not yet
+  fetched, a stopped group. A plan that only watches may begin on a readiness
+  set with no registration.
+
 ### Completed Read Storage
 
 Andrew approved nullable completed-read access on 2026-10-11 (`B: Nullable

@@ -12,6 +12,9 @@ use crate::wait_budget::DrWaitBudgetV1;
 
 pub(crate) enum Observation<T: TerminalOutcome> {
     Completion(Completion<T>),
+    /// The watch at this index among the plan's watches completed: its
+    /// source is ready, or the group stopped while it was armed.
+    Watch(usize),
     /// Report once before taking any retained terminal transfer.
     WaitFailed(Failure),
     /// The group has no outstanding transfer or queued completion.
@@ -24,6 +27,8 @@ pub(crate) enum Observation<T: TerminalOutcome> {
 pub(crate) trait WaitTimeout: Copy {
     fn indefinite() -> Self;
     fn limited_by(self, observation: Self) -> Self;
+    /// This timeout, ending no later than `deadline` on the monotonic clock.
+    fn limited_until(self, deadline: u64) -> Result<Self, Failure>;
 }
 
 pub(crate) trait ObservationBudget<T> {
@@ -163,10 +168,19 @@ impl<
                         *phase = Phase::Stopping;
                         continue;
                     }
-                    if let Some(result) = group.take_observation() {
-                        return Poll::Ready(result);
+                    if let Some(failure) = group.take_wait_failure() {
+                        return Poll::Ready(failure);
                     }
-                    if !group.has_active() {
+                    // A watch reports once per arming, so asking it before
+                    // queued transfers cannot starve them, and a key is never
+                    // held behind a stream that always has bytes.
+                    if let Some(index) = group.take_watch() {
+                        return Poll::Ready(Observation::Watch(index));
+                    }
+                    if let Some(completion) = group.take_ready() {
+                        return Poll::Ready(Observation::Completion(completion));
+                    }
+                    if !group.has_active() && !group.has_armed_watch() {
                         return Poll::Ready(Observation::NoCompletion);
                     }
                     match budget.next_wait() {
@@ -291,7 +305,7 @@ impl<
                     if let Some(result) = group.take_observation() {
                         return Poll::Ready(result);
                     }
-                    if !group.has_active() {
+                    if !group.has_active() && !group.has_armed_watch() {
                         return Poll::Ready(Observation::NoCompletion);
                     }
                     if D::QUERY_CAN_TRANSFER && *immediate_polled {
@@ -334,10 +348,23 @@ impl<
                             continue;
                         }
                     };
-                    match group.driver.wait_any(
-                        wait.timeout.limited_by(observation_wait.timeout),
-                        group.control.cancellation_signal(),
-                    ) {
+                    let mut timeout = wait.timeout.limited_by(observation_wait.timeout);
+                    if let Some(deadline) = group.watch_limit() {
+                        // A watched source becomes ready at this moment with
+                        // nothing arriving; the pass after the wait asks it.
+                        timeout = match timeout.limited_until(deadline) {
+                            Ok(timeout) => timeout,
+                            Err(failure) => {
+                                group.begin_stop(Stop::Failure(WaitOperation, failure));
+                                *phase = Phase::Stopping;
+                                continue;
+                            }
+                        };
+                    }
+                    match group
+                        .driver
+                        .wait_any(timeout, group.control.cancellation_signal())
+                    {
                         Ok(Wake::Timeout) if wait.immediate => {
                             group.begin_stop(Stop::BudgetExhausted);
                             *phase = Phase::Stopping;
@@ -391,6 +418,10 @@ impl WaitTimeout for DrWaitBudgetV1 {
     fn limited_by(self, observation: Self) -> Self {
         self.limited_by(observation)
     }
+
+    fn limited_until(self, deadline: u64) -> Result<Self, Failure> {
+        Ok(self.limited_by(DrWaitBudgetV1::new(3, deadline, || Ok(0))?))
+    }
 }
 
 impl ObservationBudget<DrWaitBudgetV1> for DrWaitBudgetV1 {
@@ -410,6 +441,13 @@ impl WaitTimeout for u32 {
 
     fn limited_by(self, observation: Self) -> Self {
         self.min(observation)
+    }
+
+    /// Milliseconds, rounded up so the wait does not end before the moment.
+    fn limited_until(self, deadline: u64) -> Result<Self, Failure> {
+        let remaining = deadline.saturating_sub(crate::monotonic_clock::now()?);
+        let milliseconds = remaining.div_ceil(1_000_000).min(u64::from(u32::MAX - 1));
+        Ok(self.min(milliseconds as u32))
     }
 }
 
@@ -446,5 +484,9 @@ impl WaitTimeout for i64 {
             (_, -1) => self,
             _ => self.min(observation),
         }
+    }
+
+    fn limited_until(self, _: u64) -> Result<Self, Failure> {
+        Ok(self)
     }
 }

@@ -1575,6 +1575,24 @@ impl State {
                     }));
                     sources
                 }
+                // A watch keeps its source in shared use until the plan, and
+                // the group begun from it, is destroyed.
+                mir::Terminator::CheckedIo {
+                    operation:
+                        mir::CheckedIoOperation::WatchTransferPlan {
+                            previous, source, ..
+                        },
+                    success,
+                    ..
+                } if *success == target => {
+                    let mut sources = previous
+                        .map(|previous| state.loans[previous.0].clone())
+                        .unwrap_or_default();
+                    sources.extend(state.roots[source.0].iter().cloned().map(|place| {
+                        Source::new(place, false, false, mir::RetainedLifetime::Cleanup)
+                    }));
+                    sources
+                }
                 mir::Terminator::CheckedConstruct {
                     constructor,
                     args,

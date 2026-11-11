@@ -137,18 +137,8 @@ pub(super) fn lower_term_intrinsic(
             })
         }
         TermFunction::FromWord(_) => {
-            let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Inline(ty))) =
-                return_type
-            else {
-                unreachable!("a Term word factory returns its checked inline value");
-            };
-            mir::ValueExpression::Inline(mir::InlineValueExpression::FromWord {
-                ty,
-                word: Box::new(mir::IntegerExpression::use_operand(
-                    IntegerType::Int64,
-                    mir::Operand::Local(params[0]),
-                )),
-            })
+            lower_word_factory(params[0], return_type, context);
+            return;
         }
         TermFunction::Word(_) => {
             let mir::Type::Scalar(mir::ScalarType::Inline(ty)) = context.local_type(params[0])
@@ -164,6 +154,27 @@ pub(super) fn lower_term_intrinsic(
             )))
         }
     };
+    context.cleanup_scopes_from(0);
+    context.terminate_current(mir::Terminator::Return(mir::Rvalue::Value(value)));
+}
+
+/// The body of a `fromBits` factory: a one-word inline value built from its
+/// integer. The Term values and `Doria\Std\Io\WatchSource` share it.
+pub(super) fn lower_word_factory(
+    word: mir::LocalId,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) {
+    let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Inline(ty))) = return_type else {
+        unreachable!("a word factory returns its checked inline value");
+    };
+    let value = mir::ValueExpression::Inline(mir::InlineValueExpression::FromWord {
+        ty,
+        word: Box::new(mir::IntegerExpression::use_operand(
+            IntegerType::Int64,
+            mir::Operand::Local(word),
+        )),
+    });
     context.cleanup_scopes_from(0);
     context.terminate_current(mir::Terminator::Return(mir::Rvalue::Value(value)));
 }

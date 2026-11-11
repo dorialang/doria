@@ -359,6 +359,55 @@ unsafe fn await_event(
     platform::await_event(budget, cancellation)
 }
 
+/// What a transfer group sees when it asks about a raw mode it watches
+/// (Decision 0140).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Watched {
+    /// An event wait would return at once: a key or a resize is waiting, the
+    /// terminal has closed, or asking failed and the event wait is what
+    /// reports the failure.
+    Ready,
+    /// Nothing yet. `until` is when a sequence held back for the escape delay
+    /// becomes a key without more input, on the monotonic clock.
+    Waiting { until: Option<u64> },
+}
+
+/// Whether [`dr_v1_terminal_await_event`] with an immediate wait would
+/// observe something other than a timeout for raw mode `generation`. It reads
+/// what the terminal already has into the event queue and takes nothing out,
+/// so the program's own event waits see every event exactly once.
+///
+/// # Safety
+/// Called on the thread that drives the terminal layer.
+pub(crate) unsafe fn watched(generation: u32) -> Watched {
+    if !raw_mode_is(generation) {
+        return Watched::Ready;
+    }
+    match platform::events_waiting() {
+        Ok(Watched::Ready) | Err(_) => Watched::Ready,
+        Ok(waiting) => {
+            // A wait for events follows: what the program drew is on the
+            // screen first, as it is before the program's own event wait.
+            drop(standard_device(StandardStream::Stdout).try_borrow());
+            waiting
+        }
+    }
+}
+
+/// What a wait can include to wake when raw mode `generation` may have an
+/// event: readable or signaled while the terminal has input or a notice.
+/// `None` when that raw mode has ended, which [`watched`] reports as ready.
+///
+/// # Safety
+/// Called on the thread that drives the terminal layer.
+pub(crate) unsafe fn watch_handle(generation: u32) -> Option<crate::native_handle::NativeHandle> {
+    if raw_mode_is(generation) {
+        platform::event_handle()
+    } else {
+        None
+    }
+}
+
 /// One `Console`, `RawMode` or `AlternateScreen` operation, as compiled Doria
 /// calls it. The result packs a status and a payload as `wire` defines.
 ///

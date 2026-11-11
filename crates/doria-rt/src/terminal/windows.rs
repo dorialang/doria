@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::queue::{Queue, Utf16, READ_CAPACITY};
 use super::wire::{ColorSupport, Observation};
-use super::{ledger, Exclusive, OutputClass, Refusal, Shared};
+use super::{ledger, Exclusive, OutputClass, Refusal, Shared, Watched};
 use crate::cancellation::{CancellationClaim, DrCancellationV1};
 use crate::cancellation_signal;
 use crate::device_io::{byte_handle, standard_device, StandardStream};
@@ -16,9 +16,9 @@ use crate::native_handle::NativeHandle;
 use crate::platform_io::{self, Failure, Reason};
 use crate::wait_budget::DrWaitBudgetV1;
 use crate::win32::{
-    wait_for_multiple_objects, ConsoleScreenBufferInfo, GetConsoleMode, GetConsoleScreenBufferInfo,
-    GetEnvironmentVariableA, InputRecord, ReadConsoleInputW, SetConsoleCtrlHandler, SetConsoleMode,
-    INFINITE, WAIT_TIMEOUT,
+    wait_for_multiple_objects, wait_for_single_object, ConsoleScreenBufferInfo, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetEnvironmentVariableA, InputRecord, ReadConsoleInputW,
+    SetConsoleCtrlHandler, SetConsoleMode, INFINITE, WAIT_TIMEOUT,
 };
 
 const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
@@ -320,6 +320,39 @@ pub(super) unsafe fn await_event(
             _ => return Err(platform_io::last_failure().into()),
         }
     }
+}
+
+/// Whether [`await_event`] with an immediate wait would observe an event.
+/// Records the console already has are read into the queue; nothing is taken
+/// out of it and a pending resize stays pending.
+pub(super) unsafe fn events_waiting() -> Result<Watched, Refusal> {
+    let _exclusive = Exclusive::acquire()?;
+    let Some(raw) = (*RAW.0.get()).as_mut() else {
+        return Ok(Watched::Ready);
+    };
+    let input = byte_handle(StandardStream::Stdin)?;
+    loop {
+        if raw.queue.has_key()? || raw.resized {
+            return Ok(Watched::Ready);
+        }
+        match wait_for_single_object(input, 0, "terminal input") {
+            0 => read_records(raw, input)?,
+            WAIT_TIMEOUT => {
+                return Ok(Watched::Waiting {
+                    until: raw.queue.held_until(),
+                });
+            }
+            _ => return Err(platform_io::last_failure().into()),
+        }
+    }
+}
+
+/// The console input handle: signaled while the console has records to read.
+pub(super) unsafe fn event_handle() -> Option<NativeHandle> {
+    if (*RAW.0.get()).is_none() {
+        return None;
+    }
+    byte_handle(StandardStream::Stdin).ok()
 }
 
 /// The console knows where its cursor is; nothing is asked of the terminal

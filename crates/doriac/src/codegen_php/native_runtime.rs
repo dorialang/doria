@@ -286,6 +286,7 @@ uint8_t dr_v1_host_transfer_group_observe_wait(void *owner, uint8_t kind,
     uint64_t low, int64_t high, DrIoStatusV1 *status);
 uint8_t dr_v1_host_transfer_group_resubmit(void *owner, const void *key, uint8_t reading,
     size_t offset, size_t length, DrIoStatusV1 *status);
+uint8_t dr_v1_host_transfer_group_resubmit_watch(void *owner, const void *key, DrIoStatusV1 *status);
 void dr_v1_host_transfer_group_close(void *owner);
 uint8_t dr_v1_host_transfer_group_poll(const void *frame, void *owner, uint8_t *kind,
     size_t *index, DrAdapterOutcomeV1 *outcome, void *terminal, void *control);
@@ -299,7 +300,7 @@ uint8_t dr_v1_host_pending_request_configure_standard(const void *frame, void *o
     DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_host_transfer_group_read_region(const void *owner, const void *key,
     const uint8_t **data, size_t *length, DrIoStatusV1 *status);
-uint8_t dr_v1_host_transfer_group_observed(const void *owner, uint8_t reading, void *key);
+uint8_t dr_v1_host_transfer_group_observed(const void *owner, uint8_t kind, void *key);
 void dr_v1_host_transfer_group_drop(const void *frame, void *owner);
 uint8_t dr_v1_checked_pending_request_outcome(const void *frame, const void *request,
     uint64_t *tag, size_t *count, DrStringV1 **message, DrStringV1 **path,
@@ -310,9 +311,14 @@ uint8_t dr_v1_host_transfer_plan_new(const void *frame, const void *key,
 uint8_t dr_v1_host_transfer_plan_append(const void *frame, void *plan, const void *key,
     uint8_t *base, size_t capacity, size_t offset, size_t length, uint8_t reading, void **result, DrStringV1 **message,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
+uint8_t dr_v1_checked_transfer_plan_watch_new(const void *frame, uint64_t source, void **result,
+    DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
+uint8_t dr_v1_checked_transfer_plan_watch_append(const void *frame, void *plan, uint64_t source,
+    void **result, DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred,
+    uint64_t *meta);
 void dr_v1_transfer_plan_drop(void *plan);
 uint8_t dr_v1_checked_transfer_plan_key(const void *frame, const void *plan,
-    int64_t position, uint8_t reading, void *result, DrStringV1 **message,
+    int64_t position, uint8_t kind, void *result, DrStringV1 **message,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_deadline_from_now(int64_t duration, uint64_t *low, int64_t *high,
     int64_t *system_code, uint8_t *has_system_code);

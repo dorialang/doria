@@ -5275,6 +5275,7 @@ fn emit_class_instance(
             inline,
             crate::inline_value::InlineValueKind::ReadTransferKey
                 | crate::inline_value::InlineValueKind::WriteTransferKey
+                | crate::inline_value::InlineValueKind::WatchKey
         ) {
             for line in [
                 "public static function __doriaFromTransferKey(int $low, int $high): self",

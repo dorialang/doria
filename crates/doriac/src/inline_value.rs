@@ -38,6 +38,10 @@ pub enum InlineValueKind {
     RegistrationKey,
     ReadTransferKey,
     WriteTransferKey,
+    /// Identifies one watch of a transfer plan, as the transfer keys do.
+    WatchKey,
+    /// What the runtime waits on for a watched source (Decision 0140).
+    WatchSource,
     CancellationToken,
     StandardInput,
     StandardOutput,
@@ -53,6 +57,8 @@ impl InlineValueKind {
             crate::compiler_known_stream::REGISTRATION_KEY => Some(Self::RegistrationKey),
             crate::compiler_known_stream::READ_TRANSFER_KEY => Some(Self::ReadTransferKey),
             crate::compiler_known_stream::WRITE_TRANSFER_KEY => Some(Self::WriteTransferKey),
+            crate::compiler_known_stream::WATCH_KEY => Some(Self::WatchKey),
+            crate::compiler_known_stream::WATCH_SOURCE => Some(Self::WatchSource),
             crate::compiler_known_concurrency::CANCELLATION_TOKEN => Some(Self::CancellationToken),
             crate::compiler_known_stream::STANDARD_INPUT => Some(Self::StandardInput),
             crate::compiler_known_stream::STANDARD_OUTPUT => Some(Self::StandardOutput),
@@ -71,6 +77,8 @@ impl InlineValueKind {
             | Self::Deadline
             | Self::ReadTransferKey
             | Self::WriteTransferKey
+            | Self::WatchKey
+            | Self::WatchSource
             | Self::CancellationToken
             | Self::StandardInput
             | Self::StandardOutput
@@ -87,6 +95,8 @@ impl InlineValueKind {
             Self::RegistrationKey => InlineValueType::RegistrationKey(class),
             Self::ReadTransferKey => InlineValueType::ReadTransferKey(class),
             Self::WriteTransferKey => InlineValueType::WriteTransferKey(class),
+            Self::WatchKey => InlineValueType::WatchKey(class),
+            Self::WatchSource => InlineValueType::WatchSource(class),
             Self::CancellationToken => InlineValueType::CancellationToken(class),
             Self::StandardInput => InlineValueType::StandardInput(class),
             Self::StandardOutput => InlineValueType::StandardOutput(class),
@@ -98,6 +108,7 @@ impl InlineValueKind {
     pub const fn storage_bytes(self) -> u32 {
         match self {
             Self::Duration
+            | Self::WatchSource
             | Self::CancellationToken
             | Self::StandardInput
             | Self::StandardOutput
@@ -106,7 +117,8 @@ impl InlineValueKind {
             Self::Deadline
             | Self::RegistrationKey
             | Self::ReadTransferKey
-            | Self::WriteTransferKey => 16,
+            | Self::WriteTransferKey
+            | Self::WatchKey => 16,
         }
     }
 
@@ -122,6 +134,8 @@ pub enum InlineValueType {
     RegistrationKey(ClassId),
     ReadTransferKey(ClassId),
     WriteTransferKey(ClassId),
+    WatchKey(ClassId),
+    WatchSource(ClassId),
     CancellationToken(ClassId),
     StandardInput(ClassId),
     StandardOutput(ClassId),
@@ -152,6 +166,8 @@ impl InlineValueType {
             Self::RegistrationKey(_) => crate::compiler_known_stream::REGISTRATION_KEY,
             Self::ReadTransferKey(_) => crate::compiler_known_stream::READ_TRANSFER_KEY,
             Self::WriteTransferKey(_) => crate::compiler_known_stream::WRITE_TRANSFER_KEY,
+            Self::WatchKey(_) => crate::compiler_known_stream::WATCH_KEY,
+            Self::WatchSource(_) => crate::compiler_known_stream::WATCH_SOURCE,
             Self::CancellationToken(_) => crate::compiler_known_concurrency::CANCELLATION_TOKEN,
             Self::StandardInput(_) => crate::compiler_known_stream::STANDARD_INPUT,
             Self::StandardOutput(_) => crate::compiler_known_stream::STANDARD_OUTPUT,
@@ -162,14 +178,29 @@ impl InlineValueType {
 
     /// One 64-bit word that the declaring module builds from an integer and
     /// reads back as one. `Duration` is its nanosecond count; the Term values
-    /// are packed fields.
+    /// and `WatchSource` are packed fields.
     pub const fn is_word(self) -> bool {
-        matches!(self, Self::Duration | Self::Terminal(..))
+        matches!(
+            self,
+            Self::Duration | Self::WatchSource(_) | Self::Terminal(..)
+        )
+    }
+
+    /// The runtime's kind of the plan entry a key identifies: 0 for a write,
+    /// 1 for a read and 2 for a watch. Other inline values are not such keys.
+    pub const fn transfer_entry_kind(self) -> Option<u8> {
+        match self {
+            Self::WriteTransferKey(_) => Some(0),
+            Self::ReadTransferKey(_) => Some(1),
+            Self::WatchKey(_) => Some(2),
+            _ => None,
+        }
     }
 
     pub const fn storage_bytes(self) -> u32 {
         match self {
             Self::Duration
+            | Self::WatchSource(_)
             | Self::CancellationToken(_)
             | Self::StandardInput(_)
             | Self::StandardOutput(_)
@@ -178,7 +209,8 @@ impl InlineValueType {
             Self::Deadline
             | Self::RegistrationKey(_)
             | Self::ReadTransferKey(_)
-            | Self::WriteTransferKey(_) => 16,
+            | Self::WriteTransferKey(_)
+            | Self::WatchKey(_) => 16,
         }
     }
 
@@ -189,6 +221,8 @@ impl InlineValueType {
             Self::RegistrationKey(class)
             | Self::ReadTransferKey(class)
             | Self::WriteTransferKey(class)
+            | Self::WatchKey(class)
+            | Self::WatchSource(class)
             | Self::CancellationToken(class)
             | Self::StandardInput(class)
             | Self::StandardOutput(class)
@@ -205,6 +239,8 @@ impl InlineValueType {
             Self::RegistrationKey(class)
             | Self::ReadTransferKey(class)
             | Self::WriteTransferKey(class)
+            | Self::WatchKey(class)
+            | Self::WatchSource(class)
             | Self::CancellationToken(class)
             | Self::StandardInput(class)
             | Self::StandardOutput(class)
@@ -222,6 +258,8 @@ impl InlineValueType {
             | Self::RegistrationKey(_)
             | Self::ReadTransferKey(_)
             | Self::WriteTransferKey(_)
+            | Self::WatchKey(_)
+            | Self::WatchSource(_)
             | Self::StandardInput(_)
             | Self::StandardOutput(_)
             | Self::StandardError(_)
@@ -325,6 +363,8 @@ mod tests {
             (InlineValueKind::RegistrationKey, 16),
             (InlineValueKind::ReadTransferKey, 16),
             (InlineValueKind::WriteTransferKey, 16),
+            (InlineValueKind::WatchKey, 16),
+            (InlineValueKind::WatchSource, 8),
         ] {
             let inline = kind.specialize(ClassId(7));
             assert_eq!(inline.storage_bytes(), bytes);
@@ -424,6 +464,41 @@ mod tests {
                 coalesce.owned_inline_temporary(),
                 mode != InlineValueUseMode::Borrow
             );
+        }
+    }
+
+    #[test]
+    fn watch_values_are_a_plan_key_and_a_one_word_identity() {
+        let class = ClassId(7);
+        let key = InlineValueKind::for_nominal(crate::compiler_known_stream::WATCH_KEY, 0)
+            .unwrap()
+            .specialize(class);
+        assert_eq!(key, InlineValueType::WatchKey(class));
+        assert_eq!(key.name(), crate::compiler_known_stream::WATCH_KEY);
+        assert_eq!(key.nominal_class(), Some(class));
+        assert!(!key.is_word());
+        assert_eq!(key.transfer_entry_kind(), Some(2));
+        assert_eq!(
+            InlineValueType::ReadTransferKey(class).transfer_entry_kind(),
+            Some(1)
+        );
+        assert_eq!(
+            InlineValueType::WriteTransferKey(class).transfer_entry_kind(),
+            Some(0)
+        );
+        let source = InlineValueKind::for_nominal(crate::compiler_known_stream::WATCH_SOURCE, 0)
+            .unwrap()
+            .specialize(class);
+        assert_eq!(source, InlineValueType::WatchSource(class));
+        assert_eq!(source.name(), crate::compiler_known_stream::WATCH_SOURCE);
+        assert!(source.is_word());
+        assert_eq!(source.transfer_entry_kind(), None);
+        assert_eq!(
+            InlineValueType::RegistrationKey(class).transfer_entry_kind(),
+            None
+        );
+        for name in ["WatchKey", "WatchSource", "User\\WatchKey"] {
+            assert_eq!(InlineValueKind::for_name(name), None);
         }
     }
 }

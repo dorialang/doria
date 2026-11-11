@@ -88,6 +88,32 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 operation, result, error, success, failure, status, slots,
             );
         }
+        if let mir::CheckedIoOperation::ResubmitWatch { group, key } = operation {
+            self.set_active_panic_site(span)?;
+            let pointer = self.context.ptr_type(AddressSpace::default());
+            let slots = self.checked_io_output_slots()?;
+            let group = build(self.builder.build_load(
+                pointer,
+                local_slot(&self.local_slots, *group)?,
+                "resubmit-watch.group",
+            ))?;
+            let key = local_slot(&self.local_slots, *key)?;
+            let mut args: Vec<BasicMetadataValueEnum<'ctx>> =
+                vec![self.current_frame.into(), group.into(), key.into()];
+            args.extend([2, 3, 4, 7, 8].map(|index| BasicMetadataValueEnum::from(slots[index])));
+            let status = self
+                .call_runtime(
+                    "dr_v1_checked_transfer_group_resubmit_watch",
+                    &[pointer.into(); 8],
+                    Some(self.context.i8_type().into()),
+                    &args,
+                )?
+                .ok_or_else(|| backend_failure("watch resubmission produced no status"))?
+                .into_int_value();
+            return self.finish_checked_resource(
+                operation, result, error, success, failure, status, slots,
+            );
+        }
         if let mir::CheckedIoOperation::TransferGroupReadRegion { group, key } = operation {
             self.set_active_panic_site(span)?;
             let pointer = self.context.ptr_type(AddressSpace::default());
@@ -908,37 +934,55 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             definition.layout.cases[0].fields[0].offset,
             "observe.completion",
         )?;
-        let direction =
-            build(self.builder.build_load(byte, reading, "observe.reading"))?.into_int_value();
-        let is_read = build(self.builder.build_int_compare(
-            IntPredicate::NE,
-            direction,
-            byte.const_zero(),
-            "observe.is-read",
-        ))?;
-        let blocks = [
-            self.context.append_basic_block(function, "observe.read"),
-            self.context.append_basic_block(function, "observe.write"),
-        ];
-        build(
-            self.builder
-                .build_conditional_branch(is_read, blocks[0], blocks[1]),
-        )?;
-        for (direction, block) in blocks.into_iter().enumerate() {
+        // The runtime reports the completed operation's kind; each kind fills
+        // one completion case, and any other value is malformed transport.
+        let reported =
+            build(self.builder.build_load(byte, reading, "observe.kind"))?.into_int_value();
+        let mut blocks = Vec::with_capacity(crate::native_abi::TRANSFER_COMPLETION_CASES.len());
+        for (runtime_kind, case) in crate::native_abi::TRANSFER_COMPLETION_CASES {
+            let block = self.context.append_basic_block(function, "observe.case");
+            let next = self
+                .context
+                .append_basic_block(function, "observe.next-kind");
+            let chosen = build(self.builder.build_int_compare(
+                IntPredicate::EQ,
+                reported,
+                byte.const_int(u64::from(runtime_kind), false),
+                "observe.is-kind",
+            ))?;
+            build(self.builder.build_conditional_branch(chosen, block, next))?;
+            self.builder.position_at_end(next);
+            blocks.push((runtime_kind, case, block));
+        }
+        self.trap_invalid_membership_transport()?;
+        for (runtime_kind, case, block) in blocks {
             self.builder.position_at_end(block);
+            let watch = runtime_kind == crate::native_abi::TRANSFER_KIND_WATCH;
+            let case_definition = completion_definition
+                .cases
+                .get(case)
+                .ok_or_else(|| malformed_mir("transfer completion lacks a case"))?;
             self.store_payload_enum_tag(
                 completion,
                 completion_definition.layout.tag_width,
-                direction as u32,
+                case_definition.tag,
             )?;
-            let fields = &completion_definition.layout.cases[direction].fields;
+            let fields = &completion_definition.layout.cases[case].fields;
+            let key_type = if watch {
+                types.watch_key
+            } else {
+                types.keys[case]
+            };
+            let key_words = integer.array_type(key_type.storage_bytes() / 8);
             let key_address =
                 self.byte_offset(completion, fields[0].offset, "observe.key-field")?;
-            let value = build(
-                self.builder
-                    .build_load(integer.array_type(2), key, "observe.key"),
-            )?;
+            let value = build(self.builder.build_load(key_words, key, "observe.key"))?;
             build(self.builder.build_store(key_address, value))?;
+            if watch {
+                // `Ready` carries the watch's key and no outcome.
+                build(self.builder.build_unconditional_branch(success))?;
+                continue;
+            }
             let tag = build(
                 self.builder
                     .build_load(byte, outcome_tag, "observe.outcome-tag"),
@@ -960,7 +1004,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.builder.position_at_end(fill);
             let nullable = self.byte_offset(completion, fields[1].offset, "observe.nullable")?;
             build(self.builder.build_store(nullable, byte.const_int(1, false)))?;
-            let outcome_type = types.outcomes[direction];
+            let outcome_type = types.outcomes[case];
             let inner = self.byte_offset(
                 nullable,
                 outcome_type.nullable_payload_offset,

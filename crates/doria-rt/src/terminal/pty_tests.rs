@@ -356,6 +356,7 @@ fn child() {
             "job" => child_job(2),
             "suspended" => child_shell(),
             "watching" => child_watching(),
+            "grouped" => child_grouped(),
             _ => panic!("unknown scenario {scenario}"),
         }
     }
@@ -749,6 +750,139 @@ unsafe fn child_watching() {
     );
 }
 
+/// A transfer group that watches raw mode (Decision 0140): the group's wait
+/// is what wakes for a key, for a lone Escape's delay and for a resize, and
+/// the program's own event waits still see every event exactly once.
+unsafe fn child_grouped() {
+    use crate::transfer_group::transport::watch_fixture::{Fetched, WatchingGroup};
+    const IMMEDIATE: Wait = (0, 0);
+    let generation = enter_raw_mode();
+    let source = (1 << 32) | generation;
+    let drain = |expected: &[Observation]| {
+        for event in expected {
+            assert_eq!(
+                next_event(generation, IMMEDIATE, core::ptr::null_mut()),
+                *event
+            );
+        }
+        assert_eq!(
+            next_event(generation, IMMEDIATE, core::ptr::null_mut()),
+            Observation::TimedOut
+        );
+    };
+    {
+        let mut group = WatchingGroup::begin(source, None);
+        // Armed, with nothing typed yet. An armed watch cannot be armed again.
+        assert_eq!(group.fetch(IMMEDIATE), Fetched::TimedOut);
+        assert_eq!(group.fetch(within(20_000_000)), Fetched::TimedOut);
+        assert!(!group.resubmit());
+        assert!(!group.resubmit_foreign());
+
+        announce("<key>");
+        assert_eq!(group.fetch(indefinite()), Fetched::Ready);
+        // Reported once. Until it is armed again the watch is retired, and
+        // with nothing else in the plan the group has nothing left.
+        assert_eq!(group.fetch(IMMEDIATE), Fetched::Exhausted);
+        assert_eq!(group.fetch(indefinite()), Fetched::Exhausted);
+        drain(&[key('a')]);
+        assert!(group.resubmit());
+        assert!(!group.resubmit());
+        assert_eq!(group.fetch(IMMEDIATE), Fetched::TimedOut);
+        eprintln!("key");
+
+        // A lone Escape is a key only once its delay has run out. The group
+        // must wake for that moment, and not report before it.
+        announce("<escape>");
+        assert_eq!(group.fetch(indefinite()), Fetched::Ready);
+        drain(&[Observation::Key {
+            key: Key::Escape,
+            modifiers: 0,
+        }]);
+        assert!(group.resubmit());
+        eprintln!("escape");
+
+        announce("<resize>");
+        assert_eq!(group.fetch(indefinite()), Fetched::Ready);
+        drain(&[Observation::Resized {
+            columns: 100,
+            rows: 30,
+        }]);
+        assert!(group.resubmit());
+        eprintln!("resize");
+
+        // Events that were waiting before the watch was armed count, and a
+        // program that takes them itself is not told about them afterwards.
+        announce("<typed-ahead>");
+        assert_eq!(
+            next_event(generation, indefinite(), core::ptr::null_mut()),
+            key('b')
+        );
+        assert_eq!(group.fetch(IMMEDIATE), Fetched::TimedOut);
+        announce("<waiting>");
+        assert_eq!(
+            next_event(generation, indefinite(), core::ptr::null_mut()),
+            key('c')
+        );
+        assert_eq!(group.fetch(within(20_000_000)), Fetched::TimedOut);
+        eprintln!("drained");
+
+        // A finite wait ends on its budget and leaves the watch armed.
+        assert_eq!(group.fetch(within(20_000_000)), Fetched::TimedOut);
+        announce("<again>");
+        assert_eq!(group.fetch(within(20_000_000_000)), Fetched::Ready);
+        drain(&[key('d')]);
+
+        // A second group on the same readiness set, begun while the first
+        // one's watch was armed: the set holds nothing of the first.
+        assert!(group.resubmit());
+        group.begin_again(source, None);
+        assert_eq!(group.fetch(within(20_000_000)), Fetched::TimedOut);
+
+        // A group whose deadline has passed retires its armed watch the way
+        // it retires a pending transfer: reported once, then nothing is left
+        // and nothing can be armed.
+        let past = crate::deadline::DrDeadlineV1::from_clock_and_duration(0, -1);
+        group.begin_again(source, Some(past));
+        assert_eq!(group.fetch(indefinite()), Fetched::Ready);
+        assert_eq!(group.fetch(indefinite()), Fetched::Exhausted);
+        assert!(!group.resubmit());
+        drain(&[]);
+    }
+    // Teardown leaves raw mode in effect and the event wait working.
+    let raw = input_mode(0);
+    eprintln!(
+        "still_raw={}",
+        raw.c_lflag & (libc::ICANON | libc::ECHO) == 0
+    );
+    announce("<after>");
+    assert_eq!(
+        next_event(generation, indefinite(), core::ptr::null_mut()),
+        key('e')
+    );
+    // Input that reached the terminal before a group began is there when
+    // its watch is armed, so the first fetch reports it.
+    announce("<before>");
+    let mut typed = libc::pollfd {
+        fd: 0,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(libc::poll(&mut typed, 1, 20_000), 1);
+    {
+        let mut group = WatchingGroup::begin(source, None);
+        assert_eq!(group.fetch(IMMEDIATE), Fetched::Ready);
+        drain(&[key('f')]);
+    }
+    leave_raw_mode(generation);
+    {
+        // A raw mode that has ended is closed, which an event wait reports
+        // at once, so a watch of it is ready.
+        let mut group = WatchingGroup::begin(source, None);
+        assert_eq!(group.fetch(IMMEDIATE), Fetched::Ready);
+    }
+    eprintln!("done");
+}
+
 // ---- What the terminal sees ----------------------------------------------
 
 #[test]
@@ -806,6 +940,46 @@ fn keys_and_resizes_arrive_as_one_ordered_stream_and_the_input_mode_returns() {
         "Key { key: Character('q'), modifiers: 0 }",
         "restored=true",
         "restored=true",
+    ];
+    let reported: Vec<&str> = report
+        .lines()
+        .filter(|line| !line.is_empty())
+        .take(expected.len())
+        .collect();
+    assert_eq!(reported, expected, "{report}");
+    assert!(same_mode(&before, &terminal.mode()));
+}
+
+#[test]
+fn a_transfer_group_wakes_for_a_key_an_escape_delay_and_a_resize_and_takes_no_event() {
+    let mut terminal = Terminal::open(80, 24);
+    let before = terminal.mode();
+    let mut child = terminal.run("grouped");
+    terminal.wait_for(&mut child, b"<key>");
+    terminal.type_bytes(b"a");
+    terminal.wait_for(&mut child, b"<escape>");
+    terminal.type_bytes(b"\x1b");
+    terminal.wait_for(&mut child, b"<resize>");
+    terminal.resize(100, 30);
+    terminal.wait_for(&mut child, b"<typed-ahead>");
+    terminal.type_bytes(b"b");
+    terminal.wait_for(&mut child, b"<waiting>");
+    terminal.type_bytes(b"c");
+    terminal.wait_for(&mut child, b"<again>");
+    terminal.type_bytes(b"d");
+    terminal.wait_for(&mut child, b"<after>");
+    terminal.type_bytes(b"e");
+    terminal.wait_for(&mut child, b"<before>");
+    terminal.type_bytes(b"f");
+    let (status, report) = terminal.finish(child);
+    assert_eq!(status, Some(0), "{report}");
+    let expected = [
+        "key",
+        "escape",
+        "resize",
+        "drained",
+        "still_raw=true",
+        "done",
     ];
     let reported: Vec<&str> = report
         .lines()

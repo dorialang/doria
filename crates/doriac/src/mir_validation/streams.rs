@@ -29,6 +29,15 @@ pub(super) fn validate_transfer_observation(
         }
         validate_transfer_group_key(program, function, group, key)?;
     }
+    if !matches!(
+        types.watch_key,
+        crate::inline_value::InlineValueType::WatchKey(_)
+    ) {
+        return Err(malformed_mir(
+            "completion observation has the wrong watch key",
+        ));
+    }
+    validate_transfer_group_key(program, function, group, types.watch_key)?;
     if !local_in(function, group)?.writable {
         return Err(malformed_mir(
             "completion observation requires writable group access",
@@ -67,6 +76,10 @@ pub(super) fn validate_transfer_observation(
                         Type::Scalar(ScalarType::Inline(types.keys[1])),
                         Type::NullablePayloadEnum(types.outcomes[1]),
                     ],
+                ),
+                (
+                    "Ready",
+                    vec![Type::Scalar(ScalarType::Inline(types.watch_key))],
                 ),
             ],
         ),
@@ -201,7 +214,7 @@ pub(super) fn validate_transfer_plan_key(
             "transfer key lookup requires its exact plan and int position",
         ));
     }
-    validate_directional_key(program, key)
+    validate_entry_key(program, key)
 }
 
 pub(super) fn validate_transfer_group_key(
@@ -220,7 +233,7 @@ pub(super) fn validate_transfer_group_key(
             "observed key requires its exact compiler-owned group",
         ));
     }
-    validate_directional_key(program, key)
+    validate_entry_key(program, key)
 }
 
 pub(super) fn validate_transfer_group_read_region(
@@ -275,7 +288,31 @@ pub(super) fn validate_transfer_resubmission(
     validate_transfer_group_key(program, function, group, key)
 }
 
-fn validate_directional_key(
+/// Arms a watch again: the group is written, and the key is a watch key.
+pub(super) fn validate_watch_resubmission(
+    program: &mir::Program,
+    function: &mir::Function,
+    group: mir::LocalId,
+    key: mir::LocalId,
+) -> Result<(), BackendError> {
+    let mir::Type::Scalar(mir::ScalarType::Inline(
+        key @ crate::inline_value::InlineValueType::WatchKey(_),
+    )) = local_in(function, key)?.ty
+    else {
+        return Err(malformed_mir(
+            "watch resubmission requires its exact watch key",
+        ));
+    };
+    if !local_in(function, group)?.writable {
+        return Err(malformed_mir(
+            "watch resubmission requires writable group access",
+        ));
+    }
+    validate_transfer_group_key(program, function, group, key)
+}
+
+/// A plan entry is identified by the key of its kind: read, write or watch.
+fn validate_entry_key(
     program: &mir::Program,
     key: crate::inline_value::InlineValueType,
 ) -> Result<(), BackendError> {
@@ -286,9 +323,10 @@ fn validate_directional_key(
         crate::inline_value::InlineValueType::WriteTransferKey(_) => {
             compiler_known_stream::WRITE_TRANSFER_KEY
         }
+        crate::inline_value::InlineValueType::WatchKey(_) => compiler_known_stream::WATCH_KEY,
         _ => {
             return Err(malformed_mir(
-                "transfer key lookup requires its exact directional key",
+                "transfer key lookup requires its exact read, write or watch key",
             ))
         }
     };
@@ -301,15 +339,12 @@ fn validate_directional_key(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn validate_transfer_plan(
+/// The plan a configuration returns, and the plan an append consumes.
+fn validate_configured_plan(
     program: &mir::Program,
     function: &mir::Function,
     class: crate::class_layout::ClassId,
     previous: Option<mir::LocalId>,
-    key: mir::LocalId,
-    region: mir::LocalId,
-    reading: bool,
 ) -> Result<(), BackendError> {
     canonical_class(
         program,
@@ -329,6 +364,79 @@ pub(super) fn validate_transfer_plan(
             ));
         }
     }
+    Ok(())
+}
+
+/// A watch borrows a source the standard library backs and passes only that
+/// source's one-word identity to the runtime (Decision 0140).
+pub(super) fn validate_transfer_plan_watch(
+    program: &mir::Program,
+    function: &mir::Function,
+    class: crate::class_layout::ClassId,
+    previous: Option<mir::LocalId>,
+    source: mir::LocalId,
+    identity: mir::LocalId,
+) -> Result<(), BackendError> {
+    validate_configured_plan(program, function, class, previous)?;
+    let source = local_in(function, source)?;
+    // `Watchable` is sealed to compiler-owned sources, so a watched value is
+    // one of their classes, or a `Watchable` interface view of one.
+    let backed = match source.ty {
+        mir::Type::Class(class) => class_in(program, class)?
+            .source_span
+            .source
+            .is_compiler_owned(),
+        mir::Type::Interface(interface) => {
+            let definition = program
+                .interface_types
+                .get(interface.0)
+                .ok_or_else(|| malformed_mir("watch source names an unknown interface"))?;
+            std::iter::once(interface)
+                .chain(definition.ancestors.iter().copied())
+                .any(|candidate| {
+                    program
+                        .interface_types
+                        .get(candidate.0)
+                        .is_some_and(|ancestor| ancestor.name == compiler_known_stream::WATCHABLE)
+                })
+        }
+        _ => false,
+    };
+    if !backed || source.owned {
+        return Err(malformed_mir(
+            "watch requires a borrowed source backed by the standard library",
+        ));
+    }
+    let mir::Type::Scalar(mir::ScalarType::Inline(
+        identity @ crate::inline_value::InlineValueType::WatchSource(identity_class),
+    )) = local_in(function, identity)?.ty
+    else {
+        return Err(malformed_mir(
+            "watch requires its exact one-word source identity",
+        ));
+    };
+    validate_type(
+        program,
+        mir::Type::Scalar(mir::ScalarType::Inline(identity)),
+    )?;
+    canonical_class(
+        program,
+        mir::Type::Class(identity_class),
+        compiler_known_stream::WATCH_SOURCE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_transfer_plan(
+    program: &mir::Program,
+    function: &mir::Function,
+    class: crate::class_layout::ClassId,
+    previous: Option<mir::LocalId>,
+    key: mir::LocalId,
+    region: mir::LocalId,
+    reading: bool,
+) -> Result<(), BackendError> {
+    validate_configured_plan(program, function, class, previous)?;
     let mir::Type::Scalar(mir::ScalarType::Inline(
         crate::inline_value::InlineValueType::RegistrationKey(key),
     )) = local_in(function, key)?.ty

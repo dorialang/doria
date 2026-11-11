@@ -32,6 +32,9 @@ pub(super) struct Callback {
 }
 
 struct Entry {
+    /// The entry's position in the plan, which counts watches too. Keys carry
+    /// it; everything else addresses a transfer by its index in `entries`.
+    position: usize,
     registration: u64,
     buffer: ByteRegionValue,
     region: ByteRegionValue,
@@ -60,18 +63,52 @@ impl Entry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchState {
+    /// Waiting for its source; reports `Ready` once the source is ready.
+    Armed,
+    /// The group stopped while the watch was armed: `Ready` is owed once.
+    Retired,
+    /// Its `Ready` was fetched; only a resubmission arms it again.
+    Idle,
+}
+
+/// A watch of the plan (Decision 0140). It has no stream, request or buffer.
+struct Watch {
+    position: usize,
+    /// The `WatchSource` word: its kind above bit 32, its token below.
+    source: u64,
+    state: WatchState,
+}
+
+/// The fetch a group is serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fetch {
+    call: CheckedCall,
+    result_type: mir::PayloadEnumType,
+    /// Only an `Indefinite` wait keeps checking armed watches.
+    indefinite: bool,
+}
+
+/// The kind of plan entry a key identifies, as the runtime numbers it.
+const WRITE_ENTRY: u8 = 0;
+const READ_ENTRY: u8 = 1;
+const WATCH_ENTRY: u8 = 2;
+
 pub(super) struct GroupOwner {
     pub(super) standard_claims: [bool; 3],
     set: usize,
     class: crate::class_layout::ClassId,
     identity: u64,
-    observed: Option<(usize, bool)>,
+    /// The plan position and kind of the completion the last fetch returned.
+    observed: Option<(usize, u8)>,
     entries: Vec<Entry>,
+    watches: Vec<Watch>,
     setup: Option<CheckedCall>,
     setup_error: Option<InterfaceCarrier>,
     setup_reason: Option<IoErrorReason>,
     resubmission: Option<CheckedCall>,
-    observation: Option<(CheckedCall, mir::PayloadEnumType)>,
+    observation: Option<Fetch>,
     span: Span,
     deadline: Option<i128>,
     cancellation: Option<u128>,
@@ -113,11 +150,58 @@ impl Interpreter<'_> {
             false
         };
         if stopped {
-            let owner = self.transfer_groups.get_mut(&group).unwrap();
-            owner.stopped = true;
-            owner.wait_failure = failure;
+            self.mark_group_stopped(group, failure);
         }
         Ok(stopped)
+    }
+
+    /// A stopped group waits on nothing. Like a pending transfer, a watch
+    /// that was armed still reports its completion once.
+    fn mark_group_stopped(&mut self, group: usize, failure: Option<(IoErrorReason, Option<i64>)>) {
+        let owner = self.transfer_groups.get_mut(&group).unwrap();
+        owner.stopped = true;
+        owner.wait_failure = failure;
+        for watch in &mut owner.watches {
+            if watch.state == WatchState::Armed {
+                watch.state = WatchState::Retired;
+            }
+        }
+    }
+
+    /// Whether an active transfer was submitted to a source that had nothing
+    /// for it: it has neither an outcome nor a failure yet. Every fetch tries
+    /// it again, so it completes once its source need not wait.
+    fn transfer_awaits_source(&self, group: usize, position: usize) -> bool {
+        let entry = &self.transfer_groups[&group].entries[position];
+        let view = &self.pending_requests[&entry.request];
+        entry.prepared
+            && view.outcome.is_none()
+            && view.failure.is_none()
+            && matches!(
+                view.selection,
+                Some(file_stream::RequestSelection::Native {
+                    prepared: false,
+                    ..
+                })
+            )
+    }
+
+    /// What the first transfer still waiting on its source waits for.
+    fn awaited_source(&self, group: usize) -> Result<Option<&'static str>, InterpreterError> {
+        let owner = &self.transfer_groups[&group];
+        for (position, entry) in owner.entries.iter().enumerate() {
+            if entry.delivered || !self.transfer_awaits_source(group, position) {
+                continue;
+            }
+            if let Some(file_stream::RequestSelection::Native { source, region, .. }) =
+                self.pending_requests[&entry.request].selection
+            {
+                if let Some(wait) = self.readiness_source_read_wait(source, region.length)? {
+                    return Ok(Some(wait));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn absent_transfer_outcome(&self, reading: bool) -> Result<FunctionOutcome, InterpreterError> {
@@ -170,14 +254,14 @@ impl Interpreter<'_> {
         if self.transfer_groups[&group].resubmission.is_some() {
             return self.return_transfer_resubmission(group);
         }
-        let (call, result_type) = self
+        let observation = self
             .transfer_groups
             .get_mut(&group)
             .unwrap()
             .observation
             .take()
             .ok_or_else(|| InterpreterError::new("control drainage has no waiting caller"))?;
-        self.fetch_virtual_completion(group, result_type, call)
+        self.fetch_virtual_completion(group, observation)
     }
 
     pub(super) fn observe_transfer_group(
@@ -196,8 +280,10 @@ impl Interpreter<'_> {
         let LocalValue::PayloadEnum(wait) = read_local(&self.current_frame()?.locals, wait)? else {
             return Err(InterpreterError::new("completion observation has no Wait"));
         };
-        // Virtual transfers are ready synchronously, but relative waits still
-        // freeze their clock reading before observing any completed operation.
+        // Most virtual transfers complete as they are submitted, but relative
+        // waits still freeze their clock reading before observing any
+        // completed operation.
+        let indefinite = wait.case.index == 3;
         let relative_wait = if wait.case.index == 1 {
             let Some(LocalValue::Scalar(mir::ScalarValue::Inline(duration))) = wait.fields.first()
             else {
@@ -233,26 +319,96 @@ impl Interpreter<'_> {
                 );
             }
         }
-        let active = self.transfer_groups[&group]
-            .entries
-            .iter()
-            .any(|entry| entry.prepared);
+        let observation = Fetch {
+            call,
+            result_type,
+            indefinite,
+        };
+        let owner = &self.transfer_groups[&group];
+        let active = owner.entries.iter().any(|entry| entry.prepared)
+            || owner
+                .watches
+                .iter()
+                .any(|watch| watch.state == WatchState::Armed);
         if active && self.group_control_stopped(group)? {
             let owner = self.transfer_groups.get_mut(&group).unwrap();
             owner.observed = None;
-            owner.observation = Some((call, result_type));
+            owner.observation = Some(observation);
             owner.span = call.span;
             return self.stop_virtual_group(group, 0);
         }
-        self.fetch_virtual_completion(group, result_type, call)
+        self.fetch_virtual_completion(group, observation)
+    }
+
+    /// Whether the source of an armed watch is ready now. A terminal raw mode
+    /// is ready when its next event wait would not time out.
+    fn watch_source_ready(&mut self, source: u64) -> Result<bool, InterpreterError> {
+        if source >> 32 != transfer_plan::RAW_MODE_WATCH {
+            return Err(InterpreterError::new("watch has an unknown source kind"));
+        }
+        Ok(self.terminal_watch_ready(source as u32))
+    }
+
+    /// The first watch, in plan order, whose completion can be reported: one
+    /// the group retired while armed, or an armed one whose source is ready.
+    fn reportable_watch(&mut self, group: usize) -> Result<Option<usize>, InterpreterError> {
+        let count = self.transfer_groups[&group].watches.len();
+        for index in 0..count {
+            let watch = &self.transfer_groups[&group].watches[index];
+            let (source, state) = (watch.source, watch.state);
+            let reportable = match state {
+                WatchState::Retired => true,
+                WatchState::Armed => self.watch_source_ready(source)?,
+                WatchState::Idle => false,
+            };
+            if reportable {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reports `Completed(Ready($key))` and leaves the watch idle.
+    fn finish_watch_observation(
+        &mut self,
+        group: usize,
+        index: usize,
+        observation: Fetch,
+    ) -> Result<StepOutcome, InterpreterError> {
+        let Fetch {
+            call, result_type, ..
+        } = observation;
+        let types = stream::TransferObservationTypes::for_result(self.program, result_type)
+            .ok_or_else(|| InterpreterError::new("completion has no canonical schema"))?;
+        let owner = self.transfer_groups.get_mut(&group).unwrap();
+        let watch = &mut owner.watches[index];
+        watch.state = WatchState::Idle;
+        let position = watch.position;
+        owner.observed = Some((position, WATCH_ENTRY));
+        let key = LocalValue::Scalar(mir::ScalarValue::Inline(crate::inline_value::InlineValue {
+            ty: types.watch_key,
+            bits: u128::from(owner.identity) | ((position as u128) << 64),
+        }));
+        let completion = Self::transfer_enum(types.completion, 2, vec![key]);
+        self.finish_checked_io_result(
+            CheckedIoResult::Success(Some(Self::transfer_enum(result_type, 0, vec![completion]))),
+            call.result,
+            call.error,
+            call.success,
+            call.failure,
+        )
     }
 
     fn fetch_virtual_completion(
         &mut self,
         group: usize,
-        result_type: mir::PayloadEnumType,
-        call: CheckedCall,
+        observation: Fetch,
     ) -> Result<StepOutcome, InterpreterError> {
+        let Fetch {
+            call,
+            result_type,
+            indefinite,
+        } = observation;
         let owner = self.transfer_groups.get_mut(&group).unwrap();
         owner.observed = None;
         if let Some((reason, code)) = owner.wait_failure.filter(|_| !owner.wait_failure_reported) {
@@ -272,9 +428,68 @@ impl Interpreter<'_> {
                 call.failure,
             );
         }
-        let position = owner.entries.iter().position(|entry| !entry.delivered);
+        // Watches report before queued transfers. The check happens here, as
+        // the completion is reported, so events the program has already
+        // drained are never announced.
+        if let Some(index) = self.reportable_watch(group)? {
+            return self.finish_watch_observation(group, index, observation);
+        }
+        // The first transfer, in plan order, with a completion to report. One
+        // whose source had nothing for it is tried again, and passed over
+        // while its source still has nothing.
+        let mut position = None;
+        for candidate in 0..self.transfer_groups[&group].entries.len() {
+            if self.transfer_groups[&group].entries[candidate].delivered {
+                continue;
+            }
+            if self.transfer_awaits_source(group, candidate) {
+                if self.submit_virtual_transfer(group, candidate)? {
+                    return Ok(StepOutcome::CleanExit);
+                }
+                if self.transfer_awaits_source(group, candidate) {
+                    continue;
+                }
+            }
+            position = Some(candidate);
+            break;
+        }
         let Some(position) = position else {
-            let value = Self::transfer_enum(result_type, 2, Vec::new());
+            let owner = &self.transfer_groups[&group];
+            let waiting = owner
+                .watches
+                .iter()
+                .any(|watch| watch.state == WatchState::Armed);
+            let pending = owner.entries.iter().any(|entry| !entry.delivered);
+            if waiting && indefinite {
+                // Each check of a source that is not ready uses up one moment
+                // in which it had nothing, so this ends when the source does.
+                // No transfer can complete meanwhile: the program is here.
+                loop {
+                    if let Some(index) = self.reportable_watch(group)? {
+                        return self.finish_watch_observation(group, index, observation);
+                    }
+                }
+            }
+            if pending && indefinite {
+                // Only the group's deadline can end this wait. Waits here take
+                // no time, so the deadline is reached now; without one the
+                // wait never ends, and the run stops with the reason.
+                if owner.deadline.is_none() {
+                    let wait = self.awaited_source(group)?.ok_or_else(|| {
+                        InterpreterError::new("a pending transfer waits on no source")
+                    })?;
+                    return Err(InterpreterError::new(wait));
+                }
+                self.mark_group_stopped(group, None);
+                let owner = self.transfer_groups.get_mut(&group).unwrap();
+                owner.observation = Some(observation);
+                owner.span = call.span;
+                return self.stop_virtual_group(group, 0);
+            }
+            // Nothing completed within the wait: `TimedOut` while a transfer
+            // is pending or a watch is armed, `Exhausted` once nothing is.
+            let waited = waiting || pending;
+            let value = Self::transfer_enum(result_type, if waited { 1 } else { 2 }, Vec::new());
             return self.finish_checked_io_result(
                 CheckedIoResult::Success(Some(value)),
                 call.result,
@@ -283,8 +498,9 @@ impl Interpreter<'_> {
                 call.failure,
             );
         };
+        let owner = self.transfer_groups.get_mut(&group).unwrap();
         owner.span = call.span;
-        owner.observation = Some((call, result_type));
+        owner.observation = Some(observation);
         if let Some(outcome) = owner.entries[position].ready.take() {
             return self.finish_transfer_observation(group, position, outcome);
         }
@@ -320,14 +536,18 @@ impl Interpreter<'_> {
     ) -> Result<StepOutcome, InterpreterError> {
         self.retire_completed_transfer(group, position, &outcome)?;
         let owner = self.transfer_groups.get_mut(&group).unwrap();
-        let (call, result_type) = owner
+        let Fetch {
+            call, result_type, ..
+        } = owner
             .observation
             .take()
             .ok_or_else(|| InterpreterError::new("completion observation has no caller"))?;
         let entry = &mut owner.entries[position];
         entry.delivered = true;
-        owner.observed = Some((position, entry.reading));
-        let direction = usize::from(!entry.reading);
+        let reading = entry.reading;
+        let position = entry.position;
+        owner.observed = Some((position, if reading { READ_ENTRY } else { WRITE_ENTRY }));
+        let direction = usize::from(!reading);
         let identity = u128::from(owner.identity) | ((position as u128) << 64);
         let outcome = match outcome {
             FunctionOutcome::CheckedError(error) => CheckedIoResult::Error(error),
@@ -446,12 +666,17 @@ impl Interpreter<'_> {
             }
         }
         let [offset, length] = bounds;
-        let position = usize::try_from(key.bits >> 64).ok();
         let owner = self
             .transfer_groups
             .get(&group)
             .ok_or_else(|| InterpreterError::new("resubmission group was released"))?;
-        let entry = position.and_then(|position| owner.entries.get(position));
+        let position = usize::try_from(key.bits >> 64).ok().and_then(|position| {
+            owner
+                .entries
+                .iter()
+                .position(|entry| entry.position == position)
+        });
+        let entry = position.map(|position| &owner.entries[position]);
         let region = entry
             .filter(|entry| entry.reading == reading)
             .and_then(|entry| entry.resubmission_region(offset, length));
@@ -571,8 +796,12 @@ impl Interpreter<'_> {
             .transfer_groups
             .get(object)
             .ok_or_else(|| InterpreterError::new("completed read group was released"))?;
-        let position = usize::try_from(key.bits >> 64).ok();
-        let entry = position.and_then(|position| owner.entries.get(position));
+        let entry = usize::try_from(key.bits >> 64).ok().and_then(|position| {
+            owner
+                .entries
+                .iter()
+                .find(|entry| entry.position == position)
+        });
         if key.bits as u64 != owner.identity || !entry.is_some_and(|entry| entry.reading) {
             return Ok(CheckedIoResult::Error(self.allocate_io_error(
                 IoOperation::Access,
@@ -622,13 +851,10 @@ impl Interpreter<'_> {
             .transfer_groups
             .get(object)
             .ok_or_else(|| InterpreterError::new("observed key group was released"))?;
-        let reading = matches!(
-            key,
-            crate::inline_value::InlineValueType::ReadTransferKey(_)
-        );
+        let kind = key.transfer_entry_kind();
         Ok(owner
             .observed
-            .filter(|(_, direction)| *direction == reading)
+            .filter(|(_, observed)| Some(*observed) == kind)
             .map(|(position, _)| {
                 mir::ScalarValue::Inline(crate::inline_value::InlineValue {
                     ty: key,
@@ -657,13 +883,22 @@ impl Interpreter<'_> {
             .remove(&plan)
             .ok_or_else(|| InterpreterError::new("group setup plan configuration was released"))?;
         let owner = &self.readiness_sets[&set];
+        // A plan of watches alone names no set, so any set can begin it.
         let valid = !owner.active
-            && plan.owner == set as u64
+            && plan.owner.is_none_or(|bound| bound == set as u64)
             && !plan.entries.is_empty()
-            && plan.entries.iter().all(|(key, _, reading)| {
+            && plan.entries.iter().all(|entry| {
+                let transfer_plan::PlanEntry::Transfer {
+                    registration,
+                    reading,
+                    ..
+                } = entry
+                else {
+                    return true;
+                };
                 owner
                     .members
-                    .get(key)
+                    .get(registration)
                     .and_then(|(_, value)| value.as_ref())
                     .is_some_and(|value| {
                         let ty = local_value_type(self.program, value);
@@ -735,42 +970,56 @@ impl Interpreter<'_> {
         }
         let group = self.next_object;
         self.next_object += 1;
-        let entries = plan
-            .entries
-            .into_iter()
-            .enumerate()
-            .map(|(position, (registration, region, reading))| {
-                let request = self.next_object;
-                self.next_object += 1;
-                self.pending_requests.insert(
-                    request,
-                    file_stream::RequestView {
-                        selection: None,
-                        invalid: false,
-                        observing: false,
-                        outcome: None,
-                        failure: None,
-                        target: IoTarget::TransferGroup,
-                        reading,
-                        source: None,
-                        bound: region.length,
-                        owner: Some((group, position)),
-                        pin: None,
-                    },
-                );
-                Entry {
-                    registration,
-                    buffer: region,
-                    region,
-                    request,
-                    reading,
-                    prepared: false,
-                    delivered: false,
-                    ready: None,
-                    completed_progress: None,
+        let mut entries = Vec::new();
+        // Every watch of the plan is armed as the group begins.
+        let mut watches = Vec::new();
+        for (position, entry) in plan.entries.into_iter().enumerate() {
+            let (registration, region, reading) = match entry {
+                transfer_plan::PlanEntry::Watch(source) => {
+                    watches.push(Watch {
+                        position,
+                        source,
+                        state: WatchState::Armed,
+                    });
+                    continue;
                 }
-            })
-            .collect();
+                transfer_plan::PlanEntry::Transfer {
+                    registration,
+                    region,
+                    reading,
+                } => (registration, region, reading),
+            };
+            let request = self.next_object;
+            self.next_object += 1;
+            self.pending_requests.insert(
+                request,
+                file_stream::RequestView {
+                    selection: None,
+                    invalid: false,
+                    observing: false,
+                    outcome: None,
+                    failure: None,
+                    target: IoTarget::TransferGroup,
+                    reading,
+                    source: None,
+                    bound: region.length,
+                    owner: Some((group, entries.len())),
+                    pin: None,
+                },
+            );
+            entries.push(Entry {
+                position,
+                registration,
+                buffer: region,
+                region,
+                request,
+                reading,
+                prepared: false,
+                delivered: false,
+                ready: None,
+                completed_progress: None,
+            });
+        }
         self.readiness_sets.get_mut(&set).unwrap().active = true;
         self.transfer_groups.insert(
             group,
@@ -781,6 +1030,7 @@ impl Interpreter<'_> {
                 identity: plan.identity,
                 observed: None,
                 entries,
+                watches,
                 setup: Some(call),
                 setup_error: None,
                 setup_reason: None,
@@ -802,6 +1052,10 @@ impl Interpreter<'_> {
         {
             return self.stop_virtual_group(group, 0);
         }
+        // Watches need no stream callback, so a plan of watches alone is set up.
+        if self.transfer_groups[&group].entries.is_empty() {
+            return self.finish_virtual_group_setup(group);
+        }
         self.push_transfer_source_getter(
             group,
             0,
@@ -813,6 +1067,58 @@ impl Interpreter<'_> {
             call.span,
         )?;
         Ok(StepOutcome::Continue)
+    }
+
+    /// Arms a watch again. Only a watch of this group whose `Ready` was
+    /// fetched can be armed, and never once the group has stopped: the same
+    /// conditions a transfer is resubmitted under.
+    pub(super) fn resubmit_watch(
+        &mut self,
+        group: mir::LocalId,
+        key: mir::LocalId,
+    ) -> Result<CheckedIoResult, InterpreterError> {
+        let LocalValue::Class { object: group, .. } =
+            read_local(&self.current_frame()?.locals, group)?
+        else {
+            return Err(InterpreterError::new("watch resubmission has no group"));
+        };
+        let group = *group;
+        let LocalValue::Scalar(mir::ScalarValue::Inline(key)) =
+            read_local(&self.current_frame()?.locals, key)?
+        else {
+            return Err(InterpreterError::new("watch resubmission has no watch key"));
+        };
+        let key = *key;
+        let owner = self
+            .transfer_groups
+            .get(&group)
+            .ok_or_else(|| InterpreterError::new("watch resubmission group was released"))?;
+        let idle = usize::try_from(key.bits >> 64)
+            .ok()
+            .and_then(|position| {
+                owner
+                    .watches
+                    .iter()
+                    .position(|watch| watch.position == position)
+            })
+            .filter(|index| {
+                key.bits as u64 == owner.identity
+                    && !owner.stopped
+                    && owner.setup.is_none()
+                    && owner.resubmission.is_none()
+                    && owner.watches[*index].state == WatchState::Idle
+            });
+        let Some(index) = idle else {
+            return Ok(CheckedIoResult::Error(self.allocate_io_error(
+                IoOperation::Configure,
+                IoTarget::TransferGroup,
+                IoErrorReason::InvalidInput,
+                None,
+                None,
+            )?));
+        };
+        self.transfer_groups.get_mut(&group).unwrap().watches[index].state = WatchState::Armed;
+        Ok(CheckedIoResult::Success(None))
     }
 
     fn transfer_receiver(
@@ -1291,6 +1597,15 @@ impl Interpreter<'_> {
             }
         };
         if let Some((source, region)) = selected {
+            // A read whose source has nothing yet stays active with no
+            // outcome; a later fetch performs it.
+            if reading
+                && self
+                    .readiness_source_read_wait(source, region.length)?
+                    .is_some()
+            {
+                return Ok(false);
+            }
             let name = if reading {
                 "Doria\\Std\\Io\\ReadOutcome"
             } else {
@@ -1592,6 +1907,7 @@ function main(): void {
                 length: 8,
             };
             let mut entry = Entry {
+                position: 0,
                 registration: 2,
                 buffer,
                 region: buffer,

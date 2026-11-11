@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::queue::{Queue, READ_CAPACITY};
 use super::wire::{ColorSupport, Observation};
-use super::{ledger, render, Exclusive, OutputClass, Refusal, Shared};
+use super::{ledger, render, Exclusive, OutputClass, Refusal, Shared, Watched};
 use crate::cancellation::DrCancellationV1;
 use crate::cancellation_signal::{self, Signal};
 use crate::device_io::{standard_device, StandardStream, WriteOutcome};
@@ -644,6 +644,45 @@ pub(super) unsafe fn await_event(
             TerminalWake::Cancelled => return Ok(Observation::Cancelled),
         }
     }
+}
+
+/// Whether [`await_event`] with an immediate wait would observe an event.
+/// Input the terminal already has is read into the queue; nothing is taken
+/// out of it and the resize flag is left set.
+pub(super) unsafe fn events_waiting() -> Result<Watched, Refusal> {
+    let _exclusive = Exclusive::acquire()?;
+    let Some(raw) = (*RAW.0.get()).as_mut() else {
+        return Ok(Watched::Ready);
+    };
+    let immediate = DrWaitBudgetV1::new(0, 0, || Ok(0))?;
+    loop {
+        if raw.queue.has_key()? || RESIZED.load(Ordering::SeqCst) || raw.queue.closed {
+            return Ok(Watched::Ready);
+        }
+        match raw.watch.wait(&immediate, ptr::null_mut())? {
+            TerminalWake::Ready { input, notice } => {
+                if notice {
+                    cancellation_signal::reset(NOTICE.load(Ordering::Acquire))?;
+                }
+                if input {
+                    fill(&mut raw.queue)?;
+                }
+            }
+            TerminalWake::TimedOut | TerminalWake::Cancelled => {
+                return Ok(Watched::Waiting {
+                    until: raw.queue.held_until(),
+                });
+            }
+        }
+    }
+}
+
+/// The terminal watch itself: one descriptor that is readable while standard
+/// input or the resize notice is.
+pub(super) unsafe fn event_handle() -> Option<c_int> {
+    (*RAW.0.get())
+        .as_ref()
+        .and_then(|raw| raw.watch.handle().ok())
 }
 
 pub(super) unsafe fn cursor_position() -> Result<(u32, u32), Refusal> {

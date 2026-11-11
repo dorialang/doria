@@ -63,7 +63,8 @@ pub enum TermFunction {
 // The numbers in this text are `doria_terminal::wire`: operation selectors,
 // result and observation layouts, and the bit fields of the four one-word
 // values. `term_contract_tests.rs` runs this text against the Rust operation
-// core, so a number that disagrees with that module fails there.
+// core, so a number that disagrees with that module fails there. A raw mode's
+// watch identity is the runtime's `WatchSource` layout (Decision 0140).
 pub const SOURCE_TEXT: &str = r#"
 enum TerminalErrorReason {
     case NotATerminal;
@@ -222,7 +223,7 @@ class AlternateScreen {
         let $ignored = Doria\Std\Term\Console::operate(21, $this->generation, 0, "");
     }
 }
-class RawMode {
+class RawMode implements Doria\Std\Io\Watchable {
     internal writable int $generation;
 
     internal function __construct(parameter int $generation) {
@@ -256,6 +257,12 @@ class RawMode {
     function getCursorPosition(): Doria\Std\Term\Position throws Doria\Std\Term\TerminalError {
         return Doria\Std\Term\Position::fromBits(
             Doria\Std\Term\Console::run(23, $this->generation, 0, ""));
+    }
+
+    // What a transfer group waits on for this raw mode: watch kind 1 above
+    // bit 32 and this raw mode's generation below.
+    Doria\Std\Io\WatchSource $watchSource {
+        get => Doria\Std\Io\WatchSource::fromBits(4294967296 | $this->generation);
     }
 
     consuming function leave(): void throws Doria\Std\Term\TerminalError {

@@ -1549,6 +1549,8 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
                 crate::inline_value::InlineValueKind::RegistrationKey
                     | crate::inline_value::InlineValueKind::ReadTransferKey
                     | crate::inline_value::InlineValueKind::WriteTransferKey
+                    | crate::inline_value::InlineValueKind::WatchKey
+                    | crate::inline_value::InlineValueKind::WatchSource
                     | crate::inline_value::InlineValueKind::CancellationToken
                     | crate::inline_value::InlineValueKind::StandardInput
                     | crate::inline_value::InlineValueKind::StandardOutput

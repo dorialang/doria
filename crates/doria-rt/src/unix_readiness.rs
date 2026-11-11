@@ -17,6 +17,9 @@ const WRITE: u8 = 2;
 const CLOSED: u8 = 4;
 const FAULT: u8 = 8;
 const CANCEL: u64 = u64::MAX;
+/// A descriptor that only ends a wait: a watched source's own readiness. It
+/// has no registration and reports no event.
+const WAKE: u64 = u64::MAX - 1;
 
 /// Private namespaces within this watch owner: registrations use even values,
 /// helper notices use odd operation values. Public registration keys never
@@ -27,7 +30,7 @@ fn watch_key(index: usize, helper: bool) -> Result<u64, Failure> {
         .ok()
         .and_then(|index| index.checked_mul(2))
         .and_then(|key| key.checked_add(u64::from(helper)))
-        .filter(|key| *key != CANCEL)
+        .filter(|key| *key != CANCEL && *key != WAKE)
         .ok_or_else(exhausted)?;
     Ok(key)
 }
@@ -199,7 +202,8 @@ impl Set {
         }
         let registrations =
             Layout::array::<Registration>(capacity).map_err(|_| Failure::invalid_input())?;
-        let events = Layout::array::<platform::Event>(capacity * 2 + 1)
+        // One event for each direction of each watch, cancellation and a wake.
+        let events = Layout::array::<platform::Event>(capacity * 2 + 2)
             .map_err(|_| Failure::invalid_input())?;
         registrations
             .extend(events)
@@ -388,6 +392,27 @@ impl Set {
         Ok(())
     }
 
+    /// Makes every wait also end, with tag 4, while `handle` is readable.
+    /// The caller owns the descriptor and removes it before closing it.
+    fn add_wake(&mut self, handle: i32) -> Result<(), Failure> {
+        let watcher = self.handle()?;
+        let result = platform::add(watcher, handle, READ, WAKE);
+        self.registration_result(result)
+    }
+
+    fn remove_wake(&mut self, handle: i32) {
+        let removed = self.handle().and_then(|watcher| {
+            platform::remove(watcher, handle, READ, WAKE).map_err(|failure| failure.failure)
+        });
+        if removed.is_err() {
+            // A wake left behind would end later waits for a source nobody
+            // watches. Close only this runtime-owned poller.
+            drop(self.watcher.take());
+        }
+    }
+
+    /// Tags: 0 with ready events, 1 the budget ended, 2 cancellation, 4 only
+    /// an added wake was ready.
     fn wait(
         &mut self,
         budget: &DrWaitBudgetV1,
@@ -438,18 +463,23 @@ impl Set {
                 return Ok((1, 0));
             }
             let poll_only = count != 0 || kind == 0;
-            let events = unsafe { slice::from_raw_parts_mut(self.events, self.capacity * 2 + 1) };
+            let events = unsafe { slice::from_raw_parts_mut(self.events, self.capacity * 2 + 2) };
             let ready = match native_wait(watcher, events, if poll_only { 0 } else { kind }, units)
             {
                 Ok(ready) => ready,
                 Err(failure) if failure.system_code == Some(i64::from(libc::EINTR)) => continue,
                 Err(failure) => return Err(failure),
             };
+            let mut woken = false;
             for index in 0..ready {
                 let event = unsafe { (*self.events.add(index)).assume_init_ref() };
                 let (token, facts) = platform::decode(event)?;
                 if token == CANCEL {
                     return Ok((2, 0));
+                }
+                if token == WAKE {
+                    woken = true;
+                    continue;
                 }
                 let slot_index = (token & u64::from(u32::MAX)) as usize;
                 if slot_index >= self.capacity {
@@ -474,6 +504,9 @@ impl Set {
             }
             if count != 0 {
                 return Ok((0, count));
+            }
+            if woken {
+                return Ok((4, 0));
             }
             if kind == 0 {
                 return Ok((1, 0));

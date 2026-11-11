@@ -1370,6 +1370,8 @@ fn validate_class(
             crate::inline_value::InlineValueType::RegistrationKey(_)
             | crate::inline_value::InlineValueType::ReadTransferKey(_)
             | crate::inline_value::InlineValueType::WriteTransferKey(_)
+            | crate::inline_value::InlineValueType::WatchKey(_)
+            | crate::inline_value::InlineValueType::WatchSource(_)
             | crate::inline_value::InlineValueType::StandardInput(_)
             | crate::inline_value::InlineValueType::StandardOutput(_)
             | crate::inline_value::InlineValueType::StandardError(_) => {
@@ -4915,6 +4917,7 @@ fn validate_terminator(
                     Some(mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly))
                 }
                 mir::CheckedIoOperation::ConfigureTransferPlan { class, .. }
+                | mir::CheckedIoOperation::WatchTransferPlan { class, .. }
                 | mir::CheckedIoOperation::BeginTransferGroup { class, .. } => {
                     Some(mir::Type::Class(*class))
                 }
@@ -4940,6 +4943,7 @@ fn validate_terminator(
                 }
                 mir::CheckedIoOperation::CloseOwnedFile { .. }
                 | mir::CheckedIoOperation::ResubmitTransfer { .. }
+                | mir::CheckedIoOperation::ResubmitWatch { .. }
                 | mir::CheckedIoOperation::PreparePendingFile { .. }
                 | mir::CheckedIoOperation::PreparePendingStandard { .. } => None,
                 mir::CheckedIoOperation::ControlOwnedFile { control, .. } => control.result_type(),
@@ -5244,6 +5248,17 @@ fn validate_checked_io_operation(
         } => streams::validate_transfer_plan(
             program, function, *class, *previous, *key, *region, *reading,
         ),
+        mir::CheckedIoOperation::WatchTransferPlan {
+            class,
+            previous,
+            source,
+            identity,
+        } => streams::validate_transfer_plan_watch(
+            program, function, *class, *previous, *source, *identity,
+        ),
+        mir::CheckedIoOperation::ResubmitWatch { group, key } => {
+            streams::validate_watch_resubmission(program, function, *group, *key)
+        }
         mir::CheckedIoOperation::RegisterReadinessStream { .. }
         | mir::CheckedIoOperation::UnregisterReadinessStream { .. }
         | mir::CheckedIoOperation::BorrowReadinessStream { .. } => {
@@ -14532,6 +14547,23 @@ fn collect_checked_io_class_local_accesses<'a>(
             }
             accesses.resource_read(*region);
         }
+        mir::CheckedIoOperation::WatchTransferPlan {
+            previous,
+            source,
+            identity,
+            ..
+        } => {
+            if let Some(previous) = previous {
+                accesses.transfer(*previous);
+            }
+            accesses.borrow(*source);
+            accesses.resource_read(*identity);
+        }
+        mir::CheckedIoOperation::ResubmitWatch { group, key } => {
+            accesses.borrow(*group);
+            accesses.contents_access(*group, true);
+            accesses.resource_read(*key);
+        }
         mir::CheckedIoOperation::NewReadinessSet { .. } => {}
         mir::CheckedIoOperation::RegisterReadinessStream { set, stream, .. } => {
             accesses.borrow(*set);
@@ -20312,10 +20344,14 @@ fn checked_io_observes_property(
         mir::CheckedIoOperation::TransferPlanKey { plan, .. } => *plan == receiver,
         mir::CheckedIoOperation::TransferGroupReadRegion { group, .. }
         | mir::CheckedIoOperation::ObserveTransferGroup { group, .. }
-        | mir::CheckedIoOperation::ResubmitTransfer { group, .. } => *group == receiver,
+        | mir::CheckedIoOperation::ResubmitTransfer { group, .. }
+        | mir::CheckedIoOperation::ResubmitWatch { group, .. } => *group == receiver,
         mir::CheckedIoOperation::ConfigureTransferPlan { previous, .. } => {
             *previous == Some(receiver)
         }
+        mir::CheckedIoOperation::WatchTransferPlan {
+            previous, source, ..
+        } => *previous == Some(receiver) || *source == receiver,
         mir::CheckedIoOperation::NewReadinessSet { .. } => false,
         mir::CheckedIoOperation::RegisterReadinessStream { set, stream, .. } => {
             *set == receiver || *stream == receiver

@@ -1,0 +1,282 @@
+// Stage 46 example (Decision 0140): one wait for a command's output and the
+// terminal's events.
+//
+// Pass the command to run as this program's arguments, for example `cat`.
+// The program sends the command a `>` to begin with and a `.` for every
+// character typed, and lists whatever the command writes as it arrives. `q`
+// or Escape ends the program, which closes the command's input and waits for
+// the command to end, so the command should be one that ends when its input
+// does.
+//
+// One transfer group reads the command's output and watches the terminal in
+// the same wait, so the program sleeps until either has something. `Ready`
+// says terminal events are waiting: the program takes them with
+// `getNextEvent(Wait::Immediate)` until there are none, then watches again.
+namespace Demo\Relay;
+
+use Doria\Std\Io\{BorrowedBufferedReader, IoError, ReadinessSet, ReadOutcome, TransferCompletion,
+    TransferPlan, TransferWaitResult, Wait};
+use Doria\Std\Process\{ChildCleanup, ChildOutput, Command, ExitStatus};
+use Doria\Std\Term\{Console, Key, TerminalError, TerminalEvent, TerminalWaitResult};
+
+// The lines shown, oldest first. A window too short for all of them shows
+// the newest.
+class Journal {
+    internal writable List<string> $lines = [];
+
+    function __construct(string $title) {}
+
+    writable function add(string $line): void {
+        $this->lines->add($line);
+    }
+
+    function draw(): void throws TerminalError {
+        let $size = Console::getSize();
+        let $visible = $size->rows - 3;
+        let writable $first = 0;
+        if ($this->lines->count > $visible) {
+            $first = $this->lines->count - $visible;
+        }
+
+        Console::clear();
+        Console::writeAt(0, 0, $this->title);
+        let writable $row = 0;
+        while ($first + $row < $this->lines->count) {
+            Console::writeAt(0, $row + 2, $this->lines[$first + $row]);
+            $row++;
+        }
+        Console::flush();
+    }
+}
+
+// How many bytes a completed read carried: -1 at the end of the command's
+// output, and -2 when the completion is not a read.
+function readCount(TransferWaitResult $result): int {
+    return match ($result) {
+        TransferWaitResult::Completed($completion) => match ($completion) {
+            TransferCompletion::Read($finished, $outcome) => match ($outcome) {
+                ReadOutcome::Data($bytes) => $bytes,
+                ReadOutcome::EndOfStream => -1,
+                default => 0,
+            },
+            default => -2,
+        },
+        default => -2,
+    };
+}
+
+function isReady(TransferWaitResult $result): bool {
+    return match ($result) {
+        TransferWaitResult::Completed($completion) => match ($completion) {
+            TransferCompletion::Ready($watch) => true,
+            default => false,
+        },
+        default => false,
+    };
+}
+
+function windowLine(int $columns, int $rows): string {
+    return "window is now {$columns}x{$rows}";
+}
+
+function describe(TerminalWaitResult $result): string {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => match ($key) {
+                Key::Character($text) => "key {$text}",
+                Key::Enter => "key Enter",
+                Key::Escape => "key Escape",
+                default => "another key",
+            },
+            TerminalEvent::Resized($size) => windowLine($size->columns, $size->rows),
+        },
+        TerminalWaitResult::Closed => "terminal closed",
+        default => "another event",
+    };
+}
+
+function isResize(TerminalWaitResult $result): bool {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => false,
+            TerminalEvent::Resized($size) => true,
+        },
+        default => false,
+    };
+}
+
+// `q`, Escape and a terminal that has gone away end the program.
+function ends(TerminalWaitResult $result): bool {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => match ($key) {
+                Key::Character($text) => $text == "q",
+                Key::Escape => true,
+                default => false,
+            },
+            TerminalEvent::Resized($size) => false,
+        },
+        TerminalWaitResult::Closed => true,
+        default => false,
+    };
+}
+
+// A typed character, as opposed to a named key or a resize.
+function isCharacter(TerminalWaitResult $result): bool {
+    return match ($result) {
+        TerminalWaitResult::Event($event) => match ($event) {
+            TerminalEvent::Key($key, $modifiers) => match ($key) {
+                Key::Character($text) => true,
+                default => false,
+            },
+            TerminalEvent::Resized($size) => false,
+        },
+        default => false,
+    };
+}
+
+function text(Bytes $bytes): string {
+    let $text = String::fromBytes($bytes);
+    return $text ?? "?";
+}
+
+function ending(ExitStatus $status, int $emptyWakes): string {
+    let $end = match ($status) {
+        ExitStatus::Exited($code) => "The command exited with status {$code}.",
+        ExitStatus::Signaled($signal) => "The command was ended by signal {$signal}.",
+    };
+    if ($emptyWakes > 0) {
+        return "{$end} The terminal was reported ready {$emptyWakes} times with nothing waiting.";
+    }
+    return $end;
+}
+
+// Runs the command and relays until the user ends it. The two guards put the
+// terminal back when this function ends, however it ends.
+function relay(List<string> $command): string throws TerminalError, IoError {
+    let $keys = Console::enterRawMode();
+    let $screen = Console::enterAlternateScreen();
+    Console::hideCursor();
+
+    writable Command $program = Command::executable($command[0]);
+    let writable $argument = 1;
+    while ($argument < $command->count) {
+        $program->argument($command[$argument]);
+        $argument++;
+    }
+    let writable $child = $program->spawn(ChildCleanup::Terminate);
+
+    let writable $journal = new Journal("Each character typed sends a mark. q or Escape ends.");
+    $journal->draw();
+    let $size = Console::getSize();
+    let writable $window = windowLine($size->columns, $size->rows);
+    let writable $emptyWakes = 0;
+
+    // A command that copies its input answers this `>`, so its output is the
+    // first thing to arrive. Each typed character sends it a `.` afterwards.
+    writable Bytes $prompt = Bytes::allocate(1);
+    $prompt[0] = 62;
+    writable Bytes $mark = Bytes::allocate(1);
+    $mark[0] = 46;
+    let $greeted = $child->getInput()->write($prompt->getRegion(0, 1));
+
+    writable Bytes $storage = Bytes::allocate(64);
+    {
+        let writable $reader = new BorrowedBufferedReader<ChildOutput>($child->getOutput(), 64);
+        writable ReadinessSet $set = new ReadinessSet();
+        let $tap = $set->register($reader);
+        {
+            // The plan borrows the raw mode: it stays usable for its events,
+            // and cannot be left while the group watches it.
+            let $plan = TransferPlan::read($tap, $storage->getWritableRegion(0, 64))->andWatch($keys);
+            let $output = $plan->getReadKey(0);
+            let $terminal = $plan->getWatchKey(1);
+            let writable $group = $set->begin($plan);
+
+            let writable $open = true;
+            while ($open) {
+                let $result = $group->getNextCompletion(Wait::Indefinite);
+                let $count = readCount($result);
+                if ($count == -1) {
+                    // A read that is not submitted again is retired.
+                    $journal->add("command output ended");
+                } else if ($count >= 0) {
+                    if ($count > 0) {
+                        writable Bytes $copy = Bytes::allocate($count);
+                        {
+                            let $region = $group->getReadRegion($output);
+                            if ($region != null) {
+                                let writable $at = 0;
+                                while ($at < $count) {
+                                    $copy[$at] = $region[$at];
+                                    $at += 1;
+                                }
+                            }
+                        }
+                        $journal->add("command wrote: " . text($copy));
+                    }
+                    $group->resubmitRead($output, 0, 64);
+                } else if (isReady($result)) {
+                    let writable $taken = 0;
+                    let writable $waiting = true;
+                    while ($waiting) {
+                        let $event = $keys->getNextEvent(Wait::Immediate);
+                        if ($event == TerminalWaitResult::TimedOut) {
+                            $waiting = false;
+                        } else if (isResize($event)) {
+                            // A window may announce a size it already had.
+                            $taken++;
+                            let $line = describe($event);
+                            if ($line != $window) {
+                                $window = $line;
+                                $journal->add($line);
+                            }
+                        } else {
+                            $taken++;
+                            $journal->add(describe($event));
+                            if (ends($event)) {
+                                $open = false;
+                                $waiting = false;
+                            } else if (isCharacter($event)) {
+                                let $written = $child->getInput()->write($mark->getRegion(0, 1));
+                            }
+                        }
+                    }
+                    if ($taken == 0) {
+                        $emptyWakes++;
+                        $journal->add("ready, but nothing was waiting");
+                    }
+                    // A watch reports once; this arms it for the next events.
+                    if ($open) {
+                        $group->resubmitWatch($terminal);
+                    }
+                } else if ($result == TransferWaitResult::Exhausted) {
+                    $open = false;
+                }
+                $journal->draw();
+            }
+        }
+        let $returned = $set->unregister($tap);
+    }
+
+    Console::showCursor();
+    return ending($child->wait(), $emptyWakes);
+}
+
+function main(List<string> $args): int {
+    if ($args->isEmpty) {
+        echo "Pass the command to run, for example: cat\n";
+        return 2;
+    }
+    try {
+        let $summary = relay($args);
+        echo "{$summary}\n";
+        return 0;
+    } catch (TerminalError $error) {
+        echo "This program needs a terminal: {$error->message}\n";
+        return 2;
+    } catch (IoError $error) {
+        echo "The command could not be relayed: {$error->message}\n";
+        return 3;
+    }
+}

@@ -7519,6 +7519,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 | mir::CheckedIoOperation::ObserveTransferGroup { .. }
                 | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
                 | mir::CheckedIoOperation::ResubmitTransfer { .. }
+                | mir::CheckedIoOperation::ResubmitWatch { .. }
         ) {
             return self
                 .lower_readiness_membership(operation, result, error, success, failure, span);
@@ -7541,6 +7542,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if matches!(
             operation,
             mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+                | mir::CheckedIoOperation::WatchTransferPlan { .. }
                 | mir::CheckedIoOperation::TransferPlanKey { .. }
         ) {
             return self
@@ -7563,8 +7565,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::CheckedIoOperation::BeginTransferGroup { .. }
             | mir::CheckedIoOperation::ObserveTransferGroup { .. }
             | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
-            | mir::CheckedIoOperation::ResubmitTransfer { .. } => unreachable!(),
+            | mir::CheckedIoOperation::ResubmitTransfer { .. }
+            | mir::CheckedIoOperation::ResubmitWatch { .. } => unreachable!(),
             mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+            | mir::CheckedIoOperation::WatchTransferPlan { .. }
             | mir::CheckedIoOperation::TransferPlanKey { .. } => unreachable!(),
             mir::CheckedIoOperation::NewReadinessSet { .. } => (
                 crate::native_abi::CHECKED_IO_NEW_READINESS_SET,
@@ -8285,18 +8289,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 local_slot(&self.local_slots, *position)?,
                 "plan.position",
             ))?;
-            let reading = byte.const_int(
-                u64::from(matches!(
-                    key,
-                    crate::inline_value::InlineValueType::ReadTransferKey(_)
-                )),
-                false,
-            );
+            let kind = key
+                .transfer_entry_kind()
+                .ok_or_else(|| malformed_mir("transfer key lookup names no key type"))?;
+            let kind = byte.const_int(u64::from(kind), false);
             let mut args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
                 self.current_frame.into(),
                 plan.into(),
                 position.into(),
-                reading.into(),
+                kind.into(),
                 local_slot(&self.local_slots, result)?.into(),
             ];
             args.extend([2, 3, 4, 7, 8].map(|index| BasicMetadataValueEnum::from(slots[index])));
@@ -8322,6 +8323,50 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .into_int_value();
             return self
                 .finish_checked_resource(operation, None, error, success, failure, status, slots);
+        }
+        if let mir::CheckedIoOperation::WatchTransferPlan {
+            previous, identity, ..
+        } = operation
+        {
+            self.set_active_panic_site(span)?;
+            let pointer = self.context.ptr_type(AddressSpace::default());
+            let int = self.context.i64_type();
+            let slots = self.checked_io_output_slots()?;
+            // Only the source's one-word identity crosses; the plan's loan of
+            // the source itself is the checker's business.
+            let identity = build(self.builder.build_load(
+                int,
+                local_slot(&self.local_slots, *identity)?,
+                "plan.watch-source",
+            ))?;
+            let mut args: Vec<BasicMetadataValueEnum<'ctx>> = vec![self.current_frame.into()];
+            let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = vec![pointer.into()];
+            if let Some(previous) = previous {
+                let slot = local_slot(&self.local_slots, *previous)?;
+                let owner = build(self.builder.build_load(pointer, slot, "plan.previous"))?
+                    .into_pointer_value();
+                build(self.builder.build_store(slot, pointer.const_null()))?;
+                args.push(owner.into());
+                params.push(pointer.into());
+            }
+            args.push(identity.into());
+            params.push(int.into());
+            for index in [1, 2, 3, 4, 7, 8] {
+                args.push(slots[index].into());
+                params.push(pointer.into());
+            }
+            let name = if previous.is_some() {
+                "dr_v1_checked_transfer_plan_watch_append"
+            } else {
+                "dr_v1_checked_transfer_plan_watch_new"
+            };
+            let status = self
+                .call_runtime(name, &params, Some(self.context.i8_type().into()), &args)?
+                .ok_or_else(|| backend_failure("watch plan produced no status"))?
+                .into_int_value();
+            return self.finish_checked_resource(
+                operation, result, error, success, failure, status, slots,
+            );
         }
         let mir::CheckedIoOperation::ConfigureTransferPlan {
             previous,
@@ -18013,19 +18058,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 let output = self.entry_alloca(payload_type, "observed.key")?;
                 build(self.builder.build_store(output, payload_type.const_zero()))?;
-                let reading = byte.const_int(
-                    u64::from(matches!(
-                        key,
-                        crate::inline_value::InlineValueType::ReadTransferKey(_)
-                    )),
-                    false,
-                );
+                let kind = key
+                    .transfer_entry_kind()
+                    .ok_or_else(|| malformed_mir("observed key names no key type"))?;
+                let kind = byte.const_int(u64::from(kind), false);
                 let status = self
                     .call_runtime(
                         "dr_v1_transfer_adapter_group_observed",
                         &[pointer.into(), byte.into(), pointer.into()],
                         Some(byte.into()),
-                        &[owner.into(), reading.into(), output.into()],
+                        &[owner.into(), kind.into(), output.into()],
                     )?
                     .ok_or_else(|| backend_failure("observed key produced no presence"))?
                     .into_int_value();

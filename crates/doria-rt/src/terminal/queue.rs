@@ -83,33 +83,58 @@ impl Queue {
         Ok(true)
     }
 
+    /// What the queued bytes begin with. A sequence that has waited out the
+    /// escape delay is decoded as it stands. `None` when nothing is queued.
+    unsafe fn step(&self) -> Result<Option<Step>, Failure> {
+        let queued = self.queued();
+        if queued.is_empty() {
+            return Ok(None);
+        }
+        let mut step = decode::decode(queued, self.closed);
+        if matches!(step, Step::Incomplete)
+            && crate::monotonic_clock::now()? >= self.escape_deadline
+        {
+            step = decode::decode(queued, true);
+        }
+        Ok(Some(step))
+    }
+
     /// The next whole key, in the order typed. `None` when the queue is empty
     /// or holds only the start of a sequence that may still continue.
     pub(super) unsafe fn next_key(&mut self) -> Result<Option<Observation>, Failure> {
         loop {
-            let queued = self.queued();
-            if queued.is_empty() {
-                return Ok(None);
-            }
-            let mut step = decode::decode(queued, self.closed);
-            if matches!(step, Step::Incomplete)
-                && crate::monotonic_clock::now()? >= self.escape_deadline
-            {
-                step = decode::decode(queued, true);
-            }
-            match step {
-                Step::Key {
+            match self.step()? {
+                Some(Step::Key {
                     length,
                     key,
                     modifiers,
-                } => {
+                }) => {
                     self.start += length;
                     return Ok(Some(Observation::Key { key, modifiers }));
                 }
-                Step::Ignored { length } => self.start += length,
-                Step::Incomplete => return Ok(None),
+                Some(Step::Ignored { length }) => self.start += length,
+                Some(Step::Incomplete) | None => return Ok(None),
             }
         }
+    }
+
+    /// Whether [`Self::next_key`] would hand out a key now. The key stays
+    /// queued; bytes the decoder ignores are dropped, as they are on the way
+    /// to a key that is taken.
+    pub(super) unsafe fn has_key(&mut self) -> Result<bool, Failure> {
+        loop {
+            match self.step()? {
+                Some(Step::Key { .. }) => return Ok(true),
+                Some(Step::Ignored { length }) => self.start += length,
+                Some(Step::Incomplete) | None => return Ok(false),
+            }
+        }
+    }
+
+    /// When the sequence held back in the queue becomes a key without more
+    /// input, on the monotonic clock. `None` when nothing is held back.
+    pub(super) fn held_until(&self) -> Option<u64> {
+        (!self.is_empty()).then_some(self.escape_deadline)
     }
 
     /// How long a wait for more input may last: the caller's budget, cut to
@@ -239,6 +264,32 @@ mod tests {
             assert_eq!(queue.push(b"\x1b"), Ok(true));
             queue.closed = true;
             assert_eq!(queue.next_key(), Ok(escape));
+        }
+    }
+
+    #[test]
+    fn asking_for_a_key_leaves_it_queued_and_names_the_escape_deadline() {
+        unsafe {
+            let mut queue = Queue::new(64).unwrap();
+            assert_eq!(queue.has_key(), Ok(false));
+            assert_eq!(queue.held_until(), None);
+            assert_eq!(queue.push(b"a\x1b"), Ok(true));
+            assert_eq!(queue.has_key(), Ok(true));
+            assert_eq!(queue.has_key(), Ok(true));
+            assert_eq!(queue.next_key(), Ok(key('a')));
+            // The lone Escape is not a key until its delay has run out.
+            assert_eq!(queue.has_key(), Ok(false));
+            assert_eq!(queue.held_until(), Some(queue.escape_deadline));
+            queue.escape_deadline = 0;
+            assert_eq!(queue.has_key(), Ok(true));
+            assert!(matches!(
+                queue.next_key(),
+                Ok(Some(Observation::Key {
+                    key: Key::Escape,
+                    ..
+                }))
+            ));
+            assert_eq!(queue.held_until(), None);
         }
     }
 

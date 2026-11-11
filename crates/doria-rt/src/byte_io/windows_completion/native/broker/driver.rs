@@ -407,6 +407,7 @@ impl CompletionSet {
             cancellation: control.state,
             linked: 0,
             registered: false,
+            wake: None,
         };
         {
             let mut routing = broker.routing().lock();
@@ -521,6 +522,46 @@ pub(crate) struct Dispatcher<'s> {
     cancellation: *const DrCancellationV1,
     linked: usize,
     registered: bool,
+    /// A watched source's handle. It is outside the port, so each sleeping
+    /// wait covers it with a thread-pool wait that pokes the port.
+    wake: Option<NativeHandle>,
+}
+
+/// One thread-pool wait on a handle outside the completion port. When the
+/// handle is signaled its callback wakes the broker once, the way a
+/// cancellation does. Dropping it returns only after a running callback has
+/// finished, so nothing refers to the broker afterwards.
+struct HandleWake(NativeHandle);
+
+impl HandleWake {
+    unsafe fn arm(handle: NativeHandle, broker: &Broker) -> Result<Self, Failure> {
+        let mut wait = ptr::null_mut();
+        if crate::win32::RegisterWaitForSingleObject(
+            &mut wait,
+            handle,
+            wake_broker,
+            ptr::from_ref(broker).cast_mut().cast(),
+            INFINITE,
+            crate::win32::WT_EXECUTEONLYONCE,
+        ) == 0
+        {
+            return Err(last_failure());
+        }
+        Ok(Self(wait))
+    }
+}
+
+impl Drop for HandleWake {
+    fn drop(&mut self) {
+        unsafe {
+            crate::win32::UnregisterWaitEx(self.0, crate::win32::INVALID_HANDLE_VALUE);
+        }
+    }
+}
+
+unsafe extern "system" fn wake_broker(context: *mut c_void, _timed_out: u8) {
+    // A poke that cannot be posted leaves the wait to its timeout.
+    let _ = crate::cancellation::WakeTarget::wake(&*context.cast::<Broker>());
 }
 
 impl Dispatcher<'_> {
@@ -1097,8 +1138,30 @@ unsafe impl GroupDriver for Dispatcher<'_> {
 
     fn wait_any(&mut self, timeout: u32, _: Option<usize>) -> Result<Wake, Failure> {
         unsafe {
+            // An immediate poll does not sleep, and the group has just asked
+            // the watched source itself.
+            let _wake = match self.wake {
+                Some(handle) if timeout != 0 => Some(HandleWake::arm(handle, self.broker)?),
+                _ => None,
+            };
             self.broker
                 .wait(self.group, timeout, self.cancellation, None)
+        }
+    }
+
+    unsafe fn attach_wake(&mut self, handle: NativeHandle) -> Result<(), Failure> {
+        // One watched handle at a time: every watchable source today is the
+        // one console.
+        if self.wake.is_some() {
+            return Err(Failure::unsupported());
+        }
+        self.wake = Some(handle);
+        Ok(())
+    }
+
+    unsafe fn detach_wake(&mut self, handle: NativeHandle) {
+        if self.wake == Some(handle) {
+            self.wake = None;
         }
     }
 

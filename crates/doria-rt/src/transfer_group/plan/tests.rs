@@ -133,7 +133,7 @@ fn moving_appending_and_dropping_plan_preserves_caller_storage() {
         )
         .unwrap_or_else(|_| panic!("plan construction failed"));
         assert_eq!(
-            bytes(&plan.entries.as_slice()[0].buffer).as_ptr(),
+            bytes(plan.entries.as_slice()[0].buffer()).as_ptr(),
             destination_pointer
         );
         let plan = plan
@@ -148,10 +148,10 @@ fn moving_appending_and_dropping_plan_preserves_caller_storage() {
         let moved = plan;
         let entries = moved.entries.as_slice();
         assert_eq!(entries.len(), 2);
-        assert_eq!(bytes(&entries[0].buffer).as_ptr(), destination_pointer);
-        assert_eq!(bytes(&entries[0].buffer), &[0xa5; 4]);
-        assert_eq!(bytes(&entries[1].buffer).as_ptr(), source_pointer);
-        assert_eq!(bytes(&entries[1].buffer), &[1, 2, 3]);
+        assert_eq!(bytes(entries[0].buffer()).as_ptr(), destination_pointer);
+        assert_eq!(bytes(entries[0].buffer()), &[0xa5; 4]);
+        assert_eq!(bytes(entries[1].buffer()).as_ptr(), source_pointer);
+        assert_eq!(bytes(entries[1].buffer()), &[1, 2, 3]);
     }
     assert_eq!(destination.as_ptr(), destination_pointer);
     assert_eq!(destination, [0xa5; 4]);
@@ -266,15 +266,15 @@ fn invalid_keys_reject_before_append_allocation_and_return_both_loans() {
             assert_eq!(returned.entries.raw(0), descriptor_pointer);
             let entry = &returned.entries.as_slice()[0];
             assert_eq!(
-                entry.key,
+                entry.key(),
                 PlanKey {
                     owner: OWNER,
                     value: 10
                 }
             );
-            assert!(matches!(&entry.buffer, Buffer::Read(_)));
-            assert_eq!(bytes(&entry.buffer).as_ptr(), original_pointer);
-            assert_eq!(bytes(&entry.buffer), &[0xa1; 3]);
+            assert!(matches!(entry.buffer(), Buffer::Read(_)));
+            assert_eq!(bytes(entry.buffer()).as_ptr(), original_pointer);
+            assert_eq!(bytes(entry.buffer()), &[0xa1; 3]);
             assert!(matches!(&buffer, Buffer::Read(_)));
             assert_eq!(bytes(&buffer).as_ptr(), incoming_pointer);
             assert_eq!(bytes(&buffer), &[0xb2; 4]);
@@ -360,23 +360,23 @@ fn invalid_preparation_preserves_original_plan_before_runtime_allocation() {
             assert_eq!(returned.entries.raw(0), descriptor_pointer);
             let entries = returned.entries.as_slice();
             assert_eq!(
-                entries[0].key,
+                entries[0].key(),
                 PlanKey {
                     owner: OWNER,
                     value: 10
                 }
             );
             assert_eq!(
-                entries[1].key,
+                entries[1].key(),
                 PlanKey {
                     owner: OWNER,
                     value: 30
                 }
             );
-            assert_eq!(bytes(&entries[0].buffer).as_ptr(), first_pointer);
-            assert_eq!(bytes(&entries[1].buffer).as_ptr(), third_pointer);
-            assert_eq!(bytes(&entries[0].buffer), &[0xc3; 3]);
-            assert_eq!(bytes(&entries[1].buffer), &[0xd4; 4]);
+            assert_eq!(bytes(entries[0].buffer()).as_ptr(), first_pointer);
+            assert_eq!(bytes(entries[1].buffer()).as_ptr(), third_pointer);
+            assert_eq!(bytes(entries[0].buffer()), &[0xc3; 3]);
+            assert_eq!(bytes(entries[1].buffer()), &[0xd4; 4]);
         }
         assert_eq!(first, [0xc3; 3]);
         assert_eq!(third, [0xd4; 4]);

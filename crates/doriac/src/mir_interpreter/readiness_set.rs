@@ -65,6 +65,28 @@ impl Interpreter<'_> {
         }
     }
 
+    /// What a read of `length` bytes from this source waits for, when it
+    /// cannot complete yet. Files and the scripted standard input always have
+    /// bytes or their end; a live child's output can have neither.
+    pub(super) fn readiness_source_read_wait(
+        &self,
+        source: Source,
+        length: usize,
+    ) -> Result<Option<&'static str>, InterpreterError> {
+        let Source::File(file) = source else {
+            return Ok(None);
+        };
+        match self.file_owners.get(&file) {
+            Some(owner) if owner.open => match owner.pipe {
+                Some(pipe) if self.child_pipe_read_waits(pipe, length)? => {
+                    Ok(Some(child_process::CHILD_OUTPUT_WAIT))
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn readiness_source_target(
         &self,
         source: Source,

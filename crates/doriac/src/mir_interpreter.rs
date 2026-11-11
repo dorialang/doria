@@ -2929,9 +2929,11 @@ impl<'a> Interpreter<'a> {
                     | mir::CheckedIoOperation::BeginTransferGroup { .. }
                     | mir::CheckedIoOperation::ObserveTransferGroup { .. }
                     | mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+                    | mir::CheckedIoOperation::WatchTransferPlan { .. }
                     | mir::CheckedIoOperation::TransferPlanKey { .. }
                     | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
                     | mir::CheckedIoOperation::ResubmitTransfer { .. }
+                    | mir::CheckedIoOperation::ResubmitWatch { .. }
                     | mir::CheckedIoOperation::RegisterReadinessStream { .. }
                     | mir::CheckedIoOperation::UnregisterReadinessStream { .. }
                     | mir::CheckedIoOperation::BorrowReadinessStream { .. }
@@ -14354,6 +14356,15 @@ impl<'a> Interpreter<'a> {
                 region,
                 reading,
             } => self.configure_transfer_plan(class, previous, key, region, reading)?,
+            mir::CheckedIoOperation::WatchTransferPlan {
+                class,
+                previous,
+                identity,
+                ..
+            } => self.watch_transfer_plan(class, previous, identity)?,
+            mir::CheckedIoOperation::ResubmitWatch { group, key } => {
+                self.resubmit_watch(group, key)?
+            }
             mir::CheckedIoOperation::NewReadinessSet { class } => {
                 let object = self.next_object;
                 self.next_object += 1;
@@ -20262,6 +20273,7 @@ mod tests {
             crate::inline_value::InlineValueType::RegistrationKey(class),
             crate::inline_value::InlineValueType::ReadTransferKey(class),
             crate::inline_value::InlineValueType::WriteTransferKey(class),
+            crate::inline_value::InlineValueType::WatchKey(class),
         ] {
             for bits in [0, (1_u128 << 96) | 27, u128::MAX] {
                 let scalar = mir::ScalarType::Inline(ty);

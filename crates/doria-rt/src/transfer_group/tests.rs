@@ -7,6 +7,7 @@ use doria_diagnostic_catalogue::IoMessageOperation;
 
 mod observation_tests;
 mod prepared_source_tests;
+mod watch_tests;
 
 struct TestRequest {
     terminal: usize,

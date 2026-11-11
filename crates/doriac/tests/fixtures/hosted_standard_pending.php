@@ -279,7 +279,8 @@ $begin = static function(__TestStandardPending $device, bool $usesHome,
     $member = new __DoriaPendingMember(__DoriaCell::borrowed($device), 'source', $usesHome,
         $reading ? ['prepare', $flags & 7] : null, $reading ? [$complete, $flags] : null,
         $reading ? null : ['prepare', $flags & 7], $reading ? null : [$complete, $flags]);
-    return __DoriaHostedTransferGroup::begin($set, $plan[0], [['device', $region, $reading]],
+    // The third element is the operation's kind: 1 a read, 0 a write.
+    return __DoriaHostedTransferGroup::begin($set, $plan[0], [['device', $region, (int) $reading]],
         ['device' => $member], null, null);
 };
 
@@ -309,7 +310,7 @@ foreach ([0, 1, 2] as $stream) {
             throw new LogicException('standard group changed bytes, outcome or callback count');
         }
         if ($bytes->toArray() !== [255, 0, 81]) { throw new LogicException('binary input changed'); }
-        $key = $group->observed($stream === 0);
+        $key = $group->observed($stream === 0 ? 1 : 0);
         if ($key === null) { throw new LogicException('observed key missing'); }
         $keyWords = $runtime->new('int64_t[2]');
         $key->__doriaWriteNativeTransferKey($keyWords);
@@ -347,7 +348,7 @@ foreach ([0, 1, 2] as $stream) {
             if ($group->observe(1, 0, 0) !== 0 || $group->outcome->tag !== 0 || $group->outcome->count !== 0) {
                 throw new LogicException('empty standard transfer changed its outcome');
             }
-            $seen = $group->observed($stream === 0);
+            $seen = $group->observed($stream === 0 ? 1 : 0);
             if ($seen === null || get_class($seen) !== $keyClass) {
                 throw new LogicException('repeated observation lost its directional key');
             }

@@ -428,6 +428,32 @@ behavior that keeps those sections true, and each is covered by a test.
 - `Closed` is reported once the terminal behind standard input has gone
   away, after every key already read.
 
+**Group wait**
+
+- `RawMode` exposes a readonly `Doria\Std\Io\WatchSource $watchSource`, the
+  one member `Watchable` requires. The value is opaque; programs have no use
+  for it beyond passing the `RawMode` to a plan.
+- The group and `getNextEvent` share one event queue, decoder and reader. A
+  group asks the terminal by reading what has already arrived into that queue
+  and taking nothing out.
+- Unix: while a watch is armed, the terminal's own wait descriptor (the one
+  that covers standard input and the resize notice) is a member of the
+  group's wait, so standard input is never registered twice. A lone Escape
+  shortens the group's wait to the end of its delay. No thread and no extra
+  signal handler exist for this.
+- Windows: the console input handle cannot join a completion port, so each
+  sleeping wait registers a one-shot thread-pool wait on it that wakes the
+  port, and removes it when the wait returns. One group can watch one such
+  handle; the console is the only one today.
+- Console output still waiting is written before a group sleeps on an armed
+  watch, as it is before `getNextEvent` waits.
+- Leaving or moving a `RawMode` that a plan or group watches is E0763, whose
+  help now says to end the value that holds the loan first. A class in a
+  program that declares `Watchable` is E0781.
+- Standard-library modules may use each other's `internal` members. Before,
+  that was limited to one module; `RawMode` building its watch identity
+  needed the wider rule. Programs still cannot reach any of them.
+
 **Standard views**
 
 - `$isInteractive` asks the terminal runtime through the packed operation

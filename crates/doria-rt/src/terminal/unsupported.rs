@@ -29,6 +29,14 @@ pub(super) unsafe fn await_event(
     Ok(Observation::Closed)
 }
 
+pub(super) unsafe fn events_waiting() -> Result<super::Watched, Refusal> {
+    Ok(super::Watched::Ready)
+}
+
+pub(super) unsafe fn event_handle() -> Option<crate::native_handle::NativeHandle> {
+    None
+}
+
 pub(super) unsafe fn cursor_position() -> Result<(u32, u32), Refusal> {
     Err(Refusal::not_a_terminal())
 }

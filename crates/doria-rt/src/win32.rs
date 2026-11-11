@@ -172,6 +172,20 @@ pub(crate) struct ProcessInformation {
 #[cfg(windows)]
 pub(crate) type ThreadStart = extern "system" fn(parameter: *mut c_void) -> u32;
 
+/// The callback of `RegisterWaitForSingleObject`. The second argument is
+/// nonzero when the wait timed out instead of being signaled.
+#[cfg(windows)]
+pub(crate) type WaitCallback = unsafe extern "system" fn(context: *mut c_void, timed_out: u8);
+
+/// `WT_EXECUTEONLYONCE`: the wait ends after its callback has run once.
+#[cfg(windows)]
+pub(crate) const WT_EXECUTEONLYONCE: u32 = 0x0000_0008;
+
+/// `INVALID_HANDLE_VALUE`. Passed to `UnregisterWaitEx`, it makes the call
+/// return only after a running callback has finished.
+#[cfg(windows)]
+pub(crate) const INVALID_HANDLE_VALUE: NativeHandle = usize::MAX as NativeHandle;
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -309,6 +323,16 @@ unsafe extern "system" {
         wait_all: i32,
         milliseconds: u32,
     ) -> u32;
+    // A thread-pool wait: the callback runs once the object is signaled.
+    pub(crate) fn RegisterWaitForSingleObject(
+        wait: *mut NativeHandle,
+        object: NativeHandle,
+        callback: WaitCallback,
+        context: *mut c_void,
+        milliseconds: u32,
+        flags: u32,
+    ) -> i32;
+    pub(crate) fn UnregisterWaitEx(wait: NativeHandle, completion_event: NativeHandle) -> i32;
     pub(crate) fn CreateIoCompletionPort(
         handle: NativeHandle,
         port: NativeHandle,

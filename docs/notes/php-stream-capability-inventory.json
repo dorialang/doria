@@ -1172,7 +1172,7 @@
                 "Windows console handles differ from redirected handles"
             ],
             "doriaClassification": "Existing Doria Runtime Substrate",
-            "doriaOwner": "Doria\\Std\\Term",
+            "doriaOwner": "Doria\\Std\\Io",
             "doriaCapability": "standard-stream-interactivity",
             "doriaCandidateSpelling": null,
             "doriaStatus": "v1-required",
@@ -1184,9 +1184,11 @@
             "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "metadata",
             "semanticDifferences": [
-                "Runtime detection exists; public terminal owner lands at Stage 46"
+                "A fact about a standard device, so it belongs to Io, not Term (Decision 0140): each standard view has a readonly bool $isInteractive",
+                "It never fails and does not borrow the device, so it answers while a pending transfer holds the stream",
+                "Only the three standard streams answer; an arbitrary handle has no such question in v1.0"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
             "notes": ""

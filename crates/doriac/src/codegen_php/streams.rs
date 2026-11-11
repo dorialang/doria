@@ -51,16 +51,14 @@ public function __doriaBegin(FFI\CData $set, array $members, mixed $deadline, mi
     $this->__doriaTransferOperations = [];
     return __DoriaHostedTransferGroup::begin($set, $plan, $operations, $members, $deadline, $cancellation);
 }
+// Each entry is [member identity, region, kind] at its plan position. Kind is
+// the runtime's: 0 a write, 1 a read, 2 a watch, which has neither of the others.
 private static function __doriaConfigure(?FFI\CData $previous, array $operations, FFI\CData $key,
     __DoriaByteRegion $region, bool $reading, string $identity): self
 {
     $runtime = __DoriaNativeIo::get();
-    $result = $runtime->new('void *[1]');
-    $message = $runtime->new('DrStringV1 *[1]');
-    $path = $runtime->new('DrStringV1 *[1]');
-    $system = $runtime->new('int64_t[1]');
-    $transferred = $runtime->new('size_t[1]');
-    $meta = $runtime->new('uint64_t[1]');
+    $outputs = self::__doriaPlanOutputs($runtime);
+    [$result, $message, $path, $system, $transferred, $meta] = $outputs;
     $source = $region->__doriaNativeStorage($reading);
     $base = $source->__doriaNativeBase();
     $capacity = count($source);
@@ -71,9 +69,33 @@ private static function __doriaConfigure(?FFI\CData $previous, array $operations
             (int) $reading, $result, $message, $path, $system, $transferred, $meta)
         : $runtime->dr_v1_host_transfer_plan_append(null, $previous, $key, $base, $capacity, $offset, $length,
             (int) $reading, $result, $message, $path, $system, $transferred, $meta);
+    return self::__doriaPlanned($runtime, $code, $outputs, $operations, [$identity, $region, (int) $reading]);
+}
+// Only the source's one-word identity reaches the runtime, which owns the wait.
+private static function __doriaWatch(?FFI\CData $previous, array $operations, int $source): self
+{
+    $runtime = __DoriaNativeIo::get();
+    $outputs = self::__doriaPlanOutputs($runtime);
+    [$result, $message, $path, $system, $transferred, $meta] = $outputs;
+    $code = $previous === null
+        ? $runtime->dr_v1_checked_transfer_plan_watch_new(null, $source,
+            $result, $message, $path, $system, $transferred, $meta)
+        : $runtime->dr_v1_checked_transfer_plan_watch_append(null, $previous, $source,
+            $result, $message, $path, $system, $transferred, $meta);
+    return self::__doriaPlanned($runtime, $code, $outputs, $operations, [null, null, 2]);
+}
+private static function __doriaPlanOutputs(FFI $runtime): array
+{
+    return [$runtime->new('void *[1]'), $runtime->new('DrStringV1 *[1]'), $runtime->new('DrStringV1 *[1]'),
+        $runtime->new('int64_t[1]'), $runtime->new('size_t[1]'), $runtime->new('uint64_t[1]')];
+}
+private static function __doriaPlanned(FFI $runtime, int $code, array $outputs, array $operations,
+    array $operation): self
+{
+    [$result, $message, $path, $system, $transferred, $meta] = $outputs;
     try {
         if ($code === 0) {
-            $operations[] = [$identity, $region, $reading];
+            $operations[] = $operation;
             return new self($result[0], $operations);
         }
         if ($code !== 1) { __DoriaNativeIo::fail('protocol'); }
@@ -111,7 +133,20 @@ pub(super) fn emit_plan_body(
     indent: usize,
     scopes: &PhpNameScopes,
 ) {
-    if intrinsic.is_key_lookup() {
+    use crate::compiler_known_stream::TransferPlanFunction as Plan;
+    use crate::native_abi::{TRANSFER_KIND_READ, TRANSFER_KIND_WATCH, TRANSFER_KIND_WRITE};
+    let key_kind = match intrinsic {
+        Plan::GetWriteKey => Some(TRANSFER_KIND_WRITE),
+        Plan::GetReadKey => Some(TRANSFER_KIND_READ),
+        Plan::GetWatchKey => Some(TRANSFER_KIND_WATCH),
+        Plan::Read
+        | Plan::AndReadFrom
+        | Plan::WriteTo
+        | Plan::AndWriteTo
+        | Plan::StartWatch
+        | Plan::AppendWatch => None,
+    };
+    if let Some(kind) = key_kind {
         let position = intrinsic_parameter(function, 0, scopes);
         let key_type = scopes
             .specialization
@@ -122,8 +157,7 @@ pub(super) fn emit_plan_body(
                     .expect("key lookup returns a value"),
                 &scopes.substitutions,
             )
-            .expect("key lookup returns its exact directional key");
-        let reading = if intrinsic.is_read() { 1 } else { 0 };
+            .expect("key lookup returns its exact key");
         for line in [
             "$runtime = __DoriaNativeIo::get();".to_string(),
             "$key = $runtime->new('int64_t[2]');".into(),
@@ -132,7 +166,7 @@ pub(super) fn emit_plan_body(
             "$system = $runtime->new('int64_t[1]');".into(),
             "$transferred = $runtime->new('size_t[1]');".into(),
             "$meta = $runtime->new('uint64_t[1]');".into(),
-            format!("$code = $runtime->dr_v1_checked_transfer_plan_key(null, $this->__doriaTransferPlan, {position}, {reading}, $key, $message, $path, $system, $transferred, $meta);"),
+            format!("$code = $runtime->dr_v1_checked_transfer_plan_key(null, $this->__doriaTransferPlan, {position}, {kind}, $key, $message, $path, $system, $transferred, $meta);"),
             "try {".into(),
             format!("    if ($code === 0) {{ return {key_type}::__doriaFromTransferKey($key[0], $key[1]); }}"),
             "    if ($code !== 1) { __DoriaNativeIo::fail('protocol'); }".into(),
@@ -149,8 +183,6 @@ pub(super) fn emit_plan_body(
         }
         return;
     }
-    let key = intrinsic_parameter(function, 0, scopes);
-    let region = intrinsic_parameter(function, 1, scopes);
     let previous = if intrinsic.is_appending() {
         writeln(output, indent, "$previous = $this->__doriaTransferPlan;");
         writeln(output, indent, "if ($previous === null) { throw new LogicException('consumed transfer plan was used'); }");
@@ -166,6 +198,21 @@ pub(super) fn emit_plan_body(
         writeln(output, indent, "$operations = [];");
         "null"
     };
+    if intrinsic.is_watch() {
+        // Parameter 0 is the watched source, which only lends itself to the
+        // plan; parameter 1 is the one-word identity the runtime waits on.
+        let identity = intrinsic_parameter(function, 1, scopes);
+        writeln(
+            output,
+            indent,
+            &format!(
+                "return self::__doriaWatch({previous}, $operations, {identity}->__doriaLowWord());"
+            ),
+        );
+        return;
+    }
+    let key = intrinsic_parameter(function, 0, scopes);
+    let region = intrinsic_parameter(function, 1, scopes);
     let reading = if intrinsic.is_read() { "true" } else { "false" };
     writeln(output, indent, &format!("return self::__doriaConfigure({previous}, $operations, {key}->__doriaNativeRegistration(), {region}, {reading}, {key}->__doriaRegistrationIdentity());"));
 }
@@ -747,6 +794,8 @@ pub(super) fn emit_body(
             );
         }
         FileFunction::AskTerminal => term::emit_operate(output, indent),
+        // The same inline carrier as the Term module's one-word values.
+        FileFunction::WatchSourceFromBits => writeln(output, indent, "return new self($bits);"),
         FileFunction::UnavailableConstructor if scopes.file_payload => {
             // Only the backend factory calls this private payload constructor.
             // The compiler-owned source constructor remains unavailable.
@@ -1916,11 +1965,11 @@ require $path;
             r#"
 use Doria\Std\Time\{Duration, Deadline};
 use Doria\Std\Io\{RegistrationKey, ReadableFile, ReadTransferKey, WriteTransferKey,
-    StandardInput, StandardOutput, StandardError, TransferGroup};
+    WatchKey, WatchSource, StandardInput, StandardOutput, StandardError, TransferGroup};
 use Doria\Std\Concurrency\CancellationToken;
 function carriers(Duration $duration, Deadline $deadline, RegistrationKey<ReadableFile> $registration,
-    ReadTransferKey $read, WriteTransferKey $write, StandardInput $input,
-    StandardOutput $output, StandardError $error, CancellationToken $token,
+    ReadTransferKey $read, WriteTransferKey $write, WatchKey $watch, WatchSource $watched,
+    StandardInput $input, StandardOutput $output, StandardError $error, CancellationToken $token,
     TransferGroup $group): void {}
 function main(): void {}
 "#,
@@ -1941,7 +1990,7 @@ function scalarWordBody(ReflectionMethod $method): void {
     }
 }
 $parameters = (new ReflectionFunction('__DORIA_CARRIERS__'))->getParameters();
-$widths = [1, 2, 2, 2, 2, 1, 1, 1];
+$widths = [1, 2, 2, 2, 2, 2, 1, 1, 1, 1];
 foreach ($widths as $index => $width) {
     $class = new ReflectionClass($parameters[$index]->getType()->getName());
     foreach (['__doriaLowWord', '__doriaHighWord'] as $name) {
@@ -1962,7 +2011,7 @@ foreach ($widths as $index => $width) {
         }
     }
 }
-$managed = $parameters[8]->getType()->getName();
+$managed = $parameters[10]->getType()->getName();
 if (method_exists($managed, '__doriaLowWord') || method_exists($managed, '__doriaHighWord')) {
     throw new LogicException('managed Copy acquired unretained word transport');
 }
@@ -2352,6 +2401,8 @@ function main(): void {
             ),
             ("ReadKey", "Doria\\Std\\Io\\ReadTransferKey", 2),
             ("WriteKey", "Doria\\Std\\Io\\WriteTransferKey", 2),
+            ("WatchKey", "Doria\\Std\\Io\\WatchKey", 2),
+            ("WatchSource", "Doria\\Std\\Io\\WatchSource", 1),
             ("Input", "Doria\\Std\\Io\\StandardInput", 1),
             ("Output", "Doria\\Std\\Io\\StandardOutput", 1),
             ("Error", "Doria\\Std\\Io\\StandardError", 1),

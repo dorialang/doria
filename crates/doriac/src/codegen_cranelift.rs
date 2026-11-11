@@ -6770,6 +6770,7 @@ fn lower_checked_io_terminator(
             | mir::CheckedIoOperation::ObserveTransferGroup { .. }
             | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
             | mir::CheckedIoOperation::ResubmitTransfer { .. }
+            | mir::CheckedIoOperation::ResubmitWatch { .. }
     ) {
         return readiness_set::lower(
             builder, operation, result, error, success, failure, span, resources,
@@ -6794,6 +6795,7 @@ fn lower_checked_io_terminator(
     if matches!(
         operation,
         mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+            | mir::CheckedIoOperation::WatchTransferPlan { .. }
             | mir::CheckedIoOperation::TransferPlanKey { .. }
     ) {
         return lower_checked_transfer_plan(
@@ -6819,8 +6821,10 @@ fn lower_checked_io_terminator(
         | mir::CheckedIoOperation::BeginTransferGroup { .. }
         | mir::CheckedIoOperation::ObserveTransferGroup { .. }
         | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
-        | mir::CheckedIoOperation::ResubmitTransfer { .. } => unreachable!(),
+        | mir::CheckedIoOperation::ResubmitTransfer { .. }
+        | mir::CheckedIoOperation::ResubmitWatch { .. } => unreachable!(),
         mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+        | mir::CheckedIoOperation::WatchTransferPlan { .. }
         | mir::CheckedIoOperation::TransferPlanKey { .. } => unreachable!(),
         mir::CheckedIoOperation::NewReadinessSet { .. } => (
             CHECKED_IO_NEW_READINESS_SET,
@@ -7489,18 +7493,15 @@ fn lower_checked_transfer_plan(
             local_slot(resources.local_slots, *position)?,
             0,
         );
-        let reading = builder.ins().iconst(
-            types::I8,
-            i64::from(matches!(
-                key,
-                crate::inline_value::InlineValueType::ReadTransferKey(_)
-            )),
-        );
+        let kind = key
+            .transfer_entry_kind()
+            .ok_or_else(|| malformed_mir("transfer key lookup names no key type"))?;
+        let kind = builder.ins().iconst(types::I8, i64::from(kind));
         let address =
             builder
                 .ins()
                 .stack_addr(pointer, local_slot(resources.local_slots, result)?, 0);
-        let mut args = vec![resources.current_frame, plan, position, reading, address];
+        let mut args = vec![resources.current_frame, plan, position, kind, address];
         args.extend(
             [2, 3, 4, 7, 8].map(|index| builder.ins().stack_addr(pointer, slots[index], 0)),
         );
@@ -7526,6 +7527,48 @@ fn lower_checked_transfer_plan(
         .ok_or_else(|| backend_failure("transfer key lookup produced no status"))?;
         return finish_checked_resource(
             builder, operation, None, error, success, failure, status, slots, resources,
+        );
+    }
+    if let mir::CheckedIoOperation::WatchTransferPlan {
+        previous, identity, ..
+    } = operation
+    {
+        set_active_panic_site(builder, span, resources);
+        let pointer = resources.module.target_config().pointer_type();
+        let slots = checked_io_output_slots(builder, pointer);
+        // Only the source's one-word identity crosses; the plan's loan of
+        // the source itself is the checker's business.
+        let identity = builder.ins().stack_load(
+            pointer,
+            types::I64,
+            local_slot(resources.local_slots, *identity)?,
+            0,
+        );
+        let mut args = vec![resources.current_frame];
+        let mut params = vec![pointer];
+        if let Some(previous) = previous {
+            let slot = local_slot(resources.local_slots, *previous)?;
+            let owner = builder.ins().stack_load(pointer, pointer, slot, 0);
+            let zero = builder.ins().iconst(pointer, 0);
+            builder.ins().stack_store(pointer, zero, slot, 0);
+            args.push(owner);
+            params.push(pointer);
+        }
+        args.push(identity);
+        params.push(types::I64);
+        for index in [1, 2, 3, 4, 7, 8] {
+            args.push(builder.ins().stack_addr(pointer, slots[index], 0));
+            params.push(pointer);
+        }
+        let name = if previous.is_some() {
+            "dr_v1_checked_transfer_plan_watch_append"
+        } else {
+            "dr_v1_checked_transfer_plan_watch_new"
+        };
+        let status = runtime_call(builder, name, &params, Some(types::I8), &args, resources)?
+            .ok_or_else(|| backend_failure("watch plan produced no status"))?;
+        return finish_checked_resource(
+            builder, operation, result, error, success, failure, status, slots, resources,
         );
     }
     let mir::CheckedIoOperation::ConfigureTransferPlan {
@@ -19499,19 +19542,16 @@ fn lower_nullable_scalar_expression(
             ));
             let output = builder.ins().stack_addr(pointer, slot, 0);
             zero_inline_bytes(builder, output, 16, pointer);
-            let reading = builder.ins().iconst(
-                types::I8,
-                i64::from(matches!(
-                    key,
-                    crate::inline_value::InlineValueType::ReadTransferKey(_)
-                )),
-            );
+            let kind = key
+                .transfer_entry_kind()
+                .ok_or_else(|| malformed_mir("observed key names no key type"))?;
+            let kind = builder.ins().iconst(types::I8, i64::from(kind));
             let status = runtime_call(
                 builder,
                 "dr_v1_transfer_adapter_group_observed",
                 &[pointer, types::I8, pointer],
                 Some(types::I8),
-                &[owner, reading, output],
+                &[owner, kind, output],
                 resources,
             )?
             .ok_or_else(|| backend_failure("observed key produced no presence"))?;

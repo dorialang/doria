@@ -247,6 +247,26 @@ impl Interpreter<'_> {
         observation
     }
 
+    /// Whether a watch of raw mode `generation` is ready: whether an immediate
+    /// event wait would observe something other than `TimedOut`. Readiness
+    /// takes no event from the script. A scripted `TimedOut` is one moment in
+    /// which the terminal had nothing, and whoever asks uses it up.
+    pub(super) fn terminal_watch_ready(&mut self, generation: u32) -> bool {
+        let state = &mut self.terminal;
+        if !state.raw_mode_is(generation) {
+            return true;
+        }
+        let next = state
+            .script
+            .as_ref()
+            .and_then(|script| script.events.get(state.observed));
+        if next == Some(&Observation::TimedOut) {
+            state.observed += 1;
+            return false;
+        }
+        true
+    }
+
     /// What the runtime does when a process ends: the terminal goes back the
     /// way the program found it.
     pub(super) fn terminal_ending(&mut self) {

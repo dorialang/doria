@@ -42,6 +42,12 @@ impl TerminalWatch {
         Ok(Self { set })
     }
 
+    /// This watch as one descriptor another readiness set can wait on: it is
+    /// readable exactly while the input or the notice is.
+    pub(crate) fn handle(&self) -> Result<i32, Failure> {
+        self.set.handle()
+    }
+
     /// # Safety
     /// `cancellation` is null or a live cancellation state.
     pub(crate) unsafe fn wait(

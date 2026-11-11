@@ -33,6 +33,7 @@ function verifyRead(TransferWaitResult $result, ReadTransferKey $expected, ?Read
         TransferWaitResult::Completed($completion) => match ($completion) {
             TransferCompletion::Read($key, $outcome) => $key == $expected && $outcome == $actual,
             TransferCompletion::Write($key, $outcome) => false,
+            TransferCompletion::Ready($key) => false,
         },
         TransferWaitResult::TimedOut => false,
         TransferWaitResult::Exhausted => false,
@@ -43,6 +44,7 @@ function verifyWrite(TransferWaitResult $result, WriteTransferKey $expected, ?Wr
         TransferWaitResult::Completed($completion) => match ($completion) {
             TransferCompletion::Read($key, $outcome) => false,
             TransferCompletion::Write($key, $outcome) => $key == $expected && $outcome == $actual,
+            TransferCompletion::Ready($key) => false,
         },
         TransferWaitResult::TimedOut => false,
         TransferWaitResult::Exhausted => false,
@@ -65,7 +67,7 @@ fn completion_and_wait_results_are_nominal_nested_inline_copy_values() {
     let program =
         doriac::lower_source_to_mir("completion-shape.doria", completion_source()).unwrap();
     for (name, cases) in [
-        (doriac::compiler_known_stream::TRANSFER_COMPLETION, 2),
+        (doriac::compiler_known_stream::TRANSFER_COMPLETION, 3),
         (doriac::compiler_known_stream::TRANSFER_WAIT_RESULT, 3),
     ] {
         let definition = program
@@ -150,6 +152,11 @@ fn completion_construction_requires_exact_keys_outcomes_and_wait_cases() {
             "TransferCompletion::TimedOut => false,",
         ),
         source.replace("TransferWaitResult::Exhausted => false,", ""),
+        source.replace("TransferCompletion::Ready($key) => false,", ""),
+        source.replace(
+            "TransferCompletion::Ready($key) => false,",
+            "TransferCompletion::Ready($key, $outcome) => false,",
+        ),
     ] {
         assert!(
             doriac::check_source("invalid-completion.doria", &invalid).is_err(),

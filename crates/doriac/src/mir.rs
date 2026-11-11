@@ -6207,6 +6207,20 @@ pub enum CheckedIoOperation {
         region: LocalId,
         reading: bool,
     },
+    /// Adds a watch to a plan (Decision 0140). The plan retains a shared loan of
+    /// `source`; only `identity`, its one-word `WatchSource`, reaches the runtime.
+    /// Append consumes `previous` on either edge, like `ConfigureTransferPlan`.
+    WatchTransferPlan {
+        class: ClassId,
+        previous: Option<LocalId>,
+        source: LocalId,
+        identity: LocalId,
+    },
+    /// Arms a watch again after its `Ready` was fetched.
+    ResubmitWatch {
+        group: LocalId,
+        key: LocalId,
+    },
     NewReadinessSet {
         class: ClassId,
     },
@@ -7102,9 +7116,11 @@ fn checked_io_class_temporary_capacity(operation: &CheckedIoOperation) -> usize 
     match operation {
         CheckedIoOperation::ObserveTransferGroup { .. } => 0,
         CheckedIoOperation::ConfigureTransferPlan { .. }
+        | CheckedIoOperation::WatchTransferPlan { .. }
         | CheckedIoOperation::BeginTransferGroup { .. }
         | CheckedIoOperation::TransferGroupReadRegion { .. }
         | CheckedIoOperation::ResubmitTransfer { .. }
+        | CheckedIoOperation::ResubmitWatch { .. }
         | CheckedIoOperation::TransferPlanKey { .. } => 0,
         CheckedIoOperation::NewReadinessSet { .. }
         | CheckedIoOperation::RegisterReadinessStream { .. }

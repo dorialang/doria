@@ -11,6 +11,7 @@ pub(super) fn emit_runtime(output: &mut String) {
         "WriteOutcome",
         "ReadTransferKey",
         "WriteTransferKey",
+        "WatchKey",
         "TransferCompletion",
         "TransferWaitResult",
     ] {
@@ -55,19 +56,17 @@ pub(in crate::codegen_php) fn emit_group_body(
     scopes: &mut PhpNameScopes,
 ) {
     use crate::compiler_known_stream::TransferGroupFunction;
+    use crate::native_abi::{TRANSFER_KIND_READ, TRANSFER_KIND_WATCH, TRANSFER_KIND_WRITE};
     if intrinsic == TransferGroupFunction::NextCompletion {
         emit_completion_body(function, parameters, output, indent, scopes);
         return;
     }
+    let observed = |kind: u8| format!("return $this->__doriaTransferGroup->observed({kind});");
     let body = match intrinsic {
         TransferGroupFunction::NextCompletion => unreachable!(),
-        TransferGroupFunction::ObservedReadKey | TransferGroupFunction::ObservedWriteKey => {
-            let reading = intrinsic == TransferGroupFunction::ObservedReadKey;
-            format!(
-                "return $this->__doriaTransferGroup->observed({});",
-                if reading { "true" } else { "false" }
-            )
-        }
+        TransferGroupFunction::ObservedReadKey => observed(TRANSFER_KIND_READ),
+        TransferGroupFunction::ObservedWriteKey => observed(TRANSFER_KIND_WRITE),
+        TransferGroupFunction::ObservedWatchKey => observed(TRANSFER_KIND_WATCH),
         TransferGroupFunction::ReadRegion => {
             assert!(
                 scopes.value_return.is_some(),
@@ -91,6 +90,12 @@ pub(in crate::codegen_php) fn emit_group_body(
                 intrinsic_parameter(function, 2, scopes)
             )
         }
+        TransferGroupFunction::ResubmitWatch => {
+            format!(
+                "$this->__doriaTransferGroup->resubmitWatch({});",
+                intrinsic_parameter(function, 0, scopes)
+            )
+        }
     };
     writeln(output, indent, &body);
 }
@@ -102,6 +107,7 @@ fn emit_completion_body(
     indent: usize,
     scopes: &mut PhpNameScopes,
 ) {
+    use crate::native_abi::{TRANSFER_KIND_READ, TRANSFER_KIND_WATCH, TRANSFER_KIND_WRITE};
     use value_result::CaseArgument::{Result, Scalar};
     let wait = value_result::intrinsic_parameter(
         function,
@@ -135,39 +141,52 @@ fn emit_completion_body(
             &format!("if ($code === {code}) {{ {call} return; }}"),
         );
     }
+    // 0 carries an outcome, 4 a transfer with none, 9 a completed watch.
     writeln(
         output,
         indent,
-        "if ($code !== 0 && $code !== 4) { __DoriaNativeIo::fail('protocol'); }",
+        "if ($code !== 0 && $code !== 4 && $code !== 9) { __DoriaNativeIo::fail('protocol'); }",
     );
-    writeln(output, indent, "$reading = $group->isReadCompletion();");
-    writeln(output, indent, "$key = $group->observed($reading);");
+    writeln(output, indent, "$kind = $group->completionKind();");
+    writeln(output, indent, "$key = $group->observed($kind);");
     writeln(
         output,
         indent,
-        "if ($key === null) { __DoriaNativeIo::fail('protocol'); }",
+        &format!(
+            "if ($key === null || ($kind === {TRANSFER_KIND_WATCH}) !== ($code === 9)) {{ __DoriaNativeIo::fail('protocol'); }}"
+        ),
     );
     // Adapter dispatch can use the same channel. Publish only this observation.
     value_result::clear(output, indent);
-    for (reading, name, case, variants) in [
+    // `Ready` carries the watch's key and no outcome.
+    let ready = value_result::case_call(
+        "Doria\\Std\\Io\\TransferCompletion",
+        "Ready",
+        &[Scalar("$key")],
+        &scopes.specialization,
+    );
+    writeln(
+        output,
+        indent,
+        &format!("if ($kind === {TRANSFER_KIND_WATCH}) {{"),
+    );
+    writeln(output, indent + 1, &ready);
+    writeln(output, indent, "}");
+    for (kind, name, case, variants) in [
         (
-            true,
+            TRANSFER_KIND_READ,
             "Doria\\Std\\Io\\ReadOutcome",
             "Read",
             &["Data", "WouldBlock", "EndOfStream", "TimedOut"][..],
         ),
         (
-            false,
+            TRANSFER_KIND_WRITE,
             "Doria\\Std\\Io\\WriteOutcome",
             "Write",
             &["Accepted", "WouldBlock"][..],
         ),
     ] {
-        writeln(
-            output,
-            indent,
-            if reading { "if ($reading) {" } else { "else {" },
-        );
+        writeln(output, indent, &format!("elseif ($kind === {kind}) {{"));
         writeln(output, indent + 1, "if ($code === 0) {");
         writeln(output, indent + 2, "switch ($group->outcome->tag) {");
         for (tag, variant) in variants.iter().enumerate() {
@@ -195,6 +214,11 @@ fn emit_completion_body(
         writeln(output, indent + 1, &call);
         writeln(output, indent, "}");
     }
+    writeln(
+        output,
+        indent,
+        "else { __DoriaNativeIo::fail('protocol'); }",
+    );
     let call = value_result::case_call(
         result,
         "Completed",
@@ -320,11 +344,13 @@ function __doria_native_opaque_storage(int $size, int $alignment): FFI\CData
     return $runtime->new('uint64_t[' . intdiv($size + FFI::sizeof($word) - 1, FFI::sizeof($word)) . ']');
 }
 
+// Kind is the runtime's: 0 a write, 1 a read, 2 a watch. A watch waits on a
+// source the runtime owns, so it has no member and no region.
 final class __DoriaHostedOperation
 {
-    public function __construct(public readonly __DoriaPendingMember $member,
-        public readonly __DoriaByteRegion $root, public readonly bool $reading,
-        public readonly __DoriaReadTransferKey|__DoriaWriteTransferKey $key) {}
+    public function __construct(public readonly ?__DoriaPendingMember $member,
+        public readonly ?__DoriaByteRegion $root, public readonly int $kind,
+        public readonly __DoriaReadTransferKey|__DoriaWriteTransferKey|__DoriaWatchKey $key) {}
 }
 
 final class __DoriaHostedTransferGroup
@@ -357,8 +383,10 @@ final class __DoriaHostedTransferGroup
     private array $regionHomes = [];
     private array $operations = [];
 
-    // Operations contain compiler-proved member dispatch, original borrowed
-    // region and direction. The readiness set remains the sole receiver owner.
+    // Operations are indexed by plan position. A transfer contains its
+    // compiler-proved member dispatch, original borrowed region and direction;
+    // a watch contains only its key. The readiness set remains the sole
+    // receiver owner.
     private function __construct(int $operationCount)
     {
         $this->runtime = $runtime = __DoriaNativeIo::get();
@@ -417,10 +445,16 @@ final class __DoriaHostedTransferGroup
                 $instant === null ? null : FFI::addr($instant), $state, $group->statusAddress);
             if ($owner === null || FFI::isNull($owner)) { $group->throwStatus(__DoriaStdIoIoOperation::Configure, $group->status); }
             $group->owner = $owner;
-            foreach ($operations as $index => [$identity, $root, $reading]) {
+            foreach ($operations as $index => [$identity, $root, $kind]) {
+                if ($kind === 2) {
+                    // The runtime waits on a watch's source itself; the host holds only its key.
+                    $group->operations[$index] = new __DoriaHostedOperation(null, null, $kind, $keys[$index]);
+                    continue;
+                }
+                $reading = $kind === 1;
                 if (!isset($members[$identity])) { __DoriaNativeIo::fail('protocol'); }
                 $member = $members[$identity];
-                $group->operations[$index] = new __DoriaHostedOperation($member, $root, $reading, $keys[$index]);
+                $group->operations[$index] = new __DoriaHostedOperation($member, $root, $kind, $keys[$index]);
                 $request = new __DoriaPendingRequest($group->viewAddress, $group->runtime,
                     $member->receiver, $member->getter, $member->getterUsesHome, $owner);
                 $group->requests[$index] = $reading
@@ -464,14 +498,17 @@ final class __DoriaHostedTransferGroup
         $transferred = $runtime->new('size_t[1]');
         $meta = $runtime->new('uint64_t[1]');
         $keys = [];
-        foreach ($operations as $index => [, , $reading]) {
-            $code = $runtime->dr_v1_checked_transfer_plan_key(null, $plan, $index, (int) $reading,
+        foreach ($operations as $index => [, , $kind]) {
+            $code = $runtime->dr_v1_checked_transfer_plan_key(null, $plan, $index, $kind,
                 $this->key, $message, $path, $system, $transferred, $meta);
             try {
                 if ($code === 0) {
-                    $keys[] = $reading
-                        ? __DoriaReadTransferKey::__doriaFromTransferKey($this->key[0], $this->key[1])
-                        : __DoriaWriteTransferKey::__doriaFromTransferKey($this->key[0], $this->key[1]);
+                    $keys[] = match ($kind) {
+                        0 => __DoriaWriteTransferKey::__doriaFromTransferKey($this->key[0], $this->key[1]),
+                        1 => __DoriaReadTransferKey::__doriaFromTransferKey($this->key[0], $this->key[1]),
+                        2 => __DoriaWatchKey::__doriaFromTransferKey($this->key[0], $this->key[1]),
+                        default => __DoriaNativeIo::fail('protocol'),
+                    };
                     continue;
                 }
                 if ($code !== 1) { __DoriaNativeIo::fail('protocol'); }
@@ -504,7 +541,9 @@ final class __DoriaHostedTransferGroup
             $index = $this->index[0];
             $operation = $this->operations[$index];
             $member = $operation->member;
-            $reading = $operation->reading;
+            // A watch is never handed to the host.
+            if ($member === null) { __DoriaNativeIo::fail('protocol'); }
+            $reading = $operation->kind === 1;
             // Source handoffs have no request/buffer direction yet.
             if ($action >= 3 && $reading !== ($this->reading[0] !== 0)) { __DoriaNativeIo::fail('protocol'); }
             $error = null;
@@ -583,19 +622,20 @@ final class __DoriaHostedTransferGroup
         return $this->observe($kind, $instant->__doriaLowWord(), $instant->__doriaHighWord());
     }
 
-    public function isReadCompletion(): bool
+    // The poll reports the completed operation's plan position.
+    public function completionKind(): int
     {
-        return $this->operations[$this->index[0]]->reading;
+        return $this->operations[$this->index[0]]->kind;
     }
 
-    public function observed(bool $reading): __DoriaReadTransferKey|__DoriaWriteTransferKey|null
+    public function observed(int $kind): __DoriaReadTransferKey|__DoriaWriteTransferKey|__DoriaWatchKey|null
     {
-        $code = $this->runtime->dr_v1_host_transfer_group_observed($this->native(), (int) $reading, $this->key);
+        $code = $this->runtime->dr_v1_host_transfer_group_observed($this->native(), $kind, $this->key);
         if ($code === 1) { return null; }
         if ($code !== 0) { __DoriaNativeIo::fail('protocol'); }
         $operation = $this->operations[$this->key[1]];
         $key = $operation->key;
-        if ($operation->reading !== $reading || $key->__doriaLowWord() !== $this->key[0]
+        if ($operation->kind !== $kind || $key->__doriaLowWord() !== $this->key[0]
             || $key->__doriaHighWord() !== $this->key[1]) { __DoriaNativeIo::fail('protocol'); }
         return $key;
     }
@@ -639,6 +679,16 @@ final class __DoriaHostedTransferGroup
         $this->regionHomes[$index]->__doriaStoreFields();
         $code = $this->drive();
         if ($code !== 0) { $this->throwResult($code, __DoriaStdIoIoOperation::Configure); }
+    }
+
+    // Arming is synchronous: the runtime answers at once and no poll follows.
+    public function resubmitWatch(__DoriaWatchKey $key): void
+    {
+        $key->__doriaWriteNativeTransferKey($this->key);
+        if ($this->runtime->dr_v1_host_transfer_group_resubmit_watch($this->native(), $this->key,
+            $this->statusAddress) !== 0) {
+            $this->throwStatus(__DoriaStdIoIoOperation::Configure, $this->status);
+        }
     }
 
     public function close(): void
