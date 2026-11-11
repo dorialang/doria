@@ -1,9 +1,10 @@
-// PHP output cannot prove a float-to-integer conversion exact, so it rejects
-// this valid program.
-const FLOAT_CONVERSION_SOURCE: &str = r#"
+// PHP output cannot measure a string in grapheme clusters without optional
+// extensions, so it rejects this valid program.
+const STRING_LENGTH_SOURCE: &str = r#"
 function main(): int
 {
-    return Float::toInt(42.0);
+    let $text = "forty-two characters fill this literal....";
+    return $text->length;
 }
 "#;
 
@@ -64,12 +65,12 @@ function main(): int
 
 #[test]
 fn accepts_programs_the_php_backend_rejects() {
-    let php_diagnostics = doriac::compile_source_to_php("test.doria", FLOAT_CONVERSION_SOURCE)
-        .expect_err("float-to-integer conversion remains unsupported by the PHP backend");
-    assert_eq!(php_diagnostics[0].code, "B1301");
+    let php_diagnostics = doriac::compile_source_to_php("test.doria", STRING_LENGTH_SOURCE)
+        .expect_err("string measurement remains unsupported by the PHP backend");
+    assert_eq!(php_diagnostics[0].code, "B2501");
 
-    let debug = doriac::compile_source_to_debug("test.doria", FLOAT_CONVERSION_SOURCE)
-        .expect("the conversion is valid Doria and must run on the debug target");
+    let debug = doriac::compile_source_to_debug("test.doria", STRING_LENGTH_SOURCE)
+        .expect("the measurement is valid Doria and must run on the debug target");
 
     assert_eq!(debug, "exit_status: 42\nstdout:\n");
 }

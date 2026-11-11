@@ -13,6 +13,44 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
+  designed and not implemented. Two records are drafted in `docs/decisions/`
+  as Proposed and wait for Andrew's review, uncommitted until he has read
+  them: the geometry-math decision (surface, scalar math on the `Float` and
+  `Float32` companions, `declare(math: "host")`, inline records, the operator
+  table, acceptance, and a readiness note listing what the stage touches and
+  depends on) and the geometry layout decision (C layout, no SIMD in v0, what
+  Stage 44 inherits). His sixteen card rulings of 2026-11-11 are quoted in
+  them.
+  Landed ahead of the stage, each approved by Andrew on a card that day
+  ("All three now", "Yes, as its own change now", "Fix the native runtime
+  now"): PHP output computes `float32` exactly (literals, constants, `+ - *
+  /`, compound assignment, `++`, `--`, each rounded once to binary32), converts
+  with `Int::toFloat` and `Float::toInt` (P1110 as native), and prints floats
+  and `%f` from the exact decimal expansion, so the float rejections in PHP
+  output are gone; the native runtime's `%f` no longer scales in floating
+  point first (`%.1f` of 1.15 printed 1.2, and `%f` of 1e40 panicked with
+  P1205) and the interpreter and runtime share one rule for precisions past
+  the 1074th fraction digit.
+  Evidence, macOS arm64 with LLVM, in the shared checkout: all 117 `doriac`
+  test targets and the `doriac` and `doria-rt` library tests, 4,294 passing
+  test executions, none failed or ignored; the hosted runtime profile's
+  tests (676); strict Clippy for `doriac` and `doria-rt`; format; the
+  repository guard scripts. New:
+  `php_float_execution_tests` (interpreter, fast, release and PHP held to one
+  another and to a table computed in Rust `f32`), added to the local LLVM
+  suite list. Not run: `validate_work_unit.php`, Linux, Windows, the other
+  workspace crates, the release-mode runtime tests, the Windows and Linux lint
+  graphs.
+  Found and open: the fast profile's executable size and compile memory grow
+  with the square of a program's size (936 one-line statements in
+  48-statement functions: 112 MB executable, 308 MB to compile; 1,872: 406 MB
+  and 888 MB; release: 6.6 MB and 7.0 MB). Function size does not matter.
+  Cause not investigated. It stopped the first runs of the float32 table on
+  an 8 GB machine, so that test checks the table as fifteen small programs.
+  Float literals have no exponent syntax. No stage owns scalar math or the
+  `declare` grammar today; the geometry-math decision puts both in Stage 47's
+  first slice.
 - Stage 46, the terminal layer, delivered 2026-11-11 under Decision 0140.
   `Doria\Std\Term` is one module authored in Doria over two runtime
   primitives: `Console`, the `RawMode` and `AlternateScreen` guards, typed key

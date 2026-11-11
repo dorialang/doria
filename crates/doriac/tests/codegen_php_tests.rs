@@ -2533,9 +2533,9 @@ function widen(int8 $value): int { return Int::from($value); }
 #[test]
 fn php_capability_failure_does_not_make_valid_doria_fail_check() {
     let source = r#"
-function convert(float $value): int
+function measure(string $text): int
 {
-    return Float::toInt($value);
+    return $text->length;
 }
 "#;
 
@@ -2543,12 +2543,12 @@ function convert(float $value): int
         .expect("PHP compatibility limitations must not affect Doria checking");
 
     let diagnostics = doriac::compile_source_to_php("test.doria", source)
-        .expect_err("PHP generation must reject a conversion it cannot prove exact");
-    assert_eq!(diagnostics[0].code, "B1301");
+        .expect_err("PHP generation must reject a string measurement it cannot preserve");
+    assert_eq!(diagnostics[0].code, "B2501");
     assert!(diagnostics[0]
         .message
         .contains("PHP compatibility backend cannot preserve"));
-    assert!(diagnostics[0].message.contains("conversion semantics"));
+    assert!(diagnostics[0].message.contains("String intrinsic property"));
 }
 
 #[test]
@@ -2581,23 +2581,38 @@ function total(): float64
 }
 
 #[test]
-fn php_backend_rejects_noncanonical_float_display() {
-    for source in [
-        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { echo 10000000000.0 * 10000000000.0; }",
-        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { echo \"value=\" . 1.5; }",
-        "function show(float $value): void throws Doria\\Std\\Io\\IoError { echo \"value={$value}\"; } function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error {}",
-    ] {
-        let diagnostics = doriac::compile_source_to_php("test.doria", source)
-            .expect_err("PHP must reject float display it cannot preserve canonically");
-        assert_eq!(diagnostics[0].code, "B1301");
-        assert!(diagnostics[0]
-            .message
-            .contains("canonical float display formatting"));
-    }
+fn php_backend_prints_floats_with_canonical_text() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function show(float $value, float32 $narrow): void throws Doria\Std\Io\IoError
+{
+    echo 10000000000.0 * 10000000000.0;
+    echo ";" . 1.5 . ";{$value};{$narrow};";
+    echo sprintf("%s|%.2f|%8.3f|%-8.1f|%08.2f", $value, $value, $narrow, $value, -1.5);
+}
+"#,
+    )
+    .expect("PHP prints a float as the native runtime does");
+    let body = php_function_body(&php, "show");
+    assert!(body.contains("__doria_float_text($value, 64)"), "{body}");
+    assert!(body.contains("__doria_float_text($narrow, 32)"), "{body}");
+    assert!(
+        body.contains("__doria_float_fixed($narrow, 3, 8, false, false)"),
+        "{body}"
+    );
+    // The shortest text that identifies each value at its own width: the
+    // float32 nearest one tenth prints as 0.1, not as its binary64 digits.
+    assert_php_execution(
+        &php,
+        &format!("{}(0.1, 0.10000000149011612);", php_function_name("show")),
+        b"1e20;1.5;0.1;0.1;0.1|0.10|   0.100|0.1     |-0001.50",
+        0,
+    );
 }
 
 #[test]
-fn php_backend_uses_fdiv_and_rejects_inexact_cross_kind_conversions() {
+fn php_backend_uses_fdiv_and_converts_between_int_and_float_exactly() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
@@ -2627,19 +2642,44 @@ function divide(float $left, float64 $right): float
         0,
     );
 
-    for source in [
-        "function main(): int throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { return Float::toInt(42.0); }",
-        "function helper(): float { return Int::toFloat(42); } function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error {}",
-    ] {
-        let diagnostics = doriac::compile_source_to_php("test.doria", source)
-            .expect_err("PHP must reject conversions it cannot prove exact");
-        assert_eq!(diagnostics[0].code, "B1301");
-        assert!(diagnostics[0].message.contains("conversion semantics"));
-    }
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function widen(int $value): float
+{
+    return Int::toFloat($value);
+}
+
+function truncate(float $value): int
+{
+    return Float::toInt($value);
+}
+"#,
+    )
+    .expect("PHP converts between `int` and `float` exactly");
+    let widen_body = php_function_body(&php, "widen");
+    assert!(widen_body.contains("(float) ($value)"), "{widen_body}");
+    let truncate_body = php_function_body(&php, "truncate");
+    assert!(
+        truncate_body.contains("__doria_float_to_int($value, "),
+        "{truncate_body}"
+    );
+
+    // 2^53 + 1 lies halfway between two binary64 values and rounds to even.
+    let widen = php_function_name("widen");
+    let truncate = php_function_name("truncate");
+    assert_php_execution(
+        &php,
+        &format!(
+            "exit({widen}(9007199254740993) === 9007199254740992.0 && {truncate}(-2.75) === -2 && {truncate}(-0.0) === 0 && {truncate}(9223372036854774784.0) === 9223372036854774784 ? 0 : 1);"
+        ),
+        b"",
+        0,
+    );
 }
 
 #[test]
-fn php_backend_accepts_float32_storage_but_rejects_unrounded_arithmetic() {
+fn php_backend_rounds_float32_arithmetic_and_literals_to_binary32() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
@@ -2649,19 +2689,66 @@ function identity(float32 $value): float32
 }
 "#,
     )
-    .expect("PHP can carry an already-quantized float32 value without arithmetic");
+    .expect("PHP carries a float32 value in a PHP float that holds a binary32 number");
     assert!(php.contains(&format!(
         "function {}(float $value): float",
         php_function_name("identity")
     )));
 
-    let diagnostics = doriac::compile_source_to_php(
+    let php = doriac::compile_source_to_php(
         "test.doria",
-        "function add(float32 $left, float32 $right): float32 { return $left + $right; }",
+        r#"
+function add(float32 $left, float32 $right): float32
+{
+    return $left + $right;
+}
+
+function divide(float32 $left, float32 $right): float32
+{
+    return $left / $right;
+}
+
+function tenth(): float32
+{
+    return 0.1;
+}
+
+function accumulate(float32 $start): float32
+{
+    writable float32 $value = $start;
+    $value += 1.0;
+    $value++;
+    return $value;
+}
+"#,
     )
-    .expect_err("PHP must reject float32 operations without binary32 rounding");
-    assert_eq!(diagnostics[0].code, "B1301");
-    assert!(diagnostics[0].message.contains("binary32 rounding"));
+    .expect("PHP rounds every float32 operation to binary32");
+    let add_body = php_function_body(&php, "add");
+    assert!(
+        add_body.contains("__doria_float32_operation(\"+\", $left, $right)"),
+        "{add_body}"
+    );
+    let divide_body = php_function_body(&php, "divide");
+    assert!(
+        divide_body.contains("__doria_float32_operation(\"/\", $left, $right)"),
+        "{divide_body}"
+    );
+    // The literal is the binary32 value nearest one tenth, not binary64's.
+    let tenth_body = php_function_body(&php, "tenth");
+    assert!(tenth_body.contains("0.10000000149011612"), "{tenth_body}");
+
+    let add = php_function_name("add");
+    let divide = php_function_name("divide");
+    let tenth = php_function_name("tenth");
+    let accumulate = php_function_name("accumulate");
+    assert_php_execution(
+        &php,
+        &format!(
+            "exit({add}(16777216.0, 1.0) === 16777216.0 && {divide}(1.0, 3.0) === 0.3333333432674408 && {tenth}() === 0.10000000149011612 && {accumulate}(16777216.0) === 16777216.0 && {accumulate}(1.5) === 3.5 && {add}(3.0e38, 3.0e38) === INF ? 0 : 1);"
+        ),
+        b"",
+        0,
+    );
 }
 
 #[test]
@@ -4625,21 +4712,6 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert_eq!(output.status.code(), Some(101));
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
-    for source in [
-        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { echo sprintf(\"%s\", 1.5); }",
-        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { printf(\"%s\", 1.5); }",
-    ] {
-        let diagnostics = doriac::compile_source_to_php("test.doria", source)
-            .expect_err("PHP must reject float display formatting it cannot preserve canonically");
-        assert_eq!(diagnostics[0].code, "B1301");
-        assert!(diagnostics[0]
-            .message
-            .contains("canonical float display formatting"));
-    }
 }
 
 #[test]

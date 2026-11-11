@@ -713,7 +713,7 @@ function main(): void {{
 }
 
 #[test]
-fn nullable_writable_float32_arguments_preserve_native_precision() {
+fn nullable_writable_float32_arguments_preserve_precision_on_every_backend() {
     let source = r#"
 function main(): void {
     writable float32 $number = 1.5;
@@ -727,22 +727,9 @@ function main(): void {
     echo $number;
 }
 "#;
-    let program = fixture_mir("writeback-float32.doria", source);
-    assert_native_output(&program, "3.5", source);
-    // PHP has an existing, explicit float32 implementation boundary. It must
-    // reject this program rather than silently change its numeric semantics.
-    let diagnostics = doriac::compile_source(
-        "writeback-float32.doria",
-        source,
-        doriac::backend::BackendTarget::Php,
-    )
-    .unwrap_err();
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "B1301" && diagnostic.message.contains("float32")),
-        "{diagnostics:#?}"
-    );
+    // Each addition rounds to binary32 and the result prints as a float32 on
+    // the interpreter, both native profiles and PHP output.
+    assert_execution(source, "3.5");
 }
 
 #[test]

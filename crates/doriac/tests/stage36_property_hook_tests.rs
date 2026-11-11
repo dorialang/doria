@@ -682,26 +682,21 @@ class Value {{
 
 #[test]
 fn cached_validated_and_temperature_properties_execute_through_public_backends() {
-    for (source, stdout, php_boundary) in [
-        (include_str!("../../../examples/native/main_stage36_temperature.doria"),
-         "freezing: 32.0 F\nboiling: 100.0 C; 212.0 F\n",
-         Some("canonical `%f` float formatting")),
-        (include_str!("../../../examples/native/main_stage36_cached_property.doria"),
-         "first: 39\nagain: 39\ncalculations: 1\n",
-         None),
-        (include_str!("../../../examples/native/main_stage36_validated_property.doria"),
-         "price: choose a price before reading the total\ntotal: 36\nquantity: quantity must be positive\nkept: 3; total: 36\n",
-         None),
+    for (source, stdout) in [
+        (
+            include_str!("../../../examples/native/main_stage36_temperature.doria"),
+            "freezing: 32.0 F\nboiling: 100.0 C; 212.0 F\n",
+        ),
+        (
+            include_str!("../../../examples/native/main_stage36_cached_property.doria"),
+            "first: 39\nagain: 39\ncalculations: 1\n",
+        ),
+        (
+            include_str!("../../../examples/native/main_stage36_validated_property.doria"),
+            "price: choose a price before reading the total\ntotal: 36\nquantity: quantity must be positive\nkept: 3; total: 36\n",
+        ),
     ] {
-        if let Some(php_boundary) = php_boundary {
-            assert_hook_execution(source, stdout);
-            let diagnostics = doriac::compile_source_to_php("hook-numeric-compatibility.doria", source)
-                .expect_err("PHP retains its canonical float formatting boundary");
-            assert!(diagnostics.iter().all(|diagnostic| diagnostic.code == "B1301"
-                && diagnostic.message.contains(php_boundary)), "{diagnostics:?}");
-        } else {
-            assert_hook_php_execution(source, stdout);
-        }
+        assert_hook_php_execution(source, stdout);
     }
 }
 

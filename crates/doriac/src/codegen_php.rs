@@ -9,7 +9,7 @@ use crate::diagnostics::Diagnostic;
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::hir::*;
 use crate::mir;
-use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType};
+use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType};
 use crate::php_closure::{PhpClosureDescriptor, PhpClosurePlan};
 #[cfg(test)]
 use crate::php_execution;
@@ -27,6 +27,7 @@ mod core_collection;
 mod core_value;
 mod diagnostic_sites;
 mod expression_region;
+mod float_text;
 mod integers;
 mod interface;
 mod native_runtime;
@@ -224,7 +225,9 @@ function __doria_assertion_presentation(mixed $value, string $type): string
         return __doria_assertion_collection_presentation($value, $type);
     } elseif (is_bool($value)) {
         $presentation = $value ? "true" : "false";
-    } elseif (is_int($value) || is_float($value)) {
+    } elseif (is_float($value)) {
+        $presentation = __doria_float_text($value, ltrim($type, "?") === "float32" ? 32 : 64);
+    } elseif (is_int($value)) {
         $presentation = __doria_display($value);
     } elseif ($value instanceof \UnitEnum) {
         $presentation = $type . "::" . $value->name;
@@ -267,7 +270,8 @@ function __doria_assertion_item_presentation(mixed $value, string $type): string
         return $encoded === false ? '"<invalid string>"' : $encoded;
     }
     if (is_bool($value)) { return $value ? 'true' : 'false'; }
-    if (is_int($value) || is_float($value)) { return __doria_display($value); }
+    if (is_float($value)) { return __doria_float_text($value, $type === 'float32' ? 32 : 64); }
+    if (is_int($value)) { return __doria_display($value); }
     if ($value instanceof \UnitEnum) { return $type . '::' . $value->name; }
     return '<' . $type . '>';
 }
@@ -1712,7 +1716,7 @@ pub fn generate_artifact(
     let closure_plan = Rc::new(closure_plan);
 
     let mut output = String::from(
-        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function &value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function &value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    if (is_float($value)) { throw new LogicException(\"compiler float display has no width\"); }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
     value_result::emit_runtime(program, &mut output, &specialization);
     emit_primitive_comparison_runtime(&mut output);
@@ -1738,6 +1742,7 @@ pub fn generate_artifact(
     bytes::emit_runtime(&mut output, runtime.is_some());
     output.push_str(integers::RUNTIME);
     output.push_str(numeric_place::RUNTIME);
+    output.push_str(float_text::RUNTIME);
     streams::emit_runtime(
         &mut output,
         program
@@ -2656,6 +2661,13 @@ fn php_expression_types(semantic: &SemanticInfo) -> HashMap<Span, ResolvedType> 
             types.insert(*span, ResolvedType::Integer(*integer));
         }
     }
+    // A float literal takes its width from context after its own type is
+    // recorded, exactly as an integer literal does.
+    for (span, float) in &semantic.float_expression_types {
+        if matches!(types.get(span), Some(ResolvedType::Float(_)) | None) {
+            types.insert(*span, ResolvedType::Float(*float));
+        }
+    }
     types
 }
 
@@ -2777,16 +2789,13 @@ fn validate_class(
         match member {
             ClassMember::Property(property) => {
                 validate_type(&property.ty, property.span, semantic_info)?;
-                if property.is_static && property.has_storage() {
-                    validate_evaluated_value(
-                        semantic_info,
-                        &ConstKey::Static {
-                            class_name: class_decl.name.clone(),
-                            name: property.name.clone(),
-                        },
-                        property.span,
-                    )?;
-                } else if let Some(initializer) = &property.initializer {
+                // A static with storage holds its folded value, which PHP
+                // output emits exactly at every width.
+                if let Some(initializer) = property
+                    .initializer
+                    .as_ref()
+                    .filter(|_| !(property.is_static && property.has_storage()))
+                {
                     validate_expr(initializer, semantic_info)?;
                 }
             }
@@ -2796,14 +2805,6 @@ fn validate_class(
                 if let Some(ty) = &constant.ty {
                     validate_type(ty, constant.span, semantic_info)?;
                 }
-                validate_evaluated_value(
-                    semantic_info,
-                    &ConstKey::Class {
-                        class_name: class_decl.name.clone(),
-                        name: constant.name.clone(),
-                    },
-                    constant.span,
-                )?;
             }
         }
     }
@@ -2830,11 +2831,7 @@ fn validate_item(item: &Item, semantic_info: &PhpValidation<'_>) -> Result<(), B
             if let Some(ty) = &constant.ty {
                 validate_type(ty, constant.span, semantic_info)?;
             }
-            validate_evaluated_value(
-                semantic_info,
-                &ConstKey::TopLevel(constant.name.clone()),
-                constant.span,
-            )
+            Ok(())
         }
         Item::Statement(statement) => validate_statement(statement, semantic_info),
     }
@@ -2851,24 +2848,6 @@ fn validate_php_class_constant_name(constant: &ConstDecl) -> Result<(), BackendE
         ));
     }
     Ok(())
-}
-
-fn validate_evaluated_value(
-    semantic_info: &SemanticInfo,
-    key: &ConstKey,
-    span: Span,
-) -> Result<(), BackendError> {
-    validate_const_value(evaluated_value(&semantic_info.const_evaluation, key), span)
-}
-
-fn validate_const_value(value: &ConstValue, span: Span) -> Result<(), BackendError> {
-    match value {
-        ConstValue::Float(value) if !value.ty.is_default_float() => Err(unsupported_numeric_shape(
-            span,
-            "Doria `float32` precision with PHP's `float` type",
-        )),
-        _ => Ok(()),
-    }
 }
 
 fn validate_function(
@@ -2890,7 +2869,7 @@ fn validate_function(
     for (parameter_index, param) in function.params.iter().enumerate() {
         validate_type(&param.ty, param.span, semantic_info)?;
         if param.default.is_some() {
-            let default = semantic_info
+            semantic_info
                 .parameter_defaults
                 .get(&ParameterDefaultKey {
                     function: function.span,
@@ -2902,7 +2881,6 @@ fn validate_function(
                         param.name
                     ))
                 })?;
-            validate_const_value(default, param.span)?;
         }
     }
     if let Some(return_type) = &function.return_type {
@@ -3122,7 +3100,7 @@ fn validate_statement(
             validate_expr(&decl.initializer, semantic_info)
         }
         Stmt::Assignment(assignment) => validate_assignment(assignment, semantic_info),
-        Stmt::Echo { expr, .. } => validate_display_expr(expr, semantic_info),
+        Stmt::Echo { expr, .. } => validate_expr(expr, semantic_info),
         Stmt::Return { expr, .. } => {
             if let Some(expr) = expr {
                 validate_expr(expr, semantic_info)?;
@@ -3326,6 +3304,7 @@ fn validate_increment(
 ) -> Result<(), BackendError> {
     if bytes::supports_rmw(&increment.target, semantic_info)
         || integers::ty(semantic_info.expression_type(increment.target.span())).is_some()
+        || semantic_info.float_type(increment.target.span()).is_some()
     {
         validate_expr(&increment.target, semantic_info)
     } else {
@@ -3402,7 +3381,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         Expr::InterpolatedString { parts, .. } => {
             for part in parts {
                 if let InterpolatedStringPart::Expr(expr) = part {
-                    validate_display_expr(expr, semantic_info)?;
+                    validate_expr(expr, semantic_info)?;
                 }
             }
             Ok(())
@@ -3562,14 +3541,6 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                     format!("collection constructor `{class_name}::{method}`"),
                 ));
             }
-            if (class_name == "Int" && method == "toFloat")
-                || (class_name == "Float" && method == "toInt")
-            {
-                return Err(unsupported_numeric_shape(
-                    *span,
-                    format!("exact Doria conversion semantics for `{class_name}::{method}(...)`"),
-                ));
-            }
             // A widening conversion cannot fail and PHP integers hold every
             // Doria integer up to 64 bits, so it is the value itself.
             if php_widening_integer_conversion(class_name, method, args, semantic_info) {
@@ -3648,10 +3619,6 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         } => {
             validate_expr(left, semantic_info)?;
             validate_expr(right, semantic_info)?;
-            if *op == BinaryOp::Concat {
-                validate_display_type(left, semantic_info)?;
-                validate_display_type(right, semantic_info)?;
-            }
             let float_operands = matches!(
                 (
                     semantic_info.float_type(left.span()),
@@ -3659,22 +3626,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                 ),
                 (Some(left), Some(right)) if left == right
             );
-            let float32_operands = matches!(
-                (
-                    semantic_info.float_type(left.span()),
-                    semantic_info.float_type(right.span()),
-                ),
-                (Some(FloatType::Float32), Some(FloatType::Float32))
-            );
             let feature = match op {
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
-                    if float32_operands =>
-                {
-                    return Err(unsupported_numeric_shape(
-                        *span,
-                        "Doria `float32` arithmetic with binary32 rounding after each operation",
-                    ));
-                }
                 BinaryOp::Add if float_operands => None,
                 BinaryOp::Sub if float_operands => None,
                 BinaryOp::Mul if float_operands => None,
@@ -3736,14 +3688,10 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                 .get(span)
                 .ok_or_else(|| BackendError::new("checked match has no semantic plan"))?;
             for (arm, arm_info) in arms.iter().zip(&info.arms) {
-                match (&arm.pattern, &arm_info.pattern) {
-                    (MatchPattern::Expression(pattern), ResolvedMatchPattern::Condition) => {
-                        validate_expr(pattern, semantic_info)?;
-                    }
-                    (_, ResolvedMatchPattern::Constant(value)) => {
-                        validate_const_value(value, arm.span)?;
-                    }
-                    _ => {}
+                if let (MatchPattern::Expression(pattern), ResolvedMatchPattern::Condition) =
+                    (&arm.pattern, &arm_info.pattern)
+                {
+                    validate_expr(pattern, semantic_info)?;
                 }
                 if let Some(guard) = &arm.guard {
                     validate_expr(&guard.condition, semantic_info)?;
@@ -3768,27 +3716,6 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             Ok(())
         }
     }
-}
-
-fn validate_display_expr(
-    expr: &Expr,
-    semantic_info: &PhpValidation<'_>,
-) -> Result<(), BackendError> {
-    validate_display_type(expr, semantic_info)?;
-    validate_expr(expr, semantic_info)
-}
-
-fn validate_display_type(
-    expr: &Expr,
-    semantic_info: &PhpValidation<'_>,
-) -> Result<(), BackendError> {
-    if semantic_info.float_type(expr.span()).is_some() {
-        return Err(unsupported_numeric_shape(
-            expr.span(),
-            "canonical float display formatting",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3819,7 +3746,7 @@ mod validation_tests {
         let Stmt::Echo { expr, .. } = &function.body.statements[0] else {
             unreachable!();
         };
-        validate_display_expr(expr, &context).unwrap();
+        validate_expr(expr, &context).unwrap();
         assert_eq!(context.expression_visits.get(), expected);
     }
 }
@@ -3845,13 +3772,7 @@ fn validate_php_format_call(
     for (argument, conversion) in args[1..].iter().zip(conversions) {
         let argument = &argument.value;
         match conversion {
-            FormatConversion::Display => validate_display_expr(argument, semantic_info)?,
-            FormatConversion::Float => {
-                return Err(unsupported_numeric_shape(
-                    argument.span(),
-                    "canonical `%f` float formatting",
-                ));
-            }
+            FormatConversion::Display => validate_expr(argument, semantic_info)?,
             _ => validate_expr(argument, semantic_info)?,
         }
     }
@@ -6184,18 +6105,7 @@ fn emit_const_value(value: &ConstValue, plan: &specialization::Plan) -> String {
             "(-9223372036854775807 - 1)".to_string()
         }
         ConstValue::Integer(value) => value.display(),
-        ConstValue::Float(value) => {
-            let value = value.display();
-            match value.as_str() {
-                "NaN" => "NAN".to_string(),
-                "Infinity" => "INF".to_string(),
-                "-Infinity" => "-INF".to_string(),
-                _ if !value.contains('.') && !value.contains('e') && !value.contains('E') => {
-                    format!("{value}.0")
-                }
-                _ => value,
-            }
-        }
+        ConstValue::Float(value) => emit_float_value(*value),
         ConstValue::String(value) => emit_php_string_literal(value),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::Null => "null".to_string(),
@@ -10070,6 +9980,14 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
             let value = parse_decimal_magnitude(value).expect("checked uint64 literal") as u64;
             emit_integer_bits(value as i64)
         }
+        Expr::Float { value, span }
+            if numeric_place::float_type(*span, scopes) == Some(FloatType::Float32) =>
+        {
+            emit_float_value(
+                FloatValue::parse_decimal(FloatType::Float32, value)
+                    .expect("checked float32 literal has a binary32 value"),
+            )
+        }
         Expr::Int { value, .. } | Expr::Float { value, .. } => value.clone(),
         Expr::Bool { value, .. } => {
             if *value {
@@ -10520,6 +10438,14 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
                     .expect("PHP capability validation admits typed integer conversions only");
                 return integers::convert(&argument.value, source, target, *span, scopes);
             }
+            if class_name == "Int" && method == "toFloat" && args.len() == 1 {
+                // PHP converts an integer to binary64 by rounding to nearest,
+                // ties to even, which is the Doria conversion.
+                return format!("(float) ({})", emit_expr(&args[0].value, scopes));
+            }
+            if class_name == "Float" && method == "toInt" && args.len() == 1 {
+                return numeric_place::float_to_int(&args[0].value, *span, scopes);
+            }
             if class_name == "String" && method == "fromBytes" && args.len() == 1 {
                 return format!("{}->__doriaUtf8String()", emit_expr(&args[0].value, scopes));
             }
@@ -10810,9 +10736,11 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
             right,
             span,
         } => match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
-                if scopes.expression_types.get(&left.span())
-                    == Some(&ResolvedType::Float(FloatType::Float64)) =>
+            // Binary64 division stays the host `fdiv`; every other float
+            // operation goes through the helper that owns its width.
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                if numeric_place::float_type(left.span(), scopes)
+                    .is_some_and(|ty| ty == FloatType::Float32 || !matches!(op, BinaryOp::Div)) =>
             {
                 numeric_place::float_binary(left, emit_binary_op(op), right, scopes)
             }
@@ -11800,10 +11728,32 @@ fn emit_display_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     let value = emit_expr(expr, scopes);
     let displayed = if is_uint64(scopes.expression_types.get(&expr.span())) {
         format!("sprintf(\"%u\", {value})")
+    } else if let Some(float) = numeric_place::float_type(expr.span(), scopes) {
+        float_text::display(&value, float)
     } else {
         format!("__doria_display({value})")
     };
     expression_region::operation(expr, displayed, scopes)
+}
+
+/// A PHP float literal holding exactly `value`. A `float32` is carried as the
+/// binary64 number equal to it, so its literal is that number's shortest text
+/// rather than the shorter text that only identifies it among binary32 values.
+fn emit_float_value(value: FloatValue) -> String {
+    let value = match value.ty {
+        FloatType::Float32 => FloatValue::from_f64(f64::from(value.as_f32())),
+        FloatType::Float64 => value,
+    }
+    .display();
+    match value.as_str() {
+        "NaN" => "NAN".to_string(),
+        "Infinity" => "INF".to_string(),
+        "-Infinity" => "-INF".to_string(),
+        _ if !value.contains('.') && !value.contains('e') && !value.contains('E') => {
+            format!("{value}.0")
+        }
+        _ => value,
+    }
 }
 
 fn emit_binary_op(op: &BinaryOp) -> &'static str {
@@ -11854,20 +11804,26 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         if let Some(Expr::String { value, span }) = args.first().map(|argument| &argument.value) {
             if let Ok(pieces) = format_string::parse(value, *span) {
                 emitted[0] = emit_php_string_literal(&php_format_from_plan(&pieces, args, scopes));
-                let conversions = pieces.iter().filter_map(|piece| match piece {
-                    FormatPiece::Argument { spec, .. } => Some(spec.conversion),
+                let specs = pieces.iter().filter_map(|piece| match piece {
+                    FormatPiece::Argument { spec, .. } => Some(spec),
                     FormatPiece::Literal(_) => None,
                 });
-                for ((argument, source), conversion) in emitted
+                for ((argument, source), spec) in emitted
                     .iter_mut()
                     .skip(1)
                     .zip(args.iter().skip(1))
-                    .zip(conversions)
+                    .zip(specs)
                 {
-                    if conversion == FormatConversion::Display {
+                    if spec.conversion == FormatConversion::Float {
+                        *argument = float_text::fixed(argument, spec);
+                    } else if spec.conversion == FormatConversion::Display {
                         *argument = if is_uint64(scopes.expression_types.get(&source.value.span()))
                         {
                             format!("sprintf(\"%u\", {argument})")
+                        } else if let Some(float) =
+                            numeric_place::float_type(source.value.span(), scopes)
+                        {
+                            float_text::display(argument, float)
                         } else {
                             diagnostic_sites::operation(
                                 format!("__doria_display({argument})"),
@@ -11925,6 +11881,10 @@ fn php_format_from_plan(
     for piece in pieces {
         match piece {
             FormatPiece::Literal(value) => format.push_str(&value.replace('%', "%%")),
+            FormatPiece::Argument { spec, .. } if spec.conversion == FormatConversion::Float => {
+                // The runtime rounds and pads `%f` itself, exactly.
+                format.push_str("%s");
+            }
             FormatPiece::Argument { index, spec } => {
                 format.push('%');
                 if spec.left_align {
@@ -11950,7 +11910,7 @@ fn php_format_from_plan(
                         'u'
                     }
                     FormatConversion::Decimal => 'd',
-                    FormatConversion::Float => 'F',
+                    FormatConversion::Float => unreachable!("`%f` is formatted before the format"),
                     FormatConversion::HexLower => 'x',
                     FormatConversion::HexUpper => 'X',
                     FormatConversion::Octal => 'o',

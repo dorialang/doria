@@ -246,7 +246,7 @@ function main(): void {
 }
 
 #[test]
-fn native_mixed_float_widths_and_increments_keep_php_precision_boundaries() {
+fn mixed_float_widths_and_increments_round_at_their_own_width() {
     for ty in ["float32", "float64"] {
         let source = format!(
             r#"
@@ -260,12 +260,7 @@ function update({ty} $input): void {{
 function main(): void {{ update(1.25); }}
 "#
         );
-        assert_native_parity(&source, "true");
-        let errors = doriac::compile_source_to_php("float-boundary.doria", &source).unwrap_err();
-        assert!(
-            errors.iter().any(|error| error.code == "B1301"),
-            "{errors:?}"
-        );
+        assert_parity(&source, "true");
     }
 }
 

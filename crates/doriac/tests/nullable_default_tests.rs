@@ -36,7 +36,7 @@ fn assert_execution(source: &str, expected: &str) {
 
 #[test]
 fn every_copy_scalar_width_preserves_null_and_present_defaults() {
-    for include_float32 in [true, false] {
+    {
         let mut source = String::new();
         let mut main = String::from("function main(): void {");
         let mut expected = String::new();
@@ -57,7 +57,6 @@ fn every_copy_scalar_width_preserves_null_and_present_defaults() {
         ]
         .into_iter()
         .enumerate()
-        .filter(|(_, (ty, _, _))| include_float32 || *ty != "float32")
         {
             source.push_str(&format!(
                 "const ?{ty} EMPTY_{index} = null;\n\
@@ -72,20 +71,7 @@ fn every_copy_scalar_width_preserves_null_and_present_defaults() {
         }
         source.push_str(&main);
         source.push('}');
-        if include_float32 {
-            assert_native_execution(&source, &expected);
-            let diagnostics =
-                doriac::compile_source("float32-defaults.doria", source, BackendTarget::Php)
-                    .unwrap_err();
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|error| error.code == "B1301" && error.message.contains("float32")),
-                "{diagnostics:?}"
-            );
-        } else {
-            assert_execution(&source, &expected);
-        }
+        assert_execution(&source, &expected);
     }
 }
 
