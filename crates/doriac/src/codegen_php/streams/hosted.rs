@@ -697,10 +697,19 @@ final class __DoriaHostedTransferGroup
         try {
             if (!$this->closed) {
                 $this->runtime->dr_v1_host_transfer_group_close($this->owner);
-                if ($this->drive() !== 0 || $this->kind[0] !== 3) { __DoriaNativeIo::fail('protocol'); }
+                $code = $this->drive();
+                if ($code !== 0 || $this->kind[0] !== 3) {
+                    __DoriaNativeIo::fail('protocol',
+                        "draining ended with code {$code} and kind {$this->kind[0]}");
+                }
                 $this->closed = true;
             }
             $this->runtime->dr_v1_host_transfer_group_drop(null, $this->owner);
+        } catch (Throwable $problem) {
+            // Ending a group raises nothing: a transfer's error stays with
+            // the transfer. Anything thrown here would leave the native group
+            // half ended behind a set that believes it is still in use.
+            __DoriaNativeIo::fail('protocol', get_class($problem) . ": " . $problem->getMessage());
         } finally {
             $this->owner = null;
             $this->errors->sweep();

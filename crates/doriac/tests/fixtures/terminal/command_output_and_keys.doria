@@ -1,5 +1,6 @@
-// Stage 46 example (Decision 0140): one wait for a command's output and the
-// terminal's events.
+// One wait for a command's output and the terminal's events (Decision 0140).
+// The terminal tests run this on each platform against a command that copies
+// its input.
 //
 // Pass the command to run as this program's arguments, for example `cat`.
 // The program sends the command a `>` to begin with and a `.` for every

@@ -28,9 +28,9 @@ use doriac::mir_interpreter::{
 use native_execution::{stage_executable, ExecutionDirectory};
 
 const MENU_PATH: &str = "menu.doria";
-const MENU: &str = include_str!("../../../examples/future/stage46/menu.doria");
+const MENU: &str = include_str!("../../../examples/terminal/menu.doria");
 const RELAY_PATH: &str = "command_output_and_keys.doria";
-const RELAY: &str = include_str!("../../../examples/future/stage46/command_output_and_keys.doria");
+const RELAY: &str = include_str!("fixtures/terminal/command_output_and_keys.doria");
 const COLUMNS: u16 = 80;
 const ROWS: u16 = 24;
 
@@ -839,4 +839,60 @@ fn php_output_puts_the_terminal_back_before_a_panic_report() {
         |_| php(ENDINGS_PATH, ENDINGS),
         &[Step::Press(Key::Character('p'))],
     );
+}
+
+const ERROR_WHILE_WATCHING_PATH: &str = "error_while_watching.doria";
+const ERROR_WHILE_WATCHING: &str = include_str!("fixtures/terminal/error_while_watching.doria");
+
+/// A checked error leaves a function while its transfer group still reads a
+/// command's output and watches the terminal: the group, its set, the reader,
+/// the command and the terminal guards end in order, and the caller handles
+/// the error.
+fn a_checked_error_ends_a_busy_group_in_order(
+    launch: impl FnOnce(&doriac::mir::Program) -> Launch,
+) {
+    let program = lower(ERROR_WHILE_WATCHING_PATH, ERROR_WHILE_WATCHING);
+    let steps = [Step::Press(Key::Character('x'))];
+    let output = interpret_with_io(
+        &program,
+        MirIo {
+            args: COPY_COMMAND.iter().map(|part| part.to_string()).collect(),
+            programs: [(
+                COPY_COMMAND[0].to_string(),
+                MirProgram {
+                    echo_input: true,
+                    exit: Some(MirExitStatus::Exited(0)),
+                    ..MirProgram::default()
+                },
+            )]
+            .into(),
+            terminal: Some(scripted(steps.iter().copied().map(observed).collect())),
+            ..MirIo::default()
+        },
+    )
+    .unwrap()
+    .output;
+    let expected = replayed(&output, &steps, &[1]);
+    assert_eq!(expected.status, 3);
+    assert_eq!(
+        expected.ended,
+        "caught: failed to configure transfer group: invalid input"
+    );
+    shows_the_expected_screens(
+        launch(&program).with_arguments(COPY_COMMAND),
+        &expected,
+        &steps,
+    );
+}
+
+#[test]
+fn a_checked_error_ends_a_reading_and_watching_group_in_order_on_every_platform() {
+    a_checked_error_ends_a_busy_group_in_order(|program| native(program, NativeProfile::Fast));
+}
+
+#[test]
+fn php_output_ends_a_reading_and_watching_group_in_order_when_a_checked_error_leaves() {
+    a_checked_error_ends_a_busy_group_in_order(|_| {
+        php(ERROR_WHILE_WATCHING_PATH, ERROR_WHILE_WATCHING)
+    });
 }

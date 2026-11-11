@@ -174,7 +174,7 @@ fn pressed(key: Key) -> Observation {
 }
 
 /// The Stage 46 acceptance program: one source for every platform.
-const MENU: &str = include_str!("../../../examples/future/stage46/menu.doria");
+const MENU: &str = include_str!("../../../examples/terminal/menu.doria");
 
 #[test]
 fn the_menu_moves_with_the_arrow_keys_and_enter_chooses_the_focused_item() {

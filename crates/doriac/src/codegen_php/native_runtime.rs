@@ -139,10 +139,24 @@ final class __DoriaNativeIo
 {
     private static ?FFI $runtime = null;
 
-    public static function fail(string $reason): void
+    // `$detail` says what the runtime answered when the failure is one of
+    // its answers. A protocol failure also names the operation that saw it,
+    // since the diagnostic alone cannot tell forty call sites apart.
+    public static function fail(string $reason, string $detail = ''): void
     {
         global $__doria_native_failures;
+        // The report belongs on the screen the user returns to.
+        __doria_terminal_ending();
         fwrite(STDERR, $__doria_native_failures[$reason]);
+        if ($reason === "protocol") {
+            $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1] ?? [];
+            $operation = ($caller["class"] ?? "") === "" ? ($caller["function"] ?? "")
+                : $caller["class"] . "::" . ($caller["function"] ?? "");
+            if ($operation !== "") {
+                fwrite(STDERR, "The operation that failed was " . $operation .
+                    ($detail === "" ? "" : ": " . $detail) . ".\n");
+            }
+        }
         exit(1);
     }
 

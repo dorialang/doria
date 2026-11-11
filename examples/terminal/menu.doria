@@ -1,10 +1,17 @@
-// Stage 46 acceptance program (Decision 0140).
+// A menu of any number of items, moved through with the arrow keys and
+// chosen with Enter.
 //
-// One source file, no platform conditionals, nothing but Doria\Std\Term:
-// a menu of any number of items, moved through with the arrow keys and
-// chosen with Enter. It must behave identically in a Linux terminal, a
-// macOS terminal and a native Windows console (PowerShell or cmd in
-// Windows Terminal or conhost, not WSL).
+// One source file, no platform conditionals, nothing but Doria\Std\Term. It
+// behaves the same in a Linux terminal, a macOS terminal and a native Windows
+// console (PowerShell or cmd in Windows Terminal or conhost, not WSL). This
+// is the terminal layer's acceptance program (Decision 0140): CI compiles it
+// on each platform, types at it inside a pseudo-terminal and holds every
+// screen to the interpreter's.
+//
+// Build and run it:
+//
+//     doriac compile examples/terminal/menu.doria --out menu
+//     ./menu
 namespace Demo\Menu;
 
 use Doria\Std\Io\Wait;
