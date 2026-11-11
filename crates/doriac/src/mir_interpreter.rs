@@ -19853,34 +19853,40 @@ fn format_integer_base(
     }
 }
 
+/// A finite binary64 value is a multiple of 2^-1074, so its decimal expansion
+/// ends within this many fraction digits. Every later digit is zero. The
+/// native runtime applies the same split (`format_fixed_float` in `doria-rt`).
+const FIXED_FLOAT_EXACT_FRACTION_DIGITS: usize = 1074;
+
+/// `%f` rounds the exact value to the requested fraction digits, ties to even
+/// (Decision 0074).
 fn format_fixed_float(value: FloatValue, precision: u32) -> String {
-    let precision = precision as usize;
-    match value.ty {
+    let (value, negative) = match value.ty {
         crate::numeric::FloatType::Float32 => {
             let value = value.as_f32();
-            if value.is_nan() {
-                "NaN".to_string()
-            } else if value == f32::INFINITY {
-                "Infinity".to_string()
-            } else if value == f32::NEG_INFINITY {
-                "-Infinity".to_string()
-            } else {
-                format!("{value:.precision$}")
-            }
+            (f64::from(value), value.is_sign_negative())
         }
         crate::numeric::FloatType::Float64 => {
             let value = value.as_f64();
-            if value.is_nan() {
-                "NaN".to_string()
-            } else if value == f64::INFINITY {
-                "Infinity".to_string()
-            } else if value == f64::NEG_INFINITY {
-                "-Infinity".to_string()
-            } else {
-                format!("{value:.precision$}")
-            }
+            (value, value.is_sign_negative())
         }
+    };
+    if value.is_nan() {
+        return "NaN".to_string();
     }
+    if value.is_infinite() {
+        return if negative { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let precision = precision as usize;
+    let exact = precision.min(FIXED_FLOAT_EXACT_FRACTION_DIGITS);
+    let magnitude = value.abs();
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    text.push_str(&format!("{magnitude:.exact$}"));
+    text.extend(core::iter::repeat_n('0', precision - exact));
+    text
 }
 
 fn apply_width(mut value: String, spec: crate::format_string::FormatSpec) -> String {
