@@ -383,22 +383,26 @@ pub(super) fn assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> Opt
         if let Some(integer) = integers::ty(nested.expression_types.get(&assignment.value.span()))
             .or_else(|| integers::ty(nested.expression_types.get(&target.span())))
         {
-            integers::operation(
+            integers::operation_at(
                 integers::assignment_op(&assignment.op).expect("validated integer update"),
                 &format!("${value_name}"),
                 &rhs,
                 integer,
                 assignment.span,
+                Some(assignment.value.span()),
                 &nested,
             )
         } else {
-            match assignment.op {
-                AssignOp::AddAssign => format!("(${value_name} + {rhs})"),
-                AssignOp::SubAssign => format!("(${value_name} - {rhs})"),
-                AssignOp::MulAssign => format!("(${value_name} * {rhs})"),
-                AssignOp::DivAssign => format!("fdiv(${value_name}, {rhs})"),
-                _ => unreachable!("PHP compound assignment was validated"),
-            }
+            let float = numeric_place::float_type(assignment.value.span(), &nested)
+                .or_else(|| numeric_place::float_type(target.span(), &nested))
+                .expect("PHP capability validation admits float updates of a known width");
+            numeric_place::float_operation(
+                numeric_place::float_assignment_op(&assignment.op)
+                    .expect("PHP compound assignment was validated"),
+                float,
+                &format!("${value_name}"),
+                &rhs,
+            )
         }
     };
     let argument = if plan.caller_receiver_home() {

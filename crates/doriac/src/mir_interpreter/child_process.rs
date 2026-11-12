@@ -55,6 +55,12 @@ pub(super) struct ChildEmulation {
     truncated: bool,
 }
 
+/// What a read of a child's output waits for when the child is alive and
+/// has written nothing more. Nothing runs beside the program in the sandbox,
+/// so only its own later writes to the child, or the child's end, supply it.
+pub(super) const CHILD_OUTPUT_WAIT: &str =
+    "reading child output that only this program's own later writes could produce";
+
 /// The raw status native code reports after a forced termination.
 const TERMINATED: i64 = if cfg!(windows) { 1 } else { -9 };
 
@@ -432,6 +438,28 @@ impl Interpreter<'_> {
         }
     }
 
+    /// Whether a read of `length` bytes from this pipe end has to wait: the
+    /// child is alive and none of its output is unread.
+    pub(super) fn child_pipe_read_waits(
+        &self,
+        pipe: PipeEnd,
+        length: usize,
+    ) -> Result<bool, InterpreterError> {
+        let child = self
+            .child_processes
+            .get(&pipe.process)
+            .ok_or_else(|| InterpreterError::new("a child pipe outlived its process owner"))?;
+        let available = match pipe.stream {
+            ChildStream::Output => child.output.len() - child.output_read,
+            ChildStream::Errors => child.errors.len() - child.errors_read,
+            ChildStream::Input => return Ok(false),
+        };
+        Ok(length != 0 && available == 0 && !child.exited())
+    }
+
+    /// Reads what the child has written. A read that would have to wait is a
+    /// dead end here: a transfer group keeps such a read pending instead and
+    /// performs it once it need not wait.
     pub(super) fn read_child_pipe(
         &mut self,
         pipe: PipeEnd,
@@ -439,11 +467,13 @@ impl Interpreter<'_> {
         region: ByteRegionValue,
         outcome: mir::PayloadEnumType,
     ) -> Result<file_stream::FileTransferResult, InterpreterError> {
+        if self.child_pipe_read_waits(pipe, region.length)? {
+            return Err(InterpreterError::new(CHILD_OUTPUT_WAIT));
+        }
         let child = self
             .child_processes
             .get_mut(&pipe.process)
             .ok_or_else(|| InterpreterError::new("a child pipe outlived its process owner"))?;
-        let exited = child.exited();
         let (bytes, read) = match pipe.stream {
             ChildStream::Output => (&child.output, &mut child.output_read),
             ChildStream::Errors => (&child.errors, &mut child.errors_read),
@@ -457,11 +487,6 @@ impl Interpreter<'_> {
             }
         };
         let available = bytes.len() - *read;
-        if region.length != 0 && available == 0 && !exited {
-            return Err(InterpreterError::new(
-                "reading child output that only this program's own later writes could produce",
-            ));
-        }
         let count = region.length.min(available);
         let chunk = bytes[*read..*read + count].to_vec();
         *read += count;

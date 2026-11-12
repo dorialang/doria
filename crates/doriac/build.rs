@@ -41,7 +41,12 @@ fn main() {
     // the runtime's own sources would leave a stale archive bundled after an edit
     // to a crate the runtime links, which is the same class of mistake as
     // selecting a stale rlib.
-    for sibling in ["doria-unicode", "doria-diagnostic-catalogue", "doria-time"] {
+    for sibling in [
+        "doria-unicode",
+        "doria-diagnostic-catalogue",
+        "doria-time",
+        "doria-terminal",
+    ] {
         println!(
             "cargo:rerun-if-changed={}",
             manifest_dir.join("..").join(sibling).join("src").display()

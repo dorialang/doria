@@ -2081,6 +2081,60 @@ impl Checker<'_> {
         }
     }
 
+    /// `Doria\Std\Io\Watchable` is sealed to the standard library (Decision
+    /// 0140): the runtime backs every watchable source, so a conformance
+    /// declared in authored source is rejected, whether it names the interface
+    /// or one that extends it. Returns whether `origin` is such a conformance.
+    fn report_sealed_conformance(
+        &mut self,
+        class: &str,
+        interface: &InterfaceType<TypeId>,
+        origin: Span,
+    ) -> bool {
+        let watchable = crate::compiler_known_stream::WATCHABLE;
+        if interface.name != watchable
+            || origin.source.is_compiler_owned()
+            || self
+                .interface_declaration(watchable)
+                .is_none_or(|declaration| {
+                    declaration.span.source != crate::compiler_known_stream::SOURCE_ID
+                })
+        {
+            return false;
+        }
+        // One class declaration is checked once per concrete instance.
+        if self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0781" && diagnostic.span == origin)
+        {
+            return true;
+        }
+        let mut diagnostic = Diagnostic::new(
+            "E0781",
+            format!("class `{class}` cannot implement `{watchable}`"),
+            origin,
+        )
+        .with_title("Standard Interface Cannot Be Implemented")
+        .with_primary_label("Conformance Declared Here")
+        .with_explanation(format!(
+            "A watchable source is backed by the runtime, so only standard library types implement `{watchable}`."
+        ))
+        .with_help(
+            "watch a `Doria\\Std\\Term\\RawMode` with `TransferPlan::watch` or `andWatch`; a class that owns one passes it instead of implementing the interface",
+        );
+        if let Some(Some(declared)) = self.declared_conformance_types.get(&origin) {
+            if declared.name != watchable {
+                diagnostic = diagnostic.with_note(format!(
+                    "`{}` extends `{watchable}`, so implementing it implements `{watchable}` too.",
+                    declared.name
+                ));
+            }
+        }
+        self.diagnostics.push(diagnostic);
+        true
+    }
+
     fn checked_class_conformance_facts(
         &mut self,
         declaration: &ClassDecl,
@@ -2102,11 +2156,16 @@ impl Checker<'_> {
                         && diagnostic.span.end <= declaration.span.end
                 });
             let requirements = self.canonical_interface_requirements(&interface, &mut Vec::new());
+            let sealed = self.report_sealed_conformance(&class.name, &interface, origin);
             let mut fact = ConformanceFacts {
                 implementing_type: self.types.resolved(implementing_type),
                 interface: self.resolved_interface(&interface),
                 origin,
-                status: if !conformances.valid || !requirements.valid || !composition_valid {
+                status: if sealed
+                    || !conformances.valid
+                    || !requirements.valid
+                    || !composition_valid
+                {
                     ConformanceStatus::Invalid
                 } else if requirements.valid && !legacy_diagnostic {
                     ConformanceStatus::Checked

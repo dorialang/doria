@@ -70,6 +70,7 @@ impl<'s, 'b, D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome>
             stopped: None,
             stop_drain: None,
             wait_failure_reported: false,
+            watches: None,
         };
         // Install the whole cleanup owner before acquisition or any user call.
         for index in 0..group.len() {

@@ -23,6 +23,51 @@ mod scheduling_tests {
     use super::*;
 
     #[test]
+    fn copies_of_local_values_share_what_neither_changed() {
+        let mut values = LocalValues::new(3);
+        values[1] = Value::owner(Root::Group);
+        let mut copy = values.clone();
+        copy[2].unknown_callable = true;
+        assert!(std::rc::Rc::ptr_eq(&values.0[0], &copy.0[0]));
+        assert!(std::rc::Rc::ptr_eq(&values.0[1], &copy.0[1]));
+        assert!(!std::rc::Rc::ptr_eq(&values.0[2], &copy.0[2]));
+
+        // The copy already holds everything the original does.
+        assert!(!copy.join(&values, false));
+        assert!(!copy.join(&values, true));
+        assert!(std::rc::Rc::ptr_eq(&values.0[1], &copy.0[1]));
+
+        // The original gains the one value the copy changed and nothing else.
+        assert!(values.join(&copy, false));
+        assert!(values == copy);
+        assert!(std::rc::Rc::ptr_eq(&values.0[0], &copy.0[0]));
+    }
+
+    #[test]
+    fn a_back_edge_still_widens_values_two_copies_share() {
+        let root = Owner::new(Root::Local(0, Some(mir::LocalId(0))));
+        let nested = root
+            .projected(Projection::Element(None))
+            .projected(Projection::Element(None));
+        let mut values = LocalValues::new(1);
+        values[0].owners = HashSet::from([root.clone(), nested.clone()]);
+        let shared = values.clone();
+
+        // An ordinary join of a value with itself changes nothing.
+        assert!(!values.join(&shared, false));
+        // Across a back edge the longer owner widens against the shorter one,
+        // exactly as it does when the two copies do not share the value.
+        let mut expected = Value {
+            owners: HashSet::from([root, nested]),
+            ..Value::default()
+        };
+        let incoming = expected.clone();
+        let changed = expected.join_on_cycle(&incoming, true);
+        assert_eq!(values.join(&shared, true), changed);
+        assert!(values[0] == expected);
+    }
+
+    #[test]
     fn copy_enum_construction_keeps_region_origins_in_plain_and_nullable_fields() {
         let program = crate::lower_source_to_mir(
             "enum-region-origins.doria",
@@ -68,7 +113,7 @@ mod scheduling_tests {
                 (Root::Local(0, Some(mir::LocalId(0))), false),
             ] {
                 let mut flow = Flow {
-                    values: vec![Value::owner(source)],
+                    values: vec![Value::owner(source)].into(),
                     fields: HashMap::new(),
                     selected: HashSet::new(),
                     writes: HashMap::new(),
@@ -259,7 +304,7 @@ function main(): void {
             call: 0,
         };
         let flow = Flow {
-            values: Vec::new(),
+            values: LocalValues::new(0),
             fields: HashMap::new(),
             selected: HashSet::new(),
             writes: HashMap::new(),
@@ -427,7 +472,7 @@ mod join_tests {
             ..Value::default()
         };
         let mut flow = Flow {
-            values: vec![Value::owner(root.root)],
+            values: vec![Value::owner(root.root)].into(),
             fields: HashMap::from([(home, stored.clone())]),
             selected: HashSet::new(),
             writes: HashMap::new(),
@@ -930,11 +975,81 @@ impl Selection {
     }
 }
 
+/// One origin value for each local of the function being proved.
+///
+/// The proof keeps one copy of this state for every block it has reached and
+/// makes another for every edge it follows. A block changes a handful of
+/// locals, so the copies share every value they have not changed: copying
+/// costs a reference count for each local, and joining two copies skips the
+/// values they still share.
+#[derive(Clone, PartialEq, Eq)]
+struct LocalValues(Vec<std::rc::Rc<Value>>);
+
+impl LocalValues {
+    fn new(count: usize) -> Self {
+        // Every local starts as the same empty value, held once.
+        let empty = std::rc::Rc::new(Value::default());
+        Self((0..count).map(|_| std::rc::Rc::clone(&empty)).collect())
+    }
+
+    #[cfg(test)]
+    fn push(&mut self, value: Value) {
+        self.0.push(std::rc::Rc::new(value));
+    }
+
+    fn join(&mut self, incoming: &Self, cyclic: bool) -> bool {
+        let mut changed = false;
+        for (value, incoming) in self.0.iter_mut().zip(&incoming.0) {
+            // Joining a value with itself changes nothing, except that a join
+            // across a back edge first widens each owner against the others
+            // and each closure home against the other homes. One owner and
+            // one closure have nothing to widen against.
+            if std::rc::Rc::ptr_eq(value, incoming)
+                && (!cyclic || value.owners.len() <= 1 && value.closures.len() <= 1)
+            {
+                continue;
+            }
+            changed |= std::rc::Rc::make_mut(value).join_on_cycle(incoming, cyclic);
+        }
+        changed
+    }
+
+    /// Applies `change` to every value `matches` selects and leaves the
+    /// others shared.
+    fn change_where(&mut self, matches: impl Fn(&Value) -> bool, change: impl Fn(&mut Value)) {
+        for value in &mut self.0 {
+            if matches(value) {
+                change(std::rc::Rc::make_mut(value));
+            }
+        }
+    }
+}
+
+impl From<Vec<Value>> for LocalValues {
+    fn from(values: Vec<Value>) -> Self {
+        Self(values.into_iter().map(std::rc::Rc::new).collect())
+    }
+}
+
+impl std::ops::Index<usize> for LocalValues {
+    type Output = Value;
+
+    fn index(&self, local: usize) -> &Value {
+        &self.0[local]
+    }
+}
+
+impl std::ops::IndexMut<usize> for LocalValues {
+    fn index_mut(&mut self, local: usize) -> &mut Value {
+        std::rc::Rc::make_mut(&mut self.0[local])
+    }
+}
+
 // Function-local loan safety is checked before this call-context proof;
 // retain only the interprocedural origin facts here.
 #[derive(Clone, PartialEq, Eq)]
 struct Flow {
-    values: Vec<Value>,
+    values: LocalValues,
     fields: HashMap<Owner, Value>,
     selected: HashSet<Selection>,
     writes: HashMap<Owner, Value>,
@@ -952,10 +1067,7 @@ impl Flow {
     }
 
     fn join(&mut self, incoming: Self, cyclic: bool) -> bool {
-        let mut changed = false;
-        for (value, incoming) in self.values.iter_mut().zip(incoming.values) {
-            changed |= value.join_on_cycle(&incoming, cyclic);
-        }
+        let mut changed = self.values.join(&incoming.values, cyclic);
         changed |= join_storage(&mut self.fields, &incoming.fields, cyclic);
         changed |= join_storage(&mut self.writes, &incoming.writes, cyclic);
         let before = self.selected.len();
@@ -1024,12 +1136,14 @@ impl Flow {
                 .entry(owner.clone())
                 .or_default()
                 .join(replacement);
-            for alias in &mut self.values {
-                if alias
-                    .owners
-                    .iter()
-                    .any(|alias| alias.storage_overlaps(owner))
-                {
+            self.values.change_where(
+                |alias| {
+                    alias
+                        .owners
+                        .iter()
+                        .any(|alias| alias.storage_overlaps(owner))
+                },
+                |alias| {
                     alias.types.extend(replacement.types.iter().copied());
                     alias.closures.extend(replacement.closures.iter().cloned());
                     alias
@@ -1037,8 +1151,8 @@ impl Flow {
                         .extend(replacement.boxed_homes.iter().copied());
                     alias.unknown_callable |= replacement.unknown_callable;
                     alias.unknown_contents |= replacement.unknown_contents;
-                }
-            }
+                },
+            );
             for alias in self.fields.values_mut() {
                 if alias
                     .owners
@@ -1924,7 +2038,7 @@ impl Proof<'_> {
         let finalizers = super::FinalizerExits::of(function);
         let mut pending = borrowed_views::NodeWorklist::new(function)?;
         let mut initial = Flow {
-            values: vec![Value::default(); function.locals.len()],
+            values: LocalValues::new(function.locals.len()),
             fields: self.contexts[context].fields.clone(),
             selected: self.contexts[context].selected.clone(),
             writes: HashMap::new(),

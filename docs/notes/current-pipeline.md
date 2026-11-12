@@ -13,6 +13,116 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
+  designed and not implemented. Two records are drafted in `docs/decisions/`
+  as Proposed and wait for Andrew's review, uncommitted until he has read
+  them: the geometry-math decision (surface, scalar math on the `Float` and
+  `Float32` companions, `declare(math: "host")`, inline records, the operator
+  table, acceptance, and a readiness note listing what the stage touches and
+  depends on) and the geometry layout decision (C layout, no SIMD in v0, what
+  Stage 44 inherits). His sixteen card rulings of 2026-11-11 are quoted in
+  them.
+  Landed ahead of the stage, each approved by Andrew on a card that day
+  ("All three now", "Yes, as its own change now", "Fix the native runtime
+  now"): PHP output computes `float32` exactly (literals, constants, `+ - *
+  /`, compound assignment, `++`, `--`, each rounded once to binary32), converts
+  with `Int::toFloat` and `Float::toInt` (P1110 as native), and prints floats
+  and `%f` from the exact decimal expansion, so the float rejections in PHP
+  output are gone; the native runtime's `%f` no longer scales in floating
+  point first (`%.1f` of 1.15 printed 1.2, and `%f` of 1e40 panicked with
+  P1205) and the interpreter and runtime share one rule for precisions past
+  the 1074th fraction digit.
+  Evidence, macOS arm64 with LLVM, in the shared checkout: all 117 `doriac`
+  test targets and the `doriac` and `doria-rt` library tests, 4,294 passing
+  test executions, none failed or ignored; the hosted runtime profile's
+  tests (676); strict Clippy for `doriac` and `doria-rt`; format; the
+  repository guard scripts. New:
+  `php_float_execution_tests` (interpreter, fast, release and PHP held to one
+  another and to a table computed in Rust `f32`), added to the local LLVM
+  suite list. Not run: `validate_work_unit.php`, Linux, Windows, the other
+  workspace crates, the release-mode runtime tests, the Windows and Linux lint
+  graphs.
+  Found and open: the fast profile's executable size and compile memory grow
+  with the square of a program's size (936 one-line statements in
+  48-statement functions: 112 MB executable, 308 MB to compile; 1,872: 406 MB
+  and 888 MB; release: 6.6 MB and 7.0 MB). Function size does not matter.
+  Cause not investigated. It stopped the first runs of the float32 table on
+  an 8 GB machine, so that test checks the table as fifteen small programs.
+  Float literals have no exponent syntax. No stage owns scalar math or the
+  `declare` grammar today; the geometry-math decision puts both in Stage 47's
+  first slice.
+- Stage 46, the terminal layer, delivered 2026-11-11 under Decision 0140.
+  `Doria\Std\Term` is one module authored in Doria over two runtime
+  primitives: `Console`, the `RawMode` and `AlternateScreen` guards, typed key
+  and resize events, `Style` and `Color`, `TerminalError`. The runtime keeps a
+  ledger of what a program changed and puts the terminal back on return,
+  closed pipe, panic and signals. Windows uses console modes and input
+  records behind the same VT renderer and decoder as Unix.
+  Also delivered with it: `$isInteractive` on the standard views; terminal
+  events in a transfer-group wait (`Watchable`, `TransferPlan::watch` and
+  `andWatch`, `WatchKey`, `TransferCompletion::Ready`, `resubmitWatch`,
+  Decision 0110 "Watched Sources"); PHP output for all of it through the
+  native runtime; integer `/ % << >> & | ^ ~`, their compound forms and
+  checked `Target::from` in PHP output, which the module itself needed; one
+  decoder for native I/O failures in PHP output; the runtime's self-check
+  panic (P1001) naming the check that failed; E0781 for a program class that
+  declares `Watchable`; standard modules reaching each other's `internal`
+  members.
+  Acceptance: `examples/terminal/menu.doria`, the `Menu` / `MenuItem` program
+  Andrew asked for, runs unchanged on Linux, macOS and native Windows. The
+  `terminal` CI job compiles it on each platform, drives it in a pty or
+  ConPTY (keys, a window resize, cancel) and holds every screen to the
+  interpreter's, with the fast profile, the release profile and PHP output.
+  The same harness runs a key and modifier probe, a return and panic restore
+  probe, a relay that waits on a command's output and the terminal together,
+  and a checked error leaving a group that reads and watches.
+  Evidence: CI run 43033980886 on `a2d19dc`, all three `terminal` jobs green.
+  Local validation on macOS at `bceee70`: `php scripts/validate_work_unit.php
+  --llvm` ran every step from an empty cache (the repository guards, format,
+  strict Clippy for the host and for the Windows and Linux targets, the
+  workspace tests, the hosted runtime profile, the release runtime tests and
+  the LLVM suites): 8,254 passing test executions in 169 suites, none failed
+  or ignored. The runner exited 1 only after its 22.79 GiB target exceeded
+  the separate 15 GiB cache cap and was reclaimed; this is not an overall
+  validator pass. Since the local vet gained the Windows and Linux lint
+  graphs, a run from an empty cache cannot stay under that cap; that is a
+  defect in the validator and is open.
+  Open, not closure conditions: the runtime's own pty tests (signals, stop
+  and continue, cursor query) run on Unix only, so those paths have Windows
+  coverage only through the probes; a cancelled pending read of a child's
+  pipe is reported as a failure on Windows and as no outcome on Unix, which
+  PHP output now decodes but nothing unifies; `codegen_php_tests` is not in
+  the Windows CI job; mouse events, a line editor and scroll regions are
+  later slices of Decision 0140; the build ledger was reconciled by hand once
+  on 2026-11-10 after its guard was killed.
+  After the completion commit `61e3145` the `rust` CI job reached its
+  90-minute limit: its test step had grown from 52 to 71 minutes in a day.
+  Ten of those minutes were one Stage 46 test, the PHP integer operator
+  parity test, whose generated `main` has about 1,366 statements. The cause
+  was the Stage 36a call-origin proof, which copied its whole per-local state
+  at every block and edge; `863949d` makes copies share unchanged values and
+  cut that proof's cost by about 28 times on that program. Still open from
+  the same measurements: the borrowed-views validator has the same dense
+  state and is now the larger cost (about 5 seconds for that function in a
+  release build); a fast-profile executable for that program is 74 MB, 66 MB
+  of it read-only data, and grows with the square of program size.
+  With the fix the `rust` job passed in 81 minutes (run 43099429345 on
+  `0514bfd`). It had been running the durable parity suite twice, once in its
+  workspace test step and again in a step of its own, about 14 minutes a run;
+  Andrew ruled on 2026-11-12 to remove the repeated step. The suite still
+  runs once, in the `Test` step.
+  Review of the release to `main` on 2026-11-12 found two runtime defects,
+  fixed the same day. On Unix a signal's predecessor is now saved once per
+  installation: entering raw mode again under a handler a library had
+  installed over this layer's saved that handler as the predecessor, and the
+  two called each other without end. The same holds for the six interruption
+  signals, and a stop now puts back the handler it displaced instead of this
+  layer's own. On Windows Control+Space is reported: the console delivers it
+  as a key record whose character is zero, which the reader had dropped with
+  the keys that have no character. That rule rests on the console writing
+  the characters of its input without a scan code; it is checked through
+  ConPTY in CI, not on a physical keyboard.
+
 - Stage 36a push, 2026-11-05 (delivered 2026-11-08). Decisions and their
   alternatives are in `docs/notes/stage36a-decision-log.md` (entries 1-51).
   Landed: PHP generic payload enums (class per specialization, exact `mixed`

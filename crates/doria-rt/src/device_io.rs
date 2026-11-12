@@ -9,6 +9,7 @@ mod checked_stream;
 mod device;
 #[cfg(any(unix, windows))]
 pub(crate) mod helper;
+mod output;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod pending_tests;
 mod stream;
@@ -411,6 +412,13 @@ pub(crate) unsafe fn write_panic(bytes: *const u8, length: usize) -> WriteOutcom
         return WriteOutcome::OtherFailure(Failure::invalid_input());
     };
     loan.write_text(bytes, length)
+}
+
+/// The terminal restore as the process ends. Whoever holds the device loan
+/// will never finish with it, so this write does not wait for it.
+#[cfg(windows)]
+pub(crate) unsafe fn write_stdout_at_process_end(bytes: &[u8]) {
+    let _ = write_unclaimed(StandardStream::Stdout, bytes.as_ptr(), bytes.len());
 }
 
 #[cfg(unix)]

@@ -13,8 +13,13 @@ pub enum TransferPlanFunction {
     AndReadFrom,
     WriteTo,
     AndWriteTo,
+    /// `startWatch`: a plan whose first entry watches a source (Decision 0140).
+    StartWatch,
+    /// `appendWatch`: adds a watch to a consumed plan.
+    AppendWatch,
     GetReadKey,
     GetWriteKey,
+    GetWatchKey,
 }
 
 impl TransferPlanFunction {
@@ -23,11 +28,22 @@ impl TransferPlanFunction {
     }
 
     pub fn is_key_lookup(self) -> bool {
-        matches!(self, Self::GetReadKey | Self::GetWriteKey)
+        matches!(
+            self,
+            Self::GetReadKey | Self::GetWriteKey | Self::GetWatchKey
+        )
     }
 
     pub fn is_appending(self) -> bool {
-        matches!(self, Self::AndReadFrom | Self::AndWriteTo)
+        matches!(
+            self,
+            Self::AndReadFrom | Self::AndWriteTo | Self::AppendWatch
+        )
+    }
+
+    /// A watch entry has a source and its identity, not a key and a region.
+    pub fn is_watch(self) -> bool {
+        matches!(self, Self::StartWatch | Self::AppendWatch)
     }
 
     pub fn return_borrow(self) -> Option<crate::symbols::ReturnBorrow> {
@@ -48,18 +64,25 @@ impl TransferPlanFunction {
             return Vec::new();
         }
         use crate::symbols::BorrowSource;
-        let source = |source, writable| crate::ownership::RetainedSource {
+        let source = |source, inherited, writable| crate::ownership::RetainedSource {
             source,
-            inherited: true,
+            inherited,
             writable,
             lifetime: crate::types::RetainedLifetime::Cleanup,
             owned_path: Vec::new(),
         };
         let mut sources = Vec::new();
         if self.is_appending() {
-            sources.push(source(BorrowSource::Receiver, false));
+            sources.push(source(BorrowSource::Receiver, true, false));
         }
-        sources.push(source(BorrowSource::Parameter(1), self.is_read()));
+        if self.is_watch() {
+            // The plan keeps the watched source itself in shared use. A region
+            // is a carrier whose loans the plan inherits; a watched source
+            // carries none, so the plan borrows the source directly.
+            sources.push(source(BorrowSource::Parameter(0), false, false));
+        } else {
+            sources.push(source(BorrowSource::Parameter(1), true, self.is_read()));
+        }
         sources
     }
 }
@@ -79,9 +102,12 @@ pub enum TransferGroupFunction {
     NextCompletion,
     ObservedReadKey,
     ObservedWriteKey,
+    ObservedWatchKey,
     ReadRegion,
     ResubmitRead,
     ResubmitWrite,
+    /// Arms a watch again after its `Ready` was fetched (Decision 0140).
+    ResubmitWatch,
 }
 
 impl TransferGroupFunction {
@@ -113,6 +139,8 @@ pub(crate) struct TransferObservationTypes {
     pub(crate) completion: crate::mir::PayloadEnumType,
     pub(crate) keys: [crate::inline_value::InlineValueType; 2],
     pub(crate) outcomes: [crate::mir::PayloadEnumType; 2],
+    /// The only payload of the completion's third case, `Ready`.
+    pub(crate) watch_key: crate::inline_value::InlineValueType,
 }
 
 impl TransferObservationTypes {
@@ -144,10 +172,16 @@ impl TransferObservationTypes {
             keys.push(key);
             outcomes.push(outcome);
         }
+        let Type::Scalar(ScalarType::Inline(watch_key)) =
+            definition.cases.get(2)?.payload.first()?.ty
+        else {
+            return None;
+        };
         Some(Self {
             completion,
             keys: keys.try_into().ok()?,
             outcomes: outcomes.try_into().ok()?,
+            watch_key,
         })
     }
 }
@@ -462,6 +496,11 @@ pub enum FileFunction {
     WriteRequestOutcome,
     CompleteReadRequest,
     CompleteWriteRequest,
+    /// The terminal runtime's packed operation, for facts about a standard
+    /// device that `Doria\Std\Io` reports itself.
+    AskTerminal,
+    /// `WatchSource::fromBits`: the one-word value built from its integer.
+    WatchSourceFromBits,
     UnavailableConstructor,
 }
 
@@ -470,6 +509,8 @@ impl FileFunction {
         !matches!(
             self,
             Self::UnavailableConstructor
+                | Self::AskTerminal
+                | Self::WatchSourceFromBits
                 | Self::StandardInput
                 | Self::StandardOutput
                 | Self::StandardError
@@ -549,9 +590,13 @@ pub fn standard_device(name: &str) -> Option<crate::mir::StandardIoStream> {
 pub const WRITABLE_FILE: &str = "Doria\\Std\\Io\\WritableFile";
 pub const DUPLEX_FILE: &str = "Doria\\Std\\Io\\DuplexFile";
 pub const READINESS_SOURCE: &str = "Doria\\Std\\Io\\ReadinessSource";
+pub const WAIT: &str = "Doria\\Std\\Io\\Wait";
 pub const REGISTRATION_KEY: &str = "Doria\\Std\\Io\\RegistrationKey";
 pub const READ_TRANSFER_KEY: &str = "Doria\\Std\\Io\\ReadTransferKey";
 pub const WRITE_TRANSFER_KEY: &str = "Doria\\Std\\Io\\WriteTransferKey";
+pub const WATCHABLE: &str = "Doria\\Std\\Io\\Watchable";
+pub const WATCH_SOURCE: &str = "Doria\\Std\\Io\\WatchSource";
+pub const WATCH_KEY: &str = "Doria\\Std\\Io\\WatchKey";
 pub const TRANSFER_COMPLETION: &str = "Doria\\Std\\Io\\TransferCompletion";
 pub const TRANSFER_WAIT_RESULT: &str = "Doria\\Std\\Io\\TransferWaitResult";
 pub const READINESS_SET: &str = "Doria\\Std\\Io\\ReadinessSet";
@@ -656,7 +701,7 @@ pub fn cleanup_may_block(name: &str) -> bool {
     (owns_native_file(name) && !is_child_pipe(name)) || matches!(name, TRANSFER_GROUP | CHILD)
 }
 
-pub const CANONICAL_TYPES: [&str; 56] = [
+pub const CANONICAL_TYPES: [&str; 59] = [
     STANDARD_STREAMS,
     STANDARD_INPUT,
     STANDARD_OUTPUT,
@@ -695,6 +740,9 @@ pub const CANONICAL_TYPES: [&str; 56] = [
     REGISTRATION_KEY,
     READ_TRANSFER_KEY,
     WRITE_TRANSFER_KEY,
+    WATCHABLE,
+    WATCH_SOURCE,
+    WATCH_KEY,
     TRANSFER_COMPLETION,
     TRANSFER_WAIT_RESULT,
     READINESS_SET,
@@ -749,7 +797,9 @@ const PROCESS_DECLARATIONS: [&str; 8] = [
 /// the file's public lock methods construct the guards in Doria.
 fn authored_member(class: &str, member: &crate::ast::ClassMember) -> bool {
     let crate::ast::ClassMember::Method(method) = member else {
-        return AUTHORED_CLASSES.contains(&class);
+        return AUTHORED_CLASSES.contains(&class)
+            || matches!(member, crate::ast::ClassMember::Property(property)
+                if property.name == "isInteractive");
     };
     match class {
         "FileLock" | "LockedFile" => !matches!(method.name.as_str(), "releaseFile" | "abandonFile"),
@@ -761,6 +811,9 @@ fn authored_member(class: &str, member: &crate::ast::ClassMember) -> bool {
             method.name.as_str(),
             "waitUntil" | "wait" | "terminate" | "detach" | "collect" | "status"
         ),
+        // The watch members read the source's identity in Doria and hand it to
+        // the intrinsics that take it.
+        "TransferPlan" => matches!(method.name.as_str(), "watch" | "andWatch"),
         _ => AUTHORED_CLASSES.contains(&class),
     }
 }
@@ -1695,6 +1748,7 @@ class BorrowedBufferedWriter<S implements Doria\Std\Io\WritableStream> implement
 enum TransferCompletion {
     case Read(Doria\Std\Io\ReadTransferKey $key, ?Doria\Std\Io\ReadOutcome $outcome);
     case Write(Doria\Std\Io\WriteTransferKey $key, ?Doria\Std\Io\WriteOutcome $outcome);
+    case Ready(Doria\Std\Io\WatchKey $key);
 }
 enum TransferWaitResult {
     case Completed(Doria\Std\Io\TransferCompletion $completion);
@@ -1726,6 +1780,20 @@ class ReadTransferKey {
 class WriteTransferKey {
     internal function __construct() {}
 }
+// A source a transfer plan can watch (Decision 0140). The runtime backs every
+// watchable source, so only standard classes implement this.
+interface Watchable {
+    Doria\Std\Io\WatchSource $watchSource { get; }
+}
+// What the runtime waits on for a watched source: its kind above bit 32 and
+// that kind's token below. Kind 1 is a terminal raw mode.
+class WatchSource {
+    internal function __construct() {}
+    internal static function fromBits(int $bits): self {}
+}
+class WatchKey {
+    internal function __construct() {}
+}
 class ReadinessSet {
     function __construct() throws Doria\Std\Io\IoError {}
     writable function register<T implements Doria\Std\Io\ReadinessStream>(take T $stream): Doria\Std\Io\RegistrationKey<T> throws Doria\Std\Io\IoError {}
@@ -1741,9 +1809,11 @@ class TransferGroup {
     writable function getNextCompletion(Doria\Std\Io\Wait $wait): Doria\Std\Io\TransferWaitResult throws Doria\Std\Io\IoError {}
     ?Doria\Std\Io\ReadTransferKey $observedReadKey { get {} }
     ?Doria\Std\Io\WriteTransferKey $observedWriteKey { get {} }
+    ?Doria\Std\Io\WatchKey $observedWatchKey { get {} }
     function getReadRegion(Doria\Std\Io\ReadTransferKey $key): ?Doria\Std\Io\ByteRegion throws Doria\Std\Io\IoError {}
     writable function resubmitRead(Doria\Std\Io\ReadTransferKey $key, int $offset, int $length): void throws Doria\Std\Io\IoError {}
     writable function resubmitWrite(Doria\Std\Io\WriteTransferKey $key, int $offset, int $length): void throws Doria\Std\Io\IoError {}
+    writable function resubmitWatch(Doria\Std\Io\WatchKey $key): void throws Doria\Std\Io\IoError {}
 }
 class TransferPlan {
     internal function __construct() {}
@@ -1753,6 +1823,18 @@ class TransferPlan {
     consuming function andWriteTo<T implements Doria\Std\Io\PendingWritableStream>(Doria\Std\Io\RegistrationKey<T> $key, Doria\Std\Io\ByteRegion $source): self throws Doria\Std\Io\IoError {}
     function getReadKey(int $position): Doria\Std\Io\ReadTransferKey throws Doria\Std\Io\IoError {}
     function getWriteKey(int $position): Doria\Std\Io\WriteTransferKey throws Doria\Std\Io\IoError {}
+    // The plan, and the group begun from it, keep the watched source in shared
+    // use; only its identity reaches the runtime.
+    static function watch<T implements Doria\Std\Io\Watchable>(T $source): self throws Doria\Std\Io\IoError {
+        return Doria\Std\Io\TransferPlan::startWatch($source, $source->watchSource);
+    }
+    consuming function andWatch<T implements Doria\Std\Io\Watchable>(T $source): self throws Doria\Std\Io\IoError {
+        let $plan = $this;
+        return $plan->appendWatch($source, $source->watchSource);
+    }
+    internal static function startWatch<T implements Doria\Std\Io\Watchable>(T $source, Doria\Std\Io\WatchSource $identity): self throws Doria\Std\Io\IoError {}
+    internal consuming function appendWatch<T implements Doria\Std\Io\Watchable>(T $source, Doria\Std\Io\WatchSource $identity): self throws Doria\Std\Io\IoError {}
+    function getWatchKey(int $position): Doria\Std\Io\WatchKey throws Doria\Std\Io\IoError {}
 }
 interface ReadinessStream {
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get; }
@@ -1780,6 +1862,9 @@ class StandardStreams {
     static Doria\Std\Io\StandardInput $input { get {} }
     static Doria\Std\Io\StandardOutput $output { get {} }
     static Doria\Std\Io\StandardError $error { get {} }
+    // One call into the terminal runtime, which owns what a standard device
+    // is attached to. Its result packs as `Doria\Std\Term` results do.
+    internal static function askTerminal(int $operation, int $first, int $second, string $text): int {}
 }
 class StandardInput implements Doria\Std\Io\PendingReadableStream {
     internal function __construct() {}
@@ -1787,6 +1872,9 @@ class StandardInput implements Doria\Std\Io\PendingReadableStream {
     writable function prepareRead(writable Doria\Std\Io\ReadRequest $request, writable Doria\Std\Io\WritableByteRegion $destination): void throws Doria\Std\Io\IoError {}
     writable function completeRead(Doria\Std\Io\ReadRequest $request, writable Doria\Std\Io\WritableByteRegion $destination): ?Doria\Std\Io\ReadOutcome throws Doria\Std\Io\IoError {}
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get {} }
+    bool $isInteractive {
+        get { return (Doria\Std\Io\StandardStreams::askTerminal(24, 0, 0, "") >> 8) == 1; }
+    }
 }
 class StandardOutput implements Doria\Std\Io\PendingWritableStream {
     internal function __construct() {}
@@ -1794,6 +1882,9 @@ class StandardOutput implements Doria\Std\Io\PendingWritableStream {
     writable function prepareWrite(writable Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): void throws Doria\Std\Io\IoError {}
     writable function completeWrite(Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): ?Doria\Std\Io\WriteOutcome throws Doria\Std\Io\IoError {}
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get {} }
+    bool $isInteractive {
+        get { return (Doria\Std\Io\StandardStreams::askTerminal(24, 1, 0, "") >> 8) == 1; }
+    }
 }
 class StandardError implements Doria\Std\Io\PendingWritableStream {
     internal function __construct() {}
@@ -1801,6 +1892,9 @@ class StandardError implements Doria\Std\Io\PendingWritableStream {
     writable function prepareWrite(writable Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): void throws Doria\Std\Io\IoError {}
     writable function completeWrite(Doria\Std\Io\WriteRequest $request, Doria\Std\Io\ByteRegion $source): ?Doria\Std\Io\WriteOutcome throws Doria\Std\Io\IoError {}
     Doria\Std\Io\ReadinessSource $readinessSource { borrowed get {} }
+    bool $isInteractive {
+        get { return (Doria\Std\Io\StandardStreams::askTerminal(24, 2, 0, "") >> 8) == 1; }
+    }
 }
 class File {
     internal function __construct() {}
@@ -2120,6 +2214,9 @@ pub fn declarations() -> &'static Program {
                                             "observedWriteKey" => {
                                                 TransferGroupFunction::ObservedWriteKey
                                             }
+                                            "observedWatchKey" => {
+                                                TransferGroupFunction::ObservedWatchKey
+                                            }
                                             _ => unreachable!("compiler-known group property"),
                                         },
                                     ),
@@ -2157,6 +2254,7 @@ pub fn declarations() -> &'static Program {
                                     "getReadRegion" => TransferGroupFunction::ReadRegion,
                                     "resubmitRead" => TransferGroupFunction::ResubmitRead,
                                     "resubmitWrite" => TransferGroupFunction::ResubmitWrite,
+                                    "resubmitWatch" => TransferGroupFunction::ResubmitWatch,
                                     _ => unreachable!("compiler-owned group method"),
                                 },
                             ),
@@ -2174,6 +2272,9 @@ pub fn declarations() -> &'static Program {
                                     "andWriteTo" => TransferPlanFunction::AndWriteTo,
                                     "getReadKey" => TransferPlanFunction::GetReadKey,
                                     "getWriteKey" => TransferPlanFunction::GetWriteKey,
+                                    "startWatch" => TransferPlanFunction::StartWatch,
+                                    "appendWatch" => TransferPlanFunction::AppendWatch,
+                                    "getWatchKey" => TransferPlanFunction::GetWatchKey,
                                     _ => unreachable!("compiler-owned transfer-plan method"),
                                 },
                             ),
@@ -2225,6 +2326,8 @@ pub fn declarations() -> &'static Program {
                     }
                     let implementation = match (declaration.name.as_str(), method.name.as_str()) {
                         (_, "__construct") => FileFunction::UnavailableConstructor,
+                        ("StandardStreams", "askTerminal") => FileFunction::AskTerminal,
+                        ("WatchSource", "fromBits") => FileFunction::WatchSourceFromBits,
                         ("ReadRequest", "complete") => FileFunction::CompleteReadRequest,
                         ("WriteRequest", "complete") => FileFunction::CompleteWriteRequest,
                         (_, "prepareRead") => FileFunction::PrepareRead,
@@ -2297,11 +2400,29 @@ pub fn declarations() -> &'static Program {
     &DECLARATIONS
 }
 
+/// The Term module is written over `Wait`, so a program that uses Term uses
+/// this source too.
 pub fn resolved_facts_use_streams(facts: &GlobalSymbolFacts) -> bool {
-    facts.references.iter().any(|reference| {
-        matches!(&reference.symbol_id.owner,
-            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
-                if CANONICAL_TYPES.contains(&name.as_str()))
+    crate::compiler_known_term::resolved_facts_use_term(facts)
+        || facts.references.iter().any(|reference| {
+            matches!(&reference.symbol_id.owner,
+                GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
+                    if CANONICAL_TYPES.contains(&name.as_str()))
+        })
+}
+
+/// The fully qualified standard names a piece of standard source mentions.
+/// Every cross-reference in compiler-known source is fully qualified, so
+/// scanning the text is exact.
+fn standard_names(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices("Doria\\Std\\").map(move |(start, _)| {
+        let rest = &text[start..];
+        let end = rest
+            .char_indices()
+            .skip("Doria\\Std\\".len())
+            .find(|(_, character)| !(character.is_alphanumeric() || *character == '\\'))
+            .map_or(rest.len(), |(end, _)| end);
+        &rest[..end]
     })
 }
 
@@ -2346,14 +2467,8 @@ fn declaration_dependencies() -> &'static [Vec<usize>] {
                 let span = item_span(item);
                 let text = &SOURCE_TEXT[span.start..span.end];
                 let mut dependencies = Vec::new();
-                for (start, _) in text.match_indices("Doria\\Std\\") {
-                    let rest = &text[start..];
-                    let end = rest
-                        .char_indices()
-                        .skip("Doria\\Std\\".len())
-                        .find(|(_, character)| !(character.is_alphanumeric() || *character == '\\'))
-                        .map_or(rest.len(), |(end, _)| end);
-                    if let Some(position) = index.get(&rest[..end]) {
+                for name in standard_names(text) {
+                    if let Some(position) = index.get(name) {
                         if !dependencies.contains(position) {
                             dependencies.push(*position);
                         }
@@ -2373,15 +2488,23 @@ pub fn augment_program_for(program: &Program, facts: &GlobalSymbolFacts) -> Prog
     let items = &declarations().items;
     let dependencies = declaration_dependencies();
     let mut reached = vec![false; items.len()];
+    // The Term source is added whole, so everything it names here is reached
+    // by any program that uses Term.
+    let named_by_term = if crate::compiler_known_term::resolved_facts_use_term(facts) {
+        standard_names(crate::compiler_known_term::SOURCE_TEXT).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut pending = items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            facts.references.iter().any(|reference| {
-                matches!(&reference.symbol_id.owner,
-                    GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
-                        if name == item_name(item))
-            })
+            named_by_term.contains(&item_name(item))
+                || facts.references.iter().any(|reference| {
+                    matches!(&reference.symbol_id.owner,
+                        GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(name))
+                            if name == item_name(item))
+                })
         })
         .map(|(position, _)| position)
         .collect::<Vec<_>>();

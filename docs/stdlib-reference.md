@@ -277,6 +277,10 @@ independent snapshot. Immediate borrowed calls are valid; a stored returned
 borrow requires an explicitly declared interface owner, such as
 `ReadinessStream $owner = $input; let $view = borrowInput($owner);`.
 The original Copy binding stays independent.
+Each view has a readonly `bool $isInteractive`: true when that standard
+stream is attached to a terminal (Decision 0140). It never throws, answers
+while a pending transfer holds the device, and in PHP output is asked of the
+native runtime like every other standard-view member.
 
 Line reading (Decision 0110, Text Adapters): `LineReader<S implements
 ReadableStream>` owns its source, and `BorrowedLineReader<S>` borrows it.
@@ -346,14 +350,21 @@ conversion, or hashing contract is provided.
 - **`Doria\Std\Net`** — networking, TCP first. Stage 40a owns the first typed TCP/TLS and HTTP-client foundation over decision 0110 streams, readiness, duration/deadline timing, cancellation, partial writes, backpressure, and reusable buffers. Stage 44 matures and hardens it; socket streams do not define a second I/O contract. Exact TLS configuration belongs to the Stage 40a network design. *(Surface TBD.)*
 - **`Doria\Std\Http`** — HTTP client foundation alongside `Net` in Stage 40a; further maturation in Stage 44. *(Surface TBD.)*
 - **`Doria\Std\Data`** — **DDO**, the batteries-included database layer: decomposed `Connection` / `Statement` / `Transaction` / typed rows, the `Sql` provenance newtype, RAII transactions with consuming `commit`, capability-based drivers, typed fetches. Direction: plan §9 (DDO); prerequisites checked errors (Stage 29) + `Net`. *(The authoritative DDO record is unauthored; 0007 is a superseded sketch.)*
-- **`Doria\Std\Term`** — the portable terminal layer for the TUI product in plan §2, surfaced through the `Console` static facade. It reuses decision 0110's standard-stream views, readiness, blocking substrate, duration/deadline timing, cancellation, and platform-device abstraction; generic stream readiness is not reimplemented here. Raw mode and terminal events remain Term-owned, and mode changes require exclusive control plus a restoring guard. See "The terminal layer" in plan §9 and the Console/terminal decision. Surface (planned):
-  - **terminal info** — size, interactivity, colour capability;
-  - **screen** — clear, title (alternate-screen later);
-  - **cursor** — position, move, show/hide;
-  - **styled output**;
-  - **input** — blocking `readKey`, non-blocking `pollKey`, resize events, decoded to payload enums (`KeyEvent::Char(string $char)`, `KeyEvent::Up`, …);
-  - **raw mode** — entered through an ownership guard whose `__destruct` restores the terminal on every structured exit.
-  Capability-based (no escape sequences or platform encodings in any public value); stateless (no `ScreenBuffer` std type). *(Method inventory settled in the Console/terminal decision, TermUtil-informed; lands Stage 46.)*
+- **`Doria\Std\Term`** — the portable terminal layer for the TUI product in plan §2, specified by [Decision 0140](decisions/0140-terminal-layer-console-and-raw-mode.md). One program behaves the same in a Linux terminal, a macOS terminal and a native Windows console. It reuses decision 0110's standard-stream views, waits, duration/deadline timing, cancellation, and platform-device layer; generic stream readiness is not reimplemented here. No public value carries an escape sequence or a platform encoding, and there is no screen-buffer type. Columns and rows are zero-based, column first. Every `Console` method below is static and throws `TerminalError` unless noted. Import or qualify the names; there is no prelude alias.
+  - **`Console`** (no instances)
+    - **terminal** — `getSize(): Size`; readonly static `ColorSupport $colorSupport` (never throws). Whether a standard stream is a terminal is `$isInteractive` on the `Doria\Std\Io` standard views.
+    - **output** — `write(string $text, ?Style $style = null)`, `writeAt(int $column, int $row, string $text, ?Style $style = null)`, `flush()`. A style belongs to one write: the style, the text, then the default attributes again. A color the terminal cannot show maps to the nearest one it can. When standard output is not a terminal, or it has no color, `write` emits the text alone. Output collects and reaches the device as one write on `flush()`, before an event wait, before any other use of a standard stream, and at exit, in order with `echo`.
+    - **screen** — `clear()`, `clearLine()`, `clearLineFromCursor()`, `eraseAt(int $column, int $row)`, `setTitle(string $title)`, `setLineWrap(LineWrap $wrap)`, `reset()`.
+    - **cursor** — `moveTo(int $column, int $row)`, `moveUp(int $count = 1)`, `moveDown`, `moveLeft`, `moveRight`, `showCursor()`, `hideCursor()`. A negative position or count panics.
+    - **modes** — `enterRawMode(): RawMode` and `enterAlternateScreen(): AlternateScreen`. Each returns a Move guard; a second one while the first is alive throws `TerminalError` (in use).
+  - **`RawMode`** — the owner of terminal input. `getNextEvent(Wait $wait, ?CancellationToken $cancellation = null): TerminalWaitResult throws TerminalError` waits for one key or resize; `getCursorPosition(): Position throws TerminalError`; consuming `leave(): void throws TerminalError`. While it is alive, `read_line`, the byte intrinsics and `StandardInput` reads are refused, and Control+C is a key.
+  - **`AlternateScreen`** — consuming `leave(): void throws TerminalError`; the first screen and its scrollback return when it ends. Independent of raw mode.
+  - **restoring** — a guard's destructor puts back what it changed. So does the runtime on every way a program ends (return from `main`, `exit`, a closed output pipe, a panic before its message is written) and on termination and stop signals; a forced kill cannot be restored.
+  - **`TerminalWaitResult`** — `Event(TerminalEvent $event)`, `TimedOut`, `Cancelled`, `Closed`. **`TerminalEvent`** — `Key(Key $key, KeyModifiers $modifiers)`, `Resized(Size $size)`; several resizes between two waits are one event with the latest size. **`Key`** — `Character(string $text)` (one Unicode scalar), `Enter`, `Escape`, `Backspace`, `Tab`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `Function(int $number)` (1 to 12).
+  - **values** — inline Copy `Size` (`$columns`, `$rows`), `Position` (`$column`, `$row`), `KeyModifiers` (`$control`, `$alt`, `$shift`) and `Style`. A `Style` starts from static `Style::plain` and each of `withForeground(Color $color)`, `withBackground(Color $color)`, `withBold()`, `withDim()`, `withItalic()`, `withUnderline()`, `withReverse()`, `withStrikethrough()` returns a changed copy; `$foreground`, `$background`, `$isBold`, `$isDim`, `$isItalic`, `$isUnderlined`, `$isReversed`, `$isStruckThrough` read it back.
+  - **enums** — `Color`: `Default`, `Black`, `Red`, `Green`, `Yellow`, `Blue`, `Magenta`, `Cyan`, `White`, the eight `Bright…` forms, `Indexed(int $index)`, `Rgb(int $red, int $green, int $blue)` (each 0 to 255; outside it panics when the color is used). `ColorSupport`: `None`, `Basic`, `Indexed`, `TrueColor`. `LineWrap`: `Enabled`, `Disabled`.
+  - **`TerminalError`** implements `Error` with readonly `message`, `TerminalErrorReason $reason` (`NotATerminal`, `InUse`, `Unsupported`, `DeviceFailure`) and `?int $systemCode`.
+  Executable in the interpreter, which runs against a scripted terminal, and in both native profiles. PHP output drives the terminal through the native runtime (FFI), so it needs the compiler-published shared runtime beside the generated program. A `RawMode` implements `Doria\Std\Io\Watchable` (readonly `WatchSource $watchSource`), so a transfer plan can watch it and one group wait covers a program's transfers and its terminal events; see "Watched Sources" under `Doria\Std\Io`.
 - **`Doria\Std\Math`** — batteries-included game/graphics math as built-in Copy value types: `Vector2`/`Vector3`/`Vector4`, `Quaternion`, `Euler`, `Matrix3x3`/`Matrix4x4`, plus `lerp`/`clamp`/easing helpers. Compiler-known arithmetic operators; `$v->length` / `$v->normalized` properties, `$v->dot`/`$v->cross` methods. Direction: plan §9 (math); lands Stage 47. *(Geometry-math record unauthored.)*
 
 ### Byte Transfer Contracts
@@ -583,6 +594,68 @@ Invalid resubmission keys or ranges, active operations and unobserved results
 use existing `IoError` with
 `IoOperation::Configure`, `IoTarget::TransferGroup`, and
 `IoErrorReason::InvalidInput`, without a path, system code or byte progress.
+
+### Watched Sources
+
+A plan can also watch a source that is not a byte stream, so one group wait
+covers transfers and, for example, the terminal's key and resize events
+(Decisions 0110 and 0140):
+
+```doria
+interface Watchable {
+    WatchSource $watchSource { get; }
+}
+class TransferPlan {
+    static function watch<T implements Watchable>(T $source): self throws IoError;
+    consuming function andWatch<T implements Watchable>(T $source): self throws IoError;
+    function getWatchKey(int $position): WatchKey throws IoError;
+}
+enum TransferCompletion {
+    case Read(ReadTransferKey $key, ?ReadOutcome $outcome);
+    case Write(WriteTransferKey $key, ?WriteOutcome $outcome);
+    case Ready(WatchKey $key);
+}
+class TransferGroup {
+    ?WatchKey $observedWatchKey { get; }
+    writable function resubmitWatch(WatchKey $key): void throws IoError;
+}
+```
+
+- `Watchable` is implemented by the standard library only;
+  `Doria\Std\Term\RawMode` is the first implementation. A class in a program
+  that declares it is rejected (E0781). `WatchSource` is an opaque inline Copy
+  value with no public constructor or member: it is how a source tells the
+  runtime what to watch.
+- A watched source is borrowed, not registered. The plan and then the group
+  keep a shared loan of it: its readonly members stay callable while the group
+  runs, and consuming or moving it while it is watched is rejected (E0763).
+  A plan that only watches can begin on a `ReadinessSet` with no registration.
+- `WatchKey` is an inline Copy key. `getWatchKey` takes the zero-based plan
+  position; a position that is not a watch throws the same `IoError` as a
+  wrong-direction `getReadKey` (`Access`, `TransferPlan`, `InvalidInput`), and
+  `getReadKey` / `getWriteKey` throw it for a watch position.
+  `observedWatchKey` follows the two directional properties: present only
+  after a fetch that reported that watch.
+- A watch is armed when the group begins. It completes once, as
+  `Completed(Ready($key))`, when its source has something the program can take
+  without waiting. For a `RawMode` that is when
+  `getNextEvent(Wait::Immediate)` would not return `TimedOut`. The program
+  takes what is there and calls `resubmitWatch($key)` to watch again. A watch
+  that is not resubmitted is retired, and a group whose every read, write and
+  watch is retired reports `Exhausted`.
+- At each fetch a ready watch is reported before a queued transfer, in plan
+  order. If the program has already taken everything itself, no `Ready` is
+  reported.
+- When cancellation or the group deadline stops the group, a watch that was
+  armed is reported once as `Ready`, as a pending read is reported once as
+  `Read($key, null)`. Destroying the group retires its watches silently and
+  leaves the source as it was.
+- `resubmitWatch` throws `IoError` (`Configure`, `TransferGroup`,
+  `InvalidInput`) for a key that is not a watch of this group, a watch that
+  is still armed, a `Ready` that has not been fetched, and a stopped group.
+  `begin` throws `IoError` (`Configure`, `TransferGroup`, `Unsupported`) when
+  the platform's wait cannot include the source; on Windows one group can
+  watch one source.
 Validation submits no work and consumes no stored transfer Error; actual
 transfer failures still propagate unchanged at `getNextCompletion`.
 `getNextCompletion(Wait $wait)` returns `TransferWaitResult`. Both result types

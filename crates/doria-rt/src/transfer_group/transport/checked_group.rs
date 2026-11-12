@@ -8,9 +8,10 @@ use doria_diagnostic_catalogue::IoMessageOperation;
 /// Fetches through the registered complete adapters, with one call-owned wait.
 /// Private wait tags are 0 immediate, 1 indefinite, 2 signed relative nanoseconds,
 /// and 3 an exact two-word Deadline (low word first). Success returns tag 0 with
-/// result 0 Completed, 1 TimedOut, or 2 Exhausted. A completion has its original
-/// directional key and outcome 0 absent, 1 Data/Accepted, 2 WouldBlock, 3 EOF,
-/// or 4 TimedOut. Returns 1 with ordinary IoError fields, or 2 with the original
+/// result 0 Completed, 1 TimedOut, or 2 Exhausted. A completion has its kind
+/// in `reading` (0 write, 1 read, 2 watch), its original key and, for a
+/// transfer, outcome 0 absent, 1 Data/Accepted, 2 WouldBlock, 3 EOF, or
+/// 4 TimedOut. A watch has no outcome. Returns 1 with ordinary IoError fields, or 2 with the original
 /// owned adapter Error. No public enum layout is imposed by this scalar transport.
 /// Control retains the complete raw stop/cancellation facts for the caller;
 /// projecting a transfer result does not erase those independent facts.
@@ -98,6 +99,13 @@ pub unsafe extern "C" fn dr_v1_checked_transfer_group_observe(
                 .unwrap_or_else(|| crate::runtime_invariant_panic()),
             &outputs,
         ),
+        9 => {
+            if adapter::dr_v1_transfer_adapter_group_observed(owner, 2, key) != 0 {
+                crate::runtime_invariant_panic();
+            }
+            *reading = 2;
+            0
+        }
         0 | 1 | 3 | 4 => {
             *reading = if adapter::dr_v1_transfer_adapter_group_observed(owner, 1, key) == 0 {
                 1
@@ -371,6 +379,45 @@ pub unsafe extern "C" fn dr_v1_checked_transfer_group_resubmit(
             )
         }
         _ => status.fail(Failure::invalid_input()),
+    };
+    checked_group_result(
+        frame,
+        tag,
+        &status,
+        IoMessageOperation::Configure,
+        &IoFailureOutputs {
+            message,
+            path,
+            system_code,
+            transferred_byte_count,
+            meta,
+        },
+    )
+}
+
+/// Arms a watch again after its `Ready` was fetched (Decision 0140).
+/// Returns 0 when the watch is armed, or 1 with Configure/TransferGroup IoError
+/// fields. Rejection changes nothing.
+/// # Safety
+/// Owner/key are null for checked rejection or live exclusive group/key storage.
+/// No completion/region loan may overlap group mutation. Outputs are disjoint
+/// writable EMPTY error slots. Frame is null or live for this call only.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_checked_transfer_group_resubmit_watch(
+    frame: *const DrStackFrameV2,
+    owner: *mut c_void,
+    key: *const c_void,
+    message: *mut *mut DrStringV1,
+    path: *mut *mut DrStringV1,
+    system_code: *mut i64,
+    transferred_byte_count: *mut usize,
+    meta: *mut u64,
+) -> u8 {
+    let mut status = DrIoStatusV1::default();
+    let tag = if owner.is_null() || key.is_null() {
+        status.fail(Failure::invalid_input())
+    } else {
+        adapter::dr_v1_transfer_adapter_group_rearm_watch(owner, key, &mut status)
     };
     checked_group_result(
         frame,

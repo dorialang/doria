@@ -1,14 +1,10 @@
-const FIXED_WIDTH_SOURCE: &str = r#"
-function answer(uint8 $base): uint8
-{
-    return $base + 2;
-}
-
-// Widening `Int::from(uint8)` runs on PHP (decision log entry 33); the
-// narrowing `UInt8::from(int)` is what PHP still rejects.
+// PHP output cannot measure a string in grapheme clusters without optional
+// extensions, so it rejects this valid program.
+const STRING_LENGTH_SOURCE: &str = r#"
 function main(): int
 {
-    return Int::from(answer(UInt8::from(40)));
+    let $text = "forty-two characters fill this literal....";
+    return $text->length;
 }
 "#;
 
@@ -69,12 +65,12 @@ function main(): int
 
 #[test]
 fn accepts_programs_the_php_backend_rejects() {
-    let php_diagnostics = doriac::compile_source_to_php("test.doria", FIXED_WIDTH_SOURCE)
-        .expect_err("narrowing integer conversions remain unsupported by the PHP backend");
-    assert_eq!(php_diagnostics[0].code, "B1301");
+    let php_diagnostics = doriac::compile_source_to_php("test.doria", STRING_LENGTH_SOURCE)
+        .expect_err("string measurement remains unsupported by the PHP backend");
+    assert_eq!(php_diagnostics[0].code, "B2501");
 
-    let debug = doriac::compile_source_to_debug("test.doria", FIXED_WIDTH_SOURCE)
-        .expect("fixed-width integers are valid Doria and must run on the debug target");
+    let debug = doriac::compile_source_to_debug("test.doria", STRING_LENGTH_SOURCE)
+        .expect("the measurement is valid Doria and must run on the debug target");
 
     assert_eq!(debug, "exit_status: 42\nstdout:\n");
 }

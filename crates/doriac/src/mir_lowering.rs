@@ -3824,7 +3824,24 @@ fn lower_function(
                     &mut context,
                 )?;
             }
-            crate::ast::CompilerIntrinsic::TransferGroup(_) => {
+            crate::ast::CompilerIntrinsic::TransferGroup(
+                crate::compiler_known_stream::TransferGroupFunction::ResubmitWatch,
+            ) => {
+                lower_checked_intrinsic(
+                    mir::CheckedIoOperation::ResubmitWatch {
+                        group: params[0],
+                        key: params[1],
+                    },
+                    None,
+                    function.span,
+                    &mut context,
+                )?;
+            }
+            crate::ast::CompilerIntrinsic::TransferGroup(
+                crate::compiler_known_stream::TransferGroupFunction::ObservedReadKey
+                | crate::compiler_known_stream::TransferGroupFunction::ObservedWriteKey
+                | crate::compiler_known_stream::TransferGroupFunction::ObservedWatchKey,
+            ) => {
                 let mir::ReturnType::Value(mir::Type::NullableScalar(mir::ScalarType::Inline(key))) =
                     signature.return_type
                 else {
@@ -3857,12 +3874,21 @@ fn lower_function(
                     };
                     let appending = intrinsic.is_appending();
                     let offset = usize::from(appending);
-                    mir::CheckedIoOperation::ConfigureTransferPlan {
-                        class,
-                        previous: appending.then(|| params[0]),
-                        key: params[offset],
-                        region: params[offset + 1],
-                        reading: intrinsic.is_read(),
+                    if intrinsic.is_watch() {
+                        mir::CheckedIoOperation::WatchTransferPlan {
+                            class,
+                            previous: appending.then(|| params[0]),
+                            source: params[offset],
+                            identity: params[offset + 1],
+                        }
+                    } else {
+                        mir::CheckedIoOperation::ConfigureTransferPlan {
+                            class,
+                            previous: appending.then(|| params[0]),
+                            key: params[offset],
+                            region: params[offset + 1],
+                            reading: intrinsic.is_read(),
+                        }
                     }
                 };
                 lower_checked_intrinsic(operation, Some(result_ty), function.span, &mut context)?;
@@ -3876,6 +3902,15 @@ fn lower_function(
             )?,
             crate::ast::CompilerIntrinsic::Time(intrinsic) => {
                 inline_value::lower_intrinsic(intrinsic, function.span, &params, &mut context);
+            }
+            crate::ast::CompilerIntrinsic::Term(intrinsic) => {
+                inline_value::lower_term_intrinsic(
+                    intrinsic,
+                    function.span,
+                    &params,
+                    signature.return_type,
+                    &mut context,
+                );
             }
             crate::ast::CompilerIntrinsic::Concurrency(intrinsic) => {
                 inline_value::lower_concurrency_intrinsic(
@@ -4553,6 +4588,20 @@ fn lower_file_intrinsic(
         )));
         return Ok(());
     }
+    if intrinsic == FileFunction::AskTerminal {
+        inline_value::lower_term_intrinsic(
+            crate::compiler_known_term::TermFunction::Operate,
+            span,
+            params,
+            return_type,
+            context,
+        );
+        return Ok(());
+    }
+    if intrinsic == FileFunction::WatchSourceFromBits {
+        inline_value::lower_word_factory(params[0], return_type, context);
+        return Ok(());
+    }
     let standard = params
         .first()
         .and_then(|receiver| match context.locals[receiver.0].ty {
@@ -4726,6 +4775,8 @@ fn lower_file_intrinsic(
             }
         }
         FileFunction::UnavailableConstructor
+        | FileFunction::AskTerminal
+        | FileFunction::WatchSourceFromBits
         | FileFunction::StandardInput
         | FileFunction::StandardOutput
         | FileFunction::StandardError

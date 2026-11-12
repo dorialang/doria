@@ -1,0 +1,48 @@
+// A checked error that leaves a function while a transfer group still reads
+// a command's output and watches the terminal. The group, its readiness set,
+// the reader, the command and both terminal guards have to end in order on
+// the way out, on every backend. Pass the command to run, for example `cat`.
+use Doria\Std\Io\{BorrowedBufferedReader, IoError, ReadinessSet, TransferPlan, Wait};
+use Doria\Std\Process\{ChildCleanup, ChildOutput, Command};
+use Doria\Std\Term\{Console, TerminalError};
+
+function watchAndFail(List<string> $command): void throws TerminalError, IoError {
+    let $keys = Console::enterRawMode();
+    let $screen = Console::enterAlternateScreen();
+    Console::hideCursor();
+    Console::clear();
+    Console::writeAt(0, 0, "any key fails while a group reads and watches");
+    Console::flush();
+    let $pressed = $keys->getNextEvent(Wait::Indefinite);
+
+    writable Command $program = Command::executable($command[0]);
+    let writable $argument = 1;
+    while ($argument < $command->count) {
+        $program->argument($command[$argument]);
+        $argument++;
+    }
+    let writable $child = $program->spawn(ChildCleanup::Terminate);
+    writable Bytes $storage = Bytes::allocate(64);
+    let writable $reader = new BorrowedBufferedReader<ChildOutput>($child->getOutput(), 64);
+    writable ReadinessSet $set = new ReadinessSet();
+    let $tap = $set->register($reader);
+    let $plan = TransferPlan::read($tap, $storage->getWritableRegion(0, 64))->andWatch($keys);
+    let $watch = $plan->getWatchKey(1);
+    let writable $group = $set->begin($plan);
+    // The watch is still armed and the read is still pending, so this throws
+    // with both in flight.
+    $group->resubmitWatch($watch);
+}
+
+function main(List<string> $args): int {
+    try {
+        watchAndFail($args);
+        return 0;
+    } catch (TerminalError $error) {
+        echo "This program needs a terminal: {$error->message}\n";
+        return 2;
+    } catch (IoError $error) {
+        echo "caught: {$error->message}\n";
+        return 3;
+    }
+}

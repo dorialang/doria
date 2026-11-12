@@ -1033,6 +1033,17 @@ unsafe impl<D: PendingNativeDriver, R: PendingRecords> GroupDriver<AdapterTermin
         self.native.wait_any(timeout, cancellation)
     }
 
+    unsafe fn attach_wake(
+        &mut self,
+        handle: crate::native_handle::NativeHandle,
+    ) -> Result<(), Failure> {
+        self.native.attach_wake(handle)
+    }
+
+    unsafe fn detach_wake(&mut self, handle: crate::native_handle::NativeHandle) {
+        self.native.detach_wake(handle);
+    }
+
     unsafe fn cancel(
         &mut self,
         index: usize,

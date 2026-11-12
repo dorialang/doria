@@ -1232,11 +1232,21 @@ unsafe impl GroupDriver for Dispatcher<'_> {
 
     fn wait_any(&mut self, budget: Self::Timeout, _: Option<usize>) -> Result<Wake, Failure> {
         match self.watcher.wait(&budget, self.events)? {
-            (0, _) => Ok(Wake::Completion),
+            // An attached wake ends the wait like a completion: the group
+            // then asks the watched source.
+            (0 | 4, _) => Ok(Wake::Completion),
             (1, _) => Ok(Wake::Timeout),
             (2, _) => Ok(Wake::Cancellation),
             _ => Err(Failure::other()),
         }
+    }
+
+    unsafe fn attach_wake(&mut self, handle: i32) -> Result<(), Failure> {
+        self.watcher.add_wake(handle)
+    }
+
+    unsafe fn detach_wake(&mut self, handle: i32) {
+        self.watcher.remove_wake(handle);
     }
 
     unsafe fn cancel(

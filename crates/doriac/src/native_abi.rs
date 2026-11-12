@@ -85,6 +85,21 @@ pub(crate) fn transfer_control_size(pointer_bytes: u32) -> u32 {
     (3 * status + 4).next_multiple_of(8)
 }
 
+/// The kind byte every runtime entry point that takes or returns a
+/// transfer-group key uses (Decision 0140). A key type names its own kind
+/// through `InlineValueType::transfer_entry_kind`.
+pub const TRANSFER_KIND_WRITE: u8 = 0;
+pub const TRANSFER_KIND_READ: u8 = 1;
+pub const TRANSFER_KIND_WATCH: u8 = 2;
+
+/// The `Doria\Std\Io\TransferCompletion` case, by declaration index, that a
+/// completed operation of each runtime kind fills: `Read`, `Write`, `Ready`.
+pub(crate) const TRANSFER_COMPLETION_CASES: [(u8, usize); 3] = [
+    (TRANSFER_KIND_READ, 0),
+    (TRANSFER_KIND_WRITE, 1),
+    (TRANSFER_KIND_WATCH, 2),
+];
+
 pub const STRING_FROM_UTF8: &str = "dr_v1_string_from_utf8";
 pub const PROCESS_EXIT: &str = "dr_v1_exit_process";
 pub const STRING_RETAIN: &str = "dr_v1_string_retain";
@@ -158,6 +173,8 @@ pub const BYTE_REGION_COPY_WITHIN: &str = "dr_v1_byte_region_copy_within";
 /// Decision 0110 child processes: one checked transport for every `Child`
 /// intrinsic (operation tag, child payload, operand words, checked outputs).
 pub const CHECKED_PROCESS: &str = "dr_v1_checked_process";
+pub const TERMINAL_OPERATE: &str = "dr_v1_terminal_operate";
+pub const TERMINAL_AWAIT_EVENT: &str = "dr_v1_terminal_await_event";
 pub const BYTES_EQUAL: &str = "dr_v1_bytes_equal";
 pub const BYTES_FROM_COLLECTION: &str = "dr_v1_bytes_from_collection";
 pub const BYTES_TO_COLLECTION: &str = "dr_v1_bytes_to_collection";
@@ -710,10 +727,45 @@ mod tests {
             InlineValueType::RegistrationKey(ClassId(7)),
             InlineValueType::ReadTransferKey(ClassId(7)),
             InlineValueType::WriteTransferKey(ClassId(7)),
+            InlineValueType::WatchKey(ClassId(7)),
+            InlineValueType::WatchSource(ClassId(7)),
         ] {
             assert_eq!(super::inline_copy_retain_symbol(value), None);
             assert_eq!(super::inline_copy_release_symbol(value), None);
         }
+    }
+
+    #[test]
+    fn transfer_key_kinds_match_the_shared_kind_bytes() {
+        use crate::class_layout::ClassId;
+        use crate::inline_value::InlineValueType;
+        for (key, kind) in [
+            (
+                InlineValueType::WriteTransferKey(ClassId(7)),
+                super::TRANSFER_KIND_WRITE,
+            ),
+            (
+                InlineValueType::ReadTransferKey(ClassId(7)),
+                super::TRANSFER_KIND_READ,
+            ),
+            (
+                InlineValueType::WatchKey(ClassId(7)),
+                super::TRANSFER_KIND_WATCH,
+            ),
+        ] {
+            assert_eq!(key.transfer_entry_kind(), Some(kind));
+            assert_eq!(key.storage_bytes(), 16);
+        }
+        // Each kind fills exactly one completion case.
+        let mut cases = super::TRANSFER_COMPLETION_CASES.map(|(_, case)| case);
+        cases.sort_unstable();
+        assert_eq!(cases, [0, 1, 2]);
+        let mut kinds = super::TRANSFER_COMPLETION_CASES.map(|(kind, _)| kind);
+        kinds.sort_unstable();
+        assert_eq!(kinds, [0, 1, 2]);
+        // A watch source is one word; only its bits reach the runtime.
+        assert_eq!(InlineValueType::WatchSource(ClassId(7)).storage_bytes(), 8);
+        assert!(InlineValueType::WatchSource(ClassId(7)).is_word());
     }
 
     #[test]

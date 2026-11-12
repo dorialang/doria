@@ -172,6 +172,20 @@ pub(crate) struct ProcessInformation {
 #[cfg(windows)]
 pub(crate) type ThreadStart = extern "system" fn(parameter: *mut c_void) -> u32;
 
+/// The callback of `RegisterWaitForSingleObject`. The second argument is
+/// nonzero when the wait timed out instead of being signaled.
+#[cfg(windows)]
+pub(crate) type WaitCallback = unsafe extern "system" fn(context: *mut c_void, timed_out: u8);
+
+/// `WT_EXECUTEONLYONCE`: the wait ends after its callback has run once.
+#[cfg(windows)]
+pub(crate) const WT_EXECUTEONLYONCE: u32 = 0x0000_0008;
+
+/// `INVALID_HANDLE_VALUE`. Passed to `UnregisterWaitEx`, it makes the call
+/// return only after a running callback has finished.
+#[cfg(windows)]
+pub(crate) const INVALID_HANDLE_VALUE: NativeHandle = usize::MAX as NativeHandle;
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -206,6 +220,21 @@ unsafe extern "system" {
         characters: u32,
         written: *mut u32,
         reserved: *mut c_void,
+    ) -> i32;
+    pub(crate) fn SetConsoleMode(handle: NativeHandle, mode: u32) -> i32;
+    pub(crate) fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+    pub(crate) fn ReadConsoleInputW(
+        handle: NativeHandle,
+        records: *mut InputRecord,
+        capacity: u32,
+        read: *mut u32,
+    ) -> i32;
+    pub(crate) fn GetConsoleScreenBufferInfo(
+        handle: NativeHandle,
+        info: *mut ConsoleScreenBufferInfo,
     ) -> i32;
 
     // Byte transfer.
@@ -294,6 +323,16 @@ unsafe extern "system" {
         wait_all: i32,
         milliseconds: u32,
     ) -> u32;
+    // A thread-pool wait: the callback runs once the object is signaled.
+    pub(crate) fn RegisterWaitForSingleObject(
+        wait: *mut NativeHandle,
+        object: NativeHandle,
+        callback: WaitCallback,
+        context: *mut c_void,
+        milliseconds: u32,
+        flags: u32,
+    ) -> i32;
+    pub(crate) fn UnregisterWaitEx(wait: NativeHandle, completion_event: NativeHandle) -> i32;
     pub(crate) fn CreateIoCompletionPort(
         handle: NativeHandle,
         port: NativeHandle,
@@ -445,6 +484,71 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// `COORD`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Coord {
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+}
+
+/// `SMALL_RECT`. All four edges are inclusive.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct SmallRect {
+    pub(crate) left: i16,
+    pub(crate) top: i16,
+    pub(crate) right: i16,
+    pub(crate) bottom: i16,
+}
+
+/// `CONSOLE_SCREEN_BUFFER_INFO`. `window` is the visible part of the buffer
+/// and `cursor` is a buffer position, not a window position.
+#[cfg(windows)]
+#[repr(C)]
+pub(crate) struct ConsoleScreenBufferInfo {
+    pub(crate) size: Coord,
+    pub(crate) cursor: Coord,
+    pub(crate) attributes: u16,
+    pub(crate) window: SmallRect,
+    pub(crate) maximum_window_size: Coord,
+}
+
+/// `KEY_EVENT_RECORD`, with `uChar` read as its UTF-16 member.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct KeyEventRecord {
+    pub(crate) key_down: i32,
+    pub(crate) repeat_count: u16,
+    pub(crate) virtual_key_code: u16,
+    pub(crate) virtual_scan_code: u16,
+    pub(crate) character: u16,
+    pub(crate) control_key_state: u32,
+}
+
+/// The `Event` union of `INPUT_RECORD`. `other` gives it the size of its
+/// largest member; which member is live is `InputRecord::event_type`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) union InputEvent {
+    pub(crate) key: KeyEventRecord,
+    pub(crate) window_buffer_size: Coord,
+    pub(crate) other: [u32; 4],
+}
+
+/// `INPUT_RECORD`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct InputRecord {
+    pub(crate) event_type: u16,
+    pub(crate) event: InputEvent,
+}
+
 /// Win32 `INFINITE`: wait until the object is signaled.
 #[cfg(windows)]
 pub(crate) const INFINITE: u32 = u32::MAX;
@@ -452,7 +556,7 @@ pub(crate) const INFINITE: u32 = u32::MAX;
 /// `WAIT_TIMEOUT`, as `WaitForSingleObject` and `WaitForMultipleObjects`
 /// return it and as `GetQueuedCompletionStatus` reports it.
 #[cfg(windows)]
-const WAIT_TIMEOUT: u32 = 258;
+pub(crate) const WAIT_TIMEOUT: u32 = 258;
 
 /// `ERROR_TIMEOUT`, as `SleepConditionVariableSRW` reports it.
 #[cfg(windows)]

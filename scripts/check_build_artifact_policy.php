@@ -83,6 +83,7 @@ foreach ([
 foreach ([
     ['#![no_std]', $timeSource],
     ['"doria-time"', $compilerBuild],
+    ['"doria-terminal"', $compilerBuild],
     ['.join(sibling).join("src")', $compilerBuild],
     ['.join(sibling)', $compilerBuild],
     ['.join("Cargo.toml")', $compilerBuild],

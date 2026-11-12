@@ -637,6 +637,18 @@ impl AdapterGroup<'_, '_> {
     pub(crate) fn stop(&self) -> Option<Stop> {
         self.inner.stop()
     }
+
+    /// The plan's watched sources join this group's wait (Decision 0140).
+    pub(crate) fn watch(
+        &mut self,
+        sources: &[crate::transfer_group::WatchSource],
+    ) -> Result<(), Failure> {
+        self.inner.watch(sources)
+    }
+
+    pub(crate) fn rearm_watch(&mut self, index: usize) -> Result<(), Failure> {
+        self.inner.rearm_watch(index)
+    }
 }
 
 #[cfg(test)]

@@ -1782,24 +1782,27 @@ function main(): void {
     }
 
     #[test]
-    fn php_validation_keeps_concrete_restrictions_inside_generic_bodies() {
+    fn php_output_displays_floats_at_their_concrete_width_inside_generic_bodies() {
+        // `0.1` held as a float32 prints `0.10000000149011612` when a generic
+        // body displays it at the wrong width.
         let source = r#"
-function render<T implements Displayable>(T $value): void { echo $value; }
-function main(): void { render(1.5); }
+function render<T implements Displayable>(T $value): void { echo $value; echo ";"; }
+function show<T implements Displayable>(T $value): string { return "<" . $value . ">"; }
+function main(): void {
+    float32 $narrow = 0.1;
+    render(1.5);
+    render($narrow);
+    render(100000000000000000000.0);
+    render(7);
+    echo show($narrow);
+    echo show(0.1);
+}
 "#;
-        let hir = checked_hir(source, crate::build_plan::SourceScope::Main);
-        let program = lower_program(&hir).unwrap();
-        crate::mir_validation::validate_program(&program).unwrap();
-        let error = crate::codegen_php::generate(&hir, Some(&program)).unwrap_err();
-        assert!(
-            error
-                .diagnostics
-                .as_ref()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("canonical float display")),
-            "{error:?}"
-        );
+        let program = lower_checked_source(source);
+        let output = crate::mir_interpreter::interpret(&program).unwrap();
+        assert_eq!(output.stdout, b"1.5;0.1;1e20;7;<0.1><0.1>");
+        assert_native_output(&program, &output.stdout);
+        assert_php_output(source, &output.stdout);
     }
 
     #[test]

@@ -205,13 +205,28 @@ unsafe fn configure_host_plan(
     };
     let owner = allocate_owner::<HostGroupOwner>(frame);
     (*set).active = true;
-    match configure(native, prepared.buffers, prepared.selection) {
+    let configured =
+        configure(native, prepared.buffers, prepared.selection).and_then(|mut setup| {
+            // The plan's watches are armed with the group guard in place, so
+            // every later path, a failed startup included, lets go of them.
+            match setup.group.watch(prepared.watches.as_slice()) {
+                Ok(()) => Ok(setup),
+                Err(failure) => {
+                    setup.drop_in_frame(frame);
+                    Err(failure.into())
+                }
+            }
+        });
+    match configured {
         Ok(setup) => {
             owner.write(HostGroupOwner {
                 setup: ManuallyDrop::new(setup),
                 call: Call::Startup,
                 set,
-                identity: crate::transfer_group::plan::GroupIdentity::new(prepared.identity),
+                identity: crate::transfer_group::plan::GroupIdentity::with_watches(
+                    prepared.identity,
+                    prepared.watch_positions,
+                ),
             });
             owner.cast()
         }
@@ -276,6 +291,28 @@ pub unsafe extern "C" fn dr_v1_host_transfer_group_observe_wait(
     0
 }
 
+/// Arms a watch again after its completion was fetched. It is finished when
+/// it returns: no host call is involved and no poll follows.
+/// # Safety
+/// Owner is exclusive and idle; key/status are disjoint readable/writable homes.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_host_transfer_group_resubmit_watch(
+    owner: *mut c_void,
+    key: *const c_void,
+    status: *mut DrIoStatusV1,
+) -> u8 {
+    *status = DrIoStatusV1::default();
+    let owner = &mut *owner.cast::<HostGroupOwner>();
+    if !matches!(owner.call, Call::Idle) || key.is_null() {
+        return (*status).fail(Failure::invalid_input());
+    }
+    let result = owner
+        .identity
+        .watch_index(*key.cast())
+        .and_then(|index| owner.setup.group.rearm_watch(index));
+    (*status).complete(result.map(|()| 0))
+}
+
 /// # Safety
 /// Owner is exclusive and idle; key/status are disjoint readable/writable homes.
 /// No buffer/result loan overlaps reuse. Direction is zero/one write/read.
@@ -324,8 +361,9 @@ pub unsafe extern "C" fn dr_v1_host_transfer_group_close(owner: *mut c_void) {
 
 /// 8 means an ordinary host handoff. Other tags match the existing completion
 /// projection: 0 outcome, 1 original hosted Error, 3 platform failure, 4 absent
-/// transfer, 5 exhausted, 6 timeout, 7 wait failure. Kind is 0 startup,
-/// 1 observation, 2 resubmission or 3 close. No output home is retained.
+/// transfer, 5 exhausted, 6 timeout, 7 wait failure, and 9 a completed watch.
+/// Kind is 0 startup, 1 observation, 2 resubmission or 3 close. Index is the
+/// completed entry's plan position. No output home is retained.
 /// # Safety
 /// Owner is exclusive live storage. Outputs are disjoint writable EMPTY homes;
 /// terminal has its queried opaque layout. Frame is current for this poll only.
@@ -369,8 +407,12 @@ pub unsafe extern "C" fn dr_v1_host_transfer_group_poll(
                 Observation::NoCompletion => return 5,
                 Observation::TimedOut => return 6,
                 Observation::WaitFailed(failure) => return control.project_wait_failure(failure),
+                Observation::Watch(watch) => {
+                    *index = owner.identity.observe_watch(watch);
+                    return 9;
+                }
             };
-            *index = completion.index;
+            *index = owner.identity.transfer_position(completion.index);
             let (reading, _) = owner.setup.group.request_info(completion.index).unwrap();
             owner.identity.observe(completion.index, reading);
             let crate::transfer_group::Awaited {
@@ -433,7 +475,7 @@ pub unsafe extern "C" fn dr_v1_host_transfer_group_action(
     let Some((position, pending)) = owner.host_call() else {
         return 0;
     };
-    *index = position;
+    *index = owner.identity.transfer_position(position);
     *record = pending;
     crate::transfer_group::pending::host::dr_v1_host_pending_action(
         pending, view, caller, length, reading,
@@ -568,15 +610,16 @@ pub unsafe extern "C" fn dr_v1_host_transfer_group_read_region(
     project_completed_region(region, data, length, status)
 }
 
+/// Kind is 0 for writes, 1 for reads or 2 for watches.
 /// # Safety
 /// Owner is shared idle storage. Key is a disjoint writable operation-key home.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_host_transfer_group_observed(
     owner: *const c_void,
-    reading: u8,
+    kind: u8,
     key: *mut c_void,
 ) -> u8 {
-    project_observed_operation(&(*owner.cast::<HostGroupOwner>()).identity, reading, key)
+    project_observed_operation(&(*owner.cast::<HostGroupOwner>()).identity, kind, key)
 }
 
 /// # Safety

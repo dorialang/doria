@@ -392,6 +392,8 @@ mod tests {
             (crate::compiler_known_stream::REGISTRATION_KEY, 1, true),
             (crate::compiler_known_stream::READ_TRANSFER_KEY, 0, true),
             (crate::compiler_known_stream::WRITE_TRANSFER_KEY, 0, true),
+            (crate::compiler_known_stream::WATCH_KEY, 0, true),
+            (crate::compiler_known_stream::WATCH_SOURCE, 0, true),
             (crate::compiler_known_stream::STANDARD_INPUT, 0, true),
             (crate::compiler_known_stream::STANDARD_OUTPUT, 0, true),
             (crate::compiler_known_stream::STANDARD_ERROR, 0, true),

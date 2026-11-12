@@ -19,6 +19,8 @@ mod adapter;
 mod checked_group;
 pub(crate) mod plan;
 pub(crate) mod registration;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) mod watch_fixture;
 
 /// Constructs the same opaque owner used by membership and group transport.
 /// Native resources remain lazy; actual creation failures use the existing
@@ -521,6 +523,8 @@ pub(crate) unsafe fn observe_group(
         super::Observation::NoCompletion => return 5,
         super::Observation::TimedOut => return 6,
         super::Observation::WaitFailed(failure) => return status.project_wait_failure(failure),
+        // This owner never arms a watch.
+        super::Observation::Watch(_) => crate::runtime_invariant_panic(),
     };
     *key = completion.key;
     *index = completion.index;
@@ -548,9 +552,11 @@ pub unsafe extern "C" fn dr_v1_transfer_group_observed(
     project_observed_operation(&(*owner.cast::<GroupOwner>()).identity, reading, key)
 }
 
+/// Kind is 0 for a write, 1 for a read and 2 for a watch. A byte that names
+/// no kind has no observed operation.
 unsafe fn project_observed_operation(
     identity: &super::plan::GroupIdentity,
-    reading: u8,
+    kind: u8,
     key: *mut c_void,
 ) -> u8 {
     let key = &mut *key.cast::<super::plan::OperationKey>();
@@ -558,7 +564,10 @@ unsafe fn project_observed_operation(
         owner: 0,
         position: 0,
     };
-    let Some(observed) = identity.observed(reading != 0) else {
+    let observed = super::plan::EntryKind::from_byte(kind)
+        .ok()
+        .and_then(|kind| identity.observed(kind));
+    let Some(observed) = observed else {
         return 1;
     };
     *key = observed;

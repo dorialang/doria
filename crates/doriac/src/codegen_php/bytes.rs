@@ -719,23 +719,7 @@ final class __DoriaByteRegion implements Countable
 function __doria_uint8_operation(string $op, int $left, int $right, int $start,
     int $end, int $rightStart, int $rightEnd, string $callable): int
 {
-    if ($op === "+" || $op === "-" || $op === "*") {
-        return __doria_integer_operation($op, $left, $right, 8, false, $start, $end, $callable);
-    }
-    if (($op === "/" || $op === "%") && $right === 0) {
-        __doria_panic($op === "/" ? "P1105" : "P1107", $rightStart, $rightEnd, null, $callable,
-            [], __doria_diagnostic_site($start, $end));
-    }
-    if (($op === "<<" || $op === ">>") && ($right < 0 || $right >= 8)) {
-        __doria_panic("P1108", $rightStart, $rightEnd, null, $callable,
-            [], __doria_diagnostic_site($start, $end));
-    }
-    $value = match ($op) {
-        "/" => intdiv($left, $right), "%" => $left % $right,
-        "<<" => ($left << $right) & 255, ">>" => $left >> $right,
-        "&" => $left & $right, "|" => $left | $right, "^" => $left ^ $right,
-        default => throw new LogicException("MIR byte operation is unknown"),
-    };
-    return $value;
+    return __doria_integer_operation($op, $left, $right, 8, false, $start, $end, $callable,
+        $rightStart, $rightEnd);
 }
 "#;

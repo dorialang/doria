@@ -984,7 +984,7 @@ UInt64::from($value)
 
 `Int` and `Int64` target the same canonical `int64` type. Each `from` accepts exactly one integer expression. Same-type and exact widening conversions preserve the value; narrowing and signedness-changing conversions are checked and panic with `integer conversion out of range` when the value cannot be represented. Stage 13 adds no `as` cast and no wrapping, saturating, or unchecked conversion API.
 
-The exact operator, panic, and conversion rules are authoritative in decisions 0041 and 0042. The PHP compatibility backend supports only integer shapes it can preserve exactly; it emits a backend unsupported-feature diagnostic for precise Stage 13 behavior that PHP cannot represent rather than changing Doria semantics.
+The exact operator, panic, and conversion rules are authoritative in decisions 0041 and 0042. The PHP compatibility backend implements these rules exactly for operands whose integer types the compiler knows, and emits a backend unsupported-feature diagnostic for the remaining shapes rather than changing Doria semantics.
 
 ### Inline Time values
 
@@ -1409,7 +1409,7 @@ each carries ambient `Doria\Std\Io\IoError` at runtime.
 its buffer and follows the ordinary closed-pipe clean-exit rule. All Stage 23 I/O intrinsics are
 unshadowable.
 
-`sprintf` and `printf` require a direct literal format in Stage 17. The compiler parses it into a validated MIR plan before any backend runs. Accepted conversions are `%s`, `%d`, `%f`, `%x`, `%X`, `%o`, `%b`, and `%%`; accepted controls are decimal field width, `-` left alignment, `0` numeric zero padding, and `.N` precision on `%f`. Width for `%s` counts UTF-8 bytes. Formatting is deterministic and locale-independent. `printf` uses the same plan, returns `void`, and adds no newline. `print` is rejected in favor of `echo`; dynamic/positional formats, `*` width, `%e`, `%g`, and `sscanf` are not accepted.
+`sprintf` and `printf` require a direct literal format in Stage 17. The compiler parses it into a validated MIR plan before any backend runs. Accepted conversions are `%s`, `%d`, `%f`, `%x`, `%X`, `%o`, `%b`, and `%%`; accepted controls are decimal field width, `-` left alignment, `0` numeric zero padding, and `.N` precision on `%f`. Width for `%s` counts UTF-8 bytes. `%f` prints the exact value rounded to the requested fraction digits, six when none is given, with ties to even; every finite value prints in full, and every backend prints the same text. Formatting is deterministic and locale-independent. `printf` uses the same plan, returns `void`, and adds no newline. `print` is rejected in favor of `echo`; dynamic/positional formats, `*` width, `%e`, `%g`, and `sscanf` are not accepted.
 
 The runtime separates raw standard-device reads/writes and explicit flush from buffered line discipline. It detects stdin, stdout, and stderr interactivity independently for internal use. On Windows, interactive console text uses validated UTF-8 converted to wide console operations; redirected handles preserve exact UTF-8 bytes. Binary standard-stream operations bypass text-console conversion and preserve exact bytes. This is infrastructure for the future Stage 46 `Console` API, not a public terminal API.
 
@@ -1672,6 +1672,41 @@ named above, together with standard-stream accessors and view types.
 Exact remaining public interface, member, readiness, file, adapter, and process spellings
 remain deferred under decision 0110; the accepted semantics above do not.
 
+### The terminal layer
+
+`Doria\Std\Term` is the portable terminal layer; decision 0140 is its
+authority. A program that uses it contains no escape sequence and no platform
+check, and behaves the same in a Linux terminal, a macOS terminal and a native
+Windows console.
+
+- `Console` writes styled text, moves the cursor, clears, sets the title and
+  line wrapping, and reports the terminal's size and color support. Its
+  output collects and reaches the terminal in order with every other write
+  to standard output. A `Style` belongs to one write and is built from
+  `Style::plain` with `with…` methods. Redirected output receives the text
+  alone.
+- `Console::enterRawMode()` returns a `RawMode` guard that owns standard
+  input until it ends. `getNextEvent(Wait, ?CancellationToken)` returns
+  `Event(TerminalEvent)`, `TimedOut`, `Cancelled` or `Closed`; an event is a
+  `Key` with `KeyModifiers`, or `Resized` with the new `Size`. A `Resized`
+  event means the window has a size the program has not been told.
+- `Console::enterAlternateScreen()` returns an `AlternateScreen` guard.
+- Whatever a program changed is put back when it ends: by the guards on
+  every structured exit, and by the runtime before the process ends on a
+  return from `main`, a closed output pipe, a panic (before its report is
+  written) and terminating or stop signals. A forced kill cannot be handled.
+- Failures are the checked `TerminalError`, whose `reason` is `NotATerminal`,
+  `InUse`, `Unsupported` or `DeviceFailure`. A negative position, movement
+  or color component is a panic.
+- Whether a standard stream is a terminal is `$isInteractive` on the
+  `Doria\Std\Io` standard views.
+- `RawMode` implements `Doria\Std\Io\Watchable`, so a `TransferPlan` can
+  watch it and one `TransferGroup` wait covers a program's transfers and its
+  terminal events (`TransferCompletion::Ready`).
+
+The interpreter runs terminal programs against a scripted terminal. PHP
+output reaches the terminal through the native runtime.
+
 ### Equality and boolean operators
 
 Doria equality is typed:
@@ -1715,7 +1750,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in decisions 0020, 0041, and 0072. Current compiler support includes typed scalar equality, rejection of `===` / `!==`, runtime bool locals/parameters/returns/calls, value- and condition-position short-circuit `not`/`and`/`or`, eager `xor`, fixed-width integer bitwise operators, typed MIR lowering, and native execution. PHP lowers only its exact supported subset.
+The accepted boolean/equality/bitwise operator direction is recorded in decisions 0020, 0041, and 0072. Current compiler support includes typed scalar equality, rejection of `===` / `!==`, runtime bool locals/parameters/returns/calls, value- and condition-position short-circuit `not`/`and`/`or`, eager `xor`, fixed-width integer bitwise operators, typed MIR lowering, and native execution. PHP output implements the fixed-width integer operators exactly for typed operands (section 13).
 
 ### Control-flow conditions
 
@@ -2712,9 +2747,11 @@ The PHP backend is currently implemented as a compatibility/debugging backend. I
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
 - Typed arrays and collection aliases are emitted as `array` for the current PHP backend only.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
-- `int`/`int64` remain the exact supported signed-integer alias subset.
-- `uint64` transport, constants/defaults, display/formatting, comparison, and collection ordering preserve all 64 bits on 64-bit PHP. The backend uses a private signed bit-pattern representation, not a floating-point conversion; this does not enable otherwise unsupported arithmetic or conversions.
-- Checked arithmetic, nondefault widths, unsigned semantics, division/remainder, shifts/bitwise operations, and integer companion conversions produce a clear backend unsupported-feature diagnostic whenever PHP cannot preserve the Doria behavior exactly.
+- Every integer width keeps its exact Doria behavior in PHP output when the operands' types are known to the compiler: checked `+`, `-`, `*` and unary `-`; `/` and `%` with their zero-divisor and overflow panics; `<<` and `>>` with the shift-count panic; `&`, `|`, `^` and `~`; their compound assignments; and `Target::from(value)` conversions between integer widths with the out-of-range panic. Panic codes, messages and the operand a panic points at match the native targets.
+- `uint64` uses all 64 bits of a PHP integer as a private bit pattern, never a floating-point conversion. Its arithmetic, division, shifts, comparison, display and collection ordering are computed on that pattern.
+- An integer operation whose operand types the backend cannot establish produces a clear backend unsupported-feature diagnostic rather than PHP behavior that differs from Doria's.
+- Both float widths keep their exact Doria behavior in PHP output. A `float32` is carried in a PHP float that always holds a binary32 value: its literals and constants are that value, and each `+`, `-`, `*`, `/`, compound assignment, `++` and `--` is computed in binary64 and rounded once to binary32, which equals the binary32 operation. `Int::toFloat` rounds to nearest with ties to even, and `Float::toInt` truncates toward zero with the P1110 panic on NaN, an infinity or a value outside `int`.
+- Float display in PHP output is the canonical text of the native targets at the value's own width, and `%f` is the exact value rounded to the requested fraction digits with ties to even. Both are computed from the value's exact decimal expansion, never by PHP's float-to-string conversion.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
 

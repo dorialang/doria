@@ -86,6 +86,36 @@ pub(super) fn lower(
             builder, operation, result, error, success, failure, status, slots, resources,
         );
     }
+    if let mir::CheckedIoOperation::ResubmitWatch { group, key } = operation {
+        set_active_panic_site(builder, span, resources);
+        let pointer = resources.module.target_config().pointer_type();
+        let slots = checked_io_output_slots(builder, pointer);
+        let group = builder.ins().stack_load(
+            pointer,
+            pointer,
+            local_slot(resources.local_slots, *group)?,
+            0,
+        );
+        let key = builder
+            .ins()
+            .stack_addr(pointer, local_slot(resources.local_slots, *key)?, 0);
+        let mut args = vec![resources.current_frame, group, key];
+        args.extend(
+            [2, 3, 4, 7, 8].map(|index| builder.ins().stack_addr(pointer, slots[index], 0)),
+        );
+        let status = runtime_call(
+            builder,
+            "dr_v1_checked_transfer_group_resubmit_watch",
+            &[pointer; 8],
+            Some(types::I8),
+            &args,
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("watch resubmission produced no status"))?;
+        return finish_checked_resource(
+            builder, operation, result, error, success, failure, status, slots, resources,
+        );
+    }
     if let mir::CheckedIoOperation::TransferGroupReadRegion { group, key } = operation {
         set_active_panic_site(builder, span, resources);
         let pointer = resources.module.target_config().pointer_type();
@@ -574,33 +604,19 @@ fn pending_adapter(
     Ok(adapter)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn observe(
+/// A `Doria\Std\Io\Wait` local as the three words every runtime wait takes:
+/// its kind (0 immediate, 1 indefinite, 2 a duration, 3 a deadline) and the
+/// low and high words of the duration or deadline.
+pub(super) fn wait_words(
     builder: &mut FunctionBuilder,
-    group: mir::LocalId,
     wait: mir::LocalId,
-    outcome: mir::PayloadEnumType,
-    result: Option<mir::LocalId>,
-    error: mir::LocalId,
-    success: Block,
-    failure: Block,
-    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
-) -> Result<(), BackendError> {
-    set_active_panic_site(builder, span, resources);
+) -> Result<Vec<Value>, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     let flags = cranelift_codegen::ir::MachMemFlags::trusted();
-    let slots = checked_io_output_slots(builder, pointer);
-    let group_id = group;
-    let group = builder.ins().stack_load(
-        pointer,
-        pointer,
-        local_slot(resources.local_slots, group)?,
-        0,
-    );
     let wait_type = local_definition(resources.program, resources.function_id, wait)?.ty;
     let mir::Type::PayloadEnum(wait_type) = wait_type else {
-        return Err(malformed_mir("observation has no Wait enum"));
+        return Err(malformed_mir("a runtime wait has no Wait enum"));
     };
     let wait_definition = enum_definition(resources.program, wait_type.id)?;
     let wait_address =
@@ -649,7 +665,34 @@ fn observe(
         .ins()
         .jump(wait_values, &[kind.into(), zero64.into(), zero64.into()]);
     builder.switch_to_block(wait_values);
-    let values = builder.block_params(wait_values).to_vec();
+    Ok(builder.block_params(wait_values).to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe(
+    builder: &mut FunctionBuilder,
+    group: mir::LocalId,
+    wait: mir::LocalId,
+    outcome: mir::PayloadEnumType,
+    result: Option<mir::LocalId>,
+    error: mir::LocalId,
+    success: Block,
+    failure: Block,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    set_active_panic_site(builder, span, resources);
+    let pointer = resources.module.target_config().pointer_type();
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let slots = checked_io_output_slots(builder, pointer);
+    let group_id = group;
+    let group = builder.ins().stack_load(
+        pointer,
+        pointer,
+        local_slot(resources.local_slots, group)?,
+        0,
+    );
+    let values = wait_words(builder, wait, resources)?;
     let output = [1, 1, 2, 1, 1].map(|words| scratch(builder, pointer, words));
     let control = scratch(
         builder,
@@ -736,24 +779,52 @@ fn observe(
         address,
         i64::from(definition.layout.cases[0].fields[0].offset),
     );
-    let reading = builder.ins().load(types::I8, flags, output[1], 0);
-    let is_read = builder.ins().icmp_imm_u(IntCC::NotEqual, reading, 0);
-    let blocks = [builder.create_block(), builder.create_block()];
-    builder.ins().brif(is_read, blocks[0], &[], blocks[1], &[]);
-    for (direction, block) in blocks.into_iter().enumerate() {
+    // The runtime reports the completed operation's kind; each kind fills one
+    // completion case, and any other value is malformed transport.
+    let kind = builder.ins().load(types::I8, flags, output[1], 0);
+    let mut blocks = Vec::with_capacity(crate::native_abi::TRANSFER_COMPLETION_CASES.len());
+    for (runtime_kind, case) in crate::native_abi::TRANSFER_COMPLETION_CASES {
+        let block = builder.create_block();
+        let next = builder.create_block();
+        let selected = builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, kind, i64::from(runtime_kind));
+        builder.ins().brif(selected, block, &[], next, &[]);
+        builder.switch_to_block(next);
+        blocks.push((runtime_kind, case, block));
+    }
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    for (runtime_kind, case, block) in blocks {
         builder.switch_to_block(block);
+        let watch = runtime_kind == crate::native_abi::TRANSFER_KIND_WATCH;
+        let case_definition = completion_definition
+            .cases
+            .get(case)
+            .ok_or_else(|| malformed_mir("transfer completion lacks a case"))?;
         store_payload_enum_tag(
             builder,
             completion,
             completion_definition.layout.tag_width,
-            direction as u32,
+            case_definition.tag,
         )?;
-        let fields = &completion_definition.layout.cases[direction].fields;
-        for word in [0i32, 8] {
+        let fields = &completion_definition.layout.cases[case].fields;
+        let key_type = if watch {
+            types.watch_key
+        } else {
+            types.keys[case]
+        };
+        for word in (0..key_type.storage_bytes() as i32).step_by(8) {
             let value = builder.ins().load(types::I64, flags, output[2], word);
             builder
                 .ins()
                 .store(flags, value, completion, fields[0].offset as i32 + word);
+        }
+        if watch {
+            // `Ready` carries the watch's key and no outcome.
+            builder.ins().jump(success, &[]);
+            continue;
         }
         let outcome_tag = builder.ins().load(types::I8, flags, output[3], 0);
         let present = builder.ins().icmp_imm_u(IntCC::NotEqual, outcome_tag, 0);
@@ -764,7 +835,7 @@ fn observe(
         builder
             .ins()
             .store(flags, present, completion, fields[1].offset as i32);
-        let outcome_type = types.outcomes[direction];
+        let outcome_type = types.outcomes[case];
         let inner = builder.ins().iadd_imm_u(
             completion,
             i64::from(fields[1].offset + outcome_type.nullable_payload_offset),

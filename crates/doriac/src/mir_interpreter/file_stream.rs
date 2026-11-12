@@ -635,10 +635,12 @@ impl Interpreter<'_> {
             Source::Standard(stream) => {
                 let claim = &mut self.standard_claims[usize::from(stream.runtime_tag())];
                 match claim {
-                    Some(owner) if *owner != group => return Ok(Some(IoErrorReason::InvalidInput)),
+                    Some(owner) if *owner != StandardClaim::Group(group) => {
+                        return Ok(Some(IoErrorReason::InvalidInput))
+                    }
                     Some(_) => (),
                     None => {
-                        *claim = Some(group);
+                        *claim = Some(StandardClaim::Group(group));
                         self.transfer_groups
                             .get_mut(&group)
                             .unwrap()

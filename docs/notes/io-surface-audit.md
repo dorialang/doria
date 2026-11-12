@@ -343,7 +343,13 @@ TTY detection, standard-input readiness, blocking mode, and platform device
 abstraction are Stage 36a substrate. Portable key events additionally require raw
 mode, canonical-mode changes, escape/console-event decoding, resize events, and
 restoration, all exclusively Stage 46 `Console` work. Non-blocking stdin alone is
-not a portable `pollKey` implementation.
+not a portable key-event implementation.
+
+Stage 46 delivers that boundary under Decision 0140. TTY detection is public as
+`$isInteractive` on the three standard views. Key and resize events are read
+from the raw-mode guard, and a transfer plan can watch that guard, so one group
+wait covers a program's transfers and its terminal events without a second
+polling core.
 
 ### 16. Filters, wrappers, contexts, and adapters
 
@@ -399,7 +405,7 @@ contract.
 | Socket readiness substrate                         | Required For v1.0    | Generic substrate only                            | Stage 36a              |
 | Network/TLS adapter boundary                       | Recommended For v1.0 | Product spelling deferred                         | Stage 44               |
 | Compression and encoding adapters                  | Recommended For v1.0 | Typed adapter names deferred                      | Review after Stage 36a |
-| Terminal readiness integration                     | Required For v1.0    | Generic substrate only                            | Stages 36a/46          |
+| Terminal readiness integration                     | Required For v1.0    | Watched `RawMode` in a transfer group (0140)      | Stages 36a/46          |
 | Async stream integration                           | Required For v1.0    | Reuses sync contracts                             | Stages 37–39           |
 
 Functionality, candidate spelling, and implementation stage are deliberately
@@ -438,7 +444,7 @@ in the JSON row with the same PHP name.
 | `stream_get_transports`             | streams / function    | network-stream                 | Proposed Doria Std Net / Doria\Std\Net                           | Recommended For v1.0 / 44                               | Rewrite Through Domain Module |
 | `stream_get_wrappers`               | streams / function    | wrapper-registry-introspection | Rejected Dynamic Wrapper Mechanism / —                           | Rejected / —                                            | No Doria Equivalent By Design |
 | `stream_is_local`                   | streams / function    | capability-metadata            | Proposed Doria Std Io / Doria\Std\Io                             | Required For v1.0 / 36a                                 | Rewrite With Semantic Warning |
-| `stream_isatty`                     | streams / function    | tty-detection                  | Existing Doria Runtime Substrate / Doria\Std\Term                | Required For v1.0 / 46                                  | Rewrite Through Domain Module |
+| `stream_isatty`                     | streams / function    | tty-detection                  | Existing Doria Runtime Substrate / Doria\Std\Io                  | Required For v1.0 / 46                                  | Rewrite Through Domain Module |
 | `stream_notification_callback`      | streams / function    | progress-notification          | Deferred Post-v1 / Operation-Specific Progress API               | Deferred / operation-specific review                    | Deferred Until Named Stage    |
 | `stream_register_wrapper`           | streams / function    | wrapper-registry-alias         | Rejected PHP Alias / —                                           | Rejected / —                                            | No Doria Equivalent By Design |
 | `stream_resolve_include_path`       | streams / function    | path-resolution                | Proposed Doria Std Fs / Doria\Std\Fs                             | Acceptable Post-v1 / Fs design                          | Rewrite Through Domain Module |

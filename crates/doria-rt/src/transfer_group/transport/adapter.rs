@@ -118,6 +118,20 @@ impl AdapterGroupMode<'_, '_> {
         }
     }
 
+    fn watch(&mut self, sources: &[crate::transfer_group::WatchSource]) -> Result<(), Failure> {
+        match self {
+            Self::Synchronous(group) => group.watch(sources),
+            Self::Pending(group) => group.watch(sources),
+        }
+    }
+
+    fn rearm_watch(&mut self, index: usize) -> Result<(), Failure> {
+        match self {
+            Self::Synchronous(group) => group.rearm_watch(index),
+            Self::Pending(group) => group.rearm_watch(index),
+        }
+    }
+
     fn request_info(&self, index: usize) -> Option<(bool, usize)> {
         match self {
             Self::Synchronous(group) => group.request_info(index),
@@ -1289,16 +1303,31 @@ unsafe fn begin_adapter_plan_with(
         .map_err(|(failure, _)| SetupFailure::Platform(failure))?;
     let owner = allocate_owner::<AdapterGroupOwner>(frame);
     (*set).active = true;
-    match begin(
+    let begun = begin(
         AdapterSetOwner::native(set),
         prepared.buffers,
         prepared.selection,
-    ) {
+    )
+    .and_then(|mut group| {
+        // The plan's watches are armed once its transfers have begun. A wait
+        // that cannot include a watched source ends the group again.
+        match group.watch(prepared.watches.as_slice()) {
+            Ok(()) => Ok(group),
+            Err(failure) => {
+                group.drop_in_frame(frame);
+                Err(failure.into())
+            }
+        }
+    });
+    match begun {
         Ok(group) => {
             owner.write(AdapterGroupOwner {
                 group: ManuallyDrop::new(group),
                 set,
-                identity: super::super::plan::GroupIdentity::new(prepared.identity),
+                identity: super::super::plan::GroupIdentity::with_watches(
+                    prepared.identity,
+                    prepared.watch_positions,
+                ),
             });
             Ok(owner.cast())
         }
@@ -1311,8 +1340,9 @@ unsafe fn begin_adapter_plan_with(
 }
 
 /// Returns 0 explicit outcome, 1 original checked adapter error, 3 platform
-/// failure, 4 not submitted, 5 no completion, or 7 wait failure before taking a
-/// queued completion. Tag 7 has no transfer identity or owned adapter error.
+/// failure, 4 not submitted, 5 no completion, 7 wait failure before taking a
+/// queued completion, or 9 a completed watch, whose key is the observed watch
+/// key. Tag 7 has no transfer identity or owned adapter error.
 /// Wait/control facts remain in
 /// the existing completion-status record; no error is reconstructed from them.
 /// # Safety
@@ -1420,6 +1450,10 @@ unsafe fn observe_adapter_group(
         crate::transfer_group::Observation::WaitFailed(failure) => {
             return control.project_wait_failure(failure)
         }
+        crate::transfer_group::Observation::Watch(watch) => {
+            *index = owner.identity.observe_watch(watch);
+            return 9;
+        }
     };
     *key = completion.key;
     *index = completion.index;
@@ -1445,12 +1479,12 @@ unsafe fn observe_adapter_group(
     }
 }
 
-/// Returns 0 with the last fetched operation key for the requested direction,
+/// Returns 0 with the last fetched operation key for the requested kind,
 /// or 1 when absent (including before the first fetch or after a fetch timeout).
 /// This observes metadata only and never takes an error, outcome or region loan.
 /// # Safety
 /// Owner is live shared group storage. Key is disjoint aligned writable
-/// OperationKey storage; reading is 0 for writes or 1 for reads.
+/// OperationKey storage; kind is 0 for writes, 1 for reads or 2 for watches.
 /// A rejected fetch with a nonempty error carrier does
 /// not change this record; the caller must first release that owned error.
 #[no_mangle]
@@ -1517,6 +1551,28 @@ pub unsafe extern "C" fn dr_v1_transfer_adapter_group_submit_key(
         .identity
         .operation_position(key, reading != 0, |index| owner.group.request_info(index))
         .and_then(|index| owner.group.submit(frame, index, offset, length));
+    (*status).complete(result.map(|()| 0))
+}
+
+/// Arms a watch again after its completion was fetched. A key that is not a
+/// watch of this group, a watch that is still armed or whose completion has
+/// not been fetched, and a stopped group are rejected without any change.
+/// # Safety
+/// Owner is live exclusive storage with no borrowed completion/region view.
+/// Key is aligned live OperationKey storage, disjoint from owner and status.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_transfer_adapter_group_rearm_watch(
+    owner: *mut c_void,
+    key: *const c_void,
+    status: *mut DrIoStatusV1,
+) -> u8 {
+    *status = DrIoStatusV1::default();
+    let owner = &mut *owner.cast::<AdapterGroupOwner>();
+    let key = *key.cast::<super::super::plan::OperationKey>();
+    let result = owner
+        .identity
+        .watch_index(key)
+        .and_then(|index| owner.group.rearm_watch(index));
     (*status).complete(result.map(|()| 0))
 }
 

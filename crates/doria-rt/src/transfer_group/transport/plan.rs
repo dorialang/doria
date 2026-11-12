@@ -1,9 +1,12 @@
 //! Keyed configuration shares the ordinary group owner and native cleanup.
 
 use super::*;
-use crate::transfer_group::plan::OperationKey;
+use crate::transfer_group::plan::{EntryKind, OperationKey};
+use crate::transfer_group::WatchSource;
 
 /// Readonly metadata lookup; a copied operation key owns and borrows nothing.
+/// Kind is 0 for a write, 1 for a read and 2 for a watch; the entry at the
+/// position must be of that kind.
 /// # Safety
 /// Plan is null or a live shared plan. Result is aligned writable OperationKey
 /// storage; all outputs are disjoint empty slots, disjoint from the plan.
@@ -13,7 +16,7 @@ pub unsafe extern "C" fn dr_v1_checked_transfer_plan_key(
     frame: *const DrStackFrameV2,
     plan: *const c_void,
     position: i64,
-    reading: u8,
+    kind: u8,
     result: *mut c_void,
     message: *mut *mut DrStringV1,
     path: *mut *mut DrStringV1,
@@ -25,10 +28,11 @@ pub unsafe extern "C" fn dr_v1_checked_transfer_plan_key(
         owner: 0,
         position: 0,
     });
-    let lookup = if plan.is_null() || reading > 1 {
+    let lookup = if plan.is_null() {
         Err(Failure::invalid_input())
     } else {
-        (*plan.cast::<TransferPlan<'static>>()).operation_key(position, reading != 0)
+        EntryKind::from_byte(kind)
+            .and_then(|kind| (*plan.cast::<TransferPlan<'static>>()).operation_key(position, kind))
     };
     match lookup {
         Ok(key) => {
@@ -277,6 +281,94 @@ pub unsafe extern "C" fn dr_v1_checked_transfer_plan_append(
     )
 }
 
+/// Creates a plan whose first entry watches a runtime-backed source (Decision
+/// 0140). Source is the `WatchSource` word: the source's kind above bit 32 and
+/// that kind's token below. The plan belongs to no readiness set until a keyed
+/// entry is appended. Nothing is waited for before a group begins.
+/// # Safety
+/// Frame is null or live for this call. All outputs are disjoint writable EMPTY
+/// slots; neither frame nor output addresses are retained. The compiler keeps
+/// the watched source in shared use until the plan, or the group begun from
+/// it, is dropped.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_checked_transfer_plan_watch_new(
+    frame: *const DrStackFrameV2,
+    source: u64,
+    result: *mut *mut c_void,
+    message: *mut *mut DrStringV1,
+    path: *mut *mut DrStringV1,
+    system_code: *mut i64,
+    transferred_byte_count: *mut usize,
+    meta: *mut u64,
+) -> u8 {
+    let mut status = DrIoStatusV1::default();
+    let owner = match WatchSource::from_bits(source).and_then(TransferPlan::watching) {
+        Ok(plan) => allocate_plan(frame, plan),
+        Err(failure) => {
+            status.fail(failure);
+            ptr::null_mut()
+        }
+    };
+    checked_plan_result(
+        frame,
+        owner,
+        &status,
+        result,
+        IoFailureOutputs {
+            message,
+            path,
+            system_code,
+            transferred_byte_count,
+            meta,
+        },
+    )
+}
+
+/// Appends a watch. Consumes the old plan on success and checked failure,
+/// forwarding every earlier loan only into a successful replacement.
+/// # Safety
+/// Plan is null for checked rejection or an exclusively owned live plan. The
+/// frame, source and outputs obey `dr_v1_checked_transfer_plan_watch_new`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_checked_transfer_plan_watch_append(
+    frame: *const DrStackFrameV2,
+    plan: *mut c_void,
+    source: u64,
+    result: *mut *mut c_void,
+    message: *mut *mut DrStringV1,
+    path: *mut *mut DrStringV1,
+    system_code: *mut i64,
+    transferred_byte_count: *mut usize,
+    meta: *mut u64,
+) -> u8 {
+    let mut status = DrIoStatusV1::default();
+    let appended = match take_plan(plan) {
+        Some(plan) => WatchSource::from_bits(source)
+            .and_then(|source| plan.append_watch(source).map_err(|(failure, _)| failure)),
+        None => Err(Failure::invalid_input()),
+    };
+    let owner = match appended {
+        Ok(plan) => allocate_plan(frame, plan),
+        Err(failure) => {
+            status.fail(failure);
+            ptr::null_mut()
+        }
+    };
+    checked_plan_result(
+        frame,
+        owner,
+        &status,
+        result,
+        IoFailureOutputs {
+            message,
+            path,
+            system_code,
+            transferred_byte_count,
+            meta,
+        },
+    )
+}
+
 /// `dr_v1_checked_transfer_plan_new` for a PHP host, which names the buffer by range.
 /// # Safety
 /// As `dr_v1_checked_transfer_plan_new`, for the range `byte_region::host_range` forms.
@@ -417,7 +509,9 @@ pub unsafe extern "C" fn dr_v1_transfer_plan_begin(
             return ptr::null_mut();
         }
     };
-    if budget.is_null() {
+    // A watch needs the complete registered owner's group; this bare native
+    // owner has no place in its wait for one.
+    if budget.is_null() || prepared.watches.len() != 0 {
         (*status).fail(Failure::invalid_input());
         return ptr::null_mut();
     }

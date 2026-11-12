@@ -6713,6 +6713,34 @@ impl Checker<'_> {
             } else {
                 "readonly"
             };
+            let (label, action, acting) = match requested {
+                UseMode::Give => (
+                    "Source Given Away Here",
+                    "give the source away",
+                    "giving the source away",
+                ),
+                UseMode::Write => (
+                    "Source Changed Here",
+                    "change the source",
+                    "changing the source",
+                ),
+                UseMode::Read => ("Source Read Here", "read the source", "reading the source"),
+            };
+            // The two lifetimes need different fixes: a value that only uses
+            // its source can be finished with, while a value that still needs
+            // its source when it is destroyed has to end first.
+            let (explanation, help) = match lease.lifetime {
+                RetainedLifetime::LastUse => (
+                    "A value built from this source is used again later, and it keeps the source in use until then.",
+                    format!("{action} only after the last use of the borrow-bound value"),
+                ),
+                RetainedLifetime::Cleanup => (
+                    "A value built from this source still needs it when that value is destroyed, so it keeps the source in use for as long as it is alive.",
+                    format!(
+                        "end the borrow-bound value before {acting}, for example by closing the block that declares it"
+                    ),
+                ),
+            };
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0763",
@@ -6720,10 +6748,10 @@ impl Checker<'_> {
                     span,
                 )
                 .with_title("Borrow-Bound Value Keeps Source In Use")
+                .with_primary_label(label)
+                .with_explanation(explanation)
                 .with_related(lease.capture_span, "Source Loan Starts Here")
-                .with_help(
-                    "finish using the borrowed value before conflicting access to its source",
-                ),
+                .with_help(help),
             );
             return;
         }

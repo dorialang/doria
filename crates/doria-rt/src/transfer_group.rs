@@ -18,11 +18,13 @@ mod storage;
 mod tests;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) mod transport;
+mod watch;
 
 pub(crate) use observation::{Observation, ObservationBudget, WaitTimeout};
 pub(crate) use outcome::DrCompletionStatusV1;
 pub(crate) use plan::{PlanKey, TransferPlan};
 pub(crate) use storage::{FixedSlice, StableSlots};
+pub(crate) use watch::WatchSource;
 
 pub(crate) enum Buffer<'a> {
     Read(&'a mut [u8]),
@@ -667,6 +669,16 @@ pub(crate) unsafe trait GroupDriver<T = Result<usize, Failure>> {
         timeout: Self::Timeout,
         cancellation: Option<usize>,
     ) -> Result<Wake, Failure>;
+    /// Makes `wait_any` also return, as a completion wake, while `handle` is
+    /// readable or signaled. The group attaches the handle of a watched
+    /// source only while a watch on it is armed, and each handle once. A
+    /// driver whose wait cannot include another handle refuses.
+    unsafe fn attach_wake(&mut self, _: crate::native_handle::NativeHandle) -> Result<(), Failure> {
+        Err(Failure::unsupported())
+    }
+    /// Takes an attached handle out of the wait. It never fails the caller:
+    /// a wait that could not let go of the handle must not be used again.
+    unsafe fn detach_wake(&mut self, _: crate::native_handle::NativeHandle) {}
     unsafe fn cancel(
         &mut self,
         index: usize,
@@ -734,6 +746,8 @@ pub(crate) struct TransferGroup<
     stopped: Option<Stop>,
     stop_drain: Option<usize>,
     wait_failure_reported: bool,
+    // None until a plan with watches arms them; most groups have none.
+    watches: Option<FixedSlice<watch::Watch>>,
 }
 
 impl<'s, 'b, D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome>
@@ -835,7 +849,9 @@ impl<'s, 'b, D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome>
                 // Internal drain callers receive both facts in Awaited. Public
                 // observation reports the wait failure separately, first.
                 Observation::WaitFailed(_) => continue,
-                Observation::TimedOut => unsafe { crate::runtime_invariant_panic() },
+                Observation::Watch(_) | Observation::TimedOut => unsafe {
+                    crate::runtime_invariant_panic()
+                },
             }
         }
     }
@@ -1246,6 +1262,7 @@ impl<'s, 'b, D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome>
 
     fn begin_stop(&mut self, stop: Stop) {
         self.stopped.get_or_insert(stop);
+        self.stop_watches();
         if self.stop_drain.is_some() || !self.has_active() {
             return;
         }
@@ -1341,6 +1358,11 @@ impl<'s, 'b, D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome>
     }
 
     fn take_observation(&mut self) -> Option<Observation<T>> {
+        self.take_wait_failure()
+            .or_else(|| self.take_ready().map(Observation::Completion))
+    }
+
+    fn take_wait_failure(&mut self) -> Option<Observation<T>> {
         if !self.wait_failure_reported {
             if let Some(Stop::Failure(
                 doria_diagnostic_catalogue::IoMessageOperation::Wait,
@@ -1351,7 +1373,7 @@ impl<'s, 'b, D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome>
                 return Some(Observation::WaitFailed(failure));
             }
         }
-        self.take_ready().map(Observation::Completion)
+        None
     }
 
     fn take_ready(&mut self) -> Option<Completion<T>> {
@@ -1378,6 +1400,7 @@ impl<D: GroupDriver<T>, C: Control<D::Timeout>, T: TerminalOutcome> Drop
     for TransferGroup<'_, '_, D, C, T>
 {
     fn drop(&mut self) {
+        self.release_watches();
         if self.has_active() {
             self.stop_all(Stop::Cancellation);
         }

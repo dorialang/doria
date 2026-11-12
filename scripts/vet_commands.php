@@ -35,6 +35,7 @@ function llvm_test_suites(): array
         'property_hook_initializer_tests',
         'property_hook_cleanup_effect_tests',
         'php_integer_execution_tests',
+        'php_float_execution_tests',
         'bytes_allocate_tests',
         'byte_region_execution_tests',
         'byte_region_mir_validation_tests',

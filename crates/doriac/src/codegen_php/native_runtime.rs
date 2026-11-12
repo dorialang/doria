@@ -24,7 +24,8 @@ pub(super) fn required(program: &Program) -> bool {
             _ => None,
         })
         .collect::<HashSet<_>>();
-    program.semantic_info.call_targets.values().any(|target| {
+    term::used(program)
+        || program.semantic_info.call_targets.values().any(|target| {
         matches!(target, crate::semantics::CallableTarget::Method { class_type, method_name, .. }
             if class_type.name == crate::compiler_known_time::DEADLINE && method_name == "fromNow")
     }) || program
@@ -138,10 +139,28 @@ final class __DoriaNativeIo
 {
     private static ?FFI $runtime = null;
 
-    public static function fail(string $reason): void
+    // `$detail` says what the runtime answered when the failure is one of
+    // its answers. A protocol failure also names the operation that saw it,
+    // since the diagnostic alone cannot tell forty call sites apart.
+    public static function fail(string $reason, string $detail = ''): void
     {
         global $__doria_native_failures;
+        // The report belongs on the screen the user returns to.
+        __doria_terminal_ending();
+        // Leaving through `exit` unwinds the callers, and nothing they hold
+        // may run a Doria drop against a runtime that has just failed.
+        global $__doria_shutting_down;
+        $__doria_shutting_down = true;
         fwrite(STDERR, $__doria_native_failures[$reason]);
+        if ($reason === "protocol") {
+            $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1] ?? [];
+            $operation = ($caller["class"] ?? "") === "" ? ($caller["function"] ?? "")
+                : $caller["class"] . "::" . ($caller["function"] ?? "");
+            if ($operation !== "") {
+                fwrite(STDERR, "The operation that failed was " . $operation .
+                    ($detail === "" ? "" : ": " . $detail) . ".\n");
+            }
+        }
         exit(1);
     }
 
@@ -285,6 +304,7 @@ uint8_t dr_v1_host_transfer_group_observe_wait(void *owner, uint8_t kind,
     uint64_t low, int64_t high, DrIoStatusV1 *status);
 uint8_t dr_v1_host_transfer_group_resubmit(void *owner, const void *key, uint8_t reading,
     size_t offset, size_t length, DrIoStatusV1 *status);
+uint8_t dr_v1_host_transfer_group_resubmit_watch(void *owner, const void *key, DrIoStatusV1 *status);
 void dr_v1_host_transfer_group_close(void *owner);
 uint8_t dr_v1_host_transfer_group_poll(const void *frame, void *owner, uint8_t *kind,
     size_t *index, DrAdapterOutcomeV1 *outcome, void *terminal, void *control);
@@ -298,7 +318,7 @@ uint8_t dr_v1_host_pending_request_configure_standard(const void *frame, void *o
     DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_host_transfer_group_read_region(const void *owner, const void *key,
     const uint8_t **data, size_t *length, DrIoStatusV1 *status);
-uint8_t dr_v1_host_transfer_group_observed(const void *owner, uint8_t reading, void *key);
+uint8_t dr_v1_host_transfer_group_observed(const void *owner, uint8_t kind, void *key);
 void dr_v1_host_transfer_group_drop(const void *frame, void *owner);
 uint8_t dr_v1_checked_pending_request_outcome(const void *frame, const void *request,
     uint64_t *tag, size_t *count, DrStringV1 **message, DrStringV1 **path,
@@ -309,12 +329,22 @@ uint8_t dr_v1_host_transfer_plan_new(const void *frame, const void *key,
 uint8_t dr_v1_host_transfer_plan_append(const void *frame, void *plan, const void *key,
     uint8_t *base, size_t capacity, size_t offset, size_t length, uint8_t reading, void **result, DrStringV1 **message,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
+uint8_t dr_v1_checked_transfer_plan_watch_new(const void *frame, uint64_t source, void **result,
+    DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
+uint8_t dr_v1_checked_transfer_plan_watch_append(const void *frame, void *plan, uint64_t source,
+    void **result, DrStringV1 **message, DrStringV1 **path, int64_t *system_code, size_t *transferred,
+    uint64_t *meta);
 void dr_v1_transfer_plan_drop(void *plan);
 uint8_t dr_v1_checked_transfer_plan_key(const void *frame, const void *plan,
-    int64_t position, uint8_t reading, void *result, DrStringV1 **message,
+    int64_t position, uint8_t kind, void *result, DrStringV1 **message,
     DrStringV1 **path, int64_t *system_code, size_t *transferred, uint64_t *meta);
 uint8_t dr_v1_deadline_from_now(int64_t duration, uint64_t *low, int64_t *high,
     int64_t *system_code, uint8_t *has_system_code);
+int64_t dr_v1_host_terminal_operate(uint32_t operation, int64_t first, int64_t second,
+    const char *text, size_t length);
+int64_t dr_v1_terminal_await_event(uint32_t generation, uint8_t wait_kind, uint64_t wait_low,
+    int64_t wait_high, DrCancellationV1 *cancellation);
+void dr_v1_terminal_process_ending(void);
 DORIA_NATIVE_ABI, $path);
         } catch (Throwable) {
             // Configuration failures are backend diagnostics, never Doria IoError.

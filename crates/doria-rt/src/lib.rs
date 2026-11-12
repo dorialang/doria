@@ -32,6 +32,7 @@ mod owned_interface;
 mod platform_io;
 mod process;
 mod string_ops;
+pub mod terminal;
 #[cfg(test)]
 mod test_callback;
 #[cfg(test)]
@@ -2004,7 +2005,7 @@ pub unsafe extern "C" fn dr_v2_main_int(
     source_span_start: usize,
     source_span_end: usize,
 ) -> i32 {
-    process_status(
+    finish_main(process_status(
         entry(ptr::null()),
         source_path,
         source_path_length,
@@ -2012,7 +2013,15 @@ pub unsafe extern "C" fn dr_v2_main_int(
         source_text_length,
         source_span_start,
         source_span_end,
-    )
+    ))
+}
+
+/// A `main` that returns leaves through the C runtime, not through
+/// `exit_process`, so the terminal is put back and waiting console output is
+/// written here.
+unsafe fn finish_main(status: i32) -> i32 {
+    terminal::process_ending();
+    status
 }
 
 /// Maps a Doria `main(): int` result to a process status, panicking outside the
@@ -2085,7 +2094,7 @@ pub unsafe extern "C" fn dr_v2_main_int_args(
         source_span_end,
     );
     entry_args::release(args);
-    status
+    finish_main(status)
 }
 
 /// Invokes a Doria `main(List<string> $args): void`.
@@ -2105,7 +2114,7 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
     let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     entry(ptr::null(), home.as_ptr(), args);
     entry_args::release(args);
-    0
+    finish_main(0)
 }
 
 /// Invokes a generated Doria void entry function.
@@ -2117,7 +2126,7 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v2_main_void(entry: DrMainVoidV2) -> i32 {
     entry(ptr::null());
-    0
+    finish_main(0)
 }
 
 /// Invokes a checked Doria `main(): int` and reports an escaping Error as R1000.
@@ -2136,7 +2145,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
 ) -> i32 {
     let mut value = 0_i64;
     let mut error = empty_error_carrier();
-    match entry(ptr::null(), &mut value, &mut error) {
+    finish_main(match entry(ptr::null(), &mut value, &mut error) {
         0 => process_status(
             value,
             source_path,
@@ -2148,7 +2157,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
         ),
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 /// Invokes a checked Doria `main(): void` and reports an escaping Error as R1000.
@@ -2158,11 +2167,11 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v3_main_checked_void(entry: DrMainCheckedVoidV3) -> i32 {
     let mut error = empty_error_carrier();
-    match entry(ptr::null(), &mut error) {
+    finish_main(match entry(ptr::null(), &mut error) {
         0 => 0,
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 /// Invokes a checked Doria `main(List<string> $args): int`.
@@ -2188,7 +2197,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
     let mut error = empty_error_carrier();
     let status = entry(ptr::null(), &mut value, &mut error, home.as_ptr(), args);
     entry_args::release(args);
-    match status {
+    finish_main(match status {
         0 => process_status(
             value,
             source_path,
@@ -2200,7 +2209,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
         ),
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 /// Invokes a checked Doria `main(List<string> $args): void`.
@@ -2219,11 +2228,11 @@ pub unsafe extern "C" fn dr_v3_main_checked_void_args(
     let mut error = empty_error_carrier();
     let status = entry(ptr::null(), &mut error, home.as_ptr(), args);
     entry_args::release(args);
-    match status {
+    finish_main(match status {
         0 => 0,
         1 => report_unhandled_error(error),
         _ => emergency_runtime_panic(),
-    }
+    })
 }
 
 const fn empty_error_carrier() -> DrInterfaceCarrierV1 {
@@ -2600,23 +2609,6 @@ pub unsafe extern "C" fn dr_v2_flush_stderr(current_frame: *const DrStackFrameV2
         WriteOutcome::OtherFailure(_) => {}
     }
     panic_catalogued(current_frame, b"P1407")
-}
-
-/// Returns whether one standard stream is attached to an interactive terminal.
-///
-/// Stream identifiers are 0=stdin, 1=stdout, and 2=stderr. Unknown identifiers return false.
-///
-/// # Safety
-/// This operation has no pointer preconditions.
-#[no_mangle]
-pub unsafe extern "C" fn dr_v1_stream_is_interactive(stream: u8) -> u8 {
-    let stream = match stream {
-        0 => StandardStream::Stdin,
-        1 => StandardStream::Stdout,
-        2 => StandardStream::Stderr,
-        _ => return 0,
-    };
-    u8::from(device_io::is_interactive(stream))
 }
 
 /// Reads one UTF-8 line from stdin, returning null only for EOF before bytes.
@@ -3149,7 +3141,7 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
     } else {
         write_panic_fragment(entry.explanation.as_bytes());
     }
-    if entry.code == "P1000" && message_length != 0 {
+    if (entry.code == "P1000" || entry.code == "P1001") && message_length != 0 {
         write_panic_fragment(b"\n\nNote\n");
         write_panic_bytes(message, message_length);
     }
@@ -4189,6 +4181,36 @@ pub unsafe extern "C" fn dr_v1_format_f64(
     format_fixed_float(value, value.is_sign_negative(), precision, width, flags)
 }
 
+/// A finite binary64 value is a multiple of 2^-1074, so its decimal expansion
+/// ends within this many fraction digits. Every later digit is zero.
+const FIXED_FLOAT_EXACT_FRACTION_DIGITS: usize = 1074;
+
+/// The longest text of a finite binary64 magnitude at that precision: 309
+/// integer digits, the point, and the exact fraction digits.
+const FIXED_FLOAT_DIGIT_CAPACITY: usize = 309 + 1 + FIXED_FLOAT_EXACT_FRACTION_DIGITS;
+
+struct FixedFloatDigits {
+    bytes: [u8; FIXED_FLOAT_DIGIT_CAPACITY],
+    length: usize,
+}
+
+impl core::fmt::Write for FixedFloatDigits {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let end = self
+            .length
+            .checked_add(value.len())
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(core::fmt::Error)?;
+        self.bytes[self.length..end].copy_from_slice(value.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+/// `%f` rounds the exact value to the requested fraction digits, ties to even
+/// (Decision 0074). The digits come from the same core formatter the MIR
+/// interpreter uses, so the two cannot disagree: scaling by a power of ten in
+/// floating point first would round once before the digits are chosen.
 unsafe fn format_fixed_float(
     value: f64,
     negative: bool,
@@ -4196,6 +4218,8 @@ unsafe fn format_fixed_float(
     width: u32,
     flags: u8,
 ) -> *mut DrStringV1 {
+    use core::fmt::Write as _;
+
     if value.is_nan() {
         return padded_string(b"NaN".as_ptr(), 3, width, flags, false);
     }
@@ -4206,58 +4230,35 @@ unsafe fn format_fixed_float(
         return padded_string(b"-Infinity".as_ptr(), 9, width, flags, true);
     }
     let precision = precision as usize;
-    let mut factor = 1_u128;
-    for _ in 0..precision {
-        factor = factor
-            .checked_mul(10)
-            .unwrap_or_else(|| string_result_too_large());
-    }
-    let scaled = value.abs() * factor as f64;
-    if !scaled.is_finite() || scaled > u128::MAX as f64 {
-        string_result_too_large();
-    }
-    let truncated = scaled as u128;
-    let fraction = scaled - truncated as f64;
-    let rounded = if fraction > 0.5 || (fraction == 0.5 && truncated & 1 == 1) {
-        truncated
-            .checked_add(1)
-            .unwrap_or_else(|| string_result_too_large())
-    } else {
-        truncated
+    let exact = precision.min(FIXED_FLOAT_EXACT_FRACTION_DIGITS);
+    let magnitude = value.abs();
+    let mut digits = FixedFloatDigits {
+        bytes: [0; FIXED_FLOAT_DIGIT_CAPACITY],
+        length: 0,
     };
-    let integer = rounded / factor;
-    let fractional = rounded % factor;
-    let mut digits = [0_u8; 39];
-    let (integer_start, integer_length) = unsigned_decimal_u128(integer, &mut digits);
+    if write!(digits, "{magnitude:.exact$}").is_err() {
+        runtime_invariant_panic();
+    }
     let sign_length = usize::from(negative);
-    let decimal_length = usize::from(precision != 0);
+    let zeros = precision - exact;
     let length = sign_length
-        .checked_add(integer_length)
-        .and_then(|length| length.checked_add(decimal_length))
-        .and_then(|length| length.checked_add(precision))
+        .checked_add(digits.length)
+        .and_then(|length| length.checked_add(zeros))
         .unwrap_or_else(|| string_result_too_large());
     let raw = allocate_string(length);
-    let mut cursor = 0;
     if negative {
         *string_bytes_mut(raw) = b'-';
-        cursor += 1;
     }
     ptr::copy_nonoverlapping(
-        digits.as_ptr().add(integer_start),
-        string_bytes_mut(raw).add(cursor),
-        integer_length,
+        digits.bytes.as_ptr(),
+        string_bytes_mut(raw).add(sign_length),
+        digits.length,
     );
-    cursor += integer_length;
-    if precision != 0 {
-        *string_bytes_mut(raw).add(cursor) = b'.';
-        cursor += 1;
-        let mut divisor = factor / 10;
-        for _ in 0..precision {
-            *string_bytes_mut(raw).add(cursor) = b'0' + ((fractional / divisor) % 10) as u8;
-            cursor += 1;
-            divisor = core::cmp::max(divisor / 10, 1);
-        }
-    }
+    ptr::write_bytes(
+        string_bytes_mut(raw).add(sign_length + digits.length),
+        b'0',
+        zeros,
+    );
     let padded = padded_string(string_bytes(raw), length, width, flags, negative);
     dr_v1_string_release(raw);
     padded
@@ -4318,19 +4319,6 @@ fn unsigned_base(mut value: u64, conversion: u8, buffer: &mut [u8; 65]) -> (usiz
             _ => b'a' + digit - 10,
         };
         value /= radix;
-        if value == 0 {
-            break;
-        }
-    }
-    (cursor, buffer.len() - cursor)
-}
-
-fn unsigned_decimal_u128(mut value: u128, buffer: &mut [u8; 39]) -> (usize, usize) {
-    let mut cursor = buffer.len();
-    loop {
-        cursor -= 1;
-        buffer[cursor] = b'0' + (value % 10) as u8;
-        value /= 10;
         if value == 0 {
             break;
         }
@@ -4474,8 +4462,37 @@ unsafe fn string_result_too_large() -> ! {
     panic_catalogued(ptr::null(), b"P1205")
 }
 
+/// The runtime found its own state impossible. The report names the check
+/// that failed, since nothing in the program's source can.
+#[track_caller]
 unsafe fn runtime_invariant_panic() -> ! {
-    panic_catalogued(ptr::null(), b"P1001")
+    static mut NOTE: [u8; 192] = [0; 192];
+    let location = core::panic::Location::caller();
+    let note = &mut *ptr::addr_of_mut!(NOTE);
+    let mut length = 0;
+    let mut line = [0_u8; 10];
+    let mut digits = line.len();
+    let mut number = location.line();
+    loop {
+        digits -= 1;
+        line[digits] = b'0' + (number % 10) as u8;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    for part in [
+        &b"A runtime check failed at "[..],
+        location.file().as_bytes(),
+        b":",
+        &line[digits..],
+        b". This is a defect in Doria, not in the program; please report it.",
+    ] {
+        let taken = part.len().min(note.len() - length);
+        note[length..length + taken].copy_from_slice(&part[..taken]);
+        length += taken;
+    }
+    dr_v2_panic_code(ptr::null(), b"P1001".as_ptr(), 5, note.as_ptr(), length)
 }
 
 #[cfg(test)]
@@ -4594,6 +4611,9 @@ unsafe fn write_panic_fragment(bytes: &[u8]) {
 }
 
 unsafe fn write_panic_bytes(bytes: *const u8, byte_length: usize) {
+    // A panic message written to an alternate screen, or under a hidden
+    // cursor in raw mode, is a message nobody reads.
+    terminal::process_ending();
     // Panic diagnostics are best effort; their sink must not replace the fatal status.
     let _ = device_io::write_panic(bytes, byte_length);
 }
@@ -4629,11 +4649,13 @@ unsafe fn exit_process(status: i32) -> ! {
 
 #[cfg(unix)]
 unsafe fn abort_process(status: i32) -> ! {
+    terminal::process_ending();
     _exit(status)
 }
 
 #[cfg(windows)]
 unsafe fn abort_process(status: i32) -> ! {
+    terminal::process_ending();
     ExitProcess(status as u32)
 }
 
@@ -5377,6 +5399,52 @@ mod tests {
             dr_v1_string_release(retained);
             dr_v1_string_release(right);
             dr_v1_string_release(joined);
+        }
+    }
+
+    #[test]
+    fn fixed_float_formatting_rounds_the_exact_value() {
+        // 1.15 is stored just below 1.15, and 0.125 and 2.5 are exact ties.
+        // 1e40 and the largest value have more integer digits than any
+        // scaled integer could hold, and a precision past the 1074th fraction
+        // digit adds only zeros.
+        let largest = "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368";
+        unsafe {
+            for (value, precision, width, flags, expected) in [
+                (1.15, 1, 0, 0, "1.1".to_string()),
+                (0.125, 2, 0, 0, "0.12".to_string()),
+                (0.375, 2, 0, 0, "0.38".to_string()),
+                (2.5, 0, 0, 0, "2".to_string()),
+                (-0.0, 1, 0, 0, "-0.0".to_string()),
+                (
+                    1e40,
+                    2,
+                    0,
+                    0,
+                    "10000000000000000303786028427003666890752.00".to_string(),
+                ),
+                (
+                    f64::MAX,
+                    1080,
+                    0,
+                    0,
+                    format!("{largest}.{}", "0".repeat(1080)),
+                ),
+                (0.5, 1080, 0, 0, format!("0.5{}", "0".repeat(1079))),
+                (-1.5, 2, 8, FORMAT_ZERO_PAD, "-0001.50".to_string()),
+                (1.5, 1, 6, FORMAT_LEFT_ALIGN, "1.5   ".to_string()),
+            ] {
+                let text = dr_v1_format_f64(value, precision, width, flags);
+                assert_eq!(
+                    core::str::from_utf8(bytes(text)).unwrap(),
+                    expected,
+                    "{value} at precision {precision}"
+                );
+                dr_v1_string_release(text);
+            }
+            let narrow = dr_v1_format_f32(0.1, 10, 0, 0);
+            assert_eq!(bytes(narrow), b"0.1000000015");
+            dr_v1_string_release(narrow);
         }
     }
 

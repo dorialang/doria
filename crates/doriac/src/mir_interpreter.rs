@@ -21,7 +21,9 @@ mod file_stream;
 mod inline_value;
 mod readiness_set;
 mod standard_stream;
+mod terminal;
 use byte_region::ByteRegionValue;
+pub use terminal::MirTerminal;
 mod transfer_group;
 mod transfer_plan;
 
@@ -48,6 +50,15 @@ struct PayloadProjection {
     ty: mir::PayloadEnumType,
     case: crate::enums::EnumCaseId,
     field: usize,
+}
+
+/// What holds a standard device against other access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandardClaim {
+    /// The transfer group with this identity has a pending transfer on it.
+    Group(usize),
+    /// Raw mode owns standard input until it is left.
+    RawMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1193,8 +1204,11 @@ struct Interpreter<'program> {
     transfer_plans: BTreeMap<usize, transfer_plan::PlanOwner>,
     transfer_groups: BTreeMap<usize, transfer_group::GroupOwner>,
     cancellation_states: BTreeMap<u128, inline_value::CancellationState>,
+    terminal: terminal::State,
     pending_requests: BTreeMap<usize, file_stream::RequestView>,
-    standard_claims: [Option<usize>; 3],
+    /// What holds each standard device against other access, as the
+    /// runtime's device loans do.
+    standard_claims: [Option<StandardClaim>; 3],
     standard_source_homes: [usize; 3],
     heap: BTreeMap<usize, ObjectValue>,
     interface_collections: BTreeMap<usize, CollectionValue>,
@@ -1332,6 +1346,9 @@ pub struct MirIo {
     /// Deterministic host failures used to verify the shared standard-I/O
     /// contract without depending on platform-specific devices.
     pub faults: MirIoFaults,
+    /// The terminal behind standard input and output. `None` runs the
+    /// program as if both were redirected.
+    pub terminal: Option<MirTerminal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1464,6 +1481,7 @@ fn interpret_internal_with_clock(
         match interpreter.step()? {
             StepOutcome::Continue => {}
             StepOutcome::CleanExit => {
+                interpreter.terminal_ending();
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
                     live_closure_environments: interpreter.closure_environments.len(),
@@ -1485,6 +1503,7 @@ fn interpret_internal_with_clock(
                 ));
             }
             StepOutcome::RuntimePanic(event) => {
+                interpreter.terminal_ending();
                 let output = interpreter.runtime_panic_output(event);
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
@@ -1502,6 +1521,7 @@ fn interpret_internal_with_clock(
                 ));
             }
             StepOutcome::EntryReturned(outcome) => {
+                interpreter.terminal_ending();
                 let output = interpreter.finish_entry(entry, outcome)?;
                 let metrics = InterpreterMetrics {
                     closure_environment_allocations: interpreter.closure_environment_allocations,
@@ -1639,6 +1659,7 @@ impl<'a> Interpreter<'a> {
             transfer_plans: BTreeMap::new(),
             transfer_groups: BTreeMap::new(),
             cancellation_states: BTreeMap::new(),
+            terminal: terminal::State::new(io.terminal),
             pending_requests: BTreeMap::new(),
             standard_claims: [None; 3],
             // Canonical process-owned opaque homes, matching the native static
@@ -2908,9 +2929,11 @@ impl<'a> Interpreter<'a> {
                     | mir::CheckedIoOperation::BeginTransferGroup { .. }
                     | mir::CheckedIoOperation::ObserveTransferGroup { .. }
                     | mir::CheckedIoOperation::ConfigureTransferPlan { .. }
+                    | mir::CheckedIoOperation::WatchTransferPlan { .. }
                     | mir::CheckedIoOperation::TransferPlanKey { .. }
                     | mir::CheckedIoOperation::TransferGroupReadRegion { .. }
                     | mir::CheckedIoOperation::ResubmitTransfer { .. }
+                    | mir::CheckedIoOperation::ResubmitWatch { .. }
                     | mir::CheckedIoOperation::RegisterReadinessStream { .. }
                     | mir::CheckedIoOperation::UnregisterReadinessStream { .. }
                     | mir::CheckedIoOperation::BorrowReadinessStream { .. }
@@ -7326,11 +7349,11 @@ impl<'a> Interpreter<'a> {
         expression: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::IntegerExpression::DurationNanoseconds(value) => {
+            mir::IntegerExpression::InlineWord(value) => {
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
-                    .push(EvaluationTask::Inline(inline_value::Task::Nanoseconds));
+                    .push(EvaluationTask::Inline(inline_value::Task::Word));
                 frame
                     .tasks
                     .push(EvaluationTask::Inline(inline_value::Task::Value(*value)));
@@ -7463,6 +7486,10 @@ impl<'a> Interpreter<'a> {
                     .push(EvaluationTask::ByteRegion(byte_region::Task::Copy));
                 frame.tasks.push(EvaluationTask::Rvalue(*source));
                 frame.tasks.push(EvaluationTask::Rvalue(*destination));
+            }
+            mir::IntegerExpression::Terminal { call, .. } => {
+                let result = self.terminal_call(call)?;
+                self.push_scalar(mir::ScalarValue::Integer(result))?;
             }
         }
         Ok(())
@@ -14329,6 +14356,15 @@ impl<'a> Interpreter<'a> {
                 region,
                 reading,
             } => self.configure_transfer_plan(class, previous, key, region, reading)?,
+            mir::CheckedIoOperation::WatchTransferPlan {
+                class,
+                previous,
+                identity,
+                ..
+            } => self.watch_transfer_plan(class, previous, identity)?,
+            mir::CheckedIoOperation::ResubmitWatch { group, key } => {
+                self.resubmit_watch(group, key)?
+            }
             mir::CheckedIoOperation::NewReadinessSet { class } => {
                 let object = self.next_object;
                 self.next_object += 1;
@@ -19817,34 +19853,40 @@ fn format_integer_base(
     }
 }
 
+/// A finite binary64 value is a multiple of 2^-1074, so its decimal expansion
+/// ends within this many fraction digits. Every later digit is zero. The
+/// native runtime applies the same split (`format_fixed_float` in `doria-rt`).
+const FIXED_FLOAT_EXACT_FRACTION_DIGITS: usize = 1074;
+
+/// `%f` rounds the exact value to the requested fraction digits, ties to even
+/// (Decision 0074).
 fn format_fixed_float(value: FloatValue, precision: u32) -> String {
-    let precision = precision as usize;
-    match value.ty {
+    let (value, negative) = match value.ty {
         crate::numeric::FloatType::Float32 => {
             let value = value.as_f32();
-            if value.is_nan() {
-                "NaN".to_string()
-            } else if value == f32::INFINITY {
-                "Infinity".to_string()
-            } else if value == f32::NEG_INFINITY {
-                "-Infinity".to_string()
-            } else {
-                format!("{value:.precision$}")
-            }
+            (f64::from(value), value.is_sign_negative())
         }
         crate::numeric::FloatType::Float64 => {
             let value = value.as_f64();
-            if value.is_nan() {
-                "NaN".to_string()
-            } else if value == f64::INFINITY {
-                "Infinity".to_string()
-            } else if value == f64::NEG_INFINITY {
-                "-Infinity".to_string()
-            } else {
-                format!("{value:.precision$}")
-            }
+            (value, value.is_sign_negative())
         }
+    };
+    if value.is_nan() {
+        return "NaN".to_string();
     }
+    if value.is_infinite() {
+        return if negative { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let precision = precision as usize;
+    let exact = precision.min(FIXED_FLOAT_EXACT_FRACTION_DIGITS);
+    let magnitude = value.abs();
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    text.push_str(&format!("{magnitude:.exact$}"));
+    text.extend(core::iter::repeat_n('0', precision - exact));
+    text
 }
 
 fn apply_width(mut value: String, spec: crate::format_string::FormatSpec) -> String {
@@ -20237,6 +20279,7 @@ mod tests {
             crate::inline_value::InlineValueType::RegistrationKey(class),
             crate::inline_value::InlineValueType::ReadTransferKey(class),
             crate::inline_value::InlineValueType::WriteTransferKey(class),
+            crate::inline_value::InlineValueType::WatchKey(class),
         ] {
             for bits in [0, (1_u128 << 96) | 27, u128::MAX] {
                 let scalar = mir::ScalarType::Inline(ty);

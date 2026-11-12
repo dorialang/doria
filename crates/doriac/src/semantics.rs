@@ -21371,15 +21371,16 @@ impl<'program> Checker<'program> {
         use_span: Span,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        // A compiler-owned standard source is one unit: its classes cooperate
-        // through internal members (file lock methods construct the guards)
-        // that authored code still cannot reach.
+        // The compiler-owned standard sources are one unit: their classes
+        // cooperate through internal members (file lock methods construct the
+        // guards; a raw mode builds its watch identity) that authored code
+        // still cannot reach.
         method_context.is_some_and(|context| context.class_name == declaring_class)
             || (use_span.source.is_compiler_owned()
                 && self
                     .classes
                     .get(declaring_class)
-                    .is_some_and(|class| class.declaration.source == use_span.source))
+                    .is_some_and(|class| class.declaration.source.is_compiler_owned()))
     }
 
     fn type_parameter_has_constraint(&self, parameter: &str, required: &str) -> bool {

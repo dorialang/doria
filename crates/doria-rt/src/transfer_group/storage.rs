@@ -17,6 +17,16 @@ pub(crate) struct FixedSlice<T> {
 }
 
 impl<T> FixedSlice<T> {
+    /// Storage for nothing. It allocates nothing, so it cannot fail.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            pointer: NonNull::dangling(),
+            allocation: core::ptr::null_mut(),
+            capacity: 0,
+            initialized: 0,
+        }
+    }
+
     pub(crate) fn new(capacity: usize) -> Result<Self, Failure> {
         let layout = Layout::array::<T>(capacity).map_err(|_| Failure::invalid_input())?;
         let mut storage = Self {

@@ -4936,7 +4936,12 @@ impl InlineValueUseMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineValueExpression {
-    DurationFromNanoseconds(Box<IntegerExpression>),
+    /// Builds a one-word inline value from its bits: a `Duration` from its
+    /// nanoseconds, a Term value from its packed fields.
+    FromWord {
+        ty: crate::inline_value::InlineValueType,
+        word: Box<IntegerExpression>,
+    },
     InterfaceReceiver {
         ty: crate::inline_value::InlineValueType,
         receiver: LocalId,
@@ -4970,8 +4975,8 @@ pub enum InlineValueExpression {
 impl InlineValueExpression {
     pub const fn ty(&self) -> crate::inline_value::InlineValueType {
         match self {
-            Self::DurationFromNanoseconds(_) => crate::inline_value::InlineValueType::Duration,
-            Self::CancellationToken { ty, .. }
+            Self::FromWord { ty, .. }
+            | Self::CancellationToken { ty, .. }
             | Self::InterfaceReceiver { ty, .. }
             | Self::Use { ty, .. }
             | Self::Call { ty, .. }
@@ -4992,7 +4997,7 @@ impl InlineValueExpression {
                     || matches!(**left, NullableScalarExpression::Null(_)))
                     && right.owned_temporary()
             }
-            Self::DurationFromNanoseconds(_) => false,
+            Self::FromWord { .. } => false,
         }
     }
 }
@@ -5050,7 +5055,8 @@ pub enum IntegerBinaryOp {
 
 #[derive(Debug, Clone)]
 pub enum IntegerExpression {
-    DurationNanoseconds(Box<InlineValueExpression>),
+    /// The bits of a one-word inline value, as `int64`.
+    InlineWord(Box<InlineValueExpression>),
     Use {
         ty: IntegerType,
         operand: Operand,
@@ -5103,12 +5109,39 @@ pub enum IntegerExpression {
         source: Box<Rvalue>,
         span: Span,
     },
+    /// One call into the terminal layer. It yields the packed result that
+    /// `doria_terminal::wire` defines and never fails as a call: the
+    /// `Doria\Std\Term` source reads the status and raises the error.
+    Terminal {
+        call: TerminalCall,
+        span: Span,
+    },
+}
+
+/// The two terminal primitives (Decision 0140). Their operands are the
+/// parameters of the intrinsic function that makes the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCall {
+    /// `int` operation selector and arguments, and the `string` text.
+    Operate {
+        operation: LocalId,
+        first: LocalId,
+        second: LocalId,
+        text: LocalId,
+    },
+    /// The raw-mode generation, a `Doria\Std\Io\Wait`, and a nullable
+    /// `CancellationToken`.
+    AwaitEvent {
+        generation: LocalId,
+        wait: LocalId,
+        cancellation: LocalId,
+    },
 }
 
 impl PartialEq for IntegerExpression {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::DurationNanoseconds(left), Self::DurationNanoseconds(right)) => left == right,
+            (Self::InlineWord(left), Self::InlineWord(right)) => left == right,
             (
                 Self::Use {
                     ty: left_ty,
@@ -5217,6 +5250,9 @@ impl PartialEq for IntegerExpression {
                     ..
                 },
             ) => left_destination == right_destination && left_source == right_source,
+            (Self::Terminal { call: left, .. }, Self::Terminal { call: right, .. }) => {
+                left == right
+            }
             _ => false,
         }
     }
@@ -5233,8 +5269,10 @@ impl IntegerExpression {
             | Self::Convert { ty, .. }
             | Self::Call { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
-            Self::FloatToInt { .. } | Self::DurationNanoseconds(_) => IntegerType::Int64,
-            Self::EnumBacking { .. } | Self::CopyByteRegion { .. } => IntegerType::Int64,
+            Self::FloatToInt { .. } | Self::InlineWord(_) => IntegerType::Int64,
+            Self::EnumBacking { .. } | Self::CopyByteRegion { .. } | Self::Terminal { .. } => {
+                IntegerType::Int64
+            }
         }
     }
 
@@ -6169,6 +6207,20 @@ pub enum CheckedIoOperation {
         region: LocalId,
         reading: bool,
     },
+    /// Adds a watch to a plan (Decision 0140). The plan retains a shared loan of
+    /// `source`; only `identity`, its one-word `WatchSource`, reaches the runtime.
+    /// Append consumes `previous` on either edge, like `ConfigureTransferPlan`.
+    WatchTransferPlan {
+        class: ClassId,
+        previous: Option<LocalId>,
+        source: LocalId,
+        identity: LocalId,
+    },
+    /// Arms a watch again after its `Ready` was fetched.
+    ResubmitWatch {
+        group: LocalId,
+        key: LocalId,
+    },
     NewReadinessSet {
         class: ClassId,
     },
@@ -7064,9 +7116,11 @@ fn checked_io_class_temporary_capacity(operation: &CheckedIoOperation) -> usize 
     match operation {
         CheckedIoOperation::ObserveTransferGroup { .. } => 0,
         CheckedIoOperation::ConfigureTransferPlan { .. }
+        | CheckedIoOperation::WatchTransferPlan { .. }
         | CheckedIoOperation::BeginTransferGroup { .. }
         | CheckedIoOperation::TransferGroupReadRegion { .. }
         | CheckedIoOperation::ResubmitTransfer { .. }
+        | CheckedIoOperation::ResubmitWatch { .. }
         | CheckedIoOperation::TransferPlanKey { .. } => 0,
         CheckedIoOperation::NewReadinessSet { .. }
         | CheckedIoOperation::RegisterReadinessStream { .. }
@@ -7716,9 +7770,7 @@ fn value_class_temporary_capacity(value: &ValueExpression) -> usize {
 
 fn inline_class_temporary_capacity(value: &InlineValueExpression) -> usize {
     match value {
-        InlineValueExpression::DurationFromNanoseconds(value) => {
-            integer_class_temporary_capacity(value)
-        }
+        InlineValueExpression::FromWord { word, .. } => integer_class_temporary_capacity(word),
         InlineValueExpression::CancellationToken { .. }
         | InlineValueExpression::InterfaceReceiver { .. }
         | InlineValueExpression::Use { .. } => 0,
@@ -7743,7 +7795,7 @@ fn enum_class_temporary_capacity(value: &EnumExpression) -> usize {
 
 fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
     match value {
-        IntegerExpression::DurationNanoseconds(value) => inline_class_temporary_capacity(value),
+        IntegerExpression::InlineWord(value) => inline_class_temporary_capacity(value),
         IntegerExpression::Use { .. } => 0,
         IntegerExpression::Unary { operand, .. }
         | IntegerExpression::Convert { value: operand, .. } => {
@@ -7765,6 +7817,7 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
             source,
             ..
         } => rvalue_class_temporary_capacity(destination) + rvalue_class_temporary_capacity(source),
+        IntegerExpression::Terminal { .. } => 0,
     }
 }
 
@@ -9390,8 +9443,8 @@ impl fmt::Display for InlineValueExpression {
                 receiver.0,
                 vtable.0,
             ),
-            Self::DurationFromNanoseconds(value) => {
-                write!(formatter, "durationFromNanoseconds({value})")
+            Self::FromWord { ty, word } => {
+                write!(formatter, "fromWord<{}>({word})", ty.name())
             }
             Self::CancellationToken { source, .. } => {
                 write!(formatter, "cancellationToken(local{})", source.0)
@@ -9465,7 +9518,7 @@ impl fmt::Display for IntegerBinaryOp {
 impl fmt::Display for IntegerExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DurationNanoseconds(value) => write!(formatter, "durationNanoseconds({value})"),
+            Self::InlineWord(value) => write!(formatter, "inlineWord({value})"),
             IntegerExpression::Use { ty, operand } => match operand {
                 Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
                     write!(formatter, "{operand}: {ty}")
@@ -9538,6 +9591,27 @@ impl fmt::Display for IntegerExpression {
                 source,
                 ..
             } => write!(formatter, "region_copy({destination}, {source}): int"),
+            IntegerExpression::Terminal { call, .. } => match call {
+                TerminalCall::Operate {
+                    operation,
+                    first,
+                    second,
+                    text,
+                } => write!(
+                    formatter,
+                    "terminal_operate(local{}, local{}, local{}, local{}): int",
+                    operation.0, first.0, second.0, text.0
+                ),
+                TerminalCall::AwaitEvent {
+                    generation,
+                    wait,
+                    cancellation,
+                } => write!(
+                    formatter,
+                    "terminal_await_event(local{}, local{}, local{}): int",
+                    generation.0, wait.0, cancellation.0
+                ),
+            },
         }
     }
 }

@@ -582,11 +582,21 @@ unsafe impl GroupDriver<AdapterTerminal> for Dispatcher<'_> {
 
     fn wait_any(&mut self, budget: Self::Timeout, _: Option<usize>) -> Result<Wake, Failure> {
         match self.watcher.wait(&budget, self.events)? {
-            (0, _) => Ok(Wake::Completion),
+            // An attached wake ends the wait like a completion: the group
+            // then asks the watched source.
+            (0 | 4, _) => Ok(Wake::Completion),
             (1, _) => Ok(Wake::Timeout),
             (2, _) => Ok(Wake::Cancellation),
             _ => Err(Failure::other()),
         }
+    }
+
+    unsafe fn attach_wake(&mut self, handle: i32) -> Result<(), Failure> {
+        self.watcher.add_wake(handle)
+    }
+
+    unsafe fn detach_wake(&mut self, handle: i32) {
+        self.watcher.remove_wake(handle);
     }
 
     unsafe fn cancel(
@@ -677,6 +687,18 @@ impl AdapterGroup<'_, '_> {
 
     pub(crate) fn stop(&self) -> Option<Stop> {
         self.inner.stop()
+    }
+
+    /// The plan's watched sources join this group's wait (Decision 0140).
+    pub(crate) fn watch(
+        &mut self,
+        sources: &[crate::transfer_group::WatchSource],
+    ) -> Result<(), Failure> {
+        self.inner.watch(sources)
+    }
+
+    pub(crate) fn rearm_watch(&mut self, index: usize) -> Result<(), Failure> {
+        self.inner.rearm_watch(index)
     }
 }
 
