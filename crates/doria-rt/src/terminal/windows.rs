@@ -17,8 +17,8 @@ use crate::platform_io::{self, Failure, Reason};
 use crate::wait_budget::DrWaitBudgetV1;
 use crate::win32::{
     wait_for_multiple_objects, wait_for_single_object, ConsoleScreenBufferInfo, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetEnvironmentVariableA, InputRecord, ReadConsoleInputW,
-    SetConsoleCtrlHandler, SetConsoleMode, INFINITE, WAIT_TIMEOUT,
+    GetConsoleScreenBufferInfo, GetEnvironmentVariableA, InputRecord, KeyEventRecord,
+    ReadConsoleInputW, SetConsoleCtrlHandler, SetConsoleMode, INFINITE, WAIT_TIMEOUT,
 };
 
 const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
@@ -221,6 +221,22 @@ pub(super) unsafe fn leave_raw_mode() -> Result<(), Refusal> {
     restored.map_err(Refusal::from)
 }
 
+/// Whether a key record is one character of the console's input.
+///
+/// In this input mode the console turns each key into the characters a
+/// terminal would send and writes one key-down record for each. A record it
+/// writes that way names no physical key, so it has no scan code, and that is
+/// what tells the NUL of Control+Space from a key that has no character: a
+/// modifier, a lock or a dead key arrives as the key that was pressed, scan
+/// code and all. A character composed with Alt and the number pad arrives on
+/// the release of Alt.
+fn carries_character(key: &KeyEventRecord) -> bool {
+    if key.key_down == 0 {
+        return key.virtual_key_code == VK_MENU && key.character != 0;
+    }
+    key.character != 0 || key.virtual_scan_code == 0
+}
+
 /// One read of the records the console has. The input handle was signaled,
 /// so this does not block.
 unsafe fn read_records(raw: &mut Raw, input: NativeHandle) -> Result<(), Failure> {
@@ -239,7 +255,7 @@ unsafe fn read_records(raw: &mut Raw, input: NativeHandle) -> Result<(), Failure
         match record.event_type {
             KEY_EVENT => {
                 let key = record.event.key;
-                if key.character == 0 || (key.key_down == 0 && key.virtual_key_code != VK_MENU) {
+                if !carries_character(&key) {
                     continue;
                 }
                 let queue = &mut raw.queue;

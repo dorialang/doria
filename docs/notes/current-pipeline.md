@@ -111,6 +111,17 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   workspace test step and again in a step of its own, about 14 minutes a run;
   Andrew ruled on 2026-11-12 to remove the repeated step. The suite still
   runs once, in the `Test` step.
+  Review of the release to `main` on 2026-11-12 found two runtime defects,
+  fixed the same day. On Unix a signal's predecessor is now saved once per
+  installation: entering raw mode again under a handler a library had
+  installed over this layer's saved that handler as the predecessor, and the
+  two called each other without end. The same holds for the six interruption
+  signals, and a stop now puts back the handler it displaced instead of this
+  layer's own. On Windows Control+Space is reported: the console delivers it
+  as a key record whose character is zero, which the reader had dropped with
+  the keys that have no character. That rule rests on the console writing
+  the characters of its input without a scan code; it is checked through
+  ConPTY in CI, not on a physical keyboard.
 
 - Stage 36a push, 2026-11-05 (delivered 2026-11-08). Decisions and their
   alternatives are in `docs/notes/stage36a-decision-log.md` (entries 1-51).

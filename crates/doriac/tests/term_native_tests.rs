@@ -784,6 +784,9 @@ const EVERY_KEY: &[Step] = &[
     Step::Typed(b"\x1b[24~", Key::Function(12), 0),
     // In raw mode Control+C is a key, not an interrupt.
     Step::Typed(b"\x03", Key::Character('c'), MODIFIER_CONTROL),
+    // Control+Space is NUL. The Windows console reports it as a key record
+    // whose character is zero, like the keys that have no character at all.
+    Step::Typed(b"\x00", Key::Character(' '), MODIFIER_CONTROL),
     Step::Typed(b"\x1b[1;5C", Key::Right, MODIFIER_CONTROL),
     Step::Typed(b"\x1b[1;2A", Key::Up, MODIFIER_SHIFT),
     Step::Typed(b"\x1b[1;3D", Key::Left, MODIFIER_ALT),
