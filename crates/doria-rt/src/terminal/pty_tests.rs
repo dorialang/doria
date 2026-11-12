@@ -765,24 +765,26 @@ static HOST_BELOW_DETAILED: [AtomicBool; 4] = [const { AtomicBool::new(false) };
 /// What a well-behaved library installs: it does its own work, here a count,
 /// and calls the handler it replaced.
 extern "C" fn host_handler(signal: i32, info: *mut libc::siginfo_t, context: *mut c_void) {
-    let Some(index) = HOSTED.iter().position(|hosted| *hosted == signal) else {
-        return;
-    };
-    HOST_CALLS[index].fetch_add(1, Ordering::SeqCst);
-    let below = HOST_BELOW[index].load(Ordering::SeqCst);
-    if below == libc::SIG_DFL || below == libc::SIG_IGN {
-        return;
-    }
-    unsafe {
-        if HOST_BELOW_DETAILED[index].load(Ordering::SeqCst) {
-            let below: extern "C" fn(i32, *mut libc::siginfo_t, *mut c_void) =
-                core::mem::transmute(below);
-            below(signal, info, context);
-        } else {
-            let below: extern "C" fn(i32) = core::mem::transmute(below);
-            below(signal);
+    crate::test_callback::guard(|| {
+        let Some(index) = HOSTED.iter().position(|hosted| *hosted == signal) else {
+            return;
+        };
+        HOST_CALLS[index].fetch_add(1, Ordering::SeqCst);
+        let below = HOST_BELOW[index].load(Ordering::SeqCst);
+        if below == libc::SIG_DFL || below == libc::SIG_IGN {
+            return;
         }
-    }
+        unsafe {
+            if HOST_BELOW_DETAILED[index].load(Ordering::SeqCst) {
+                let below: extern "C" fn(i32, *mut libc::siginfo_t, *mut c_void) =
+                    core::mem::transmute(below);
+                below(signal, info, context);
+            } else {
+                let below: extern "C" fn(i32) = core::mem::transmute(below);
+                below(signal);
+            }
+        }
+    })
 }
 
 fn host_handler_address() -> libc::sighandler_t {
