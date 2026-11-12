@@ -57,7 +57,7 @@ unsafe fn fill(queue: &mut Queue) -> Result<(), Failure> {
 static RAW: Shared<Option<Raw>> = Shared::new(None);
 /// The input mode before raw mode, valid while the ledger holds `RAW_MODE`.
 static ORIGINAL_INPUT: Shared<MaybeUninit<libc::termios>> = Shared::new(MaybeUninit::zeroed());
-static PREVIOUS_RESIZE: Shared<MaybeUninit<libc::sigaction>> = Shared::new(MaybeUninit::zeroed());
+static RESIZE: Handled = Handled::new();
 /// The wake the resize handler sets. It is made on the first entry to raw
 /// mode and lives as long as the process, so a handler that another library
 /// has chained behind its own can never reach a closed descriptor.
@@ -171,6 +171,90 @@ unsafe fn errno() -> *mut c_int {
     }
 }
 
+/// This layer's place in one signal's chain of handlers.
+///
+/// A signal has one disposition, and a handler that wants the one before it
+/// to run as well saves it and calls it. This layer does that, and so may a
+/// library the program uses, over this layer's handler. The predecessor is
+/// therefore saved once, when the handler is installed, and stays the
+/// predecessor for as long as the handler stands in the chain. Installing it
+/// again over a handler that already calls it would save that handler as the
+/// predecessor, and the two would call each other without end.
+struct Handled {
+    /// What the signal did before the handler was installed, valid while
+    /// `standing`.
+    previous: Shared<MaybeUninit<libc::sigaction>>,
+    /// Set from the time the handler is installed until this layer puts
+    /// `previous` back.
+    standing: AtomicBool,
+}
+
+impl Handled {
+    const fn new() -> Self {
+        Self {
+            previous: Shared::new(MaybeUninit::zeroed()),
+            standing: AtomicBool::new(false),
+        }
+    }
+
+    fn previous(&self) -> *const libc::sigaction {
+        self.previous.0.get().cast()
+    }
+
+    /// Makes sure `action` receives `signal`. When another handler was
+    /// installed over ours and is still the installed one, ours is reached
+    /// through it and nothing changes. A default or ignored disposition, or
+    /// the predecessor itself, means ours was taken out of the chain, and it
+    /// is installed again.
+    unsafe fn install(&self, signal: c_int, action: &libc::sigaction) -> Result<(), Failure> {
+        let mut current = MaybeUninit::<libc::sigaction>::zeroed();
+        if libc::sigaction(signal, ptr::null(), current.as_mut_ptr()) != 0 {
+            return Err(platform_io::last_failure());
+        }
+        let current = current.assume_init();
+        let installed = current.sa_sigaction;
+        if self.standing.load(Ordering::Acquire) {
+            if installed == action.sa_sigaction {
+                return Ok(());
+            }
+            let over_ours = installed != libc::SIG_DFL
+                && installed != libc::SIG_IGN
+                && installed != (*self.previous()).sa_sigaction;
+            if over_ours {
+                return Ok(());
+            }
+        }
+        // The predecessor is in place before the handler can run.
+        *self.previous.0.get() = MaybeUninit::new(current);
+        if libc::sigaction(signal, action, ptr::null_mut()) != 0 {
+            return Err(platform_io::last_failure());
+        }
+        self.standing.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Puts the predecessor back while `handler` is still the installed one.
+    /// A handler installed over it since then keeps its place: ours stays in
+    /// the chain under it, safe to reach, with its predecessor unchanged.
+    unsafe fn remove(&self, signal: c_int, handler: libc::sighandler_t) {
+        if !self.standing.load(Ordering::Acquire) {
+            return;
+        }
+        let mut current = MaybeUninit::<libc::sigaction>::zeroed();
+        if libc::sigaction(signal, ptr::null(), current.as_mut_ptr()) == 0
+            && current.assume_init().sa_sigaction == handler
+            && libc::sigaction(signal, self.previous(), ptr::null_mut()) == 0
+        {
+            self.standing.store(false, Ordering::Release);
+        }
+    }
+
+    /// The handler itself gave the signal back to its predecessor.
+    fn gave_way(&self) {
+        self.standing.store(false, Ordering::Release);
+    }
+}
+
 unsafe fn chain(
     previous: *const libc::sigaction,
     signal: c_int,
@@ -203,7 +287,7 @@ extern "C" fn on_resize(signal: c_int, info: *mut libc::siginfo_t, context: *mut
         if notice != 0 {
             let _ = cancellation_signal::set(notice);
         }
-        chain((*PREVIOUS_RESIZE.0.get()).as_ptr(), signal, info, context);
+        chain(RESIZE.previous(), signal, info, context);
         *location = saved;
     }
 }
@@ -217,31 +301,11 @@ unsafe fn install_resize_handler() -> Result<(), Failure> {
     action.sa_sigaction = resize_handler();
     action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
     libc::sigemptyset(&mut action.sa_mask);
-    if libc::sigaction(
-        libc::SIGWINCH,
-        &action,
-        (*PREVIOUS_RESIZE.0.get()).as_mut_ptr(),
-    ) != 0
-    {
-        return Err(platform_io::last_failure());
-    }
-    Ok(())
+    RESIZE.install(libc::SIGWINCH, &action)
 }
 
-/// Puts the previous disposition back while ours is still the installed one.
-/// A handler installed over ours since then keeps its place, and ours stays
-/// safe to reach through it.
 unsafe fn remove_resize_handler() {
-    let mut current = MaybeUninit::<libc::sigaction>::zeroed();
-    if libc::sigaction(libc::SIGWINCH, ptr::null(), current.as_mut_ptr()) == 0
-        && current.assume_init().sa_sigaction == resize_handler()
-    {
-        libc::sigaction(
-            libc::SIGWINCH,
-            (*PREVIOUS_RESIZE.0.get()).as_ptr(),
-            ptr::null_mut(),
-        );
-    }
+    RESIZE.remove(libc::SIGWINCH, resize_handler());
 }
 
 /// The signals that end the process by default, then stop and continue.
@@ -255,15 +319,9 @@ const INTERRUPTIONS: [c_int; 6] = [
 ];
 const STOP: usize = 4;
 
-static PREVIOUS_INTERRUPTION: [Shared<MaybeUninit<libc::sigaction>>; 6] = [
-    Shared::new(MaybeUninit::zeroed()),
-    Shared::new(MaybeUninit::zeroed()),
-    Shared::new(MaybeUninit::zeroed()),
-    Shared::new(MaybeUninit::zeroed()),
-    Shared::new(MaybeUninit::zeroed()),
-    Shared::new(MaybeUninit::zeroed()),
-];
-/// Which of [`INTERRUPTIONS`] carry this layer's handler.
+static INTERRUPTION: [Handled; 6] = [const { Handled::new() }; 6];
+/// Which of [`INTERRUPTIONS`] this layer is watching: every one that was not
+/// ignored when the program came to have something to put back.
 static INTERRUPTION_WATCHED: [AtomicBool; 6] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
@@ -285,6 +343,11 @@ static TAKING_TERMINAL: AtomicBool = AtomicBool::new(false);
 /// Set from the moment a stop starts undoing the changes until its end has
 /// made them again.
 static STOPPING: AtomicBool = AtomicBool::new(false);
+/// What stood in the stop signal's way when the stop handler lent the signal
+/// to its predecessor, valid while `STOP_LENT`: this layer's handler, or one
+/// installed over it.
+static STOP_DISPLACED: Shared<MaybeUninit<libc::sigaction>> = Shared::new(MaybeUninit::zeroed());
+static STOP_LENT: AtomicBool = AtomicBool::new(false);
 
 /// The handlers block one another while they work, except that a continue
 /// may arrive inside the stop handler, which is where a stopped process is.
@@ -351,9 +414,18 @@ unsafe fn take_terminal_again(stop_ended: bool) {
         core::hint::spin_loop();
     }
     if stop_ended || !STOPPING.load(Ordering::SeqCst) {
-        // Stopping handed the stop signal back to its previous disposition.
-        if INTERRUPTION_WATCHED[STOP].load(Ordering::Acquire) {
-            libc::sigaction(libc::SIGTSTP, &interruption_action(), ptr::null_mut());
+        // Stopping lent the stop signal to its predecessor. What stood in
+        // its way comes back: a handler installed over ours always, and ours
+        // while the program still has something to put back.
+        if STOP_LENT.swap(false, Ordering::AcqRel) {
+            let displaced = STOP_DISPLACED.0.get().cast::<libc::sigaction>();
+            if (*displaced).sa_sigaction != interruption_handler()
+                || INTERRUPTION_WATCHED[STOP].load(Ordering::Acquire)
+            {
+                libc::sigaction(libc::SIGTSTP, displaced, ptr::null_mut());
+            } else {
+                INTERRUPTION[STOP].gave_way();
+            }
         }
         if in_foreground() {
             make_changes_again();
@@ -366,9 +438,9 @@ unsafe fn take_terminal_again(stop_ended: bool) {
 }
 
 /// The stop handler's half: the program's changes are undone and the stop
-/// signal goes back to its previous disposition, as one step that no
-/// continue can interleave with. A late continue would otherwise put this
-/// handler back in the signal's way just before the stop is raised.
+/// signal is lent to its predecessor, as one step that no continue can
+/// interleave with. A late continue would otherwise put a handler back in
+/// the signal's way just before the stop is raised.
 unsafe fn give_terminal_back(previous: *const libc::sigaction) {
     while TAKING_TERMINAL.swap(true, Ordering::AcqRel) {
         core::hint::spin_loop();
@@ -378,7 +450,13 @@ unsafe fn give_terminal_back(previous: *const libc::sigaction) {
         super::restore_on_interruption(false);
         GAVE_TERMINAL_BACK.store(true, Ordering::SeqCst);
     }
-    libc::sigaction(libc::SIGTSTP, previous, ptr::null_mut());
+    let mut displaced = MaybeUninit::<libc::sigaction>::zeroed();
+    if libc::sigaction(libc::SIGTSTP, previous, displaced.as_mut_ptr()) == 0
+        && !STOP_LENT.load(Ordering::Acquire)
+    {
+        *STOP_DISPLACED.0.get() = displaced;
+        STOP_LENT.store(true, Ordering::Release);
+    }
     TAKING_TERMINAL.store(false, Ordering::Release);
 }
 
@@ -417,7 +495,7 @@ extern "C" fn on_interruption(signal: c_int, info: *mut libc::siginfo_t, context
         let Some(index) = INTERRUPTIONS.iter().position(|watched| *watched == signal) else {
             return;
         };
-        let previous = (*PREVIOUS_INTERRUPTION[index].0.get()).as_ptr();
+        let previous = INTERRUPTION[index].previous();
         match signal {
             libc::SIGCONT => {
                 take_terminal_again(false);
@@ -447,7 +525,9 @@ extern "C" fn on_interruption(signal: c_int, info: *mut libc::siginfo_t, context
                 // The signal goes on to do what it would have done without
                 // this layer: it is delivered again, under its previous
                 // disposition, as soon as this handler returns.
-                libc::sigaction(signal, previous, ptr::null_mut());
+                if libc::sigaction(signal, previous, ptr::null_mut()) == 0 {
+                    INTERRUPTION[index].gave_way();
+                }
                 libc::raise(signal);
             }
         }
@@ -459,34 +539,25 @@ extern "C" fn on_interruption(signal: c_int, info: *mut libc::siginfo_t, context
 /// would turn a signal that did nothing into one that ends the program.
 pub(super) unsafe fn watch_for_interruption() {
     for (index, signal) in INTERRUPTIONS.into_iter().enumerate() {
-        let previous = (*PREVIOUS_INTERRUPTION[index].0.get()).as_mut_ptr();
-        if libc::sigaction(signal, ptr::null(), previous) != 0
-            || (*previous).sa_sigaction == libc::SIG_IGN
+        let mut current = MaybeUninit::<libc::sigaction>::zeroed();
+        if libc::sigaction(signal, ptr::null(), current.as_mut_ptr()) != 0
+            || current.assume_init().sa_sigaction == libc::SIG_IGN
         {
             continue;
         }
-        if libc::sigaction(signal, &interruption_action(), ptr::null_mut()) == 0 {
+        if INTERRUPTION[index]
+            .install(signal, &interruption_action())
+            .is_ok()
+        {
             INTERRUPTION_WATCHED[index].store(true, Ordering::Release);
         }
     }
 }
 
-/// Puts each previous disposition back while ours is still the installed
-/// one, as for the resize handler.
 pub(super) unsafe fn stop_watching_for_interruption() {
     for (index, signal) in INTERRUPTIONS.into_iter().enumerate() {
-        if !INTERRUPTION_WATCHED[index].swap(false, Ordering::AcqRel) {
-            continue;
-        }
-        let mut current = MaybeUninit::<libc::sigaction>::zeroed();
-        if libc::sigaction(signal, ptr::null(), current.as_mut_ptr()) == 0
-            && current.assume_init().sa_sigaction == interruption_handler()
-        {
-            libc::sigaction(
-                signal,
-                (*PREVIOUS_INTERRUPTION[index].0.get()).as_ptr(),
-                ptr::null_mut(),
-            );
+        if INTERRUPTION_WATCHED[index].swap(false, Ordering::AcqRel) {
+            INTERRUPTION[index].remove(signal, interruption_handler());
         }
     }
 }

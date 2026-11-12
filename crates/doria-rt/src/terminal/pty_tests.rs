@@ -3,6 +3,8 @@
 //! child with the slave side as its standard input and output, types at it,
 //! resizes it and reads exactly what it drew. The child calls the same entry
 //! points compiled Doria code calls.
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -356,6 +358,8 @@ fn child() {
             "job" => child_job(2),
             "suspended" => child_shell(),
             "watching" => child_watching(),
+            "layered" => child_layered(false),
+            "layered-terminated" => child_layered(true),
             "grouped" => child_grouped(),
             _ => panic!("unknown scenario {scenario}"),
         }
@@ -747,6 +751,117 @@ unsafe fn child_watching() {
         "raw_released={} resize_released={}",
         handler_of(libc::SIGHUP) == libc::SIG_DFL,
         handler_of(libc::SIGWINCH) == libc::SIG_DFL
+    );
+}
+
+/// The signals a library the program uses takes over in [`child_layered`].
+const HOSTED: [i32; 4] = [libc::SIGWINCH, libc::SIGCONT, libc::SIGTSTP, libc::SIGTERM];
+static HOST_CALLS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+/// The handler each host handler replaced, and whether it takes three
+/// arguments.
+static HOST_BELOW: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static HOST_BELOW_DETAILED: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
+
+/// What a well-behaved library installs: it does its own work, here a count,
+/// and calls the handler it replaced.
+extern "C" fn host_handler(signal: i32, info: *mut libc::siginfo_t, context: *mut c_void) {
+    let Some(index) = HOSTED.iter().position(|hosted| *hosted == signal) else {
+        return;
+    };
+    HOST_CALLS[index].fetch_add(1, Ordering::SeqCst);
+    let below = HOST_BELOW[index].load(Ordering::SeqCst);
+    if below == libc::SIG_DFL || below == libc::SIG_IGN {
+        return;
+    }
+    unsafe {
+        if HOST_BELOW_DETAILED[index].load(Ordering::SeqCst) {
+            let below: extern "C" fn(i32, *mut libc::siginfo_t, *mut c_void) =
+                core::mem::transmute(below);
+            below(signal, info, context);
+        } else {
+            let below: extern "C" fn(i32) = core::mem::transmute(below);
+            below(signal);
+        }
+    }
+}
+
+fn host_handler_address() -> libc::sighandler_t {
+    host_handler as *const () as libc::sighandler_t
+}
+
+unsafe fn install_host_handlers() {
+    for (index, signal) in HOSTED.into_iter().enumerate() {
+        let mut action: libc::sigaction = core::mem::zeroed();
+        action.sa_sigaction = host_handler_address();
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        let mut below = core::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        assert_eq!(libc::sigaction(signal, &action, below.as_mut_ptr()), 0);
+        let below = below.assume_init();
+        HOST_BELOW[index].store(below.sa_sigaction, Ordering::SeqCst);
+        HOST_BELOW_DETAILED[index].store(below.sa_flags & libc::SA_SIGINFO != 0, Ordering::SeqCst);
+    }
+}
+
+unsafe fn host_handlers_installed() -> bool {
+    HOSTED
+        .into_iter()
+        .all(|signal| handler_of(signal) == host_handler_address())
+}
+
+fn host_calls() -> [usize; 4] {
+    [0, 1, 2, 3].map(|index| HOST_CALLS[index].load(Ordering::SeqCst))
+}
+
+/// A library installs its handlers over this layer's while raw mode is on,
+/// and the program then leaves raw mode and enters it again. The library's
+/// handlers keep their place, each signal still reaches both, once, and the
+/// second raw mode ends like the first.
+unsafe fn child_layered(terminated: bool) {
+    let before = input_mode(0);
+    let first = enter_raw_mode();
+    let under: Vec<bool> = HOSTED
+        .into_iter()
+        .map(|signal| handler_of(signal) != libc::SIG_DFL)
+        .collect();
+    install_host_handlers();
+    leave_raw_mode(first);
+    eprintln!(
+        "under={under:?} kept_after_leaving={}",
+        host_handlers_installed()
+    );
+    let second = enter_raw_mode();
+    eprintln!("kept_after_entering={}", host_handlers_installed());
+
+    announce("<resize>");
+    let event = next_event(second, indefinite(), core::ptr::null_mut());
+    eprintln!("{event:?} calls={:?}", host_calls());
+
+    libc::raise(libc::SIGCONT);
+    eprintln!("continued calls={:?}", host_calls());
+
+    // The child leads its session, so the system discards the stop and the
+    // handler runs straight through to taking the terminal again.
+    libc::raise(libc::SIGTSTP);
+    let event = next_event(second, indefinite(), core::ptr::null_mut());
+    eprintln!(
+        "{event:?} calls={:?} kept_after_stopping={}",
+        host_calls(),
+        host_handlers_installed()
+    );
+
+    announce("<ready>");
+    let event = next_event(second, indefinite(), core::ptr::null_mut());
+    if terminated {
+        // Only the terminating signal ends this wait.
+        panic!("{event:?} arrived instead of the terminating signal");
+    }
+    assert_eq!(event, key('q'));
+    leave_raw_mode(second);
+    eprintln!(
+        "kept_at_the_end={} restored={}",
+        host_handlers_installed(),
+        same_mode(&before, &input_mode(0))
     );
 }
 
@@ -1211,6 +1326,47 @@ fn a_stop_the_system_discards_leaves_the_program_with_its_terminal() {
         printable(terminal.drawn_between(b"<ready>", b"<left>")),
         "ESC[?1049lESC[?7hESC[?25hESC[?1049hESC[?7lESC[?25l<1>ESC[?7hESC[?25hESC[?1049l<left>"
     );
+    assert!(same_mode(&before, &terminal.mode()));
+}
+
+#[test]
+fn handlers_a_library_installed_over_ours_keep_working_when_raw_mode_is_entered_again() {
+    let mut terminal = Terminal::open(80, 24);
+    let before = terminal.mode();
+    let mut child = terminal.run("layered");
+    terminal.wait_for(&mut child, b"<resize>");
+    terminal.resize(100, 30);
+    terminal.wait_for(&mut child, b"<ready>");
+    terminal.type_bytes(b"q");
+    let (status, report) = terminal.finish(child);
+    assert_eq!(status, Some(0), "{report}");
+    // Each signal reached the library's handler once and ours once: the
+    // resize and the end of the stop are each reported as one event.
+    for line in [
+        "under=[true, true, true, true] kept_after_leaving=true",
+        "kept_after_entering=true",
+        "Resized { columns: 100, rows: 30 } calls=[1, 0, 0, 0]",
+        "continued calls=[1, 1, 0, 0]",
+        "Resized { columns: 100, rows: 30 } calls=[1, 1, 1, 0] kept_after_stopping=true",
+        "kept_at_the_end=true restored=true",
+    ] {
+        assert!(report.contains(line), "missing {line:?} in:\n{report}");
+    }
+    assert!(same_mode(&before, &terminal.mode()));
+}
+
+#[test]
+fn a_terminating_signal_through_a_librarys_handler_still_puts_the_terminal_back() {
+    let mut terminal = Terminal::open(80, 24);
+    let before = terminal.mode();
+    let mut child = terminal.run("layered-terminated");
+    terminal.wait_for(&mut child, b"<resize>");
+    terminal.resize(100, 30);
+    terminal.wait_for(&mut child, b"<ready>");
+    assert!(!same_mode(&before, &terminal.mode()));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let (status, report) = terminal.finish_with_status(child);
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{report}");
     assert!(same_mode(&before, &terminal.mode()));
 }
 
