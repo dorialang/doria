@@ -19059,13 +19059,16 @@ impl<'program> Checker<'program> {
         match spelling.target {
             StringSpellingTarget::Companion(member) => {
                 // Replacing the name alone is correct only when the call's
-                // arguments already fit the companion operation.
-                let fits = self
-                    .string_companion_signature(member)
-                    .is_some_and(|(params, _)| {
-                        let required = params.iter().filter(|param| !param.has_default).count();
-                        (required..=params.len()).contains(&args.len())
-                    });
+                // arguments already fit the companion operation. A named
+                // argument uses the foreign function's parameter name, which
+                // the companion does not declare, so it never fits.
+                let fits = args.iter().all(|argument| argument.name.is_none())
+                    && self
+                        .string_companion_signature(member)
+                        .is_some_and(|(params, _)| {
+                            let required = params.iter().filter(|param| !param.has_default).count();
+                            (required..=params.len()).contains(&args.len())
+                        });
                 if spelling.same_argument_order && spelling.alternative.is_none() && fits {
                     diagnostic = diagnostic.with_fix(
                         Span::new(span.start, span.start + name.len()),

@@ -269,6 +269,12 @@ fn foreign_string_spellings_offer_a_rename_only_when_the_arguments_fit() {
             r#"function main(): void { substr("abc", 1); }"#,
             Some("String::slice"),
         ),
+        // A named argument carries PHP's parameter name, which the
+        // companion operation does not declare.
+        (
+            r#"function main(): void { strtolower(string: "A"); }"#,
+            None,
+        ),
         // PHP's second argument, the characters to strip, has no place in
         // `String::trim`.
         (r#"function main(): void { trim(" a ", " "); }"#, None),
