@@ -297,6 +297,106 @@ if (!str_contains($plan, 'Decision 0103 Completeness Review — Implemented')) {
     fail($failures, 'the completed Decision 0103 completeness review is missing');
 }
 
+// The compiler's foreign-spelling table (crates/doriac/src/builtins.rs) is
+// what diagnostics and the migration command teach. It must agree with this
+// inventory in both directions.
+$spellingTablePath = $root . '/crates/doriac/src/builtins.rs';
+$spellingTableSource = (string) file_get_contents($spellingTablePath);
+$spellingTable = [];
+// Rows whose Doria spelling is accepted but not executable yet.
+$pendingStringSpellings = [];
+if (preg_match('/pub const FOREIGN_STRING_SPELLINGS[^=]*=\s*&\[(.*?)\n\];/s', $spellingTableSource, $spellingTableMatch) !== 1) {
+    fail($failures, 'crates/doriac/src/builtins.rs does not define FOREIGN_STRING_SPELLINGS as a `&[ ... ];` table');
+} else {
+    $spellingTableBody = $spellingTableMatch[1];
+    preg_match_all('/\bcompanion\(\s*"([^"]+)",\s*"([^"]+)",/', $spellingTableBody, $spellingRows, PREG_SET_ORDER);
+    foreach ($spellingRows as $spellingRow) {
+        $spellingTable[$spellingRow[1]] = ['String::' . $spellingRow[2]];
+    }
+    preg_match_all('/\bpadding\(\s*"([^"]+)"\s*\)/', $spellingTableBody, $spellingRows, PREG_SET_ORDER);
+    foreach ($spellingRows as $spellingRow) {
+        $spellingTable[$spellingRow[1]] = ['String::padEnd', 'String::padStart'];
+    }
+    preg_match_all(
+        '/foreign:\s*"([^"]+)",\s*target:\s*StringSpellingTarget::(Property|PendingComparison|Companion)\("([^"]+)"\)/',
+        $spellingTableBody,
+        $spellingRows,
+        PREG_SET_ORDER,
+    );
+    foreach ($spellingRows as $spellingRow) {
+        $spellingTable[$spellingRow[1]] = [
+            ($spellingRow[2] === 'Property' ? '$text->' : 'String::') . $spellingRow[3],
+        ];
+        if ($spellingRow[2] === 'PendingComparison') {
+            $pendingStringSpellings[$spellingRow[1]] = true;
+        }
+    }
+    $spellingForeignCount = preg_match_all('/(?:\bcompanion\(|\bpadding\(|foreign:)\s*"/', $spellingTableBody);
+    if ($spellingForeignCount !== count($spellingTable)) {
+        fail(
+            $failures,
+            "FOREIGN_STRING_SPELLINGS has {$spellingForeignCount} rows but " . count($spellingTable)
+                . ' could be read; a row is written in a form this check does not parse, or a name is listed twice',
+        );
+    }
+}
+
+// Earlier Doria spellings in the table. They were never PHP functions, so the
+// PHP inventory has no row for them.
+$removedDoriaStringSpellings = ['str_case_compare'];
+
+$inventorySpellings = [];
+foreach ($entries as $row) {
+    if (is_array($row) && is_string($row['phpName'] ?? null) && is_string($row['doriaCanonicalSpelling'] ?? null)) {
+        $inventorySpellings[$row['phpName']] = $row['doriaCanonicalSpelling'];
+    }
+}
+
+$taughtSpellings = [];
+foreach ($spellingTable as $foreign => $targets) {
+    if (!isset($pendingStringSpellings[$foreign])) {
+        foreach ($targets as $target) {
+            $taughtSpellings[$target] = true;
+        }
+    }
+    if (in_array($foreign, $removedDoriaStringSpellings, true)) {
+        continue;
+    }
+    if (!isset($inventorySpellings[$foreign])) {
+        fail($failures, "FOREIGN_STRING_SPELLINGS teaches `{$foreign}`, which has no Doria spelling in the PHP string inventory; add or correct its inventory row");
+        continue;
+    }
+    foreach ($targets as $target) {
+        if (!str_contains($inventorySpellings[$foreign], $target)) {
+            fail(
+                $failures,
+                "FOREIGN_STRING_SPELLINGS maps `{$foreign}` to `{$target}`, but the inventory says `{$inventorySpellings[$foreign]}`; make the two agree",
+            );
+        }
+    }
+}
+
+// A PHP function whose inventory spelling is an executable one the compiler
+// already teaches for another function must be taught too. Spellings that are
+// accepted but not executable yet are not suggested for PHP names.
+foreach ($inventorySpellings as $phpName => $canonical) {
+    if (isset($spellingTable[$phpName])) {
+        continue;
+    }
+    if (preg_match('/^(?:String::\w+|\$text->\w+)(?: or String::\w+)?$/', $canonical) !== 1) {
+        continue;
+    }
+    foreach (explode(' or ', $canonical) as $target) {
+        if (isset($taughtSpellings[$target])) {
+            fail(
+                $failures,
+                "the inventory maps `{$phpName}` to `{$canonical}`, which the compiler teaches for other functions; add `{$phpName}` to FOREIGN_STRING_SPELLINGS in crates/doriac/src/builtins.rs",
+            );
+            break;
+        }
+    }
+}
+
 if ($failures !== []) {
     fwrite(STDERR, "string API completeness check failed:\n");
     foreach ($failures as $failure) {

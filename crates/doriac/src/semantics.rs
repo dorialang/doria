@@ -48,7 +48,10 @@ use crate::attributes::{
     AttributeClassIdentity, AttributeClassSchema, AttributeSchemaParameter, AttributeSemanticInfo,
     AttributeTarget,
 };
-use crate::builtins::{is_reserved_intrinsic_name, php_function_suggestion, Builtin};
+use crate::builtins::{
+    foreign_string_spelling, is_reserved_intrinsic_name, php_function_suggestion, Builtin,
+    ForeignStringSpelling, StringSpellingTarget,
+};
 use crate::class_layout::{ClassId, PropertyId};
 use crate::collection_diagnostics::{
     self, ArgumentShape, CollectionMemberKind, CollectionReceiver, ImplementationStatus,
@@ -18332,59 +18335,8 @@ impl<'program> Checker<'program> {
         }
 
         let Some(function_info) = self.functions.get(name).cloned() else {
-            if let Some((replacement, executable, direct_replacement)) = match name {
-                "str_starts_with" => Some((
-                    "String::startsWith($text, $prefix)",
-                    true,
-                    Some("String::startsWith"),
-                )),
-                "str_ends_with" => Some((
-                    "String::endsWith($text, $suffix)",
-                    true,
-                    Some("String::endsWith"),
-                )),
-                "str_contains" => Some((
-                    "String::contains($text, $needle)",
-                    true,
-                    Some("String::contains"),
-                )),
-                "str_case_compare" => {
-                    Some(("String::compareIgnoreCase($left, $right)", false, None))
-                }
-                "explode" => Some(("String::split($text, $separator)", true, None)),
-                "implode" => Some((
-                    "String::join($separator, $values)",
-                    true,
-                    Some("String::join"),
-                )),
-                "substr" => Some((
-                    "String::slice($text, $start, $length)",
-                    true,
-                    Some("String::slice"),
-                )),
-                _ => None,
-            } {
-                let mut diagnostic = Diagnostic::new(
-                    "E0461",
-                    format!("`{name}` is not a Doria string operation"),
-                    span,
-                )
-                .with_title("Use The String Companion")
-                .with_primary_label("Removed Or Foreign String Spelling")
-                .with_explanation(
-                    "Doria keeps string-specific operations on the `String` companion and has no public `str_*` family.",
-                )
-                .with_help(format!("write `{replacement}`"));
-                if !executable {
-                    diagnostic = diagnostic.with_help(
-                        "`String::compareIgnoreCase` is accepted but remains pending until `Ordering` is executable; use `String::equalsIgnoreCase` for equality",
-                    );
-                } else if let Some(direct_replacement) = direct_replacement {
-                    diagnostic = diagnostic.with_fix(
-                        Span::new(span.start, span.start + name.len()),
-                        direct_replacement,
-                    );
-                }
+            if let Some(spelling) = foreign_string_spelling(name) {
+                let diagnostic = self.foreign_string_spelling_diagnostic(spelling, args, span);
                 self.diagnostics.push(diagnostic);
                 return;
             }
@@ -18951,6 +18903,96 @@ impl<'program> Checker<'program> {
                 .expect("checked instance call has a selected target")
                 .clone();
             self.record_selected_contract_effects(&target, &method_info, span);
+        }
+    }
+
+    /// The error for a call to a foreign string function: it names the Doria
+    /// spelling, written out with the companion's own parameter names.
+    fn foreign_string_spelling_diagnostic(
+        &mut self,
+        spelling: &ForeignStringSpelling,
+        args: &[Argument],
+        span: Span,
+    ) -> Diagnostic {
+        let name = spelling.foreign;
+        let is_property = matches!(spelling.target, StringSpellingTarget::Property(_));
+        let (title, explanation) = if is_property {
+            (
+                "Use The String Property",
+                "Doria exposes a string's measurements as properties and has no public `str_*` family.",
+            )
+        } else {
+            (
+                "Use The String Companion",
+                "Doria keeps string-specific operations on the `String` companion and has no public `str_*` family.",
+            )
+        };
+        let mut diagnostic = Diagnostic::new(
+            "E0461",
+            format!("`{name}` is not a Doria string operation"),
+            span,
+        )
+        .with_title(title)
+        .with_primary_label("Removed Or Foreign String Spelling")
+        .with_explanation(explanation)
+        .with_help(format!(
+            "write `{}`",
+            self.string_spelling_text(spelling.target)
+        ));
+        if let Some((alternative, when)) = spelling.alternative {
+            diagnostic = diagnostic.with_help(format!(
+                "use `{}` {when}",
+                self.string_spelling_text(alternative)
+            ));
+        }
+        match spelling.target {
+            StringSpellingTarget::Companion(member) => {
+                // Replacing the name alone is correct only when the call's
+                // arguments already fit the companion operation.
+                let fits = self
+                    .string_companion_signature(member)
+                    .is_some_and(|(params, _)| {
+                        let required = params.iter().filter(|param| !param.has_default).count();
+                        (required..=params.len()).contains(&args.len())
+                    });
+                if spelling.same_argument_order && spelling.alternative.is_none() && fits {
+                    diagnostic = diagnostic.with_fix(
+                        Span::new(span.start, span.start + name.len()),
+                        format!("String::{member}"),
+                    );
+                }
+            }
+            StringSpellingTarget::PendingComparison(_) => {
+                diagnostic = diagnostic.with_help(
+                    "`String::compareIgnoreCase` is accepted but remains pending until `Ordering` is executable; use `String::equalsIgnoreCase` for equality",
+                );
+            }
+            StringSpellingTarget::Property(_) => {}
+        }
+        diagnostic
+    }
+
+    /// A Doria string spelling as source text with placeholder arguments,
+    /// such as `String::padEnd($text, $length, $padding)` or `$text->length`.
+    fn string_spelling_text(&mut self, target: StringSpellingTarget) -> String {
+        match target {
+            StringSpellingTarget::Companion(member) => {
+                let parameters = self
+                    .string_companion_signature(member)
+                    .map(|(params, _)| {
+                        params
+                            .iter()
+                            .map(|param| format!("${}", param.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                format!("String::{member}({parameters})")
+            }
+            StringSpellingTarget::PendingComparison(member) => {
+                format!("String::{member}($left, $right)")
+            }
+            StringSpellingTarget::Property(property) => format!("$text->{property}"),
         }
     }
 
