@@ -346,11 +346,20 @@ if (preg_match('/pub const FOREIGN_STRING_SPELLINGS[^=]*=\s*&\[(.*?)\n\];/s', $s
 $removedDoriaStringSpellings = ['str_case_compare'];
 
 $inventorySpellings = [];
+$inventoryStatuses = [];
 foreach ($entries as $row) {
     if (is_array($row) && is_string($row['phpName'] ?? null) && is_string($row['doriaCanonicalSpelling'] ?? null)) {
         $inventorySpellings[$row['phpName']] = $row['doriaCanonicalSpelling'];
+        $inventoryStatuses[$row['phpName']] = $row['doriaStatus'] ?? null;
     }
 }
+
+// The entry rows keep the 2026-07-30 audit classification, and
+// reviewResolution is the approval overlay on top of them. A spelling is
+// accepted when its row says so or the overlay approves the operation. The
+// compiler may teach only accepted spellings, so a row it teaches for must
+// resolve to accepted through one of the two.
+$overlayApprovedOperations = is_array($approvedStringOperations) ? $approvedStringOperations : [];
 
 $taughtSpellings = [];
 foreach ($spellingTable as $foreign => $targets) {
@@ -371,6 +380,19 @@ foreach ($spellingTable as $foreign => $targets) {
             fail(
                 $failures,
                 "FOREIGN_STRING_SPELLINGS maps `{$foreign}` to `{$target}`, but the inventory says `{$inventorySpellings[$foreign]}`; make the two agree",
+            );
+        }
+        if (
+            !isset($pendingStringSpellings[$foreign])
+            && ($inventoryStatuses[$foreign] ?? null) !== 'accepted-current'
+            && !in_array($target, $overlayApprovedOperations, true)
+        ) {
+            fail(
+                $failures,
+                "FOREIGN_STRING_SPELLINGS teaches `{$target}` for `{$foreign}`, but the inventory row is `"
+                    . ($inventoryStatuses[$foreign] ?? 'missing')
+                    . "` and reviewResolution.approvedCanonicalStringOperations does not list `{$target}`; "
+                    . 'record the approval there, or remove the row from the compiler table',
             );
         }
     }
