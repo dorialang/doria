@@ -1141,8 +1141,11 @@ function display(?Label $label): string
 
 `$left ?? $fallback` evaluates the left operand once and evaluates the fallback
 only when the left value is null. The left operand must be able to be null: `??`
-after a value that is never null, such as an index read, is rejected (E0782,
-Decision 0144). `$list->get($index) ?? $fallback` is the safe indexed read. `$receiver?->member` evaluates the receiver
+after a value whose type is not nullable, such as an index read of a
+`List<string>`, is rejected (E0782, Decision 0144).
+`$list->get($index) ?? $fallback` is the safe indexed read. An index read of a
+`List<?T>` has a nullable type and may be coalesced; it still panics when the
+index is out of range. `$receiver?->member` evaluates the receiver
 once and skips the access, method body, and arguments when it is null. A
 value-producing null-safe access produces a nullable result; an already-nullable
 member result is not wrapped in another nullable layer.

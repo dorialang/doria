@@ -23,7 +23,7 @@ Andrew ruled both on 2026-11-13.
 A `??` whose left operand can never be null is a compile-time error, E0782, "Null-Coalescing Operand Is Never Null".
 
 - A binding counts by its declared type. A `?T` or `mixed` binding that flow analysis has narrowed to `T` may still be coalesced; the check is redundant and valid, as Decision 0093's narrowing already allows for `== null`.
-- Any other operand counts by the type of the expression. An index read, a call, or a property of type `T` is never null.
+- Any other operand counts by the type of the expression. An index read, a call, or a property whose type is a non-nullable `T` is never null. An index read of a `List<?T>` has type `?T` and may be coalesced.
 - `null ?? $fallback` stays valid. A bare `mixed` operand keeps its existing mixed-operation error.
 
 The error names the fix. After an index read it says to read the element with `get`; otherwise it says to remove `??` and its fallback or make the operand nullable.
