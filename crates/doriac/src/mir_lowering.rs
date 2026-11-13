@@ -14646,7 +14646,12 @@ fn string_intrinsic_signature(
         Kind::PadStart | Kind::PadEnd => (
             vec![string, int, string],
             vec!["text", "length", "padding"],
-            vec![None, None, None],
+            // Padding defaults to one space (Decision 0103).
+            vec![
+                None,
+                None,
+                Some(crate::const_eval::ConstValue::String(" ".to_string())),
+            ],
             string,
         ),
         Kind::FromBytes => (

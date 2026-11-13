@@ -19081,7 +19081,7 @@ impl<'program> Checker<'program> {
                 vec![
                     required("text", string),
                     required("length", int),
-                    required("padding", string),
+                    optional("padding", string),
                 ],
                 string,
             ),

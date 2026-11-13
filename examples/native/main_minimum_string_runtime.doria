@@ -27,6 +27,8 @@ function main(): void
 
     echo String::slice("a👍🏾bc", 1, 2) . "\n";
     echo String::padEnd("Doria", 8, ".") . "\n";
+    echo "[" . String::padEnd("Doria", 8) . "]\n";
+    echo "[" . String::padStart("Doria", 8) . "]\n";
 
     let $bytes = "Doria"->bytes;
     echo String::fromBytes($bytes) ?? "invalid";
