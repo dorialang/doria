@@ -169,6 +169,8 @@ impl Checker<'_> {
                                 writable: parameter.writable,
                                 borrow: false,
                                 has_default: parameter.has_default,
+                                default: parameter.default.clone(),
+                                declaration: parameter.declaration,
                             })
                             .collect(),
                         return_type: self.types.resolved(signature.return_ty),
@@ -265,7 +267,7 @@ impl Checker<'_> {
                             generic_parameter_count: method.type_params.len(),
                             parameters: method.params.iter().enumerate().map(|(index, parameter)| CallableParameterSemanticInfo {
                                 name: parameter.name.clone(), r#type: self.types.resolved(parameter.ty), take: parameter.take,
-                                writable: parameter.writable, has_default: parameter.has_default,
+                                writable: parameter.writable, has_default: parameter.has_default, default: parameter.default.clone(), declaration: parameter.declaration,
                                 borrow: matches!(&syntax, Some(ClassMember::Method(method)) if method.params.get(index).is_some_and(|parameter| parameter.borrow_span.is_some())),
                             }).collect(), return_type: self.types.resolved(method.return_ty),
                         });
@@ -373,6 +375,8 @@ impl Checker<'_> {
                         writable: parameter.writable,
                         borrow: false,
                         has_default: parameter.has_default,
+                        default: parameter.default.clone(),
+                        declaration: parameter.declaration,
                     })
                     .collect(),
                 return_type: self.types.resolved(method.return_ty),

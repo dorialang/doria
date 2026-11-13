@@ -1961,6 +1961,8 @@ impl Checker<'_> {
                         writable: parameter.writable,
                         borrow: false,
                         has_default: false,
+                        default: None,
+                        declaration: None,
                     })
                     .collect(),
                 return_type: self.types.resolved(method.return_ty),

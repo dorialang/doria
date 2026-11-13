@@ -467,6 +467,12 @@ pub struct CallableParameterSemanticInfo {
     pub writable: bool,
     pub borrow: bool,
     pub has_default: bool,
+    /// The default as authored, on one line, so tooling can show
+    /// `int $width = 120` for a declaration in any source of the graph.
+    pub default: Option<String>,
+    /// The authored parameter, the key of its `constructor_parameters` role;
+    /// absent for compiler-supplied parameters.
+    pub declaration: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,6 +840,18 @@ impl ClassSemanticInfo {
     pub fn implements(&self, interface: BuiltinInterface) -> bool {
         self.builtin_interfaces.contains(&interface)
     }
+}
+
+/// Authored source for a one-line signature. A line break and the indentation
+/// around it become one space; spacing within a line is kept as written.
+fn single_line_source(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim);
+    let mut single = lines.next().unwrap_or_default().to_string();
+    for line in lines.filter(|line| !line.is_empty()) {
+        single.push(' ');
+        single.push_str(line);
+    }
+    single
 }
 
 fn contains_comment(text: &str) -> bool {
@@ -1445,6 +1463,8 @@ fn finish_checked_analysis(
                             writable: parameter.writable,
                             borrow: retained_parameters.contains(&(*span, index)),
                             has_default: parameter.has_default,
+                            default: parameter.default.clone(),
+                            declaration: parameter.declaration,
                         })
                         .collect(),
                     return_type: checker.types.resolved(signature.return_ty),
@@ -5714,12 +5734,14 @@ impl<'program> Checker<'program> {
             method.virtual_root = Some(virtual_root);
             for (parameter, inherited) in method.params.iter_mut().zip(inherited_params) {
                 parameter.has_default = inherited.has_default;
+                parameter.default.clone_from(&inherited.default);
             }
         }
 
         if let Some(signature) = self.function_signatures.get_mut(&declaration) {
             for (parameter, inherited) in signature.params.iter_mut().zip(inherited_params) {
                 parameter.has_default = inherited.has_default;
+                parameter.default.clone_from(&inherited.default);
             }
         }
         self.override_roots.insert(declaration, virtual_root);
@@ -8126,12 +8148,18 @@ impl<'program> Checker<'program> {
                 saw_optional = true;
             }
 
+            let default = param
+                .default_span
+                .and_then(|span| self.source_slice(span))
+                .map(single_line_source);
             params.push(ParamInfo {
                 name: param.name.clone(),
                 ty,
                 take: param.take,
                 writable: param.writable,
                 has_default,
+                default,
+                declaration: Some(param.span),
             });
         }
 
@@ -19093,6 +19121,8 @@ impl<'program> Checker<'program> {
             take: false,
             writable: false,
             has_default: false,
+            default: None,
+            declaration: None,
         };
         let optional = |name: &str, ty| ParamInfo {
             name: name.to_string(),
@@ -19100,6 +19130,8 @@ impl<'program> Checker<'program> {
             take: false,
             writable: false,
             has_default: true,
+            default: None,
+            declaration: None,
         };
         let signature = match method {
             "trim" | "trimStart" | "trimEnd" | "lower" | "upper" | "lowerFirst" | "upperFirst" => {
@@ -19903,6 +19935,8 @@ impl<'program> Checker<'program> {
                     take: self.type_is_move_type(field.ty),
                     writable: false,
                     has_default: false,
+                    default: None,
+                    declaration: None,
                 })
                 .collect::<Vec<_>>();
             if !definition.type_params.is_empty() {
@@ -20748,6 +20782,8 @@ impl<'program> Checker<'program> {
             take: param.take,
             writable: param.writable,
             has_default: param.has_default,
+            default: param.default.clone(),
+            declaration: param.declaration,
         }
     }
 
@@ -24280,6 +24316,8 @@ impl<'program> Checker<'program> {
                 take: true,
                 writable: false,
                 has_default: false,
+                default: None,
+                declaration: None,
             }],
             args,
             span,
