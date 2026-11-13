@@ -848,6 +848,7 @@ Authored subjects cite their actual record numbers:
 - Decision 0131: constructor property overrides and constructor-only parameters — default/internal constructor promotion remains; `override` reuses one exact inherited external property without a child field, store, or drop; `parameter` creates a constructor-only callable input; parent construction stays explicit and E0727 continues to reject actual hiding. The Post-Stage-34 Constructor Parameter Roles Corrective Beat is complete.
 
 - Decision 0139: accepted conditional nominal capabilities · local constrained-member clauses and coherence contract
+- Decision 0143: `for` initializer accepts every local declaration form a statement accepts
 
 Subjects awaiting decision records are deliberately unnumbered:
 

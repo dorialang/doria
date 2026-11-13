@@ -2949,38 +2949,10 @@ impl Parser {
             return self.parse_pre_increment_statement();
         }
 
-        if self.can_start_typed_decl() {
-            let checkpoint = self.checkpoint();
-            let start = self.peek().span.start;
-            let writable = self.match_kind(&TokenKind::Writable);
-            if let Some(ty) = self.parse_type_ref() {
-                if let Some((name, name_span)) = self.consume_variable() {
-                    let bindings = self.parse_local_bindings(name, name_span)?;
-                    self.expect(TokenKind::Equals, "expected `=` in variable declaration")?;
-                    let initializer = self.parse_expression()?;
-                    if self.reject_disallowed_finally() {
-                        return None;
-                    }
-                    if self.reject_additional_group_initializer() {
-                        return None;
-                    }
-                    let end = self
-                        .expect(
-                            TokenKind::Semicolon,
-                            "expected `;` after variable declaration",
-                        )?
-                        .span
-                        .end;
-                    return Some(Stmt::VarDecl(VarDecl {
-                        writable,
-                        ty: Some(ty),
-                        bindings,
-                        initializer,
-                        span: self.span(start, end),
-                    }));
-                }
-            }
-            self.restore_checkpoint(checkpoint);
+        if let Some(declaration) =
+            self.parse_typed_var_decl("expected `;` after variable declaration")?
+        {
+            return Some(Stmt::VarDecl(declaration));
         }
 
         self.parse_expression_statement()
@@ -3110,8 +3082,62 @@ impl Parser {
     ) -> Option<VarDecl> {
         let writable = self.match_kind(&TokenKind::Writable);
         let (name, name_span) = self.expect_variable("expected variable name after `let`")?;
+        self.parse_var_decl_after_first_name(
+            start,
+            writable,
+            None,
+            (name, name_span),
+            "expected `=` in let declaration",
+            semicolon_message,
+        )
+    }
+
+    /// Parses a typed local declaration, `[writable] Type $name = value;`.
+    ///
+    /// A statement and a `for` initializer accept the same local declarations,
+    /// so both call this and `parse_let_var_decl_after_let`.
+    ///
+    /// `Some(None)` means the tokens ahead are not a typed declaration: nothing
+    /// was consumed and the caller parses something else. `None` means a typed
+    /// declaration began and is malformed; its diagnostic is recorded.
+    fn parse_typed_var_decl(&mut self, semicolon_message: &str) -> Option<Option<VarDecl>> {
+        if !self.can_start_typed_decl() {
+            return Some(None);
+        }
+        let checkpoint = self.checkpoint();
+        let start = self.peek().span.start;
+        let writable = self.match_kind(&TokenKind::Writable);
+        if let Some(ty) = self.parse_type_ref() {
+            if let Some(first_name) = self.consume_variable() {
+                return self
+                    .parse_var_decl_after_first_name(
+                        start,
+                        writable,
+                        Some(ty),
+                        first_name,
+                        "expected `=` in variable declaration",
+                        semicolon_message,
+                    )
+                    .map(Some);
+            }
+        }
+        self.restore_checkpoint(checkpoint);
+        Some(None)
+    }
+
+    /// Parses the rest of a local declaration once its first variable is read:
+    /// any further grouped bindings, `=`, the initializer and the closing `;`.
+    fn parse_var_decl_after_first_name(
+        &mut self,
+        start: usize,
+        writable: bool,
+        ty: Option<TypeRef>,
+        (name, name_span): (String, Span),
+        equals_message: &str,
+        semicolon_message: &str,
+    ) -> Option<VarDecl> {
         let bindings = self.parse_local_bindings(name, name_span)?;
-        self.expect(TokenKind::Equals, "expected `=` in let declaration")?;
+        self.expect(TokenKind::Equals, equals_message)?;
         let initializer = self.parse_expression()?;
         if self.reject_disallowed_finally() {
             return None;
@@ -3126,7 +3152,7 @@ impl Parser {
 
         Some(VarDecl {
             writable,
-            ty: None,
+            ty,
             bindings,
             initializer,
             span: self.span(start, end),
@@ -3485,11 +3511,15 @@ impl Parser {
                 start,
                 "expected `;` after for initializer",
             )?))
+        } else if let Some(declaration) =
+            self.parse_typed_var_decl("expected `;` after for initializer")?
+        {
+            Some(ForInitializer::VarDecl(declaration))
         } else {
             let target = self.parse_expression()?;
             let Some(op) = self.parse_assignment_op() else {
                 self.error(
-                    "expected assignment or `let` declaration in for initializer",
+                    "expected a local declaration or an assignment in for initializer",
                     target.span(),
                 );
                 return None;

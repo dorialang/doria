@@ -1,0 +1,12 @@
+function main(): int
+{
+    writable int $sum = 0;
+
+    for (writable int $row = 0; $row < 6; $row++) {
+        for (writable int $column = 0; $column < 7; $column++) {
+            $sum += 1;
+        }
+    }
+
+    return $sum;
+}

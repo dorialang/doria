@@ -262,6 +262,14 @@ for (let writable $i = 0; $i < 10; $i++) {
 }
 ```
 
+The initializer accepts every local declaration form a statement accepts, including the typed and grouped forms, or an assignment (Decision 0143):
+
+```doria
+for (writable int $row = 0; $row < 10; $row++) {
+    echo $row;
+}
+```
+
 `foreach` is preferred for collections and ranges. Integer ranges use `..` for inclusive ranges and `..<` for exclusive-end ranges:
 
 ```doria
