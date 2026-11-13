@@ -849,6 +849,7 @@ Authored subjects cite their actual record numbers:
 
 - Decision 0139: accepted conditional nominal capabilities · local constrained-member clauses and coherence contract
 - Decision 0143: `for` initializer accepts every local declaration form a statement accepts
+- Decision 0144: `??` requires a left operand that can be null · `get(int $index): ?T` on `List<T>` and `T[]`
 
 Subjects awaiting decision records are deliberately unnumbered:
 

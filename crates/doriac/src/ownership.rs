@@ -10023,6 +10023,10 @@ impl Checker<'_> {
                                 (collection.family, method.as_str()),
                                 (CollectionFamily::List, "removeAt" | "pop")
                                     | (CollectionFamily::Dictionary, "get" | "remove")
+                                    | (
+                                        CollectionFamily::List | CollectionFamily::TypedArray,
+                                        "get"
+                                    )
                             )
                             .then_some(collection.value_class)
                             .flatten()

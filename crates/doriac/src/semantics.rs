@@ -7938,7 +7938,10 @@ impl<'program> Checker<'program> {
                 }
                 if matches!(
                     (self.types.kind(object_ty), method.as_str()),
-                    (TypeKind::Dictionary(_, _), "get")
+                    (
+                        TypeKind::Dictionary(_, _) | TypeKind::List(_) | TypeKind::TypedArray(_),
+                        "get"
+                    )
                 ) {
                     return ReturnBorrowLookup::Resolved(Some(ReturnBorrow {
                         source: BorrowSource::Receiver,
@@ -16489,6 +16492,7 @@ impl<'program> Checker<'program> {
                 self.check_relational_operand_types(left_ty, right_ty, span);
             }
             BinaryOp::Coalesce => {
+                self.check_coalesce_left_can_be_null(left, scopes, method_context);
                 let result = self.infer_binary_type(left, op, right, scopes, method_context);
                 if matches!(self.types.kind(result), TypeKind::Heterogeneous) {
                     let left_ty = self.infer_expr_type(left, scopes, method_context);
@@ -16508,6 +16512,85 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    /// `??` needs a left operand that can be null (Decision 0144).
+    ///
+    /// A binding counts by its declared type, so a nullable binding that flow
+    /// has narrowed may still be coalesced. Anything else counts by the type
+    /// of the expression: an index read, a call or a property of type `T` is
+    /// never null, and its fallback could never run.
+    fn check_coalesce_left_can_be_null(
+        &mut self,
+        left: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if self.expr_declares_nullable(left, scopes, method_context) {
+            return;
+        }
+        let mut operand = left;
+        while let Expr::Grouped { expr, .. } = operand {
+            operand = expr;
+        }
+        // A `mixed` binding may hold null whatever flow has narrowed it to.
+        if let Expr::Variable { name, .. } = operand {
+            if let Some(declared) = scopes.lookup(name).map(|binding| binding.declared_ty) {
+                if self.type_contains_mixed(declared) {
+                    return;
+                }
+            }
+        }
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        // `null ?? x` is its fallback, an unresolved operand already has its
+        // own error, and a bare `mixed` operand is reported as a mixed
+        // operation.
+        if matches!(
+            self.types.kind(left_ty),
+            TypeKind::Null | TypeKind::Unknown | TypeKind::Heterogeneous
+        ) || self.type_contains_mixed(left_ty)
+        {
+            return;
+        }
+
+        let indexed = match operand {
+            Expr::Index { collection, .. } => {
+                let collection_ty = self.infer_expr_type(collection, scopes, method_context);
+                match self.types.kind(collection_ty) {
+                    TypeKind::List(_) | TypeKind::TypedArray(_) => {
+                        Some("`$sequence->get($index) ?? $fallback`")
+                    }
+                    TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _) => {
+                        Some("`$dictionary->get($key) ?? $fallback`")
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let ty = self.types.display(left_ty);
+        let diagnostic = Diagnostic::new(
+            "E0782",
+            format!("the left operand of `??` has type `{ty}` and is never null"),
+            left.span(),
+        )
+        .with_title("Null-Coalescing Operand Is Never Null")
+        .with_primary_label("Never Null");
+        let diagnostic = match indexed {
+            Some(safe_read) => diagnostic
+                .with_explanation(
+                    "An index read asserts that the element is present and panics when it is missing, so `??` cannot supply a fallback for it.",
+                )
+                .with_help(format!(
+                    "to fall back when the element is missing, read it with `get`: {safe_read}"
+                )),
+            None => diagnostic
+                .with_explanation(
+                    "`??` uses its right operand only when the left operand is null, and this operand cannot be null.",
+                )
+                .with_help("remove `??` and its fallback, or make the left operand nullable"),
+        };
+        self.diagnostics.push(diagnostic);
     }
 
     fn check_numeric_binary_operands(
@@ -24400,6 +24483,11 @@ impl<'program> Checker<'program> {
             (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "get") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
+            // The safe indexed read of a sequence: null when the index is out
+            // of range, where `$sequence[$index]` panics.
+            (TypeKind::List(value) | TypeKind::TypedArray(value), "get") => {
+                Some(self.types.intern(TypeKind::Nullable(value)))
+            }
             (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "remove") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
@@ -25021,6 +25109,7 @@ impl<'program> Checker<'program> {
             (TypeKind::List(value), "insertAt") => (vec![int, value], true),
             (TypeKind::List(_), "removeAt") => (vec![int], true),
             (TypeKind::List(_), "pop") => (vec![], true),
+            (TypeKind::List(_) | TypeKind::TypedArray(_), "get") => (vec![int], false),
             (TypeKind::List(value), "contains") => (vec![value], false),
             (TypeKind::List(value), "indexOf") => (vec![value], false),
             (TypeKind::List(value), "remove") => (vec![value], true),

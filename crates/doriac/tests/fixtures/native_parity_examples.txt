@@ -419,6 +419,7 @@ examples/native/main_readiness_set_construction.doria
 examples/native/main_readiness_membership.doria
 examples/native/main_readiness_access.doria
 examples/native/main_read_transfer_plan.doria
+examples/native/main_sequence_get.doria
 examples/native/main_write_transfer_plan.doria
 examples/native/main_stream_seek.doria
 examples/native/main_stream_synchronize.doria
