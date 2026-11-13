@@ -711,7 +711,7 @@ pub(super) unsafe fn await_event(
                     fill(&mut raw.queue)?;
                 }
             }
-            TerminalWake::TimedOut => expired = raw.queue.caller_expired()?,
+            TerminalWake::TimedOut => expired = budget.has_ended(crate::monotonic_clock::now)?,
             TerminalWake::Cancelled => return Ok(Observation::Cancelled),
         }
     }
