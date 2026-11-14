@@ -270,9 +270,9 @@ fn foreign_string_spellings_offer_a_rename_only_when_the_arguments_fit() {
             Some("String::slice"),
         ),
         // A named argument carries PHP's parameter name, which the
-        // companion operation does not declare.
+        // companion operation does not declare. The count alone would fit.
         (
-            r#"function main(): void { strtolower(string: "A"); }"#,
+            r#"function main(): void { substr("abc", offset: 1); }"#,
             None,
         ),
         // PHP's second argument, the characters to strip, has no place in
@@ -288,6 +288,14 @@ fn foreign_string_spellings_offer_a_rename_only_when_the_arguments_fit() {
         (r#"function main(): void { str_pad("a", 5); }"#, None),
         (r#"function main(): void { strlen("a"); }"#, None),
     ] {
+        // A case that failed earlier, in the parser for example, would pass
+        // a "no rename" expectation without testing anything.
+        assert!(
+            diagnostics(source)
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0461"),
+            "{source} must reach the string spelling diagnostic"
+        );
         assert_eq!(rename(source).as_deref(), expected, "{source}");
     }
 }
