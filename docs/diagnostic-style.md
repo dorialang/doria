@@ -163,7 +163,8 @@ the code is raised stays specific to the program.
 - A code for a feature the compiler does not have yet says so without reading
   as a rejection: `Availability: planned` when the feature is part of Doria
   for the first full release, `Availability: later` when Doria reserves it
-  for a later one.
+  for a later one. A `later` entry states the reservation as the release's
+  rule, without `today` or `as before`.
 - A code that nothing raises any more is retired, not deleted: it moves to
   `RETIRED_DIAGNOSTIC_CODES` and its number is never reused.
 - A new code arrives with its entry. A code never joins

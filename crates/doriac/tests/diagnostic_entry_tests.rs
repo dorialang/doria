@@ -386,12 +386,23 @@ fn an_entry_for_an_unavailable_feature_says_it_is_part_of_doria() {
                  that this compiler does not implement it yet",
                 entry.code
             ),
-            Availability::Later => assert!(
-                text.contains("reserves") && text.contains("later"),
-                "{}: an entry for a reserved feature must say Doria reserves it for a later \
-                 release",
-                entry.code
-            ),
+            Availability::Later => {
+                assert!(
+                    text.contains("reserves") && text.contains("later"),
+                    "{}: an entry for a reserved feature must say Doria reserves it for a later \
+                     release",
+                    entry.code
+                );
+                // The reservation is the rule of the release the entry documents.
+                for dated in ["today", "as before"] {
+                    assert!(
+                        !text.contains(dated),
+                        "{}: an entry for a reserved feature states the release's rule, so it \
+                         must not date it (`{dated}`)",
+                        entry.code
+                    );
+                }
+            }
         }
         if entry.availability != Availability::Current {
             for rejected in ["is rejected", "not supported", "unsupported", "not allowed"] {
