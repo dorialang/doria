@@ -141,6 +141,27 @@ Shared MIR records adapter frame ownership explicitly; transparent entries retai
 the caller's source site. Closure names use their existing source identity, and
 method names use their nominal declaring class and member, not generated symbols.
 
+## Catalogue entries
+
+Every diagnostic code has a documentation entry in
+`crates/doria-diagnostic-catalogue/entries/<CODE>.md` (Decision 0145). An entry
+is what `doriac explain <code>` prints and what the website shows at the
+diagnostic's link. It documents the code as a whole; the message written where
+the code is raised stays specific to the program.
+
+- The title is Title Case with no closing period. Mark it `Title: fixed` when
+  the compiler raises the code under exactly that title, and `Title: varies`
+  when the compiler's title depends on the program.
+- `## Explanation` says what the code means in one to three short paragraphs.
+- `## Fix` names the concrete change, with real member and keyword names.
+- `## Example` is one small program whose first error is this code and which
+  contains no other mistake.
+- A new code arrives with its entry. A code never joins
+  `entries/WITHOUT_ENTRY.txt`; it only leaves it.
+
+The rules above for diagnostic prose apply to entries: plain Doria vocabulary,
+no compiler internals, no development stages.
+
 ## Review checklist
 
 - The code is catalogued and its default severity/kind are correct.

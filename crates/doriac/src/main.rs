@@ -230,6 +230,7 @@ fn run() -> Result<ExitCode, CliError> {
         "hir" => hir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "mir" => mir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "metadata" => metadata_command(&args[1..]).map(|()| ExitCode::SUCCESS),
+        "explain" => explain_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "compile" => compile_command(&executable, &args[1..]).map(|()| ExitCode::SUCCESS),
         command if command.ends_with(".doria") || Path::new(command).is_file() => Err(format!(
             "unknown command `{command}`\n\n\
@@ -242,6 +243,84 @@ fn run() -> Result<ExitCode, CliError> {
         command => Err(format!("unknown command `{command}`\n\nRun `doriac --help`.").into()),
     }
 }
+
+/// `doriac explain <code>` prints one catalogue entry; `doriac explain --all`
+/// lists the codes that have one. `--format json` writes the versioned
+/// document consumers read.
+fn explain_command(args: &[String]) -> Result<(), CliError> {
+    let mut code = None;
+    let mut all = false;
+    let mut json = false;
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--all" => all = true,
+            "--format" => match arguments.next().map(String::as_str) {
+                Some("json") => json = true,
+                Some("human") => json = false,
+                Some(other) => {
+                    return Err(
+                        format!("unknown explain format `{other}`\n\n{EXPLAIN_USAGE}").into(),
+                    );
+                }
+                None => {
+                    return Err(format!("`--format` needs a value\n\n{EXPLAIN_USAGE}").into());
+                }
+            },
+            option if option.starts_with('-') => {
+                return Err(format!("unknown explain option `{option}`\n\n{EXPLAIN_USAGE}").into());
+            }
+            value if code.is_none() => code = Some(value),
+            value => {
+                return Err(format!(
+                    "`doriac explain` takes one code, and `{value}` is a second\n\n{EXPLAIN_USAGE}"
+                )
+                .into());
+            }
+        }
+    }
+
+    match (code, all) {
+        (Some(_), true) => Err(format!(
+            "`doriac explain` takes a code or `--all`, and both were given\n\n{EXPLAIN_USAGE}"
+        )
+        .into()),
+        (None, false) => Err(format!("`doriac explain` needs a code\n\n{EXPLAIN_USAGE}").into()),
+        (Some(code), false) => {
+            let entry =
+                doriac::diagnostic_entries::lookup(code).map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&doriac::diagnostic_entries::entry_document(
+                        &entry
+                    ))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                print!("{}", doriac::diagnostic_entries::render(&entry));
+            }
+            Ok(())
+        }
+        (None, true) => {
+            if json {
+                let document =
+                    doriac::diagnostic_entries::export().map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&document).map_err(|error| error.to_string())?
+                );
+            } else {
+                let entries =
+                    doriac::diagnostic_entries::all().map_err(|error| error.to_string())?;
+                print!("{}", doriac::diagnostic_entries::render_index(&entries));
+            }
+            Ok(())
+        }
+    }
+}
+
+const EXPLAIN_USAGE: &str = "Usage:\n    doriac explain <code> [--format human|json]\n    doriac explain --all [--format human|json]";
 
 fn version_command(args: &[OsString]) -> Result<ExitCode, String> {
     let args = utf8_cli_arguments(args)?;
@@ -1947,7 +2026,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [--schema-version 1|2|3] [diagnostic options]\n    doriac metadata --build-plan <plan.json> [--schema-version 1|2|3] [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [--schema-version 1|2|3] [diagnostic options]\n    doriac metadata --build-plan <plan.json> [--schema-version 1|2|3] [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n    doriac explain <code> [--format human|json]\n    doriac explain --all [--format human|json]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

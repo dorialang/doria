@@ -1,5 +1,7 @@
 #![no_std]
 
+#[cfg(feature = "explanations")]
+pub mod explanations;
 pub mod source_excerpt;
 
 /// Cancellation remains requested even when a native waiter cannot be notified.

@@ -430,10 +430,7 @@ impl Diagnostic {
                 development_only: metadata.development_only,
                 documentation: Some(DiagnosticDocumentation {
                     slug: code.to_ascii_lowercase(),
-                    url: Some(format!(
-                        "https://dorialang.org/docs/diagnostics/{}",
-                        code.to_ascii_lowercase()
-                    )),
+                    url: Some(documentation_url(code)),
                 }),
                 developer_details: matches!(
                     kind,
@@ -1720,6 +1717,14 @@ pub use doria_diagnostic_catalogue::{
     runtime_entry as runtime_catalogue_entry, RuntimeCatalogueEntry,
     DIAGNOSTIC_CODES as CATALOGUED_CODES, RUNTIME_CATALOGUE,
 };
+/// Where a diagnostic code is documented for readers.
+pub fn documentation_url(code: &str) -> String {
+    format!(
+        "https://dorialang.org/docs/diagnostics/{}",
+        code.to_ascii_lowercase()
+    )
+}
+
 pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
     let runtime = code.starts_with("P1");
     let kind = match code.as_bytes().first().copied() {

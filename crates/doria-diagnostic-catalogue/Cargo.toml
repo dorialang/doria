@@ -8,3 +8,8 @@ repository.workspace = true
 [lib]
 name = "doria_diagnostic_catalogue"
 path = "src/lib.rs"
+
+[features]
+# Per-code documentation entries (Decision 0145). The compiler enables this;
+# the runtime does not, so entry text never rides into a compiled program.
+explanations = []

@@ -18,6 +18,65 @@ fn development_launcher_keeps_bundled_runtime_enabled() {
 }
 
 #[test]
+fn explain_prints_an_entry_lists_the_catalogue_and_names_what_is_wrong() {
+    let entry = Command::new(doriac_bin())
+        .args(["explain", "e0782"])
+        .output()
+        .expect("doriac binary should run");
+    assert_success("explain", entry.clone());
+    let text = String::from_utf8(entry.stdout).expect("explain output should be UTF-8");
+    assert!(
+        text.starts_with("E0782: Null-Coalescing Operand Is Never Null\n\nWhy\n"),
+        "{text}"
+    );
+    for part in [
+        "\nFix\n",
+        "\nExample\n",
+        "https://dorialang.org/docs/diagnostics/e0782",
+    ] {
+        assert!(text.contains(part), "{part:?} missing from {text}");
+    }
+
+    let export = Command::new(doriac_bin())
+        .args(["explain", "--all", "--format", "json"])
+        .output()
+        .expect("doriac binary should run");
+    assert_success("explain --all --format json", export.clone());
+    let document: serde_json::Value =
+        serde_json::from_slice(&export.stdout).expect("the export should be JSON");
+    assert_eq!(document["schemaVersion"], 1);
+    assert!(document["entries"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|entry| entry["code"] == "E0782")));
+    assert!(document["codesWithoutEntry"].is_array());
+
+    for (arguments, expected) in [
+        (
+            vec!["explain", "Z9999"],
+            "`Z9999` is not a Doria diagnostic code",
+        ),
+        (vec!["explain"], "`doriac explain` needs a code"),
+        (vec!["explain", "E0782", "--all"], "takes a code or `--all`"),
+        (
+            vec!["explain", "E0782", "--format", "yaml"],
+            "unknown explain format `yaml`",
+        ),
+    ] {
+        let output = Command::new(doriac_bin())
+            .args(&arguments)
+            .output()
+            .expect("doriac binary should run");
+        assert!(!output.status.success(), "{arguments:?} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("doriac explain"),
+            "{arguments:?} should say what to run: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn version_uses_canonical_toolchain_calver() {
     let output = Command::new(doriac_bin())
         .arg("--version")

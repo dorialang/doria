@@ -41,6 +41,7 @@ pub mod const_eval;
 mod constructor_init;
 pub mod control_flow;
 pub mod dataflow;
+pub mod diagnostic_entries;
 pub mod diagnostics;
 pub mod enums;
 pub mod format_string;
