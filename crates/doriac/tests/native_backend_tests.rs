@@ -413,6 +413,11 @@ fn compiles_and_runs_legacy_native_boundary_examples() {
         ),
         ("main_for_42", "examples/native/main_for_42.doria", 42),
         (
+            "main_for_typed_initializer_42",
+            "examples/native/main_for_typed_initializer_42.doria",
+            42,
+        ),
+        (
             "main_for_pre_increment_42",
             "inline_main_for_pre_increment_42.doria",
             42,

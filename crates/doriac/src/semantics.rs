@@ -48,7 +48,10 @@ use crate::attributes::{
     AttributeClassIdentity, AttributeClassSchema, AttributeSchemaParameter, AttributeSemanticInfo,
     AttributeTarget,
 };
-use crate::builtins::{is_reserved_intrinsic_name, php_function_suggestion, Builtin};
+use crate::builtins::{
+    foreign_string_spelling, is_reserved_intrinsic_name, php_function_suggestion, Builtin,
+    ForeignStringSpelling, StringSpellingTarget,
+};
 use crate::class_layout::{ClassId, PropertyId};
 use crate::collection_diagnostics::{
     self, ArgumentShape, CollectionMemberKind, CollectionReceiver, ImplementationStatus,
@@ -464,6 +467,12 @@ pub struct CallableParameterSemanticInfo {
     pub writable: bool,
     pub borrow: bool,
     pub has_default: bool,
+    /// The default as authored, on one line, so tooling can show
+    /// `int $width = 120` for a declaration in any source of the graph.
+    pub default: Option<String>,
+    /// The authored parameter, the key of its `constructor_parameters` role;
+    /// absent for compiler-supplied parameters.
+    pub declaration: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,6 +840,18 @@ impl ClassSemanticInfo {
     pub fn implements(&self, interface: BuiltinInterface) -> bool {
         self.builtin_interfaces.contains(&interface)
     }
+}
+
+/// Authored source for a one-line signature. A line break and the indentation
+/// around it become one space; spacing within a line is kept as written.
+fn single_line_source(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim);
+    let mut single = lines.next().unwrap_or_default().to_string();
+    for line in lines.filter(|line| !line.is_empty()) {
+        single.push(' ');
+        single.push_str(line);
+    }
+    single
 }
 
 fn contains_comment(text: &str) -> bool {
@@ -1442,6 +1463,8 @@ fn finish_checked_analysis(
                             writable: parameter.writable,
                             borrow: retained_parameters.contains(&(*span, index)),
                             has_default: parameter.has_default,
+                            default: parameter.default.clone(),
+                            declaration: parameter.declaration,
                         })
                         .collect(),
                     return_type: checker.types.resolved(signature.return_ty),
@@ -5711,12 +5734,14 @@ impl<'program> Checker<'program> {
             method.virtual_root = Some(virtual_root);
             for (parameter, inherited) in method.params.iter_mut().zip(inherited_params) {
                 parameter.has_default = inherited.has_default;
+                parameter.default.clone_from(&inherited.default);
             }
         }
 
         if let Some(signature) = self.function_signatures.get_mut(&declaration) {
             for (parameter, inherited) in signature.params.iter_mut().zip(inherited_params) {
                 parameter.has_default = inherited.has_default;
+                parameter.default.clone_from(&inherited.default);
             }
         }
         self.override_roots.insert(declaration, virtual_root);
@@ -7935,7 +7960,10 @@ impl<'program> Checker<'program> {
                 }
                 if matches!(
                     (self.types.kind(object_ty), method.as_str()),
-                    (TypeKind::Dictionary(_, _), "get")
+                    (
+                        TypeKind::Dictionary(_, _) | TypeKind::List(_) | TypeKind::TypedArray(_),
+                        "get"
+                    )
                 ) {
                     return ReturnBorrowLookup::Resolved(Some(ReturnBorrow {
                         source: BorrowSource::Receiver,
@@ -8120,12 +8148,18 @@ impl<'program> Checker<'program> {
                 saw_optional = true;
             }
 
+            let default = param
+                .default_span
+                .and_then(|span| self.source_slice(span))
+                .map(single_line_source);
             params.push(ParamInfo {
                 name: param.name.clone(),
                 ty,
                 take: param.take,
                 writable: param.writable,
                 has_default,
+                default,
+                declaration: Some(param.span),
             });
         }
 
@@ -16486,6 +16520,7 @@ impl<'program> Checker<'program> {
                 self.check_relational_operand_types(left_ty, right_ty, span);
             }
             BinaryOp::Coalesce => {
+                self.check_coalesce_left_can_be_null(left, scopes, method_context);
                 let result = self.infer_binary_type(left, op, right, scopes, method_context);
                 if matches!(self.types.kind(result), TypeKind::Heterogeneous) {
                     let left_ty = self.infer_expr_type(left, scopes, method_context);
@@ -16505,6 +16540,85 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    /// `??` needs a left operand that can be null (Decision 0144).
+    ///
+    /// A binding counts by its declared type, so a nullable binding that flow
+    /// has narrowed may still be coalesced. Anything else counts by the type
+    /// of the expression: an index read, a call or a property of type `T` is
+    /// never null, and its fallback could never run.
+    fn check_coalesce_left_can_be_null(
+        &mut self,
+        left: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if self.expr_declares_nullable(left, scopes, method_context) {
+            return;
+        }
+        let mut operand = left;
+        while let Expr::Grouped { expr, .. } = operand {
+            operand = expr;
+        }
+        // A `mixed` binding may hold null whatever flow has narrowed it to.
+        if let Expr::Variable { name, .. } = operand {
+            if let Some(declared) = scopes.lookup(name).map(|binding| binding.declared_ty) {
+                if self.type_contains_mixed(declared) {
+                    return;
+                }
+            }
+        }
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        // `null ?? x` is its fallback, an unresolved operand already has its
+        // own error, and a bare `mixed` operand is reported as a mixed
+        // operation.
+        if matches!(
+            self.types.kind(left_ty),
+            TypeKind::Null | TypeKind::Unknown | TypeKind::Heterogeneous
+        ) || self.type_contains_mixed(left_ty)
+        {
+            return;
+        }
+
+        let indexed = match operand {
+            Expr::Index { collection, .. } => {
+                let collection_ty = self.infer_expr_type(collection, scopes, method_context);
+                match self.types.kind(collection_ty) {
+                    TypeKind::List(_) | TypeKind::TypedArray(_) => {
+                        Some("`$sequence->get($index) ?? $fallback`")
+                    }
+                    TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _) => {
+                        Some("`$dictionary->get($key) ?? $fallback`")
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let ty = self.types.display(left_ty);
+        let diagnostic = Diagnostic::new(
+            "E0782",
+            format!("the left operand of `??` has type `{ty}` and is never null"),
+            left.span(),
+        )
+        .with_title("Null-Coalescing Operand Is Never Null")
+        .with_primary_label("Never Null");
+        let diagnostic = match indexed {
+            Some(safe_read) => diagnostic
+                .with_explanation(
+                    "An index read asserts that the element is present and panics when it is missing, so `??` cannot supply a fallback for it.",
+                )
+                .with_help(format!(
+                    "to fall back when the element is missing, read it with `get`: {safe_read}"
+                )),
+            None => diagnostic
+                .with_explanation(
+                    "`??` uses its right operand only when the left operand is null, and this operand cannot be null.",
+                )
+                .with_help("remove `??` and its fallback, or make the left operand nullable"),
+        };
+        self.diagnostics.push(diagnostic);
     }
 
     fn check_numeric_binary_operands(
@@ -18332,59 +18446,8 @@ impl<'program> Checker<'program> {
         }
 
         let Some(function_info) = self.functions.get(name).cloned() else {
-            if let Some((replacement, executable, direct_replacement)) = match name {
-                "str_starts_with" => Some((
-                    "String::startsWith($text, $prefix)",
-                    true,
-                    Some("String::startsWith"),
-                )),
-                "str_ends_with" => Some((
-                    "String::endsWith($text, $suffix)",
-                    true,
-                    Some("String::endsWith"),
-                )),
-                "str_contains" => Some((
-                    "String::contains($text, $needle)",
-                    true,
-                    Some("String::contains"),
-                )),
-                "str_case_compare" => {
-                    Some(("String::compareIgnoreCase($left, $right)", false, None))
-                }
-                "explode" => Some(("String::split($text, $separator)", true, None)),
-                "implode" => Some((
-                    "String::join($separator, $values)",
-                    true,
-                    Some("String::join"),
-                )),
-                "substr" => Some((
-                    "String::slice($text, $start, $length)",
-                    true,
-                    Some("String::slice"),
-                )),
-                _ => None,
-            } {
-                let mut diagnostic = Diagnostic::new(
-                    "E0461",
-                    format!("`{name}` is not a Doria string operation"),
-                    span,
-                )
-                .with_title("Use The String Companion")
-                .with_primary_label("Removed Or Foreign String Spelling")
-                .with_explanation(
-                    "Doria keeps string-specific operations on the `String` companion and has no public `str_*` family.",
-                )
-                .with_help(format!("write `{replacement}`"));
-                if !executable {
-                    diagnostic = diagnostic.with_help(
-                        "`String::compareIgnoreCase` is accepted but remains pending until `Ordering` is executable; use `String::equalsIgnoreCase` for equality",
-                    );
-                } else if let Some(direct_replacement) = direct_replacement {
-                    diagnostic = diagnostic.with_fix(
-                        Span::new(span.start, span.start + name.len()),
-                        direct_replacement,
-                    );
-                }
+            if let Some(spelling) = foreign_string_spelling(name) {
+                let diagnostic = self.foreign_string_spelling_diagnostic(spelling, args, span);
                 self.diagnostics.push(diagnostic);
                 return;
             }
@@ -18954,6 +19017,99 @@ impl<'program> Checker<'program> {
         }
     }
 
+    /// The error for a call to a foreign string function: it names the Doria
+    /// spelling, written out with the companion's own parameter names.
+    fn foreign_string_spelling_diagnostic(
+        &mut self,
+        spelling: &ForeignStringSpelling,
+        args: &[Argument],
+        span: Span,
+    ) -> Diagnostic {
+        let name = spelling.foreign;
+        let is_property = matches!(spelling.target, StringSpellingTarget::Property(_));
+        let (title, explanation) = if is_property {
+            (
+                "Use The String Property",
+                "Doria exposes a string's measurements as properties and has no public `str_*` family.",
+            )
+        } else {
+            (
+                "Use The String Companion",
+                "Doria keeps string-specific operations on the `String` companion and has no public `str_*` family.",
+            )
+        };
+        let mut diagnostic = Diagnostic::new(
+            "E0461",
+            format!("`{name}` is not a Doria string operation"),
+            span,
+        )
+        .with_title(title)
+        .with_primary_label("Removed Or Foreign String Spelling")
+        .with_explanation(explanation)
+        .with_help(format!(
+            "write `{}`",
+            self.string_spelling_text(spelling.target)
+        ));
+        if let Some((alternative, when)) = spelling.alternative {
+            diagnostic = diagnostic.with_help(format!(
+                "use `{}` {when}",
+                self.string_spelling_text(alternative)
+            ));
+        }
+        match spelling.target {
+            StringSpellingTarget::Companion(member) => {
+                // Replacing the name alone is correct only when the call's
+                // arguments already fit the companion operation. A named
+                // argument uses the foreign function's parameter name, which
+                // the companion does not declare, so it never fits.
+                let fits = args.iter().all(|argument| argument.name.is_none())
+                    && self
+                        .string_companion_signature(member)
+                        .is_some_and(|(params, _)| {
+                            let required = params.iter().filter(|param| !param.has_default).count();
+                            (required..=params.len()).contains(&args.len())
+                        });
+                if spelling.same_argument_order && spelling.alternative.is_none() && fits {
+                    diagnostic = diagnostic.with_fix(
+                        Span::new(span.start, span.start + name.len()),
+                        format!("String::{member}"),
+                    );
+                }
+            }
+            StringSpellingTarget::PendingComparison(_) => {
+                diagnostic = diagnostic.with_help(
+                    "`String::compareIgnoreCase` is accepted but remains pending until `Ordering` is executable; use `String::equalsIgnoreCase` for equality",
+                );
+            }
+            StringSpellingTarget::Property(_) => {}
+        }
+        diagnostic
+    }
+
+    /// A Doria string spelling as source text with placeholder arguments,
+    /// such as `String::padEnd($text, $length, $padding)` or `$text->length`.
+    fn string_spelling_text(&mut self, target: StringSpellingTarget) -> String {
+        match target {
+            StringSpellingTarget::Companion(member) => {
+                let parameters = self
+                    .string_companion_signature(member)
+                    .map(|(params, _)| {
+                        params
+                            .iter()
+                            .map(|param| format!("${}", param.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                format!("String::{member}({parameters})")
+            }
+            StringSpellingTarget::PendingComparison(member) => {
+                format!("String::{member}($left, $right)")
+            }
+            StringSpellingTarget::Property(property) => format!("$text->{property}"),
+        }
+    }
+
     fn string_companion_signature(&mut self, method: &str) -> Option<(Vec<ParamInfo>, TypeId)> {
         let string = self.types.intern(TypeKind::String);
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
@@ -18968,6 +19124,8 @@ impl<'program> Checker<'program> {
             take: false,
             writable: false,
             has_default: false,
+            default: None,
+            declaration: None,
         };
         let optional = |name: &str, ty| ParamInfo {
             name: name.to_string(),
@@ -18975,6 +19133,8 @@ impl<'program> Checker<'program> {
             take: false,
             writable: false,
             has_default: true,
+            default: None,
+            declaration: None,
         };
         let signature = match method {
             "trim" | "trimStart" | "trimEnd" | "lower" | "upper" | "lowerFirst" | "upperFirst" => {
@@ -19039,7 +19199,7 @@ impl<'program> Checker<'program> {
                 vec![
                     required("text", string),
                     required("length", int),
-                    required("padding", string),
+                    optional("padding", string),
                 ],
                 string,
             ),
@@ -19778,6 +19938,8 @@ impl<'program> Checker<'program> {
                     take: self.type_is_move_type(field.ty),
                     writable: false,
                     has_default: false,
+                    default: None,
+                    declaration: None,
                 })
                 .collect::<Vec<_>>();
             if !definition.type_params.is_empty() {
@@ -20623,6 +20785,8 @@ impl<'program> Checker<'program> {
             take: param.take,
             writable: param.writable,
             has_default: param.has_default,
+            default: param.default.clone(),
+            declaration: param.declaration,
         }
     }
 
@@ -24155,6 +24319,8 @@ impl<'program> Checker<'program> {
                 take: true,
                 writable: false,
                 has_default: false,
+                default: None,
+                declaration: None,
             }],
             args,
             span,
@@ -24356,6 +24522,11 @@ impl<'program> Checker<'program> {
             | (TypeKind::PriorityQueue(_), "contains")
             | (TypeKind::Deque(_), "contains") => Some(bool_ty),
             (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "get") => {
+                Some(self.types.intern(TypeKind::Nullable(value)))
+            }
+            // The safe indexed read of a sequence: null when the index is out
+            // of range, where `$sequence[$index]` panics.
+            (TypeKind::List(value) | TypeKind::TypedArray(value), "get") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
             (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "remove") => {
@@ -24979,6 +25150,7 @@ impl<'program> Checker<'program> {
             (TypeKind::List(value), "insertAt") => (vec![int, value], true),
             (TypeKind::List(_), "removeAt") => (vec![int], true),
             (TypeKind::List(_), "pop") => (vec![], true),
+            (TypeKind::List(_) | TypeKind::TypedArray(_), "get") => (vec![int], false),
             (TypeKind::List(value), "contains") => (vec![value], false),
             (TypeKind::List(value), "indexOf") => (vec![value], false),
             (TypeKind::List(value), "remove") => (vec![value], true),

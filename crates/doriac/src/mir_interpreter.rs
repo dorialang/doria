@@ -4585,10 +4585,11 @@ impl<'a> Interpreter<'a> {
                                     "MIR collection offset is not an integer",
                                 ));
                             };
-                            let offset = usize::try_from(offset.signed_value()).map_err(|_| {
-                                InterpreterError::new("MIR collection offset is negative")
-                            })?;
-                            (offset < entries.entries().len()).then_some(offset)
+                            // A negative offset is absent, as it is in the
+                            // native runtime's optional read.
+                            usize::try_from(offset.signed_value())
+                                .ok()
+                                .filter(|offset| *offset < entries.entries().len())
                         }
                         _ => match self.collection_position(collection, &key, false) {
                             Ok(position) => Some(position),

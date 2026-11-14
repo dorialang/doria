@@ -170,3 +170,160 @@ function main(): void throws Doria\Std\Io\IoError
     )
     .expect("String intrinsic recognition must respect the receiver's resolved type");
 }
+
+/// The Doria spellings a diagnostic's help lines name, in backticks, after
+/// "write" or "use".
+fn suggested_spellings(diagnostic: &Diagnostic) -> Vec<String> {
+    diagnostic
+        .helps
+        .iter()
+        .filter_map(|help| {
+            let rest = help
+                .strip_prefix("write `")
+                .or_else(|| help.strip_prefix("use `"))?;
+            Some(rest.split('`').next()?.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn every_foreign_string_spelling_names_doria_that_compiles() {
+    use doriac::builtins::{StringSpellingTarget, FOREIGN_STRING_SPELLINGS};
+
+    for spelling in FOREIGN_STRING_SPELLINGS {
+        let foreign = spelling.foreign;
+        let found = diagnostics(&format!("function main(): void {{ {foreign}(\"a\"); }}"));
+        let diagnostic = found
+            .iter()
+            .find(|diagnostic| diagnostic.code == "E0461")
+            .unwrap_or_else(|| panic!("`{foreign}` should name its Doria spelling: {found:?}"));
+        let expected_title = match spelling.target {
+            StringSpellingTarget::Property(_) => "Use The String Property",
+            _ => "Use The String Companion",
+        };
+        assert_eq!(diagnostic.title, expected_title, "`{foreign}`");
+
+        let suggested = suggested_spellings(diagnostic);
+        let expected_count = 1 + usize::from(spelling.alternative.is_some());
+        assert_eq!(
+            suggested.len(),
+            expected_count,
+            "`{foreign}`: {suggested:?}"
+        );
+        if matches!(spelling.target, StringSpellingTarget::PendingComparison(_)) {
+            continue;
+        }
+        for spelling_text in suggested {
+            let program = format!(
+                r#"
+function main(): void
+{{
+    let $text = "a";
+    let $needle = "a";
+    let $prefix = "a";
+    let $suffix = "a";
+    let $search = "a";
+    let $replacement = "b";
+    let $separator = ",";
+    let $padding = " ";
+    int $start = 0;
+    int $length = 1;
+    int $count = 2;
+    List<string> $values = ["a", "b"];
+    let $result = {spelling_text};
+}}
+"#
+            );
+            if let Err(errors) = doriac::check_source("suggested.doria", &program) {
+                panic!(
+                    "`{foreign}` suggests `{spelling_text}`, which does not compile: {errors:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn foreign_string_spellings_offer_a_rename_only_when_the_arguments_fit() {
+    let rename = |source: &str| -> Option<String> {
+        diagnostics(source)
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0461")
+            .flat_map(|diagnostic| diagnostic.fixes.iter())
+            .filter(|fix| fix.applicability == FixApplicability::MachineApplicable)
+            .flat_map(|fix| fix.edits.iter())
+            .map(|edit| edit.replacement.clone())
+            .next()
+    };
+
+    for (source, expected) in [
+        (
+            r#"function main(): void { strtolower("A"); }"#,
+            Some("String::lower"),
+        ),
+        (
+            r#"function main(): void { trim(" a "); }"#,
+            Some("String::trim"),
+        ),
+        (
+            r#"function main(): void { substr("abc", 1); }"#,
+            Some("String::slice"),
+        ),
+        // A named argument carries PHP's parameter name, which the
+        // companion operation does not declare.
+        (
+            r#"function main(): void { strtolower(string: "A"); }"#,
+            None,
+        ),
+        // PHP's second argument, the characters to strip, has no place in
+        // `String::trim`.
+        (r#"function main(): void { trim(" a ", " "); }"#, None),
+        // The arguments are in a different order.
+        (
+            r#"function main(): void { str_replace("a", "b", "abc"); }"#,
+            None,
+        ),
+        (r#"function main(): void { explode(",", "a,b"); }"#, None),
+        // Two Doria spellings replace it, and the padding text is required.
+        (r#"function main(): void { str_pad("a", 5); }"#, None),
+        (r#"function main(): void { strlen("a"); }"#, None),
+    ] {
+        assert_eq!(rename(source).as_deref(), expected, "{source}");
+    }
+}
+
+#[test]
+fn padding_with_the_php_spelling_names_both_companion_operations() {
+    let found = diagnostics(
+        r#"
+class Window
+{
+    internal writable int $width = 4;
+
+    function render(string $lineContent): void
+    {
+        echo str_pad($lineContent, $this->width);
+    }
+}
+
+function main(): void
+{
+}
+"#,
+    );
+    assert!(
+        !found.iter().any(|diagnostic| diagnostic.code == "E0309"),
+        "{found:?}"
+    );
+    let diagnostic = found
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0461")
+        .unwrap_or_else(|| panic!("expected the string spelling diagnostic: {found:?}"));
+    assert_eq!(
+        suggested_spellings(diagnostic),
+        [
+            "String::padEnd($text, $length, $padding)",
+            "String::padStart($text, $length, $padding)",
+        ]
+    );
+}

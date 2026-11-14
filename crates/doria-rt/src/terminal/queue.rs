@@ -147,12 +147,6 @@ impl Queue {
         }
     }
 
-    /// A wait under [`Self::wait_limit`] timed out. True when it was the
-    /// caller's budget that ended, not the escape delay.
-    pub(super) fn caller_expired(&self) -> Result<bool, Failure> {
-        Ok(self.is_empty() || crate::monotonic_clock::now()? < self.escape_deadline)
-    }
-
     /// Takes the terminal's answer to a cursor-position query out of the
     /// queue. Keys typed around it stay, in order.
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -234,7 +228,6 @@ mod tests {
             // Within the escape delay the sequence may still continue.
             assert_eq!(queue.next_key(), Ok(None));
             assert!(!queue.is_empty());
-            assert_eq!(queue.caller_expired(), Ok(true));
             assert_eq!(queue.push(b"A"), Ok(true));
             assert_eq!(
                 queue.next_key(),
@@ -244,6 +237,33 @@ mod tests {
                 }))
             );
             assert!(queue.is_empty());
+        }
+    }
+
+    /// A wait cut to the escape delay can time out, and can wake before the
+    /// delay has fully passed. Only the caller's own budget makes that a
+    /// timeout for the caller.
+    #[test]
+    fn a_wait_cut_short_by_the_escape_delay_is_not_the_callers_timeout() {
+        unsafe {
+            let mut queue = Queue::new(64).unwrap();
+            assert_eq!(queue.push(b"\x1b"), Ok(true));
+            // Still inside the escape delay, as after an early wake.
+            assert_eq!(queue.next_key(), Ok(None));
+            let now = crate::monotonic_clock::now;
+
+            let indefinite = DrWaitBudgetV1::indefinite();
+            assert!(queue.wait_limit(&indefinite).is_ok());
+            assert_eq!(indefinite.has_ended(now), Ok(false));
+
+            let later = DrWaitBudgetV1::new(3, u64::MAX, || Ok(0)).unwrap();
+            assert_eq!(later.has_ended(now), Ok(false));
+
+            let immediate = DrWaitBudgetV1::new(0, 0, || Ok(0)).unwrap();
+            assert_eq!(immediate.has_ended(now), Ok(true));
+
+            let passed = DrWaitBudgetV1::new(3, 0, || Ok(0)).unwrap();
+            assert_eq!(passed.has_ended(now), Ok(true));
         }
     }
 
@@ -258,7 +278,6 @@ mod tests {
             assert_eq!(queue.push(b"\x1b"), Ok(true));
             assert_eq!(queue.next_key(), Ok(None));
             queue.escape_deadline = 0;
-            assert_eq!(queue.caller_expired(), Ok(false));
             assert_eq!(queue.next_key(), Ok(escape));
 
             assert_eq!(queue.push(b"\x1b"), Ok(true));

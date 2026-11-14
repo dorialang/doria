@@ -1,0 +1,52 @@
+class Row
+{
+    function __construct(string $text)
+    {
+    }
+
+    function describe(): string
+    {
+        return $this->text;
+    }
+}
+
+class Window
+{
+    internal writable List<string> $contents = ["alpha", "beta"];
+    internal writable int $height = 4;
+
+    function render(): void
+    {
+        for (writable int $row = -1; $row < $this->height; $row++) {
+            let $lineContent = $this->contents->get($row) ?? "";
+            echo "[" . String::padEnd($lineContent, 6) . "]\n";
+        }
+    }
+}
+
+function main(): void
+{
+    let $window = new Window();
+    $window->render();
+
+    List<int> $numbers = [10, 20, 30];
+    echo ($numbers->get(1) ?? -1) . " " . ($numbers->get(3) ?? -1) . " " . ($numbers->get(-1) ?? -1) . "\n";
+
+    int[] $fixed = [7, 8];
+    echo ($fixed->get(0) ?? -1) . " " . ($fixed->get(2) ?? -1) . "\n";
+
+    List<?int> $gaps = [1, null];
+    echo ($gaps->get(1) ?? -5) . " " . ($gaps->get(9) ?? -6) . "\n";
+
+    List<Row> $rows = [new Row("first"), new Row("second")];
+    let $found = $rows->get(1);
+    if ($found != null) {
+        echo $found->describe() . "\n";
+    }
+    let $missing = $rows->get(5);
+    if ($missing == null) {
+        echo "none\n";
+    } else {
+        echo "some\n";
+    }
+}

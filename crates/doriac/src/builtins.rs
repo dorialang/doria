@@ -44,6 +44,137 @@ pub const PHP_DOUBLE_QUOTED_STRING_MIGRATION: PhpDoubleQuotedStringMigration =
         rewrite_bare_close_brace: false,
     };
 
+/// Where Doria spells a string capability that another language, or an
+/// earlier Doria, spelled as a free function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringSpellingTarget {
+    /// An executable `String::member(...)` companion operation.
+    Companion(&'static str),
+    /// An accepted `String::member($left, $right)` comparison that waits for
+    /// the executable `Ordering` type.
+    PendingComparison(&'static str),
+    /// A `$text->property` measurement.
+    Property(&'static str),
+}
+
+/// One foreign string function and the Doria spelling that replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignStringSpelling {
+    pub foreign: &'static str,
+    pub target: StringSpellingTarget,
+    /// The foreign function takes the same arguments in the same order, so a
+    /// call with a matching argument count only needs its name replaced.
+    pub same_argument_order: bool,
+    /// A second Doria spelling the foreign function also covered, and when to
+    /// choose it.
+    pub alternative: Option<(StringSpellingTarget, &'static str)>,
+}
+
+const fn companion(
+    foreign: &'static str,
+    member: &'static str,
+    same_argument_order: bool,
+) -> ForeignStringSpelling {
+    ForeignStringSpelling {
+        foreign,
+        target: StringSpellingTarget::Companion(member),
+        same_argument_order,
+        alternative: None,
+    }
+}
+
+const fn padding(foreign: &'static str) -> ForeignStringSpelling {
+    ForeignStringSpelling {
+        foreign,
+        target: StringSpellingTarget::Companion("padEnd"),
+        same_argument_order: true,
+        alternative: Some((
+            StringSpellingTarget::Companion("padStart"),
+            "to pad at the start",
+        )),
+    }
+}
+
+/// Foreign string functions whose capability Doria has, with the Doria
+/// spelling.
+///
+/// Diagnostics and the future PHP migration command read this one table.
+/// `docs/notes/php-string-capability-inventory.json` is the reviewed PHP
+/// inventory; `scripts/check_string_api_completeness.php` fails when the two
+/// disagree. A function belongs here only when its Doria spelling is accepted;
+/// candidate spellings stay out until they are.
+pub const FOREIGN_STRING_SPELLINGS: &[ForeignStringSpelling] = &[
+    companion("trim", "trim", true),
+    companion("mb_trim", "trim", true),
+    companion("ltrim", "trimStart", true),
+    companion("mb_ltrim", "trimStart", true),
+    companion("rtrim", "trimEnd", true),
+    companion("mb_rtrim", "trimEnd", true),
+    companion("strtolower", "lower", true),
+    companion("mb_strtolower", "lower", true),
+    companion("strtoupper", "upper", true),
+    companion("mb_strtoupper", "upper", true),
+    companion("lcfirst", "lowerFirst", true),
+    companion("mb_lcfirst", "lowerFirst", true),
+    companion("ucfirst", "upperFirst", true),
+    companion("mb_ucfirst", "upperFirst", true),
+    companion("str_contains", "contains", true),
+    companion("str_starts_with", "startsWith", true),
+    companion("str_ends_with", "endsWith", true),
+    companion("strpos", "indexOf", true),
+    companion("mb_strpos", "indexOf", true),
+    companion("grapheme_strpos", "indexOf", true),
+    companion("strrpos", "lastIndexOf", true),
+    companion("mb_strrpos", "lastIndexOf", true),
+    companion("grapheme_strrpos", "lastIndexOf", true),
+    companion("stripos", "indexOfIgnoreCase", true),
+    companion("mb_stripos", "indexOfIgnoreCase", true),
+    companion("grapheme_stripos", "indexOfIgnoreCase", true),
+    companion("strripos", "lastIndexOfIgnoreCase", true),
+    companion("mb_strripos", "lastIndexOfIgnoreCase", true),
+    companion("grapheme_strripos", "lastIndexOfIgnoreCase", true),
+    companion("substr_count", "countOccurrences", true),
+    companion("mb_substr_count", "countOccurrences", true),
+    companion("str_replace", "replace", false),
+    companion("explode", "split", false),
+    companion("implode", "join", true),
+    companion("substr", "slice", true),
+    companion("mb_substr", "slice", true),
+    companion("grapheme_substr", "slice", true),
+    companion("str_repeat", "repeat", true),
+    padding("str_pad"),
+    padding("mb_str_pad"),
+    ForeignStringSpelling {
+        foreign: "strlen",
+        target: StringSpellingTarget::Property("byteLength"),
+        same_argument_order: false,
+        alternative: Some((
+            StringSpellingTarget::Property("length"),
+            "for the number of characters a reader sees",
+        )),
+    },
+    ForeignStringSpelling {
+        foreign: "grapheme_strlen",
+        target: StringSpellingTarget::Property("length"),
+        same_argument_order: false,
+        alternative: None,
+    },
+    // An earlier Doria spelling, removed when string operations moved to the
+    // companion.
+    ForeignStringSpelling {
+        foreign: "str_case_compare",
+        target: StringSpellingTarget::PendingComparison("compareIgnoreCase"),
+        same_argument_order: true,
+        alternative: None,
+    },
+];
+
+pub fn foreign_string_spelling(name: &str) -> Option<&'static ForeignStringSpelling> {
+    FOREIGN_STRING_SPELLINGS
+        .iter()
+        .find(|spelling| spelling.foreign == name)
+}
+
 pub fn php_function_suggestion(name: &str) -> Option<&'static str> {
     PHP_FUNCTION_SUGGESTIONS
         .iter()

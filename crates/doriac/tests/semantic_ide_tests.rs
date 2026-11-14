@@ -691,3 +691,66 @@ function inspect<U implements Ready>(Adapter<No> $value): int { return $value->p
         );
     }
 }
+
+#[test]
+fn callable_signatures_carry_authored_defaults_and_parameter_declarations() {
+    use doriac::ast::MemberAccess;
+    use doriac::semantics::ConstructorParameterSemanticRole;
+
+    let source = r#"open class Root
+{
+    open function value(int $input = 1): int { return $input; }
+}
+
+class Leaf extends Root
+{
+    override function value(int $input): int { return $input + 1; }
+}
+
+class Window
+{
+    function __construct(
+        string $title,
+        internal writable int $x = 0,
+        int $width = 120,
+        string $label = "Doria"
+            . " TUI"
+    ) {}
+}
+"#;
+    let (program, analysis) =
+        doriac::analyze_source_for_ide("defaults.doria", source).expect("source should analyze");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+
+    let constructor = method_declaration_span(&program, "Window", "__construct");
+    let parameters = &analysis.info.callable_signatures[&constructor].parameters;
+    let defaults = parameters
+        .iter()
+        .map(|parameter| parameter.default.as_deref())
+        .collect::<Vec<_>>();
+    // Authored text, with a line break and its indentation read as one space.
+    assert_eq!(
+        defaults,
+        [None, Some("0"), Some("120"), Some("\"Doria\" . \" TUI\"")]
+    );
+
+    // The declaration span is the key of the compiler's constructor role.
+    let x = parameters[1].declaration.expect("authored parameter");
+    assert_eq!(&source[x.start..x.end], "internal writable int $x = 0");
+    assert_eq!(
+        analysis.info.constructor_parameters[&x].role,
+        ConstructorParameterSemanticRole::Promoted {
+            access: MemberAccess::Internal
+        }
+    );
+
+    // An override inherits its virtual root's default, text included.
+    let leaf = method_declaration_span(&program, "Leaf", "value");
+    let inherited = &analysis.info.callable_signatures[&leaf].parameters[0];
+    assert!(inherited.has_default);
+    assert_eq!(inherited.default.as_deref(), Some("1"));
+}

@@ -194,6 +194,9 @@ String::padStart($text, $length, $padding)
 String::padEnd($text, $length, $padding)
 ```
 
+`$padding` is optional and defaults to one space, so
+`String::padEnd($text, $length)` pads with spaces (amended 2026-11-13).
+
 Padding targets use grapheme units. `repeat` returns empty for zero and panics
 on a negative count with `String Repetition Count Cannot Be Negative`. Padding
 returns the source when the target is no larger than its grapheme count.

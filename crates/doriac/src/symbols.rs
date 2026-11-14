@@ -244,6 +244,11 @@ pub struct ParamInfo {
     pub take: bool,
     pub writable: bool,
     pub has_default: bool,
+    /// The default as authored, on one line, when the declaring source text
+    /// is available. Presentation only: `has_default` decides binding.
+    pub default: Option<String>,
+    /// The authored parameter, absent for compiler-supplied parameters.
+    pub declaration: Option<Span>,
 }
 
 #[derive(Debug, Clone)]

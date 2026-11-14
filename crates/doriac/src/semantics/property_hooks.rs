@@ -729,6 +729,8 @@ impl Checker<'_> {
                     writable: parameter.writable,
                     borrow: false,
                     has_default: false,
+                    default: None,
+                    declaration: None,
                 }),
         };
         let calls = self.property_accessor_calls.entry(span).or_default();

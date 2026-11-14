@@ -2385,3 +2385,153 @@ function main(): void throws Doria\Std\Io\IoError
         b"make<drop>truemake<drop>falsemaybefalsenull"
     );
 }
+
+#[test]
+fn coalesce_after_a_value_that_is_never_null_is_rejected_with_the_safe_form() {
+    for (source, operand_type, help) in [
+        (
+            r#"
+function main(): void
+{
+    List<string> $lines = ["a"];
+    let $line = $lines[3] ?? "";
+}
+"#,
+            "`string`",
+            "`$sequence->get($index) ?? $fallback`",
+        ),
+        (
+            r#"
+function main(): void
+{
+    int[] $numbers = [1];
+    let $number = $numbers[3] ?? 0;
+}
+"#,
+            "`int`",
+            "`$sequence->get($index) ?? $fallback`",
+        ),
+        (
+            r#"
+function main(): void
+{
+    Dictionary<string, int> $counts = ["a" => 1];
+    let $count = $counts["z"] ?? 0;
+}
+"#,
+            "`int`",
+            "`$dictionary->get($key) ?? $fallback`",
+        ),
+        (
+            r#"
+function name(): string { return "x"; }
+function main(): void
+{
+    let $name = name() ?? "";
+}
+"#,
+            "`string`",
+            "remove `??` and its fallback",
+        ),
+        (
+            r#"
+function main(): void
+{
+    string $plain = "p";
+    let $copy = $plain ?? "";
+}
+"#,
+            "`string`",
+            "remove `??` and its fallback",
+        ),
+    ] {
+        let diagnostic = assert_code(source, "E0782");
+        assert_eq!(diagnostic.title, "Null-Coalescing Operand Is Never Null");
+        assert!(
+            diagnostic.message.contains(operand_type),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.helps.iter().any(|line| line.contains(help)),
+            "expected help containing {help}, got {:?}",
+            diagnostic.helps
+        );
+    }
+}
+
+#[test]
+fn coalesce_after_a_value_that_can_be_null_stays_valid() {
+    doriac::check_source(
+        "stage22-coalesce.doria",
+        r#"
+class Holder
+{
+    internal writable ?string $label = null;
+
+    function show(): string
+    {
+        if ($this->label != null) {
+            return $this->label ?? "narrowed";
+        }
+        return $this->label ?? "empty";
+    }
+}
+
+function maybe(bool $flag): ?string
+{
+    if ($flag) { return "yes"; }
+    return null;
+}
+
+function main(): void
+{
+    ?string $value = maybe(true);
+    if ($value != null) {
+        echo $value ?? "narrowed";
+    }
+    echo maybe(false) ?? "fallback";
+    echo null ?? "literal";
+    List<?int> $gaps = [1, null];
+    echo $gaps[1] ?? -5;
+    List<string> $lines = ["a"];
+    echo $lines->get(3) ?? "missing";
+    int[] $numbers = [1];
+    echo $numbers->get(3) ?? -1;
+}
+"#,
+    )
+    .expect("a left operand that can be null may be coalesced");
+}
+
+#[test]
+fn sequence_get_takes_an_int_index_and_returns_a_nullable_element() {
+    for (source, code) in [
+        (
+            r#"
+function main(): void
+{
+    List<string> $lines = ["a"];
+    string $line = $lines->get(0);
+}
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function main(): void
+{
+    List<string> $lines = ["a"];
+    let $line = $lines->get("0");
+}
+"#,
+            "E0403",
+        ),
+    ] {
+        let found = diagnostics(source);
+        assert!(
+            found.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code}, got {found:?}"
+        );
+    }
+}

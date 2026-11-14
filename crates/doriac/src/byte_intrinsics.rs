@@ -42,6 +42,8 @@ impl ByteIntrinsic {
                 take: false,
                 writable: false,
                 has_default: false,
+                default: None,
+                declaration: None,
             })
             .collect()
     }

@@ -330,7 +330,7 @@ pub(super) unsafe fn await_event(
             (1, _) => INFINITE,
             (2, milliseconds) => milliseconds as u32,
             _ => {
-                expired = raw.queue.caller_expired()?;
+                expired = budget.has_ended(crate::monotonic_clock::now)?;
                 continue;
             }
         };
@@ -343,7 +343,9 @@ pub(super) unsafe fn await_event(
         ) {
             0 => read_records(raw, input)?,
             1 => return Ok(Observation::Cancelled),
-            WAIT_TIMEOUT => expired = raw.queue.caller_expired()?,
+            // The wait may return a little before its time, so the clock
+            // alone cannot say whose limit ended. The caller's budget can.
+            WAIT_TIMEOUT => expired = budget.has_ended(crate::monotonic_clock::now)?,
             _ => return Err(platform_io::last_failure().into()),
         }
     }

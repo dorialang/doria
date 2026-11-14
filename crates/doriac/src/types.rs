@@ -77,7 +77,7 @@ impl CollectionFamily {
     pub(crate) fn borrows_element(self, member: &str) -> bool {
         matches!(
             (self, member),
-            (Self::Dictionary, "get")
+            (Self::Dictionary | Self::List | Self::TypedArray, "get")
                 | (Self::List | Self::Set, "first" | "last")
                 | (Self::PriorityQueue, "peek")
                 | (Self::Deque, "peekFront" | "peekBack")

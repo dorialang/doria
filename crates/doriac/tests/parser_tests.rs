@@ -1391,6 +1391,103 @@ fn rejects_numeric_or_labeled_loop_control() {
 }
 
 #[test]
+fn for_initializer_accepts_every_local_declaration_form() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+for (writable int $row = 0; $row < 10; $row++) {
+}
+
+for (int $limit = 10; $limit > 0;) {
+}
+
+for (writable ?string $name = null; $name == null;) {
+}
+
+for (writable int $low, $high = 0; $low < 10; $low++) {
+}
+
+for (let writable $index = 0; $index < 10; $index++) {
+}
+
+for (let $fixed = 0; $fixed < 10;) {
+}
+"#,
+    )
+    .expect("every local declaration form should parse in a for initializer");
+
+    // Each declaration, written back in one canonical spelling.
+    let declarations: Vec<String> = program
+        .items
+        .iter()
+        .map(|item| {
+            let Item::Statement(Stmt::For(for_stmt)) = item else {
+                panic!("expected for loop, got {item:?}");
+            };
+            let Some(ForInitializer::VarDecl(declaration)) = &for_stmt.initializer else {
+                panic!("expected a declaration, got {:?}", for_stmt.initializer);
+            };
+            let mut words = Vec::new();
+            if declaration.ty.is_none() {
+                words.push("let".to_string());
+            }
+            if declaration.writable {
+                words.push("writable".to_string());
+            }
+            if let Some(ty) = &declaration.ty {
+                let nullable = if ty.nullable { "?" } else { "" };
+                words.push(format!("{nullable}{}", ty.name));
+            }
+            let names: Vec<String> = declaration
+                .bindings
+                .iter()
+                .map(|binding| format!("${}", binding.name))
+                .collect();
+            words.push(names.join(", "));
+            words.join(" ")
+        })
+        .collect();
+
+    assert_eq!(
+        declarations,
+        [
+            "writable int $row",
+            "int $limit",
+            "writable ?string $name",
+            "writable int $low, $high",
+            "let writable $index",
+            "let $fixed",
+        ]
+    );
+}
+
+#[test]
+fn for_initializer_reports_malformed_declarations_and_bare_expressions() {
+    for (source, message) in [
+        (
+            "for (writable int $row; $row < 10; $row++) { }",
+            "expected `=` in variable declaration",
+        ),
+        (
+            "for (writable int $row = 0 $row < 10; $row++) { }",
+            "expected `;` after for initializer",
+        ),
+        (
+            "for (10; true;) { }",
+            "expected a local declaration or an assignment in for initializer",
+        ),
+    ] {
+        let err = doriac::parse_source("test.doria", source)
+            .expect_err("a malformed for initializer should be rejected");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.message.contains(message)),
+            "expected diagnostic containing {message}, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn parses_stage_9_for_loops_and_mutation_statements() {
     let program = doriac::parse_source(
         "test.doria",

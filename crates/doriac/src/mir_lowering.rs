@@ -14646,7 +14646,12 @@ fn string_intrinsic_signature(
         Kind::PadStart | Kind::PadEnd => (
             vec![string, int, string],
             vec!["text", "length", "padding"],
-            vec![None, None, None],
+            // Padding defaults to one space (Decision 0103).
+            vec![
+                None,
+                None,
+                Some(crate::const_eval::ConstValue::String(" ".to_string())),
+            ],
             string,
         ),
         Kind::FromBytes => (
@@ -15331,6 +15336,15 @@ fn lower_coalesce_rvalue(
             expected,
             mir::Type::Interface(_) | mir::Type::NullableInterface(_)
         ) && matches!(present_type, mir::Type::Interface(_) | mir::Type::Class(_));
+    if !nullable && expected == left_type {
+        // A left operand that flow has proven present is its own result; the
+        // fallback is never evaluated.
+        return if transfer {
+            lower_rvalue_as_expected(left, expected, context)
+        } else {
+            lower_rvalue_as_borrowed(left, expected, context)
+        };
+    }
     if !nullable || (expected != present_type && expected != left_type && !interface_conversion) {
         return Err(vec![Diagnostic::new(
             "I2201",
@@ -23861,7 +23875,10 @@ impl NullableCollectionScalarOperation<'_> {
             Self::Method("get", [_]) => {
                 matches!(
                     definition.kind,
-                    mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary
+                    mir::CollectionKind::Dictionary
+                        | mir::CollectionKind::SortedDictionary
+                        | mir::CollectionKind::List
+                        | mir::CollectionKind::TypedArray
                 ) && definition.value == mir::Type::Scalar(expected)
             }
             Self::Method("removeAt", [_]) => {
@@ -23908,6 +23925,24 @@ impl NullableCollectionScalarOperation<'_> {
                     } else {
                         mir::NullableCollectionAccess::Last
                     },
+                })
+            }
+            Self::Method("get", [index])
+                if matches!(
+                    definition.kind,
+                    mir::CollectionKind::List | mir::CollectionKind::TypedArray
+                ) =>
+            {
+                Ok(mir::NullableScalarExpression::DictionaryGet {
+                    index_span: span,
+                    ty: expected,
+                    collection,
+                    key: Box::new(lower_rvalue_as_borrowed(
+                        &index.value,
+                        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                        context,
+                    )?),
+                    access: mir::NullableCollectionAccess::At,
                 })
             }
             Self::Method("get" | "remove", [key]) => {
@@ -24636,6 +24671,16 @@ fn lower_dictionary_get(
                 context,
             )?,
             mir::NullableCollectionAccess::Remove,
+        ),
+        // The safe indexed read of a sequence is the optional read at an
+        // offset: absent, not a panic, when the index is out of range.
+        (mir::CollectionKind::List | mir::CollectionKind::TypedArray, "get", [index]) => (
+            lower_rvalue_as_borrowed(
+                &index.value,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                context,
+            )?,
+            mir::NullableCollectionAccess::At,
         ),
         (mir::CollectionKind::List | mir::CollectionKind::PriorityQueue, "pop", []) => (
             mir::Rvalue::Value(mir::ValueExpression::Integer(

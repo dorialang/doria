@@ -105,6 +105,7 @@ through the Stage 22 flow model. Naming follows the §9.1 charter.
 | `insertAt(int $index, T): void` | writable, moves in | insert; panics on out-of-range index |
 | `removeAt(int $index): T` | writable | removes and returns the **owned** element; panics out of bounds |
 | `pop(): ?T` | writable | removes and returns the last element; `null` if empty |
+| `get(int $index): ?T` | readonly borrow | safe indexed read; `null` when the index is out of range (Decision 0144, also on `T[]`) |
 | `contains(T): bool` | readonly | value membership |
 | `first: ?T` / `last: ?T` | readonly properties | safe end borrows; `null` if empty |
 | `count` / `isEmpty` | readonly properties | live size / emptiness |

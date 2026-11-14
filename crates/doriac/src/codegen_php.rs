@@ -3467,7 +3467,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                 && !matches!(receiver_type, Some(ResolvedType::List(_)) if method == "removeAt" && !null_safe)
                 && !matches!(receiver_type, Some(ResolvedType::List(_)) if method == "pop" && !null_safe)
                 && !matches!(receiver_type, Some(ResolvedType::List(_) | ResolvedType::Dictionary(_, _)) if method == "clear" && !null_safe)
-                && !matches!(receiver_type, Some(ResolvedType::Dictionary(_, _)) if method == "get")
+                && !matches!(receiver_type, Some(ResolvedType::Dictionary(_, _) | ResolvedType::List(_) | ResolvedType::TypedArray(_)) if method == "get")
                 && !matches!(receiver_type, Some(ResolvedType::Dictionary(_, _)) if method == "set" && !null_safe)
                 && !matches!(receiver_type, Some(ResolvedType::Dictionary(_, _)) if method == "remove" && !null_safe)
                 && !(receiver_type.is_some_and(bytes::uses) && method == "toArray")
@@ -10318,7 +10318,13 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
             ..
         } if matches!(
             scopes.expression_types.get(&object.span()),
-            Some(ResolvedType::Dictionary(_, _))
+            // A sequence is a PHP list, so its safe indexed read is the same
+            // optional array read a dictionary uses.
+            Some(
+                ResolvedType::Dictionary(_, _)
+                    | ResolvedType::List(_)
+                    | ResolvedType::TypedArray(_)
+            )
         ) && method == "get" =>
         {
             format!(

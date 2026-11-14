@@ -75,6 +75,24 @@ impl DrWaitBudgetV1 {
         }
     }
 
+    /// Whether this budget has no time left: an immediate budget, or a
+    /// deadline that has passed. An indefinite budget never ends.
+    ///
+    /// A wait that timed out asks this before it reports a timeout. A wait
+    /// may be cut short by another limit, and a platform wait may return a
+    /// little before its time; neither is the caller's budget ending.
+    pub(crate) fn has_ended(
+        &self,
+        now: impl FnOnce() -> Result<u64, Failure>,
+    ) -> Result<bool, Failure> {
+        match self.kind {
+            IMMEDIATE | EXPIRED => Ok(true),
+            INDEFINITE => Ok(false),
+            DEADLINE => Ok(self.deadline.remaining_at(now()?).is_none()),
+            _ => Err(Failure::invalid_input()),
+        }
+    }
+
     pub(crate) fn remaining(
         &self,
         unit_nanoseconds: u64,

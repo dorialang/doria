@@ -36,6 +36,7 @@ examples/native/main_float_to_int_nan_panic.doria
 examples/native/main_float_to_int_range_panic.doria
 examples/native/main_file_copy.doria
 examples/native/main_for_42.doria
+examples/native/main_for_typed_initializer_42.doria
 examples/native/main_foreach_range_45.doria
 examples/native/main_foreach_range_55.doria
 examples/native/main_function_add_42.doria
@@ -418,6 +419,7 @@ examples/native/main_readiness_set_construction.doria
 examples/native/main_readiness_membership.doria
 examples/native/main_readiness_access.doria
 examples/native/main_read_transfer_plan.doria
+examples/native/main_sequence_get.doria
 examples/native/main_write_transfer_plan.doria
 examples/native/main_stream_seek.doria
 examples/native/main_stream_synchronize.doria
