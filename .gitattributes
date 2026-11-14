@@ -6,3 +6,8 @@ crates/doriac/tests/fixtures/** -text
 
 # Development launchers must retain Unix-compatible shebangs.
 bin/doriac text eol=lf
+
+# Diagnostic catalogue entries are embedded in the compiler as text. LF in
+# every checkout keeps `doriac explain` and its export identical on every
+# platform (Decision 0145).
+crates/doria-diagnostic-catalogue/entries/** text eol=lf

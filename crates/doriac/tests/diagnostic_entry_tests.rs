@@ -14,6 +14,20 @@ fn begins_with_a_capital(title: &str) -> bool {
         .is_some_and(|first| !first.is_lowercase())
 }
 
+/// Entry text is embedded as checked out. A carriage return would make the
+/// export differ between platforms and breaks the entry parser, so the files
+/// are LF in every checkout (`.gitattributes`).
+#[test]
+fn entry_files_use_lf_line_endings_on_every_platform() {
+    for (code, source) in ENTRY_SOURCES {
+        assert!(
+            !source.contains('\r'),
+            "{code}: entries/{code}.md has CRLF line endings; .gitattributes must mark \
+             crates/doria-diagnostic-catalogue/entries/** as `text eol=lf`"
+        );
+    }
+}
+
 #[test]
 fn every_entry_is_well_formed_and_its_example_raises_its_code() {
     let entries = diagnostic_entries::all().expect("every entry file should parse");
