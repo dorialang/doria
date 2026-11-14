@@ -4,7 +4,7 @@
 
 use doria_diagnostic_catalogue::{
     explanations::{self, DiagnosticEntry, EntryError},
-    DIAGNOSTIC_CODES,
+    DIAGNOSTIC_CODES, RETIRED_DIAGNOSTIC_CODES,
 };
 use serde_json::{json, Value};
 
@@ -18,6 +18,8 @@ pub enum LookupError {
     UnknownCode(String),
     /// The code exists and no entry has been written for it.
     NoEntry(&'static str),
+    /// The code was retired: no compiler raises it any more.
+    Retired(&'static str),
     /// The entry file is not in the required shape.
     Malformed(&'static str, EntryError),
 }
@@ -35,6 +37,12 @@ impl std::fmt::Display for LookupError {
                 formatter,
                 "no explanation has been written for {code} yet\n\n\
                  Run `doriac explain --all` to list the codes that have one."
+            ),
+            Self::Retired(code) => write!(
+                formatter,
+                "{code} is a retired code: no current compiler raises it, and its number is \
+                 kept so that it is never reused\n\n\
+                 Run `doriac explain --all` to list the codes that are in use."
             ),
             Self::Malformed(code, error) => write!(
                 formatter,
@@ -55,6 +63,13 @@ fn catalogued(code: &str) -> Option<&'static str> {
 
 /// The entry for a code typed by a person.
 pub fn lookup(code: &str) -> Result<DiagnosticEntry<'static>, LookupError> {
+    if let Some(retired) = RETIRED_DIAGNOSTIC_CODES
+        .iter()
+        .copied()
+        .find(|retired| retired.eq_ignore_ascii_case(code))
+    {
+        return Err(LookupError::Retired(retired));
+    }
     let known = catalogued(code).ok_or_else(|| LookupError::UnknownCode(code.to_string()))?;
     match explanations::entry(known) {
         Some(Ok(entry)) => Ok(entry),
@@ -91,9 +106,17 @@ fn entry_json(entry: &DiagnosticEntry<'_>) -> Value {
         "code": entry.code,
         "title": entry.title,
         "titleIsFixed": entry.title_is_fixed,
+        "family": entry.family,
+        "availability": entry.availability.name(),
         "explanation": entry.explanation,
         "fix": entry.fix,
         "example": entry.example,
+        "exampleNote": entry.example_note,
+        "exampleSource": if entry.example_is_development_source {
+            "development"
+        } else {
+            "main"
+        },
         "url": crate::diagnostics::documentation_url(entry.code),
     })
 }
@@ -111,13 +134,32 @@ pub fn entry_document(entry: &DiagnosticEntry<'_>) -> Value {
 /// The whole catalogue as the document consumers pin: every entry, and the
 /// codes that have none yet.
 pub fn export() -> Result<Value, LookupError> {
-    let entries: Vec<Value> = all()?.iter().map(entry_json).collect();
+    let all = all()?;
+    let entries: Vec<Value> = all.iter().map(entry_json).collect();
+    let families: Vec<Value> = explanations::families()
+        .map(|family| {
+            let codes: Vec<&str> = all
+                .iter()
+                .filter(|entry| entry.family == family.id)
+                .map(|entry| entry.code)
+                .collect();
+            json!({
+                "id": family.id,
+                "title": family.title,
+                "summary": family.summary,
+                "codes": codes,
+            })
+        })
+        .collect();
     Ok(json!({
         "schemaVersion": EXPORT_SCHEMA_VERSION,
         "toolchainVersion": crate::TOOLCHAIN_VERSION,
         "compilerCommit": crate::BUILD_COMMIT,
+        "documentationRelease": crate::diagnostics::documentation_release(),
+        "families": families,
         "entries": entries,
         "codesWithoutEntry": codes_without_entry(),
+        "retiredCodes": RETIRED_DIAGNOSTIC_CODES,
     }))
 }
 
@@ -129,7 +171,11 @@ pub fn render(entry: &DiagnosticEntry<'_>) -> String {
         entry.title,
         entry.explanation,
         entry.fix,
-        entry.example.trim_end(),
+        entry
+            .example
+            .or(entry.example_note)
+            .unwrap_or_default()
+            .trim_end(),
         crate::diagnostics::documentation_url(entry.code),
     )
 }

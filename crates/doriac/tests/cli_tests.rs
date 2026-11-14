@@ -32,7 +32,7 @@ fn explain_prints_an_entry_lists_the_catalogue_and_names_what_is_wrong() {
     for part in [
         "\nFix\n",
         "\nExample\n",
-        "https://dorialang.org/docs/diagnostics/e0782",
+        "https://docs.dorialang.org/v2026.3.1/diagnostics/e0782",
     ] {
         assert!(text.contains(part), "{part:?} missing from {text}");
     }

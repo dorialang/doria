@@ -1717,10 +1717,36 @@ pub use doria_diagnostic_catalogue::{
     runtime_entry as runtime_catalogue_entry, RuntimeCatalogueEntry,
     DIAGNOSTIC_CODES as CATALOGUED_CODES, RUNTIME_CATALOGUE,
 };
-/// Where a diagnostic code is documented for readers.
+/// The documentation release this compiler links to, as the documentation
+/// site names its releases: `v`, then the toolchain's year, quarter and
+/// release number without zero padding and without a channel suffix. Toolchain
+/// `2026.03.1-canary` links to `v2026.3.1`.
+pub fn documentation_release() -> String {
+    let release = crate::TOOLCHAIN_VERSION
+        .split('-')
+        .next()
+        .unwrap_or(crate::TOOLCHAIN_VERSION);
+    let parts: Vec<&str> = release
+        .split('.')
+        .map(|part| {
+            let unpadded = part.trim_start_matches('0');
+            if unpadded.is_empty() {
+                "0"
+            } else {
+                unpadded
+            }
+        })
+        .collect();
+    format!("v{}", parts.join("."))
+}
+
+/// Where a diagnostic code is documented for readers: one page per code for
+/// each documentation release, so a compiler links to the explanations for
+/// its own release.
 pub fn documentation_url(code: &str) -> String {
     format!(
-        "https://dorialang.org/docs/diagnostics/{}",
+        "https://docs.dorialang.org/{}/diagnostics/{}",
+        documentation_release(),
         code.to_ascii_lowercase()
     )
 }

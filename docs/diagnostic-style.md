@@ -155,7 +155,17 @@ the code is raised stays specific to the program.
 - `## Explanation` says what the code means in one to three short paragraphs.
 - `## Fix` names the concrete change, with real member and keyword names.
 - `## Example` is one small program whose first error is this code and which
-  contains no other mistake.
+  contains no other mistake. For a runtime panic the program compiles and
+  panics with the code when run. A code that no program raises on demand has
+  a sentence in place of the program, beginning `No program raises this code
+  on demand`.
+- `Family:` names the entry's family from `entries/FAMILIES.txt`.
+- A code for a feature the compiler does not have yet says so without reading
+  as a rejection: `Availability: planned` when the feature is part of Doria
+  for the first full release, `Availability: later` when Doria reserves it
+  for a later one.
+- A code that nothing raises any more is retired, not deleted: it moves to
+  `RETIRED_DIAGNOSTIC_CODES` and its number is never reused.
 - A new code arrives with its entry. A code never joins
   `entries/WITHOUT_ENTRY.txt`; it only leaves it.
 
