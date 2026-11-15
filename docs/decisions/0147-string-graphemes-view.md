@@ -89,6 +89,12 @@ general rule for compiler-known declarations that are implementation detail.
   executable.
 - The String surface table (`doriac::string_surface`) lists `graphemes` as an
   executable property of type `Iterable<string>`.
+- Interface slots use the same automatic-effect transport as structural calls,
+  so they need the `Doria\Std\Io` identities even when nothing performs I/O.
+  The compiler decides those identities once more after it adds the
+  compiler-known modules, over the program it will check, so a program that
+  walks graphemes and does no I/O compiles. Every compilation path adds the
+  compiler-known modules through one function, `augment_compiler_known`.
 
 ## Invalidated Elsewhere
 

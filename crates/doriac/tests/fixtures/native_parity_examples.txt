@@ -424,3 +424,5 @@ examples/native/main_write_transfer_plan.doria
 examples/native/main_stream_seek.doria
 examples/native/main_stream_synchronize.doria
 examples/native/main_stream_resize.doria
+examples/native/main_graphemes_library_shape.doria
+examples/native/main_graphemes_without_io.doria

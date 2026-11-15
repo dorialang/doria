@@ -6,6 +6,8 @@
 //! backend, the foreign-spelling table and compiler-adjacent tooling read it;
 //! none of them restates a member, a parameter, a default or a pending reason.
 
+use crate::types::{ByteRegionKind, IntegerType, ResolvedType, TypeRegistry};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StringMemberKind {
     /// `$text->name`, a fact about or a view of one string.
@@ -35,20 +37,41 @@ pub enum StringValueType {
 }
 
 impl StringValueType {
-    /// The type as Doria source spells it; empty for [`Self::Undecided`].
-    pub const fn source(self) -> &'static str {
-        match self {
-            Self::String => "string",
-            Self::Int => "int",
-            Self::Bool => "bool",
-            Self::Bytes => "Bytes",
-            Self::ByteRegion => "ByteRegion",
-            Self::NullableInt => "?int",
-            Self::NullableString => "?string",
-            Self::StringList => "List<string>",
-            Self::StringIterable => "Iterable<string>",
-            Self::Ordering => "Ordering",
-            Self::Undecided => "",
+    /// The type in the compiler's type model, or `None` for a pending member
+    /// whose type is not executable: `Ordering`, and an undecided type.
+    pub fn resolved(self) -> Option<ResolvedType> {
+        Some(match self {
+            Self::String => ResolvedType::String,
+            Self::Int => ResolvedType::Integer(IntegerType::Int64),
+            Self::Bool => ResolvedType::Bool,
+            Self::Bytes => ResolvedType::Bytes,
+            Self::ByteRegion => ResolvedType::ByteRegion(ByteRegionKind::Readonly),
+            Self::NullableInt => {
+                ResolvedType::Nullable(Box::new(ResolvedType::Integer(IntegerType::Int64)))
+            }
+            Self::NullableString => ResolvedType::Nullable(Box::new(ResolvedType::String)),
+            Self::StringList => ResolvedType::List(Box::new(ResolvedType::String)),
+            Self::StringIterable => ResolvedType::Interface(crate::types::InterfaceType::new(
+                "Iterable",
+                vec![ResolvedType::String],
+            )),
+            Self::Ordering | Self::Undecided => return None,
+        })
+    }
+
+    /// The type as the compiler renders it everywhere else, through the type
+    /// registry, so compiler-known types are qualified
+    /// (`Doria\Std\Io\ByteRegion`). `Ordering` is the prelude enum's name;
+    /// an undecided type renders as nothing.
+    pub fn source(self) -> String {
+        match self.resolved() {
+            Some(ty) => {
+                let mut types = TypeRegistry::new();
+                let id = types.intern_resolved(&ty);
+                types.display(id)
+            }
+            None if self == Self::Ordering => "Ordering".to_string(),
+            None => String::new(),
         }
     }
 }
@@ -568,8 +591,45 @@ mod tests {
             "$text->byteRegion"
         );
         assert_eq!(
+            property("byteRegion").unwrap().signature(),
+            "Doria\\Std\\Io\\ByteRegion $byteRegion"
+        );
+        assert_eq!(
+            property("graphemes").unwrap().signature(),
+            "Iterable<string> $graphemes"
+        );
+        assert_eq!(
             executable_property_list("and"),
             "`length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, `byteRegion`, and `graphemes`"
+        );
+    }
+
+    /// Every type the table names is spelled the way the rest of the compiler
+    /// renders it, including the byte intrinsic table's `byteRegion` entry.
+    #[test]
+    fn table_types_render_like_the_rest_of_the_compiler() {
+        let render = |ty: &ResolvedType| {
+            let mut types = TypeRegistry::new();
+            let id = types.intern_resolved(ty);
+            types.display(id)
+        };
+        for member in STRING_MEMBERS {
+            let types = member
+                .parameters
+                .iter()
+                .map(|parameter| parameter.ty)
+                .chain(std::iter::once(member.result));
+            for ty in types {
+                if let Some(resolved) = ty.resolved() {
+                    assert_eq!(ty.source(), render(&resolved), "`{}`", member.name);
+                }
+            }
+        }
+        let byte_region = crate::byte_intrinsics::member(&ResolvedType::String, "byteRegion")
+            .expect("the String byteRegion member");
+        assert_eq!(
+            StringValueType::ByteRegion.source(),
+            render(&byte_region.return_type)
         );
     }
 

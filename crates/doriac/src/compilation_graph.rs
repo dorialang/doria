@@ -850,33 +850,12 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         }
     }
 
-    if uses_compiler_known_io
-        || crate::compiler_known_io::resolved_program_uses_canonical_io(&facts, &combined)
-    {
-        combined = crate::compiler_known_io::augment_program(&combined);
-    }
-    if crate::compiler_known_stream::resolved_facts_use_streams(&facts) {
-        combined = crate::compiler_known_stream::augment_program_for(&combined, &facts);
-    }
-    if crate::compiler_known_time::resolved_facts_use_time(&facts) {
-        combined = crate::compiler_known_time::augment_program(&combined);
-    }
-    if crate::compiler_known_concurrency::resolved_facts_use_concurrency(&facts) {
-        combined = crate::compiler_known_concurrency::augment_program(&combined);
-    }
-    if crate::compiler_known_term::resolved_facts_use_term(&facts) {
-        combined = crate::compiler_known_term::augment_program(&combined);
-    }
-    if graph
+    let reads_graphemes = graph
         .sources
         .values()
-        .any(|source| crate::compiler_known_text::source_uses_graphemes(&source.source))
-    {
-        combined = crate::compiler_known_text::augment_program(&combined);
-    }
-    if crate::compiler_known_test::resolved_facts_use_assertion_surface(&facts) {
-        combined = crate::compiler_known_test::augment_program(&combined);
-    }
+        .any(|source| crate::compiler_known_text::source_uses_graphemes(&source.source));
+    combined =
+        crate::augment_compiler_known(&combined, &facts, uses_compiler_known_io, reads_graphemes);
 
     let source_texts = graph
         .sources

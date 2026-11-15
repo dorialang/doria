@@ -31,6 +31,10 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   written in the compiler-known `Doria\Std\Text` module over two
   compiler-private String intrinsics (runtime ABI 19). Its view and cursor
   classes are in no canonical-type list, so authored source cannot name them.
+  Every compilation path adds compiler-known modules through one function,
+  `augment_compiler_known`, which decides the I/O identities last over the
+  augmented program; before this, a graphemes walk in a program with no I/O
+  failed with E0401 for `Doria\Std\Io\IoError`.
 - Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
   designed and not implemented. Two records are drafted in `docs/decisions/`
   as Proposed and wait for Andrew's review, uncommitted until he has read

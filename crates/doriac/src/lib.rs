@@ -165,41 +165,12 @@ pub fn analyze_source_for_ide_with_source_context(
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
-    let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(&source)?
-        || compiler_known_io::resolved_program_uses_canonical_io(
-            &resolution.resolved.facts,
-            &resolution.resolved.program,
-        );
-    if uses_compiler_known_io {
-        resolution.resolved.program =
-            compiler_known_io::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_stream::resolved_facts_use_streams(&resolution.resolved.facts) {
-        resolution.resolved.program = compiler_known_stream::augment_program_for(
-            &resolution.resolved.program,
-            &resolution.resolved.facts,
-        );
-    }
-    if compiler_known_time::resolved_facts_use_time(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_time::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_concurrency::resolved_facts_use_concurrency(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_concurrency::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_term::resolved_facts_use_term(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_term::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_text::source_uses_graphemes(&source) {
-        resolution.resolved.program =
-            compiler_known_text::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_test::resolved_facts_use_assertion_surface(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_test::augment_program(&resolution.resolved.program);
-    }
+    resolution.resolved.program = augment_compiler_known(
+        &resolution.resolved.program,
+        &resolution.resolved.facts,
+        compiler_known_io::source_uses_io_intrinsics(&source)?,
+        compiler_known_text::source_uses_graphemes(&source),
+    );
     let (evaluation, _) =
         const_eval::evaluate_program_with_diagnostics(&resolution.resolved.program);
     let elaboration = testing::elaborate_source(
@@ -795,6 +766,51 @@ fn append_compiler_known_semantic_context(
     );
 }
 
+/// Adds the compiler-known declarations a resolved program needs, in one
+/// order, for every compilation path. `authored_uses_io` reports I/O
+/// intrinsics and structural callables in the authored text;
+/// `reads_graphemes` reports `->graphemes` in it.
+///
+/// The I/O identities are decided once more after the other modules are
+/// added, over the program as the compiler will check it: a compiler-known
+/// module can bring interface slots that no authored name shows, such as the
+/// `Iterable<string>` behind `$text->graphemes`.
+pub(crate) fn augment_compiler_known(
+    program: &Program,
+    facts: &GlobalSymbolFacts,
+    authored_uses_io: bool,
+    reads_graphemes: bool,
+) -> Program {
+    let mut program = program.clone();
+    let has_io =
+        authored_uses_io || compiler_known_io::resolved_program_uses_canonical_io(facts, &program);
+    if has_io {
+        program = compiler_known_io::augment_program(&program);
+    }
+    if compiler_known_stream::resolved_facts_use_streams(facts) {
+        program = compiler_known_stream::augment_program_for(&program, facts);
+    }
+    if compiler_known_time::resolved_facts_use_time(facts) {
+        program = compiler_known_time::augment_program(&program);
+    }
+    if compiler_known_concurrency::resolved_facts_use_concurrency(facts) {
+        program = compiler_known_concurrency::augment_program(&program);
+    }
+    if compiler_known_term::resolved_facts_use_term(facts) {
+        program = compiler_known_term::augment_program(&program);
+    }
+    if reads_graphemes {
+        program = compiler_known_text::augment_program(&program);
+    }
+    if compiler_known_test::resolved_facts_use_assertion_surface(facts) {
+        program = compiler_known_test::augment_program(&program);
+    }
+    if !has_io && compiler_known_io::program_uses_interface_slots(&program) {
+        program = compiler_known_io::augment_program(&program);
+    }
+    program
+}
+
 fn ast_uses_compiler_known_source(program: &ast::Program) -> bool {
     let synthetic = compiler_known_io::SYNTHETIC_SOURCE_ID;
     program.items.iter().any(|item| match item {
@@ -824,33 +840,12 @@ pub(crate) fn prepare_parsed_source(
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolved = names::resolve_program(&authored, &context)?;
-    let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(source)?
-        || compiler_known_io::resolved_program_uses_canonical_io(
-            &resolved.facts,
-            &resolved.program,
-        );
-    if uses_compiler_known_io {
-        resolved.program = compiler_known_io::augment_program(&resolved.program);
-    }
-    if compiler_known_stream::resolved_facts_use_streams(&resolved.facts) {
-        resolved.program =
-            compiler_known_stream::augment_program_for(&resolved.program, &resolved.facts);
-    }
-    if compiler_known_time::resolved_facts_use_time(&resolved.facts) {
-        resolved.program = compiler_known_time::augment_program(&resolved.program);
-    }
-    if compiler_known_concurrency::resolved_facts_use_concurrency(&resolved.facts) {
-        resolved.program = compiler_known_concurrency::augment_program(&resolved.program);
-    }
-    if compiler_known_term::resolved_facts_use_term(&resolved.facts) {
-        resolved.program = compiler_known_term::augment_program(&resolved.program);
-    }
-    if compiler_known_text::source_uses_graphemes(source) {
-        resolved.program = compiler_known_text::augment_program(&resolved.program);
-    }
-    if compiler_known_test::resolved_facts_use_assertion_surface(&resolved.facts) {
-        resolved.program = compiler_known_test::augment_program(&resolved.program);
-    }
+    resolved.program = augment_compiler_known(
+        &resolved.program,
+        &resolved.facts,
+        compiler_known_io::source_uses_io_intrinsics(source)?,
+        compiler_known_text::source_uses_graphemes(source),
+    );
     let source_context = testing::SourceSemanticContext::standalone(context.clone());
     let (evaluation, _) = const_eval::evaluate_program_with_diagnostics(&resolved.program);
     let elaboration = testing::elaborate_source(

@@ -1,0 +1,15 @@
+// Walks grapheme clusters in a program that does no I/O. The status is the
+// total width: 1 + 2 + 2 + 1 = 6.
+function cells(string $text): int
+{
+    writable int $total = 0;
+    foreach ($text->graphemes as string $grapheme) {
+        $total += $grapheme->displayWidth;
+    }
+    return $total;
+}
+
+function main(): int
+{
+    return cells("a日👍🏾é");
+}

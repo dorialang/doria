@@ -19129,25 +19129,10 @@ impl<'program> Checker<'program> {
 
     /// The type checker's view of one type in the String surface table.
     fn string_surface_type(&mut self, ty: crate::string_surface::StringValueType) -> TypeId {
-        use crate::string_surface::StringValueType as T;
-        let string = self.types.intern(TypeKind::String);
-        let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
-        match ty {
-            T::String => string,
-            T::Int => int,
-            T::Bool => self.types.intern(TypeKind::Bool),
-            T::Bytes => self.types.intern(TypeKind::Bytes),
-            T::ByteRegion => self.types.intern_resolved(&ResolvedType::ByteRegion(
-                crate::types::ByteRegionKind::Readonly,
-            )),
-            T::NullableInt => self.types.intern(TypeKind::Nullable(int)),
-            T::NullableString => self.types.intern(TypeKind::Nullable(string)),
-            T::StringList => self.types.intern(TypeKind::List(string)),
-            T::StringIterable => self.types.intern_resolved(&ResolvedType::Interface(
-                crate::types::InterfaceType::new("Iterable", vec![ResolvedType::String]),
-            )),
-            // Pending members: nothing reads their result type.
-            T::Ordering | T::Undecided => self.types.unknown(),
+        // A pending member's type is not executable; nothing reads it.
+        match ty.resolved() {
+            Some(resolved) => self.types.intern_resolved(&resolved),
+            None => self.types.unknown(),
         }
     }
 

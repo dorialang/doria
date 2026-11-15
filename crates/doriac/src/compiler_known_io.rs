@@ -258,6 +258,32 @@ pub fn resolved_program_uses_canonical_io(facts: &GlobalSymbolFacts, program: &P
     })
 }
 
+/// Whether `program`, as the compiler will check it, has interface slots:
+/// an interface declaration, a trait requirement, or a class that implements
+/// an interface with requirements. Slots share the automatic-effect
+/// transport of structural calls, so they need the I/O identities even when
+/// no declaration in the program performs I/O. Unlike
+/// [`resolved_program_uses_canonical_io`], this reads declarations rather than
+/// authored names, so it also sees what compiler-known modules add.
+pub fn program_uses_interface_slots(program: &Program) -> bool {
+    let has_slots = |name: &str| {
+        crate::compiler_known_contracts::interfaces()
+            .any(|interface| interface.name == name && !interface.requirements.is_empty())
+            || program.items.iter().any(
+                |item| matches!(item, Item::Interface(declaration) if declaration.name == name),
+            )
+    };
+    program.items.iter().any(|item| match item {
+        Item::Interface(_) => true,
+        Item::Trait(_) => declares_trait_requirement(item),
+        Item::Class(class) => class
+            .implements
+            .iter()
+            .any(|conformance| has_slots(&conformance.ty.name)),
+        _ => false,
+    })
+}
+
 fn declares_trait_requirement(item: &Item) -> bool {
     let Item::Trait(declaration) = item else {
         return false;

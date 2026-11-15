@@ -441,3 +441,29 @@ function main(): void
         );
     }
 }
+
+/// A program that does no I/O can walk graphemes: the view's interface slots
+/// bring the I/O identities the checker needs, although no authored name
+/// refers to them.
+#[test]
+fn graphemes_compile_in_programs_without_io() {
+    for (name, source) in [
+        (
+            "function",
+            "function cells(string $text): int\n{\n    writable int $total = 0;\n    foreach ($text->graphemes as string $g) {\n        $total += $g->displayWidth;\n    }\n    return $total;\n}\n\nfunction main(): int\n{\n    return cells(\"a\");\n}\n",
+        ),
+        (
+            "library method",
+            "class Line\n{\n    function __construct(internal string $text) {}\n\n    function cells(): int\n    {\n        writable int $total = 0;\n        foreach ($this->text->graphemes as string $g) {\n            $total += $g->displayWidth;\n        }\n        return $total;\n    }\n}\n",
+        ),
+    ] {
+        // A library has no `main` to lower, so it is checked; a program is
+        // lowered to MIR as well.
+        let result = if source.contains("function main") {
+            doriac::lower_source_to_mir("no-io.doria", source).map(|_| ())
+        } else {
+            doriac::check_source("no-io.doria", source).map(|_| ())
+        };
+        result.unwrap_or_else(|diagnostics| panic!("{name}: {diagnostics:#?}"));
+    }
+}
