@@ -14371,6 +14371,7 @@ fn lower_string_intrinsic_call(
             }
             let kind = match property.as_str() {
                 "length" => mir::StringIntrinsicKind::GraphemeLength,
+                "displayWidth" => mir::StringIntrinsicKind::DisplayWidth,
                 "byteLength" => mir::StringIntrinsicKind::ByteLength,
                 "isEmpty" => mir::StringIntrinsicKind::IsEmpty,
                 "bytes" => mir::StringIntrinsicKind::ToBytes,
@@ -14497,7 +14498,9 @@ fn string_intrinsic_signature(
             vec![None],
             mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
         ),
-        Kind::GraphemeLength | Kind::ByteLength => (vec![string], vec!["text"], vec![None], int),
+        Kind::GraphemeLength | Kind::DisplayWidth | Kind::ByteLength => {
+            (vec![string], vec!["text"], vec![None], int)
+        }
         Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
         Kind::AssertionDifference => (
             vec![string, string, int],
@@ -14693,6 +14696,7 @@ const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {
     match kind {
         Kind::Hash => "<hash>",
         Kind::GraphemeLength => "length",
+        Kind::DisplayWidth => "displayWidth",
         Kind::ByteLength => "byteLength",
         Kind::IsEmpty => "isEmpty",
         Kind::ToBytes => "bytes",

@@ -3439,7 +3439,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
                 .is_some_and(|ty| matches!(ty, ResolvedType::String))
                 && matches!(
                     property.as_str(),
-                    "length" | "byteLength" | "isEmpty" | "bytes" | "byteRegion"
+                    "length" | "displayWidth" | "byteLength" | "isEmpty" | "bytes" | "byteRegion"
                 )
             {
                 return Err(unsupported_string_runtime_shape(

@@ -273,10 +273,10 @@
             "natural and locale-aware comparison",
             "edit distance and similarity",
             "word, sentence, and line segmentation",
-            "display width and wrapping",
+            "wrapping (display width became `$text->displayWidth` under Decision 0146, 2026-11-15)",
             "phonetic keys"
         ],
-        "note": "The entry rows preserve the 2026-07-30 audit classification. This resolution is the authoritative approval overlay."
+        "note": "The entry rows preserve the 2026-07-30 audit classification, except a row whose notes name a later accepted decision that changed it. This resolution is the authoritative approval overlay."
     },
     "entries": [
         {
@@ -3498,18 +3498,18 @@
             "phpCategory": "text layout",
             "phpUnit": "display-width",
             "phpSummary": "Return width of string",
-            "doriaClassification": "Text Layout Domain",
-            "doriaOwner": "text-layout domain (module name unresolved)",
-            "doriaCanonicalSpelling": null,
-            "doriaStatus": "domain-owned",
-            "migrationAction": "Unsupported Until Named Dependency Lands",
+            "doriaClassification": "Existing String Intrinsic",
+            "doriaOwner": "string intrinsic surface",
+            "doriaCanonicalSpelling": "$text->displayWidth",
+            "doriaStatus": "accepted-current",
+            "migrationAction": "Rewrite With Semantic Warning",
             "semanticDifferences": [
-                "Display width and wrapping depend on terminal/font/line-break policy."
+                "PHP measures each code point in the selected encoding; Doria measures grapheme clusters, so an emoji sequence takes two cells and a combining mark none."
             ],
             "decisionRequired": false,
-            "dependency": "text-layout API; terminal integration may involve Doria\\Std\\Term",
+            "dependency": null,
             "canonicalPhpName": null,
-            "notes": "Not ordinary String length or slicing."
+            "notes": "Accepted by Decision 0146 (Andrew, 2026-11-15). Wrapping and width-limited truncation (mb_strimwidth) remain text-layout work."
         },
         {
             "phpSurface": "mbstring",

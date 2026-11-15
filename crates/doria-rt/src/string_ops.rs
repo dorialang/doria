@@ -615,6 +615,11 @@ pub unsafe extern "C" fn dr_v1_string_grapheme_length(value: *const DrStringV1) 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn dr_v1_string_display_width(value: *const DrStringV1) -> usize {
+    doria_unicode::display_width(text(value))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dr_v1_string_is_empty(value: *const DrStringV1) -> u8 {
     u8::from(crate::dr_v1_string_byte_length(value) == 0)
 }
@@ -1142,6 +1147,7 @@ mod tests {
         unsafe {
             let family = string("👨‍👩‍👧‍👦");
             assert_eq!(dr_v1_string_grapheme_length(family), 1);
+            assert_eq!(dr_v1_string_display_width(family), 2);
             assert_eq!(crate::dr_v1_string_byte_length(family), 25);
             assert_eq!(dr_v1_string_is_empty(family), 0);
 

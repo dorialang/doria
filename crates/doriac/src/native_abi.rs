@@ -111,6 +111,7 @@ pub const STRING_LENGTH: &str = "dr_v1_string_length";
 pub const STRING_BYTE_LENGTH: &str = "dr_v1_string_byte_length";
 pub const STRING_HASH: &str = "dr_v1_string_hash";
 pub const STRING_GRAPHEME_LENGTH: &str = "dr_v1_string_grapheme_length";
+pub const STRING_DISPLAY_WIDTH: &str = "dr_v1_string_display_width";
 pub const STRING_IS_EMPTY: &str = "dr_v1_string_is_empty";
 pub const STRING_TO_BYTES: &str = "dr_v1_string_to_bytes";
 pub const STRING_TRIM: &str = "dr_v2_string_trim";

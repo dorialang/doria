@@ -16115,12 +16115,12 @@ impl<'a> Interpreter<'a> {
                     IntegerValue::from_i128(IntegerType::UInt64, i128::from(hash)).unwrap(),
                 ))?;
             }
-            Kind::GraphemeLength | Kind::ByteLength => {
+            Kind::GraphemeLength | Kind::DisplayWidth | Kind::ByteLength => {
                 let text = local_string(&arguments, 0)?;
-                let length = if kind == Kind::GraphemeLength {
-                    doria_unicode::grapheme_count(text)
-                } else {
-                    doria_unicode::byte_length(text)
+                let length = match kind {
+                    Kind::GraphemeLength => doria_unicode::grapheme_count(text),
+                    Kind::DisplayWidth => doria_unicode::display_width(text),
+                    _ => doria_unicode::byte_length(text),
                 };
                 let Some(value) = i64::try_from(length).ok().and_then(|value| {
                     IntegerValue::from_i128(IntegerType::Int64, i128::from(value))

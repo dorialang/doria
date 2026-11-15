@@ -14,6 +14,7 @@ function main(): void
     let $text = " Dória 👍🏾 ";
     int $length = $text->length;
     int $byteLength = $text->byteLength;
+    int $displayWidth = $text->displayWidth;
     bool $empty = $text->isEmpty;
     Bytes $bytes = $text->bytes;
 

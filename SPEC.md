@@ -822,13 +822,15 @@ let $person = $repository->findById($id);
 ```
 
 Type-coupled vocabulary belongs to the type companion. For `string`,
-`$text->length`, `$text->byteLength`, `$text->isEmpty`, `$text->bytes`,
-`$text->graphemes`, and `$text->codePoints` are intrinsic properties or views;
+`$text->length`, `$text->displayWidth`, `$text->byteLength`, `$text->isEmpty`,
+`$text->bytes`, `$text->graphemes`, and `$text->codePoints` are intrinsic
+properties or views;
 all string-specific operations use the `String::` companion. Doria has no
 public `str_*` family and no instance-method aliases such as `$text->trim()`.
 
 A Doria `string` always contains valid UTF-8. `$text->length` counts Unicode
-extended grapheme clusters, while `$text->byteLength` reports exact UTF-8
+extended grapheme clusters, `$text->displayWidth` counts the terminal cells
+the text occupies (Decision 0146), and `$text->byteLength` reports exact UTF-8
 bytes. Search indices, slicing, and padding lengths use grapheme units.
 `$text->graphemes` traverses extended grapheme clusters and
 `$text->codePoints` traverses Unicode scalar values. Integer indexing on a
@@ -836,7 +838,8 @@ bytes. Search indices, slicing, and padding lengths use grapheme units.
 `String::trim`/`trimStart`/`trimEnd`, `lower`/`upper`, predicates and search,
 replacement, `split`/`join`, `slice`, `repeat`, padding, `fromBytes`, and
 comparison. Decision 0103 defines the reviewed v1 inventory. The executable
-surface includes `length`, `byteLength`, `isEmpty`, `bytes`, trimming, default
+surface includes `length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`,
+trimming, default
 Unicode casing and case folding, predicates, grapheme-indexed search,
 replacement, `split`/`join`, `slice`, `repeat`, padding, and UTF-8-validating
 `fromBytes`. It also includes the reviewed ignore-case search family,

@@ -235,7 +235,8 @@ the wait, as a timeout is, and it consumes no input.
 - **No allocation per styled write.** `Color`, `Style`, `Size`, `Position` and
   `KeyModifiers` are inline Copy values, like the standard views.
 - **Console does not measure text.** Display width is a string question owned
-  by the String API. Console does not clip, wrap or pad.
+  by the String API (`$text->displayWidth`, Decision 0146). Console does not
+  clip, wrap or pad.
 
 ### Raw mode
 

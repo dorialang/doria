@@ -11,7 +11,10 @@ use core::ops::Range;
 use icu_casemap::CaseMapper;
 use icu_locale_core::LanguageIdentifier;
 use icu_properties::{
-    props::{GraphemeClusterBreak, WhiteSpace},
+    props::{
+        DefaultIgnorableCodePoint, EastAsianWidth, Emoji, EmojiPresentation, GeneralCategory,
+        GraphemeClusterBreak, WhiteSpace,
+    },
     CodePointMapData, CodePointSetData,
 };
 use icu_segmenter::GraphemeClusterSegmenter;
@@ -90,6 +93,61 @@ pub fn grapheme_count(text: &str) -> usize {
 
 pub const fn byte_length(text: &str) -> usize {
     text.len()
+}
+
+/// The number of terminal cells `text` occupies: the sum of its grapheme
+/// clusters' widths. See [`grapheme_display_width`] for one cluster.
+pub fn display_width(text: &str) -> usize {
+    if text.is_ascii() {
+        // Every ASCII character is its own cell except the control characters.
+        return text
+            .bytes()
+            .filter(|byte| matches!(byte, 0x20..=0x7e))
+            .count();
+    }
+    let mut width = 0;
+    let mut start = 0;
+    for end in grapheme_boundaries(text).skip(1) {
+        width += grapheme_display_width(&text[start..end]);
+        start = end;
+    }
+    width
+}
+
+/// The cells one grapheme cluster occupies. The first character that is drawn
+/// decides: an East Asian Wide or Fullwidth character takes two cells, as does
+/// an emoji shown as an emoji (by default, or chosen with U+FE0F). Every other
+/// drawn character takes one cell, East Asian Ambiguous characters included.
+/// A cluster with nothing drawn takes none: control characters, line and
+/// paragraph separators, format characters, combining marks and default
+/// ignorable characters are not drawn.
+pub fn grapheme_display_width(cluster: &str) -> usize {
+    let Some(base) = cluster.chars().find(|character| is_drawn(*character)) else {
+        return 0;
+    };
+    let wide = matches!(
+        CodePointMapData::<EastAsianWidth>::new().get(base),
+        EastAsianWidth::Wide | EastAsianWidth::Fullwidth
+    );
+    let emoji = CodePointSetData::new::<EmojiPresentation>().contains(base)
+        || (CodePointSetData::new::<Emoji>().contains(base) && cluster.contains('\u{fe0f}'));
+    if wide || emoji {
+        2
+    } else {
+        1
+    }
+}
+
+fn is_drawn(character: char) -> bool {
+    !matches!(
+        CodePointMapData::<GeneralCategory>::new().get(character),
+        GeneralCategory::Control
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
+            | GeneralCategory::Format
+            | GeneralCategory::NonspacingMark
+            | GeneralCategory::EnclosingMark
+    ) && !CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(character)
 }
 
 pub const fn is_empty(text: &str) -> bool {
@@ -781,6 +839,38 @@ mod tests {
         assert_eq!(grapheme_count("👍🏾"), 1);
         assert_eq!(grapheme_count("🇿🇲"), 1);
         assert_eq!(grapheme_count("👨‍👩‍👧‍👦"), 1);
+    }
+
+    #[test]
+    fn measures_terminal_cells_per_grapheme_cluster() {
+        assert_eq!(display_width(""), 0);
+        assert_eq!(display_width("Doria"), 5);
+        // Control characters, tab and newline included, are not drawn.
+        assert_eq!(display_width("a\tb\r\n\u{7f}"), 2);
+        // A combining mark joins its base; on its own it is still not drawn.
+        assert_eq!(display_width("e\u{301}"), 1);
+        assert_eq!(display_width("\u{301}"), 0);
+        // East Asian Wide and Fullwidth take two cells, Halfwidth one.
+        assert_eq!(display_width("日本語"), 6);
+        assert_eq!(display_width("한국어"), 6);
+        assert_eq!(display_width("\u{1100}\u{1161}\u{11a8}"), 2);
+        assert_eq!(display_width("ＡＢ"), 4);
+        assert_eq!(display_width("ｱｲ"), 2);
+        // Ambiguous characters take one cell.
+        assert_eq!(display_width("±·Ω"), 3);
+        // Emoji shown as emoji take two cells, whatever joins them.
+        assert_eq!(display_width("👍"), 2);
+        assert_eq!(display_width("👍🏾"), 2);
+        assert_eq!(display_width("🇿🇲"), 2);
+        assert_eq!(display_width("👨‍👩‍👧‍👦"), 2);
+        // A text-style emoji takes one cell until U+FE0F asks for the emoji.
+        assert_eq!(display_width("\u{2764}"), 1);
+        assert_eq!(display_width("\u{2764}\u{fe0f}"), 2);
+        // Format and default ignorable characters are not drawn.
+        assert_eq!(display_width("a\u{200b}b\u{200d}c\u{00ad}\u{2060}"), 3);
+        assert_eq!(display_width("\u{2028}\u{2029}"), 0);
+        // ASCII and the general path agree.
+        assert_eq!(display_width("a b"), display_width("a b\u{301}"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Decision 0103: Canonical String API And Companion Boundary
 
-**Status:** Accepted (amended by the Minimum String Runtime Surface)
+**Status:** Accepted (amended by the Minimum String Runtime Surface; Decision
+0146 adds `displayWidth`)
 
 ## Context
 
@@ -38,6 +39,7 @@ string value:
 
 ```doria
 $text->length
+$text->displayWidth
 $text->byteLength
 $text->isEmpty
 $text->bytes
@@ -54,6 +56,8 @@ A Doria `string` always contains valid UTF-8. Invalid UTF-8 remains in `Bytes`
 until explicitly validated and converted.
 
 - `length` is the number of Unicode extended grapheme clusters.
+- `displayWidth` is the number of terminal cells the text occupies, measured
+  per grapheme cluster as Decision 0146 specifies. Added 2026-11-15.
 - `byteLength` is the exact number of bytes in the UTF-8 representation.
 - `isEmpty` is equivalent to `byteLength == 0` and does not require traversal.
 - `bytes` exposes the UTF-8 bytes under the accepted `Bytes` contract, which is

@@ -13,6 +13,15 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- String display width, 2026-11-15, for the `Doria\Tui` library that the
+  plan's approved sequence puts after Stage 46. Decision 0146 adds
+  `$text->displayWidth`: terminal cells per grapheme cluster, 2 for an East
+  Asian Wide or Fullwidth character or an emoji, 0 for a cluster with nothing
+  drawn, 1 otherwise. One implementation in `doria-unicode`, called by the
+  interpreter and exported by `doria-rt` as `dr_v1_string_display_width`
+  (runtime ABI 18) for Cranelift and LLVM; PHP output rejects it with the
+  other String intrinsic properties. The compiler teaches it for PHP's
+  `mb_strwidth`. The library itself lives in `dorialang/doria-tui`.
 - Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
   designed and not implemented. Two records are drafted in `docs/decisions/`
   as Proposed and wait for Andrew's review, uncommitted until he has read

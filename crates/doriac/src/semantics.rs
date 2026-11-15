@@ -24019,7 +24019,7 @@ impl<'program> Checker<'program> {
                     EnumBackingType::String => self.types.intern(TypeKind::String),
                 })
             }
-            (TypeKind::String, "length" | "byteLength") => Some(int),
+            (TypeKind::String, "length" | "displayWidth" | "byteLength") => Some(int),
             (TypeKind::String, "isEmpty") => Some(bool_ty),
             (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
             (TypeKind::String, "graphemes" | "codePoints") => Some(self.types.unknown()),
@@ -24845,7 +24845,7 @@ impl<'program> Checker<'program> {
         }
         if matches!(self.types.kind(ty), TypeKind::String) {
             match property {
-                "length" | "byteLength" | "isEmpty" | "bytes" | "byteRegion" => {}
+                "length" | "displayWidth" | "byteLength" | "isEmpty" | "bytes" | "byteRegion" => {}
                 "graphemes" | "codePoints" => self.diagnostics.push(
                     Diagnostic::unsupported_stage(
                         "E0304",
@@ -24855,7 +24855,7 @@ impl<'program> Checker<'program> {
                         span,
                     )
                     .with_help(
-                        "use the executable `length`, `byteLength`, `isEmpty`, `bytes`, or `byteRegion` property",
+                        "use the executable `length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, or `byteRegion` property",
                     ),
                 ),
                 _ => self.diagnostics.push(
@@ -24865,7 +24865,7 @@ impl<'program> Checker<'program> {
                         span,
                     )
                     .with_help(
-                        "String intrinsic properties are `length`, `byteLength`, `isEmpty`, `bytes`, and `byteRegion`",
+                        "String intrinsic properties are `length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, and `byteRegion`",
                     ),
                 ),
             }

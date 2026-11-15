@@ -9506,7 +9506,7 @@ fn validate_string_intrinsic(
                 mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
             )
         }
-        Kind::GraphemeLength | Kind::ByteLength => {
+        Kind::GraphemeLength | Kind::DisplayWidth | Kind::ByteLength => {
             exact(&[string])?;
             require_string_intrinsic_result(call, int)
         }

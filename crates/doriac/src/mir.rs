@@ -1602,6 +1602,7 @@ pub enum StringIntrinsicKind {
     /// Compiler-private unboxed Hashable operation over exact UTF-8 bytes.
     Hash,
     GraphemeLength,
+    DisplayWidth,
     ByteLength,
     IsEmpty,
     ToBytes,
@@ -10016,6 +10017,7 @@ impl fmt::Display for StringIntrinsicKind {
         formatter.write_str(match self {
             Self::Hash => "hash",
             Self::GraphemeLength => "graphemeLength",
+            Self::DisplayWidth => "displayWidth",
             Self::ByteLength => "byteLength",
             Self::IsEmpty => "isEmpty",
             Self::ToBytes => "toBytes",
