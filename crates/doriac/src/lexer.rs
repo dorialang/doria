@@ -161,11 +161,114 @@ pub enum TokenKind {
     Eof,
 }
 
+/// Declares the keyword table once: [`KEYWORDS`] lists every keyword spelling
+/// and [`keyword_kind`] maps a spelling to its token. Lexing and every
+/// compiler-adjacent tool read this table; nothing restates it.
+macro_rules! keyword_table {
+    ($($text:literal => TokenKind::$kind:ident,)*) => {
+        /// Every Doria keyword, in table order.
+        pub const KEYWORDS: &[&str] = &[$($text),*];
+
+        /// The keyword token for `text`, or `None` for any other word.
+        pub fn keyword_kind(text: &str) -> Option<TokenKind> {
+            match text {
+                $($text => Some(TokenKind::$kind),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+keyword_table! {
+    "class" => TokenKind::Class,
+    "enum" => TokenKind::Enum,
+    "case" => TokenKind::Case,
+    "interface" => TokenKind::Interface,
+    "trait" => TokenKind::Trait,
+    "implements" => TokenKind::Implements,
+    "namespace" => TokenKind::Namespace,
+    "use" => TokenKind::Use,
+    "include" => TokenKind::Include,
+    "extends" => TokenKind::Extends,
+    "function" => TokenKind::Function,
+    "fn" => TokenKind::Fn,
+    "const" => TokenKind::Const,
+    "internal" => TokenKind::Internal,
+    "open" => TokenKind::Open,
+    "override" => TokenKind::Override,
+    "parameter" => TokenKind::Parameter,
+    "static" => TokenKind::Static,
+    "self" => TokenKind::SelfType,
+    "parent" => TokenKind::Parent,
+    "let" => TokenKind::Let,
+    "with" => TokenKind::With,
+    "take" => TokenKind::Take,
+    "borrow" => TokenKind::Borrow,
+    "once" => TokenKind::Once,
+    "consuming" => TokenKind::Consuming,
+    "shared" => TokenKind::Shared,
+    "writable" => TokenKind::Writable,
+    "readonly" => TokenKind::Readonly,
+    "return" => TokenKind::Return,
+    "echo" => TokenKind::Echo,
+    "new" => TokenKind::New,
+    "foreach" => TokenKind::Foreach,
+    "as" => TokenKind::As,
+    "uses" => TokenKind::Uses,
+    "insteadof" => TokenKind::Insteadof,
+    "if" => TokenKind::If,
+    "else" => TokenKind::Else,
+    "match" => TokenKind::Match,
+    "default" => TokenKind::Default,
+    "when" => TokenKind::When,
+    "given" => TokenKind::Given,
+    "try" => TokenKind::Try,
+    "catch" => TokenKind::Catch,
+    "finally" => TokenKind::Finally,
+    "while" => TokenKind::While,
+    "do" => TokenKind::Do,
+    "for" => TokenKind::For,
+    "break" => TokenKind::Break,
+    "continue" => TokenKind::Continue,
+    "throw" => TokenKind::Throw,
+    "throws" => TokenKind::Throws,
+    "true" => TokenKind::True,
+    "false" => TokenKind::False,
+    "null" => TokenKind::Null,
+    "is" => TokenKind::Is,
+    "object" => TokenKind::Object,
+    "resource" => TokenKind::Resource,
+    "void" => TokenKind::Void,
+    "int" => TokenKind::IntType,
+    "int8" => TokenKind::Int8Type,
+    "int16" => TokenKind::Int16Type,
+    "int32" => TokenKind::Int32Type,
+    "int64" => TokenKind::Int64Type,
+    "uint8" => TokenKind::UInt8Type,
+    "uint16" => TokenKind::UInt16Type,
+    "uint32" => TokenKind::UInt32Type,
+    "uint64" => TokenKind::UInt64Type,
+    "float" => TokenKind::FloatType,
+    "float32" => TokenKind::Float32Type,
+    "float64" => TokenKind::Float64Type,
+    "string" => TokenKind::StringType,
+    "bool" => TokenKind::BoolType,
+    "not" => TokenKind::Not,
+    "and" => TokenKind::And,
+    "or" => TokenKind::Or,
+    "xor" => TokenKind::Xor,
+}
+
+/// Words reserved for future syntax. They lex as [`TokenKind::Reserved`] and
+/// are not keywords anyone can write yet.
+pub const RESERVED_WORDS: &[&str] = &["async", "await", "spawn", "scope"];
+
 pub struct Lexer<'source> {
     source: &'source SourceFile,
     bytes: &'source [u8],
     index: usize,
     diagnostics: Vec<Diagnostic>,
+    comments: Vec<std::ops::Range<usize>>,
 }
 
 impl<'source> Lexer<'source> {
@@ -175,6 +278,7 @@ impl<'source> Lexer<'source> {
             bytes: source.text.as_bytes(),
             index: 0,
             diagnostics: Vec::new(),
+            comments: Vec::new(),
         }
     }
 
@@ -182,7 +286,20 @@ impl<'source> Lexer<'source> {
         Span::in_source(self.source.id, start, end)
     }
 
-    pub fn lex(mut self) -> DiagnosticResult<Vec<Token>> {
+    pub fn lex(self) -> DiagnosticResult<Vec<Token>> {
+        self.lex_with_comments().0
+    }
+
+    /// Lexes the text and also returns the byte range of every comment, in
+    /// order. An unclosed block comment's range ends at the end of the text.
+    pub fn lex_with_comments(
+        mut self,
+    ) -> (DiagnosticResult<Vec<Token>>, Vec<std::ops::Range<usize>>) {
+        let tokens = self.lex_tokens();
+        (tokens, std::mem::take(&mut self.comments))
+    }
+
+    fn lex_tokens(&mut self) -> DiagnosticResult<Vec<Token>> {
         let mut tokens = Vec::new();
 
         while !self.is_at_end() {
@@ -424,7 +541,7 @@ impl<'source> Lexer<'source> {
         if self.diagnostics.is_empty() {
             Ok(tokens)
         } else {
-            Err(self.diagnostics)
+            Err(std::mem::take(&mut self.diagnostics))
         }
     }
 
@@ -456,87 +573,13 @@ impl<'source> Lexer<'source> {
         }
 
         let text = &self.source.text[start..self.index];
-        let kind = match text {
-            "class" => TokenKind::Class,
-            "enum" => TokenKind::Enum,
-            "case" => TokenKind::Case,
-            "interface" => TokenKind::Interface,
-            "trait" => TokenKind::Trait,
-            "implements" => TokenKind::Implements,
-            "namespace" => TokenKind::Namespace,
-            "use" => TokenKind::Use,
-            "include" => TokenKind::Include,
-            "extends" => TokenKind::Extends,
-            "function" => TokenKind::Function,
-            "fn" => TokenKind::Fn,
-            "const" => TokenKind::Const,
-            "internal" => TokenKind::Internal,
-            "open" => TokenKind::Open,
-            "override" => TokenKind::Override,
-            "parameter" => TokenKind::Parameter,
-            "static" => TokenKind::Static,
-            "self" => TokenKind::SelfType,
-            "parent" => TokenKind::Parent,
-            "let" => TokenKind::Let,
-            "with" => TokenKind::With,
-            "take" => TokenKind::Take,
-            "borrow" => TokenKind::Borrow,
-            "once" => TokenKind::Once,
-            "consuming" => TokenKind::Consuming,
-            "shared" => TokenKind::Shared,
-            "writable" => TokenKind::Writable,
-            "readonly" => TokenKind::Readonly,
-            "return" => TokenKind::Return,
-            "echo" => TokenKind::Echo,
-            "new" => TokenKind::New,
-            "foreach" => TokenKind::Foreach,
-            "as" => TokenKind::As,
-            "uses" => TokenKind::Uses,
-            "insteadof" => TokenKind::Insteadof,
-            "if" => TokenKind::If,
-            "else" => TokenKind::Else,
-            "match" => TokenKind::Match,
-            "default" => TokenKind::Default,
-            "when" => TokenKind::When,
-            "given" => TokenKind::Given,
-            "try" => TokenKind::Try,
-            "catch" => TokenKind::Catch,
-            "finally" => TokenKind::Finally,
-            "while" => TokenKind::While,
-            "do" => TokenKind::Do,
-            "for" => TokenKind::For,
-            "break" => TokenKind::Break,
-            "continue" => TokenKind::Continue,
-            "throw" => TokenKind::Throw,
-            "throws" => TokenKind::Throws,
-            "true" => TokenKind::True,
-            "false" => TokenKind::False,
-            "null" => TokenKind::Null,
-            "is" => TokenKind::Is,
-            "object" => TokenKind::Object,
-            "resource" => TokenKind::Resource,
-            "void" => TokenKind::Void,
-            "int" => TokenKind::IntType,
-            "int8" => TokenKind::Int8Type,
-            "int16" => TokenKind::Int16Type,
-            "int32" => TokenKind::Int32Type,
-            "int64" => TokenKind::Int64Type,
-            "uint8" => TokenKind::UInt8Type,
-            "uint16" => TokenKind::UInt16Type,
-            "uint32" => TokenKind::UInt32Type,
-            "uint64" => TokenKind::UInt64Type,
-            "float" => TokenKind::FloatType,
-            "float32" => TokenKind::Float32Type,
-            "float64" => TokenKind::Float64Type,
-            "string" => TokenKind::StringType,
-            "bool" => TokenKind::BoolType,
-            "not" => TokenKind::Not,
-            "and" => TokenKind::And,
-            "or" => TokenKind::Or,
-            "xor" => TokenKind::Xor,
-            "async" | "await" | "spawn" | "scope" => TokenKind::Reserved(text.to_string()),
-            _ => TokenKind::Identifier(text.to_string()),
-        };
+        let kind = keyword_kind(text).unwrap_or_else(|| {
+            if RESERVED_WORDS.contains(&text) {
+                TokenKind::Reserved(text.to_string())
+            } else {
+                TokenKind::Identifier(text.to_string())
+            }
+        });
 
         Token {
             kind,
@@ -648,10 +691,12 @@ impl<'source> Lexer<'source> {
                 self.advance();
             }
 
+            let start = self.index;
             if self.peek() == Some(b'/') && self.peek_next() == Some(b'/') {
                 while !matches!(self.peek(), None | Some(b'\n')) {
                     self.advance();
                 }
+                self.comments.push(start..self.index);
                 continue;
             }
 
@@ -659,6 +704,7 @@ impl<'source> Lexer<'source> {
                 while !matches!(self.peek(), None | Some(b'\n')) {
                     self.advance();
                 }
+                self.comments.push(start..self.index);
                 continue;
             }
 
@@ -667,12 +713,15 @@ impl<'source> Lexer<'source> {
                 self.advance();
                 while !(self.peek() == Some(b'*') && self.peek_next() == Some(b'/')) {
                     if self.is_at_end() {
+                        // An unclosed comment runs to the end of the text.
+                        self.comments.push(start..self.index);
                         return;
                     }
                     self.advance();
                 }
                 self.advance();
                 self.advance();
+                self.comments.push(start..self.index);
                 continue;
             }
 

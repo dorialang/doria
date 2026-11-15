@@ -18,6 +18,40 @@ pub struct Parser {
     qualified_names: Vec<QualifiedNameRef>,
     attributes: Vec<AttributeAttachment>,
     diagnostics: Vec<Diagnostic>,
+    /// `Some` while answering [`crate::syntax::completion_context`]: the
+    /// construct that first reached the end of the text, once one has.
+    completion: Option<Option<crate::syntax::CompletionContext>>,
+    /// How many diagnostics existed when the parser reached the end of the
+    /// tokens. A construct marks the cursor only while no diagnostic has been
+    /// added since, so recovery from an error at the cursor marks nothing.
+    cursor_arrival: Option<usize>,
+    /// `Some` while asking whether the parser accepts the token at an index.
+    token_trial: Option<TokenTrial>,
+    /// The token kinds a trial's parse paths tested right after the trial
+    /// token, once they had consumed it.
+    trial_followers: std::cell::RefCell<Vec<TokenKind>>,
+}
+
+/// What a token trial found: whether a parse path took the token, and which
+/// tokens the paths that consumed it asked for next.
+pub(crate) struct TokenTrialOutcome {
+    pub(crate) accepted: bool,
+    pub(crate) followers: Vec<TokenKind>,
+}
+
+/// Whether some parse path takes the token at `index`: it consumes the token
+/// with no error since reaching it, and the first error it reports afterwards,
+/// if any, is not on the token.
+#[derive(Clone, Copy)]
+struct TokenTrial {
+    index: usize,
+    span: Span,
+    /// How many diagnostics existed when the parser reached the token.
+    arrival: Option<usize>,
+    /// How many diagnostics existed when a path consumed the token, until that
+    /// path's next diagnostic is judged.
+    consumed: Option<usize>,
+    accepted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +89,117 @@ impl Parser {
             qualified_names: Vec::new(),
             attributes: Vec::new(),
             diagnostics: Vec::new(),
+            completion: None,
+            cursor_arrival: None,
+            token_trial: None,
+            trial_followers: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Whether the parser accepts the token at `index`: some parse path,
+    /// speculative ones included, consumes it before reporting an error after
+    /// reaching it (see [`crate::syntax`]).
+    pub(crate) fn token_trial_at(mut self, index: usize) -> TokenTrialOutcome {
+        self.token_trial = Some(TokenTrial {
+            index,
+            span: self.tokens[index].span,
+            arrival: None,
+            consumed: None,
+            accepted: false,
+        });
+        self.note_trial_arrival();
+        let _ = self.parse_source_items();
+        self.judge_trial();
+        TokenTrialOutcome {
+            accepted: self.token_trial.is_some_and(|trial| trial.accepted),
+            followers: self.trial_followers.take(),
+        }
+    }
+
+    /// Judges the path that consumed the trial token by its next diagnostic:
+    /// one on the token rejects it there; one elsewhere, or none by the end,
+    /// accepts it.
+    fn judge_trial(&mut self) {
+        let Some(trial) = self.token_trial.as_mut() else {
+            return;
+        };
+        let Some(count) = trial.consumed else {
+            return;
+        };
+        match self.diagnostics.get(count) {
+            Some(diagnostic) => {
+                let span = diagnostic.span;
+                let on_token = span.start >= trial.span.start && span.start < trial.span.end;
+                trial.accepted |= !on_token;
+                trial.consumed = None;
+            }
+            None if self.current + 1 >= self.tokens.len() => {
+                trial.accepted = true;
+                trial.consumed = None;
+            }
+            None => {}
+        }
+    }
+
+    fn note_trial_arrival(&mut self) {
+        let current = self.current;
+        let count = self.diagnostics.len();
+        if let Some(trial) = self.token_trial.as_mut() {
+            if current == trial.index && trial.arrival.is_none() {
+                trial.arrival = Some(count);
+            }
+        }
+    }
+
+    /// The construct that first reaches the end of the tokens, which is where
+    /// the cursor is (see [`crate::syntax`]). `None` when no recorded
+    /// construct reaches it.
+    pub(crate) fn completion_context(mut self) -> Option<crate::syntax::CompletionContext> {
+        self.completion = Some(None);
+        self.note_cursor_arrival();
+        let _ = self.parse_source_items();
+        self.completion.flatten()
+    }
+
+    /// Records `context` for completion when the parser is at the end of the
+    /// tokens. The first construct to record wins: it is the outermost one
+    /// that reaches the cursor.
+    fn mark_cursor(&mut self, context: crate::syntax::CompletionContext) {
+        self.mark_cursor_at(self.current, context);
+    }
+
+    /// As [`Self::mark_cursor`], for the token at `index`, used where the
+    /// parser decides by looking one token ahead.
+    fn mark_cursor_at(&mut self, index: usize, context: crate::syntax::CompletionContext) {
+        let undisturbed = self
+            .cursor_arrival
+            .is_none_or(|count| count == self.diagnostics.len());
+        if let Some(slot @ None) = self.completion.as_mut() {
+            if undisturbed
+                && self
+                    .tokens
+                    .get(index)
+                    .is_some_and(|token| matches!(token.kind, TokenKind::Eof))
+            {
+                *slot = Some(context);
+            }
+        }
+    }
+
+    fn note_cursor_arrival(&mut self) {
+        if self.completion.is_some() && self.cursor_arrival.is_none() && self.is_at_end() {
+            self.cursor_arrival = Some(self.diagnostics.len());
+        }
+    }
+
+    /// `function` followed by a name declares a function. The cursor right
+    /// after `function` is where that name goes.
+    fn mark_function_name(&mut self) {
+        if self.check(&TokenKind::Function) {
+            self.mark_cursor_at(
+                self.current + 1,
+                crate::syntax::CompletionContext::DeclarationName,
+            );
         }
     }
 
@@ -63,6 +208,32 @@ impl Parser {
     }
 
     pub fn parse_program(mut self) -> DiagnosticResult<Program> {
+        let (namespace, imports, includes, items) = self.parse_source_items();
+        if self.diagnostics.is_empty() {
+            Ok(Program {
+                namespace,
+                imports,
+                includes,
+                qualified_names: self.qualified_names,
+                attributes: self.attributes,
+                items,
+            })
+        } else {
+            Err(self.diagnostics)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn parse_source_items(
+        &mut self,
+    ) -> (
+        Option<NamespaceDecl>,
+        Vec<UseDecl>,
+        Vec<IncludeDecl>,
+        Vec<Item>,
+    ) {
+        use crate::syntax::CompletionContext;
+        self.mark_cursor(CompletionContext::TopLevel);
         let mut namespace_seen = false;
         let namespace = if self.match_kind(&TokenKind::Namespace) {
             namespace_seen = true;
@@ -74,7 +245,11 @@ impl Parser {
         let mut includes = Vec::new();
         let mut items = Vec::new();
 
-        while !self.is_at_end() {
+        loop {
+            self.mark_cursor(CompletionContext::TopLevel);
+            if self.is_at_end() {
+                break;
+            }
             if self.match_kind(&TokenKind::Namespace) {
                 let keyword_span = self.previous().span;
                 let duplicate = namespace_seen;
@@ -121,19 +296,7 @@ impl Parser {
                 }
             }
         }
-
-        if self.diagnostics.is_empty() {
-            Ok(Program {
-                namespace,
-                imports,
-                includes,
-                qualified_names: self.qualified_names,
-                attributes: self.attributes,
-                items,
-            })
-        } else {
-            Err(self.diagnostics)
-        }
+        (namespace, imports, includes, items)
     }
 
     fn checkpoint(&self) -> ParserCheckpoint {
@@ -147,6 +310,23 @@ impl Parser {
     }
 
     fn restore_checkpoint(&mut self, checkpoint: ParserCheckpoint) {
+        if self.tokens[checkpoint.current].kind != TokenKind::Eof {
+            self.cursor_arrival = None;
+        }
+        if self.token_trial.is_some() {
+            self.judge_trial();
+            if let Some(trial) = self.token_trial.as_mut() {
+                if checkpoint.current <= trial.index {
+                    trial.arrival = None;
+                    // A path that ends without a diagnostic after the token
+                    // took it.
+                    if trial.consumed.is_some() {
+                        trial.accepted = true;
+                        trial.consumed = None;
+                    }
+                }
+            }
+        }
         self.current = checkpoint.current;
         self.pending_type_argument_close = checkpoint.pending_type_argument_close;
         self.qualified_names
@@ -156,6 +336,9 @@ impl Parser {
     }
 
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
+        self.mark_cursor(crate::syntax::CompletionContext::NamespacePath {
+            qualifier: String::new(),
+        });
         let keyword_span = self.previous().span;
         if self.check(&TokenKind::Semicolon) || self.is_at_end() {
             self.diagnostics.push(
@@ -197,6 +380,9 @@ impl Parser {
     }
 
     fn parse_use_decl(&mut self) -> Option<UseDecl> {
+        self.mark_cursor(crate::syntax::CompletionContext::NamespacePath {
+            qualifier: String::new(),
+        });
         let keyword_span = self.previous().span;
         if self.check(&TokenKind::Function) || self.check(&TokenKind::Const) {
             let rejected = self.advance().clone();
@@ -467,6 +653,7 @@ impl Parser {
         let declaration_start = open_span
             .or(override_span)
             .map_or_else(|| self.peek().span.start, |span| span.start);
+        self.mark_function_name();
         let item = if self.match_kind(&TokenKind::Class) {
             if let Some(span) = override_span {
                 self.diagnostics.push(
@@ -860,6 +1047,7 @@ impl Parser {
         let override_span = self
             .match_kind(&TokenKind::Override)
             .then(|| self.previous().span);
+        self.mark_function_name();
         if self.match_kind(&TokenKind::Class) {
             if let Some(span) = override_span {
                 self.reject_type_modifier(None, Some(span), "a class");
@@ -930,6 +1118,7 @@ impl Parser {
     }
 
     fn parse_enum(&mut self, access: MemberAccess, start: usize) -> Option<EnumDecl> {
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected enum name")?;
         let name_span = self.previous().span;
         let (type_params, _) = self.parse_type_params()?;
@@ -945,6 +1134,7 @@ impl Parser {
             let attributes = self.parse_attribute_groups()?;
             let case_start = self.peek().span.start;
             self.expect(TokenKind::Case, "expected `case` in enum body")?;
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let name = self.expect_identifier("expected enum case name")?;
             let name_span = self.previous().span;
             let payload = if self.match_kind(&TokenKind::LeftParen) {
@@ -1003,6 +1193,7 @@ impl Parser {
             let attributes = self.parse_attribute_groups()?;
             let start = self.peek().span.start;
             let ty = self.parse_type_ref()?;
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let (name, name_span) = self.expect_variable("expected enum payload variable")?;
             let field = EnumPayloadField {
                 ty,
@@ -1032,6 +1223,7 @@ impl Parser {
         start: usize,
     ) -> Option<ClassDecl> {
         let keyword_span = self.previous().span;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected class name")?;
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
@@ -1091,6 +1283,7 @@ impl Parser {
 
     fn parse_trait(&mut self, access: MemberAccess, start: usize) -> Option<TraitDecl> {
         let keyword_span = self.previous().span;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected trait name")?;
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
@@ -1249,6 +1442,7 @@ impl Parser {
             self.reject_attribute_after_modifier(self.peek().span);
             let _ = self.parse_attribute_groups();
         }
+        self.mark_function_name();
         if self.check(&TokenKind::Function)
             && self.tokens.get(self.current + 1).is_some_and(|token| {
                 Self::is_callable_name_token(token) || matches!(token.kind, TokenKind::Reserved(_))
@@ -1287,6 +1481,7 @@ impl Parser {
         }
         let start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected property variable name")?;
         let availability = self.parse_nominal_condition()?;
         let initializer = if self.match_kind(&TokenKind::Equals) {
@@ -1522,6 +1717,7 @@ impl Parser {
         } else {
             Some(self.parse_type_ref()?)
         };
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_identifier("expected constant name")?;
         let name_span = self.previous().span;
         self.expect(TokenKind::Equals, "expected `=` after constant name")?;
@@ -1561,6 +1757,7 @@ impl Parser {
         } = modifiers;
         let keyword_span = self.previous().span;
         let start = start_span.start;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = if is_member && matches!(self.peek().kind, TokenKind::Reserved(_)) {
             self.expect_member_name("expected function name")?
         } else {
@@ -1688,6 +1885,7 @@ impl Parser {
             let attributes = self.parse_attribute_groups()?;
             self.reject_attribute_target(&attributes, "type parameters");
             let start = self.peek().span.start;
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let name = self.expect_identifier("expected type-parameter name")?;
             let mut constraints = Vec::new();
             if self.match_kind(&TokenKind::Implements) {
@@ -1743,6 +1941,7 @@ impl Parser {
 
     fn parse_interface(&mut self, access: MemberAccess, start: usize) -> Option<InterfaceDecl> {
         let keyword_span = self.previous().span;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected interface name")?;
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
@@ -1915,7 +2114,11 @@ impl Parser {
 
     fn parse_declaration_members(&mut self, allow_requirement: bool) -> Vec<ClassMember> {
         let mut members = Vec::new();
-        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+        loop {
+            self.mark_cursor(crate::syntax::CompletionContext::MemberDeclaration);
+            if self.check(&TokenKind::RightBrace) || self.is_at_end() {
+                break;
+            }
             if matches!(
                 self.peek().kind,
                 TokenKind::Class
@@ -2092,6 +2295,7 @@ impl Parser {
             let alias = if internal_span.is_some() && self.check(&TokenKind::Semicolon) {
                 None
             } else {
+                self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
                 let text = self.expect_identifier("expected an alias or `internal` after `as`")?;
                 Some(NameRef {
                     text,
@@ -2123,6 +2327,11 @@ impl Parser {
     }
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: true,
+            constructor_roles_allowed: is_constructor,
+        });
         let attributes = self.parse_attribute_groups()?;
         let start = self.peek().span.start;
         let mut authored_roles = Vec::new();
@@ -2384,6 +2593,7 @@ impl Parser {
             );
             return None;
         }
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected parameter variable name")?;
         let default = if self.match_kind(&TokenKind::Equals) {
             Some(self.parse_expression()?)
@@ -2541,6 +2751,11 @@ impl Parser {
     }
 
     fn parse_closure_parameter(&mut self) -> Option<ClosureParameter> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: true,
+            constructor_roles_allowed: false,
+        });
         let start = self.peek().span.start;
         let ownership_modifier_insert = self.span(start, start);
         let mut take_span = None;
@@ -2587,6 +2802,7 @@ impl Parser {
         let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let type_span = self.span(type_start, self.previous().span.end);
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected closure parameter variable name")?;
         if self.match_kind(&TokenKind::Equals) {
             let equals = self.previous().span;
@@ -2773,7 +2989,11 @@ impl Parser {
             .start;
         let mut statements = Vec::new();
 
-        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+        loop {
+            self.mark_cursor(crate::syntax::CompletionContext::Statement);
+            if self.check(&TokenKind::RightBrace) || self.is_at_end() {
+                break;
+            }
             if let Some(statement) = self.parse_statement() {
                 statements.push(statement);
             } else {
@@ -3081,6 +3301,7 @@ impl Parser {
         semicolon_message: &str,
     ) -> Option<VarDecl> {
         let writable = self.match_kind(&TokenKind::Writable);
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected variable name after `let`")?;
         self.parse_var_decl_after_first_name(
             start,
@@ -3108,6 +3329,7 @@ impl Parser {
         let start = self.peek().span.start;
         let writable = self.match_kind(&TokenKind::Writable);
         if let Some(ty) = self.parse_type_ref() {
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             if let Some(first_name) = self.consume_variable() {
                 return self
                     .parse_var_decl_after_first_name(
@@ -3212,6 +3434,7 @@ impl Parser {
                 return None;
             }
 
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let (name, span) =
                 self.expect_variable("expected variable name after `,` in grouped declaration")?;
             bindings.push(VarBinding { name, span });
@@ -3705,6 +3928,7 @@ impl Parser {
         let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let type_span = self.span(type_start, self.previous().span.end);
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected foreach binding variable")?;
         let start = writable_span.map_or(type_span.start, |modifier| modifier.start);
         Some(ForeachBinding {
@@ -3796,6 +4020,9 @@ impl Parser {
         let mut left = self.parse_unary()?;
 
         loop {
+            self.mark_cursor(crate::syntax::CompletionContext::Expression {
+                after_operand: true,
+            });
             if self.check(&TokenKind::Is) {
                 const IS_PRECEDENCE: u8 = 8;
                 if IS_PRECEDENCE < min_prec {
@@ -3839,6 +4066,9 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Option<Expr> {
+        self.mark_cursor(crate::syntax::CompletionContext::Expression {
+            after_operand: false,
+        });
         let op = if self.match_kind(&TokenKind::Bang) || self.match_kind(&TokenKind::Not) {
             Some(UnaryOp::Not)
         } else if self.match_kind(&TokenKind::Minus) {
@@ -3944,6 +4174,7 @@ impl Parser {
                 None
             };
             if let Some(null_safe) = null_safe {
+                self.mark_cursor(crate::syntax::CompletionContext::Member);
                 let property = self
                     .expect_member_name("expected property or method name after member access")?;
                 let member_span = self.previous().span;
@@ -4384,6 +4615,14 @@ impl Parser {
         qualifier_span: Span,
         start: usize,
     ) -> Option<Expr> {
+        self.mark_cursor(crate::syntax::CompletionContext::Static {
+            qualifier: match &qualifier {
+                StaticQualifier::Class(name) => name.clone(),
+                StaticQualifier::SelfType => "self".to_string(),
+                StaticQualifier::Parent => "parent".to_string(),
+                StaticQualifier::InvalidStatic => "static".to_string(),
+            },
+        });
         let token = self.advance().clone();
         let (member, member_sigil_span) = match token.kind {
             TokenKind::Identifier(name) | TokenKind::Reserved(name) => (name, None),
@@ -4687,6 +4926,11 @@ impl Parser {
     }
 
     fn parse_new(&mut self, start: usize, shared: bool) -> Option<Expr> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: true,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let type_start = self.peek().span.start;
         let class_type = self.parse_type_ref()?;
         let type_span = self.span(type_start, self.previous().span.end);
@@ -4890,6 +5134,11 @@ impl Parser {
     }
 
     fn parse_type_ref(&mut self) -> Option<TypeRef> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let ty = self.parse_type_ref_inner();
         match (ty, self.pending_type_argument_close.take()) {
             (Some(ty), None) => Some(ty),
@@ -5574,6 +5823,15 @@ impl Parser {
             });
             name.span = name.span.merge(segment_span);
         }
+        // A `\` with nothing after it ends the text at a segment.
+        if self.check(&TokenKind::Backslash) {
+            self.mark_cursor_at(
+                self.current + 1,
+                crate::syntax::CompletionContext::NamespacePath {
+                    qualifier: format!("{}\\", name.canonical()),
+                },
+            );
+        }
         Some(name)
     }
 
@@ -5720,6 +5978,14 @@ impl Parser {
     }
 
     fn check(&self, kind: &TokenKind) -> bool {
+        if let Some(trial) = &self.token_trial {
+            if self.current == trial.index + 1 {
+                let mut followers = self.trial_followers.borrow_mut();
+                if !followers.contains(kind) {
+                    followers.push(kind.clone());
+                }
+            }
+        }
         if self.is_at_end() {
             return matches!(kind, TokenKind::Eof);
         }
@@ -5730,7 +5996,16 @@ impl Parser {
         if self.is_at_end() {
             return self.peek();
         }
+        self.judge_trial();
+        let count = self.diagnostics.len();
+        if let Some(trial) = self.token_trial.as_mut() {
+            if self.current == trial.index && trial.arrival == Some(count) {
+                trial.consumed = Some(count);
+            }
+        }
         self.current += 1;
+        self.note_cursor_arrival();
+        self.note_trial_arrival();
         self.previous()
     }
 
@@ -5789,6 +6064,21 @@ impl Parser {
             }
         }
     }
+}
+
+/// Source text for one token of `kind`, for a parser trial: a placeholder for
+/// names, variables and literals, the spelling for keywords and punctuation,
+/// and `None` for the end of the text.
+pub(crate) fn token_text(kind: &TokenKind) -> Option<String> {
+    Some(match kind {
+        TokenKind::Eof => return None,
+        TokenKind::Identifier(_) | TokenKind::Reserved(_) => "x".to_string(),
+        TokenKind::Variable(_) => "$x".to_string(),
+        TokenKind::IntLiteral(_) => "1".to_string(),
+        TokenKind::FloatLiteral(_) => "1.0".to_string(),
+        TokenKind::StringLiteral { .. } => "\"\"".to_string(),
+        other => token_name(other).to_string(),
+    })
 }
 
 fn token_name(kind: &TokenKind) -> &'static str {

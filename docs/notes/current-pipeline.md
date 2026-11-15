@@ -13,6 +13,18 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Completion context, 2026-11-15. `doriac::syntax::completion_context(path,
+  source, offset)` reports the syntax context at a cursor (top level, member
+  declaration, statement, expression operand or after an operand, type with
+  its parameter and constructor flags, declared name, qualified-name segment,
+  member, static member, variable, a keyword-only continuation, or none inside
+  a comment, string or number) and the keywords the parser takes there. The
+  context comes from marks at parser entry points; each keyword is tried
+  through the real parser. The keyword table is declared once in the lexer
+  (`lexer::KEYWORDS`, `lexer::keyword_kind`). The language server reads this
+  instead of its token heuristics. Not covered: keywords the checker rejects
+  after the parser takes them (`break`/`continue` outside a loop, E0422; a
+  constructor role on an ordinary parameter, E0737).
 - String display width, 2026-11-15, for the `Doria\Tui` library that the
   plan's approved sequence puts after Stage 46. Decision 0146 adds
   `$text->displayWidth`: terminal cells per grapheme cluster, 2 for an East
