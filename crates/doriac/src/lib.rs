@@ -76,6 +76,7 @@ pub mod source;
 pub mod source_map;
 pub mod source_provider;
 pub mod string_literal;
+pub mod string_surface;
 pub mod symbols;
 pub mod testing;
 pub mod trait_composition;

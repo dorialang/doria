@@ -22,6 +22,11 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   (runtime ABI 18) for Cranelift and LLVM; PHP output rejects it with the
   other String intrinsic properties. The compiler teaches it for PHP's
   `mb_strwidth`. The library itself lives in `dorialang/doria-tui`.
+- The String surface table, 2026-11-15. `doriac::string_surface` lists every
+  `$text->` property and `String::` companion member with its signature,
+  availability, pending reason and one-line documentation. The type checker,
+  MIR lowering (parameter names and defaults), the PHP backend's property
+  check, the foreign-spelling validation and the language server read it.
 - Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
   designed and not implemented. Two records are drafted in `docs/decisions/`
   as Proposed and wait for Andrew's review, uncommitted until he has read

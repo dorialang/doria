@@ -19076,10 +19076,17 @@ impl<'program> Checker<'program> {
                     );
                 }
             }
-            StringSpellingTarget::PendingComparison(_) => {
-                diagnostic = diagnostic.with_help(
-                    "`String::compareIgnoreCase` is accepted but remains pending until `Ordering` is executable; use `String::equalsIgnoreCase` for equality",
-                );
+            StringSpellingTarget::PendingComparison(member) => {
+                if let Some(entry) = crate::string_surface::companion(member) {
+                    if let crate::string_surface::StringAvailability::Pending { reason, .. } =
+                        entry.availability
+                    {
+                        let help = entry.pending_help().unwrap_or_default();
+                        diagnostic = diagnostic.with_help(format!(
+                            "`String::{member}` is accepted and {reason}; {help}"
+                        ));
+                    }
+                }
             }
             StringSpellingTarget::Property(_) => {}
         }
@@ -19104,109 +19111,62 @@ impl<'program> Checker<'program> {
                 format!("String::{member}({parameters})")
             }
             StringSpellingTarget::PendingComparison(member) => {
-                format!("String::{member}($left, $right)")
+                let parameters = crate::string_surface::companion(member)
+                    .map(|entry| {
+                        entry
+                            .parameters
+                            .iter()
+                            .map(|param| format!("${}", param.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                format!("String::{member}({parameters})")
             }
             StringSpellingTarget::Property(property) => format!("$text->{property}"),
         }
     }
 
-    fn string_companion_signature(&mut self, method: &str) -> Option<(Vec<ParamInfo>, TypeId)> {
+    /// The type checker's view of one type in the String surface table.
+    fn string_surface_type(&mut self, ty: crate::string_surface::StringValueType) -> TypeId {
+        use crate::string_surface::StringValueType as T;
         let string = self.types.intern(TypeKind::String);
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
-        let bool_ty = self.types.intern(TypeKind::Bool);
-        let bytes = self.types.intern(TypeKind::Bytes);
-        let nullable_int = self.types.intern(TypeKind::Nullable(int));
-        let nullable_string = self.types.intern(TypeKind::Nullable(string));
-        let string_list = self.types.intern(TypeKind::List(string));
-        let required = |name: &str, ty| ParamInfo {
-            name: name.to_string(),
-            ty,
-            take: false,
-            writable: false,
-            has_default: false,
-            default: None,
-            declaration: None,
-        };
-        let optional = |name: &str, ty| ParamInfo {
-            name: name.to_string(),
-            ty,
-            take: false,
-            writable: false,
-            has_default: true,
-            default: None,
-            declaration: None,
-        };
-        let signature = match method {
-            "trim" | "trimStart" | "trimEnd" | "lower" | "upper" | "lowerFirst" | "upperFirst" => {
-                (vec![required("text", string)], string)
-            }
-            "contains" | "containsIgnoreCase" => (
-                vec![required("text", string), required("needle", string)],
-                bool_ty,
-            ),
-            "startsWith" | "startsWithIgnoreCase" => (
-                vec![required("text", string), required("prefix", string)],
-                bool_ty,
-            ),
-            "endsWith" | "endsWithIgnoreCase" => (
-                vec![required("text", string), required("suffix", string)],
-                bool_ty,
-            ),
-            "equalsIgnoreCase" => (
-                vec![required("left", string), required("right", string)],
-                bool_ty,
-            ),
-            "indexOf" | "lastIndexOf" | "indexOfIgnoreCase" | "lastIndexOfIgnoreCase" => (
-                vec![required("text", string), required("needle", string)],
-                nullable_int,
-            ),
-            "countOccurrences" => (
-                vec![required("text", string), required("needle", string)],
-                int,
-            ),
-            "replace" => (
-                vec![
-                    required("text", string),
-                    required("search", string),
-                    required("replacement", string),
-                ],
-                string,
-            ),
-            "split" => (
-                vec![required("text", string), required("separator", string)],
-                string_list,
-            ),
-            "join" => (
-                vec![
-                    required("separator", string),
-                    required("values", string_list),
-                ],
-                string,
-            ),
-            "slice" => (
-                vec![
-                    required("text", string),
-                    required("start", int),
-                    optional("length", nullable_int),
-                ],
-                string,
-            ),
-            "repeat" => (
-                vec![required("text", string), required("count", int)],
-                string,
-            ),
-            "padStart" | "padEnd" => (
-                vec![
-                    required("text", string),
-                    required("length", int),
-                    optional("padding", string),
-                ],
-                string,
-            ),
-            "fromBytes" => (vec![required("bytes", bytes)], nullable_string),
-            _ => return None,
-        };
-        Some(signature)
+        match ty {
+            T::String => string,
+            T::Int => int,
+            T::Bool => self.types.intern(TypeKind::Bool),
+            T::Bytes => self.types.intern(TypeKind::Bytes),
+            T::ByteRegion => self.types.intern_resolved(&ResolvedType::ByteRegion(
+                crate::types::ByteRegionKind::Readonly,
+            )),
+            T::NullableInt => self.types.intern(TypeKind::Nullable(int)),
+            T::NullableString => self.types.intern(TypeKind::Nullable(string)),
+            T::StringList => self.types.intern(TypeKind::List(string)),
+            // Pending members: nothing reads their result type.
+            T::StringIterable | T::Ordering | T::Undecided => self.types.unknown(),
+        }
+    }
+
+    /// An executable `String::` companion member's parameters and result,
+    /// from the String surface table.
+    fn string_companion_signature(&mut self, method: &str) -> Option<(Vec<ParamInfo>, TypeId)> {
+        let member =
+            crate::string_surface::companion(method).filter(|member| member.is_executable())?;
+        let params = member
+            .parameters
+            .iter()
+            .map(|parameter| ParamInfo {
+                name: parameter.name.to_string(),
+                ty: self.string_surface_type(parameter.ty),
+                take: false,
+                writable: false,
+                has_default: parameter.default.is_some(),
+                default: None,
+                declaration: None,
+            })
+            .collect();
+        Some((params, self.string_surface_type(member.result)))
     }
 
     fn check_string_companion_call(
@@ -19217,17 +19177,20 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        if matches!(method, "compare" | "compareIgnoreCase") {
-            self.diagnostics.push(
-                Diagnostic::unsupported_stage(
-                    "E0304",
-                    format!("String::{method} requires the executable `Ordering` type"),
-                    span,
-                )
-                .with_help(
-                    "use typed equality or `String::equalsIgnoreCase` when only equality is needed",
-                ),
-            );
+        if let Some(member) =
+            crate::string_surface::companion(method).filter(|member| !member.is_executable())
+        {
+            let crate::string_surface::StringAvailability::Pending { reason, .. } =
+                member.availability
+            else {
+                unreachable!("a member that is not executable is pending")
+            };
+            let mut diagnostic =
+                Diagnostic::unsupported_stage("E0304", format!("String::{method} {reason}"), span);
+            if let Some(help) = member.pending_help() {
+                diagnostic = diagnostic.with_help(help);
+            }
+            self.diagnostics.push(diagnostic);
             return;
         }
         let Some((params, _)) = self.string_companion_signature(method) else {
@@ -24019,10 +23982,12 @@ impl<'program> Checker<'program> {
                     EnumBackingType::String => self.types.intern(TypeKind::String),
                 })
             }
-            (TypeKind::String, "length" | "displayWidth" | "byteLength") => Some(int),
-            (TypeKind::String, "isEmpty") => Some(bool_ty),
-            (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
-            (TypeKind::String, "graphemes" | "codePoints") => Some(self.types.unknown()),
+            // An unknown String property is reported where it is checked; its
+            // type here is unknown, as for the other built-in receivers below.
+            (TypeKind::String, _) => Some(match crate::string_surface::property(property) {
+                Some(member) => self.string_surface_type(member.result),
+                None => self.types.unknown(),
+            }),
             (TypeKind::TypedArray(_), "length") => Some(int),
             (
                 TypeKind::List(_)
@@ -24056,8 +24021,7 @@ impl<'program> Checker<'program> {
                 Some(self.types.intern(TypeKind::Nullable(*value)))
             }
             (
-                TypeKind::String
-                | TypeKind::Error
+                TypeKind::Error
                 | TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
                 | TypeKind::TypedArray(_)
@@ -24844,29 +24808,34 @@ impl<'program> Checker<'program> {
             return;
         }
         if matches!(self.types.kind(ty), TypeKind::String) {
-            match property {
-                "length" | "displayWidth" | "byteLength" | "isEmpty" | "bytes" | "byteRegion" => {}
-                "graphemes" | "codePoints" => self.diagnostics.push(
-                    Diagnostic::unsupported_stage(
+            match crate::string_surface::property(property) {
+                Some(member) if member.is_executable() => {}
+                Some(member) => {
+                    let crate::string_surface::StringAvailability::Pending { reason, .. } =
+                        member.availability
+                    else {
+                        unreachable!("a member that is not executable is pending")
+                    };
+                    let mut diagnostic = Diagnostic::unsupported_stage(
                         "E0304",
-                        format!(
-                            "String property `{property}` requires the future public iteration protocol"
-                        ),
+                        format!("String property `{property}` {reason}"),
                         span,
-                    )
-                    .with_help(
-                        "use the executable `length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, or `byteRegion` property",
-                    ),
-                ),
-                _ => self.diagnostics.push(
+                    );
+                    if let Some(help) = member.pending_help() {
+                        diagnostic = diagnostic.with_help(help);
+                    }
+                    self.diagnostics.push(diagnostic);
+                }
+                None => self.diagnostics.push(
                     Diagnostic::new(
                         "E0306",
                         format!("unknown String property `{property}`"),
                         span,
                     )
-                    .with_help(
-                        "String intrinsic properties are `length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, and `byteRegion`",
-                    ),
+                    .with_help(format!(
+                        "String intrinsic properties are {}",
+                        crate::string_surface::executable_property_list("and")
+                    )),
                 ),
             }
             return;

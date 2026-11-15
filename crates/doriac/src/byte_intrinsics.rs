@@ -104,9 +104,12 @@ pub fn members(receiver: &ResolvedType, kind: ByteMemberKind) -> Vec<ByteIntrins
 /// 49). Decision 0103 keeps the string instance surface to properties for
 /// data, measurements and views; this is the borrowed byte view, beside
 /// `bytes`, which copies. Ranges come from the region's own `getRegion`.
+/// Its name and documentation are the String surface table's entry.
 fn string_member(name: &str) -> Option<ByteIntrinsic> {
-    (name == "byteRegion").then(|| ByteIntrinsic {
-        name: "byteRegion",
+    let entry = crate::string_surface::property(name)
+        .filter(|entry| entry.result == crate::string_surface::StringValueType::ByteRegion)?;
+    Some(ByteIntrinsic {
+        name: entry.name,
         kind: ByteMemberKind::Property,
         parameters: Vec::new(),
         return_type: ResolvedType::ByteRegion(ByteRegionKind::Readonly),
@@ -114,7 +117,7 @@ fn string_member(name: &str) -> Option<ByteIntrinsic> {
         accepts_named_arguments: false,
         writable_place: false,
         descriptor_metadata: false,
-        documentation: "Borrows this string's UTF-8 bytes as a readonly region without allocation or copying. Use the region's `getRegion` for a byte range. The region keeps the string borrowed while it is in use.",
+        documentation: entry.documentation,
     })
 }
 

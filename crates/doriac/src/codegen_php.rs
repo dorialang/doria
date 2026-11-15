@@ -3437,10 +3437,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             if semantic_info
                 .expression_type(object.span())
                 .is_some_and(|ty| matches!(ty, ResolvedType::String))
-                && matches!(
-                    property.as_str(),
-                    "length" | "displayWidth" | "byteLength" | "isEmpty" | "bytes" | "byteRegion"
-                )
+                && crate::string_surface::property(property).is_some()
             {
                 return Err(unsupported_string_runtime_shape(
                     *span,

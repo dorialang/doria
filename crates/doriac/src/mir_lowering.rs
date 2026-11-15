@@ -14491,184 +14491,111 @@ fn string_intrinsic_signature(
             .map(mir::Type::Collection)
     };
 
-    let (parameters, names, defaults, result) = match kind {
-        Kind::Hash => (
-            vec![string],
-            vec!["text"],
-            vec![None],
-            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
-        ),
-        Kind::GraphemeLength | Kind::DisplayWidth | Kind::ByteLength => {
-            (vec![string], vec!["text"], vec![None], int)
-        }
-        Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
-        Kind::AssertionDifference => (
-            vec![string, string, int],
-            vec!["actual", "expected", "mode"],
-            vec![None, None, None],
-            string,
-        ),
-        Kind::AssertionBytesDifference => {
-            let bytes = bytes().ok_or_else(|| {
-                vec![Diagnostic::new(
+    let surface_type = |ty: crate::string_surface::StringValueType| {
+        use crate::string_surface::StringValueType as T;
+        let missing = |what: &str| {
+            vec![Diagnostic::new(
+                "I1301",
+                format!(
+                    "checked String `{}` call has no interned {what} MIR type",
+                    string_intrinsic_name(kind)
+                ),
+                span,
+            )]
+        };
+        match ty {
+            T::String => Ok(string),
+            T::Int => Ok(int),
+            T::Bool => Ok(bool_ty),
+            T::Bytes => bytes().ok_or_else(|| missing("Bytes")),
+            T::NullableInt => Ok(nullable_int),
+            T::NullableString => Ok(mir::Type::NullableString),
+            T::StringList => strings().ok_or_else(|| missing("List<string>")),
+            T::ByteRegion | T::StringIterable | T::Ordering | T::Undecided => {
+                Err(vec![Diagnostic::new(
                     "I1301",
-                    "checked Bytes assertion has no interned Bytes MIR type",
+                    format!(
+                        "String `{}` is not lowered as a String intrinsic call",
+                        string_intrinsic_name(kind)
+                    ),
                     span,
-                )]
-            })?;
-            (
-                vec![bytes, bytes],
+                )])
+            }
+        }
+    };
+
+    let (parameters, names, defaults, result) = if let Some(member) = public_string_member(kind) {
+        // A property reads its receiver; a companion takes its parameters.
+        let mut parameters = Vec::new();
+        let mut names = Vec::new();
+        let mut defaults = Vec::new();
+        if member.kind == crate::string_surface::StringMemberKind::Property {
+            parameters.push(string);
+            names.push("text");
+            defaults.push(None);
+        }
+        for parameter in member.parameters {
+            parameters.push(surface_type(parameter.ty)?);
+            names.push(parameter.name);
+            defaults.push(parameter.default.map(|default| match default {
+                crate::string_surface::StringDefault::Null => crate::const_eval::ConstValue::Null,
+                crate::string_surface::StringDefault::Text(text) => {
+                    crate::const_eval::ConstValue::String(text.to_string())
+                }
+            }));
+        }
+        (parameters, names, defaults, surface_type(member.result)?)
+    } else {
+        match kind {
+            Kind::Hash => (
+                vec![string],
+                vec!["text"],
+                vec![None],
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
+            ),
+            Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
+            Kind::AssertionDifference => (
+                vec![string, string, int],
+                vec!["actual", "expected", "mode"],
+                vec![None, None, None],
+                string,
+            ),
+            Kind::AssertionBytesDifference => {
+                let bytes = bytes().ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I1301",
+                        "checked Bytes assertion has no interned Bytes MIR type",
+                        span,
+                    )]
+                })?;
+                (
+                    vec![bytes, bytes],
+                    vec!["actual", "expected"],
+                    vec![None, None],
+                    string,
+                )
+            }
+            Kind::AssertionCountDifference => (
+                vec![int, int],
                 vec!["actual", "expected"],
                 vec![None, None],
                 string,
-            )
-        }
-        Kind::AssertionCountDifference => (
-            vec![int, int],
-            vec!["actual", "expected"],
-            vec![None, None],
-            string,
-        ),
-        Kind::AssertionErrorPresentation => (
-            vec![string, string],
-            vec!["type", "message"],
-            vec![None, None],
-            string,
-        ),
-        Kind::AssertionCollectionPresentation => {
-            return Err(vec![Diagnostic::new(
-                "I1301",
-                "collection assertion presentation is compiler-private",
-                span,
-            )]);
-        }
-        Kind::IsEmpty => (vec![string], vec!["text"], vec![None], bool_ty),
-        Kind::ToBytes => (
-            vec![string],
-            vec!["text"],
-            vec![None],
-            bytes().ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "I1301",
-                    "checked String bytes property has no interned Bytes MIR type",
-                    span,
-                )]
-            })?,
-        ),
-        Kind::Trim
-        | Kind::TrimStart
-        | Kind::TrimEnd
-        | Kind::Lower
-        | Kind::Upper
-        | Kind::LowerFirst
-        | Kind::UpperFirst => (vec![string], vec!["text"], vec![None], string),
-        Kind::Contains | Kind::ContainsIgnoreCase => (
-            vec![string, string],
-            vec!["text", "needle"],
-            vec![None, None],
-            bool_ty,
-        ),
-        Kind::StartsWith | Kind::StartsWithIgnoreCase => (
-            vec![string, string],
-            vec!["text", "prefix"],
-            vec![None, None],
-            bool_ty,
-        ),
-        Kind::EndsWith | Kind::EndsWithIgnoreCase => (
-            vec![string, string],
-            vec!["text", "suffix"],
-            vec![None, None],
-            bool_ty,
-        ),
-        Kind::EqualsIgnoreCase => (
-            vec![string, string],
-            vec!["left", "right"],
-            vec![None, None],
-            bool_ty,
-        ),
-        Kind::IndexOf
-        | Kind::LastIndexOf
-        | Kind::IndexOfIgnoreCase
-        | Kind::LastIndexOfIgnoreCase => (
-            vec![string, string],
-            vec!["text", "needle"],
-            vec![None, None],
-            nullable_int,
-        ),
-        Kind::CountOccurrences => (
-            vec![string, string],
-            vec!["text", "needle"],
-            vec![None, None],
-            int,
-        ),
-        Kind::Replace => (
-            vec![string, string, string],
-            vec!["text", "search", "replacement"],
-            vec![None, None, None],
-            string,
-        ),
-        Kind::Split => (
-            vec![string, string],
-            vec!["text", "separator"],
-            vec![None, None],
-            strings().ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "I1301",
-                    "checked String::split call has no interned List<string> MIR type",
-                    span,
-                )]
-            })?,
-        ),
-        Kind::Join => (
-            vec![
+            ),
+            Kind::AssertionErrorPresentation => (
+                vec![string, string],
+                vec!["type", "message"],
+                vec![None, None],
                 string,
-                strings().ok_or_else(|| {
-                    vec![Diagnostic::new(
-                        "I1301",
-                        "checked String::join call has no interned List<string> MIR type",
-                        span,
-                    )]
-                })?,
-            ],
-            vec!["separator", "values"],
-            vec![None, None],
-            string,
-        ),
-        Kind::Slice => (
-            vec![string, int, nullable_int],
-            vec!["text", "start", "length"],
-            vec![None, None, Some(crate::const_eval::ConstValue::Null)],
-            string,
-        ),
-        Kind::Repeat => (
-            vec![string, int],
-            vec!["text", "count"],
-            vec![None, None],
-            string,
-        ),
-        Kind::PadStart | Kind::PadEnd => (
-            vec![string, int, string],
-            vec!["text", "length", "padding"],
-            // Padding defaults to one space (Decision 0103).
-            vec![
-                None,
-                None,
-                Some(crate::const_eval::ConstValue::String(" ".to_string())),
-            ],
-            string,
-        ),
-        Kind::FromBytes => (
-            vec![bytes().ok_or_else(|| {
-                vec![Diagnostic::new(
+            ),
+            Kind::AssertionCollectionPresentation => {
+                return Err(vec![Diagnostic::new(
                     "I1301",
-                    "checked String::fromBytes call has no interned Bytes MIR type",
+                    "collection assertion presentation is compiler-private",
                     span,
-                )]
-            })?],
-            vec!["bytes"],
-            vec![None],
-            mir::Type::NullableString,
-        ),
+                )]);
+            }
+            _ => unreachable!("public String members are signed by the String surface table"),
+        }
     };
     let count = parameters.len();
     Ok(FunctionSignature {
@@ -14689,6 +14616,17 @@ fn string_intrinsic_signature(
         test_assertion_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
     })
+}
+
+/// The String surface table's entry for a source-visible String intrinsic;
+/// compiler-private intrinsics have none.
+fn public_string_member(
+    kind: mir::StringIntrinsicKind,
+) -> Option<&'static crate::string_surface::StringMember> {
+    let name = string_intrinsic_name(kind);
+    crate::string_surface::property(name)
+        .or_else(|| crate::string_surface::companion(name))
+        .filter(|member| member.is_executable())
 }
 
 const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {

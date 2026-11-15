@@ -336,3 +336,68 @@ function main(): void
         ]
     );
 }
+
+/// The String surface table is the checker's only source: every executable
+/// member type-checks with the declared result type, and every pending member
+/// reports E0304.
+#[test]
+fn string_surface_table_matches_the_checker() {
+    use doriac::string_surface::{StringMemberKind, StringValueType, STRING_MEMBERS};
+
+    fn argument(ty: StringValueType) -> &'static str {
+        match ty {
+            StringValueType::String => "\"a\"",
+            StringValueType::Int => "1",
+            StringValueType::Bool => "true",
+            StringValueType::Bytes => "\"a\"->bytes",
+            StringValueType::NullableInt => "null",
+            StringValueType::NullableString => "null",
+            StringValueType::StringList => "[\"a\"]",
+            other => panic!("no sample argument for {other:?}"),
+        }
+    }
+
+    for member in STRING_MEMBERS {
+        let expression = match member.kind {
+            StringMemberKind::Property => format!("$text->{}", member.name),
+            StringMemberKind::Companion => {
+                let arguments = member
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.default.is_none())
+                    .map(|parameter| argument(parameter.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("String::{}({arguments})", member.name)
+            }
+        };
+        let declaration = match member.result {
+            StringValueType::ByteRegion
+            | StringValueType::StringIterable
+            | StringValueType::Ordering
+            | StringValueType::Undecided => "let".to_string(),
+            result => result.source().to_string(),
+        };
+        let source = format!(
+            "function main(): void\n{{\n    let $text = \"a\";\n    {declaration} $value = {expression};\n}}\n"
+        );
+        let result = doriac::check_source("surface.doria", &source);
+        if member.is_executable() {
+            assert!(
+                result.is_ok(),
+                "`{}` should type-check as {declaration}: {:#?}",
+                member.spelling(),
+                result.err()
+            );
+        } else {
+            let diagnostics = result.expect_err("a pending member is reported");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0304"),
+                "pending `{}` should report E0304: {diagnostics:#?}",
+                member.spelling()
+            );
+        }
+    }
+}
