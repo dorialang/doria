@@ -93,14 +93,14 @@ fn deferred_and_removed_string_surfaces_have_structured_guidance() {
 function main(): void
 {
     let $text = "Doria";
-    let $graphemes = $text->graphemes;
+    let $codePoints = $text->codePoints;
     String::compare("a", "b");
 }
 "#,
     );
     assert!(deferred.iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::UnsupportedDevelopmentSurface
-            && diagnostic.message.contains("grapheme")
+            && diagnostic.message.contains("codePoints")
     }));
     assert!(deferred.iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::UnsupportedDevelopmentSurface
@@ -399,5 +399,45 @@ fn string_surface_table_matches_the_checker() {
                 member.spelling()
             );
         }
+    }
+}
+
+/// `$text->graphemes` is an `Iterable<string>`, and the classes behind it are
+/// compiler-private: authored source cannot name them (Decision 0147).
+#[test]
+fn graphemes_is_an_iterable_view_whose_classes_cannot_be_named() {
+    let source = r#"
+function count(Iterable<string> $items): int
+{
+    writable int $total = 0;
+    foreach ($items as string $item) {
+        $total++;
+    }
+    return $total;
+}
+
+function main(): void
+{
+    let $text = "a👍🏾b";
+    Iterable<string> $view = $text->graphemes;
+    int $total = count($view);
+    foreach ($text->graphemes as string $grapheme) {
+        int $width = $grapheme->displayWidth;
+    }
+}
+"#;
+    doriac::lower_source_to_mir("graphemes.doria", source)
+        .expect("$text->graphemes type-checks and lowers as Iterable<string>");
+
+    for name in [
+        "Doria\\Std\\Text\\GraphemeView",
+        "Doria\\Std\\Text\\GraphemeCursor",
+    ] {
+        let source =
+            format!("function main(): void\n{{\n    let $value = new {name}(\"a\");\n}}\n");
+        assert!(
+            doriac::check_source("private.doria", &source).is_err(),
+            "authored source must not reach `{name}`"
+        );
     }
 }

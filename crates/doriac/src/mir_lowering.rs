@@ -3903,6 +3903,9 @@ fn lower_function(
             crate::ast::CompilerIntrinsic::Time(intrinsic) => {
                 inline_value::lower_intrinsic(intrinsic, function.span, &params, &mut context);
             }
+            crate::ast::CompilerIntrinsic::Text(intrinsic) => {
+                lower_text_intrinsic(intrinsic, function.span, &params, &mut context);
+            }
             crate::ast::CompilerIntrinsic::Term(intrinsic) => {
                 inline_value::lower_term_intrinsic(
                     intrinsic,
@@ -14553,6 +14556,18 @@ fn string_intrinsic_signature(
                 vec![None],
                 mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
             ),
+            Kind::GraphemeBoundaryAfter => (
+                vec![string, int],
+                vec!["text", "offset"],
+                vec![None, None],
+                int,
+            ),
+            Kind::TextBetween => (
+                vec![string, int, int],
+                vec!["text", "start", "end"],
+                vec![None, None, None],
+                string,
+            ),
             Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
             Kind::AssertionDifference => (
                 vec![string, string, int],
@@ -14618,6 +14633,45 @@ fn string_intrinsic_signature(
     })
 }
 
+/// The body of a `Doria\Std\Text` primitive (Decision 0147): one String
+/// intrinsic call over the parameters, returned.
+fn lower_text_intrinsic(
+    intrinsic: crate::compiler_known_text::TextFunction,
+    span: Span,
+    params: &[mir::LocalId],
+    context: &mut LoweringContext,
+) {
+    use crate::compiler_known_text::TextFunction;
+    let int = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+    let call = |result: mir::Type, types: &[mir::Type]| mir::StringIntrinsicCall {
+        kind: intrinsic.string_intrinsic(),
+        args: params
+            .iter()
+            .zip(types)
+            .map(|(local, ty)| local_rvalue(*local, *ty, false))
+            .collect(),
+        result,
+        span,
+        argument_spans: vec![span; params.len()],
+    };
+    let value = match intrinsic {
+        TextFunction::GraphemeBoundaryAfter => {
+            mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                ty: IntegerType::Int64,
+                operand: mir::Operand::StringIntrinsic(Box::new(call(
+                    int,
+                    &[mir::Type::String, int],
+                ))),
+            }))
+        }
+        TextFunction::TextBetween => mir::Rvalue::String(mir::StringExpression::Intrinsic(
+            Box::new(call(mir::Type::String, &[mir::Type::String, int, int])),
+        )),
+    };
+    context.cleanup_scopes_from(0);
+    context.terminate_current(mir::Terminator::Return(value));
+}
+
 /// The String surface table's entry for a source-visible String intrinsic;
 /// compiler-private intrinsics have none.
 fn public_string_member(
@@ -14635,6 +14689,8 @@ const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {
         Kind::Hash => "<hash>",
         Kind::GraphemeLength => "length",
         Kind::DisplayWidth => "displayWidth",
+        Kind::GraphemeBoundaryAfter => "<graphemeBoundaryAfter>",
+        Kind::TextBetween => "<textBetween>",
         Kind::ByteLength => "byteLength",
         Kind::IsEmpty => "isEmpty",
         Kind::ToBytes => "bytes",
@@ -18378,12 +18434,48 @@ fn lower_error_expression(
     lower_interface_expression(expr, mir::InterfaceTypeId::ERROR, transfer, context)
 }
 
+/// `$text->graphemes` on a string is a call of the compiler-known factory
+/// `Doria\Std\Text\GraphemeView::of($text)` (Decision 0147). The call keeps
+/// the property's span, so it carries the property's checked type,
+/// `Iterable<string>`.
+fn string_view_factory_call(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<Option<hir::Expr>> {
+    let hir::Expr::PropertyAccess {
+        object,
+        property,
+        null_safe: false,
+        take: false,
+        span,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if property != "graphemes" || context.expression_type(object)? != mir::Type::String {
+        return Ok(None);
+    }
+    Ok(Some(hir::Expr::StaticCall {
+        class_name: crate::compiler_known_text::GRAPHEME_VIEW.to_string(),
+        method: crate::compiler_known_text::GRAPHEME_VIEW_FACTORY.to_string(),
+        args: vec![hir::Argument {
+            name: None,
+            value: object.as_ref().clone(),
+            span: object.span(),
+        }],
+        span: *span,
+    }))
+}
+
 fn lower_interface_expression(
     expr: &hir::Expr,
     interface: mir::InterfaceTypeId,
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::InterfaceValue> {
+    if let Some(call) = string_view_factory_call(expr, context)? {
+        return lower_interface_expression(&call, interface, transfer, context);
+    }
     let expected = mir::Type::Interface(interface);
     if let Some((local, source)) = lower_shared_interface_payload(expr, false, context)? {
         if transfer {

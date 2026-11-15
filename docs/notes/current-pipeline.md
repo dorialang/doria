@@ -27,6 +27,10 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   availability, pending reason and one-line documentation. The type checker,
   MIR lowering (parameter names and defaults), the PHP backend's property
   check, the foreign-spelling validation and the language server read it.
+- `$text->graphemes`, 2026-11-15 (Decision 0147): an `Iterable<string>` view
+  written in the compiler-known `Doria\Std\Text` module over two
+  compiler-private String intrinsics (runtime ABI 19). Its view and cursor
+  classes are in no canonical-type list, so authored source cannot name them.
 - Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
   designed and not implemented. Two records are drafted in `docs/decisions/`
   as Proposed and wait for Andrew's review, uncommitted until he has read

@@ -237,7 +237,9 @@ const PADDING: &[StringParameter] = &[
     optional("padding", T::String, StringDefault::Text(" ")),
 ];
 
-const PENDING_ITERATION: &str = "requires the future public iteration protocol";
+const PENDING_CODE_POINTS: &str = "is part of Doria and this compiler does not implement it yet";
+const CODE_POINTS_HELP: &str =
+    "use `$text->graphemes` to walk the text, or `$text->bytes` for its UTF-8 bytes";
 const PENDING_ORDERING: &str = "requires the executable `Ordering` type";
 const ORDERING_HELP: Option<&str> =
     Some("use typed equality or `String::equalsIgnoreCase` when only equality is needed");
@@ -274,14 +276,10 @@ pub const STRING_MEMBERS: &[StringMember] = &[
         T::ByteRegion,
         "Borrows this string's UTF-8 bytes as a readonly region without allocation or copying. Use the region's `getRegion` for a byte range. The region keeps the string borrowed while it is in use.",
     ),
-    pending(
-        property_entry(
-            "graphemes",
-            T::StringIterable,
-            "Walks the string's extended grapheme clusters in order.",
-        ),
-        PENDING_ITERATION,
-        None,
+    property_entry(
+        "graphemes",
+        T::StringIterable,
+        "Walks the string's extended grapheme clusters in order, each as a string, without copying the text first (Decision 0147).",
     ),
     pending(
         property_entry(
@@ -289,8 +287,8 @@ pub const STRING_MEMBERS: &[StringMember] = &[
             T::Undecided,
             "Walks the string's Unicode scalar values in order.",
         ),
-        PENDING_ITERATION,
-        None,
+        PENDING_CODE_POINTS,
+        Some(CODE_POINTS_HELP),
     ),
     companion_entry(
         "trim",
@@ -571,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             executable_property_list("and"),
-            "`length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, and `byteRegion`"
+            "`length`, `displayWidth`, `byteLength`, `isEmpty`, `bytes`, `byteRegion`, and `graphemes`"
         );
     }
 

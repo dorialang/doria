@@ -36,6 +36,7 @@ pub mod compiler_known_io;
 pub mod compiler_known_stream;
 pub mod compiler_known_term;
 pub mod compiler_known_test;
+pub mod compiler_known_text;
 pub mod compiler_known_time;
 pub mod const_eval;
 mod constructor_init;
@@ -190,6 +191,10 @@ pub fn analyze_source_for_ide_with_source_context(
     if compiler_known_term::resolved_facts_use_term(&resolution.resolved.facts) {
         resolution.resolved.program =
             compiler_known_term::augment_program(&resolution.resolved.program);
+    }
+    if compiler_known_text::source_uses_graphemes(&source) {
+        resolution.resolved.program =
+            compiler_known_text::augment_program(&resolution.resolved.program);
     }
     if compiler_known_test::resolved_facts_use_assertion_surface(&resolution.resolved.facts) {
         resolution.resolved.program =
@@ -361,6 +366,7 @@ pub(crate) fn complete_standalone_hir(
     compiler_known_time::append_hir_source(&mut hir);
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
+    compiler_known_text::append_hir_source(&mut hir);
     hir.source_path = source.path;
     hir.source_text = source.text;
     hir
@@ -549,6 +555,7 @@ pub fn lower_compilation_graph(
     compiler_known_time::append_hir_source(&mut hir);
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
+    compiler_known_text::append_hir_source(&mut hir);
     Ok(hir)
 }
 
@@ -751,6 +758,18 @@ fn append_compiler_known_semantic_context(
         },
     );
     source_texts.insert(
+        compiler_known_text::SOURCE_ID,
+        compiler_known_text::SOURCE_TEXT,
+    );
+    contexts.insert(
+        compiler_known_text::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_text::SOURCE_NAME.to_string()),
+        },
+    );
+    source_texts.insert(
         compiler_known_contracts::SOURCE_ID,
         compiler_known_contracts::SOURCE_TEXT,
     );
@@ -825,6 +844,9 @@ pub(crate) fn prepare_parsed_source(
     }
     if compiler_known_term::resolved_facts_use_term(&resolved.facts) {
         resolved.program = compiler_known_term::augment_program(&resolved.program);
+    }
+    if compiler_known_text::source_uses_graphemes(source) {
+        resolved.program = compiler_known_text::augment_program(&resolved.program);
     }
     if compiler_known_test::resolved_facts_use_assertion_surface(&resolved.facts) {
         resolved.program = compiler_known_test::augment_program(&resolved.program);

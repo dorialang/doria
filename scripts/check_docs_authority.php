@@ -843,7 +843,8 @@ if ($namingAuthority !== false) {
         || !str_contains($stdlib, 'executable intrinsic properties')
         || !str_contains($stdlib, 'containsIgnoreCase')
         || !str_contains($stdlib, 'countOccurrences')
-        || !str_contains($stdlib, 'await the public traversal protocol')
+        || !str_contains($stdlib, '`$s->graphemes`, an `Iterable<string>`')
+        || !str_contains($stdlib, 'The `$s->codePoints` view is part of Doria and not implemented by this compiler yet')
         || !str_contains($stdlib, 'There is no public `str_*` family')
     ) {
         $failures[] = "{$stdlibPath}: missing canonical executable and deferred String inventory";

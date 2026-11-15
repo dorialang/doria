@@ -6560,6 +6560,13 @@ fn emit_function_instance_body(
             crate::ast::CompilerIntrinsic::Concurrency(intrinsic) => {
                 concurrency::emit_body(intrinsic, output, indent + 1);
             }
+            // PHP output rejects `$text->graphemes` (B2501) before emission, so
+            // the text view's primitives are never called from PHP.
+            crate::ast::CompilerIntrinsic::Text(_) => writeln(
+                output,
+                indent + 1,
+                "throw new LogicException(\"compiler-private text primitive is unreachable in PHP output\");",
+            ),
             crate::ast::CompilerIntrinsic::Term(intrinsic) => term::emit_body(
                 intrinsic,
                 function,

@@ -118,6 +118,11 @@ pub enum CompilerSymbolIdentity {
     Attribute(String),
 }
 
+/// The one way authored source reaches a compiler-known type: its canonical
+/// name is in a module's public canonical-type list. A compiler-known
+/// declaration outside every list, such as the `Doria\Std\Text` view and
+/// cursor behind `$text->graphemes` (Decision 0147), is compiler-private: no
+/// authored name resolves to it, and only lowering the compiler owns reaches it.
 pub(crate) fn standard_type_identity(canonical: &str) -> Option<CompilerSymbolIdentity> {
     if crate::compiler_known_concurrency::CANONICAL_TYPES.contains(&canonical) {
         Some(CompilerSymbolIdentity::StandardConcurrency(

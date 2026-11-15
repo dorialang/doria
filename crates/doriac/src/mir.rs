@@ -1603,6 +1603,11 @@ pub enum StringIntrinsicKind {
     Hash,
     GraphemeLength,
     DisplayWidth,
+    /// Compiler-private: the end of the grapheme cluster at a byte offset
+    /// (Decision 0147's `$text->graphemes` cursor).
+    GraphemeBoundaryAfter,
+    /// Compiler-private: the text between two cluster boundaries.
+    TextBetween,
     ByteLength,
     IsEmpty,
     ToBytes,
@@ -10018,6 +10023,8 @@ impl fmt::Display for StringIntrinsicKind {
             Self::Hash => "hash",
             Self::GraphemeLength => "graphemeLength",
             Self::DisplayWidth => "displayWidth",
+            Self::GraphemeBoundaryAfter => "graphemeBoundaryAfter",
+            Self::TextBetween => "textBetween",
             Self::ByteLength => "byteLength",
             Self::IsEmpty => "isEmpty",
             Self::ToBytes => "toBytes",

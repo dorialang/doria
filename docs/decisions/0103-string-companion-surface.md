@@ -1,7 +1,7 @@
 # Decision 0103: Canonical String API And Companion Boundary
 
 **Status:** Accepted (amended by the Minimum String Runtime Surface; Decision
-0146 adds `displayWidth`)
+0146 adds `displayWidth`; Decision 0147 makes `graphemes` an `Iterable<string>`)
 
 ## Context
 
@@ -67,7 +67,8 @@ until explicitly validated and converted.
   released while the view is in use, and it copies nothing; a byte range is
   the region's own `getRegion`. Added 2026-11-06 under Andrew's Stage 36a
   approval of recommended forks (Stage 36a decision log entry 49).
-- `graphemes` traverses Unicode extended grapheme clusters.
+- `graphemes` traverses Unicode extended grapheme clusters. Its type is
+  `Iterable<string>` and each cluster is a `string` (Decision 0147).
 - `codePoints` traverses Unicode scalar values.
 
 `chars` is not a canonical Doria member. The exact nameable types behind the two

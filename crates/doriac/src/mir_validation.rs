@@ -9680,6 +9680,14 @@ fn validate_string_intrinsic(
             exact(&[string, int])?;
             require_string_intrinsic_result(call, string)
         }
+        Kind::GraphemeBoundaryAfter => {
+            exact(&[string, int])?;
+            require_string_intrinsic_result(call, int)
+        }
+        Kind::TextBetween => {
+            exact(&[string, int, int])?;
+            require_string_intrinsic_result(call, string)
+        }
         Kind::PadStart | Kind::PadEnd => {
             exact(&[string, int, string])?;
             require_string_intrinsic_result(call, string)

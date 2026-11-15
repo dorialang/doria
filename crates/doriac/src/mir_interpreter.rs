@@ -16387,6 +16387,28 @@ impl<'a> Interpreter<'a> {
                 };
                 self.push_string(text[range].to_string())?;
             }
+            Kind::GraphemeBoundaryAfter => {
+                let text = local_string(&arguments, 0)?;
+                let offset = usize::try_from(local_int(&arguments, 1)?).unwrap_or(text.len());
+                let end = doria_unicode::grapheme_boundary_after(text, offset);
+                let Some(value) = i64::try_from(end).ok().and_then(|value| {
+                    IntegerValue::from_i128(IntegerType::Int64, i128::from(value))
+                }) else {
+                    return panic(StringError::ResultTooLarge);
+                };
+                self.push_scalar(mir::ScalarValue::Integer(value))?;
+            }
+            Kind::TextBetween => {
+                let text = local_string(&arguments, 0)?;
+                let part = match (
+                    usize::try_from(local_int(&arguments, 1)?),
+                    usize::try_from(local_int(&arguments, 2)?),
+                ) {
+                    (Ok(start), Ok(end)) => doria_unicode::text_between(text, start, end),
+                    _ => "",
+                };
+                self.push_string(part.to_string())?;
+            }
             Kind::Repeat => {
                 let text = local_string(&arguments, 0)?;
                 let count = local_int(&arguments, 1)?;

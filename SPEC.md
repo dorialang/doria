@@ -843,8 +843,9 @@ trimming, default
 Unicode casing and case folding, predicates, grapheme-indexed search,
 replacement, `split`/`join`, `slice`, `repeat`, padding, and UTF-8-validating
 `fromBytes`. It also includes the reviewed ignore-case search family,
-first-grapheme casing, and occurrence counting. The `graphemes`/`codePoints`
-views await the public traversal protocol, and ordering comparisons await the
+first-grapheme casing, and occurrence counting. `$text->graphemes` is an
+executable `Iterable<string>` view (Decision 0147); the `codePoints` view is
+not implemented by this compiler yet, and ordering comparisons await the
 executable `Ordering` type.
 
 ## 7. Basic type system

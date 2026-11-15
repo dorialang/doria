@@ -61,12 +61,13 @@ use crate::native_abi::{
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_DISPLAY_WIDTH,
     STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL,
     STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
-    STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE,
-    STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE,
-    STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE,
-    STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
-    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
-    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
+    STRING_FROM_UTF8, STRING_GRAPHEME_BOUNDARY_AFTER, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
+    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
+    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
+    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
+    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TEXT_BETWEEN,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
     WRITABLE_SHARED_PAYLOAD_DESCRIPTOR, WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
     WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE,
@@ -21600,6 +21601,30 @@ fn lower_string_intrinsic_call(
                     argument(1)?,
                     length,
                     has_length,
+                ],
+                resources,
+            )?)
+        }
+        Kind::GraphemeBoundaryAfter => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_GRAPHEME_BOUNDARY_AFTER,
+            &[pointer, types::I64],
+            types::I64,
+            &[argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::TextBetween => {
+            set_active_panic_site(builder, call.span, resources);
+            LoweredValue::Single(call_runtime(
+                builder,
+                STRING_TEXT_BETWEEN,
+                &[pointer, pointer, types::I64, types::I64],
+                pointer,
+                &[
+                    resources.current_frame,
+                    argument(0)?,
+                    argument(1)?,
+                    argument(2)?,
                 ],
                 resources,
             )?)

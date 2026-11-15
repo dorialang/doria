@@ -503,6 +503,7 @@ pub enum CompilerIntrinsic {
     Time(crate::compiler_known_time::TimeFunction),
     Concurrency(crate::compiler_known_concurrency::ConcurrencyFunction),
     Term(crate::compiler_known_term::TermFunction),
+    Text(crate::compiler_known_text::TextFunction),
     Process(crate::compiler_known_stream::ProcessFunction),
 }
 
@@ -517,6 +518,7 @@ impl CompilerIntrinsic {
             Self::Time(_) => crate::compiler_known_time::SOURCE_ID,
             Self::Concurrency(_) => crate::compiler_known_concurrency::SOURCE_ID,
             Self::Term(_) => crate::compiler_known_term::SOURCE_ID,
+            Self::Text(_) => crate::compiler_known_text::SOURCE_ID,
         }
     }
 
@@ -532,7 +534,7 @@ impl CompilerIntrinsic {
             Self::Term(function) => {
                 function == crate::compiler_known_term::TermFunction::AwaitEvent
             }
-            Self::Time(_) | Self::TransferPlan(_) | Self::Concurrency(_) => false,
+            Self::Time(_) | Self::TransferPlan(_) | Self::Concurrency(_) | Self::Text(_) => false,
         }
     }
 
@@ -543,7 +545,7 @@ impl CompilerIntrinsic {
             Self::TransferPlan(implementation) => implementation.return_borrow(),
             Self::TransferGroup(implementation) => implementation.return_borrow(),
             Self::Process(function) => function.return_borrow(),
-            Self::Time(_) | Self::Concurrency(_) | Self::Term(_) => None,
+            Self::Time(_) | Self::Concurrency(_) | Self::Term(_) | Self::Text(_) => None,
         }
     }
 
@@ -556,7 +558,8 @@ impl CompilerIntrinsic {
             | Self::Time(_)
             | Self::Concurrency(_)
             | Self::Process(_)
-            | Self::Term(_) => Vec::new(),
+            | Self::Term(_)
+            | Self::Text(_) => Vec::new(),
         }
     }
 }

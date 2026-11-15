@@ -91,6 +91,33 @@ pub fn grapheme_count(text: &str) -> usize {
     grapheme_boundaries(text).count().saturating_sub(1)
 }
 
+/// The end of the grapheme cluster that starts at byte `offset`, which is
+/// a cluster boundary; `text.len()` from the end. A walk from 0 that keeps
+/// calling this visits the same clusters `grapheme_count` counts.
+pub fn grapheme_boundary_after(text: &str, offset: usize) -> usize {
+    if offset >= text.len() || !text.is_char_boundary(offset) {
+        return text.len();
+    }
+    let bytes = text.as_bytes();
+    // An ASCII character other than CR is a whole cluster unless a
+    // non-ASCII character follows it; extending characters are not ASCII.
+    if bytes[offset].is_ascii()
+        && bytes[offset] != b'\r'
+        && bytes.get(offset + 1).is_none_or(u8::is_ascii)
+    {
+        return offset + 1;
+    }
+    grapheme_boundaries(&text[offset..])
+        .nth(1)
+        .map_or(text.len(), |end| offset + end)
+}
+
+/// The text between two byte offsets, or an empty string when the range is
+/// not a range of characters in `text`.
+pub fn text_between(text: &str, start: usize, end: usize) -> &str {
+    text.get(start..end).unwrap_or("")
+}
+
 pub const fn byte_length(text: &str) -> usize {
     text.len()
 }
@@ -839,6 +866,35 @@ mod tests {
         assert_eq!(grapheme_count("👍🏾"), 1);
         assert_eq!(grapheme_count("🇿🇲"), 1);
         assert_eq!(grapheme_count("👨‍👩‍👧‍👦"), 1);
+    }
+
+    #[test]
+    fn walks_the_clusters_that_grapheme_count_counts() {
+        for text in [
+            "",
+            "abc",
+            "a\r\nb",
+            "e\u{301}x",
+            "👍🏾🇿🇲a",
+            "👨‍👩‍👧‍👦日",
+            "a\u{301}\u{302}",
+        ] {
+            let mut clusters = Vec::new();
+            let mut start = 0;
+            while start < text.len() {
+                let end = grapheme_boundary_after(text, start);
+                assert!(end > start, "{text:?} advances from {start}");
+                clusters.push(text_between(text, start, end));
+                start = end;
+            }
+            assert_eq!(clusters.len(), grapheme_count(text), "{text:?}");
+            assert_eq!(clusters.concat(), text);
+        }
+        assert_eq!(grapheme_boundary_after("a\r\nb", 1), 3);
+        assert_eq!(grapheme_boundary_after("abc", 3), 3);
+        assert_eq!(grapheme_boundary_after("日", 1), 3);
+        assert_eq!(text_between("日本", 1, 3), "");
+        assert_eq!(text_between("日本", 3, 6), "本");
     }
 
     #[test]

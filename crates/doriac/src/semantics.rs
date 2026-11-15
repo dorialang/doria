@@ -19143,8 +19143,11 @@ impl<'program> Checker<'program> {
             T::NullableInt => self.types.intern(TypeKind::Nullable(int)),
             T::NullableString => self.types.intern(TypeKind::Nullable(string)),
             T::StringList => self.types.intern(TypeKind::List(string)),
+            T::StringIterable => self.types.intern_resolved(&ResolvedType::Interface(
+                crate::types::InterfaceType::new("Iterable", vec![ResolvedType::String]),
+            )),
             // Pending members: nothing reads their result type.
-            T::StringIterable | T::Ordering | T::Undecided => self.types.unknown(),
+            T::Ordering | T::Undecided => self.types.unknown(),
         }
     }
 

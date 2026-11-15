@@ -867,6 +867,13 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
     if crate::compiler_known_term::resolved_facts_use_term(&facts) {
         combined = crate::compiler_known_term::augment_program(&combined);
     }
+    if graph
+        .sources
+        .values()
+        .any(|source| crate::compiler_known_text::source_uses_graphemes(&source.source))
+    {
+        combined = crate::compiler_known_text::augment_program(&combined);
+    }
     if crate::compiler_known_test::resolved_facts_use_assertion_surface(&facts) {
         combined = crate::compiler_known_test::augment_program(&combined);
     }
@@ -898,6 +905,10 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         .chain(std::iter::once((
             crate::compiler_known_term::SOURCE_ID,
             crate::compiler_known_term::SOURCE_TEXT,
+        )))
+        .chain(std::iter::once((
+            crate::compiler_known_text::SOURCE_ID,
+            crate::compiler_known_text::SOURCE_TEXT,
         )))
         .collect::<HashMap<_, _>>();
     let compiler_known_context = selected_context(graph);
@@ -947,6 +958,14 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_term::SOURCE_NAME.to_string()),
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_text::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_text::SOURCE_NAME.to_string()),
         },
     );
     let mut semantic = crate::semantics::analyze_program_for_ide_with_graph_and_test_context(
