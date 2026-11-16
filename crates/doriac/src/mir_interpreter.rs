@@ -1437,6 +1437,11 @@ fn interpret_internal_with_clock(
 ) -> Result<(InterpreterIoOutput, InterpreterMetrics), InterpreterError> {
     crate::mir_validation::validate_program(program)
         .map_err(|error| InterpreterError::new(error.message))?;
+    // Unsafe operations run through the native companion library, which
+    // this compiler does not build yet; refuse before any effect.
+    if let Some(form) = crate::unsafe_code::companion_operations(program).first() {
+        return Err(InterpreterError::new(form.message.clone()));
+    }
     let entry = function_in(program, program.entry)?;
     // Decision 0099: the entry takes either no parameters or one `List<string>`
     // of program arguments, which the glue owns and lends to `main`.
@@ -2637,6 +2642,11 @@ impl<'a> Interpreter<'a> {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::DropFunction(local));
+            }
+            mir::Statement::Pointer { .. } => {
+                return Err(InterpreterError::new(
+                    "the interpreter runs pointer operations through the native companion library",
+                ));
             }
         }
         Ok(StepOutcome::Continue)

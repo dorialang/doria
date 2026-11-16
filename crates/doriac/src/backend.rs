@@ -304,6 +304,10 @@ impl Backend for DebugBackend {
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
         let mir = lower_validated_mir(program)?;
+        let companion = crate::unsafe_code::companion_operations(&mir);
+        if !companion.is_empty() {
+            return Err(BackendError::from_diagnostics(companion));
+        }
         let output = mir_interpreter::interpret(&mir).map_err(|error| {
             BackendError::from_diagnostics(vec![Diagnostic::new(
                 "M1102",

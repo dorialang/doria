@@ -950,10 +950,12 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
         .filter(|diagnostic| diagnostic.code == "E0784")
         .map(|diagnostic| diagnostic.title.as_str())
         .collect::<Vec<_>>();
-    // Every target builds boundary conversions; only the pointer is gated.
+    // Every target builds boundary conversions, and the native targets
+    // build the other pointer operations; only a pointer to a Doria place
+    // is gated.
     assert_eq!(
         titles,
-        ["Pointer Operations Cannot Be Built Yet"],
+        ["Pointers To Doria Places Cannot Be Built Yet"],
         "{diagnostics:#?}"
     );
 }

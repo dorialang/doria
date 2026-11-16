@@ -1,6 +1,12 @@
 //! The catalogue's per-code documentation (Decision 0145): every entry is in
 //! the required shape, and its example is a program that raises its code.
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/native_execution_runner.rs"]
+mod native_execution;
+
 use doria_diagnostic_catalogue::explanations::ENTRY_SOURCES;
 use doriac::diagnostic_entries::{self, LookupError};
 
@@ -148,6 +154,23 @@ fn check_entry(entry: &doria_diagnostic_catalogue::explanations::DiagnosticEntry
             .unwrap_or_else(|diagnostics| {
                 panic!("{code}: its example does not compile: {diagnostics:?}")
             });
+        // The interpreter runs unsafe code through the native companion
+        // library, which this compiler does not build yet; such an example
+        // runs as a native program, whose report carries the same title.
+        if !doriac::unsafe_code::companion_operations(&program).is_empty() {
+            let run = native_execution::execute_native(
+                &program,
+                doriac::backend::NativeProfile::Fast,
+            );
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert_eq!(run.status.code(), Some(101), "{code}: {stderr}");
+            assert!(stderr.contains(code), "{code}: its example ends with {stderr}");
+            assert!(
+                stderr.contains(entry.title) == entry.title_is_fixed,
+                "{code}: the entry's `Title:` line does not match the report: {stderr}"
+            );
+            return;
+        }
         let output = doriac::mir_interpreter::interpret(&program)
             .unwrap_or_else(|error| panic!("{code}: its example could not be run: {error}"));
         let raised = output.runtime_diagnostic.unwrap_or_else(|| {

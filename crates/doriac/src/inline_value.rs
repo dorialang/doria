@@ -148,6 +148,10 @@ pub enum InlineValueType {
     StandardOutput(ClassId),
     StandardError(ClassId),
     Terminal(TerminalValue, ClassId),
+    /// A raw pointer, `Ptr<T>`, `MutPtr<T>` or a C function pointer
+    /// (Decision 0148 sections 3 and 12): one address word. Its pointee,
+    /// access and C signature are checking facts MIR does not carry.
+    Pointer,
 }
 
 /// Cleanup belongs to the value representation, independently of Copy capability.
@@ -180,6 +184,7 @@ impl InlineValueType {
             Self::StandardOutput(_) => crate::compiler_known_stream::STANDARD_OUTPUT,
             Self::StandardError(_) => crate::compiler_known_stream::STANDARD_ERROR,
             Self::Terminal(value, _) => value.name(),
+            Self::Pointer => crate::foreign::PTR,
         }
     }
 
@@ -189,7 +194,7 @@ impl InlineValueType {
     pub const fn is_word(self) -> bool {
         matches!(
             self,
-            Self::Duration | Self::WatchSource(_) | Self::Terminal(..)
+            Self::Duration | Self::WatchSource(_) | Self::Terminal(..) | Self::Pointer
         )
     }
 
@@ -212,7 +217,8 @@ impl InlineValueType {
             | Self::StandardInput(_)
             | Self::StandardOutput(_)
             | Self::StandardError(_)
-            | Self::Terminal(..) => 8,
+            | Self::Terminal(..)
+            | Self::Pointer => 8,
             Self::Deadline
             | Self::RegistrationKey(_)
             | Self::ReadTransferKey(_)
@@ -225,6 +231,7 @@ impl InlineValueType {
         match self {
             Self::Duration => 0,
             Self::Deadline => 1,
+            Self::Pointer => 2,
             Self::RegistrationKey(class)
             | Self::ReadTransferKey(class)
             | Self::WriteTransferKey(class)
@@ -236,7 +243,7 @@ impl InlineValueType {
             | Self::StandardError(class)
             | Self::Terminal(_, class) => u32::try_from(class.0)
                 .ok()
-                .and_then(|id| id.checked_add(2))
+                .and_then(|id| id.checked_add(3))
                 .expect("validated inline nominal type identity"),
         }
     }
@@ -253,7 +260,7 @@ impl InlineValueType {
             | Self::StandardOutput(class)
             | Self::StandardError(class)
             | Self::Terminal(_, class) => Some(class),
-            Self::Duration | Self::Deadline => None,
+            Self::Duration | Self::Deadline | Self::Pointer => None,
         }
     }
 
@@ -270,7 +277,8 @@ impl InlineValueType {
             | Self::StandardInput(_)
             | Self::StandardOutput(_)
             | Self::StandardError(_)
-            | Self::Terminal(..) => InlineValueLifecycle::Trivial,
+            | Self::Terminal(..)
+            | Self::Pointer => InlineValueLifecycle::Trivial,
         }
     }
 
@@ -339,7 +347,7 @@ mod tests {
             crate::compiler_known_concurrency::CANCELLATION_TOKEN
         );
         assert_eq!(token.nominal_class(), Some(ClassId(7)));
-        assert_eq!(token.type_id(), 9);
+        assert_eq!(token.type_id(), 10);
         assert_eq!(token.storage_bytes(), 8);
         assert_ne!(token, InlineValueType::ReadTransferKey(ClassId(7)));
         assert_ne!(token.type_id(), InlineValueType::Duration.type_id());

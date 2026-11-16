@@ -1372,6 +1372,9 @@ fn validate_class(
             crate::inline_value::InlineValueType::Terminal(..) => {
                 crate::compiler_known_term::SOURCE_ID
             }
+            crate::inline_value::InlineValueType::Pointer => {
+                return Err(malformed_mir("a raw pointer is not a class"));
+            }
         };
         if class.source_span.source != source
             || class.arguments.len()
@@ -4141,6 +4144,9 @@ fn validate_statement(
             }
             validate_type(program, expected)
         }
+        mir::Statement::Pointer {
+            target, operation, ..
+        } => validate_pointer_operation(program, function, *target, operation),
         mir::Statement::DropFunction {
             local,
             function_type,
@@ -6396,6 +6402,70 @@ fn validate_enum_operand(
         | mir::Operand::CollectionKeyAt { .. }
         | mir::Operand::StringIntrinsic(_) => Err(malformed_mir(
             "enum expression uses an incompatible operand",
+        )),
+    }
+}
+
+/// A pointer operation reads a pointer local and assigns a result of its
+/// own type (Decision 0148 section 4).
+fn validate_pointer_operation(
+    program: &mir::Program,
+    function: &mir::Function,
+    target: Option<mir::LocalId>,
+    operation: &mir::PointerOperation,
+) -> Result<(), BackendError> {
+    use crate::inline_value::InlineValueType;
+    let pointer = mir::Type::Scalar(mir::ScalarType::Inline(InlineValueType::Pointer));
+    if let Some(local) = operation.pointer() {
+        if local_in(function, local)?.ty != pointer {
+            return Err(malformed_mir("a pointer operation reads a pointer local"));
+        }
+    }
+    let accessed = |ty: mir::Type| match ty {
+        mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar).is_some(),
+        _ => false,
+    };
+    let result = match operation {
+        mir::PointerOperation::Read { ty, .. } => {
+            if !accessed(*ty) {
+                return Err(malformed_mir("a pointer reads a scalar with a C layout"));
+            }
+            Some(*ty)
+        }
+        mir::PointerOperation::Write { value, .. } => {
+            if !accessed(value.ty()) {
+                return Err(malformed_mir("a pointer writes a scalar with a C layout"));
+            }
+            validate_rvalue(program, function, value)?;
+            None
+        }
+        mir::PointerOperation::Offset { count, scale, .. } => {
+            if count.ty() != IntegerType::Int64 || *scale == 0 || *scale > i64::MAX as u64 {
+                return Err(malformed_mir(
+                    "a pointer offset scales an int64 count by a nonzero size",
+                ));
+            }
+            validate_integer_expression(program, function, count)?;
+            Some(pointer)
+        }
+        mir::PointerOperation::Address { .. } => {
+            Some(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)))
+        }
+        mir::PointerOperation::FromAddress { address } => {
+            if address.ty() != IntegerType::UInt64 {
+                return Err(malformed_mir("a pointer is formed from a uint64 address"));
+            }
+            validate_integer_expression(program, function, address)?;
+            Some(mir::Type::NullableScalar(mir::ScalarType::Inline(
+                InlineValueType::Pointer,
+            )))
+        }
+    };
+    match (target, result) {
+        (Some(target), Some(result)) if local_in(function, target)?.ty == result => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(malformed_mir(
+            "a pointer operation assigns its result to a local of its type",
         )),
     }
 }
@@ -14264,6 +14334,21 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
     let mut accesses = ClassLocalAccesses::default();
     match statement {
         mir::Statement::SetDiagnosticSite { .. } => {}
+        mir::Statement::Pointer { operation, .. } => {
+            if let Some(pointer) = operation.pointer() {
+                accesses.resource_read(pointer);
+            }
+            match operation {
+                mir::PointerOperation::Write { value, .. } => {
+                    collect_rvalue_class_local_accesses(value, &mut accesses)
+                }
+                mir::PointerOperation::Offset { count: value, .. }
+                | mir::PointerOperation::FromAddress { address: value } => {
+                    collect_integer_class_local_accesses(value, &mut accesses)
+                }
+                mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => {}
+            }
+        }
         mir::Statement::CompletePendingRequest {
             request, outcome, ..
         } => {
@@ -20208,6 +20293,16 @@ fn statement_observes_property(
 ) -> bool {
     match statement {
         mir::Statement::SetDiagnosticSite { .. } => false,
+        mir::Statement::Pointer { operation, .. } => match operation {
+            mir::PointerOperation::Write { value, .. } => {
+                rvalue_observes_property(value, receiver, property)
+            }
+            mir::PointerOperation::Offset { count: value, .. }
+            | mir::PointerOperation::FromAddress { address: value } => {
+                integer_observes_property(value, receiver, property)
+            }
+            mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => false,
+        },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,
         mir::Statement::AssignByteRegionIndex { index, value, .. } => {

@@ -3986,6 +3986,11 @@ fn lower_statement(
             environment,
             bindings,
         } => lower_bind_closure_environment(builder, *environment, bindings, resources)?,
+        mir::Statement::Pointer {
+            target,
+            operation,
+            span,
+        } => lower_pointer_operation(builder, *target, operation, *span, resources)?,
         mir::Statement::DropFunction { local, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
@@ -20377,6 +20382,142 @@ fn lower_integer_binary(
         mir::IntegerBinaryOp::BitwiseXor => Ok(builder.ins().bxor(left, right)),
         mir::IntegerBinaryOp::BitwiseOr => Ok(builder.ins().bor(left, right)),
     }
+}
+
+/// One raw pointer operation (Decision 0148 section 4). Memory is accessed
+/// with the pointee's size; an aligned access tests the address first.
+fn lower_pointer_operation(
+    builder: &mut FunctionBuilder,
+    target: Option<mir::LocalId>,
+    operation: &mir::PointerOperation,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let address_of = |builder: &mut FunctionBuilder,
+                      local: mir::LocalId,
+                      resources: &mut LoweringResources<'_, '_>| {
+        load_lowered_from_stack(
+            builder,
+            resources.program,
+            local_definition(resources.program, resources.function_id, local)?.ty,
+            local_slot(resources.local_slots, local)?,
+            pointer,
+        )
+        .single()
+    };
+    let accessed = |ty: mir::Type| match ty {
+        mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar)
+            .map(|size| (scalar, size))
+            .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout")),
+        _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
+    };
+    let result = match operation {
+        mir::PointerOperation::Read {
+            pointer: local,
+            ty,
+            aligned,
+        } => {
+            let (scalar, size) = accessed(*ty)?;
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(builder, address, size, span, resources)?;
+            }
+            let value = builder
+                .ins()
+                .load(clif_scalar_type(scalar), MemFlagsData::new(), address, 0);
+            // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+            let value = if scalar == mir::ScalarType::Bool {
+                builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
+            } else {
+                value
+            };
+            Some(LoweredValue::Single(value))
+        }
+        mir::PointerOperation::Write {
+            pointer: local,
+            value,
+            aligned,
+        } => {
+            let (_, size) = accessed(value.ty())?;
+            let value = lower_rvalue(builder, value, resources)?.single()?;
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(builder, address, size, span, resources)?;
+            }
+            builder.ins().store(MemFlagsData::new(), value, address, 0);
+            None
+        }
+        mir::PointerOperation::Offset {
+            pointer: local,
+            count,
+            scale,
+        } => {
+            let count = lower_integer_expression(builder, count, resources)?;
+            let address = address_of(builder, *local, resources)?;
+            let scale = builder.ins().iconst(types::I64, *scale as i64);
+            let (bytes, scaled_overflow) = builder.ins().smul_overflow(count, scale);
+            let moved = builder.ins().iadd(address, bytes);
+            // A negative offset must move down and any other up; wrapping
+            // past either end of the address space, or reaching zero,
+            // leaves every address a `Ptr<T>` can hold.
+            let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, bytes, 0);
+            let wrapped_down = builder.ins().icmp(IntCC::UnsignedGreaterThan, moved, address);
+            let wrapped_up = builder.ins().icmp(IntCC::UnsignedLessThan, moved, address);
+            let wrapped = builder.ins().select(negative, wrapped_down, wrapped_up);
+            let null = builder.ins().icmp_imm_u(IntCC::Equal, moved, 0);
+            let leaves = builder.ins().bor(scaled_overflow, wrapped);
+            let leaves = builder.ins().bor(leaves, null);
+            lower_panic_if_code(
+                builder,
+                leaves,
+                crate::foreign::POINTER_ADDRESS_PANIC_CODE,
+                span,
+                resources,
+            )?;
+            Some(LoweredValue::Single(moved))
+        }
+        mir::PointerOperation::Address { pointer: local } => {
+            Some(LoweredValue::Single(address_of(builder, *local, resources)?))
+        }
+        mir::PointerOperation::FromAddress { address } => {
+            let address = lower_integer_expression(builder, address, resources)?;
+            let present = builder.ins().icmp_imm_u(IntCC::NotEqual, address, 0);
+            Some(LoweredValue::Nullable {
+                present: builder.ins().uextend(pointer, present),
+                payload: address,
+            })
+        }
+    };
+    if let (Some(target), Some(value)) = (target, result) {
+        let ty = local_definition(resources.program, resources.function_id, target)?.ty;
+        let slot = local_slot(resources.local_slots, target)?;
+        store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)?;
+    }
+    Ok(())
+}
+
+/// Panics with P1702 unless `address` is aligned for a pointee of `size`
+/// bytes, whose alignment is its size.
+fn lower_pointer_alignment_check(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    size: u64,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if size <= 1 {
+        return Ok(());
+    }
+    let misaligned = builder.ins().band_imm_u(address, (size - 1) as i64);
+    let misaligned = builder.ins().icmp_imm_u(IntCC::NotEqual, misaligned, 0);
+    lower_panic_if_code(
+        builder,
+        misaligned,
+        crate::foreign::POINTER_ALIGNMENT_PANIC_CODE,
+        span,
+        resources,
+    )
 }
 
 fn lower_checked_arithmetic(

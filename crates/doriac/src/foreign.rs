@@ -16,6 +16,14 @@ pub const OPAQUE: &str = "Doria\\Std\\Ffi\\Opaque";
 /// value outside the C type's range on this target (section 5).
 pub const BOUNDARY_CONVERSION_PANIC_CODE: &str = "P1701";
 
+/// The panic of `read` and `write` at an address that is not aligned for
+/// the pointee (section 4).
+pub const POINTER_ALIGNMENT_PANIC_CODE: &str = "P1702";
+
+/// The panic of `offset` and `byteOffset` when the address leaves the
+/// address space or reaches zero, which no `Ptr<T>` holds (section 4).
+pub const POINTER_ADDRESS_PANIC_CODE: &str = "P1703";
+
 /// Read access (`Ptr<T>`) or read and write access (`MutPtr<T>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PointerAccess {

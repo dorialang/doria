@@ -6076,6 +6076,58 @@ pub enum Statement {
         function_type: FunctionTypeId,
         nullable: bool,
     },
+    /// One raw pointer operation (Decision 0148 section 4), assigning its
+    /// result, if it has one, to `target`. `span` is the operation's
+    /// source, where a misaligned access (P1702) or an address that
+    /// leaves the address space (P1703) panics.
+    Pointer {
+        target: Option<LocalId>,
+        operation: PointerOperation,
+        span: Span,
+    },
+}
+
+/// What a `Statement::Pointer` does. Every pointer is the inline pointer
+/// value of the local it names; `ty` is the scalar the C layout reads or
+/// writes, with alignment equal to its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointerOperation {
+    /// `read` and `readUnaligned`: the value of type `ty` at the address.
+    Read {
+        pointer: LocalId,
+        ty: Type,
+        aligned: bool,
+    },
+    /// `write` and `writeUnaligned`: stores `value` of type `ty`.
+    Write {
+        pointer: LocalId,
+        value: Rvalue,
+        aligned: bool,
+    },
+    /// `offset` (`scale` is the pointee's size) and `byteOffset` (`scale`
+    /// is 1): the pointer `count * scale` bytes away.
+    Offset {
+        pointer: LocalId,
+        count: IntegerExpression,
+        scale: u64,
+    },
+    /// `$pointer->address`, as `uint64`.
+    Address { pointer: LocalId },
+    /// `Ptr::fromAddress`: `?Ptr`, absent for address zero.
+    FromAddress { address: IntegerExpression },
+}
+
+impl PointerOperation {
+    /// The pointer local the operation reads, if any.
+    pub const fn pointer(&self) -> Option<LocalId> {
+        match self {
+            Self::Read { pointer, .. }
+            | Self::Write { pointer, .. }
+            | Self::Offset { pointer, .. }
+            | Self::Address { pointer } => Some(*pointer),
+            Self::FromAddress { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7094,6 +7146,12 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropCollection { .. }
         | Statement::DropFunction { .. }
         | Statement::WriteStreamBytes { .. } => 0,
+        Statement::Pointer { operation, .. } => match operation {
+            PointerOperation::Write { value, .. } => rvalue_class_temporary_capacity(value),
+            PointerOperation::Offset { count, .. } => integer_class_temporary_capacity(count),
+            PointerOperation::FromAddress { address } => integer_class_temporary_capacity(address),
+            PointerOperation::Read { .. } | PointerOperation::Address { .. } => 0,
+        },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
         }
@@ -10504,6 +10562,46 @@ impl fmt::Display for Statement {
                 function_type.0,
                 local.0
             ),
+            Statement::Pointer {
+                target, operation, ..
+            } => {
+                if let Some(target) = target {
+                    write!(formatter, "local{} = ", target.0)?;
+                }
+                match operation {
+                    PointerOperation::Read {
+                        pointer,
+                        ty,
+                        aligned,
+                    } => write!(
+                        formatter,
+                        "pointer_read<{ty}{}>(local{})",
+                        if *aligned { "" } else { ", unaligned" },
+                        pointer.0
+                    ),
+                    PointerOperation::Write {
+                        pointer,
+                        value,
+                        aligned,
+                    } => write!(
+                        formatter,
+                        "pointer_write{}(local{}, {value})",
+                        if *aligned { "" } else { "_unaligned" },
+                        pointer.0
+                    ),
+                    PointerOperation::Offset {
+                        pointer,
+                        count,
+                        scale,
+                    } => write!(formatter, "pointer_offset(local{}, {count} * {scale})", pointer.0),
+                    PointerOperation::Address { pointer } => {
+                        write!(formatter, "pointer_address(local{})", pointer.0)
+                    }
+                    PointerOperation::FromAddress { address } => {
+                        write!(formatter, "pointer_from_address({address})")
+                    }
+                }
+            }
             Statement::DropInlineValue {
                 local,
                 ty,

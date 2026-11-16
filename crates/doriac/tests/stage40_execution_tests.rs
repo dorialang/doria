@@ -168,3 +168,152 @@ fn php_output_reports_that_it_does_not_build_boundary_values_yet() {
         "{diagnostics:#?}"
     );
 }
+
+/// The program prints `stdout` and exits 0 on every native profile; the
+/// interpreter reports that it runs pointer operations through the native
+/// companion library.
+fn assert_runs_natively(source: &str, stdout: &str) {
+    let mir = program(source);
+    assert_interpreter_reports_companion(&mir);
+    for profile in NativeProfile::AVAILABLE {
+        let run = execute_native(&mir, *profile);
+        assert_eq!(run.status.code(), Some(0), "{profile:?}: {run:?}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), stdout, "{profile:?}");
+        assert!(run.stderr.is_empty(), "{profile:?}: {run:?}");
+    }
+}
+
+/// The program panics with `code` and `title` on every native profile.
+fn assert_panics_natively(source: &str, code: &str, title: &str) {
+    let mir = program(source);
+    assert_interpreter_reports_companion(&mir);
+    for profile in NativeProfile::AVAILABLE {
+        let run = execute_native(&mir, *profile);
+        assert_eq!(run.status.code(), Some(101), "{profile:?}: {run:?}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains(code) && stderr.contains(title),
+            "{profile:?}: {stderr}"
+        );
+    }
+}
+
+fn assert_interpreter_reports_companion(mir: &doriac::mir::Program) {
+    let companion = doriac::unsafe_code::companion_operations(mir);
+    assert!(
+        companion.iter().all(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
+        "{companion:#?}"
+    );
+    assert!(!companion.is_empty());
+    let error = interpret(mir).expect_err("the interpreter runs pointers through the companion");
+    assert!(error.to_string().contains("pointer operations"), "{error}");
+}
+
+const POINTER: &str = "use Doria\\Std\\Ffi\\{MutPtr, Ptr};\n";
+
+#[test]
+fn pointer_addresses_offset_cast_and_compare() {
+    let source = format!(
+        "{POINTER}
+function step(Ptr<int32> $pointer, int $count): Ptr<int32>
+{{
+    return unsafe($pointer->offset($count));
+}}
+
+function main(): void
+{{
+    unsafe {{
+        ?Ptr<int32> $absent = Ptr::fromAddress(0);
+        echo $absent == null;
+        echo \" \";
+        ?Ptr<int32> $maybe = Ptr::fromAddress(4096);
+        if ($maybe != null) {{
+            let $base = $maybe;
+            echo $base->address;
+            echo \" \";
+            echo step($base, 3)->address;
+            echo \" \";
+            echo $base->offset(-2)->address;
+            echo \" \";
+            echo $base->byteOffset(6)->address;
+            echo \" \";
+            Ptr<uint8> $bytes = Ptr::cast($base);
+            echo $bytes->offset(5)->address;
+            echo \" \";
+            MutPtr<int64> $wide = MutPtr::cast($base);
+            echo $wide->offset(1)->address;
+            echo \" \";
+            Ptr<int64> $readonly = Ptr::from($wide);
+            echo $readonly->address == $base->address;
+            echo \" \";
+            echo $base == step($base, 0);
+            echo \" \";
+            echo $base != step($base, 1);
+        }}
+    }}
+}}
+"
+    );
+    assert_runs_natively(
+        &source,
+        "true 4096 4108 4088 4102 4101 4104 true true true",
+    );
+}
+
+#[test]
+fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
+    for body in [
+        "?Ptr<int32> $pointer = Ptr::fromAddress(4098); if ($pointer != null) { echo $pointer->read(); }",
+        "?Ptr<float64> $pointer = Ptr::fromAddress(4100); if ($pointer != null) { MutPtr<float64> $mutable = MutPtr::cast($pointer); $mutable->write(1.5); }",
+    ] {
+        let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
+        assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
+    }
+}
+
+#[test]
+fn an_offset_that_leaves_the_address_space_panics_with_p1703() {
+    for body in [
+        // Below zero.
+        "?Ptr<uint8> $pointer = Ptr::fromAddress(8); if ($pointer != null) { echo $pointer->byteOffset(-16)->address; }",
+        // To zero, which no `Ptr<T>` holds.
+        "?Ptr<int64> $pointer = Ptr::fromAddress(16); if ($pointer != null) { echo $pointer->offset(-2)->address; }",
+        // Past the largest address.
+        "?Ptr<uint8> $pointer = Ptr::fromAddress(18446744073709551608); if ($pointer != null) { echo $pointer->byteOffset(8)->address; }",
+        // The scaled count overflows before the address moves.
+        "?Ptr<int64> $pointer = Ptr::fromAddress(4096); if ($pointer != null) { echo $pointer->offset(2305843009213693952)->address; }",
+    ] {
+        let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
+        assert_panics_natively(&source, "P1703", "Pointer Arithmetic Left The Address Space");
+    }
+}
+
+#[test]
+fn the_interpreter_and_php_output_report_pointer_operations() {
+    let source = format!(
+        "{POINTER}function main(): void {{ unsafe {{ ?Ptr<int32> $pointer = Ptr::fromAddress(4096); echo $pointer == null; }} }}"
+    );
+    let debug = doriac::compile_source(
+        "stage40.doria",
+        source.clone(),
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter runs pointers through the companion");
+    assert!(
+        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
+        "{debug:#?}"
+    );
+    let php = doriac::compile_source(
+        "stage40.doria",
+        source,
+        doriac::backend::BackendTarget::Php,
+    )
+    .expect_err("PHP output runs pointers through the companion");
+    assert!(
+        php.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Pointers Cannot Be Built For PHP Output Yet"),
+        "{php:#?}"
+    );
+}

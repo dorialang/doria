@@ -5116,6 +5116,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 environment,
                 bindings,
             } => self.bind_closure_environment(*environment, bindings)?,
+            mir::Statement::Pointer {
+                target,
+                operation,
+                span,
+            } => self.lower_pointer_operation(*target, operation, *span)?,
             mir::Statement::DropFunction { local, .. } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let carrier = build(self.builder.build_load(
@@ -22060,6 +22065,169 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
+    /// One raw pointer operation (Decision 0148 section 4). Memory is
+    /// accessed with the pointee's size; an aligned access tests the
+    /// address first and then states the alignment it proved.
+    fn lower_pointer_operation(
+        &mut self,
+        target: Option<mir::LocalId>,
+        operation: &mir::PointerOperation,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let word = self.context.i64_type();
+        let accessed = |ty: mir::Type| match ty {
+            mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar)
+                .map(|size| (scalar, size))
+                .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout")),
+            _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
+        };
+        let result: Option<BasicValueEnum<'ctx>> = match operation {
+            mir::PointerOperation::Read {
+                pointer,
+                ty,
+                aligned,
+            } => {
+                let (scalar, size) = accessed(*ty)?;
+                let address = self.pointer_local(*pointer)?;
+                let memory = self.checked_pointer_memory(address, size, *aligned, span)?;
+                let loaded = build(self.builder.build_load(
+                    scalar_type(self.context, scalar),
+                    memory,
+                    "pointer.read",
+                ))?;
+                set_access_alignment(loaded.as_instruction_value(), size, *aligned)?;
+                // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+                Some(if scalar == mir::ScalarType::Bool {
+                    let byte = loaded.into_int_value();
+                    let set = build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        byte,
+                        byte.get_type().const_zero(),
+                        "pointer.read.bool",
+                    ))?;
+                    build(self.builder.build_int_z_extend(
+                        set,
+                        self.context.i8_type(),
+                        "pointer.read.bool.byte",
+                    ))?
+                    .into()
+                } else {
+                    loaded
+                })
+            }
+            mir::PointerOperation::Write {
+                pointer,
+                value,
+                aligned,
+            } => {
+                let (_, size) = accessed(value.ty())?;
+                let value = self.lower_rvalue(value)?;
+                let address = self.pointer_local(*pointer)?;
+                let memory = self.checked_pointer_memory(address, size, *aligned, span)?;
+                let stored = build(self.builder.build_store(memory, value))?;
+                set_access_alignment(Some(stored), size, *aligned)?;
+                None
+            }
+            mir::PointerOperation::Offset {
+                pointer,
+                count,
+                scale,
+            } => {
+                let count = self.lower_integer_expression(count)?;
+                let address = self.pointer_local(*pointer)?;
+                let (bytes, scaled_overflow) = self.checked_arithmetic_parts(
+                    IntegerType::Int64,
+                    mir::IntegerBinaryOp::Multiply,
+                    count,
+                    word.const_int(*scale, false),
+                )?;
+                let moved = build(self.builder.build_int_add(address, bytes, "pointer.offset"))?;
+                // A negative offset must move down and any other up; wrapping
+                // past either end of the address space, or reaching zero,
+                // leaves every address a `Ptr<T>` can hold.
+                let compare = |this: &Self, predicate, left, right, name| {
+                    build(this.builder.build_int_compare(predicate, left, right, name))
+                };
+                let negative =
+                    compare(self, IntPredicate::SLT, bytes, word.const_zero(), "offset.negative")?;
+                let wrapped_down =
+                    compare(self, IntPredicate::UGT, moved, address, "offset.wrapped.down")?;
+                let wrapped_up =
+                    compare(self, IntPredicate::ULT, moved, address, "offset.wrapped.up")?;
+                let wrapped = build(self.builder.build_select(
+                    negative,
+                    wrapped_down,
+                    wrapped_up,
+                    "offset.wrapped",
+                ))?
+                .into_int_value();
+                let null = compare(self, IntPredicate::EQ, moved, word.const_zero(), "offset.null")?;
+                let leaves = build(self.builder.build_or(scaled_overflow, wrapped, "offset.leaves"))?;
+                let leaves = build(self.builder.build_or(leaves, null, "offset.leaves"))?;
+                self.lower_panic_if_code(leaves, crate::foreign::POINTER_ADDRESS_PANIC_CODE, span)?;
+                Some(moved.into())
+            }
+            mir::PointerOperation::Address { pointer } => Some(self.pointer_local(*pointer)?.into()),
+            mir::PointerOperation::FromAddress { address } => {
+                let address = self.lower_integer_expression(address)?;
+                let present = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    address,
+                    word.const_zero(),
+                    "pointer.present",
+                ))?;
+                let present = build(self.builder.build_int_z_extend(
+                    present,
+                    self.context.ptr_sized_int_type(self.target_data, None),
+                    "pointer.present.word",
+                ))?;
+                Some(self.nullable_value(present, address.into())?.into())
+            }
+        };
+        if let (Some(target), Some(value)) = (target, result) {
+            let slot = local_slot(&self.local_slots, target)?;
+            build(self.builder.build_store(slot, value))?;
+        }
+        Ok(())
+    }
+
+    /// The address a pointer local holds.
+    fn pointer_local(&mut self, local: mir::LocalId) -> Result<IntValue<'ctx>, BackendError> {
+        let slot = local_slot(&self.local_slots, local)?;
+        Ok(build(self.builder.build_load(self.context.i64_type(), slot, "pointer"))?.into_int_value())
+    }
+
+    /// The memory at `address`, after P1702's alignment test for an aligned
+    /// access to a pointee of `size` bytes, whose alignment is its size.
+    fn checked_pointer_memory(
+        &mut self,
+        address: IntValue<'ctx>,
+        size: u64,
+        aligned: bool,
+        span: crate::source::Span,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        if aligned && size > 1 {
+            let word = self.context.i64_type();
+            let low = build(self.builder.build_and(
+                address,
+                word.const_int(size - 1, false),
+                "pointer.misalignment",
+            ))?;
+            let misaligned = build(self.builder.build_int_compare(
+                IntPredicate::NE,
+                low,
+                word.const_zero(),
+                "pointer.misaligned",
+            ))?;
+            self.lower_panic_if_code(misaligned, crate::foreign::POINTER_ALIGNMENT_PANIC_CODE, span)?;
+        }
+        build(self.builder.build_int_to_ptr(
+            address,
+            self.context.ptr_type(AddressSpace::default()),
+            "pointer.memory",
+        ))
+    }
+
     fn lower_checked_arithmetic(
         &mut self,
         ty: IntegerType,
@@ -22068,6 +22236,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         right: IntValue<'ctx>,
         span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
+        let (value, overflow) = self.checked_arithmetic_parts(ty, op, left, right)?;
+        let panic = match op {
+            mir::IntegerBinaryOp::Add => IntegerPanic::OverflowAddition,
+            mir::IntegerBinaryOp::Subtract => IntegerPanic::OverflowSubtraction,
+            mir::IntegerBinaryOp::Multiply => IntegerPanic::OverflowMultiplication,
+            _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
+        };
+        self.lower_panic_if_code(overflow, panic.code(), span)?;
+        Ok(value)
+    }
+
+    /// The wrapped result of `op` and whether it overflowed `ty`.
+    fn checked_arithmetic_parts(
+        &mut self,
+        ty: IntegerType,
+        op: mir::IntegerBinaryOp,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>), BackendError> {
         let operation = match op {
             mir::IntegerBinaryOp::Add => "add",
             mir::IntegerBinaryOp::Subtract => "sub",
@@ -22112,14 +22299,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .build_extract_value(result, 1, "arithmetic.overflow"),
         )?
         .into_int_value();
-        let panic = match op {
-            mir::IntegerBinaryOp::Add => IntegerPanic::OverflowAddition,
-            mir::IntegerBinaryOp::Subtract => IntegerPanic::OverflowSubtraction,
-            mir::IntegerBinaryOp::Multiply => IntegerPanic::OverflowMultiplication,
-            _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
-        };
-        self.lower_panic_if_code(overflow, panic.code(), span)?;
-        Ok(value)
+        Ok((value, overflow))
     }
 
     fn lower_integer_division(
@@ -25300,6 +25480,20 @@ fn float_compare_predicate(op: mir::CompareOp) -> FloatPredicate {
         mir::CompareOp::Greater => FloatPredicate::OGT,
         mir::CompareOp::GreaterEqual => FloatPredicate::OGE,
     }
+}
+
+/// The alignment a pointer access states: the pointee's size after the
+/// aligned form's test, and one byte for the unaligned forms.
+fn set_access_alignment(
+    instruction: Option<inkwell::values::InstructionValue<'_>>,
+    size: u64,
+    aligned: bool,
+) -> Result<(), BackendError> {
+    let alignment = if aligned { size as u32 } else { 1 };
+    instruction
+        .ok_or_else(|| backend_failure("a pointer access produced no instruction"))?
+        .set_alignment(alignment)
+        .map_err(|message| backend_failure(format!("pointer access alignment: {message}")))
 }
 
 fn scalar_type(context: &Context, ty: mir::ScalarType) -> BasicTypeEnum<'_> {

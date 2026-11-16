@@ -68,8 +68,31 @@ pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Di
     Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
         .with_title(title)
         .with_explanation(
-            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target; the interpreter and PHP output run this form through the native companion library, which this compiler does not build yet.",
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and PHP output takes the target's C data model, through the native companion library, which this compiler does not build yet.",
         )
+}
+
+/// One E0784 diagnostic per MIR operation the native targets build and the
+/// interpreter runs through the native companion library, in program order.
+pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
+    let mut seen = HashSet::new();
+    let mut diagnostics = Vec::new();
+    for function in &program.functions {
+        for block in &function.blocks {
+            for statement in &block.statements {
+                if let crate::mir::Statement::Pointer { span, .. } = statement {
+                    if seen.insert(*span) {
+                        diagnostics.push(companion_form(
+                            *span,
+                            "Pointer Operations Cannot Run In The Interpreter Yet",
+                            "pointer operations are part of Doria; the interpreter does not run them yet",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    diagnostics
 }
 
 /// One E0784 diagnostic per checked form that no execution target runs yet.
@@ -302,15 +325,25 @@ impl Finder {
                 ..
             } if self.gate == Gate::Execution => {
                 match crate::pointer_intrinsics::ForeignCompanion::from_class_name(class) {
-                    Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(access)) => self
-                        .report(
+                    // The native targets build every other pointer
+                    // operation; the interpreter and PHP output report them.
+                    Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(access))
+                        if crate::pointer_intrinsics::formation(
+                            &StaticQualifier::Class(class.clone()),
+                            method,
+                        )
+                        .is_some() =>
+                    {
+                        self.report(
                             *span,
-                            "Pointer Operations Cannot Be Built Yet",
+                            "Pointers To Doria Places Cannot Be Built Yet",
                             format!(
-                                "`{}::{method}` is part of Doria; this compiler does not build pointer operations yet",
+                                "`{}::{method}` is part of Doria; this compiler does not build pointers to Doria places yet",
                                 access.short_name()
                             ),
-                        ),
+                        )
+                    }
+                    Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(_)) => {}
                     // Every target builds boundary conversions; PHP output
                     // reports them itself.
                     Some(crate::pointer_intrinsics::ForeignCompanion::Boundary(_)) | None => {}
@@ -334,8 +367,8 @@ impl Finder {
         if types.foreign {
             self.report(
                 span,
-                "Foreign Types Cannot Be Built Yet",
-                "pointers and C function pointer types are part of Doria; this compiler does not build code that uses them yet",
+                "C Function Pointer Types Cannot Be Built Yet",
+                "C function pointer types are part of Doria; this compiler does not build code that uses them yet",
             );
         }
     }
@@ -353,8 +386,6 @@ impl Transform for TypeFinder {
             .as_ref()
             .is_some_and(|function| function.c_abi.is_some())
             || ty.fixed_array_parts().is_some()
-            || (crate::foreign::is_type_name(&ty.name)
-                && crate::foreign::CBoundaryType::from_source_name(&ty.name).is_none())
         {
             self.foreign = true;
         }

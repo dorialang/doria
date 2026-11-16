@@ -642,6 +642,19 @@ pub fn function_symbol(function: &mir::Function) -> String {
     format!("__doria_fn_{}_{}", function.id.0, sanitized)
 }
 
+/// The C size, equal to its alignment, of a scalar a raw pointer reads and
+/// writes (Decision 0148 section 4); `None` for a scalar without a C layout.
+pub(crate) const fn pointee_scalar_size(scalar: crate::mir::ScalarType) -> Option<u64> {
+    use crate::mir::ScalarType;
+    match scalar {
+        ScalarType::Integer(ty) => Some(ty.storage_bytes() as u64),
+        ScalarType::Float(ty) => Some(ty.storage_bytes() as u64),
+        ScalarType::Bool => Some(1),
+        ScalarType::Inline(crate::inline_value::InlineValueType::Pointer) => Some(8),
+        ScalarType::Inline(_) | ScalarType::Enum(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{collection_header_size, collection_value_width, nullable_payload_type};
@@ -854,3 +867,4 @@ mod tests {
         assert_eq!(align_of::<usize>(), doria_rt::DR_COLLECTION_ALIGN);
     }
 }
+

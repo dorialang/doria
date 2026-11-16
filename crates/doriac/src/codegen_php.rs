@@ -3327,6 +3327,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         );
     }
     if let Some(ty) = semantic_info.expression_type(expr.span()) {
+        foreign_value(ty, expr.span())?;
         enum_core::validate_collection(ty, expr.span())?;
     }
     match expr {
@@ -3524,18 +3525,6 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             span,
             ..
         } => {
-            if let Some(boundary) = crate::foreign::CBoundaryType::from_source_name(class_name) {
-                return Err(BackendError::from_diagnostics(vec![
-                    crate::unsafe_code::companion_form(
-                        *span,
-                        "C Boundary Values Cannot Be Built For PHP Output Yet",
-                        format!(
-                            "`{}::{method}` is part of Doria; PHP output does not build C boundary values yet",
-                            boundary.short_name()
-                        ),
-                    ),
-                ]));
-            }
             // UTF-8 validation is exact with PCRE, which every PHP build has.
             if class_name == "String" && method == "fromBytes" && args.len() == 1 {
                 return validate_arguments(args, semantic_info);
@@ -4069,6 +4058,40 @@ fn unsupported_collection_shape(span: Span, feature: impl Into<String>) -> Backe
         ),
         span,
     )])
+}
+
+/// PHP output runs unsafe code, and takes the target's C data model,
+/// through the native companion library (Decision 0148 section 23), which
+/// this compiler does not build yet.
+fn foreign_value(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
+    let foreign = match ty {
+        ResolvedType::Foreign(foreign) => foreign,
+        ResolvedType::Nullable(inner) => match inner.as_ref() {
+            ResolvedType::Foreign(foreign) => foreign,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let (title, values) = match foreign.as_ref() {
+        crate::foreign::ForeignType::Boundary(_) => (
+            "C Boundary Values Cannot Be Built For PHP Output Yet",
+            "C boundary values",
+        ),
+        crate::foreign::ForeignType::Pointer { .. } | crate::foreign::ForeignType::Function(_) => {
+            ("Pointers Cannot Be Built For PHP Output Yet", "pointers")
+        }
+        _ => (
+            "Foreign Values Cannot Be Built For PHP Output Yet",
+            "foreign structs and unions",
+        ),
+    };
+    Err(BackendError::from_diagnostics(vec![
+        crate::unsafe_code::companion_form(
+            span,
+            title,
+            format!("{values} are part of Doria; PHP output does not build them yet"),
+        ),
+    ]))
 }
 
 fn php_widening_integer_conversion(

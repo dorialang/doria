@@ -25,6 +25,7 @@ use crate::types::{
 use crate::{hir, mir};
 
 mod byte_region;
+mod foreign;
 #[cfg(test)]
 pub(crate) mod conditional_results;
 mod core_collection;
@@ -2672,17 +2673,22 @@ fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String>
 }
 
 /// The MIR form of a foreign type (Decision 0148). A C boundary value is the
-/// integer of its width and signedness on the native target; foreign forms
+/// integer of its width and signedness on the native target; a data or C
+/// function pointer is the one-word inline pointer value. Foreign forms
 /// without a MIR form yet return `None`, and the execution gate in
 /// `crate::unsafe_code` stops programs that use them.
 fn foreign_mir_type(
     foreign: &crate::foreign::ForeignType<crate::types::ResolvedType>,
 ) -> Option<mir::Type> {
+    use crate::foreign::ForeignType;
     match foreign {
-        crate::foreign::ForeignType::Boundary(boundary) => Some(mir::Type::Scalar(
-            mir::ScalarType::Integer(crate::c_layout::CTarget::host().boundary_integer(*boundary)),
+        ForeignType::Boundary(boundary) => Some(mir::Type::Scalar(mir::ScalarType::Integer(
+            crate::c_layout::CTarget::host().boundary_integer(*boundary),
+        ))),
+        ForeignType::Pointer { .. } | ForeignType::Function(_) => Some(mir::Type::Scalar(
+            mir::ScalarType::Inline(crate::inline_value::InlineValueType::Pointer),
         )),
-        _ => None,
+        ForeignType::Opaque | ForeignType::Aggregate(_) | ForeignType::FixedArray { .. } => None,
     }
 }
 
@@ -5497,6 +5503,9 @@ fn lower_expression_statement(
     }
     if let Some(value) = iteration::builtin_acquire(expr, context)? {
         lower_discarded_rvalue(value, context);
+        return Ok(());
+    }
+    if foreign::statement(expr, context)? {
         return Ok(());
     }
     if let Some(value) = core_value::primitive_call(expr, context)? {
@@ -20454,6 +20463,9 @@ fn materialize_checked_rvalue(
         .map(Some);
     }
     if let Some(value) = core_collection::expression(expr, expected, consume_result, context)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = foreign::expression(expr, expected, context)? {
         return Ok(Some(value));
     }
     if matches!(
