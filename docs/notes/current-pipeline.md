@@ -13,6 +13,11 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Term value constructors, 2026-11-16 (Decision 0140 amendment): `new Size`,
+  `new Position`, `new KeyModifiers` and `KeyModifiers::none`. `new` on a
+  compiler-known inline value is checked against its public constructor and
+  lowered to its `fromParts` factory in HIR, so the interpreter, Cranelift,
+  LLVM and PHP output share one path.
 - Completion context, 2026-11-15. `doriac::syntax::completion_context(path,
   source, offset)` reports the syntax context at a cursor (top level, member
   declaration, statement, expression operand or after an operand, type with

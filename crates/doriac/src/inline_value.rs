@@ -31,6 +31,13 @@ impl TerminalValue {
     }
 }
 
+/// The static factory that builds a compiler-known inline value from its
+/// parts. An inline value has no stored fields, so a public constructor on
+/// one is a signature only: `new T(...)` is checked against `T::__construct`
+/// and lowered to a call of `T::fromParts(...)` with the same arguments, which
+/// the declaring module writes in Doria (Decision 0140, 2026-11-16).
+pub const CONSTRUCTION_FACTORY: &str = "fromParts";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InlineValueKind {
     Duration,

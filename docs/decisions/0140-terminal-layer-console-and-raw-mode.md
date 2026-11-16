@@ -185,7 +185,9 @@ enum LineWrap { case Enabled; case Disabled; }
 ```
 
 `Size` (`$columns`, `$rows`), `Position` (`$column`, `$row`), `KeyModifiers`
-(`$control`, `$alt`, `$shift`), `Color` and `Style` are values. `Color` is an
+(`$control`, `$alt`, `$shift`), `Color` and `Style` are values. `Size`,
+`Position` and `KeyModifiers` have public constructors (see "Amendment,
+2026-11-16"). `Color` is an
 ordinary enum with `Default`, the sixteen named colors, `Indexed(int $index)`
 and `Rgb(int $red, int $green, int $blue)`. `Style` combines a foreground, a
 background and text attributes (bold, dim, italic, underline, reverse,
@@ -514,6 +516,32 @@ behavior that keeps those sections true, and each is covered by a test.
 - On Windows the control handler also restores on Control+C and
   Control+Break when the program is not in raw mode, since those end the
   process the same way close does.
+
+## Amendment, 2026-11-16: Public Value Constructors
+
+Andrew ruled on a card on 2026-11-16: "Public constructors (Recommended)".
+A library such as `Doria\Tui` builds these values itself, for example the
+size of a region it lays out or the modifiers of a shortcut it matches.
+
+```doria
+new Size(int $columns, int $rows)
+new Position(int $column, int $row)
+new KeyModifiers(bool $control, bool $alt, bool $shift)
+KeyModifiers::none
+```
+
+- A negative column, row or count panics, as `Console::moveTo` does. A value
+  above the largest a terminal reports, 16,777,215, is held as that largest
+  value, also as `Console::moveTo` does.
+- `KeyModifiers::none` is a static property, the form `Style::plain` uses: the
+  modifiers of a key pressed alone.
+- The values stay inline Copy words. An inline value has no stored fields, so
+  its public constructor is a signature: `new T(...)` is checked against it
+  and lowered to the type's `fromParts` factory, which the Term module writes
+  in Doria. The existing internal `fromBits` and `bits` paths are unchanged.
+  The rule is general for compiler-known inline values
+  (`inline_value::CONSTRUCTION_FACTORY`); a test requires each public
+  constructor to have a factory with the same parameters.
 
 ## Scope
 

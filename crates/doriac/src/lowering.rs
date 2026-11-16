@@ -1454,6 +1454,24 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             member: member.clone(),
             span: *span,
         },
+        // A compiler-known inline value is built by its factory; the checker
+        // has already held the arguments to its public constructor.
+        ast::Expr::New {
+            class_type: constructed_class,
+            args,
+            shared: false,
+            span,
+        } if crate::inline_value::InlineValueKind::for_name(&constructed_class.name).is_some() => {
+            hir::Expr::StaticCall {
+                class_name: constructed_class.name.clone(),
+                method: crate::inline_value::CONSTRUCTION_FACTORY.to_string(),
+                args: args
+                    .iter()
+                    .map(|arg| lower_argument(arg, class_name))
+                    .collect(),
+                span: *span,
+            }
+        }
         ast::Expr::New {
             class_type: constructed_class,
             args,

@@ -1209,3 +1209,106 @@ function main(): void throws IoError {{
         Err(DEAD_END.to_string())
     );
 }
+
+/// `new Size(...)`, `new Position(...)` and `new KeyModifiers(...)` build the
+/// values through each type's `fromParts` factory (Decision 0140, amended
+/// 2026-11-16); `KeyModifiers::none` has no modifier held.
+#[test]
+fn values_are_built_by_their_public_constructors() {
+    let output = run(
+        r#"
+use Doria\Std\Term\{KeyModifiers, Position, Size};
+
+function main(): void
+{
+    let $size = new Size(rows: 24, columns: 80);
+    let $at = new Position(3, 4);
+    let $none = KeyModifiers::none;
+    let $chord = new KeyModifiers(control: true, alt: false, shift: true);
+    echo "{$size->columns} {$size->rows} {$at->column} {$at->row} ";
+    echo "{$none->control} {$none->alt} {$none->shift} ";
+    echo "{$chord->control} {$chord->alt} {$chord->shift}";
+}
+"#,
+        None,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "80 24 3 4 false false false true false true"
+    );
+}
+
+/// A negative size or position panics, as `Console::moveTo` does.
+#[test]
+fn a_negative_size_or_position_panics() {
+    for (value, message) in [
+        (
+            "new Doria\\Std\\Term\\Size(-1, 2)",
+            "a terminal size cannot be negative",
+        ),
+        (
+            "new Doria\\Std\\Term\\Position(1, -2)",
+            "a terminal position cannot be negative",
+        ),
+    ] {
+        let source = format!("function main(): void\n{{\n    let $value = {value};\n}}\n");
+        let output = run(&source, None);
+        assert_eq!(output.exit_status, 101, "{value}");
+        let panic = output.runtime_diagnostic.expect("the panic is reported");
+        assert!(
+            panic.notes.iter().any(|note| note.contains(message)),
+            "{value}: {panic:#?}"
+        );
+    }
+}
+
+/// Every Term value with a public constructor has a `fromParts` factory that
+/// takes the same parameters, which is what `new` lowers to.
+#[test]
+fn each_public_value_constructor_has_a_matching_factory() {
+    let program = doriac::parse_source("term", doriac::compiler_known_term::SOURCE_TEXT)
+        .expect("the Term module parses");
+    let mut constructible = Vec::new();
+    for item in &program.items {
+        let doriac::ast::Item::Class(class) = item else {
+            continue;
+        };
+        let method = |name: &str| {
+            class.members.iter().find_map(|member| match member {
+                doriac::ast::ClassMember::Method(method) if method.name == name => Some(method),
+                _ => None,
+            })
+        };
+        let Some(constructor) = method("__construct") else {
+            continue;
+        };
+        if constructor.access != doriac::ast::MemberAccess::External {
+            continue;
+        }
+        if doriac::inline_value::InlineValueKind::for_name(&format!(
+            "Doria\\Std\\Term\\{}",
+            class.name
+        ))
+        .is_none()
+        {
+            continue;
+        }
+        let factory = method(doriac::inline_value::CONSTRUCTION_FACTORY)
+            .unwrap_or_else(|| panic!("`{}` has no `fromParts` factory", class.name));
+        let parameters = |function: &doriac::ast::FunctionDecl| {
+            function
+                .params
+                .iter()
+                .map(|param| (param.name.clone(), param.ty.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parameters(constructor),
+            parameters(factory),
+            "`{}`: the constructor and its factory take different parameters",
+            class.name
+        );
+        constructible.push(class.name.clone());
+    }
+    assert_eq!(constructible, ["Size", "Position", "KeyModifiers"]);
+}
