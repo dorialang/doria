@@ -532,6 +532,8 @@ fn top_level_internal_declarations_preserve_modifier_spans() {
             doriac::ast::Item::Trait(value) => value.access_span,
             doriac::ast::Item::Function(value) => value.access_span,
             doriac::ast::Item::Constant(value) => value.access_span,
+            doriac::ast::Item::ExternBlock(value) => value.access_span,
+            doriac::ast::Item::ForeignAggregate(value) => value.access_span,
             doriac::ast::Item::Statement(_) => panic!("expected declarations"),
         };
         let span = span.expect("internal span");
