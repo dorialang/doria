@@ -119,6 +119,15 @@ pub fn parse_source(path: impl Into<String>, text: impl Into<String>) -> Diagnos
 }
 
 pub fn check_source(path: impl Into<String>, text: impl Into<String>) -> DiagnosticResult<Program> {
+    check_source_with_warnings(path, text).map(|(program, _)| program)
+}
+
+/// Checks one source. A program with warnings and no errors checks; its
+/// warnings come back beside the program for the caller to report.
+pub fn check_source_with_warnings(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<(Program, Vec<Diagnostic>)> {
     let source = SourceFile::new(path, text);
     let context = CompilationContext::standalone(source.path.clone());
     check_source_file_with_context(&source, context)
@@ -130,7 +139,7 @@ pub fn check_source_with_context(
     context: CompilationContext,
 ) -> DiagnosticResult<Program> {
     let source = SourceFile::new(path, text);
-    check_source_file_with_context(&source, context)
+    check_source_file_with_context(&source, context).map(|(program, _)| program)
 }
 
 /// Parses and semantically analyzes one source file for editor tooling.
@@ -259,14 +268,18 @@ pub fn lower_source(
     lower_source_file_with_context(source, context)
 }
 
+/// The fingerprint a metadata document records for one source.
+pub fn source_fingerprint(path: &str, text: &str) -> String {
+    runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes())
+}
+
 pub fn metadata_source(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
     let path = path.into();
     let text = text.into();
-    let fingerprint =
-        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let fingerprint = source_fingerprint(&path, &text);
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document(&hir, fingerprint))
 }
@@ -277,8 +290,7 @@ pub fn metadata_source_v2(
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV2> {
     let path = path.into();
     let text = text.into();
-    let fingerprint =
-        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let fingerprint = source_fingerprint(&path, &text);
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document_v2(&hir, fingerprint))
 }
@@ -289,8 +301,7 @@ pub fn metadata_source_v3(
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV3> {
     let path = path.into();
     let text = text.into();
-    let fingerprint =
-        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let fingerprint = source_fingerprint(&path, &text);
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document_v3(&hir, fingerprint))
 }
@@ -349,8 +360,12 @@ pub fn lower_source_to_mir(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
-    let hir = lower_source(path, text)?;
-    let mir = mir_lowering::lower_program(&hir)?;
+    lower_hir_to_mir(&lower_source(path, text)?)
+}
+
+/// Lowers checked HIR to validated MIR.
+pub fn lower_hir_to_mir(hir: &hir::Program) -> DiagnosticResult<mir::Program> {
+    let mir = mir_lowering::lower_program(hir)?;
     mir_validation::validate_program(&mir).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
             vec![Diagnostic::new("B0001", error.message, Span::default())
@@ -389,8 +404,19 @@ pub fn compile_source_with_options(
     text: impl Into<String>,
     options: CompileOptions,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    compile_source_with_warnings(path, text, options).map(|(output, _)| output)
+}
+
+/// Compiles one source. A program with warnings and no errors compiles; its
+/// warnings come back beside the output for the caller to report.
+pub fn compile_source_with_warnings(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    options: CompileOptions,
+) -> Result<(backend::BackendOutput, Vec<Diagnostic>), Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
-    backend::emit_with_options(&hir, options).map_err(|error| {
+    let warnings = hir.semantic_info.warnings.clone();
+    let output = backend::emit_with_options(&hir, options).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
             let summary = error
                 .message
@@ -406,7 +432,8 @@ pub fn compile_source_with_options(
                     ),
             ]
         })
-    })
+    })?;
+    Ok((output, warnings))
 }
 
 pub fn compile_source_with_context(
@@ -463,11 +490,10 @@ pub fn lower_compilation_graph(
     graph: &compilation_graph::CompilationGraph,
 ) -> DiagnosticResult<hir::Program> {
     let analysis = compilation_graph::analyze_compilation_graph_for_ide(graph);
-    if !analysis.diagnostics.is_empty() {
-        return Err(analysis.diagnostics);
-    }
+    let mut semantic_info = analysis.semantic_info;
+    semantic_info.warnings = diagnostics::separate_errors(analysis.diagnostics)?;
     let mut hir =
-        lowering::lower_program_with_semantics(&analysis.resolved_program, analysis.semantic_info)?;
+        lowering::lower_program_with_semantics(&analysis.resolved_program, semantic_info)?;
     hir.sources = graph
         .sources
         .values()
@@ -577,15 +603,7 @@ pub fn lower_build_plan_file(path: impl AsRef<Path>) -> DiagnosticResult<hir::Pr
 pub fn lower_compilation_graph_to_mir(
     graph: &compilation_graph::CompilationGraph,
 ) -> DiagnosticResult<mir::Program> {
-    let hir = lower_compilation_graph(graph)?;
-    let mir = mir_lowering::lower_program(&hir)?;
-    mir_validation::validate_program(&mir).map_err(|error| {
-        error.diagnostics.unwrap_or_else(|| {
-            vec![Diagnostic::new("B0001", error.message, Span::default())
-                .with_title("Malformed MIR")]
-        })
-    })?;
-    Ok(mir)
+    lower_hir_to_mir(&lower_compilation_graph(graph)?)
 }
 
 pub fn lower_build_plan_file_to_mir(path: impl AsRef<Path>) -> DiagnosticResult<mir::Program> {
@@ -596,13 +614,23 @@ pub fn lower_build_plan_file_to_mir(path: impl AsRef<Path>) -> DiagnosticResult<
 pub fn compile_compilation_graph(
     graph: &compilation_graph::CompilationGraph,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    compile_compilation_graph_with_warnings(graph).map(|(output, _)| output)
+}
+
+/// Compiles a graph. A graph with warnings and no errors compiles; its
+/// warnings come back beside the output for the caller to report.
+pub fn compile_compilation_graph_with_warnings(
+    graph: &compilation_graph::CompilationGraph,
+) -> Result<(backend::BackendOutput, Vec<Diagnostic>), Vec<Diagnostic>> {
     let options = compilation_graph_options(graph)?;
     let hir = lower_compilation_graph(graph)?;
-    backend::emit_with_options(&hir, options).map_err(|error| {
+    let warnings = hir.semantic_info.warnings.clone();
+    let output = backend::emit_with_options(&hir, options).map_err(|error| {
         error
             .diagnostics
             .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
-    })
+    })?;
+    Ok((output, warnings))
 }
 
 pub(crate) fn compilation_graph_options(
@@ -642,10 +670,10 @@ pub fn compile_build_plan_file(
 fn check_source_file_with_context(
     source: &SourceFile,
     context: CompilationContext,
-) -> DiagnosticResult<Program> {
+) -> DiagnosticResult<(Program, Vec<Diagnostic>)> {
     let prepared = prepare_source(source, context)?;
-    analyze_prepared_source(&prepared, source)?;
-    Ok(prepared.authored)
+    let info = analyze_prepared_source(&prepared, source)?;
+    Ok((prepared.authored, info.warnings))
 }
 
 pub(crate) fn analyze_prepared_source(
@@ -669,11 +697,9 @@ pub(crate) fn analyze_prepared_source(
         prepared.global_symbols.clone(),
         prepared.test_semantics.clone(),
     );
-    if analysis.diagnostics.is_empty() {
-        Ok(analysis.info)
-    } else {
-        Err(analysis.diagnostics)
-    }
+    let mut info = analysis.info;
+    info.warnings = diagnostics::separate_errors(analysis.diagnostics)?;
+    Ok(info)
 }
 
 fn append_compiler_known_semantic_context(

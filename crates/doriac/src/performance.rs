@@ -21,6 +21,8 @@ pub const REPORT_SCHEMA_VERSION: u64 = 1;
 pub struct PerformanceCompilation {
     pub output: BackendOutput,
     pub report: Value,
+    /// Warnings from checking the program, reported beside the output.
+    pub warnings: Vec<Diagnostic>,
 }
 
 struct FrontendMeasurement {
@@ -142,6 +144,7 @@ fn emit_native(
     frontend: FrontendMeasurement,
 ) -> Result<PerformanceCompilation, Vec<Diagnostic>> {
     let started = Instant::now();
+    let warnings = hir.semantic_info.warnings.clone();
     let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;
     let mir_lowering = started.elapsed();
 
@@ -294,6 +297,7 @@ fn emit_native(
             bytes,
         },
         report,
+        warnings,
     })
 }
 
