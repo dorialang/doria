@@ -272,6 +272,77 @@ pub fn source_fingerprint(path: &str, text: &str) -> String {
     runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes())
 }
 
+/// An attribute metadata schema version a consumer asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataSchema {
+    V1,
+    V2,
+    V3,
+}
+
+/// An attribute metadata document in the schema a consumer asked for.
+#[derive(Debug, Clone)]
+pub enum MetadataDocument {
+    V1(attributes::AttributeMetadataDocumentV1),
+    V2(attributes::AttributeMetadataDocumentV2),
+    V3(attributes::AttributeMetadataDocumentV3),
+}
+
+impl serde::Serialize for MetadataDocument {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::V1(document) => document.serialize(serializer),
+            Self::V2(document) => document.serialize(serializer),
+            Self::V3(document) => document.serialize(serializer),
+        }
+    }
+}
+
+fn metadata_document_for(
+    hir: &hir::Program,
+    fingerprint: String,
+    schema: MetadataSchema,
+) -> MetadataDocument {
+    match schema {
+        MetadataSchema::V1 => MetadataDocument::V1(attributes::metadata_document(hir, fingerprint)),
+        MetadataSchema::V2 => {
+            MetadataDocument::V2(attributes::metadata_document_v2(hir, fingerprint))
+        }
+        MetadataSchema::V3 => {
+            MetadataDocument::V3(attributes::metadata_document_v3(hir, fingerprint))
+        }
+    }
+}
+
+/// The metadata document of one source file in `schema`, with the warnings
+/// checking reported. Warnings never fail it; only errors do.
+pub fn metadata_source_with_warnings(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    schema: MetadataSchema,
+) -> DiagnosticResult<(MetadataDocument, Vec<Diagnostic>)> {
+    let path = path.into();
+    let text = text.into();
+    let fingerprint = source_fingerprint(&path, &text);
+    let hir = lower_source(path, text)?;
+    let warnings = hir.semantic_info.warnings.clone();
+    Ok((metadata_document_for(&hir, fingerprint, schema), warnings))
+}
+
+/// The metadata document of a compilation graph in `schema`, with the
+/// warnings checking reported. Warnings never fail it; only errors do.
+pub fn metadata_compilation_graph_with_warnings(
+    graph: &compilation_graph::CompilationGraph,
+    schema: MetadataSchema,
+) -> DiagnosticResult<(MetadataDocument, Vec<Diagnostic>)> {
+    let hir = lower_compilation_graph(graph)?;
+    let warnings = hir.semantic_info.warnings.clone();
+    Ok((
+        metadata_document_for(&hir, graph.fingerprint.clone(), schema),
+        warnings,
+    ))
+}
+
 pub fn metadata_source(
     path: impl Into<String>,
     text: impl Into<String>,

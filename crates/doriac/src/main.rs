@@ -860,15 +860,19 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
             return Err(format!("unknown metadata option `{}`", args[2]).into());
         }
         let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
-        let hir = doriac::lower_compilation_graph(&graph).map_err(|diagnostics| {
+        let (document, warnings) = doriac::metadata_compilation_graph_with_warnings(
+            &graph,
+            schema_version,
+        )
+        .map_err(|diagnostics| {
             CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
         })?;
         report_warnings(
             WarningSources::Graph(&graph.source_map),
-            &hir.semantic_info.warnings,
+            &warnings,
             diagnostic_options,
         );
-        encode_metadata_document(&hir, graph.fingerprint.clone(), schema_version)?
+        encode_metadata(&document)?
     } else {
         let input = args
             .first()
@@ -877,35 +881,28 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
             return Err(format!("unknown metadata option `{option}`").into());
         }
         let (path, text) = read_source(input)?;
-        let fingerprint = doriac::source_fingerprint(&path, &text);
-        let hir = doriac::lower_source(path.clone(), text.clone()).map_err(|diagnostics| {
-            CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
-        })?;
+        let (document, warnings) =
+            doriac::metadata_source_with_warnings(path.clone(), text.clone(), schema_version)
+                .map_err(|diagnostics| {
+                    CliError::diagnostics(
+                        path.clone(),
+                        text.clone(),
+                        diagnostics,
+                        diagnostic_options,
+                    )
+                })?;
         report_warnings(
             WarningSources::Source {
                 path: &path,
                 text: &text,
             },
-            &hir.semantic_info.warnings,
+            &warnings,
             diagnostic_options,
         );
-        encode_metadata_document(&hir, fingerprint, schema_version)?
+        encode_metadata(&document)?
     };
     println!("{document}");
     Ok(())
-}
-
-fn encode_metadata_document(
-    hir: &doriac::hir::Program,
-    fingerprint: String,
-    schema_version: u32,
-) -> Result<String, CliError> {
-    match schema_version {
-        1 => encode_metadata(&doriac::attributes::metadata_document(hir, fingerprint)),
-        2 => encode_metadata(&doriac::attributes::metadata_document_v2(hir, fingerprint)),
-        3 => encode_metadata(&doriac::attributes::metadata_document_v3(hir, fingerprint)),
-        _ => unreachable!("metadata_schema_version accepts versions 1 to 3"),
-    }
 }
 
 fn encode_metadata(document: &impl serde::Serialize) -> Result<String, CliError> {
@@ -913,7 +910,9 @@ fn encode_metadata(document: &impl serde::Serialize) -> Result<String, CliError>
         .map_err(|error| format!("failed to encode attribute metadata: {error}").into())
 }
 
-fn metadata_schema_version(args: Vec<String>) -> Result<(Vec<String>, u32), CliError> {
+fn metadata_schema_version(
+    args: Vec<String>,
+) -> Result<(Vec<String>, doriac::MetadataSchema), CliError> {
     let mut filtered = Vec::with_capacity(args.len());
     let mut schema_version = None;
     let mut index = 0;
@@ -928,17 +927,24 @@ fn metadata_schema_version(args: Vec<String>) -> Result<(Vec<String>, u32), CliE
             let parsed = value
                 .parse::<u32>()
                 .map_err(|_| format!("invalid metadata schema version `{value}`"))?;
-            if !matches!(parsed, 1..=3) {
-                return Err(format!("unsupported metadata schema version `{parsed}`").into());
-            }
-            schema_version = Some(parsed);
+            schema_version = Some(match parsed {
+                1 => doriac::MetadataSchema::V1,
+                2 => doriac::MetadataSchema::V2,
+                3 => doriac::MetadataSchema::V3,
+                _ => {
+                    return Err(format!("unsupported metadata schema version `{parsed}`").into());
+                }
+            });
             index += 2;
             continue;
         }
         filtered.push(args[index].clone());
         index += 1;
     }
-    Ok((filtered, schema_version.unwrap_or(1)))
+    Ok((
+        filtered,
+        schema_version.unwrap_or(doriac::MetadataSchema::V1),
+    ))
 }
 
 fn hir_command(args: &[String]) -> Result<(), CliError> {
