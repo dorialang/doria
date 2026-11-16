@@ -95,6 +95,17 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// The E0784 diagnostic for a checked form no execution target builds yet,
+/// for a stage of compilation after the gates, which knows more than the
+/// source shows.
+pub fn not_built_yet(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
+    Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
+        .with_title(title)
+        .with_explanation(
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks; this compiler cannot build or run this form yet.",
+        )
+}
+
 /// One E0784 diagnostic per checked form that no execution target runs yet.
 pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
     let mut finder = Finder::new(Gate::Execution);
@@ -321,24 +332,30 @@ impl Finder {
             Expr::StaticCall {
                 qualifier: StaticQualifier::Class(class),
                 method,
+                args,
                 span,
                 ..
             } if self.gate == Gate::Execution => {
                 match crate::pointer_intrinsics::ForeignCompanion::from_class_name(class) {
                     // The native targets build every other pointer
                     // operation; the interpreter and PHP output report them.
+                    // A pointer to a local builds; one to a field or
+                    // property does not yet.
                     Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(access))
                         if crate::pointer_intrinsics::formation(
                             &StaticQualifier::Class(class.clone()),
                             method,
                         )
-                        .is_some() =>
+                        .is_some()
+                            && !args.first().is_some_and(|argument| {
+                                matches!(ungrouped(&argument.value), Expr::Variable { .. })
+                            }) =>
                     {
                         self.report(
                             *span,
-                            "Pointers To Doria Places Cannot Be Built Yet",
+                            "Pointers To Fields And Properties Cannot Be Built Yet",
                             format!(
-                                "`{}::{method}` is part of Doria; this compiler does not build pointers to Doria places yet",
+                                "`{}::{method}` of a field or property is part of Doria; this compiler does not build it yet",
                                 access.short_name()
                             ),
                         )
@@ -394,5 +411,13 @@ impl Transform for TypeFinder {
 
     fn function(&mut self, function: &mut FunctionDecl) {
         function.walk(self);
+    }
+}
+
+/// `expr` without the parentheses and `unsafe(...)` around it.
+fn ungrouped(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => ungrouped(expr),
+        _ => expr,
     }
 }

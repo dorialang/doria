@@ -147,6 +147,33 @@ pub(super) fn expression(
                 | PointerOperation::ToFunction => {
                     lower_rvalue_as_expected(argument, expected, context).map(Some)
                 }
+                PointerOperation::AddressOf => {
+                    let hir::Expr::Variable { name, span: place } = unparenthesized_place(argument)
+                    else {
+                        return Err(vec![unsupported(
+                            *span,
+                            "a pointer to a field or property is not built yet",
+                        )]);
+                    };
+                    let local = context.lookup_local(name, *place)?;
+                    if context.borrowed_place_bindings.contains(&local) {
+                        return Err(vec![crate::unsafe_code::not_built_yet(
+                            *span,
+                            "Pointers To Writable Parameters Cannot Be Built Yet",
+                            format!(
+                                "`{}::to(${name})` of a writable parameter or capture is part of Doria; this compiler does not build it yet",
+                                access.short_name()
+                            ),
+                        )]);
+                    }
+                    let target = context.declare_return_temp(POINTER, false);
+                    context.push_statement(mir::Statement::Pointer {
+                        target: Some(target),
+                        operation: mir::PointerOperation::AddressOf { local },
+                        span: *span,
+                    });
+                    Ok(Some(local_rvalue(target, POINTER, false)))
+                }
                 PointerOperation::FromAddress => {
                     let address = lower_integer_expression(argument, context)?;
                     let nullable = mir::Type::NullableScalar(mir::ScalarType::Inline(

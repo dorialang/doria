@@ -317,3 +317,58 @@ fn the_interpreter_and_php_output_report_pointer_operations() {
         "{php:#?}"
     );
 }
+
+#[test]
+fn a_pointer_to_a_local_reads_and_writes_its_place() {
+    let source = format!(
+        "{POINTER}
+function main(): void
+{{
+    writable int32 $value = 41;
+    unsafe {{
+        let $pointer = MutPtr::to($value);
+        $pointer->write(7);
+        echo $pointer->read();
+        echo \" \";
+        echo $value;
+    }}
+    echo \" \";
+    writable float64 $ratio = 0.0;
+    unsafe {{
+        let $place = MutPtr::to($ratio);
+        $place->writeUnaligned(2.5);
+        echo Float::toInt($place->readUnaligned() * 2.0);
+    }}
+    echo \" \";
+    writable bool $flag = false;
+    unsafe {{
+        MutPtr::to($flag)->write(true);
+    }}
+    echo $flag;
+    echo \" \";
+    writable int64 $wide = 0;
+    unsafe {{
+        MutPtr<uint8> $low = MutPtr::cast(MutPtr::to($wide));
+        $low->write(UInt8::from(255));
+        $low->byteOffset(1)->write(UInt8::from(1));
+    }}
+    echo $wide;
+}}
+"
+    );
+    // Every tier-1 target is little-endian.
+    assert_runs_natively(&source, "7 7 5 true 511");
+
+    // A writable parameter stands for its caller's place, which this
+    // compiler does not address yet.
+    let parameter = format!(
+        "{POINTER}function bump(writable int32 $count): void {{ unsafe {{ MutPtr::to($count)->write(8); }} }} function main(): void {{ writable int32 $value = 1; bump($value); }}"
+    );
+    let diagnostics = doriac::lower_source_to_mir("stage40.doria", parameter)
+        .expect_err("a pointer to a writable parameter is not built yet");
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Pointers To Writable Parameters Cannot Be Built Yet"),
+        "{diagnostics:#?}"
+    );
+}

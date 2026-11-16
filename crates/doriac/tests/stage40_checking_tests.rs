@@ -950,12 +950,24 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
         .filter(|diagnostic| diagnostic.code == "E0784")
         .map(|diagnostic| diagnostic.title.as_str())
         .collect::<Vec<_>>();
-    // Every target builds boundary conversions, and the native targets
-    // build the other pointer operations; only a pointer to a Doria place
-    // is gated.
+    // Every target builds boundary conversions and the native targets
+    // build pointer operations, including a pointer to a local; the
+    // interpreter runs those through the native companion.
     assert_eq!(
         titles,
-        ["Pointers To Doria Places Cannot Be Built Yet"],
+        ["Pointer Operations Cannot Run In The Interpreter Yet"],
+        "{diagnostics:#?}"
+    );
+    let field = "use Doria\\Std\\Ffi\\Ptr; extern \"C\" struct Point { int32 $x; } function main(): void { writable Point $point = new Point(x: 1); let $pointer = unsafe(Ptr::to($point->x)); }";
+    let diagnostics = doriac::compile_source(
+        "ffi.doria",
+        field.to_string(),
+        doriac::backend::BackendTarget::Native,
+    )
+    .expect_err("a pointer to a field cannot be built yet");
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Pointers To Fields And Properties Cannot Be Built Yet"),
         "{diagnostics:#?}"
     );
 }

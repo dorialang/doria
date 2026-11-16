@@ -6115,6 +6115,10 @@ pub enum PointerOperation {
     Address { pointer: LocalId },
     /// `Ptr::fromAddress`: `?Ptr`, absent for address zero.
     FromAddress { address: IntegerExpression },
+    /// `Ptr::to($local)` and `MutPtr::to($local)`: the address of the place
+    /// the local names, its own storage or the place it borrows. Checking
+    /// pins that place for the enclosing unsafe context.
+    AddressOf { local: LocalId },
 }
 
 impl PointerOperation {
@@ -6125,7 +6129,7 @@ impl PointerOperation {
             | Self::Write { pointer, .. }
             | Self::Offset { pointer, .. }
             | Self::Address { pointer } => Some(*pointer),
-            Self::FromAddress { .. } => None,
+            Self::FromAddress { .. } | Self::AddressOf { .. } => None,
         }
     }
 }
@@ -7150,7 +7154,9 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             PointerOperation::Write { value, .. } => rvalue_class_temporary_capacity(value),
             PointerOperation::Offset { count, .. } => integer_class_temporary_capacity(count),
             PointerOperation::FromAddress { address } => integer_class_temporary_capacity(address),
-            PointerOperation::Read { .. } | PointerOperation::Address { .. } => 0,
+            PointerOperation::Read { .. }
+            | PointerOperation::Address { .. }
+            | PointerOperation::AddressOf { .. } => 0,
         },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
@@ -10599,6 +10605,9 @@ impl fmt::Display for Statement {
                     }
                     PointerOperation::FromAddress { address } => {
                         write!(formatter, "pointer_from_address({address})")
+                    }
+                    PointerOperation::AddressOf { local } => {
+                        write!(formatter, "pointer_to(local{})", local.0)
                     }
                 }
             }

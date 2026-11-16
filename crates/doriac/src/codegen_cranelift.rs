@@ -20480,6 +20480,12 @@ fn lower_pointer_operation(
         mir::PointerOperation::Address { pointer: local } => {
             Some(LoweredValue::Single(address_of(builder, *local, resources)?))
         }
+        mir::PointerOperation::AddressOf { local } => {
+            refresh_borrowed_local(builder, *local, resources)?;
+            Some(LoweredValue::Single(closure_source_address(
+                builder, *local, resources,
+            )?))
+        }
         mir::PointerOperation::FromAddress { address } => {
             let address = lower_integer_expression(builder, address, resources)?;
             let present = builder.ins().icmp_imm_u(IntCC::NotEqual, address, 0);

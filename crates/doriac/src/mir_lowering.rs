@@ -3752,6 +3752,9 @@ fn lower_function(
             .map(|((param, ty), owned)| {
                 let local =
                     context.declare_user_local_owned(&param.name, param.writable, ty, owned);
+                if param.writable {
+                    context.borrowed_place_bindings.insert(local);
+                }
                 if param.writable && ty.has_move_ownership() {
                     context.replaceable_writable_bindings.insert(local);
                 } else if param.writable && ty.requires_owned_cleanup() && !owned {
@@ -4396,6 +4399,7 @@ fn lower_closure_function(
             let local = context.declare_synthetic_named_local(name, writable, ty, owned, consumed);
             if writable {
                 context.replaceable_writable_bindings.insert(local);
+                context.borrowed_place_bindings.insert(local);
             }
             capture_locals.push((field, local));
         }
@@ -4421,6 +4425,7 @@ fn lower_closure_function(
         );
         if definition.mode == mir::FunctionParameterMode::Writable {
             context.replaceable_writable_bindings.insert(local);
+            context.borrowed_place_bindings.insert(local);
         }
         params.push(local);
     }
@@ -9070,6 +9075,9 @@ struct LoweringContext<'semantic> {
     construction_root: Option<mir::LocalId>,
     locals: Vec<mir::Local>,
     replaceable_writable_bindings: HashSet<mir::LocalId>,
+    /// Writable parameters and writable captures: locals that stand for a
+    /// place another frame owns. A pointer to one is not built yet.
+    borrowed_place_bindings: HashSet<mir::LocalId>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<Span, mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
@@ -9191,6 +9199,7 @@ impl<'semantic> LoweringContext<'semantic> {
             construction_root: None,
             locals: Vec::new(),
             replaceable_writable_bindings: HashSet::new(),
+            borrowed_place_bindings: HashSet::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],

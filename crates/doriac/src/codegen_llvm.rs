@@ -22168,6 +22168,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 Some(moved.into())
             }
             mir::PointerOperation::Address { pointer } => Some(self.pointer_local(*pointer)?.into()),
+            mir::PointerOperation::AddressOf { local } => {
+                let place = self.closure_source_address(*local)?;
+                Some(
+                    build(self.builder.build_ptr_to_int(
+                        place,
+                        self.context.i64_type(),
+                        "pointer.to",
+                    ))?
+                    .into(),
+                )
+            }
             mir::PointerOperation::FromAddress { address } => {
                 let address = self.lower_integer_expression(address)?;
                 let present = build(self.builder.build_int_compare(

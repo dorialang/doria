@@ -6451,6 +6451,14 @@ fn validate_pointer_operation(
         mir::PointerOperation::Address { .. } => {
             Some(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)))
         }
+        mir::PointerOperation::AddressOf { local } => {
+            if !accessed(local_in(function, *local)?.ty) {
+                return Err(malformed_mir(
+                    "a pointer addresses a local of a scalar with a C layout",
+                ));
+            }
+            Some(pointer)
+        }
         mir::PointerOperation::FromAddress { address } => {
             if address.ty() != IntegerType::UInt64 {
                 return Err(malformed_mir("a pointer is formed from a uint64 address"));
@@ -14346,6 +14354,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 | mir::PointerOperation::FromAddress { address: value } => {
                     collect_integer_class_local_accesses(value, &mut accesses)
                 }
+                mir::PointerOperation::AddressOf { local } => accesses.resource_read(*local),
                 mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => {}
             }
         }
@@ -20301,7 +20310,9 @@ fn statement_observes_property(
             | mir::PointerOperation::FromAddress { address: value } => {
                 integer_observes_property(value, receiver, property)
             }
-            mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => false,
+            mir::PointerOperation::Read { .. }
+            | mir::PointerOperation::Address { .. }
+            | mir::PointerOperation::AddressOf { .. } => false,
         },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,
