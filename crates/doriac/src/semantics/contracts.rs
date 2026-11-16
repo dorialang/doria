@@ -2361,7 +2361,7 @@ impl Checker<'_> {
             return true;
         }
         match expr {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.prove_exact_result(expr, expected, bindings, visiting)
             }
             Expr::New { span, .. } => {

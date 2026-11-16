@@ -159,6 +159,8 @@ pub enum GlobalSymbolKind {
     Trait,
     Function,
     Constant,
+    /// An `extern "C" struct` or `union` (Decision 0148 section 6).
+    ForeignAggregate,
     CompilerKnownType,
     CompilerKnownIntrinsic,
     CompilerKnownAttribute,
@@ -561,7 +563,14 @@ pub fn graph_declaration_headers(
                     GlobalSymbolKind::Constant,
                     value.access,
                 ),
-                Item::Statement(_) => return None,
+                Item::ForeignAggregate(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::ForeignAggregate,
+                    value.access,
+                ),
+                Item::ExternBlock(_) | Item::Statement(_) => return None,
             };
             let qualified_name = canonical(name);
             Some(GlobalSymbolDeclaration {
@@ -721,7 +730,17 @@ impl<'a> Resolver<'a> {
                     unresolved: self.unresolved,
                 },
             },
-            diagnostics: self.diagnostics,
+            diagnostics: {
+                // A program with unsafe or foreign forms stops here, before an
+                // unimplemented name such as `Doria\Std\Ffi\Ptr` reads as an
+                // unknown one.
+                let unavailable = crate::unsafe_code::unavailable_forms(self.authored);
+                if unavailable.is_empty() {
+                    self.diagnostics
+                } else {
+                    unavailable
+                }
+            },
         }
     }
 
@@ -801,7 +820,14 @@ impl<'a> Resolver<'a> {
                     GlobalSymbolKind::Constant,
                     value.access,
                 )),
-                Item::Statement(_) => None,
+                Item::ForeignAggregate(value) => Some((
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::ForeignAggregate,
+                    value.access,
+                )),
+                Item::ExternBlock(_) | Item::Statement(_) => None,
             };
             let Some((source_name, name_span, declaration_span, kind, access)) = declaration else {
                 continue;
@@ -1377,6 +1403,16 @@ impl<'a> Resolver<'a> {
                 constant.name = self.canonical_declaration_name(&constant.name);
                 self.normalize_const(constant);
             }
+            Item::ForeignAggregate(aggregate) => {
+                aggregate.name = self.canonical_declaration_name(&aggregate.name);
+                for field in aggregate.fields.iter_mut().flatten() {
+                    self.normalize_type(&mut field.ty, field.type_span, GlobalReferenceRole::Type);
+                    if let Some(default) = &mut field.default {
+                        self.normalize_expression(default);
+                    }
+                }
+            }
+            Item::ExternBlock(_) => {}
             Item::Statement(statement) => self.normalize_statement(statement),
         }
     }
@@ -1616,7 +1652,9 @@ impl<'a> Resolver<'a> {
 
     fn normalize_statement(&mut self, statement: &mut Stmt) {
         match statement {
-            Stmt::Block(block) => self.normalize_block(block),
+            Stmt::Block(block) | Stmt::Unsafe(UnsafeBlock { block, .. }) => {
+                self.normalize_block(block)
+            }
             Stmt::VarDecl(declaration) => {
                 if let Some(ty) = &mut declaration.ty {
                     self.normalize_type(ty, declaration.span, GlobalReferenceRole::Type);
@@ -1856,7 +1894,7 @@ impl<'a> Resolver<'a> {
                 self.normalize_type(class_type, *span, GlobalReferenceRole::Constructor);
                 self.normalize_arguments(args);
             }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } | Expr::Unary { expr, .. } => {
                 self.normalize_expression(expr);
             }
             Expr::Binary { left, right, .. }
@@ -2017,6 +2055,7 @@ fn is_type_declaration_kind(kind: GlobalSymbolKind) -> bool {
             | GlobalSymbolKind::Enum
             | GlobalSymbolKind::Interface
             | GlobalSymbolKind::Trait
+            | GlobalSymbolKind::ForeignAggregate
     )
 }
 

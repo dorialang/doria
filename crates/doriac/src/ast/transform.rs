@@ -138,8 +138,11 @@ structure!(FunctionTypeRef {
     return_type,
     return_type_span,
     throws_clause,
+    c_abi,
     span
 });
+structure!(ForeignAbi { value, span });
+structure!(CAbiTypeRef { extern_span, abi });
 structure!(FunctionTypeParameterRef {
     ownership_mode,
     ownership_modifier_span,
@@ -271,6 +274,9 @@ walk_struct!(FunctionDecl {
     consuming_span,
     is_static,
     static_span,
+    unsafe_span,
+    linkage,
+    documentation,
     name,
     name_span,
     type_params,
@@ -283,7 +289,11 @@ walk_struct!(FunctionDecl {
     modifier_prefix_span,
     span
 });
-enumeration!(FunctionBody { Block(value), Requirement { semicolon_span }, Intrinsic { implementation, span } });
+enumeration!(FunctionLinkage { Doria, CAbi { extern_span, abi }, Foreign { block } });
+structure!(DocComment { span, safety });
+structure!(DocSection { span, text });
+enumeration!(FunctionBody { Block(value), Requirement { semicolon_span },
+    Foreign { semicolon_span }, Intrinsic { implementation, span } });
 structure!(FunctionSyntax {
     keyword_span,
     type_parameters,
@@ -333,7 +343,13 @@ structure!(Argument { name, value, span });
 structure!(Block { statements, span });
 enumeration!(Stmt { Block(value), VarDecl(value), Assignment(value), Echo { expr, span },
     Return { expr, span }, Throw(value), Try(value), If(value), While(value), DoWhile(value),
-    For(value), Break { span }, Continue { span }, Foreach(value), Increment(value), Expr { expr, span } });
+    For(value), Break { span }, Continue { span }, Foreach(value), Increment(value), Expr { expr, span },
+    Unsafe(value) });
+structure!(UnsafeBlock {
+    keyword_span,
+    block,
+    span
+});
 structure!(ThrowStmt {
     keyword_span,
     expr,
@@ -492,6 +508,7 @@ enumeration!(Expr {
     New { class_type, args, shared, span }, Grouped { expr, span }, Unary { op, expr, span },
     Binary { left, op, right, span }, Range { start, end, inclusive, span },
     Match { scrutinee, mode, arms, origin, span }, When(value), Closure(value),
+    Unsafe { keyword_span, expr, span },
 });
 structure!(WhenExpression {
     given,

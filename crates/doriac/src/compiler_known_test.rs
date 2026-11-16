@@ -226,6 +226,9 @@ pub fn augment_program(program: &Program) -> Program {
             consuming_span: None,
             is_static: false,
             static_span: None,
+            unsafe_span: None,
+            linkage: crate::ast::FunctionLinkage::Doria,
+            documentation: None,
             name: "__construct".to_string(),
             name_span: span,
             type_params: Vec::new(),
@@ -260,7 +263,8 @@ pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
             Item::Trait(value) => (&value.name, value.name_span),
             Item::Function(value) => (&value.name, value.name_span),
             Item::Constant(value) => (&value.name, value.name_span),
-            Item::Statement(_) => continue,
+            Item::ForeignAggregate(value) => (&value.name, value.name_span),
+            Item::ExternBlock(_) | Item::Statement(_) => continue,
         };
         let canonical = namespace
             .as_ref()

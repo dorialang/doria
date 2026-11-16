@@ -18,6 +18,7 @@ strings | Strings, Display And Formatting | String operations, interpolation, fo
 projects | Projects, Namespaces And Attributes | Imports, includes, packages, the build plan and attributes.
 testing | Testing | `describe`, `it`, `expect` and where tests may be written.
 io | Streams, Transfers And The Terminal | The standard I/O interfaces, pending transfers and the terminal layer.
+unsafe | Unsafe Code And Foreign Functions | `unsafe` contexts, pointers, `extern "C"` declarations, foreign layouts and linking foreign libraries.
 syntax | Syntax | Text the lexer or parser cannot read as Doria.
 runtime | Runtime Panics And Outcomes | A program that compiled and then stopped while running.
 compiler | Compiler And Backend Failures | A failure inside the compiler, a backend or an external tool; the program is not at fault.

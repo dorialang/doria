@@ -455,6 +455,8 @@ impl Evaluator {
                 | Item::Interface(_)
                 | Item::Trait(_)
                 | Item::Function(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
                 | Item::Statement(_) => {}
             }
         }
@@ -618,7 +620,9 @@ impl Evaluator {
             Expr::String { value, .. } => Some(TypedValue::new(ConstValue::String(value.clone()))),
             Expr::Bool { value, .. } => Some(TypedValue::new(ConstValue::Bool(*value))),
             Expr::Null { .. } => Some(TypedValue::new(ConstValue::Null)),
-            Expr::Grouped { expr, .. } => self.evaluate_expr(expr, expected, requester),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.evaluate_expr(expr, expected, requester)
+            }
             Expr::Identifier { name, span } => {
                 self.reference(&ConstKey::TopLevel(name.clone()), *span, requester)
             }
@@ -778,7 +782,9 @@ impl Evaluator {
     fn integer_literal_text(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Int { value, .. } => Some(value),
-            Expr::Grouped { expr, .. } => Self::integer_literal_text(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::integer_literal_text(expr)
+            }
             _ => None,
         }
     }
@@ -787,6 +793,7 @@ impl Evaluator {
         match expr {
             Expr::Int { .. } | Expr::Float { .. } => true,
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,

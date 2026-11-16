@@ -360,7 +360,24 @@ pub struct FunctionTypeRef {
     pub return_type: Box<TypeRef>,
     pub return_type_span: Span,
     pub throws_clause: Option<FunctionTypeThrowsRef>,
+    /// `extern "C" function(...)`: the C function pointer type of Decision
+    /// 0148 section 12, one word and Copy, whose call is unsafe.
+    pub c_abi: Option<CAbiTypeRef>,
     pub span: Span,
+}
+
+/// The ABI string of an `extern` form. `"C"` is the only ABI (Decision 0148
+/// section 14); checking reports any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAbi {
+    pub value: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CAbiTypeRef {
+    pub extern_span: Span,
+    pub abi: ForeignAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +493,29 @@ impl TypeRef {
         Self::generic("[]", vec![element])
     }
 
+    /// `T[N]`, the fixed-length array of a foreign aggregate field (Decision
+    /// 0148 section 6): `[]` with the element type and the count as a value
+    /// argument.
+    pub fn fixed_array_of(element: TypeRef, count: String) -> Self {
+        Self::generic_with_arguments(
+            "[]",
+            vec![
+                TypeArgumentRef::Type(element),
+                TypeArgumentRef::Value(count),
+            ],
+        )
+    }
+
+    /// The element type and authored count of a `T[N]` type.
+    pub fn fixed_array_parts(&self) -> Option<(&TypeRef, &str)> {
+        match (self.name.as_str(), self.arguments.as_slice()) {
+            ("[]", [TypeArgumentRef::Type(element), TypeArgumentRef::Value(count)]) => {
+                Some((element, count))
+            }
+            _ => None,
+        }
+    }
+
     pub fn unknown() -> Self {
         Self::named("Unknown")
     }
@@ -578,6 +618,7 @@ impl TypeRef {
                             span: clause.span,
                         }
                     }),
+                    c_abi: function.c_abi.clone(),
                     span: function.span,
                 })
             }),
@@ -635,6 +676,9 @@ impl fmt::Display for TypeRef {
                 FunctionInvocationMode::Writable => " writable",
                 FunctionInvocationMode::Once => " once",
             };
+            if let Some(c_abi) = &function.c_abi {
+                write!(formatter, "extern \"{}\" ", c_abi.abi.value)?;
+            }
             write!(
                 formatter,
                 "function{invocation}({parameters}): {}",
@@ -655,6 +699,9 @@ impl fmt::Display for TypeRef {
             if let TypeArgumentRef::Type(element) = &self.arguments[0] {
                 return write!(formatter, "{element}[]");
             }
+        }
+        if let Some((element, count)) = self.fixed_array_parts() {
+            return write!(formatter, "{element}[{count}]");
         }
 
         if self.arguments.is_empty() {
@@ -1463,6 +1510,7 @@ mod specialization_tests {
             return_type: Box::new(TypeRef::named("T")),
             return_type_span: span,
             throws_clause: None,
+            c_abi: None,
             span,
         });
         let checked = ResolvedType::Function(Box::new(SemanticFunctionType {

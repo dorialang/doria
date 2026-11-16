@@ -370,7 +370,9 @@ pub(crate) fn returned_retained_provenance(
                 Stmt::Assignment(assignment) => {
                     record_assignment(assignment, binding_resolution, sources)
                 }
-                Stmt::Block(block) => collect_sources(block, binding_resolution, sources),
+                Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                    collect_sources(block, binding_resolution, sources)
+                }
                 Stmt::If(statement) => {
                     if let Some(given) = &statement.given {
                         collect_sources(&given.block, binding_resolution, sources);
@@ -856,14 +858,16 @@ pub(crate) fn returned_retained_provenance(
                     };
                     *found = Some(found.map_or(candidate, |current| merge(current, candidate)));
                 }
-                Stmt::Block(block) => visit_block(
-                    block,
-                    function,
-                    closures,
-                    binding_resolution,
-                    sources,
-                    found,
-                ),
+                Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                    visit_block(
+                        block,
+                        function,
+                        closures,
+                        binding_resolution,
+                        sources,
+                        found,
+                    )
+                }
                 Stmt::If(statement) => {
                     visit_block(
                         &statement.then_block,
@@ -2180,7 +2184,11 @@ fn check_selected_program(
                     );
                 }
             }
-            Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Interface(_)
+            | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
+            | Item::Statement(_) => {}
         }
     }
     retained_analysis.add_template_fields(&properties);
@@ -2368,7 +2376,11 @@ fn check_selected_program(
                     }
                 }
             }
-            Item::Enum(_) | Item::Interface(_) | Item::Constant(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_) => {}
             Item::Statement(statement) => {
                 if top_level_falls_through {
                     top_level_falls_through = checker
@@ -2476,6 +2488,9 @@ pub(crate) fn closure_borrow_function(
         consuming_span: None,
         is_static: true,
         static_span: None,
+        unsafe_span: None,
+        linkage: crate::ast::FunctionLinkage::Doria,
+        documentation: None,
         name: "<closure>".to_string(),
         name_span: closure.keyword_span,
         type_params,
@@ -3047,7 +3062,9 @@ fn statement_return_borrow(
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
     match statement {
-        Stmt::Block(block) => block_return_borrow(block, function, resolve_call, shadowed, borrow),
+        Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+            block_return_borrow(block, function, resolve_call, shadowed, borrow)
+        }
         Stmt::Return {
             expr: Some(expr), ..
         } => {
@@ -3218,7 +3235,9 @@ fn expr_return_borrow(
             | ReturnBorrowLookup::OwnedValue
             | ReturnBorrowLookup::ResolvedArgument { .. } => None,
         },
-        Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, resolve_call, shadowed),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+            expr_return_borrow(expr, function, resolve_call, shadowed)
+        }
         Expr::When(_) | Expr::Match { .. } => match resolve_call(expr) {
             ReturnBorrowLookup::Resolved(borrow) => borrow,
             _ => None,
@@ -3298,7 +3317,7 @@ fn coalesced_return_borrow(
 }
 
 fn ungroup_expr(mut expr: &Expr) -> &Expr {
-    while let Expr::Grouped { expr: inner, .. } = expr {
+    while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
         expr = inner;
     }
     expr
@@ -4257,7 +4276,9 @@ impl Checker<'_> {
         return_move_type: bool,
     ) -> Flow {
         match statement {
-            Stmt::Block(block) => self.check_block(block, scopes, return_move_type, true),
+            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                self.check_block(block, scopes, return_move_type, true)
+            }
             Stmt::VarDecl(decl) => {
                 let declaration_name = decl
                     .bindings
@@ -5756,7 +5777,7 @@ impl Checker<'_> {
     ) {
         self.use_expr(target, scopes, UseMode::Write);
         let mut ungrouped_target = target;
-        while let Expr::Grouped { expr, .. } = ungrouped_target {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = ungrouped_target {
             ungrouped_target = expr;
         }
         let tracked_target = matches!(
@@ -6191,7 +6212,9 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => scopes
                 .get(name)
                 .and_then(|binding| binding.retained_value.clone()),
-            Expr::Grouped { expr, .. } => self.retained_value_from_expr(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.retained_value_from_expr(expr, scopes)
+            }
             Expr::Array { elements, .. } => {
                 let mut stored: Option<RetainedValueState> = None;
                 for element in elements {
@@ -6852,7 +6875,7 @@ impl Checker<'_> {
             scopes.1.put(target, values, scopes.lexical_depth());
             return;
         }
-        if let Expr::Grouped { expr: inner, .. } = expr {
+        if let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
             let values = self.cleanup_take_expr(inner, scopes);
             scopes.1.put(target, values, scopes.lexical_depth());
             return;
@@ -7030,7 +7053,9 @@ impl Checker<'_> {
                     self.check_assignment_write_conflict(place, mode, *span);
                 }
             }
-            Expr::Grouped { expr, .. } => self.use_place_base(expr, scopes, mode, places),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.use_place_base(expr, scopes, mode, places)
+            }
             Expr::PropertyAccess { object, .. } if self.getter_signature(expr).is_none() => {
                 self.use_place_base(object, scopes, mode, places);
             }
@@ -7247,7 +7272,9 @@ impl Checker<'_> {
             Expr::This { span } if scopes.get("this").is_some() => {
                 self.use_binding("this", *span, scopes, mode);
             }
-            Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.use_expr(expr, scopes, mode)
+            }
             // Extraction gives away the whole consumed receiver: its other
             // fields are destroyed at once, so no later use of it remains valid.
             Expr::PropertyAccess {
@@ -8942,7 +8969,9 @@ impl Checker<'_> {
             }
         }
         match expr {
-            Expr::Grouped { expr, .. } | Expr::PropertyAccess { object: expr, .. } => {
+            Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
+            | Expr::PropertyAccess { object: expr, .. } => {
                 self.activate_place_input_borrows(expr, scopes);
             }
             _ => self.activate_nested_property_borrows(expr, scopes),
@@ -8972,7 +9001,7 @@ impl Checker<'_> {
                 }
                 self.activate_place_input_borrows(object, scopes);
             }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } | Expr::Unary { expr, .. } => {
                 self.activate_nested_property_borrows(expr, scopes);
             }
             Expr::Binary {
@@ -9138,7 +9167,9 @@ impl Checker<'_> {
             return self.readonly_return_borrow_path(&signature, expr.span());
         }
         match expr {
-            Expr::Grouped { expr, .. } => self.readonly_writable_path(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.readonly_writable_path(expr, scopes)
+            }
             Expr::Index { collection, .. } => self.readonly_writable_path(collection, scopes),
             // Direct bindings are checked by `use_expr` in write mode. This
             // helper supplies the path-sensitive checks that mode cannot see.
@@ -9405,7 +9436,9 @@ impl Checker<'_> {
                     BorrowSourceRoot::Place(binding_identity_key(binding.id, name).into())
                 })
             }),
-            Expr::Grouped { expr: object, .. } => self.borrow_source_root(object, scopes),
+            Expr::Grouped { expr: object, .. } | Expr::Unsafe { expr: object, .. } => {
+                self.borrow_source_root(object, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -9502,7 +9535,9 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => scopes
                 .get(name)
                 .map(|binding| binding_identity_key(binding.id, name)),
-            Expr::Grouped { expr, .. } => self.assignment_place_key(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.assignment_place_key(expr, scopes)
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => self
@@ -9656,7 +9691,9 @@ impl Checker<'_> {
         }
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some(),
-            Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_is_move_value(expr, scopes)
+            }
             Expr::Array { .. } => true,
             Expr::ArrayRepeat { .. } => true,
             Expr::New { class_type, .. } => self.classes.contains(&class_type.name),
@@ -9799,7 +9836,9 @@ impl Checker<'_> {
             return false;
         }
         match expr {
-            Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_returns_borrow(expr, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -9893,7 +9932,9 @@ impl Checker<'_> {
             return signature.return_borrow.is_some_and(matches_kind);
         }
         match expr {
-            Expr::Grouped { expr, .. } => self.expr_has_return_contract(expr, scopes, kind),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_has_return_contract(expr, scopes, kind)
+            }
             Expr::FunctionCall { name, .. } => self
                 .signatures
                 .get(name)
@@ -9949,7 +9990,9 @@ impl Checker<'_> {
 
     fn expr_is_mixed_collection_index(&self, expr: &Expr, scopes: &Scopes) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => self.expr_is_mixed_collection_index(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_is_mixed_collection_index(expr, scopes)
+            }
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .is_some_and(|collection| collection.value_mixed),
@@ -9960,7 +10003,9 @@ impl Checker<'_> {
     fn expr_is_mixed_value(&self, expr: &Expr, scopes: &Scopes) -> bool {
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some_and(|binding| binding.mixed),
-            Expr::Grouped { expr, .. } => self.expr_is_mixed_value(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_is_mixed_value(expr, scopes)
+            }
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .is_some_and(|collection| collection.value_mixed),
@@ -9974,7 +10019,9 @@ impl Checker<'_> {
         scopes: &Scopes,
     ) -> Option<&'a PropertyInfo> {
         match target {
-            Expr::Grouped { expr, .. } => self.assignment_property_info(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.assignment_property_info(expr, scopes)
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {
@@ -10049,7 +10096,7 @@ impl Checker<'_> {
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .and_then(|collection| collection.value_class),
-            Expr::Grouped { expr, .. } => self.expr_class(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => self.expr_class(expr, scopes),
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -10154,7 +10201,9 @@ impl Checker<'_> {
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .and_then(|info| info.value_collection.map(|nested| *nested)),
-            Expr::Grouped { expr, .. } => self.expr_collection_info(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_collection_info(expr, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -10531,7 +10580,7 @@ impl Checker<'_> {
 fn variable_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Variable { name, .. } => Some(name),
-        Expr::Grouped { expr, .. } => variable_name(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => variable_name(expr),
         _ => None,
     }
 }
@@ -10594,7 +10643,9 @@ fn statements_use_variable(statements: &[Stmt], name: &str) -> bool {
 
 fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
     match statement {
-        Stmt::Block(block) => statements_use_variable(&block.statements, name),
+        Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+            statements_use_variable(&block.statements, name)
+        }
         Stmt::VarDecl(declaration) => expr_uses_variable(&declaration.initializer, name),
         Stmt::Assignment(assignment) => {
             expr_uses_variable(&assignment.target, name)
@@ -10749,6 +10800,7 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
         | Expr::MethodCall { object, .. }
         | Expr::IsType { expr: object, .. }
         | Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. } => {
             expr_uses_variable(object, name)
                 || matches!(expr, Expr::MethodCall { args, .. } if arguments_use_variable(args, name))
@@ -11165,7 +11217,7 @@ fn non_null_function_type(
 pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Bool { value, .. } => Some(*value),
-        Expr::Grouped { expr, .. } => constant_bool(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => constant_bool(expr),
         Expr::Unary {
             op: ast::UnaryOp::Not,
             expr,
@@ -11206,7 +11258,7 @@ pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
 fn is_panic_expr(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, .. } => name == "panic",
-        Expr::Grouped { expr, .. } => is_panic_expr(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => is_panic_expr(expr),
         _ => false,
     }
 }

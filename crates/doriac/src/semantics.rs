@@ -985,6 +985,7 @@ impl MatchGuardSemanticInfo {
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Block(block) => block.span,
+        Stmt::Unsafe(statement) => statement.span,
         Stmt::VarDecl(declaration) => declaration.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. }
@@ -1023,7 +1024,9 @@ fn collect_return_expression_spans(block: &Block, returns: &mut Vec<Option<Span>
     for statement in &block.statements {
         match statement {
             Stmt::Return { expr, .. } => returns.push(expr.as_ref().map(Expr::span)),
-            Stmt::Block(block) => collect_return_expression_spans(block, returns),
+            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                collect_return_expression_spans(block, returns)
+            }
             Stmt::If(statement) => {
                 collect_return_expression_spans(&statement.then_block, returns);
                 if let Some(branch) = &statement.else_branch {
@@ -2487,6 +2490,8 @@ fn collect_callable_nominal_instantiations(program: &Program, checker: &mut Chec
             | Item::Interface(_)
             | Item::Trait(_)
             | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
             | Item::Statement(_) => {}
         }
     }
@@ -3909,7 +3914,7 @@ impl<'program> Checker<'program> {
                 Item::Constant(constant) => self.check_constant_initializer(constant, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
                 Item::Enum(enum_decl) => self.check_enum(enum_decl),
-                Item::Interface(_) => {}
+                Item::Interface(_) | Item::ExternBlock(_) | Item::ForeignAggregate(_) => {}
                 Item::Trait(declaration) => self.check_trait_bodies(declaration),
             }
         }
@@ -4743,7 +4748,10 @@ impl<'program> Checker<'program> {
                         }
                     }
                 }
-                Item::Constant(_) | Item::Statement(_) => {}
+                Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
+                | Item::Statement(_) => {}
             }
         }
         None
@@ -5999,7 +6007,12 @@ impl<'program> Checker<'program> {
                 Item::Class(declaration) => Some(declaration.name.as_str()),
                 Item::Interface(declaration) => Some(declaration.name.as_str()),
                 Item::Trait(declaration) => Some(declaration.name.as_str()),
-                Item::Enum(_) | Item::Function(_) | Item::Constant(_) | Item::Statement(_) => None,
+                Item::ForeignAggregate(declaration) => Some(declaration.name.as_str()),
+                Item::Enum(_)
+                | Item::Function(_)
+                | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::Statement(_) => None,
             })
             .collect::<HashSet<_>>();
 
@@ -7376,9 +7389,12 @@ impl<'program> Checker<'program> {
                         })
                     })
                     .collect(),
-                Item::Enum(_) | Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {
-                    Vec::new()
-                }
+                Item::Enum(_)
+                | Item::Interface(_)
+                | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
+                | Item::Statement(_) => Vec::new(),
             })
             .collect::<Vec<_>>();
         let graphs = if checked_bodies {
@@ -8193,7 +8209,9 @@ impl<'program> Checker<'program> {
 
     fn assignment_target_variable_name(target: &Expr) -> Option<&str> {
         match target {
-            Expr::Grouped { expr, .. } => Self::assignment_target_variable_name(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::assignment_target_variable_name(expr)
+            }
             Expr::Variable { name, .. } => Some(name),
             _ => None,
         }
@@ -8388,7 +8406,9 @@ impl<'program> Checker<'program> {
 
     fn dictionary_foreach_projection(expr: &Expr) -> Option<(&Expr, DictionaryProjection)> {
         match expr {
-            Expr::Grouped { expr, .. } => Self::dictionary_foreach_projection(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::dictionary_foreach_projection(expr)
+            }
             Expr::PropertyAccess {
                 object,
                 property,
@@ -9485,7 +9505,7 @@ impl<'program> Checker<'program> {
 
     fn record_exact_receiver_dispatch(&mut self, object: &Expr, method: &MethodInfo, span: Span) {
         let mut object = object;
-        while let Expr::Grouped { expr, .. } = object {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = object {
             object = expr;
         }
         let lifecycle_this = matches!(object, Expr::This { .. })
@@ -9834,7 +9854,7 @@ impl<'program> Checker<'program> {
     ) {
         self.active_loop_depth = loop_depth;
         match statement {
-            Stmt::Block(block) => {
+            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
                 let mut nested_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
@@ -11646,7 +11666,9 @@ impl<'program> Checker<'program> {
 
     fn expression_root_binding(&self, expr: &Expr, scopes: &ScopeStack) -> Option<Binding> {
         match expr {
-            Expr::Grouped { expr, .. } => self.expression_root_binding(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expression_root_binding(expr, scopes)
+            }
             Expr::Variable { name, .. } => scopes.lookup(name).cloned(),
             Expr::This { .. } => scopes.lookup("this").cloned(),
             Expr::PropertyAccess { object, .. }
@@ -11670,13 +11692,13 @@ impl<'program> Checker<'program> {
         self.record_collection_construction_type(expr, expected);
         let span = expr.span();
         self.contextual_expression_types.insert(span, expected);
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.record_expected_expression_type(expr, expected);
         }
     }
 
     fn record_collection_construction_type(&mut self, expr: &Expr, expected: TypeId) {
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.record_collection_construction_type(expr, expected);
             return;
         }
@@ -11931,7 +11953,8 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, .. } => name == crate::compiler_known_test::EXPECT,
             Expr::PropertyAccess { object, .. }
             | Expr::MethodCall { object, .. }
-            | Expr::Grouped { expr: object, .. } => Self::contains_compiler_expect(object),
+            | Expr::Grouped { expr: object, .. }
+            | Expr::Unsafe { expr: object, .. } => Self::contains_compiler_expect(object),
             _ => false,
         }
     }
@@ -13448,7 +13471,7 @@ impl<'program> Checker<'program> {
                     }
                 }
             }
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
             }
             Expr::Unary { op, expr, span } => {
@@ -13868,7 +13891,9 @@ impl<'program> Checker<'program> {
 
     fn expression_provides_owned_value(&self, expr: &Expr, scopes: &ScopeStack) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => self.expression_provides_owned_value(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expression_provides_owned_value(expr, scopes)
+            }
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .is_some_and(|binding| binding.ownership == BindingOwnership::Owned),
@@ -16103,7 +16128,7 @@ impl<'program> Checker<'program> {
     }
 
     fn ungroup_expr(mut expr: &Expr) -> &Expr {
-        while let Expr::Grouped { expr: inner, .. } = expr {
+        while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
             expr = inner;
         }
         expr
@@ -16111,7 +16136,9 @@ impl<'program> Checker<'program> {
 
     fn is_grouped_range_expr(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_grouped_range_expr(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::is_grouped_range_expr(expr)
+            }
             Expr::Range { .. } => true,
             _ => false,
         }
@@ -16124,7 +16151,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<IntegerType> {
         match expr {
-            Expr::Grouped { expr, .. } => self.range_integer_type(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.range_integer_type(expr, scopes, method_context)
+            }
             Expr::Range { start, end, .. } => {
                 let ty = self.infer_binary_type(start, &BinaryOp::Add, end, scopes, method_context);
                 match self.types.kind(ty) {
@@ -16166,7 +16195,9 @@ impl<'program> Checker<'program> {
 
     fn contextualize_range_literals(&mut self, expr: &Expr, target: IntegerType) {
         match expr {
-            Expr::Grouped { expr, .. } => self.contextualize_range_literals(expr, target),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.contextualize_range_literals(expr, target)
+            }
             Expr::Range { start, end, .. } => {
                 self.contextualize_integer_literals(start, target);
                 self.contextualize_integer_literals(end, target);
@@ -16230,7 +16261,9 @@ impl<'program> Checker<'program> {
     fn integer_literal_parts(expr: &Expr) -> Option<(u128, bool)> {
         match expr {
             Expr::Int { value, .. } => parse_decimal_magnitude(value).map(|value| (value, false)),
-            Expr::Grouped { expr, .. } => Self::integer_literal_parts(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::integer_literal_parts(expr)
+            }
             Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -16243,7 +16276,9 @@ impl<'program> Checker<'program> {
     fn unsigned_integer_literal_magnitude(expr: &Expr) -> Option<u128> {
         match expr {
             Expr::Int { value, .. } => parse_decimal_magnitude(value),
-            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_magnitude(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::unsigned_integer_literal_magnitude(expr)
+            }
             _ => None,
         }
     }
@@ -16251,7 +16286,9 @@ impl<'program> Checker<'program> {
     fn unsigned_integer_literal_span(expr: &Expr) -> Option<Span> {
         match expr {
             Expr::Int { span, .. } => Some(*span),
-            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_span(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::unsigned_integer_literal_span(expr)
+            }
             _ => None,
         }
     }
@@ -16260,6 +16297,7 @@ impl<'program> Checker<'program> {
         self.integer_expression_types.insert(expr.span(), integer);
         match expr {
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -16296,6 +16334,7 @@ impl<'program> Checker<'program> {
 
         match expr {
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate | UnaryOp::BitwiseNot,
                 expr,
@@ -16327,7 +16366,7 @@ impl<'program> Checker<'program> {
     fn is_float_literal(expr: &Expr) -> bool {
         match expr {
             Expr::Float { .. } => true,
-            Expr::Grouped { expr, .. } => Self::is_float_literal(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => Self::is_float_literal(expr),
             _ => false,
         }
     }
@@ -16335,7 +16374,7 @@ impl<'program> Checker<'program> {
     fn record_float_expression_type(&mut self, expr: &Expr, float: FloatType) {
         self.float_expression_types.insert(expr.span(), float);
         self.check_float_literal_range(expr, float);
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.record_float_expression_type(expr, float);
         }
     }
@@ -16372,6 +16411,7 @@ impl<'program> Checker<'program> {
 
         match expr {
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -16556,7 +16596,7 @@ impl<'program> Checker<'program> {
             return;
         }
         let mut operand = left;
-        while let Expr::Grouped { expr, .. } = operand {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = operand {
             operand = expr;
         }
         // A `mixed` binding may hold null whatever flow has narrowed it to.
@@ -17122,7 +17162,7 @@ impl<'program> Checker<'program> {
 
     fn is_null_literal(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_null_literal(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => Self::is_null_literal(expr),
             Expr::Null { .. } => true,
             _ => false,
         }
@@ -17210,7 +17250,7 @@ impl<'program> Checker<'program> {
         // assignment has narrowed it (a redundant but valid check), while a bare `mixed`
         // (never nullable-declared) is reported.
         let mut operand = expr;
-        while let Expr::Grouped { expr, .. } = operand {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = operand {
             operand = expr;
         }
         if let Expr::Variable { name, .. } = operand {
@@ -17877,7 +17917,9 @@ impl<'program> Checker<'program> {
                 .filter(|value| value.ty == target)
                 .map(IntConstantEval::Known)
                 .unwrap_or(IntConstantEval::Unknown),
-            Expr::Grouped { expr, .. } => Self::eval_int_constant(expr, scopes, target),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::eval_int_constant(expr, scopes, target)
+            }
             Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -17929,7 +17971,9 @@ impl<'program> Checker<'program> {
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .and_then(|binding| binding.string_constant.clone()),
-            Expr::Grouped { expr, .. } => Self::eval_string_constant(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::eval_string_constant(expr, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Concat,
@@ -18000,7 +18044,7 @@ impl<'program> Checker<'program> {
         constructor_init_context: Option<&mut ConstructorInitContext>,
     ) -> Option<AssignmentTarget> {
         match target {
-            Expr::Grouped { expr, .. } => self.check_writable_place(
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => self.check_writable_place(
                 expr,
                 op,
                 scopes,
@@ -18338,7 +18382,7 @@ impl<'program> Checker<'program> {
         requirement: CaptureRequirement,
     ) {
         match expr {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.record_capture_requirement_for_expr(expr, scopes, requirement)
             }
             Expr::Variable { name, span } => {
@@ -20766,7 +20810,7 @@ impl<'program> Checker<'program> {
     }
 
     fn complete_generic_call_from_expected(&mut self, expr: &Expr, expected: TypeId) {
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.complete_generic_call_from_expected(expr, expected);
             return;
         }
@@ -21074,7 +21118,9 @@ impl<'program> Checker<'program> {
             };
         }
         let access = match expr {
-            Expr::Grouped { expr, .. } => self.storage_path_access(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.storage_path_access(expr, scopes, method_context)
+            }
             Expr::New { .. } => ObjectPathAccess::Writable,
             Expr::Variable { name, .. } => {
                 scopes
@@ -21192,7 +21238,7 @@ impl<'program> Checker<'program> {
             return false;
         }
         match argument {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.writable_mixed_requires_semantic_check(argument_ty, expr, method_context)
             }
             Expr::This { .. } | Expr::PropertyAccess { .. } => false,
@@ -21214,7 +21260,9 @@ impl<'program> Checker<'program> {
 
     fn is_property_write_object_path(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_property_write_object_path(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::is_property_write_object_path(expr)
+            }
             Expr::Variable { .. } | Expr::This { .. } => true,
             Expr::PropertyAccess { object, .. } => Self::is_property_write_object_path(object),
             _ => false,
@@ -21280,7 +21328,7 @@ impl<'program> Checker<'program> {
 
     fn is_direct_this(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_direct_this(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => Self::is_direct_this(expr),
             Expr::This { .. } => true,
             _ => false,
         }
@@ -22810,7 +22858,7 @@ impl<'program> Checker<'program> {
         }
 
         match value_expr {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.is_expr_assignable_impl(target, expr, scopes, method_context, false)
             }
             Expr::New { shared: true, .. } => self.is_contextual_shared_construction_assignable(
@@ -23815,7 +23863,9 @@ impl<'program> Checker<'program> {
                         .unwrap_or_else(|| self.types.unknown())
                 })
             }
-            Expr::Grouped { expr, .. } => self.infer_expr_type(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.infer_expr_type(expr, scopes, method_context)
+            }
             Expr::Unary { op, expr, span } => {
                 self.infer_unary_type(op, expr, *span, scopes, method_context)
             }

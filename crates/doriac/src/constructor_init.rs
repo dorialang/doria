@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     AssignOp, ClassDecl, ClassMember, Expr, ForIncrement, ForInitializer, InterpolatedStringPart,
-    Item, Program, Stmt,
+    Item, Program, Stmt, UnsafeBlock,
 };
 use crate::control_flow::{
     build_function_cfg_with_checked_effects, GivenSemanticInfoMap, Node, NodeAction, NodeKind,
@@ -641,7 +641,7 @@ fn inspect_statement(
     analysis: &mut Analysis,
 ) {
     match statement {
-        Stmt::Block(block) => {
+        Stmt::Block(block) | Stmt::Unsafe(UnsafeBlock { block, .. }) => {
             for statement in &block.statements {
                 inspect_statement(class, properties, state, statement, repeatable, analysis);
             }
@@ -828,6 +828,7 @@ fn inspect_expr(
         }
         Expr::PropertyAccess { object, .. }
         | Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. } => {
             inspect_expr(class, properties, state, object, analysis)
         }
@@ -1048,7 +1049,7 @@ fn property_init_diagnostic(
 
 fn direct_this_property(expression: &Expr) -> Option<(&str, Span)> {
     match expression {
-        Expr::Grouped { expr, .. } => direct_this_property(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => direct_this_property(expr),
         Expr::PropertyAccess {
             object,
             property,
@@ -1062,7 +1063,7 @@ fn direct_this_property(expression: &Expr) -> Option<(&str, Span)> {
 fn is_this(expression: &Expr) -> bool {
     match expression {
         Expr::This { .. } => true,
-        Expr::Grouped { expr, .. } => is_this(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => is_this(expr),
         _ => false,
     }
 }
@@ -1070,7 +1071,7 @@ fn is_this(expression: &Expr) -> bool {
 fn constant_bool(expression: &Expr) -> Option<bool> {
     match expression {
         Expr::Bool { value, .. } => Some(*value),
-        Expr::Grouped { expr, .. } => constant_bool(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => constant_bool(expr),
         Expr::Unary {
             op: crate::ast::UnaryOp::Not,
             expr,

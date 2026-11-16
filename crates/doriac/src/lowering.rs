@@ -700,8 +700,23 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
         }
         ast::Item::Function(function) => lower_function(function, None).map(hir::Item::Function),
         ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
+        ast::Item::ExternBlock(ast::ExternBlock { span, .. })
+        | ast::Item::ForeignAggregate(ast::ForeignAggregateDecl { span, .. }) => {
+            Err(unsafe_code_before_lowering(*span))
+        }
         ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement, None))),
     }
+}
+
+/// Foreign declarations have no executable form yet; checking stops every
+/// program that contains them (`crate::unsafe_code`), so reaching lowering
+/// with one is a compiler defect.
+fn unsafe_code_before_lowering(span: crate::source::Span) -> Diagnostic {
+    Diagnostic::internal_compiler_error(
+        "foreign declaration reached lowering",
+        "an extern block, foreign aggregate or foreign function reached HIR lowering, which has no form for it",
+        span,
+    )
 }
 
 fn lower_enum(enum_decl: &ast::EnumDecl) -> hir::EnumDecl {
@@ -890,6 +905,9 @@ fn lower_function(
             },
             Some(*implementation),
         ),
+        ast::FunctionBody::Foreign { semicolon_span } => {
+            return Err(unsafe_code_before_lowering(*semicolon_span))
+        }
         _ => {
             return Err(Diagnostic::new(
                 "E0749",
@@ -1016,6 +1034,8 @@ fn lower_block(block: &ast::Block, class_name: Option<ClassContext<'_>>) -> hir:
 fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hir::Stmt {
     match statement {
         ast::Stmt::Block(block) => hir::Stmt::Block(lower_block(block, class_name)),
+        // An unsafe context changes what checking permits, not what runs.
+        ast::Stmt::Unsafe(statement) => hir::Stmt::Block(lower_block(&statement.block, class_name)),
         ast::Stmt::VarDecl(decl) => hir::Stmt::VarDecl(hir::VarDecl {
             writable: decl.writable,
             ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
@@ -1486,10 +1506,12 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             shared: *shared,
             span: *span,
         },
-        ast::Expr::Grouped { expr, span } => hir::Expr::Grouped {
-            expr: Box::new(lower_expr(expr, class_name)),
-            span: *span,
-        },
+        ast::Expr::Grouped { expr, span } | ast::Expr::Unsafe { expr, span, .. } => {
+            hir::Expr::Grouped {
+                expr: Box::new(lower_expr(expr, class_name)),
+                span: *span,
+            }
+        }
         ast::Expr::Unary { op, expr, span } => hir::Expr::Unary {
             op: op.clone(),
             expr: Box::new(lower_expr(expr, class_name)),

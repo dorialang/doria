@@ -10,8 +10,21 @@ use crate::types::{
     FunctionTypeParameterRef, FunctionTypeRef, FunctionTypeThrowsRef, TypeRef,
 };
 
+mod foreign;
+
+pub(crate) use foreign::{documentation_comments, DocCommentText};
+
 pub struct Parser {
     tokens: Vec<Token>,
+    /// Documentation comments of the source, in order (Decision 0148
+    /// section 27). Empty when the caller has no source comments to give.
+    doc_comments: Vec<DocCommentText>,
+    /// True while parsing a foreign struct or union field's type, the one
+    /// place a fixed-length array type `T[N]` is written.
+    foreign_field_type: bool,
+    /// The member a foreign block or aggregate last began at. Recovery that
+    /// returns to the same token skips it, so a malformed member cannot stall.
+    recovery_stalled_at: Option<usize>,
     source_id: SourceId,
     current: usize,
     pending_type_argument_close: Option<Span>,
@@ -78,9 +91,12 @@ struct FunctionModifiers {
     writable_span: Option<Span>,
     consuming_span: Option<Span>,
     static_span: Option<Span>,
+    unsafe_span: Option<Span>,
     start_span: Span,
     is_member: bool,
     allow_requirement: bool,
+    /// A declaration inside an `extern` block: it ends with `;`, not a body.
+    foreign_declaration: bool,
 }
 
 impl Parser {
@@ -90,6 +106,9 @@ impl Parser {
             .map_or_else(SourceId::default, |token| token.span.source);
         Self {
             tokens,
+            doc_comments: Vec::new(),
+            foreign_field_type: false,
+            recovery_stalled_at: None,
             source_id,
             current: 0,
             pending_type_argument_close: None,
@@ -217,9 +236,10 @@ impl Parser {
     }
 
     pub fn parse_program(mut self) -> DiagnosticResult<Program> {
-        let (namespace, imports, includes, items) = self.parse_source_items();
+        let (directives, namespace, imports, includes, items) = self.parse_source_items();
         if self.diagnostics.is_empty() {
             Ok(Program {
+                directives,
                 namespace,
                 imports,
                 includes,
@@ -236,6 +256,7 @@ impl Parser {
     fn parse_source_items(
         &mut self,
     ) -> (
+        Vec<DeclareDirective>,
         Option<NamespaceDecl>,
         Vec<UseDecl>,
         Vec<IncludeDecl>,
@@ -243,6 +264,14 @@ impl Parser {
     ) {
         use crate::syntax::CompletionContext;
         self.mark_cursor(CompletionContext::TopLevel);
+        let mut directives = Vec::new();
+        while self.match_kind(&TokenKind::Declare) {
+            match self.parse_declare_directive() {
+                Some(directive) => directives.push(directive),
+                None => self.synchronize(),
+            }
+            self.mark_cursor(CompletionContext::TopLevel);
+        }
         let mut namespace_seen = false;
         let namespace = if self.match_kind(&TokenKind::Namespace) {
             namespace_seen = true;
@@ -258,6 +287,22 @@ impl Parser {
             self.mark_cursor(CompletionContext::TopLevel);
             if self.is_at_end() {
                 break;
+            }
+            if self.match_kind(&TokenKind::Declare) {
+                let keyword_span = self.previous().span;
+                let directive = self.parse_declare_directive();
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "`declare` directives come first in a file, before `namespace`, `use` and every declaration",
+                        keyword_span,
+                    )
+                    .with_title("Declare Directive Is Not First"),
+                );
+                if directive.is_none() {
+                    self.synchronize();
+                }
+                continue;
             }
             if self.match_kind(&TokenKind::Namespace) {
                 let keyword_span = self.previous().span;
@@ -300,12 +345,12 @@ impl Parser {
                 }
             } else {
                 match self.parse_item() {
-                    Some(item) => items.push(item),
+                    Some(parsed) => items.extend(parsed),
                     None => self.synchronize(),
                 }
             }
         }
-        (namespace, imports, includes, items)
+        (directives, namespace, imports, includes, items)
     }
 
     fn checkpoint(&self) -> ParserCheckpoint {
@@ -646,8 +691,32 @@ impl Parser {
         })
     }
 
-    fn parse_item(&mut self) -> Option<Item> {
+    fn parse_item(&mut self) -> Option<Vec<Item>> {
+        let documentation = self.documentation_before(self.current);
         let attributes = self.parse_attribute_groups()?;
+        if self.match_kind(&TokenKind::Extern) {
+            return self.parse_extern_items(
+                MemberAccess::External,
+                None,
+                documentation,
+                attributes,
+            );
+        }
+        if self.check(&TokenKind::Internal)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Extern))
+        {
+            let internal_span = self.advance().span;
+            self.advance();
+            return self.parse_extern_items(
+                MemberAccess::Internal,
+                Some(internal_span),
+                documentation,
+                attributes,
+            );
+        }
         let open_span = self
             .match_kind(&TokenKind::Open)
             .then(|| self.previous().span);
@@ -667,6 +736,7 @@ impl Parser {
         let declaration_start = open_span
             .or(override_span)
             .map_or_else(|| self.peek().span.start, |span| span.start);
+        let unsafe_span = self.match_unsafe_function_modifier();
         self.mark_function_name();
         let item = if self.match_kind(&TokenKind::Class) {
             if let Some(span) = override_span {
@@ -695,7 +765,8 @@ impl Parser {
                 .map(Item::Trait)
         } else if self.match_kind(&TokenKind::Internal) {
             self.reject_type_modifier(open_span, override_span, "`internal`");
-            self.parse_internal_item(self.previous().span)
+            let internal_span = self.previous().span;
+            return self.parse_internal_item(internal_span, documentation, attributes);
         } else if self.match_kind(&TokenKind::Consuming) {
             let consuming_span = self.previous().span;
             self.expect(TokenKind::Function, "expected `function` after `consuming`")?;
@@ -706,9 +777,11 @@ impl Parser {
                 writable_span: None,
                 consuming_span: Some(consuming_span),
                 static_span: None,
+                unsafe_span,
                 start_span: self.span(declaration_start, self.previous().span.end),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
             .map(Item::Function)
         } else if self.check(&TokenKind::Function)
@@ -725,11 +798,16 @@ impl Parser {
                 writable_span: None,
                 consuming_span: None,
                 static_span: None,
+                unsafe_span,
                 start_span: self.span(declaration_start, self.previous().span.end),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
-            .map(Item::Function)
+            .map(|mut function| {
+                function.documentation = documentation.clone().map(Box::new);
+                Item::Function(function)
+            })
         } else if self.match_kind(&TokenKind::Const) {
             self.reject_type_modifier(open_span, override_span, "a constant");
             let start = self.previous().span.start;
@@ -755,7 +833,22 @@ impl Parser {
                 self.attach_item_attributes(attributes, item);
             }
         }
-        item
+        item.map(|item| vec![item])
+    }
+
+    /// `unsafe` before `function` and a name; any other `unsafe` begins a
+    /// statement.
+    fn match_unsafe_function_modifier(&mut self) -> Option<Span> {
+        let is_modifier = self.check(&TokenKind::Unsafe)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Function))
+            && self
+                .tokens
+                .get(self.current + 2)
+                .is_some_and(Self::is_callable_name_token);
+        is_modifier.then(|| self.advance().span)
     }
 
     fn reject_type_modifier(
@@ -959,6 +1052,16 @@ impl Parser {
             Item::Trait(value) => (AttributeTargetKind::Trait, value.span, value.name_span),
             Item::Function(value) => (AttributeTargetKind::Function, value.span, value.name_span),
             Item::Constant(value) => (AttributeTargetKind::Constant, value.span, value.name_span),
+            Item::ExternBlock(value) => (
+                AttributeTargetKind::ExternBlock,
+                value.span,
+                value.extern_span,
+            ),
+            Item::ForeignAggregate(value) => (
+                AttributeTargetKind::ForeignAggregate,
+                value.span,
+                value.name_span,
+            ),
             Item::Statement(_) => return,
         };
         self.attach_attributes(
@@ -1050,7 +1153,12 @@ impl Parser {
         );
     }
 
-    fn parse_internal_item(&mut self, internal_span: Span) -> Option<Item> {
+    fn parse_internal_item(
+        &mut self,
+        internal_span: Span,
+        documentation: Option<DocComment>,
+        attributes: Vec<AttributeGroup>,
+    ) -> Option<Vec<Item>> {
         if self.check(&TokenKind::AttributeOpen) {
             self.reject_attribute_after_modifier(internal_span);
             let _ = self.parse_attribute_groups();
@@ -1061,8 +1169,18 @@ impl Parser {
         let override_span = self
             .match_kind(&TokenKind::Override)
             .then(|| self.previous().span);
+        if self.match_kind(&TokenKind::Extern) {
+            self.reject_type_modifier(open_span, override_span, "an `extern` declaration");
+            return self.parse_extern_items(
+                MemberAccess::Internal,
+                Some(internal_span),
+                documentation,
+                attributes,
+            );
+        }
+        let unsafe_span = self.match_unsafe_function_modifier();
         self.mark_function_name();
-        if self.match_kind(&TokenKind::Class) {
+        let item = if self.match_kind(&TokenKind::Class) {
             if let Some(span) = override_span {
                 self.reject_type_modifier(None, Some(span), "a class");
             }
@@ -1090,9 +1208,11 @@ impl Parser {
                 writable_span: None,
                 consuming_span: Some(consuming_span),
                 static_span: None,
+                unsafe_span,
                 start_span: internal_span.merge(self.previous().span),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
             .map(Item::Function)
         } else if self.check(&TokenKind::Function)
@@ -1109,11 +1229,16 @@ impl Parser {
                 writable_span: None,
                 consuming_span: None,
                 static_span: None,
+                unsafe_span,
                 start_span: internal_span.merge(self.previous().span),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
-            .map(Item::Function)
+            .map(|mut function| {
+                function.documentation = documentation.map(Box::new);
+                Item::Function(function)
+            })
         } else if self.match_kind(&TokenKind::Const) {
             self.reject_type_modifier(open_span, override_span, "a constant");
             self.parse_const_decl(MemberAccess::Internal, internal_span.start)
@@ -1128,7 +1253,11 @@ impl Parser {
                 .with_title("Internal Declaration Is Incomplete"),
             );
             None
+        };
+        if let Some(item) = &item {
+            self.attach_item_attributes(attributes, item);
         }
+        item.map(|item| vec![item])
     }
 
     fn parse_enum(&mut self, access: MemberAccess, start: usize) -> Option<EnumDecl> {
@@ -1328,6 +1457,7 @@ impl Parser {
     }
 
     fn parse_class_member(&mut self, allow_requirement: bool) -> Option<ClassMember> {
+        let documentation = self.documentation_before(self.current);
         let attributes = self.parse_attribute_groups()?;
         if self.match_kind(&TokenKind::Uses) {
             self.reject_attribute_target(&attributes, "trait composition");
@@ -1409,15 +1539,17 @@ impl Parser {
         let mut writable_span = None;
         let mut consuming_span = None;
         let mut readonly_span = None;
+        let mut unsafe_span = None;
         while matches!(
             self.peek().kind,
-            TokenKind::Writable | TokenKind::Consuming | TokenKind::Readonly
+            TokenKind::Writable | TokenKind::Consuming | TokenKind::Readonly | TokenKind::Unsafe
         ) {
             let token = self.advance().clone();
             let slot = match token.kind {
                 TokenKind::Writable => &mut writable_span,
                 TokenKind::Consuming => &mut consuming_span,
                 TokenKind::Readonly => &mut readonly_span,
+                TokenKind::Unsafe => &mut unsafe_span,
                 _ => unreachable!("receiver modifier was checked above"),
             };
             if slot.replace(token.span).is_some() {
@@ -1472,11 +1604,16 @@ impl Parser {
                     writable_span,
                     consuming_span,
                     static_span,
+                    unsafe_span,
                     start_span: self.span(member_start, start),
                     is_member: true,
                     allow_requirement,
+                    foreign_declaration: false,
                 })
-                .map(ClassMember::Method);
+                .map(|mut method| {
+                    method.documentation = documentation.map(Box::new);
+                    ClassMember::Method(method)
+                });
             if let Some(member) = &member {
                 self.attach_member_attributes(attributes, member);
             }
@@ -1491,6 +1628,16 @@ impl Parser {
                     span,
                 )
                 .with_title("Consuming Modifier Requires A Method"),
+            );
+        }
+        if let Some(span) = unsafe_span {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`unsafe` can modify only a function or method",
+                    span,
+                )
+                .with_title("Unsafe Modifier Requires A Function"),
             );
         }
         let start = self.peek().span.start;
@@ -1765,9 +1912,11 @@ impl Parser {
             writable_span,
             consuming_span,
             static_span,
+            unsafe_span,
             start_span,
             is_member,
             allow_requirement,
+            foreign_declaration,
         } = modifiers;
         let keyword_span = self.previous().span;
         let start = start_span.start;
@@ -1822,7 +1971,31 @@ impl Parser {
         };
 
         let availability = self.parse_nominal_condition()?;
-        let body = if allow_requirement && self.match_kind(&TokenKind::Semicolon) {
+        let body = if foreign_declaration {
+            if self.check(&TokenKind::LeftBrace) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a declaration in an `extern` block names a foreign symbol and has no body",
+                        self.peek().span,
+                    )
+                    .with_title("Extern Declaration Has A Body")
+                    .with_help(
+                        "end the declaration with `;`, or write a C-ABI Doria function as `extern \"C\" function` outside the block",
+                    ),
+                );
+                let _ = self.parse_callable_body();
+                return None;
+            }
+            FunctionBody::Foreign {
+                semicolon_span: self
+                    .expect(
+                        TokenKind::Semicolon,
+                        "expected `;` after the extern declaration",
+                    )?
+                    .span,
+            }
+        } else if allow_requirement && self.match_kind(&TokenKind::Semicolon) {
             FunctionBody::Requirement {
                 semicolon_span: self.previous().span,
             }
@@ -1843,6 +2016,9 @@ impl Parser {
             consuming_span,
             is_static: static_span.is_some(),
             static_span,
+            unsafe_span,
+            linkage: FunctionLinkage::Doria,
+            documentation: None,
             name,
             name_span,
             type_params,
@@ -2175,6 +2351,7 @@ impl Parser {
                 | TokenKind::Internal
                 | TokenKind::Writable
                 | TokenKind::Consuming
+                | TokenKind::Unsafe
                 | TokenKind::Static
                 | TokenKind::Open
                 | TokenKind::Override
@@ -3062,6 +3239,15 @@ impl Parser {
         if self.check(&TokenKind::LeftBrace) {
             return self.parse_block().map(Stmt::Block);
         }
+        if self.check(&TokenKind::Unsafe)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::LeftBrace))
+        {
+            self.advance();
+            return self.parse_unsafe_block();
+        }
         if self.check(&TokenKind::Finally) {
             self.reject_disallowed_finally();
             return None;
@@ -3200,10 +3386,12 @@ impl Parser {
             return None;
         }
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
+            self.reject_unsafe_place(&expr);
             return self.parse_post_increment_statement(expr);
         }
 
         if let Some(op) = self.parse_assignment_op() {
+            self.reject_unsafe_place(&expr);
             let start = expr.span().start;
             let value = self.parse_expression()?;
             let end = self
@@ -3772,6 +3960,7 @@ impl Parser {
             Some(ForInitializer::VarDecl(declaration))
         } else {
             let target = self.parse_expression()?;
+            self.reject_unsafe_place(&target);
             let Some(op) = self.parse_assignment_op() else {
                 self.error(
                     "expected a local declaration or an assignment in for initializer",
@@ -3827,6 +4016,7 @@ impl Parser {
         }
 
         let target = self.parse_expression()?;
+        self.reject_unsafe_place(&target);
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
             return self
                 .parse_post_increment(target, false)
@@ -3869,6 +4059,7 @@ impl Parser {
             _ => unreachable!("pre-increment parser called without increment token"),
         };
         let target = self.parse_postfix()?;
+        self.reject_unsafe_place(&target);
         let end = if expect_semicolon {
             self.expect(
                 TokenKind::Semicolon,
@@ -4173,7 +4364,7 @@ impl Parser {
                     || Self::has_unparenthesized_logical_binary(left)
                     || Self::has_unparenthesized_logical_binary(right)
             }
-            Expr::Grouped { .. } => false,
+            Expr::Grouped { .. } | Expr::Unsafe { .. } => false,
             Expr::Unary { expr, .. } => Self::has_unparenthesized_logical_binary(expr),
             _ => false,
         }
@@ -4188,7 +4379,7 @@ impl Parser {
                     || Self::has_unparenthesized_xor_binary(left)
                     || Self::has_unparenthesized_xor_binary(right)
             }
-            Expr::Grouped { .. } => false,
+            Expr::Grouped { .. } | Expr::Unsafe { .. } => false,
             Expr::Unary { expr, .. } => Self::has_unparenthesized_xor_binary(expr),
             _ => false,
         }
@@ -4314,6 +4505,7 @@ impl Parser {
         }
         let token = self.advance().clone();
         match token.kind {
+            TokenKind::Unsafe => self.parse_unsafe_expression(token.span),
             TokenKind::Backslash => {
                 self.report_leading_namespace_separator(token.span);
                 let name_token = self.advance().clone();
@@ -4889,7 +5081,7 @@ impl Parser {
                         .iter()
                         .any(|arg| Self::contains_bare_identifier(&arg.value))
             }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } | Expr::Unary { expr, .. } => {
                 Self::contains_bare_identifier(expr)
             }
             Expr::IsType { expr, .. } => Self::contains_bare_identifier(expr),
@@ -5403,6 +5595,7 @@ impl Parser {
             return_type: Box::new(return_type),
             return_type_span,
             throws_clause,
+            c_abi: None,
             span,
         }))
     }
@@ -5493,6 +5686,8 @@ impl Parser {
         };
         let mut ty = if matches!(token.kind, TokenKind::Function) {
             self.parse_function_type_ref(token.span)?
+        } else if matches!(token.kind, TokenKind::Extern) {
+            self.parse_c_function_type_ref(token.span)?
         } else if matches!(token.kind, TokenKind::LeftParen) {
             if self.check(&TokenKind::RightParen) {
                 let close_span = self.advance().span;
@@ -5608,6 +5803,10 @@ impl Parser {
 
         while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)
         {
+            if self.foreign_field_type && matches!(self.peek().kind, TokenKind::IntLiteral(_)) {
+                ty = self.parse_fixed_array_suffix(ty)?;
+                continue;
+            }
             self.expect(
                 TokenKind::RightBracket,
                 "expected `]` after typed array suffix",
@@ -5737,6 +5936,7 @@ impl Parser {
                 | TokenKind::Resource
                 | TokenKind::SelfType
                 | TokenKind::Function
+                | TokenKind::Extern
                 | TokenKind::Identifier(_)
         )
     }
@@ -6087,6 +6287,9 @@ impl Parser {
                 | TokenKind::For
                 | TokenKind::Foreach
                 | TokenKind::Internal
+                | TokenKind::Unsafe
+                | TokenKind::Extern
+                | TokenKind::Declare
                 | TokenKind::AttributeOpen => return,
                 _ => {
                     self.advance();
@@ -6148,7 +6351,7 @@ pub(crate) const CONSTRUCTOR_ROLE_KEYWORDS: [TokenKind; 3] = [
     TokenKind::Parameter,
 ];
 
-fn token_name(kind: &TokenKind) -> &'static str {
+pub(crate) fn token_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::Class => "class",
         TokenKind::Enum => "enum",
@@ -6178,6 +6381,9 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Borrow => "borrow",
         TokenKind::Once => "once",
         TokenKind::Consuming => "consuming",
+        TokenKind::Unsafe => "unsafe",
+        TokenKind::Extern => "extern",
+        TokenKind::Declare => "declare",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",
         TokenKind::Return => "return",

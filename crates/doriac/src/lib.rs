@@ -83,6 +83,7 @@ pub mod syntax;
 pub mod testing;
 pub mod trait_composition;
 pub mod types;
+pub mod unsafe_code;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
 pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
@@ -821,6 +822,8 @@ fn ast_uses_compiler_known_source(program: &ast::Program) -> bool {
         ast::Item::Trait(value) => value.span.source == synthetic,
         ast::Item::Function(value) => value.span.source == synthetic,
         ast::Item::Constant(value) => value.span.source == synthetic,
+        ast::Item::ExternBlock(value) => value.span.source == synthetic,
+        ast::Item::ForeignAggregate(value) => value.span.source == synthetic,
         ast::Item::Statement(_) => false,
     })
 }
@@ -869,8 +872,10 @@ pub(crate) fn prepare_parsed_source(
 }
 
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {
-    let tokens = lexer::Lexer::new(source).lex()?;
-    parser::Parser::new(tokens).parse_program()
+    let (tokens, comments) = lexer::Lexer::new(source).lex_with_comments();
+    parser::Parser::new(tokens?)
+        .with_documentation(parser::documentation_comments(source, &comments))
+        .parse_program()
 }
 
 pub fn render_diagnostics(

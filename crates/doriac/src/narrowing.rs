@@ -276,6 +276,8 @@ impl NullabilityCatalog {
                 | Item::Interface(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
                 | Item::Statement(_) => {}
             }
         }
@@ -475,6 +477,8 @@ impl MutationCatalog {
                 | Item::Interface(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
                 | Item::Statement(_) => {}
             }
         }
@@ -655,7 +659,12 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
                     }
                 }
             }
-            Item::Enum(_) | Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
+            | Item::Statement(_) => {}
         }
     }
     facts
@@ -664,6 +673,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Block(block) => block.span,
+        Stmt::Unsafe(statement) => statement.span,
         Stmt::VarDecl(declaration) => declaration.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. }
@@ -924,7 +934,7 @@ fn transfer_statement(
     nullability: &NullabilityCatalog,
 ) {
     match statement {
-        Stmt::Block(_) => {}
+        Stmt::Block(_) | Stmt::Unsafe(_) => {}
         Stmt::VarDecl(declaration) => transfer_declaration(
             &declaration.bindings,
             &declaration.initializer,
@@ -1073,6 +1083,7 @@ fn kill_mutated_call_arguments(
     match expr {
         Expr::PropertyAccess { object, .. }
         | Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. }
         | Expr::IsType { expr: object, .. } => {
             kill_mutated_call_arguments(object, state, resolution, mutations)
@@ -1294,7 +1305,7 @@ fn kill_mutated_calls_in_statement(
     mutations: &MutationCatalog,
 ) {
     match statement {
-        Stmt::Block(block) => {
+        Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
             for statement in &block.statements {
                 kill_mutated_calls_in_statement(statement, state, resolution, mutations);
             }
@@ -1523,7 +1534,7 @@ fn expression_fact(
             }
         }
         Expr::Binary { .. } => Some(Fact::NonNull),
-        Expr::Identifier { .. } | Expr::Grouped { .. } => None,
+        Expr::Identifier { .. } | Expr::Grouped { .. } | Expr::Unsafe { .. } => None,
     }
 }
 
@@ -1645,7 +1656,7 @@ fn collect_statement(
     facts: &mut FactsByUse,
 ) {
     match statement {
-        Stmt::Block(_) => {}
+        Stmt::Block(_) | Stmt::Unsafe(_) => {}
         Stmt::VarDecl(declaration) => {
             collect_expr(
                 &declaration.initializer,
@@ -1710,6 +1721,7 @@ fn collect_expr(
             collect_expr(object, state, resolution, mutations, facts)
         }
         Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. }
         | Expr::IsType { expr: object, .. } => {
             collect_expr(object, state, resolution, mutations, facts)
@@ -2250,7 +2262,7 @@ fn static_qualifier_class_name(
 }
 
 fn ungroup(mut expr: &Expr) -> &Expr {
-    while let Expr::Grouped { expr: inner, .. } = expr {
+    while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
         expr = inner;
     }
     expr
@@ -2389,7 +2401,9 @@ impl Resolver {
 
     fn resolve_statement(&mut self, statement: &Stmt) {
         match statement {
-            Stmt::Block(block) => self.resolve_block(block),
+            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                self.resolve_block(block)
+            }
             Stmt::VarDecl(declaration) => {
                 self.resolve_expr(&declaration.initializer);
                 let inferred_member_type = self.resolved_member_type(&declaration.initializer);
@@ -2591,6 +2605,7 @@ impl Resolver {
             }
             Expr::PropertyAccess { object, .. }
             | Expr::Grouped { expr: object, .. }
+            | Expr::Unsafe { expr: object, .. }
             | Expr::Unary { expr: object, .. }
             | Expr::IsType { expr: object, .. } => self.resolve_expr(object),
             Expr::MethodCall { object, args, .. } => {

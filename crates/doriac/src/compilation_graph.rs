@@ -574,6 +574,7 @@ pub fn compilation_context(source: &GraphSource) -> CompilationContext {
 
 fn empty_program() -> Program {
     Program {
+        directives: Vec::new(),
         namespace: None,
         imports: Vec::new(),
         includes: Vec::new(),
@@ -1560,6 +1561,7 @@ fn retarget_diagnostics(mut diagnostics: Vec<Diagnostic>, path: &str) -> Vec<Dia
 fn statement_span(statement: &crate::ast::Stmt) -> Span {
     match statement {
         crate::ast::Stmt::Block(value) => value.span,
+        crate::ast::Stmt::Unsafe(value) => value.span,
         crate::ast::Stmt::VarDecl(value) => value.span,
         crate::ast::Stmt::Assignment(value) => value.span,
         crate::ast::Stmt::Echo { span, .. }

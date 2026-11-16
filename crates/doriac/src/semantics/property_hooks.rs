@@ -251,7 +251,7 @@ impl Checker<'_> {
         context: Option<&MethodContext>,
     ) {
         let target = match target {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 return self.check_setter_argument(expr, value, scopes, context)
             }
             _ => target,
