@@ -1112,6 +1112,11 @@ impl RetainedLoan {
 struct BorrowPlace {
     owner: String,
     fields: Vec<crate::class_layout::PropertyId>,
+    /// Fields of a foreign struct or union reached after `fields`, by name.
+    /// Foreign values are Copy and contain no properties, so this path
+    /// only ever extends the end of `fields`; owned storage, which tracks
+    /// property paths, never needs it.
+    foreign_fields: Vec<String>,
     projectable: bool,
 }
 
@@ -1119,6 +1124,24 @@ impl BorrowPlace {
     fn overlaps(&self, other: &Self) -> bool {
         self.owner == other.owner
             && (self.fields.starts_with(&other.fields) || other.fields.starts_with(&self.fields))
+            && (self.fields != other.fields
+                || self.foreign_fields.starts_with(&other.foreign_fields)
+                || other.foreign_fields.starts_with(&self.foreign_fields))
+    }
+
+    /// Whether this place is `other` or contains it.
+    fn contains(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && other.fields.starts_with(&self.fields)
+            && (self.fields != other.fields
+                || other.foreign_fields.starts_with(&self.foreign_fields))
+    }
+
+    fn project_foreign(mut self, field: &str) -> Self {
+        if self.projectable {
+            self.foreign_fields.push(field.to_owned());
+        }
+        self
     }
 
     fn opaque(mut self) -> Self {
@@ -1145,6 +1168,7 @@ impl From<String> for BorrowPlace {
         Self {
             owner,
             fields: Vec::new(),
+            foreign_fields: Vec::new(),
             projectable: true,
         }
     }
@@ -5335,6 +5359,15 @@ impl Checker<'_> {
                         increment.target.span(),
                         scopes,
                     );
+                    // An increment replaces the value it updates.
+                    if let Some(pin) = self.breaking_pin(&root, UseMode::Write) {
+                        self.report_broken_pin(
+                            &root,
+                            UseMode::Write,
+                            pin.span,
+                            increment.target.span(),
+                        );
+                    }
                 }
                 self.use_expr(&increment.target, scopes, UseMode::Read);
                 Flow::fallthrough()
@@ -5967,14 +6000,22 @@ impl Checker<'_> {
                             ),
                         );
                     }
+                    let capture_mode = if access == BorrowAccess::Writable {
+                        UseMode::Write
+                    } else {
+                        UseMode::Read
+                    };
                     let conflict = self
-                        .live_borrows()
+                        .active_borrows
+                        .iter()
+                        .rev()
                         .find(|borrow| {
                             borrow.root.overlaps(root_key)
                                 && (access == BorrowAccess::Writable
                                     || borrow.mode == UseMode::Write)
                         })
-                        .cloned();
+                        .cloned()
+                        .or_else(|| self.breaking_pin(root_key, capture_mode));
                     if let Some(conflict) = conflict {
                         invalid = true;
                         self.diagnostics.push(
@@ -6097,9 +6138,16 @@ impl Checker<'_> {
                     );
                 }
                 let conflict = self
-                    .live_borrows()
+                    .active_borrows
+                    .iter()
+                    .rev()
                     .find(|borrow| root_keys.iter().any(|key| borrow.root.overlaps(key)))
-                    .cloned();
+                    .cloned()
+                    .or_else(|| {
+                        root_keys
+                            .iter()
+                            .find_map(|key| self.breaking_pin(key, UseMode::Give))
+                    });
                 if let Some(conflict) = conflict {
                     invalid = true;
                     self.diagnostics.push(
@@ -9494,6 +9542,9 @@ impl Checker<'_> {
                 object, property, ..
             } => {
                 let root = self.borrow_source_root(object, scopes)?;
+                if self.resolved_type(object).is_some_and(is_foreign_aggregate) {
+                    return Some(root.map_places(|place| place.project_foreign(property)));
+                }
                 let stored = self
                     .resolved_type(object)
                     .and_then(resolved_type_class)
@@ -9607,8 +9658,14 @@ impl Checker<'_> {
             self.check_give_against_active_borrows(root, span);
             return;
         }
+        if let Some(pin) = self.breaking_pin(root, mode) {
+            self.report_broken_pin(root, mode, pin.span, span);
+            return;
+        }
         let Some(existing) = self
-            .live_borrows()
+            .active_borrows
+            .iter()
+            .rev()
             .find(|borrow| borrow.root.overlaps(root) && borrow_modes_conflict(borrow.mode, mode))
             .cloned()
         else {
@@ -9647,10 +9704,9 @@ impl Checker<'_> {
     /// `Ptr::to($place)` or `MutPtr::to($place)`: the place is read, or
     /// written as an assignment target is, then pinned until the innermost enclosing
     /// unsafe context ends (Decision 0148 section 7). Within the context it
-    /// cannot be given away or used in a way that conflicts with the pin.
-    /// Forming another pointer to a place the context already pins with at
-    /// least that access adds nothing: pointers are Copy, so a second one
-    /// aliases no more than a copy of the first.
+    /// cannot be moved or replaced (`breaking_pin`). Forming a pointer
+    /// neither moves nor replaces its place, so it never conflicts with a
+    /// pin, including one on the same place.
     fn form_pointer(
         &mut self,
         access: crate::foreign::PointerAccess,
@@ -9666,21 +9722,11 @@ impl Checker<'_> {
             crate::foreign::PointerAccess::Write => UseMode::Write,
         };
         let roots = self.borrow_root_keys(place, scopes);
-        let pinned = !roots.is_empty()
-            && roots.iter().all(|root| {
-                self.unsafe_pins
-                    .iter()
-                    .flat_map(|context| &context.pins)
-                    .any(|pin| {
-                        pin.root == *root && (pin.mode == UseMode::Write || mode == UseMode::Read)
-                    })
-            });
-        if pinned {
-            return;
-        }
         // The place itself is used, as an assignment target is: a
         // `MutPtr::to` place must be writable.
+        let pins = std::mem::take(&mut self.unsafe_pins);
         self.use_expr(place, scopes, mode);
+        self.unsafe_pins = pins;
         let Some(context) = self.unsafe_pins.last() else {
             // Checking reports a formation outside an unsafe context.
             return;
@@ -9707,31 +9753,86 @@ impl Checker<'_> {
                 return;
             }
         }
-        let pins = roots
-            .into_iter()
-            .map(|root| ActiveBorrow { root, mode, span })
-            .collect::<Vec<_>>();
-        self.unsafe_pins
+        let context = self
+            .unsafe_pins
             .last_mut()
-            .expect("an unsafe context is active")
-            .pins
-            .extend(pins);
+            .expect("an unsafe context is active");
+        for root in roots {
+            if !context.pins.iter().any(|pin| pin.root == root) {
+                context.pins.push(ActiveBorrow { root, mode, span });
+            }
+        }
     }
 
-    /// The accesses in effect: those of the current call, then the places
-    /// unsafe contexts pin, latest first.
-    fn live_borrows(&self) -> impl Iterator<Item = &ActiveBorrow> {
-        self.active_borrows.iter().rev().chain(
-            self.unsafe_pins
-                .iter()
-                .rev()
-                .flat_map(|context| context.pins.iter().rev()),
-        )
+    /// The pin that `mode` on `place` would break (Decision 0148 section 7,
+    /// amended 2026-11-16). A pin keeps its value in place and alive, so
+    /// giving away an overlapping value conflicts, and so does `writable`
+    /// access to the pinned value or a value containing it: an assignment
+    /// replaces the value, and a `writable` argument or receiver lets the
+    /// callee replace it. Reads, and writes to a field or element inside
+    /// the pinned value, do not conflict.
+    fn breaking_pin(&self, place: &BorrowPlace, mode: UseMode) -> Option<ActiveBorrow> {
+        self.unsafe_pins
+            .iter()
+            .rev()
+            .flat_map(|context| context.pins.iter().rev())
+            .find(|pin| match mode {
+                UseMode::Read => false,
+                UseMode::Write => place.contains(&pin.root),
+                UseMode::Give => pin.root.overlaps(place),
+            })
+            .cloned()
+    }
+
+    fn report_broken_pin(&mut self, place: &BorrowPlace, mode: UseMode, pin: Span, span: Span) {
+        // A call checks a given-away argument before it uses it, and an
+        // assignment checks its target and the variable it starts from: one
+        // site breaks a pin once.
+        let overlapping = |other: Span| {
+            other.source == span.source && other.start < span.end && span.start < other.end
+        };
+        if self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0477"
+                && overlapping(diagnostic.span)
+                && diagnostic.related.iter().any(|related| related.span == pin)
+        }) {
+            return;
+        }
+        let root_display = display_borrow_root(place);
+        let (message, label) = if mode == UseMode::Give {
+            (
+                format!("`{root_display}` cannot be given away while a pointer pins it"),
+                "This Gives Away The Pinned Value",
+            )
+        } else {
+            (
+                format!("`{root_display}` cannot be replaced or lent as writable while a pointer pins it"),
+                "This Can Replace The Pinned Value",
+            )
+        };
+        self.diagnostics.push(
+            Diagnostic::new("E0477", message, span)
+                .with_title("Pinned Value Cannot Be Moved Or Replaced")
+                .with_primary_label(label)
+                .with_explanation(
+                    "A pointer to a Doria place keeps the value in place and alive until the innermost enclosing unsafe context ends. Inside the context the program may read the value and write its fields, but it cannot give the value away, replace it, or pass `writable` access to it.",
+                )
+                .with_related(pin, "Pointer Formed Here")
+                .with_help(
+                    "write through the pointer or to one of the value's fields, or make the change after the unsafe context ends",
+                ),
+        );
     }
 
     fn check_give_against_active_borrows(&mut self, root: &BorrowPlace, span: Span) {
+        if let Some(pin) = self.breaking_pin(root, UseMode::Give) {
+            self.report_broken_pin(root, UseMode::Give, pin.span, span);
+            return;
+        }
         let existing = self
-            .live_borrows()
+            .active_borrows
+            .iter()
+            .rev()
             .find(|borrow| borrow.root.overlaps(root))
             .cloned();
         if let Some(existing) = existing {
@@ -11043,6 +11144,17 @@ fn type_ref_class_name(
     (classes.contains(&ty.name)
         && crate::inline_value::InlineValueKind::for_name(&ty.name).is_none())
     .then(|| ty.name.clone())
+}
+
+/// A foreign struct or union value, or a nullable one.
+fn is_foreign_aggregate(ty: &crate::types::ResolvedType) -> bool {
+    match ty {
+        crate::types::ResolvedType::Foreign(foreign) => {
+            matches!(**foreign, crate::foreign::ForeignType::Aggregate(_))
+        }
+        crate::types::ResolvedType::Nullable(inner) => is_foreign_aggregate(inner),
+        _ => false,
+    }
 }
 
 fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {

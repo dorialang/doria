@@ -692,6 +692,15 @@ fn pointer_program(body: &str) -> String {
     format!("{POINTERS}function main(): void {{ writable int32 $value = 3; writable Point $point = new Point(x: 1, y: 2); {body} }}")
 }
 
+/// `pointer_program` with a class holding an FFI-safe property and helpers
+/// that read, change and take values.
+fn pin_program(body: &str) -> String {
+    format!(
+        "class Box {{ writable int32 $count = 0; writable int32 $other = 0; writable function reset(): void {{ $this->count = 0; }} }} function consume(take Box $box): void {{}} function show(Point $point): void {{ echo $point->x; }} function shift(writable Point $point): void {{ $point->x = 9; }} {}",
+        pointer_program(body)
+    )
+}
+
 #[test]
 fn pointer_members_have_their_types() {
     for body in [
@@ -821,27 +830,56 @@ fn pointers_have_only_their_own_members() {
 }
 
 #[test]
-fn forming_a_pointer_pins_its_place_until_the_unsafe_context_ends() {
+fn a_pin_stops_moves_and_replacement_but_not_field_access() {
+    // Decision 0148 section 7, amended 2026-11-16: "Pins stop moves, not
+    // field access".
     let conflicting = [
         "unsafe { let $pointer = Ptr::to($value); $value = 4; }",
-        "unsafe { let $pointer = MutPtr::to($value); echo $value; }",
-        "unsafe { let $pointer = Ptr::to($value); let $writable = MutPtr::to($value); }",
-        "writable int $round = 0; unsafe { while ($round < 2) { $round++; echo $value; let $pointer = MutPtr::to($value); } }",
+        "unsafe { let $pointer = MutPtr::to($value); $value++; }",
+        "unsafe { let $pointer = Ptr::to($point); $point = new Point(x: 3, y: 4); }",
+        "unsafe { let $field = MutPtr::to($point->y); $point = new Point(x: 3, y: 4); }",
+        "let writable $box = new Box(); unsafe { let $field = Ptr::to($box->count); $box->reset(); }",
+        "let writable $box = new Box(); unsafe { let $field = MutPtr::to($box->count); $box->count = 2; }",
+        "let writable $box = new Box(); unsafe { let $field = Ptr::to($box->count); consume($box); }",
     ];
     for body in conflicting {
-        let diagnostic = only(&pointer_program(body), "E0477");
-        assert_eq!(diagnostic.title, "Conflicting Access", "{body}");
+        let found = findings(&pin_program(body));
+        assert!(
+            found.len() == 1 && found[0].code == "E0477",
+            "{body}: {found:#?}"
+        );
+        let diagnostic = found.into_iter().next().expect("one finding");
+        assert_eq!(
+            diagnostic.title, "Pinned Value Cannot Be Moved Or Replaced",
+            "{body}"
+        );
+        assert!(
+            diagnostic
+                .related
+                .iter()
+                .any(|related| related.message == "Pointer Formed Here"),
+            "{body}: {diagnostic:#?}"
+        );
     }
     for body in [
         "unsafe { let $pointer = MutPtr::to($value); $pointer->write(4); } $value = 5; echo $value;",
         "unsafe { let $pointer = MutPtr::to($value); let $again = MutPtr::to($value); let $readonly = Ptr::to($value); }",
         "unsafe { let $pointer = Ptr::to($value); echo $value; }",
+        "unsafe { let $pointer = MutPtr::to($value); echo $value; }",
+        "unsafe { let $pointer = Ptr::to($value); let $writable = MutPtr::to($value); }",
+        "writable int $round = 0; unsafe { while ($round < 2) { $round++; echo $value; let $pointer = MutPtr::to($value); } }",
+        "unsafe { let $pointer = MutPtr::to($point); $point->x = 5; echo $point->y; $pointer->write(new Point(x: 1, y: 1)); echo $point->x; }",
+        "unsafe { let $field = MutPtr::to($point->y); $point->x = 3; echo $point->y; }",
+        "unsafe { let $pointer = Ptr::to($point); show($point); }",
+        // A `writable` parameter of a Copy type receives its own copy.
+        "unsafe { let $pointer = Ptr::to($point); shift($point); }",
+        "let writable $box = new Box(); unsafe { let $field = MutPtr::to($box->count); $box->other = 2; echo $box->count; }",
     ] {
-        let source = pointer_program(body);
+        let source = pin_program(body);
         assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
     }
     let capture = pointer_program(
-        "unsafe { let $pointer = MutPtr::to($value); let $read = function(): int32 with ($value) { return $value; }; }",
+        "unsafe { let $pointer = Ptr::to($value); let $bump = function(): void with (writable $value) { $value = 1; }; }",
     );
     assert!(
         codes(&capture).contains(&"E0654"),

@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended section 6 the same day (Amendment: Initializing Unions And Fixed-Length Arrays). Nothing here is implemented; delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes). Nothing here is implemented; delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -56,6 +56,14 @@ construction, and did not say how a union is built or what value supplies a
 fixed-length array field. Stage 40 implementation raised the question, and
 Andrew ruled on 2026-11-16: "Zeroed or one member; arrays zeroed or copied
 (Recommended)". Section 6 states the rule.
+
+### Amendment: What A Pin Excludes (2026-11-16)
+
+Section 7 said a pinned source cannot be "accessed in a conflicting way"
+without saying which accesses conflict, and the first implementation made a
+writable pin exclude every other access. Andrew ruled on 2026-11-16: "Pins
+stop moves, not field access (Recommended)". Section 7 states the rule, and
+section 23's marshalling paragraph follows it.
 
 ## Context
 
@@ -370,10 +378,16 @@ Formation:
   be dereferenced.
 
 Validity: forming a pointer extends the source's loan to the end of the
-innermost enclosing unsafe context. Within it the source cannot be moved,
-destroyed or accessed in a conflicting way. The pointer is valid only within
-that context on every target; using it after the context ends is undefined
-behavior. Pointers to foreign memory (from C) follow the foreign library's own
+innermost enclosing unsafe context. A pin keeps the value in place and alive:
+within the context the program cannot move, replace, release or resize the
+pinned value or a value containing it, and cannot pass `writable` access to
+any of them. It may read the value, and read and write its fields and
+elements directly between foreign calls, as C code does with a struct it
+shares with a library; the unsafe context is where the programmer vouches that
+C is not using the value at that moment (amendment of 2026-11-16). Forming
+another pointer to a pinned place is not a conflict. The pointer is valid only
+within that context on every target; using it after the context ends is
+undefined behavior. Pointers to foreign memory (from C) follow the foreign library's own
 rules and are unaffected.
 
 Consequence: the checker pins storage exactly for the audited region, which
@@ -709,9 +723,10 @@ checked error.
 | Raw handles | Host handle tokens, by value |
 | Every other value (class instances, interfaces, other collections, closures, `mixed`, shared references, nullable move values) | Stays on the host; the companion holds an opaque host token |
 
-The borrow rules of section 7 make the copies unobservable: a writable pin
-excludes every other access for the region, a readonly pin excludes mutation,
-and a pointer into Doria storage is valid only inside its region.
+The borrow rules of section 7 make the copies unobservable: a pinned place
+stays in place and alive for the region, every access the region makes to it
+runs on the region's copy, and a pointer into Doria storage is valid only
+inside its region.
 
 **Host operations.** Inside a region, a call to a Doria function, method,
 closure or hook, construction of a class, an operation on a host-owned value,
