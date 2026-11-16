@@ -2017,6 +2017,9 @@ pub struct RejectedTypeName {
     pub code: &'static str,
     pub message: &'static str,
     pub help: Option<&'static str>,
+    /// The keyword is a literal value, as `null` is, so it may still be
+    /// written where an expression begins.
+    pub literal: bool,
 }
 
 pub fn rejected_type_name(name: &str) -> Option<RejectedTypeName> {
@@ -2025,6 +2028,7 @@ pub fn rejected_type_name(name: &str) -> Option<RejectedTypeName> {
             code: "E0431",
             message: "`null` is a literal, not a type name",
             help: Some("write `?T` with a concrete type, such as `?string` or `?Person`"),
+            literal: true,
         },
         "object" => RejectedTypeName {
             code: "E0401",
@@ -2032,11 +2036,13 @@ pub fn rejected_type_name(name: &str) -> Option<RejectedTypeName> {
             help: Some(
                 "use a concrete class type, or `mixed` at a dynamic boundary and narrow it with `is`",
             ),
+            literal: false,
         },
         "resource" => RejectedTypeName {
             code: "E0432",
             message: "`resource` is reserved for PHP interop through the future Phase I bridge and is not a Doria value type",
             help: None,
+            literal: false,
         },
         _ => return None,
     })
