@@ -105,6 +105,9 @@ struct PreparedSource {
     source_semantic_contexts:
         std::collections::HashMap<source::SourceId, testing::SourceSemanticContext>,
     test_semantics: testing::TestSemanticFacts,
+    /// Warnings from name resolution and test elaboration, reported beside
+    /// the program's checking warnings.
+    warnings: Vec<Diagnostic>,
 }
 
 pub fn lex_source(
@@ -194,7 +197,9 @@ pub fn analyze_source_for_ide_with_source_context(
     );
     resolution.resolved.program = elaboration.program;
     resolution.diagnostics.extend(elaboration.diagnostics);
-    let resolution_succeeded = resolution.diagnostics.is_empty();
+    // Only an error stops a file's analysis; warnings from resolution and
+    // elaboration are reported with the semantic findings.
+    let resolution_succeeded = !diagnostics::has_errors(&resolution.diagnostics);
     let mut analysis = if resolution_succeeded {
         let mut source_texts = std::collections::HashMap::from([(source.id, source.text.as_str())]);
         let mut contexts = std::collections::HashMap::from([(source.id, context.clone())]);
@@ -213,6 +218,7 @@ pub fn analyze_source_for_ide_with_source_context(
             resolution.resolved.facts.clone(),
             elaboration.facts,
         )
+        .with_leading_diagnostics(std::mem::take(&mut resolution.diagnostics))
     } else {
         semantics::SemanticAnalysis {
             info: semantics::SemanticInfo::default(),
@@ -772,8 +778,10 @@ pub(crate) fn analyze_prepared_source(
         prepared.global_symbols.clone(),
         prepared.test_semantics.clone(),
     );
+    let mut findings = prepared.warnings.clone();
+    findings.extend(analysis.diagnostics);
     let mut info = analysis.info;
-    info.warnings = diagnostics::separate_errors(analysis.diagnostics)?;
+    info.warnings = diagnostics::separate_errors(findings)?;
     Ok(info)
 }
 
@@ -959,7 +967,9 @@ pub(crate) fn prepare_parsed_source(
 ) -> DiagnosticResult<PreparedSource> {
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
-    let mut resolved = names::resolve_program(&authored, &context)?;
+    let resolution = names::resolve_program_for_ide(&authored, &context);
+    let mut warnings = diagnostics::separate_errors(resolution.diagnostics)?;
+    let mut resolved = resolution.resolved;
     resolved.program = augment_compiler_known(
         &resolved.program,
         &resolved.facts,
@@ -974,9 +984,9 @@ pub(crate) fn prepare_parsed_source(
         &source_context,
         &evaluation,
     );
-    if !elaboration.diagnostics.is_empty() {
-        return Err(elaboration.diagnostics);
-    }
+    let mut findings = std::mem::take(&mut warnings);
+    findings.extend(elaboration.diagnostics);
+    let warnings = diagnostics::separate_errors(findings)?;
     Ok(PreparedSource {
         authored,
         resolved: elaboration.program,
@@ -984,6 +994,7 @@ pub(crate) fn prepare_parsed_source(
         global_symbols: resolved.facts,
         source_semantic_contexts: std::collections::HashMap::from([(source.id, source_context)]),
         test_semantics: elaboration.facts,
+        warnings,
     })
 }
 
@@ -1023,4 +1034,76 @@ pub fn render_diagnostics_with_options(
 ) -> String {
     let source = SourceFile::new(path, text);
     diagnostics::render_diagnostics(&source, diagnostics, options)
+}
+
+#[cfg(test)]
+mod warning_flow_tests {
+    use super::*;
+
+    const WARNING_ONLY: &str = r#"function main(): void
+{
+    let $value = 1;
+    let $unused = fn() with ($value) => 1;
+}
+"#;
+
+    /// Warnings from resolution and elaboration travel in `PreparedSource`
+    /// to the checked result; they never fail it.
+    #[test]
+    fn preparation_warnings_reach_the_checked_result() {
+        let source = SourceFile::new("main.doria", "function main(): void {}");
+        let context = CompilationContext::standalone(source.path.clone());
+        let mut prepared = prepare_source(&source, context).expect("the program prepares");
+        assert!(prepared.warnings.is_empty());
+        prepared.warnings.push(
+            Diagnostic::new("E0646", "an earlier phase warned", Span::default())
+                .with_severity(diagnostics::DiagnosticSeverity::Warning),
+        );
+        let info = analyze_prepared_source(&prepared, &source)
+            .expect("a warning from preparation does not fail checking");
+        assert_eq!(
+            info.warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            ["an earlier phase warned"]
+        );
+    }
+
+    /// Editor analysis keeps semantic facts for a file whose findings are
+    /// only warnings, and reports the warnings.
+    #[test]
+    fn editor_analysis_keeps_semantic_facts_beside_warnings() {
+        let (_, analysis) =
+            analyze_source_for_ide("main.doria", WARNING_ONLY).expect("the file parses");
+        assert_eq!(
+            analysis
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["E0646"]
+        );
+        assert!(!analysis.info.global_symbols.declarations.is_empty());
+        assert!(!analysis.info.expression_types.is_empty());
+    }
+
+    #[test]
+    fn earlier_findings_lead_an_analysis() {
+        let later = Diagnostic::new("E0646", "later", Span::default());
+        let earlier = Diagnostic::new("E0646", "earlier", Span::default());
+        let analysis = semantics::SemanticAnalysis {
+            info: semantics::SemanticInfo::default(),
+            diagnostics: vec![later],
+        }
+        .with_leading_diagnostics(vec![earlier]);
+        assert_eq!(
+            analysis
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier", "later"]
+        );
+    }
 }

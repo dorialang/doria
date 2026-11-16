@@ -16,14 +16,18 @@ pub type DiagnosticResult<T> = Result<T, Vec<Diagnostic>>;
 /// the warnings and notes to report beside the result; `Err` holds every
 /// finding, in order.
 pub fn separate_errors(diagnostics: Vec<Diagnostic>) -> Result<Vec<Diagnostic>, Vec<Diagnostic>> {
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
-    {
+    if has_errors(&diagnostics) {
         Err(diagnostics)
     } else {
         Ok(diagnostics)
     }
+}
+
+/// Whether any finding is an error, the one severity that fails checking.
+pub fn has_errors(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
