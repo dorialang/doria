@@ -140,13 +140,14 @@ Its consumers are concrete:
    symbols are reserved. D18's wording is unchanged and still differs.
 7. Plan §3.5 did not say whether an `unsafe function` body is an unsafe
    context. Resolved: it is an ordinary context (ruling 2); §3.5 amended.
-8. Decision 0142 (Proposed, untracked) leaves passing math values in vector
-   registers across FFI to Stage 44; the C ABI fixes those registers for a
-   by-value C-layout aggregate. Recorded here only; 0142 belongs to another
-   session.
-9. Decision 0141 (Proposed, untracked) places the `declare` grammar in Stage 47.
-   Stage 40 runs first and now implements it (ruling 25). Recorded here only;
-   0141 belongs to another session.
+8. The geometry layout decision draft (unaccepted, written by the Stage 47
+   session) leaves passing math values in vector registers across FFI to
+   Stage 44; the C ABI fixes those registers for a by-value C-layout
+   aggregate. Recorded here only; that draft belongs to another session.
+9. The geometry-math decision draft (unaccepted, written by the Stage 47
+   session) places the `declare` grammar in Stage 47. Stage 40 runs first and
+   now implements it (ruling 25). Recorded here only; that draft belongs to
+   another session.
 
 ## Decision
 
@@ -324,7 +325,8 @@ extern "C" union EventStorage
 - Foreign aggregates are externally accessible types under Decision 0117: one
   per file unless `internal`, with generated roots as the bundled form.
 - `Doria\Std\Math` values become FFI-safe by value through the same
-  classification once Decisions 0141 and 0142 are accepted.
+  classification once the geometry-math and geometry layout decisions are
+  accepted.
 
 Consequence: plan D3 gains one exception, foreign C layouts declared with
 `extern "C"`. Classes stay heap move types with private payloads.
@@ -864,7 +866,8 @@ has one precise contract.
   streams. Whether the host flushes buffered Doria output at each region entry,
   so ordering matches native, is not decided.
 - **`Sendable` and `Shareable` for pointers and handles** belong to Stage 39.
-- **Math values by value** wait for Decisions 0141 and 0142.
+- **Math values by value** wait for the geometry-math and geometry layout
+  decisions.
 - **Bit fields and packing** wait for a consumer.
 - **Plan D18's "until v1.0"** wording still differs from AGENTS.md.
 
@@ -1041,7 +1044,8 @@ foreign call in hooks (26); no documentation enforcement, a required
   (companion and link facts), run-time file deployment, and `baton audit unsafe`.
 - **Benchmarks (`dorialang/benchmarks`).** Call-overhead, zero-copy and
   companion region-entry cases.
-- **Draft records owned by another session, not edited.** Decision 0141 places
-  the `declare` grammar in Stage 47; Stage 40 now implements it (section 25).
-  Decision 0142 leaves FFI vector-register passing to Stage 44; section 6's
-  shared C classification fixes it for by-value math values.
+- **Draft records owned by another session, not edited.** The geometry-math
+  decision draft places the `declare` grammar in Stage 47; Stage 40 now
+  implements it (section 25). The geometry layout decision draft leaves FFI
+  vector-register passing to Stage 44; section 6's shared C classification
+  fixes it for by-value math values.
