@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16. Nothing here is implemented; delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended section 6 the same day (Amendment: Initializing Unions And Fixed-Length Arrays). Nothing here is implemented; delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -48,6 +48,14 @@ These rulings amend plan D3 for foreign layouts, replace the plan's
 Appendix A's deferral into Stage 40, and give the interpreter and PHP output
 native execution of unsafe code. The amendments are listed under Invalidated
 Elsewhere.
+
+### Amendment: Initializing Unions And Fixed-Length Arrays (2026-11-16)
+
+Section 6 required every struct field without a default to be supplied at
+construction, and did not say how a union is built or what value supplies a
+fixed-length array field. Stage 40 implementation raised the question, and
+Andrew ruled on 2026-11-16: "Zeroed or one member; arrays zeroed or copied
+(Recommended)". Section 6 states the rule.
 
 ## Context
 
@@ -311,6 +319,14 @@ extern "C" union EventStorage
 - A fixed-length array field spells its element type and count
   (`uint16[128] $tip`) and is accessed as an `ArrayRegion<T>` view borrowing the
   containing value; a writable containing place gives `WritableArrayRegion<T>`.
+- A fixed-length array field omitted at construction is zero-filled. A
+  supplied one is copied from an `ArrayRegion<T>` whose length must equal the
+  field's count: a length known at compile time that differs is a compile
+  error, and any other mismatch panics with a catalogued code (amendment of
+  2026-11-16).
+- A union is built either with `new EventStorage()`, every byte zero, or with
+  exactly one named member, `new EventStorage(key: $key)`, which writes that
+  member and leaves every other byte zero (amendment of 2026-11-16).
 - The compiler provides constants `Color::SIZE` and `Color::ALIGNMENT`.
 - A foreign aggregate has no methods, hooks, constructors, destructor,
   conformances or type parameters.
@@ -828,9 +844,11 @@ is part of the declaration's unchecked contract.
   declarations of one symbol; a logical library with no link input; a missing
   Safety section (warning); `declare(unsafe: "deny")` and package policy
   violations; an unused unsafe context (warning); a missing or mismatched
-  companion; and the runtime panics for misaligned access, address overflow,
-  interior NUL, out-of-range boundary conversion, and a callback on a foreign
-  thread.
+  companion; a union construction naming more than one member and a
+  fixed-length array field supplied with a region of a known different length;
+  and the runtime panics for misaligned access, address overflow, interior NUL,
+  out-of-range boundary conversion, a fixed-length array field supplied with a
+  region of a different length, and a callback on a foreign thread.
 
 ## Specified Without A Card
 

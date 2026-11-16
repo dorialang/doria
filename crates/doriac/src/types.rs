@@ -1102,6 +1102,9 @@ pub enum TypeKind {
     PriorityQueue(TypeId),
     Deque(TypeId),
     SharedHandle(SharedHandleKind, TypeId),
+    /// A `Doria\Std\Ffi` type, a foreign aggregate or a C function pointer
+    /// type (Decision 0148).
+    Foreign(crate::foreign::ForeignType<TypeId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1133,6 +1136,7 @@ pub enum ResolvedType {
     PriorityQueue(Box<ResolvedType>),
     Deque(Box<ResolvedType>),
     SharedHandle(SharedHandleKind, Box<ResolvedType>),
+    Foreign(Box<crate::foreign::ForeignType<ResolvedType>>),
     Unsupported,
 }
 
@@ -1172,6 +1176,10 @@ pub(crate) fn resolved_type_is_symbolic(ty: &ResolvedType) -> bool {
         | ResolvedType::PriorityQueue(inner)
         | ResolvedType::Deque(inner)
         | ResolvedType::SharedHandle(_, inner) => resolved_type_is_symbolic(inner),
+        ResolvedType::Foreign(foreign) => foreign
+            .components()
+            .into_iter()
+            .any(resolved_type_is_symbolic),
         ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
             resolved_type_is_symbolic(key) || resolved_type_is_symbolic(value)
         }
@@ -1337,6 +1345,11 @@ fn substitute_resolved_type_impl(
                 trait_receiver,
             )),
         ),
+        ResolvedType::Foreign(foreign) => {
+            ResolvedType::Foreign(Box::new(foreign.map(|component| {
+                substitute_resolved_type_impl(component, substitutions, trait_receiver)
+            })))
+        }
         ResolvedType::Enum(enum_type) => ResolvedType::Enum(enum_type.map_arguments(|argument| {
             substitute_resolved_type_impl(argument, substitutions, trait_receiver)
         })),
@@ -1667,6 +1680,13 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::PriorityQueue(inner)
         | ResolvedType::Deque(inner)
         | ResolvedType::SharedHandle(_, inner) => 1 + resolved_type_complexity(inner),
+        ResolvedType::Foreign(foreign) => {
+            1 + foreign
+                .components()
+                .into_iter()
+                .map(resolved_type_complexity)
+                .sum::<usize>()
+        }
         ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
             1 + resolved_type_complexity(key) + resolved_type_complexity(value)
         }
@@ -1829,7 +1849,12 @@ impl TypeRegistry {
             TypeKind::SharedHandle(kind, payload) => {
                 format!("{}<{}>", kind.source_name(), self.display(*payload))
             }
+            TypeKind::Foreign(foreign) => self.display_foreign(foreign),
         }
+    }
+
+    fn display_foreign(&self, foreign: &crate::foreign::ForeignType<TypeId>) -> String {
+        foreign.display_with(|component| self.display(*component))
     }
 
     fn display_function(&self, function: &SemanticFunctionType<TypeId>) -> String {
@@ -1947,6 +1972,9 @@ impl TypeRegistry {
             TypeKind::SharedHandle(kind, payload) => {
                 ResolvedType::SharedHandle(*kind, Box::new(self.resolved(*payload)))
             }
+            TypeKind::Foreign(foreign) => {
+                ResolvedType::Foreign(Box::new(foreign.map(|component| self.resolved(*component))))
+            }
             TypeKind::Unknown | TypeKind::Heterogeneous | TypeKind::EmptyCollection => {
                 ResolvedType::Unsupported
             }
@@ -2051,6 +2079,9 @@ impl TypeRegistry {
             ResolvedType::SharedHandle(kind, payload) => {
                 let payload = self.intern_resolved(payload);
                 TypeKind::SharedHandle(*kind, payload)
+            }
+            ResolvedType::Foreign(foreign) => {
+                TypeKind::Foreign(foreign.map(|component| self.intern_resolved(component)))
             }
             ResolvedType::Unsupported => TypeKind::Unknown,
         };

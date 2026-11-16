@@ -11,6 +11,7 @@ mod enum_inference;
 #[cfg(test)]
 mod enum_specialization_tests;
 pub(crate) mod executable_effects;
+mod foreign_checks;
 mod instantiation;
 mod interface_witnesses;
 mod nominal_proof;
@@ -1368,6 +1369,7 @@ fn finish_checked_analysis(
     let program = checker.program;
     checker.check_behavioral_arrow_bodies();
     checker.check_attributes();
+    checker.check_foreign_declarations();
     checker
         .test_semantics
         .tests
@@ -2880,6 +2882,8 @@ struct Checker<'program> {
     function_signatures: HashMap<Span, FunctionInfo>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
+    /// Unsafe contexts and foreign declarations (Decision 0148).
+    foreign: foreign_checks::ForeignState,
     integer_expression_types: HashMap<Span, IntegerType>,
     float_expression_types: HashMap<Span, FloatType>,
     expression_types: HashMap<Span, ResolvedType>,
@@ -3323,6 +3327,18 @@ fn semantic_type_capabilities(
             needs_drop: false,
             equality: false,
         },
+        // Every foreign value is a Copy value with no cleanup. Pointers,
+        // boundary values and C function pointers compare with `==`;
+        // foreign aggregates do not (Decision 0148 sections 4, 5 and 6).
+        TypeKind::Foreign(foreign) => EnumCapabilities {
+            equality: !matches!(
+                foreign,
+                crate::foreign::ForeignType::Aggregate(_)
+                    | crate::foreign::ForeignType::FixedArray { .. }
+                    | crate::foreign::ForeignType::Opaque
+            ),
+            ..copy_trivial
+        },
         TypeKind::Void
         | TypeKind::Interface(_)
         | TypeKind::InterfaceSelf(_)
@@ -3405,8 +3421,36 @@ fn semantic_layout_shape(
                 }
             }
         }),
+        // Pointers and C function pointers are one word; C boundary values
+        // whose width is the same on every tier-1 target have it here, and the
+        // rest have a target layout (Decision 0148 section 5).
+        TypeKind::Foreign(foreign) => match foreign {
+            crate::foreign::ForeignType::Pointer { .. }
+            | crate::foreign::ForeignType::Function(_) => Some(scalar(POINTER)),
+            crate::foreign::ForeignType::Boundary(
+                crate::foreign::CBoundaryType::Size
+                | crate::foreign::CBoundaryType::PointerDifference,
+            ) => Some(scalar(POINTER)),
+            crate::foreign::ForeignType::Boundary(crate::foreign::CBoundaryType::Char) => {
+                Some(scalar(1))
+            }
+            crate::foreign::ForeignType::Boundary(_)
+            | crate::foreign::ForeignType::Aggregate(_)
+            | crate::foreign::ForeignType::FixedArray { .. }
+            | crate::foreign::ForeignType::Opaque => None,
+        },
         TypeKind::Nullable(inner) => {
             let inner_kind = types.kind(*inner);
+            if matches!(
+                inner_kind,
+                TypeKind::Foreign(
+                    crate::foreign::ForeignType::Pointer { .. }
+                        | crate::foreign::ForeignType::Function(_)
+                )
+            ) {
+                // Null is address zero (Decision 0148 section 3).
+                return Some(scalar(POINTER));
+            }
             if matches!(
                 inner_kind,
                 TypeKind::Function(_) | TypeKind::Error | TypeKind::Interface(_)
@@ -3588,6 +3632,11 @@ enum LifecycleMethod {
 enum TypePosition {
     Return,
     Value,
+    /// The type argument of `Ptr<T>` or `MutPtr<T>`, where `Opaque` and an
+    /// incomplete foreign struct are allowed.
+    Pointee,
+    /// A foreign struct or union field, where `T[N]` is allowed.
+    ForeignField,
 }
 
 impl LifecycleMethod {
@@ -3735,6 +3784,7 @@ impl<'program> Checker<'program> {
             function_signatures: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
+            foreign: foreign_checks::ForeignState::default(),
             integer_expression_types: HashMap::new(),
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
@@ -3877,6 +3927,7 @@ impl<'program> Checker<'program> {
     fn check_callable_bodies(&mut self) {
         self.finalize_enum_metadata();
         self.collect_functions();
+        self.collect_unsafe_callables();
         self.apply_ambient_effect_seed();
         self.check_instance_property_initializers();
         self.infer_return_borrow_signatures(false);
@@ -4517,7 +4568,8 @@ impl<'program> Checker<'program> {
                 visiting.remove(enum_type);
                 compatible
             }
-            TypeKind::Void
+            TypeKind::Foreign(_)
+            | TypeKind::Void
             | TypeKind::Bytes
             | TypeKind::ByteRegion(_)
             | TypeKind::Interface(_)
@@ -4561,9 +4613,37 @@ impl<'program> Checker<'program> {
             .iter()
             .find(|declaration| declaration.declaration_span == span)
             .map(|declaration| declaration.id.clone())
+            .or_else(|| self.compiler_known_declaration_id(span))
+    }
+
+    /// The identity of a declaration a compiler-known module adds: name
+    /// resolution records only authored declarations, and these carry the
+    /// module's canonical identity (`crate::names::standard_type_identity`).
+    fn compiler_known_declaration_id(&self, span: Span) -> Option<crate::names::GlobalSymbolId> {
+        if !span.source.is_compiler_owned() {
+            return None;
+        }
+        let name = self.program.items.iter().find_map(|item| match item {
+            Item::Class(declaration) if declaration.span == span => Some(&declaration.name),
+            Item::Enum(declaration) if declaration.span == span => Some(&declaration.name),
+            _ => None,
+        })?;
+        Some(crate::names::GlobalSymbolId {
+            owner: crate::names::GlobalSymbolOwner::CompilerKnown(
+                crate::names::standard_type_identity(name)?,
+            ),
+            qualified_name: name.clone(),
+        })
     }
 
     fn resolve_attribute_target(&self, syntax: &AttributeTargetSyntax) -> Option<AttributeTarget> {
+        if syntax.kind == AttributeTargetKind::ExternBlock {
+            let (source, _) = self.attribute_context(syntax.target_span);
+            return Some(AttributeTarget::ExternBlock {
+                source,
+                span: syntax.target_span,
+            });
+        }
         if matches!(
             syntax.kind,
             AttributeTargetKind::Class
@@ -4572,6 +4652,8 @@ impl<'program> Checker<'program> {
                 | AttributeTargetKind::Trait
                 | AttributeTargetKind::Function
                 | AttributeTargetKind::Constant
+                | AttributeTargetKind::ForeignFunction
+                | AttributeTargetKind::ForeignAggregate
         ) {
             return self
                 .global_id_for_declaration_span(syntax.target_span)
@@ -6906,7 +6988,11 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
-            if let Some(message) = Self::reserved_callable_name_message(source_name) {
+            // A foreign declaration reports its name under the link-name rule
+            // (Decision 0148 section 15).
+            if let Some(message) = Self::reserved_callable_name_message(source_name)
+                .filter(|_| !function.linkage.is_foreign())
+            {
                 self.diagnostics
                     .push(Diagnostic::new("E0310", message, function.span));
                 continue;
@@ -9860,7 +9946,7 @@ impl<'program> Checker<'program> {
     ) {
         self.active_loop_depth = loop_depth;
         match statement {
-            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+            Stmt::Block(block) => {
                 let mut nested_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
@@ -9872,6 +9958,21 @@ impl<'program> Checker<'program> {
                     return_context,
                     loop_depth,
                 );
+            }
+            Stmt::Unsafe(unsafe_block) => {
+                let mut nested_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::nested);
+                self.enter_unsafe_context(unsafe_block.keyword_span);
+                self.check_block(
+                    &unsafe_block.block,
+                    scopes,
+                    method_context,
+                    nested_constructor_init_context.as_mut(),
+                    return_context,
+                    loop_depth,
+                );
+                self.leave_unsafe_context();
             }
             Stmt::VarDecl(decl) => {
                 self.check_local_declaration(decl, scopes, method_context);
@@ -12586,7 +12687,8 @@ impl<'program> Checker<'program> {
             | TypeKind::Set(_)
             | TypeKind::SortedSet(_)
             | TypeKind::PriorityQueue(_)
-            | TypeKind::Deque(_) => false,
+            | TypeKind::Deque(_)
+            | TypeKind::Foreign(_) => false,
         }
     }
 
@@ -13477,8 +13579,15 @@ impl<'program> Checker<'program> {
                     }
                 }
             }
-            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+            Expr::Grouped { expr, .. } => {
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
+            }
+            Expr::Unsafe {
+                keyword_span, expr, ..
+            } => {
+                self.enter_unsafe_context(*keyword_span);
+                self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr);
+                self.leave_unsafe_context();
             }
             Expr::Unary { op, expr, span } => {
                 if *op == UnaryOp::Negate {
@@ -13699,8 +13808,31 @@ impl<'program> Checker<'program> {
     ) -> TypeId {
         let function = match self.types.kind(callee_ty).clone() {
             TypeKind::Function(function) => function,
+            // A C function pointer is called by copying each argument, so
+            // its parameters are readonly and it has no checked effects.
+            TypeKind::Foreign(crate::foreign::ForeignType::Function(function)) => {
+                self.require_unsafe(span, "calling a C function pointer");
+                SemanticFunctionType {
+                    invocation_mode: FunctionInvocationMode::Readonly,
+                    parameters: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| SemanticFunctionParameter {
+                            ownership_mode: FunctionTypeParameterMode::Readonly,
+                            ty: *parameter,
+                        })
+                        .collect(),
+                    return_type: function.return_type,
+                    checked_effects: Vec::new(),
+                    return_borrow: None,
+                }
+            }
             TypeKind::Nullable(inner)
-                if matches!(self.types.kind(inner), TypeKind::Function(_)) =>
+                if matches!(
+                    self.types.kind(inner),
+                    TypeKind::Function(_)
+                        | TypeKind::Foreign(crate::foreign::ForeignType::Function(_))
+                ) =>
             {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -14184,6 +14316,7 @@ impl<'program> Checker<'program> {
             })
             .collect::<Vec<_>>();
 
+        self.enter_closure_barrier();
         self.active_closures.push(ActiveClosure {
             id: closure_id,
             captures,
@@ -14319,6 +14452,7 @@ impl<'program> Checker<'program> {
         self.closure_reach_effects
             .insert(closure_id, inferred_effects.reach.clone());
         let mut active = self.active_closures.pop().expect("active closure");
+        self.leave_closure_barrier();
 
         let invocation_mode = active
             .captures
@@ -18527,6 +18661,11 @@ impl<'program> Checker<'program> {
                 name: name.to_string(),
             },
         );
+        self.require_unsafe_callable(
+            span,
+            function_info.declaration,
+            name.rsplit('\\').next().unwrap_or(name),
+        );
         self.record_callable_dependency(function_info.declaration);
         let function_info = self.instantiate_generic_call(
             &format!("function `{name}`"),
@@ -20401,6 +20540,9 @@ impl<'program> Checker<'program> {
     }
 
     fn record_method_call_target(&mut self, span: Span, method: &MethodInfo, direct_parent: bool) {
+        if self.is_unsafe_callable(method.declaration) {
+            self.require_unsafe(span, "calling an unsafe method");
+        }
         self.method_call_targets.insert(
             span,
             MethodCallSemanticInfo {
@@ -21756,6 +21898,9 @@ impl<'program> Checker<'program> {
             inner.nullable |= ty.nullable;
             return self.resolve_type_ref_in_position(&inner, span, position, declaring_class);
         }
+        if let Some(foreign) = self.resolve_foreign_type_ref(ty, span, position, declaring_class) {
+            return foreign;
+        }
         if let Some(function) = &ty.function {
             let function = self.resolve_function_type_ref(function, declaring_class);
             return if ty.nullable {
@@ -21816,7 +21961,8 @@ impl<'program> Checker<'program> {
                 | TypeKind::Set(_)
                 | TypeKind::SortedSet(_)
                 | TypeKind::PriorityQueue(_)
-                | TypeKind::Deque(_) => self.types.intern(TypeKind::Nullable(inner)),
+                | TypeKind::Deque(_)
+                | TypeKind::Foreign(_) => self.types.intern(TypeKind::Nullable(inner)),
                 TypeKind::Void
                 | TypeKind::Null
                 | TypeKind::Nullable(_)

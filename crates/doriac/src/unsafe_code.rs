@@ -1,8 +1,14 @@
-//! Unsafe code and the foreign function interface (Decision 0148).
+//! Unsafe code and the foreign function interface (Decision 0148): the forms
+//! this compiler accepts before it can check or run all of them.
 //!
-//! The parser accepts every form Decision 0148 specifies. Until checking and
-//! execution land, [`unavailable_forms`] names each form in a program with
-//! E0784, so a valid program reads as not yet supported, never as invalid.
+//! The parser accepts every form Decision 0148 specifies. Two gates name with
+//! E0784 what is not implemented yet, so a valid program reads as not yet
+//! supported, never as invalid:
+//!
+//! - [`unchecked_forms`] runs at name resolution, for forms checking does not
+//!   cover yet.
+//! - [`unexecutable_forms`] runs before lowering, for checked forms no
+//!   execution target runs yet.
 
 use std::collections::HashSet;
 
@@ -12,16 +18,20 @@ use crate::diagnostics::Diagnostic;
 use crate::source::Span;
 use crate::types::TypeRef;
 
-pub const FFI_NAMESPACE: &str = "Doria\\Std\\Ffi";
-
 /// The diagnostic for an accepted Decision 0148 form this compiler does not
 /// implement yet.
 pub const NOT_AVAILABLE_CODE: &str = "E0784";
 
-/// One E0784 diagnostic per unsafe or foreign form in `program`, in source
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Checking,
+    Execution,
+}
+
+/// One E0784 diagnostic per form checking does not cover yet, in source
 /// order. Empty for a program without them.
-pub fn unavailable_forms(program: &Program) -> Vec<Diagnostic> {
-    let mut finder = Finder::default();
+pub fn unchecked_forms(program: &Program) -> Vec<Diagnostic> {
+    let mut finder = Finder::new(Gate::Checking);
     for directive in &program.directives {
         finder.report(
             directive.span,
@@ -33,56 +43,85 @@ pub fn unavailable_forms(program: &Program) -> Vec<Diagnostic> {
         );
     }
     for import in &program.imports {
-        let names_ffi = import
-            .prefix
-            .iter()
-            .map(|prefix| prefix.canonical())
-            .chain(import.entries.iter().map(|entry| entry.target.canonical()))
-            .any(|name| name == FFI_NAMESPACE || name.starts_with("Doria\\Std\\Ffi\\"));
-        if names_ffi {
-            finder.report(
-                import.span,
-                "The Doria\\Std\\Ffi Module Is Not Available Yet",
-                "`Doria\\Std\\Ffi` is part of Doria; this compiler does not implement it yet",
-            );
+        for entry in &import.entries {
+            let target = match &import.prefix {
+                Some(prefix) => format!("{}\\{}", prefix.canonical(), entry.target.canonical()),
+                None => entry.target.canonical(),
+            };
+            finder.pending_name(&target, entry.span);
         }
+    }
+    for name in &program.qualified_names {
+        finder.pending_name(&name.canonical(), name.span);
     }
     for item in &program.items {
         finder.item(item);
     }
-    for name in &program.qualified_names {
-        let canonical = name.canonical();
-        if matches!(canonical.as_str(), "ArrayRegion" | "WritableArrayRegion") {
-            finder.report(
-                name.span,
-                "Typed Array Regions Are Not Available Yet",
-                format!("`{canonical}` is part of Doria; this compiler does not implement it yet"),
-            );
-        }
-    }
-    let mut diagnostics = finder.diagnostics;
-    diagnostics.sort_by_key(|diagnostic| (diagnostic.span.source.0, diagnostic.span.start));
-    diagnostics
+    finder.finish()
 }
 
-#[derive(Default)]
+/// One E0784 diagnostic per checked form that no execution target runs yet.
+pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
+    let mut finder = Finder::new(Gate::Execution);
+    for item in &program.items {
+        finder.item(item);
+    }
+    finder.finish()
+}
+
 struct Finder {
+    gate: Gate,
     seen: HashSet<Span>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl Finder {
+    fn new(gate: Gate) -> Self {
+        Self {
+            gate,
+            seen: HashSet::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn finish(mut self) -> Vec<Diagnostic> {
+        self.diagnostics
+            .sort_by_key(|diagnostic| (diagnostic.span.source.0, diagnostic.span.start));
+        self.diagnostics
+    }
+
     fn report(&mut self, span: Span, title: &str, message: impl Into<String>) {
-        if !self.seen.insert(span) {
+        if span.source.is_compiler_owned() || !self.seen.insert(span) {
             return;
         }
+        let explanation = match self.gate {
+            Gate::Checking => {
+                "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program is not rejected; this compiler cannot check this form yet."
+            }
+            Gate::Execution => {
+                "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks; this compiler cannot build or run this form yet."
+            }
+        };
         self.diagnostics.push(
             Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
                 .with_title(title)
-                .with_explanation(
-                    "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program is not rejected; this compiler cannot check or run these forms yet.",
-                ),
+                .with_explanation(explanation),
         );
+    }
+
+    /// `Doria\Std\Ffi` members whose surface lands later, and typed array
+    /// regions.
+    fn pending_name(&mut self, canonical: &str, span: Span) {
+        let pending = crate::compiler_known_ffi::PENDING_TYPES.contains(&canonical)
+            || matches!(canonical, "ArrayRegion" | "WritableArrayRegion");
+        if pending {
+            let short = canonical.rsplit('\\').next().unwrap_or(canonical);
+            self.report(
+                span,
+                &format!("{short} Is Not Available Yet"),
+                format!("`{short}` is part of Doria; this compiler does not implement it yet"),
+            );
+        }
     }
 
     fn item(&mut self, item: &Item) {
@@ -100,7 +139,7 @@ impl Finder {
             Item::Enum(declaration) => {
                 for case in &declaration.cases {
                     for field in &case.payload {
-                        self.type_refs(field.ty.clone(), field.span);
+                        self.type_refs(&mut field.ty.clone(), field.span);
                     }
                     if let Some(value) = &case.backing_value {
                         self.expression(value);
@@ -110,15 +149,19 @@ impl Finder {
             Item::Function(function) => self.function(function),
             Item::Constant(constant) => {
                 if let Some(ty) = &constant.ty {
-                    self.type_refs(ty.clone(), constant.span);
+                    self.type_refs(&mut ty.clone(), constant.span);
                 }
                 self.expression(&constant.initializer);
             }
-            Item::ExternBlock(block) => self.report(
-                block.span,
-                "Extern Blocks Are Not Available Yet",
-                "`extern \"C\" { ... }` is part of Doria; this compiler does not implement foreign declarations yet",
-            ),
+            Item::ExternBlock(block) => {
+                if self.gate == Gate::Execution {
+                    self.report(
+                        block.span,
+                        "Extern Blocks Cannot Be Built Yet",
+                        "`extern \"C\" { ... }` is part of Doria; this compiler does not build foreign calls yet",
+                    );
+                }
+            }
             Item::ForeignAggregate(aggregate) => self.report(
                 aggregate.span,
                 match aggregate.kind {
@@ -141,7 +184,7 @@ impl Finder {
                 ClassMember::Property(property) => self.property(property),
                 ClassMember::Constant(constant) => {
                     if let Some(ty) = &constant.ty {
-                        self.type_refs(ty.clone(), constant.span);
+                        self.type_refs(&mut ty.clone(), constant.span);
                     }
                     self.expression(&constant.initializer);
                 }
@@ -151,13 +194,13 @@ impl Finder {
     }
 
     fn property(&mut self, property: &PropertyDecl) {
-        self.type_refs(property.ty.clone(), property.span);
+        self.type_refs(&mut property.ty.clone(), property.span);
         if let Some(initializer) = &property.initializer {
             self.expression(initializer);
         }
         for hook in &property.hooks {
             if let Some(parameter) = &hook.parameter {
-                self.type_refs(parameter.ty.clone(), parameter.span);
+                self.type_refs(&mut parameter.ty.clone(), parameter.span);
             }
             if let Some(body) = hook.body.as_block() {
                 self.block(body);
@@ -166,39 +209,27 @@ impl Finder {
     }
 
     fn function(&mut self, function: &FunctionDecl) {
-        match &function.linkage {
-            FunctionLinkage::CAbi { .. } => self.report(
-                function.span,
-                "C-ABI Functions Are Not Available Yet",
-                format!(
-                    "`extern \"C\" function {}` is part of Doria; this compiler does not implement C-ABI functions yet",
-                    function.name
+        if self.gate == Gate::Execution {
+            match &function.linkage {
+                FunctionLinkage::CAbi { .. } => self.report(
+                    function.span,
+                    "C-ABI Functions Cannot Be Built Yet",
+                    format!(
+                        "`extern \"C\" function {}` is part of Doria; this compiler does not build C-ABI functions yet",
+                        function.name.rsplit('\\').next().unwrap_or(&function.name)
+                    ),
                 ),
-            ),
-            FunctionLinkage::Foreign { .. } | FunctionLinkage::Doria => {}
-        }
-        if let Some(span) = function.unsafe_span {
-            self.report(
-                span.merge(function.name_span),
-                "Unsafe Functions Are Not Available Yet",
-                format!(
-                    "`unsafe function {}` is part of Doria; this compiler does not implement unsafe functions yet",
-                    function.name
-                ),
-            );
+                FunctionLinkage::Foreign { .. } => return,
+                FunctionLinkage::Doria => {}
+            }
         }
         let mut signature = function.clone();
         signature.body = FunctionBody::Requirement {
             semicolon_span: function.span,
         };
-        self.type_refs_in(&mut signature);
+        self.type_refs(&mut signature, function.span);
         if let Some(body) = function.body.as_block() {
             self.block(body);
-        }
-        for parameter in &function.params {
-            if let Some(default) = &parameter.default {
-                self.expression(default);
-            }
         }
     }
 
@@ -209,77 +240,12 @@ impl Finder {
     }
 
     fn statement(&mut self, statement: &Stmt) {
-        if let Stmt::Unsafe(unsafe_block) = statement {
-            self.report(
-                unsafe_block.keyword_span,
-                "Unsafe Blocks Are Not Available Yet",
-                "`unsafe { ... }` is part of Doria; this compiler does not implement unsafe contexts yet",
-            );
-        }
-        let mut types = statement.clone();
-        self.type_refs_in(&mut types);
+        let span = crate::return_analysis::statement_span(statement);
+        self.type_refs(&mut statement.clone(), span);
         let mut nested = Vec::new();
-        crate::ast::visit::stmt(statement, &mut |expression| {
-            nested.push(expression.clone());
-        });
+        crate::ast::visit::stmt(statement, &mut |expression| nested.push(expression.clone()));
         for expression in &nested {
             self.expression_node(expression);
-        }
-        match statement {
-            Stmt::Block(block) | Stmt::Unsafe(UnsafeBlock { block, .. }) => self.block(block),
-            Stmt::Try(statement) => {
-                self.block(&statement.body);
-                for catch in &statement.catches {
-                    self.block(&catch.body);
-                }
-                if let Some(finalizer) = &statement.finally {
-                    self.block(&finalizer.body);
-                }
-            }
-            Stmt::If(statement) => self.conditional(statement),
-            Stmt::While(statement) => {
-                self.given(&statement.given);
-                self.block(&statement.body);
-                self.finally(&statement.finally);
-            }
-            Stmt::DoWhile(statement) => {
-                self.block(&statement.body);
-                self.finally(&statement.finally);
-            }
-            Stmt::For(statement) => self.block(&statement.body),
-            Stmt::Foreach(statement) => self.block(&statement.body),
-            Stmt::VarDecl(_)
-            | Stmt::Assignment(_)
-            | Stmt::Echo { .. }
-            | Stmt::Return { .. }
-            | Stmt::Throw(_)
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. }
-            | Stmt::Increment(_)
-            | Stmt::Expr { .. } => {}
-        }
-    }
-
-    fn conditional(&mut self, statement: &IfStmt) {
-        self.given(&statement.given);
-        self.block(&statement.then_block);
-        match &statement.else_branch {
-            Some(ElseBranch::If(nested)) => self.conditional(nested),
-            Some(ElseBranch::Block(block)) => self.block(block),
-            None => {}
-        }
-        self.finally(&statement.finally);
-    }
-
-    fn given(&mut self, prelude: &Option<GivenPrelude>) {
-        if let Some(prelude) = prelude {
-            self.block(&prelude.block);
-        }
-    }
-
-    fn finally(&mut self, finalizer: &Option<ControlFlowFinally>) {
-        if let Some(finalizer) = finalizer {
-            self.block(&finalizer.block);
         }
     }
 
@@ -292,20 +258,17 @@ impl Finder {
     }
 
     /// One expression, without its children: the visitors above reach those.
-    /// Statements inside closure and `when` bodies are walked here.
     fn expression_node(&mut self, expression: &Expr) {
         match expression {
-            Expr::Unsafe { keyword_span, .. } => self.report(
-                *keyword_span,
-                "Unsafe Expressions Are Not Available Yet",
-                "`unsafe(<expression>)` is part of Doria; this compiler does not implement unsafe contexts yet",
-            ),
             Expr::StaticCall {
                 qualifier: StaticQualifier::Class(class),
                 method,
                 member_span,
                 ..
-            } if class == "String" && matches!(method.as_str(), "fromCString" | "fromUtf16") => {
+            } if self.gate == Gate::Checking
+                && class == "String"
+                && matches!(method.as_str(), "fromCString" | "fromUtf16") =>
+            {
                 self.report(
                     *member_span,
                     "Foreign String Conversions Are Not Available Yet",
@@ -316,92 +279,24 @@ impl Finder {
             }
             Expr::Closure(closure) => {
                 if let ClosureBody::Block(body) = &closure.body {
-                    for statement in &body.statements {
-                        if let Stmt::Unsafe(unsafe_block) = statement {
-                            self.statement(&Stmt::Unsafe(unsafe_block.clone()));
-                        } else {
-                            self.statement_blocks(statement);
-                        }
-                    }
-                }
-            }
-            Expr::When(when) => {
-                for branch in &when.branches {
-                    for statement in &branch.block.statements {
-                        self.statement_blocks(statement);
-                    }
-                }
-            }
-            _ => {}
-        }
-        if let Expr::New { class_type, .. } | Expr::IsType { ty: class_type, .. } = expression {
-            self.type_refs(class_type.clone(), expression.span());
-        }
-    }
-
-    /// Unsafe blocks among a statement's nested blocks.
-    fn statement_blocks(&mut self, statement: &Stmt) {
-        if let Stmt::Unsafe(unsafe_block) = statement {
-            self.report(
-                unsafe_block.keyword_span,
-                "Unsafe Blocks Are Not Available Yet",
-                "`unsafe { ... }` is part of Doria; this compiler does not implement unsafe contexts yet",
-            );
-        }
-        match statement {
-            Stmt::Block(block) | Stmt::Unsafe(UnsafeBlock { block, .. }) => {
-                for nested in &block.statements {
-                    self.statement_blocks(nested);
-                }
-            }
-            Stmt::If(statement) => self.conditional_blocks(statement),
-            Stmt::While(statement) => self.blocks_in(&statement.body),
-            Stmt::DoWhile(statement) => self.blocks_in(&statement.body),
-            Stmt::For(statement) => self.blocks_in(&statement.body),
-            Stmt::Foreach(statement) => self.blocks_in(&statement.body),
-            Stmt::Try(statement) => {
-                self.blocks_in(&statement.body);
-                for catch in &statement.catches {
-                    self.blocks_in(&catch.body);
+                    self.block(body);
                 }
             }
             _ => {}
         }
     }
 
-    fn conditional_blocks(&mut self, statement: &IfStmt) {
-        self.blocks_in(&statement.then_block);
-        match &statement.else_branch {
-            Some(ElseBranch::If(nested)) => self.conditional_blocks(nested),
-            Some(ElseBranch::Block(block)) => self.blocks_in(block),
-            None => {}
+    fn type_refs(&mut self, node: &mut impl Transformable, span: Span) {
+        if self.gate != Gate::Execution {
+            return;
         }
-    }
-
-    fn blocks_in(&mut self, block: &Block) {
-        for statement in &block.statements {
-            self.statement_blocks(statement);
-        }
-    }
-
-    fn type_refs(&mut self, mut ty: TypeRef, span: Span) {
-        let mut types = TypeFinder::default();
-        ty.transform(&mut types);
-        self.report_types(types, span);
-    }
-
-    fn type_refs_in(&mut self, node: &mut impl Transformable) {
         let mut types = TypeFinder::default();
         node.transform(&mut types);
-        self.report_types(types, Span::default());
-    }
-
-    fn report_types(&mut self, types: TypeFinder, _fallback: Span) {
-        for span in types.c_function_types {
+        if types.foreign {
             self.report(
                 span,
-                "C Function Pointer Types Are Not Available Yet",
-                "`extern \"C\" function(...)` types are part of Doria; this compiler does not implement them yet",
+                "Foreign Types Cannot Be Built Yet",
+                "pointers, C boundary types and C function pointer types are part of Doria; this compiler does not build code that uses them yet",
             );
         }
     }
@@ -409,15 +304,19 @@ impl Finder {
 
 #[derive(Default)]
 struct TypeFinder {
-    c_function_types: Vec<Span>,
+    foreign: bool,
 }
 
 impl Transform for TypeFinder {
     fn type_ref(&mut self, ty: &mut TypeRef) {
-        if let Some(function) = &ty.function {
-            if function.c_abi.is_some() {
-                self.c_function_types.push(function.span);
-            }
+        if ty
+            .function
+            .as_ref()
+            .is_some_and(|function| function.c_abi.is_some())
+            || ty.fixed_array_parts().is_some()
+            || crate::foreign::is_type_name(&ty.name)
+        {
+            self.foreign = true;
         }
         ty.walk(self);
     }

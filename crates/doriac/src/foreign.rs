@@ -1,0 +1,212 @@
+//! The types that cross the C boundary (Decision 0148 sections 3, 5, 6 and 12).
+//!
+//! One [`ForeignType`] carries every compiler-known foreign type, so the type
+//! model gains one variant (`TypeKind::Foreign`, `ResolvedType::Foreign`) and
+//! each kind stays distinct through its discriminator, as `SharedHandle` does
+//! for the shared-ownership family.
+
+use crate::ast::ForeignAggregateKind;
+
+pub const NAMESPACE: &str = "Doria\\Std\\Ffi";
+pub const PTR: &str = "Doria\\Std\\Ffi\\Ptr";
+pub const MUT_PTR: &str = "Doria\\Std\\Ffi\\MutPtr";
+pub const OPAQUE: &str = "Doria\\Std\\Ffi\\Opaque";
+
+/// Read access (`Ptr<T>`) or read and write access (`MutPtr<T>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PointerAccess {
+    Read,
+    Write,
+}
+
+impl PointerAccess {
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Read => PTR,
+            Self::Write => MUT_PTR,
+        }
+    }
+
+    pub const fn short_name(self) -> &'static str {
+        match self {
+            Self::Read => "Ptr",
+            Self::Write => "MutPtr",
+        }
+    }
+
+    pub fn from_source_name(name: &str) -> Option<Self> {
+        match name {
+            PTR => Some(Self::Read),
+            MUT_PTR => Some(Self::Write),
+            _ => None,
+        }
+    }
+}
+
+/// The C types whose width or signedness differs across tier-1 targets
+/// (section 5). Each is an inline Copy value with the target's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CBoundaryType {
+    Char,
+    Long,
+    UnsignedLong,
+    Size,
+    PointerDifference,
+    WideChar,
+}
+
+impl CBoundaryType {
+    pub const ALL: [Self; 6] = [
+        Self::Char,
+        Self::Long,
+        Self::UnsignedLong,
+        Self::Size,
+        Self::PointerDifference,
+        Self::WideChar,
+    ];
+
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Char => "Doria\\Std\\Ffi\\CChar",
+            Self::Long => "Doria\\Std\\Ffi\\CLong",
+            Self::UnsignedLong => "Doria\\Std\\Ffi\\CUnsignedLong",
+            Self::Size => "Doria\\Std\\Ffi\\CSize",
+            Self::PointerDifference => "Doria\\Std\\Ffi\\CPointerDifference",
+            Self::WideChar => "Doria\\Std\\Ffi\\CWideChar",
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        self.source_name()
+            .rsplit('\\')
+            .next()
+            .expect("a canonical name has a last segment")
+    }
+
+    pub fn from_source_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|boundary| boundary.source_name() == name)
+    }
+
+    /// The C spelling, for messages that name the type a binding stands for.
+    pub const fn c_spelling(self) -> &'static str {
+        match self {
+            Self::Char => "char",
+            Self::Long => "long",
+            Self::UnsignedLong => "unsigned long",
+            Self::Size => "size_t",
+            Self::PointerDifference => "ptrdiff_t",
+            Self::WideChar => "wchar_t",
+        }
+    }
+}
+
+/// A C function pointer type, `extern "C" function(T...): R` (section 12).
+/// It has no invocation mode, ownership modes or checked effects.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CFunctionType<T> {
+    pub parameters: Vec<T>,
+    pub return_type: T,
+}
+
+/// A foreign struct or union declared with `extern "C"`: a nominal inline Copy
+/// value with the target C layout (section 6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ForeignAggregateType {
+    pub name: String,
+    pub kind: ForeignAggregateKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ForeignType<T> {
+    /// `Ptr<T>` or `MutPtr<T>`: one machine word, never null. `?Ptr<T>` is the
+    /// nullable C pointer.
+    Pointer {
+        access: PointerAccess,
+        pointee: T,
+    },
+    /// The pointee-only type behind `Ptr<Opaque>`: no values and no size.
+    Opaque,
+    Boundary(CBoundaryType),
+    Function(CFunctionType<T>),
+    Aggregate(ForeignAggregateType),
+    /// `T[N]`, written only as a foreign struct or union field.
+    FixedArray {
+        element: T,
+        length: u64,
+    },
+}
+
+impl<T> ForeignType<T> {
+    pub fn map<U>(&self, mut map: impl FnMut(&T) -> U) -> ForeignType<U> {
+        match self {
+            Self::Pointer { access, pointee } => ForeignType::Pointer {
+                access: *access,
+                pointee: map(pointee),
+            },
+            Self::Opaque => ForeignType::Opaque,
+            Self::Boundary(boundary) => ForeignType::Boundary(*boundary),
+            Self::Function(function) => ForeignType::Function(CFunctionType {
+                parameters: function.parameters.iter().map(&mut map).collect(),
+                return_type: map(&function.return_type),
+            }),
+            Self::Aggregate(aggregate) => ForeignType::Aggregate(aggregate.clone()),
+            Self::FixedArray { element, length } => ForeignType::FixedArray {
+                element: map(element),
+                length: *length,
+            },
+        }
+    }
+
+    /// The Doria spelling, with `show` spelling each component type.
+    pub fn display_with(&self, show: impl Fn(&T) -> String) -> String {
+        match self {
+            Self::Pointer { access, pointee } => {
+                format!("{}<{}>", access.short_name(), show(pointee))
+            }
+            Self::Opaque => "Opaque".to_string(),
+            Self::Boundary(boundary) => boundary.short_name().to_string(),
+            Self::Function(function) => format!(
+                "extern \"C\" function({}): {}",
+                function
+                    .parameters
+                    .iter()
+                    .map(&show)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                show(&function.return_type)
+            ),
+            Self::Aggregate(aggregate) => aggregate.name.clone(),
+            Self::FixedArray { element, length } => format!("{}[{length}]", show(element)),
+        }
+    }
+
+    /// Every type this one is built from, in source order.
+    pub fn components(&self) -> Vec<&T> {
+        match self {
+            Self::Pointer { pointee, .. } => vec![pointee],
+            Self::Function(function) => function
+                .parameters
+                .iter()
+                .chain(std::iter::once(&function.return_type))
+                .collect(),
+            Self::FixedArray { element, .. } => vec![element],
+            Self::Opaque | Self::Boundary(_) | Self::Aggregate(_) => Vec::new(),
+        }
+    }
+}
+
+/// Every compiler-known type name of `Doria\Std\Ffi` that the type model
+/// carries itself, rather than a declaration in the module source.
+pub fn type_names() -> impl Iterator<Item = &'static str> {
+    [PTR, MUT_PTR, OPAQUE].into_iter().chain(
+        CBoundaryType::ALL
+            .into_iter()
+            .map(CBoundaryType::source_name),
+    )
+}
+
+pub fn is_type_name(name: &str) -> bool {
+    type_names().any(|candidate| candidate == name)
+}

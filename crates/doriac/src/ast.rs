@@ -181,7 +181,7 @@ pub struct ExternBlock {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ForeignAggregateKind {
     Struct,
     Union,

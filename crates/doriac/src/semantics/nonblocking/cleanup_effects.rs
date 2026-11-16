@@ -414,7 +414,8 @@ impl Checker<'_> {
             ResolvedType::Mixed | ResolvedType::Error | ResolvedType::Unsupported => {
                 effects.unknown = true
             }
-            ResolvedType::Void
+            ResolvedType::Foreign(_)
+            | ResolvedType::Void
             | ResolvedType::Integer(_)
             | ResolvedType::Float(_)
             | ResolvedType::String

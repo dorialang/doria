@@ -890,6 +890,10 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             crate::compiler_known_text::SOURCE_ID,
             crate::compiler_known_text::SOURCE_TEXT,
         )))
+        .chain(std::iter::once((
+            crate::compiler_known_ffi::SOURCE_ID,
+            crate::compiler_known_ffi::SOURCE_TEXT,
+        )))
         .collect::<HashMap<_, _>>();
     let compiler_known_context = selected_context(graph);
     contexts.insert(
@@ -938,6 +942,14 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_term::SOURCE_NAME.to_string()),
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_ffi::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_ffi::SOURCE_NAME.to_string()),
         },
     );
     contexts.insert(

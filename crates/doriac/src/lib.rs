@@ -32,6 +32,7 @@ pub mod collection_diagnostics;
 pub mod compilation_graph;
 pub mod compiler_known_concurrency;
 pub mod compiler_known_contracts;
+pub mod compiler_known_ffi;
 pub mod compiler_known_io;
 pub mod compiler_known_stream;
 pub mod compiler_known_term;
@@ -45,6 +46,7 @@ pub mod dataflow;
 pub mod diagnostic_entries;
 pub mod diagnostics;
 pub mod enums;
+pub mod foreign;
 pub mod format_string;
 pub mod hir;
 pub mod incremental;
@@ -351,6 +353,7 @@ pub(crate) fn complete_standalone_hir(
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
     compiler_known_text::append_hir_source(&mut hir);
+    compiler_known_ffi::append_hir_source(&mut hir);
     hir.source_path = source.path;
     hir.source_text = source.text;
     hir
@@ -555,6 +558,7 @@ pub fn lower_compilation_graph(
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
     compiler_known_text::append_hir_source(&mut hir);
+    compiler_known_ffi::append_hir_source(&mut hir);
     Ok(hir)
 }
 
@@ -760,6 +764,18 @@ fn append_compiler_known_semantic_context(
         compiler_known_text::SOURCE_ID,
         compiler_known_text::SOURCE_TEXT,
     );
+    source_texts.insert(
+        compiler_known_ffi::SOURCE_ID,
+        compiler_known_ffi::SOURCE_TEXT,
+    );
+    contexts.insert(
+        compiler_known_ffi::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_ffi::SOURCE_NAME.to_string()),
+        },
+    );
     contexts.insert(
         compiler_known_text::SOURCE_ID,
         CompilationContext {
@@ -826,6 +842,9 @@ pub(crate) fn augment_compiler_known(
     }
     if compiler_known_term::resolved_facts_use_term(facts) {
         program = compiler_known_term::augment_program(&program);
+    }
+    if compiler_known_ffi::resolved_facts_use_ffi(facts) {
+        program = compiler_known_ffi::augment_program(&program);
     }
     if reads_graphemes {
         program = compiler_known_text::augment_program(&program);

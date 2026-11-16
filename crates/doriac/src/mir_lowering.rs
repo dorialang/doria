@@ -2689,6 +2689,9 @@ fn intern_resolved_collection_types(
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::ByteRegion(kind) => mir::Type::ByteRegion(*kind),
         ResolvedType::Mixed => mir::Type::Mixed,
+        // Foreign values have no MIR form until native foreign calls land;
+        // the execution gate in `crate::unsafe_code` stops such programs.
+        ResolvedType::Foreign(_) => return None,
         ResolvedType::Error => mir::Type::ERROR,
         ResolvedType::Function(function) => {
             if let Some(id) = collections.function_ids.get(function.as_ref()) {
@@ -10596,6 +10599,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
+            ResolvedType::Foreign(_) => None,
             ResolvedType::Error => Some(mir::Type::ERROR),
             ResolvedType::ByteRegion(kind) => Some(mir::Type::ByteRegion(*kind)),
             ResolvedType::Function(_) => {

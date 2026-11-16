@@ -8333,6 +8333,7 @@ fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bo
         | ResolvedType::String
         | ResolvedType::Bool
         | ResolvedType::Null
+        | ResolvedType::Foreign(_)
         | ResolvedType::Unsupported => false,
     }
 }
@@ -11542,6 +11543,7 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
             kind.source_name(),
             resolved_type_identity(payload)
         ),
+        ResolvedType::Foreign(foreign) => foreign.display_with(resolved_type_identity),
         ResolvedType::Unsupported => "unsupported".to_string(),
     }
 }
@@ -12050,9 +12052,10 @@ fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
         ResolvedType::String => "string".to_string(),
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
-        ResolvedType::Mixed | ResolvedType::Unsupported | ResolvedType::TypeParameter(_) => {
-            "mixed".to_string()
-        }
+        ResolvedType::Mixed
+        | ResolvedType::Unsupported
+        | ResolvedType::TypeParameter(_)
+        | ResolvedType::Foreign(_) => "mixed".to_string(),
         ResolvedType::Error => "__DoriaErrorValue".to_string(),
         ResolvedType::Function(_) => "__DoriaFunctionValue".to_string(),
         ResolvedType::Enum(ty) => scopes

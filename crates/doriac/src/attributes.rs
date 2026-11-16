@@ -54,6 +54,9 @@ pub enum AttributeTarget {
         field_name: String,
         span: Span,
     },
+    /// An `extern "C" { ... }` block (Decision 0148 section 18). It declares
+    /// no global symbol; its source and position identify it.
+    ExternBlock { source: SourceIdentity, span: Span },
 }
 
 impl AttributeTarget {
@@ -100,6 +103,9 @@ impl AttributeTarget {
                 "enum-payload:{}:{case_index}:{field_index}",
                 enumeration.qualified_name
             ),
+            Self::ExternBlock { source, span } => {
+                format!("extern-block:{}:{}", source.0, span.start)
+            }
         }
     }
 }
@@ -1023,6 +1029,7 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
         ResolvedType::SharedHandle(kind, inner) => {
             format!("{}<{}>", kind.source_name(), metadata_type_name(inner))
         }
+        ResolvedType::Foreign(foreign) => foreign.display_with(metadata_type_name),
         ResolvedType::Unsupported => "Unknown".to_string(),
     }
 }

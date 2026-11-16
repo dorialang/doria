@@ -115,6 +115,8 @@ pub enum CompilerSymbolIdentity {
     StandardConcurrency(String),
     StandardTerm(String),
     StandardTest(String),
+    /// A member of `Doria\Std\Ffi` (Decision 0148).
+    StandardFfi(String),
     Attribute(String),
 }
 
@@ -132,6 +134,8 @@ pub(crate) fn standard_type_identity(canonical: &str) -> Option<CompilerSymbolId
         Some(CompilerSymbolIdentity::StandardTime(canonical.to_string()))
     } else if crate::compiler_known_term::CANONICAL_TYPES.contains(&canonical) {
         Some(CompilerSymbolIdentity::StandardTerm(canonical.to_string()))
+    } else if crate::compiler_known_ffi::is_canonical_type(canonical) {
+        Some(CompilerSymbolIdentity::StandardFfi(canonical.to_string()))
     } else if crate::compiler_known_io::is_canonical_type(canonical) {
         Some(CompilerSymbolIdentity::StandardIo(canonical.to_string()))
     } else {
@@ -238,6 +242,7 @@ pub enum CompilerKnownProvenance {
     StandardConcurrency,
     StandardTerm,
     StandardTest,
+    StandardFfi,
     Attribute,
 }
 
@@ -734,7 +739,7 @@ impl<'a> Resolver<'a> {
                 // A program with unsafe or foreign forms stops here, before an
                 // unimplemented name such as `Doria\Std\Ffi\Ptr` reads as an
                 // unknown one.
-                let unavailable = crate::unsafe_code::unavailable_forms(self.authored);
+                let unavailable = crate::unsafe_code::unchecked_forms(self.authored);
                 if unavailable.is_empty() {
                     self.diagnostics
                 } else {
@@ -2128,6 +2133,19 @@ pub fn compiler_known_symbol_facts(edition: Edition) -> Vec<CompilerKnownSymbolF
             kind: GlobalSymbolKind::CompilerKnownType,
             source_name: canonical.to_string(),
             provenance: CompilerKnownProvenance::StandardTerm,
+        }),
+    );
+    facts.extend(
+        crate::compiler_known_ffi::canonical_types().map(|canonical| CompilerKnownSymbolFact {
+            id: GlobalSymbolId {
+                owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardFfi(
+                    canonical.to_string(),
+                )),
+                qualified_name: canonical.to_string(),
+            },
+            kind: GlobalSymbolKind::CompilerKnownType,
+            source_name: canonical.to_string(),
+            provenance: CompilerKnownProvenance::StandardFfi,
         }),
     );
     facts.extend(

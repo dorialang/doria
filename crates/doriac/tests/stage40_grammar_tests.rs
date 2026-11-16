@@ -315,17 +315,12 @@ fn every_stage40_form_reaches_checking_as_not_available_yet() {
         .iter()
         .map(|diagnostic| diagnostic.title.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    // The forms checking does not cover yet; the rest are checked in
+    // stage40_checking_tests.
     for expected in [
         "Declare Directives Are Not Available Yet",
-        "The Doria\\Std\\Ffi Module Is Not Available Yet",
-        "Extern Blocks Are Not Available Yet",
         "Foreign Structs Are Not Available Yet",
         "Foreign Unions Are Not Available Yet",
-        "C-ABI Functions Are Not Available Yet",
-        "C Function Pointer Types Are Not Available Yet",
-        "Unsafe Functions Are Not Available Yet",
-        "Unsafe Blocks Are Not Available Yet",
-        "Unsafe Expressions Are Not Available Yet",
     ] {
         assert!(titles.contains(expected), "missing {expected}: {titles:#?}");
     }

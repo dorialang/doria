@@ -28,6 +28,10 @@ pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
+    let unexecutable = crate::unsafe_code::unexecutable_forms(program);
+    if !unexecutable.is_empty() {
+        return Err(unexecutable);
+    }
     let declarations = crate::semantics::conditional_capabilities::check_declarations(program);
     if !declarations.diagnostics.is_empty() {
         return Err(declarations.diagnostics);
@@ -708,9 +712,9 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
     }
 }
 
-/// Foreign declarations have no executable form yet; checking stops every
-/// program that contains them (`crate::unsafe_code`), so reaching lowering
-/// with one is a compiler defect.
+/// Foreign declarations have no executable form yet; the execution gate at
+/// the start of lowering (`crate::unsafe_code`) stops every program that
+/// contains them, so reaching item lowering with one is a compiler defect.
 fn unsafe_code_before_lowering(span: crate::source::Span) -> Diagnostic {
     Diagnostic::internal_compiler_error(
         "foreign declaration reached lowering",

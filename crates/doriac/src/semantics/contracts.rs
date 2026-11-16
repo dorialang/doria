@@ -673,6 +673,7 @@ impl Checker<'_> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        self.require_unsafe_callable(span, required.method.declaration, method);
         let receiver = self.infer_expr_type(object, scopes, method_context);
         if matches!(self.types.kind(receiver), TypeKind::TypeParameter(_)) {
             self.call_targets
