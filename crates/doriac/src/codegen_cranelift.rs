@@ -19761,6 +19761,13 @@ fn lower_nullable_scalar_expression(
                 payload: position,
             })
         }
+        mir::NullableScalarExpression::TryConvert { ty: target, value, .. } => {
+            let source = value.ty();
+            let value = lower_integer_expression(builder, value, resources)?;
+            Ok(lower_integer_try_conversion(
+                builder, source, *target, value, pointer,
+            ))
+        }
         mir::NullableScalarExpression::Parse { value, .. } => {
             let text = lower_string_expression(builder, value, resources)?;
             let found_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -20205,11 +20212,23 @@ fn lower_integer_expression(
             ty,
             value,
             value_span,
+            boundary,
             ..
         } => {
             let source_type = value.ty();
             let value = lower_integer_expression(builder, value, resources)?;
-            lower_integer_conversion(builder, source_type, *ty, value, *value_span, resources)
+            let code = boundary.map_or(IntegerPanic::ConversionOutOfRange.code(), |_| {
+                crate::foreign::BOUNDARY_CONVERSION_PANIC_CODE
+            });
+            lower_integer_conversion(
+                builder,
+                source_type,
+                *ty,
+                value,
+                code,
+                *value_span,
+                resources,
+            )
         }
         mir::IntegerExpression::FloatToInt {
             value, value_span, ..
@@ -20527,27 +20546,52 @@ fn lower_integer_conversion(
     source: IntegerType,
     target: IntegerType,
     value: Value,
+    code: &'static str,
     span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     if let Some(out_of_range) = conversion_out_of_range(builder, source, target, value) {
-        lower_panic_if(
-            builder,
-            out_of_range,
-            IntegerPanic::ConversionOutOfRange,
-            span,
-            resources,
-        )?;
+        lower_panic_if_code(builder, out_of_range, code, span, resources)?;
     }
+    Ok(integer_conversion_bits(builder, source, target, value))
+}
 
-    Ok(match target.bit_width().cmp(&source.bit_width()) {
+/// `CLong::tryFrom`: present when the value is in the target's range.
+fn lower_integer_try_conversion(
+    builder: &mut FunctionBuilder,
+    source: IntegerType,
+    target: IntegerType,
+    value: Value,
+    pointer: types::Type,
+) -> LoweredValue {
+    let present = match conversion_out_of_range(builder, source, target, value) {
+        Some(out_of_range) => {
+            let fits = builder.ins().icmp_imm_u(IntCC::Equal, out_of_range, 0);
+            builder.ins().uextend(pointer, fits)
+        }
+        None => builder.ins().iconst(pointer, 1),
+    };
+    LoweredValue::Nullable {
+        present,
+        payload: integer_conversion_bits(builder, source, target, value),
+    }
+}
+
+/// The bits of an in-range `value` as `target`.
+fn integer_conversion_bits(
+    builder: &mut FunctionBuilder,
+    source: IntegerType,
+    target: IntegerType,
+    value: Value,
+) -> Value {
+    match target.bit_width().cmp(&source.bit_width()) {
         std::cmp::Ordering::Equal => value,
         std::cmp::Ordering::Less => builder.ins().ireduce(clif_integer_type(target), value),
         std::cmp::Ordering::Greater if source.is_signed() => {
             builder.ins().sextend(clif_integer_type(target), value)
         }
         std::cmp::Ordering::Greater => builder.ins().uextend(clif_integer_type(target), value),
-    })
+    }
 }
 
 fn conversion_out_of_range(

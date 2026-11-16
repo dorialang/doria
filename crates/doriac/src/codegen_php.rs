@@ -3524,6 +3524,18 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             span,
             ..
         } => {
+            if let Some(boundary) = crate::foreign::CBoundaryType::from_source_name(class_name) {
+                return Err(BackendError::from_diagnostics(vec![
+                    crate::unsafe_code::companion_form(
+                        *span,
+                        "C Boundary Values Cannot Be Built For PHP Output Yet",
+                        format!(
+                            "`{}::{method}` is part of Doria; PHP output does not build C boundary values yet",
+                            boundary.short_name()
+                        ),
+                    ),
+                ]));
+            }
             // UTF-8 validation is exact with PCRE, which every PHP build has.
             if class_name == "String" && method == "fromBytes" && args.len() == 1 {
                 return validate_arguments(args, semantic_info);

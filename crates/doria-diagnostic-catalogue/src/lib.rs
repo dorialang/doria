@@ -59,7 +59,7 @@ pub const DIAGNOSTIC_CODES: &[&str] = &[
     "P1104", "P1105", "P1106", "P1107", "P1108", "P1109", "P1110", "P1111", "P1201", "P1202",
     "P1203", "P1204", "P1205", "P1206", "P1301", "P1302", "P1303", "P1304", "P1310", "P1311",
     "P1312", "P1313", "P1320", "P1321", "P1322", "P1401", "P1402", "P1403", "P1404", "P1405",
-    "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601", "R1000",
+    "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601", "P1701", "R1000",
     "R1001",
 ];
 
@@ -1021,6 +1021,15 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         domain: "class",
         primary_label: "Class Constructed Here",
         explanation: "The runtime could not allocate storage for the requested class instance.",
+        process_status: 101,
+        fact_names: &[],
+    },
+    RuntimeCatalogueEntry {
+        code: "P1701",
+        title: "C Boundary Conversion Is Out Of Range",
+        domain: "ffi",
+        primary_label: "Value Does Not Fit Here",
+        explanation: "The value does not fit in the C type's width and signedness on this target.",
         process_status: 101,
         fact_names: &[],
     },

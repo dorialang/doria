@@ -1001,7 +1001,11 @@ enum EvaluationTask {
         target: IntegerType,
         operation_span: Span,
         primary_span: Span,
+        /// P1109, or P1701 for a conversion to a C boundary type.
+        code: &'static str,
     },
+    /// `CLong::tryFrom`: the converted value, or the absent value.
+    IntegerTryConvert(IntegerType),
     FloatToInt {
         operation_span: Span,
         primary_span: Span,
@@ -5413,6 +5417,13 @@ impl<'a> Interpreter<'a> {
                 };
                 self.push_nullable_scalar(ty, value)?;
             }
+            EvaluationTask::IntegerTryConvert(target) => {
+                let value = self.pop_integer()?.convert(target).ok();
+                self.push_nullable_scalar(
+                    mir::ScalarType::Integer(target),
+                    value.map(mir::ScalarValue::Integer),
+                )?;
+            }
             EvaluationTask::BuildNullableClassSome(class) => {
                 let LocalValue::Class {
                     object,
@@ -6761,11 +6772,13 @@ impl<'a> Interpreter<'a> {
                 target,
                 operation_span,
                 primary_span,
+                code,
             } => {
                 let value = match self.pop_integer()?.convert(target) {
                     Ok(value) => value,
                     Err(panic) => {
                         let mut event = Self::integer_panic_event(panic, operation_span);
+                        event.code = code;
                         event.primary_span = primary_span;
                         return Ok(StepOutcome::RuntimePanic(event));
                     }
@@ -7429,12 +7442,17 @@ impl<'a> Interpreter<'a> {
                 value,
                 span,
                 value_span,
+                boundary,
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::IntegerConvert {
                     target: ty,
                     operation_span: span,
                     primary_span: value_span,
+                    code: boundary.map_or(
+                        IntegerPanic::ConversionOutOfRange.code(),
+                        |_| crate::foreign::BOUNDARY_CONVERSION_PANIC_CODE,
+                    ),
                 });
                 frame.tasks.push(EvaluationTask::Integer(*value));
             }
@@ -8346,6 +8364,11 @@ impl<'a> Interpreter<'a> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::ParseNullableScalar(ty));
                 frame.tasks.push(EvaluationTask::String(*value));
+            }
+            mir::NullableScalarExpression::TryConvert { ty, value, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::IntegerTryConvert(ty));
+                frame.tasks.push(EvaluationTask::Integer(*value));
             }
         }
         Ok(())

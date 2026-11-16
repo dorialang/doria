@@ -166,6 +166,36 @@ impl CScalar {
     pub const fn is_float(self) -> bool {
         matches!(self, Self::Float { .. })
     }
+
+    /// The Doria integer type with this scalar's width and signedness;
+    /// `None` for a float, `_Bool` or a pointer.
+    pub const fn integer_type(self) -> Option<crate::numeric::IntegerType> {
+        use crate::numeric::IntegerType;
+        match self {
+            Self::Integer { bytes, signed } => Some(match (bytes, signed) {
+                (1, true) => IntegerType::Int8,
+                (1, false) => IntegerType::UInt8,
+                (2, true) => IntegerType::Int16,
+                (2, false) => IntegerType::UInt16,
+                (4, true) => IntegerType::Int32,
+                (4, false) => IntegerType::UInt32,
+                (_, true) => IntegerType::Int64,
+                (_, false) => IntegerType::UInt64,
+            }),
+            Self::Float { .. } | Self::Bool | Self::Pointer => None,
+        }
+    }
+}
+
+impl CTarget {
+    /// The integer a boundary value is on this target: what MIR, the
+    /// interpreter and both native backends carry for it.
+    pub const fn boundary_integer(self, boundary: CBoundaryType) -> crate::numeric::IntegerType {
+        match self.boundary(boundary).integer_type() {
+            Some(ty) => ty,
+            None => panic!("every C boundary type is an integer"),
+        }
+    }
 }
 
 /// The C layout of an FFI-safe type.

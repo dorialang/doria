@@ -574,7 +574,10 @@ foreach ($namingFiles as $path) {
         }
 
         // Section 9.1: namespace segments are PascalCase with acronyms folded.
-        if (preg_match('/\bDoria(?:\\\\[A-Za-z0-9_]+)*\\\\[A-Z]{2,}/', $line) === 1) {
+        // An acronym is two or more capitals not followed by a lowercase
+        // letter (IO, HTTP, XMLParser). A one-letter prefix on a PascalCase
+        // word is not one: Decision 0148's `Doria\Std\Ffi\CUnsignedLong`.
+        if (preg_match('/\bDoria(?:\\\\[A-Za-z0-9_]+)*\\\\[A-Z]{2,}(?![a-z])/', $line) === 1) {
             add_failure(
                 $failures,
                 $path,

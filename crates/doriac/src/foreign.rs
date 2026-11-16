@@ -12,6 +12,10 @@ pub const PTR: &str = "Doria\\Std\\Ffi\\Ptr";
 pub const MUT_PTR: &str = "Doria\\Std\\Ffi\\MutPtr";
 pub const OPAQUE: &str = "Doria\\Std\\Ffi\\Opaque";
 
+/// The panic of `CLong::from` and the other boundary types' `from` for a
+/// value outside the C type's range on this target (section 5).
+pub const BOUNDARY_CONVERSION_PANIC_CODE: &str = "P1701";
+
 /// Read access (`Ptr<T>`) or read and write access (`MutPtr<T>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PointerAccess {

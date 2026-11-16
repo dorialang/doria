@@ -278,6 +278,14 @@ fn resolve_type_ref(
                 "bool" => ResolvedType::Bool,
                 "mixed" => ResolvedType::Mixed,
                 "Error" => ResolvedType::Error,
+                crate::foreign::OPAQUE => {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Opaque))
+                }
+                name if crate::foreign::CBoundaryType::from_source_name(name).is_some() => {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Boundary(
+                        crate::foreign::CBoundaryType::from_source_name(name)?,
+                    )))
+                }
                 _ => ResolvedType::Class(ClassType::new(plain.name, Vec::new())),
             }
         }
@@ -310,6 +318,12 @@ fn resolve_type_ref(
             name if arguments.len() == 1 => {
                 if let Some(kind) = crate::types::SharedHandleKind::from_source_name(name) {
                     ResolvedType::SharedHandle(kind, Box::new(arguments[0].clone()))
+                } else if let Some(access) = crate::foreign::PointerAccess::from_source_name(name)
+                {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Pointer {
+                        access,
+                        pointee: arguments[0].clone(),
+                    }))
                 } else {
                     ResolvedType::Class(ClassType::new(plain.name, arguments))
                 }

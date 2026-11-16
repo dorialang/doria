@@ -339,6 +339,7 @@ fn hash(
                 )),
                 span,
                 value_span: span,
+                boundary: None,
             },
         )),
     });

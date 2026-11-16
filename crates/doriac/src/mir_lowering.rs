@@ -2671,6 +2671,21 @@ fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String>
         .map(|(_, callable)| callable)
 }
 
+/// The MIR form of a foreign type (Decision 0148). A C boundary value is the
+/// integer of its width and signedness on the native target; foreign forms
+/// without a MIR form yet return `None`, and the execution gate in
+/// `crate::unsafe_code` stops programs that use them.
+fn foreign_mir_type(
+    foreign: &crate::foreign::ForeignType<crate::types::ResolvedType>,
+) -> Option<mir::Type> {
+    match foreign {
+        crate::foreign::ForeignType::Boundary(boundary) => Some(mir::Type::Scalar(
+            mir::ScalarType::Integer(crate::c_layout::CTarget::host().boundary_integer(*boundary)),
+        )),
+        _ => None,
+    }
+}
+
 fn intern_resolved_collection_types(
     ty: &crate::types::ResolvedType,
     class_ids: &ClassIds,
@@ -2689,9 +2704,7 @@ fn intern_resolved_collection_types(
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::ByteRegion(kind) => mir::Type::ByteRegion(*kind),
         ResolvedType::Mixed => mir::Type::Mixed,
-        // Foreign values have no MIR form until native foreign calls land;
-        // the execution gate in `crate::unsafe_code` stops such programs.
-        ResolvedType::Foreign(_) => return None,
+        ResolvedType::Foreign(foreign) => foreign_mir_type(foreign)?,
         ResolvedType::Error => mir::Type::ERROR,
         ResolvedType::Function(function) => {
             if let Some(id) = collections.function_ids.get(function.as_ref()) {
@@ -10599,7 +10612,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
-            ResolvedType::Foreign(_) => None,
+            ResolvedType::Foreign(foreign) => foreign_mir_type(foreign),
             ResolvedType::Error => Some(mir::Type::ERROR),
             ResolvedType::ByteRegion(kind) => Some(mir::Type::ByteRegion(*kind)),
             ResolvedType::Function(_) => {
@@ -12621,6 +12634,19 @@ fn lower_nullable_scalar_expression(
         ..
     } = unparenthesized_place(expr)
     {
+        if let (Some(boundary), "tryFrom", mir::ScalarType::Integer(ty)) = (
+            crate::foreign::CBoundaryType::from_source_name(class_name),
+            method.as_str(),
+            expected,
+        ) {
+            return Ok(mir::NullableScalarExpression::TryConvert {
+                ty,
+                boundary,
+                value: Box::new(lower_boundary_conversion_source(
+                    boundary, ty, args, *span, context,
+                )?),
+            });
+        }
         if method == "parse" {
             let is_int = IntegerType::from_companion_name(class_name) == Some(IntegerType::Int64)
                 && expected == mir::ScalarType::Integer(IntegerType::Int64);
@@ -28599,6 +28625,26 @@ fn lower_integer_expression(
                 value: Box::new(lower_integer_expression(value, context)?),
                 span: *span,
                 value_span: value.span(),
+                boundary: None,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+            ..
+        } if method == "from" && crate::foreign::CBoundaryType::from_source_name(class_name).is_some() => {
+            let boundary = crate::foreign::CBoundaryType::from_source_name(class_name)
+                .expect("guarded boundary companion name");
+            let value = lower_boundary_conversion_source(boundary, ty, args, *span, context)?;
+            Ok(mir::IntegerExpression::Convert {
+                ty,
+                value: Box::new(value),
+                span: *span,
+                // The source checked exactly one argument.
+                value_span: argument_values(args)[0].span(),
+                boundary: Some(boundary),
             })
         }
         hir::Expr::StaticCall {
@@ -28628,6 +28674,36 @@ fn lower_integer_expression(
         hir::Expr::Int { .. } => unreachable!("integer literal handled before expression match"),
         _ => Err(vec![unsupported_int_expr(expr)]),
     }
+}
+
+/// The integer argument of `CLong::from` or `CLong::tryFrom`, checked
+/// against the integer `boundary` is on this target.
+fn lower_boundary_conversion_source(
+    boundary: crate::foreign::CBoundaryType,
+    ty: IntegerType,
+    args: &[hir::Argument],
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::IntegerExpression> {
+    let short = boundary.short_name();
+    let [value] = argument_values(args)[..] else {
+        return Err(vec![Diagnostic::new(
+            "I1301",
+            format!("internal compiler consistency error: checked `{short}` conversion does not have exactly one argument"),
+            span,
+        )]);
+    };
+    let target = crate::c_layout::CTarget::host().boundary_integer(boundary);
+    if target != ty {
+        return Err(vec![Diagnostic::new(
+            "I1301",
+            format!(
+                "internal compiler consistency error: `{short}` is `{target}` on this target, expression metadata says `{ty}`"
+            ),
+            span,
+        )]);
+    }
+    lower_integer_expression(value, context)
 }
 
 fn lower_integer_binary_op(

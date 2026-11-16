@@ -4641,6 +4641,14 @@ pub enum NullableScalarExpression {
         ty: ScalarType,
         value: Box<StringExpression>,
     },
+    /// `CLong::tryFrom($value)` and the other boundary types' `tryFrom`
+    /// (Decision 0148 section 5): `value` converted to `ty`, the integer of
+    /// `boundary` on this target, or the absent value when it does not fit.
+    TryConvert {
+        ty: IntegerType,
+        boundary: crate::foreign::CBoundaryType,
+        value: Box<IntegerExpression>,
+    },
     StringIntrinsic(Box<StringIntrinsicCall>),
 }
 
@@ -4659,6 +4667,7 @@ impl NullableScalarExpression {
             | Self::Parse { ty, .. } => *ty,
             Self::EnumBacking { .. } => ScalarType::Integer(IntegerType::Int64),
             Self::CollectionIndexOf { .. } => ScalarType::Integer(IntegerType::Int64),
+            Self::TryConvert { ty, .. } => ScalarType::Integer(*ty),
             Self::TransferGroupKey { key, .. } => ScalarType::Inline(*key),
             Self::InlineClaim { ty, .. } => ScalarType::Inline(*ty),
             Self::StringIntrinsic(call) => match call.result {
@@ -5106,11 +5115,16 @@ pub enum IntegerExpression {
         span: Span,
         right_span: Span,
     },
+    /// A checked conversion to `ty`. `boundary` names the C boundary type
+    /// (Decision 0148 section 5) the result stands for: `CLong::from`
+    /// converts to the integer of `long`'s width on this target, and a value
+    /// outside it fails with P1701 instead of P1109.
     Convert {
         ty: IntegerType,
         value: Box<IntegerExpression>,
         span: Span,
         value_span: Span,
+        boundary: Option<crate::foreign::CBoundaryType>,
     },
     FloatToInt {
         value: Box<FloatExpression>,
@@ -5222,14 +5236,16 @@ impl PartialEq for IntegerExpression {
                 Self::Convert {
                     ty: left_ty,
                     value: left,
+                    boundary: left_boundary,
                     ..
                 },
                 Self::Convert {
                     ty: right_ty,
                     value: right,
+                    boundary: right_boundary,
                     ..
                 },
-            ) => left_ty == right_ty && left == right,
+            ) => left_ty == right_ty && left == right && left_boundary == right_boundary,
             (Self::FloatToInt { value: left, .. }, Self::FloatToInt { value: right, .. }) => {
                 left == right
             }
@@ -8014,6 +8030,9 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
         NullableScalarExpression::CollectionIndexOf { value, .. } => {
             rvalue_class_temporary_capacity(value)
         }
+        NullableScalarExpression::TryConvert { value, .. } => {
+            integer_class_temporary_capacity(value)
+        }
         NullableScalarExpression::StringIntrinsic(call) => {
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -9599,9 +9618,22 @@ impl fmt::Display for IntegerExpression {
                 right,
                 ..
             } => write!(formatter, "({left} {op} {right}): {ty}"),
-            IntegerExpression::Convert { ty, value, .. } => {
-                write!(formatter, "convert<{ty}>({value}): {ty}")
-            }
+            IntegerExpression::Convert {
+                ty,
+                value,
+                boundary: None,
+                ..
+            } => write!(formatter, "convert<{ty}>({value}): {ty}"),
+            IntegerExpression::Convert {
+                ty,
+                value,
+                boundary: Some(boundary),
+                ..
+            } => write!(
+                formatter,
+                "convert<{ty}, {}>({value}): {ty}",
+                boundary.short_name()
+            ),
             IntegerExpression::FloatToInt { value, .. } => {
                 write!(formatter, "Float::toInt({value}): int")
             }
@@ -10000,6 +10032,15 @@ impl fmt::Display for NullableScalarExpression {
             Self::EnumBacking { enum_id, value } => {
                 write!(formatter, "nullable_enum_backing<{enum_id:?}>({value})")
             }
+            Self::TryConvert {
+                ty,
+                boundary,
+                value,
+            } => write!(
+                formatter,
+                "try_convert<{ty}, {}>({value})",
+                boundary.short_name()
+            ),
             Self::NullSafeProperty {
                 object, property, ..
             } => {

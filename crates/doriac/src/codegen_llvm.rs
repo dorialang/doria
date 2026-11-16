@@ -18318,6 +18318,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.drop_stored_value(needle, definition.value)?;
                 self.nullable_value(present, position.into())
             }
+            mir::NullableScalarExpression::TryConvert {
+                ty: target, value, ..
+            } => {
+                let source = value.ty();
+                let value = self.lower_integer_expression(value)?;
+                self.lower_integer_try_conversion(source, *target, value)
+            }
             mir::NullableScalarExpression::Parse { value, .. } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let text = self.lower_string_expression(value)?;
@@ -21880,11 +21887,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ty,
                 value,
                 value_span,
+                boundary,
                 ..
             } => {
                 let source = value.ty();
                 let value = self.lower_integer_expression(value)?;
-                self.lower_integer_conversion(source, *ty, value, *value_span)
+                let code = boundary.map_or(IntegerPanic::ConversionOutOfRange.code(), |_| {
+                    crate::foreign::BOUNDARY_CONVERSION_PANIC_CODE
+                });
+                self.lower_integer_conversion(source, *ty, value, code, *value_span)
             }
             mir::IntegerExpression::FloatToInt {
                 value, value_span, ..
@@ -22286,15 +22297,41 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         source: IntegerType,
         target: IntegerType,
         value: IntValue<'ctx>,
+        code: &'static str,
         span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         if let Some(out_of_range) = self.conversion_out_of_range(source, target, value)? {
-            self.lower_panic_if_code(
-                out_of_range,
-                IntegerPanic::ConversionOutOfRange.code(),
-                span,
-            )?;
+            self.lower_panic_if_code(out_of_range, code, span)?;
         }
+        self.integer_conversion_bits(source, target, value)
+    }
+
+    /// `CLong::tryFrom`: present when the value is in the target's range.
+    fn lower_integer_try_conversion(
+        &mut self,
+        source: IntegerType,
+        target: IntegerType,
+        value: IntValue<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let word = self.context.ptr_sized_int_type(self.target_data, None);
+        let present = match self.conversion_out_of_range(source, target, value)? {
+            Some(out_of_range) => {
+                let fits = build(self.builder.build_not(out_of_range, "convert.fits"))?;
+                build(self.builder.build_int_z_extend(fits, word, "convert.present"))?
+            }
+            None => word.const_int(1, false),
+        };
+        let payload = self.integer_conversion_bits(source, target, value)?;
+        self.nullable_value(present, payload.into())
+    }
+
+    /// The bits of an in-range `value` as `target`.
+    fn integer_conversion_bits(
+        &mut self,
+        source: IntegerType,
+        target: IntegerType,
+        value: IntValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, BackendError> {
         let source_width = source.bit_width();
         let target_width = target.bit_width();
         let target_type = integer_type(self.context, target);

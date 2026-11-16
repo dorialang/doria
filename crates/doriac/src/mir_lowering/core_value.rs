@@ -222,6 +222,7 @@ fn primitive_hash(
         value: Box::new(value),
         span,
         value_span: span,
+        boundary: None,
     };
     match local_rvalue(receiver.0, receiver.1, false) {
         mir::Rvalue::String(value) => Ok(scalar(mir::IntegerExpression::use_operand(

@@ -5986,7 +5986,19 @@ fn validate_integer_expression(
             validate_integer_expression(program, function, left)?;
             validate_integer_expression(program, function, right)
         }
-        mir::IntegerExpression::Convert { value, .. } => {
+        mir::IntegerExpression::Convert {
+            ty,
+            value,
+            boundary,
+            ..
+        } => {
+            if boundary.is_some_and(|boundary| {
+                crate::c_layout::CTarget::host().boundary_integer(boundary) != *ty
+            }) {
+                return Err(malformed_mir(
+                    "a boundary conversion produces the integer of its C type on this target",
+                ));
+            }
             validate_integer_expression(program, function, value)
         }
         mir::IntegerExpression::FloatToInt { value, .. } => {
@@ -14139,6 +14151,9 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(&call.args, accesses)
         }
         mir::NullableScalarExpression::Local { local, .. } => accesses.resource_read(*local),
+        mir::NullableScalarExpression::TryConvert { value, .. } => {
+            collect_integer_class_local_accesses(value, accesses)
+        }
         mir::NullableScalarExpression::Parse { .. }
         | mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Static { .. } => {}
@@ -18567,6 +18582,7 @@ fn nullable_scalar_expression_presence(
         | mir::NullableScalarExpression::DictionaryGet { .. }
         | mir::NullableScalarExpression::CollectionIndexOf { .. }
         | mir::NullableScalarExpression::Parse { .. }
+        | mir::NullableScalarExpression::TryConvert { .. }
         | mir::NullableScalarExpression::StringIntrinsic(_) => None,
     }
 }
@@ -21595,6 +21611,9 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::Parse { value, .. } => {
             string_observes_property(value, receiver, property)
         }
+        mir::NullableScalarExpression::TryConvert { value, .. } => {
+            integer_observes_property(value, receiver, property)
+        }
         mir::NullableScalarExpression::StringIntrinsic(call) => call
             .args
             .iter()
@@ -24024,6 +24043,20 @@ fn validate_nullable_scalar_expression(
                 return Err(malformed_mir("parse produces only `?int` or `?float`"));
             }
             validate_string_expression(program, function, value)
+        }
+        mir::NullableScalarExpression::TryConvert {
+            ty: converted,
+            boundary,
+            value,
+        } => {
+            if ty != mir::ScalarType::Integer(*converted)
+                || crate::c_layout::CTarget::host().boundary_integer(*boundary) != *converted
+            {
+                return Err(malformed_mir(
+                    "a boundary conversion produces the integer of its C type on this target",
+                ));
+            }
+            validate_integer_expression(program, function, value)
         }
         mir::NullableScalarExpression::StringIntrinsic(call) => {
             validate_string_intrinsic(program, function, call, mir::Type::NullableScalar(ty))

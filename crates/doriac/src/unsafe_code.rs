@@ -60,6 +60,18 @@ pub fn unchecked_forms(program: &Program) -> Vec<Diagnostic> {
     finder.finish()
 }
 
+/// The E0784 diagnostic for a checked form the native targets build and the
+/// interpreter or PHP output does not: those run unsafe code, and take the
+/// target's C data model, through the native companion library (Decision
+/// 0148 sections 22 and 23).
+pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
+    Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
+        .with_title(title)
+        .with_explanation(
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target; the interpreter and PHP output run this form through the native companion library, which this compiler does not build yet.",
+        )
+}
+
 /// One E0784 diagnostic per checked form that no execution target runs yet.
 pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
     let mut finder = Finder::new(Gate::Execution);
@@ -299,16 +311,9 @@ impl Finder {
                                 access.short_name()
                             ),
                         ),
-                    Some(crate::pointer_intrinsics::ForeignCompanion::Boundary(boundary)) => self
-                        .report(
-                            *span,
-                            "C Boundary Conversions Cannot Be Built Yet",
-                            format!(
-                                "`{}::{method}` is part of Doria; this compiler does not build C boundary values yet",
-                                boundary.short_name()
-                            ),
-                        ),
-                    None => {}
+                    // Every target builds boundary conversions; PHP output
+                    // reports them itself.
+                    Some(crate::pointer_intrinsics::ForeignCompanion::Boundary(_)) | None => {}
                 }
             }
             Expr::Closure(closure) => {
@@ -330,7 +335,7 @@ impl Finder {
             self.report(
                 span,
                 "Foreign Types Cannot Be Built Yet",
-                "pointers, C boundary types and C function pointer types are part of Doria; this compiler does not build code that uses them yet",
+                "pointers and C function pointer types are part of Doria; this compiler does not build code that uses them yet",
             );
         }
     }
@@ -348,7 +353,8 @@ impl Transform for TypeFinder {
             .as_ref()
             .is_some_and(|function| function.c_abi.is_some())
             || ty.fixed_array_parts().is_some()
-            || crate::foreign::is_type_name(&ty.name)
+            || (crate::foreign::is_type_name(&ty.name)
+                && crate::foreign::CBoundaryType::from_source_name(&ty.name).is_none())
         {
             self.foreign = true;
         }
