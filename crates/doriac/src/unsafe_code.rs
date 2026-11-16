@@ -162,17 +162,21 @@ impl Finder {
                     );
                 }
             }
-            Item::ForeignAggregate(aggregate) => self.report(
-                aggregate.span,
-                match aggregate.kind {
-                    ForeignAggregateKind::Struct => "Foreign Structs Are Not Available Yet",
-                    ForeignAggregateKind::Union => "Foreign Unions Are Not Available Yet",
-                },
-                format!(
-                    "`extern \"C\" {}` is part of Doria; this compiler does not implement foreign layouts yet",
-                    aggregate.kind.keyword()
-                ),
-            ),
+            Item::ForeignAggregate(aggregate) => {
+                if self.gate == Gate::Execution {
+                    self.report(
+                        aggregate.span,
+                        match aggregate.kind {
+                            ForeignAggregateKind::Struct => "Foreign Structs Cannot Be Built Yet",
+                            ForeignAggregateKind::Union => "Foreign Unions Cannot Be Built Yet",
+                        },
+                        format!(
+                            "`extern \"C\" {}` is part of Doria; this compiler does not build foreign layouts yet",
+                            aggregate.kind.keyword()
+                        ),
+                    );
+                }
+            }
             Item::Statement(statement) => self.statement(statement),
         }
     }

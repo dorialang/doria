@@ -516,3 +516,152 @@ fn checked_foreign_code_reports_that_it_cannot_be_built_yet() {
         .expect("an unsafe function with no foreign code builds");
     assert!(!output.is_empty());
 }
+
+const COLOR: &str = r#"
+extern "C" struct Color
+{
+    uint8 $red;
+    uint8 $green;
+    uint8 $blue;
+    uint8 $alpha = 255;
+}
+
+extern "C" union Value
+{
+    int32 $number;
+    float32 $ratio;
+    Color $color;
+}
+
+extern "C" struct Stream;
+"#;
+
+#[test]
+fn foreign_structs_are_built_from_every_field_without_a_default() {
+    for body in [
+        "let $color = new Color(red: 1, green: 2, blue: 3); echo $color->alpha;",
+        "let $color = new Color(1, 2, 3, 4); echo $color->red;",
+        "writable Color $color = new Color(red: 1, green: 2, blue: 3); $color->alpha = 9; echo $color->alpha;",
+        "let $size = Color::SIZE; let $alignment = Color::ALIGNMENT; echo $size + $alignment;",
+    ] {
+        let source = format!("{COLOR}function main(): void {{ {body} }}");
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let missing = format!("{COLOR}function main(): void {{ let $color = new Color(red: 1); }}");
+    assert!(!codes(&missing).is_empty(), "missing fields are reported");
+    let readonly = format!(
+        "{COLOR}function main(): void {{ let $color = new Color(red: 1, green: 2, blue: 3); $color->red = 4; }}"
+    );
+    only(&readonly, "E0479");
+}
+
+#[test]
+fn a_union_is_built_zeroed_or_from_one_named_member() {
+    for body in [
+        "let $value = new Value();",
+        "let $value = new Value(number: 3);",
+        "writable Value $value = new Value(); $value->ratio = 1.5;",
+        "let $value = new Value(number: 3); echo unsafe($value->number);",
+    ] {
+        let source = format!("{COLOR}function main(): void {{ {body} }}");
+        assert!(
+            codes(&source).is_empty(),
+            "{body}: {:#?}",
+            findings(&source)
+        );
+    }
+    for body in [
+        "let $value = new Value(number: 3, ratio: 1.5);",
+        "let $value = new Value(3);",
+    ] {
+        let source = format!("{COLOR}function main(): void {{ {body} }}");
+        let diagnostic = only(&source, "E0799");
+        assert_eq!(diagnostic.title, "Union Construction Names One Member");
+    }
+    let read = format!(
+        "{COLOR}function main(): void {{ let $value = new Value(number: 3); echo $value->number; }}"
+    );
+    let diagnostic = only(&read, "E0785");
+    assert!(diagnostic.message.contains("union member `$number`"));
+}
+
+#[test]
+fn foreign_aggregates_have_fields_and_constants_only() {
+    for (body, title) in [
+        (
+            "let $color = new Color(red: 1, green: 2, blue: 3); echo $color->hue;",
+            "Foreign Aggregate Has No Such Field",
+        ),
+        (
+            "let $color = new Color(red: 1, green: 2, blue: 3); $color->blend();",
+            "Foreign Aggregate Has No Methods",
+        ),
+        (
+            "echo Color::COUNT;",
+            "Foreign Aggregate Has No Such Constant",
+        ),
+    ] {
+        let source = format!("{COLOR}function main(): void {{ {body} }}");
+        let diagnostic = only(&source, "E0798");
+        assert_eq!(diagnostic.title, title, "{body}");
+    }
+    for (declaration, title) in [
+        (
+            "extern \"C\" struct Pair { int32 $left; int32 $left; }",
+            "Foreign Field Is Declared Twice",
+        ),
+        (
+            "extern \"C\" union Either { int32 $left = 1; float32 $right; }",
+            "Union Member Cannot Have A Default",
+        ),
+        (
+            "extern \"C\" struct Empty { }",
+            "Foreign Aggregate Has No Fields",
+        ),
+    ] {
+        let source = format!("{declaration} function main(): void {{}}");
+        let diagnostic = only(&source, "E0798");
+        assert_eq!(diagnostic.title, title, "{declaration}");
+    }
+    let unsafe_field = "extern \"C\" struct Named { string $name; } function main(): void {}";
+    only(unsafe_field, "E0786");
+    let recursive =
+        "extern \"C\" struct Node { int32 $value; Node $next; } function main(): void {}";
+    only(recursive, "E0786");
+}
+
+#[test]
+fn an_incomplete_struct_is_used_only_through_a_pointer() {
+    let pointer = format!(
+        "use Doria\\Std\\Ffi\\MutPtr; {COLOR} extern \"C\" {{ /** @safety Valid streams. */ function finish(MutPtr<Stream> $stream): int32; }} function main(): void {{}}"
+    );
+    assert!(codes(&pointer).is_empty(), "{:#?}", findings(&pointer));
+    let by_value =
+        format!("{COLOR}function consume(Stream $stream): void {{}} function main(): void {{}}");
+    let diagnostic = only(&by_value, "E0787");
+    assert!(diagnostic
+        .helps
+        .iter()
+        .any(|help| help.contains("Ptr<Stream>")));
+}
+
+#[test]
+fn foreign_aggregates_cross_the_c_boundary_by_value_and_by_pointer() {
+    let source = format!(
+        "use Doria\\Std\\Ffi\\Ptr; {COLOR} extern \"C\" {{ /** @safety Any color. */ function blend(Color $left, Ptr<Color> $right): Color; }} function main(): void {{}}"
+    );
+    assert!(codes(&source).is_empty(), "{:#?}", findings(&source));
+}
+
+#[test]
+fn fixed_length_array_fields_are_zero_filled_until_regions_land() {
+    let declaration = "extern \"C\" struct Tip { uint16[128] $text; int32 $length; }";
+    let built = format!("{declaration} function main(): void {{ let $tip = new Tip(length: 0); echo $tip->length; }}");
+    assert!(codes(&built).is_empty(), "{:#?}", findings(&built));
+    let read = format!("{declaration} function main(): void {{ let $tip = new Tip(length: 0); let $text = $tip->text; }}");
+    let diagnostic = only(&read, "E0784");
+    assert_eq!(
+        diagnostic.title,
+        "Fixed-Length Array Fields Cannot Be Read Yet"
+    );
+}

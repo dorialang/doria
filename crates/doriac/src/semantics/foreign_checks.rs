@@ -39,6 +39,8 @@ pub(super) struct ForeignState {
     /// Innermost last. `None` is a closure body, which no unsafe context
     /// written around it reaches.
     contexts: Vec<Option<UnsafeContext>>,
+    /// Foreign structs and unions by canonical name.
+    pub(super) aggregates: HashMap<String, super::foreign_aggregates::ForeignAggregateInfo>,
     /// Declarations every call of which needs an unsafe context: `unsafe
     /// function`s, unsafe interface requirements and extern declarations.
     unsafe_callables: HashSet<Span>,
@@ -241,6 +243,9 @@ impl<'program> Checker<'program> {
                         length,
                     })),
             );
+        }
+        if let Some(aggregate) = self.resolve_foreign_aggregate_type(ty, span, position) {
+            return Some(aggregate);
         }
         let pointer = PointerAccess::from_source_name(&ty.name);
         let boundary = CBoundaryType::from_source_name(&ty.name);

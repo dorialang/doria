@@ -317,13 +317,10 @@ fn every_stage40_form_reaches_checking_as_not_available_yet() {
         .collect::<std::collections::BTreeSet<_>>();
     // The forms checking does not cover yet; the rest are checked in
     // stage40_checking_tests.
-    for expected in [
-        "Declare Directives Are Not Available Yet",
-        "Foreign Structs Are Not Available Yet",
-        "Foreign Unions Are Not Available Yet",
-    ] {
-        assert!(titles.contains(expected), "missing {expected}: {titles:#?}");
-    }
+    assert!(
+        titles.contains("Declare Directives Are Not Available Yet"),
+        "{titles:#?}"
+    );
 }
 
 #[test]

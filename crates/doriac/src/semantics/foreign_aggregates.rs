@@ -1,0 +1,642 @@
+//! Foreign structs and unions (Decision 0148 section 6, with the amendment
+//! of 2026-11-16 for unions and fixed-length array fields).
+//!
+//! A foreign aggregate is a nominal inline Copy value with the target C
+//! layout. It has fields only: no methods, hooks, constructors or
+//! conformances. A struct is built with every field that has no default; a
+//! union with no member (every byte zero) or exactly one named member.
+
+use std::collections::{HashMap, HashSet};
+
+use super::foreign_checks::{FOREIGN_TYPE_PLACEMENT_CODE, NOT_FFI_SAFE_CODE};
+use super::*;
+use crate::ast::{ForeignAggregateDecl, ForeignAggregateKind};
+use crate::foreign::{ForeignAggregateType, ForeignType};
+
+pub(super) const FIELD_CODE: &str = "E0798";
+pub(super) const UNION_CONSTRUCTION_CODE: &str = "E0799";
+
+#[derive(Debug, Clone)]
+pub(super) struct ForeignField {
+    pub(super) name: String,
+    pub(super) ty: TypeId,
+    pub(super) has_default: bool,
+    pub(super) span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ForeignAggregateInfo {
+    pub(super) kind: ForeignAggregateKind,
+    pub(super) declaration: Span,
+    /// `None` for an incomplete type declared without a body.
+    pub(super) fields: Option<Vec<ForeignField>>,
+}
+
+impl ForeignAggregateInfo {
+    fn field(&self, name: &str) -> Option<&ForeignField> {
+        self.fields
+            .as_ref()?
+            .iter()
+            .find(|field| field.name == name)
+    }
+}
+
+impl<'program> Checker<'program> {
+    /// Registers every foreign aggregate's name, then resolves its fields, so
+    /// fields and signatures may name aggregates in any order.
+    pub(super) fn collect_foreign_aggregates(&mut self) {
+        let program = self.program;
+        let declarations = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::ForeignAggregate(declaration) => Some(declaration),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for declaration in &declarations {
+            self.foreign.aggregates.insert(
+                declaration.name.clone(),
+                ForeignAggregateInfo {
+                    kind: declaration.kind,
+                    declaration: declaration.span,
+                    fields: declaration.fields.as_ref().map(|_| Vec::new()),
+                },
+            );
+        }
+        for declaration in declarations {
+            self.check_foreign_abi(&declaration.abi.value, declaration.abi.span);
+            let fields = self.resolve_foreign_fields(declaration);
+            if let Some(info) = self.foreign.aggregates.get_mut(&declaration.name) {
+                info.fields = fields;
+            }
+        }
+    }
+
+    fn resolve_foreign_fields(
+        &mut self,
+        declaration: &ForeignAggregateDecl,
+    ) -> Option<Vec<ForeignField>> {
+        let authored = declaration.fields.as_ref()?;
+        let mut seen = HashMap::<&str, Span>::new();
+        let mut fields = Vec::new();
+        if authored.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    FIELD_CODE,
+                    format!(
+                        "`{}` declares no fields; a C {} has at least one",
+                        declaration.name,
+                        declaration.kind.keyword()
+                    ),
+                    declaration.name_span,
+                )
+                .with_title("Foreign Aggregate Has No Fields")
+                .with_help(format!(
+                    "declare its fields, or write `extern \"C\" {} {};` for a type C code only points to",
+                    declaration.kind.keyword(),
+                    declaration.name
+                )),
+            );
+        }
+        for field in authored {
+            if let Some(previous) = seen.insert(&field.name, field.name_span) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        FIELD_CODE,
+                        format!(
+                            "`{}` declares the field `${}` twice",
+                            declaration.name, field.name
+                        ),
+                        field.name_span,
+                    )
+                    .with_title("Foreign Field Is Declared Twice")
+                    .with_related(previous, "the field is first declared here"),
+                );
+            }
+            let ty = self.resolve_type_ref_in_position(
+                &field.ty,
+                field.type_span,
+                TypePosition::ForeignField,
+                None,
+            );
+            self.require_foreign_field_type(ty, field.type_span);
+            if let Some(default) = &field.default {
+                if declaration.kind == ForeignAggregateKind::Union {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            FIELD_CODE,
+                            "a union's members overlap, so a member has no default; `new` with no arguments makes every byte zero",
+                            default.span(),
+                        )
+                        .with_title("Union Member Cannot Have A Default"),
+                    );
+                } else {
+                    self.check_foreign_field_default(declaration, field, ty, default);
+                }
+            }
+            fields.push(ForeignField {
+                name: field.name.clone(),
+                ty,
+                has_default: field.default.is_some()
+                    || matches!(
+                        self.types.kind(ty),
+                        TypeKind::Foreign(ForeignType::FixedArray { .. })
+                    ),
+                span: field.span,
+            });
+        }
+        Some(fields)
+    }
+
+    fn require_foreign_field_type(&mut self, ty: TypeId, span: Span) {
+        if let TypeKind::Foreign(ForeignType::FixedArray { element, .. }) = self.types.kind(ty) {
+            let element = *element;
+            if matches!(
+                self.types.kind(element),
+                TypeKind::Foreign(ForeignType::FixedArray { .. })
+            ) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        FOREIGN_TYPE_PLACEMENT_CODE,
+                        "a fixed-length array field has one dimension",
+                        span,
+                    )
+                    .with_title("Foreign Type Is Not Valid Here")
+                    .with_help("declare the field with the product of the dimensions as its count"),
+                );
+                return;
+            }
+            self.require_ffi_safe(element, span, "a fixed-length array element");
+            return;
+        }
+        if let TypeKind::Foreign(ForeignType::Aggregate(aggregate)) = self.types.kind(ty) {
+            if self
+                .foreign
+                .aggregates
+                .get(&aggregate.name)
+                .is_some_and(|info| info.fields.is_none())
+            {
+                self.report_incomplete_by_value(&aggregate.name.clone(), span);
+                return;
+            }
+        }
+        self.require_ffi_safe(ty, span, "a foreign field");
+    }
+
+    fn check_foreign_field_default(
+        &mut self,
+        declaration: &ForeignAggregateDecl,
+        field: &crate::ast::ForeignFieldDecl,
+        ty: TypeId,
+        default: &Expr,
+    ) {
+        if let Some(value) = crate::const_eval::evaluate_parameter_default(
+            &self.const_evaluation,
+            default,
+            &field.ty,
+            None,
+        ) {
+            let _ = value;
+        } else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    FIELD_CODE,
+                    format!(
+                        "the default of `{}::${}` must be a constant expression",
+                        declaration
+                            .name
+                            .rsplit('\\')
+                            .next()
+                            .unwrap_or(&declaration.name),
+                        field.name
+                    ),
+                    default.span(),
+                )
+                .with_title("Foreign Field Default Is Not Constant"),
+            );
+            return;
+        }
+        let scopes = ScopeStack::new();
+        self.record_expected_expression_type(default, ty);
+        if !self.is_expr_assignable(ty, default, &scopes, None) {
+            let actual = self.infer_expr_type(default, &scopes, None);
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0408",
+                    format!(
+                        "the default of `${}` expects `{}`, got `{}`",
+                        field.name,
+                        self.types.display(ty),
+                        self.types.display(actual)
+                    ),
+                    default.span(),
+                )
+                .with_title("Foreign Field Default Type Mismatch"),
+            );
+        }
+    }
+
+    /// The type of a foreign aggregate name, or `None` for another name.
+    pub(super) fn resolve_foreign_aggregate_type(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        position: TypePosition,
+    ) -> Option<TypeId> {
+        let info = self.foreign.aggregates.get(&ty.name)?.clone();
+        if !self.expect_type_arg_count(ty, 0, span) {
+            return Some(self.types.unknown());
+        }
+        if info.fields.is_none() && position != TypePosition::Pointee {
+            self.report_incomplete_by_value(&ty.name, span);
+            return Some(self.types.unknown());
+        }
+        let base = self.types.intern(TypeKind::Foreign(ForeignType::Aggregate(
+            ForeignAggregateType {
+                name: ty.name.clone(),
+                kind: info.kind,
+            },
+        )));
+        Some(if ty.nullable {
+            self.types.intern(TypeKind::Nullable(base))
+        } else {
+            base
+        })
+    }
+
+    fn report_incomplete_by_value(&mut self, name: &str, span: Span) {
+        let short = name.rsplit('\\').next().unwrap_or(name);
+        self.diagnostics.push(
+            Diagnostic::new(
+                FOREIGN_TYPE_PLACEMENT_CODE,
+                format!("`{short}` is declared without fields, so it has no size and no value; it is used only through a pointer"),
+                span,
+            )
+            .with_title("Foreign Type Is Not Valid Here")
+            .with_help(format!("write `Ptr<{short}>` or `MutPtr<{short}>`")),
+        );
+    }
+
+    fn aggregate_of(&self, ty: TypeId) -> Option<(String, ForeignAggregateInfo)> {
+        let ty = match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => ty,
+        };
+        let TypeKind::Foreign(ForeignType::Aggregate(aggregate)) = self.types.kind(ty) else {
+            return None;
+        };
+        let info = self.foreign.aggregates.get(&aggregate.name)?.clone();
+        Some((aggregate.name.clone(), info))
+    }
+
+    /// `new Name(...)` of a foreign aggregate. Returns false for any other
+    /// type, which ordinary construction checks.
+    pub(super) fn check_foreign_aggregate_construction(
+        &mut self,
+        class_type: &TypeRef,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let Some(info) = self.foreign.aggregates.get(&class_type.name).cloned() else {
+            return false;
+        };
+        let short = class_type
+            .name
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&class_type.name)
+            .to_string();
+        let Some(fields) = info.fields.clone() else {
+            for argument in args {
+                self.check_expr(&argument.value, scopes, method_context);
+            }
+            self.report_incomplete_by_value(&class_type.name, span);
+            return true;
+        };
+        if info.kind == ForeignAggregateKind::Union
+            && (args.len() > 1 || args.iter().any(|argument| argument.name.is_none()))
+        {
+            for argument in args {
+                self.check_expr(&argument.value, scopes, method_context);
+            }
+            self.diagnostics.push(
+                Diagnostic::new(
+                    UNION_CONSTRUCTION_CODE,
+                    format!(
+                        "a `{short}` is built with no arguments, every byte zero, or with exactly one named member"
+                    ),
+                    span,
+                )
+                .with_title("Union Construction Names One Member")
+                .with_help(format!(
+                    "write `new {short}()` or `new {short}(member: $value)`, then write any other member after construction"
+                )),
+            );
+            return true;
+        }
+        let params = fields
+            .iter()
+            .map(|field| ParamInfo {
+                name: field.name.clone(),
+                ty: field.ty,
+                take: false,
+                writable: false,
+                has_default: info.kind == ForeignAggregateKind::Union || field.has_default,
+                default: None,
+                declaration: Some(field.span),
+            })
+            .collect::<Vec<_>>();
+        for argument in args {
+            let target = match &argument.name {
+                Some(name) => fields.iter().find(|field| field.name == name.text),
+                None => None,
+            };
+            if let Some(field) = target {
+                if matches!(
+                    self.types.kind(field.ty),
+                    TypeKind::Foreign(ForeignType::FixedArray { .. })
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            crate::unsafe_code::NOT_AVAILABLE_CODE,
+                            "copying an `ArrayRegion<T>` into a fixed-length array field is part of Doria; this compiler does not implement it yet",
+                            argument.span,
+                        )
+                        .with_title("Fixed-Length Array Fields Cannot Be Supplied Yet")
+                        .with_help("omit the field: it is zero-filled"),
+                    );
+                    return true;
+                }
+            }
+        }
+        self.check_call_arguments(
+            &format!("`new {short}`"),
+            &params,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
+        true
+    }
+
+    /// The type of a field read, or `None` when `object_ty` is not a
+    /// foreign aggregate.
+    pub(super) fn check_foreign_field_read(
+        &mut self,
+        object_ty: TypeId,
+        property: &str,
+        member_span: Span,
+        span: Span,
+        null_safe: bool,
+    ) -> Option<TypeId> {
+        let (name, info) = self.aggregate_of(object_ty)?;
+        let Some(field) = info.field(property).cloned() else {
+            self.report_unknown_foreign_field(&name, &info, property, member_span);
+            return Some(self.types.unknown());
+        };
+        if matches!(
+            self.types.kind(field.ty),
+            TypeKind::Foreign(ForeignType::FixedArray { .. })
+        ) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    crate::unsafe_code::NOT_AVAILABLE_CODE,
+                    "reading a fixed-length array field as an `ArrayRegion<T>` is part of Doria; this compiler does not implement it yet",
+                    span,
+                )
+                .with_title("Fixed-Length Array Fields Cannot Be Read Yet"),
+            );
+            return Some(self.types.unknown());
+        }
+        if info.kind == ForeignAggregateKind::Union {
+            self.require_unsafe(span, &format!("reading the union member `${property}`"));
+        }
+        Some(
+            if null_safe && matches!(self.types.kind(object_ty), TypeKind::Nullable(_)) {
+                self.types.intern(TypeKind::Nullable(field.ty))
+            } else {
+                field.ty
+            },
+        )
+    }
+
+    /// The field type of a write target, or `None` when `object_ty` is not a
+    /// foreign aggregate. Writing a union member is safe. Whether the place
+    /// is writable is the ownership checker's rule, as for every place.
+    pub(super) fn check_foreign_field_write(
+        &mut self,
+        object_ty: TypeId,
+        property: &str,
+        member_span: Span,
+        span: Span,
+    ) -> Option<Option<TypeId>> {
+        let (name, info) = self.aggregate_of(object_ty)?;
+        let Some(field) = info.field(property).cloned() else {
+            self.report_unknown_foreign_field(&name, &info, property, member_span);
+            return Some(None);
+        };
+        if matches!(
+            self.types.kind(field.ty),
+            TypeKind::Foreign(ForeignType::FixedArray { .. })
+        ) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    crate::unsafe_code::NOT_AVAILABLE_CODE,
+                    "writing a fixed-length array field through a `WritableArrayRegion<T>` is part of Doria; this compiler does not implement it yet",
+                    span,
+                )
+                .with_title("Fixed-Length Array Fields Cannot Be Written Yet"),
+            );
+            return Some(None);
+        }
+        Some(Some(field.ty))
+    }
+
+    fn report_unknown_foreign_field(
+        &mut self,
+        name: &str,
+        info: &ForeignAggregateInfo,
+        property: &str,
+        span: Span,
+    ) {
+        let short = name.rsplit('\\').next().unwrap_or(name);
+        let mut diagnostic = Diagnostic::new(
+            FIELD_CODE,
+            format!("`{short}` has no field `${property}`"),
+            span,
+        )
+        .with_title("Foreign Aggregate Has No Such Field")
+        .with_related(info.declaration, "the type is declared here");
+        if info.fields.is_none() {
+            diagnostic = diagnostic.with_help(format!(
+                "`{short}` is declared without fields; C code reads it through a pointer"
+            ));
+        }
+        self.diagnostics.push(diagnostic);
+    }
+
+    /// `Name::SIZE` and `Name::ALIGNMENT` of a foreign aggregate.
+    pub(super) fn foreign_aggregate_constant(
+        &mut self,
+        qualifier: &StaticQualifier,
+        member: &str,
+        span: Span,
+    ) -> Option<TypeId> {
+        let StaticQualifier::Class(name) = qualifier else {
+            return None;
+        };
+        let info = self.foreign.aggregates.get(name)?.clone();
+        let short = name.rsplit('\\').next().unwrap_or(name);
+        if !matches!(member, "SIZE" | "ALIGNMENT") {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    FIELD_CODE,
+                    format!("`{short}` has the constants `SIZE` and `ALIGNMENT` and no `{member}`"),
+                    span,
+                )
+                .with_title("Foreign Aggregate Has No Such Constant"),
+            );
+            return Some(self.types.unknown());
+        }
+        if info.fields.is_none() {
+            self.report_incomplete_by_value(name, span);
+            return Some(self.types.unknown());
+        }
+        Some(self.types.intern(TypeKind::Integer(IntegerType::Int64)))
+    }
+
+    /// The type a field read has, without reporting anything; `None` when
+    /// `object_ty` is not a foreign aggregate.
+    pub(super) fn foreign_field_type(
+        &mut self,
+        object_ty: TypeId,
+        property: &str,
+        null_safe: bool,
+    ) -> Option<TypeId> {
+        let (_, info) = self.aggregate_of(object_ty)?;
+        let Some(field) = info.field(property) else {
+            return Some(self.types.unknown());
+        };
+        if matches!(
+            self.types.kind(field.ty),
+            TypeKind::Foreign(ForeignType::FixedArray { .. })
+        ) {
+            return Some(self.types.unknown());
+        }
+        let ty = field.ty;
+        Some(
+            if null_safe && matches!(self.types.kind(object_ty), TypeKind::Nullable(_)) {
+                self.types.intern(TypeKind::Nullable(ty))
+            } else {
+                ty
+            },
+        )
+    }
+
+    /// The type of `Name::SIZE` or `Name::ALIGNMENT`, without reporting.
+    pub(super) fn foreign_aggregate_constant_type(
+        &mut self,
+        qualifier: &StaticQualifier,
+        member: &str,
+    ) -> Option<TypeId> {
+        let StaticQualifier::Class(name) = qualifier else {
+            return None;
+        };
+        let info = self.foreign.aggregates.get(name)?;
+        Some(
+            if matches!(member, "SIZE" | "ALIGNMENT") && info.fields.is_some() {
+                self.types.intern(TypeKind::Integer(IntegerType::Int64))
+            } else {
+                self.types.unknown()
+            },
+        )
+    }
+
+    /// Foreign aggregates take no methods; every other name is reported by
+    /// ordinary member checking.
+    pub(super) fn reject_foreign_aggregate_method(
+        &mut self,
+        object_ty: TypeId,
+        method: &str,
+        span: Span,
+    ) -> bool {
+        let Some((name, info)) = self.aggregate_of(object_ty) else {
+            return false;
+        };
+        let short = name.rsplit('\\').next().unwrap_or(&name);
+        self.diagnostics.push(
+            Diagnostic::new(
+                FIELD_CODE,
+                format!(
+                    "`{short}` is a foreign {} and has no methods, so it has no `{method}()`",
+                    info.kind.keyword()
+                ),
+                span,
+            )
+            .with_title("Foreign Aggregate Has No Methods")
+            .with_related(info.declaration, "the type is declared here"),
+        );
+        true
+    }
+
+    /// Fields that are themselves foreign aggregates may not contain the
+    /// aggregate by value, directly or through other fields.
+    pub(super) fn check_foreign_aggregate_cycles(&mut self) {
+        let names = self.foreign.aggregates.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let mut visiting = HashSet::new();
+            if self.aggregate_contains(&name, &name, &mut visiting) {
+                let info = self.foreign.aggregates[&name].clone();
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        NOT_FFI_SAFE_CODE,
+                        format!(
+                            "`{}` contains itself by value, so it has no finite size",
+                            name.rsplit('\\').next().unwrap_or(&name)
+                        ),
+                        info.declaration,
+                    )
+                    .with_title("Type Cannot Cross The C Boundary")
+                    .with_help("hold the inner value through a pointer"),
+                );
+            }
+        }
+    }
+
+    fn aggregate_contains(
+        &self,
+        target: &str,
+        current: &str,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if !visiting.insert(current.to_string()) {
+            return false;
+        }
+        let Some(fields) = self
+            .foreign
+            .aggregates
+            .get(current)
+            .and_then(|info| info.fields.as_ref())
+        else {
+            return false;
+        };
+        fields.iter().any(|field| {
+            let mut ty = field.ty;
+            if let TypeKind::Foreign(ForeignType::FixedArray { element, .. }) = self.types.kind(ty)
+            {
+                ty = *element;
+            }
+            match self.types.kind(ty) {
+                TypeKind::Foreign(ForeignType::Aggregate(aggregate)) => {
+                    aggregate.name == target
+                        || self.aggregate_contains(target, &aggregate.name, visiting)
+                }
+                _ => false,
+            }
+        })
+    }
+}

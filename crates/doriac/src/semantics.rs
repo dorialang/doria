@@ -11,6 +11,7 @@ mod enum_inference;
 #[cfg(test)]
 mod enum_specialization_tests;
 pub(crate) mod executable_effects;
+mod foreign_aggregates;
 mod foreign_checks;
 mod instantiation;
 mod interface_witnesses;
@@ -3903,6 +3904,8 @@ impl<'program> Checker<'program> {
 
     fn check(&mut self) {
         self.predeclare_classes();
+        self.collect_foreign_aggregates();
+        self.check_foreign_aggregate_cycles();
         self.collect_enums();
         self.collect_classes();
         self.collect_interface_declarations();
@@ -9776,6 +9779,12 @@ impl<'program> Checker<'program> {
                     | TypeKind::Bool
                     | TypeKind::Enum(_) => true,
                     TypeKind::Class(class) => class.inline_copy_type().is_some(),
+                    // A nullable C pointer defaults to null (Decision 0148
+                    // section 15).
+                    TypeKind::Foreign(
+                        crate::foreign::ForeignType::Pointer { .. }
+                        | crate::foreign::ForeignType::Function(_),
+                    ) => true,
                     _ => false,
                 };
                 supported && !self.type_is_move_type(*inner)
@@ -13305,6 +13314,12 @@ impl<'program> Checker<'program> {
                     method_context,
                 );
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if self
+                    .check_foreign_field_read(object_ty, property, *member_span, *span, *null_safe)
+                    .is_some()
+                {
+                    return;
+                }
                 if property == "referencedValue"
                     && self
                         .shared_handle_type(object_ty, *null_safe)
@@ -13510,6 +13525,15 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 let class_name = &class_type.name;
+                if self.check_foreign_aggregate_construction(
+                    class_type,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 if self.interface_declaration(class_name).is_some()
                     || self.trait_declaration(class_name).is_some()
                 {
@@ -18286,6 +18310,14 @@ impl<'program> Checker<'program> {
                     return None;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some(field) =
+                    self.check_foreign_field_write(object_ty, property, *member_span, *span)
+                {
+                    return field.map(|ty| AssignmentTarget {
+                        ty,
+                        destination: AssignmentDestination::Type,
+                    });
+                }
                 if matches!(self.types.kind(object_ty), TypeKind::Enum(_)) {
                     self.diagnostics.push(
                         Diagnostic::new("E0578", "enum properties are readonly", *span)
@@ -18974,6 +19006,12 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if self.reject_foreign_aggregate_method(object_ty, method, member_span) {
+            for argument in args {
+                self.check_expr(&argument.value, scopes, method_context);
+            }
+            return;
+        }
         if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
             if let Some(declared) = self.trait_method(&owner, method) {
                 self.record_contract_member_reference(member_span, vec![declared.declaration]);
@@ -19965,6 +20003,12 @@ impl<'program> Checker<'program> {
         access: StaticAccess<'_>,
         method_context: Option<&MethodContext>,
     ) {
+        if self
+            .foreign_aggregate_constant(access.qualifier, access.member, access.member_span)
+            .is_some()
+        {
+            return;
+        }
         let Some(class_name) = self.resolve_static_qualifier(access, method_context) else {
             return;
         };
@@ -23658,6 +23702,9 @@ impl<'program> Checker<'program> {
                     return result;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some(field) = self.foreign_field_type(object_ty, property, *null_safe) {
+                    return field;
+                }
                 if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                     return self
                         .trait_property(&owner, property)
@@ -23978,6 +24025,9 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
+                if let Some(ty) = self.foreign_aggregate_constant_type(qualifier, member) {
+                    return ty;
+                }
                 let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context)
                 else {
                     return self.types.unknown();
