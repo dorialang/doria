@@ -177,8 +177,10 @@ fn check_entry(entry: &doria_diagnostic_catalogue::explanations::DiagnosticEntry
     let raised = if entry.example_is_development_source {
         development_source_diagnostics(example)
     } else {
-        match doriac::check_source(format!("{code}.doria"), example) {
-            Ok(_) => Vec::new(),
+        // A warning does not stop checking, so a warning's example checks
+        // and reports it beside the program.
+        match doriac::check_source_with_warnings(format!("{code}.doria"), example) {
+            Ok((_, warnings)) => warnings,
             Err(diagnostics) => diagnostics,
         }
     };

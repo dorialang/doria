@@ -117,6 +117,14 @@ a version increment. A location whose source text is unavailable keeps its
 `source` and byte `span` and has a `null` `range` (call-path frames: `null`
 `line` and `column`).
 
+Only an error stops a command. A program whose findings are warnings and
+notes checks, compiles and runs, and every command exits as it would without
+them. `check` reports its warnings as its result: on stderr with the
+`Compilation Completed With Warnings` summary before `OK`, or in its JSON
+envelope. Every other command writes its warnings to stderr in the selected
+format, because stdout carries its own result: the output path, the program's
+output, or the metadata, HIR or MIR document.
+
 `--diagnostic-color auto` colors only an interactive stderr and honors
 `NO_COLOR`. `always` and `never` are explicit and testable.
 

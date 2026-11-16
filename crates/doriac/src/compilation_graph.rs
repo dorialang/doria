@@ -1011,12 +1011,17 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
 }
 
 pub fn check_compilation_graph(graph: &CompilationGraph) -> DiagnosticResult<Program> {
+    check_compilation_graph_with_warnings(graph).map(|(program, _)| program)
+}
+
+/// Checks a graph. A graph with warnings and no errors checks; its warnings
+/// come back beside the program.
+pub fn check_compilation_graph_with_warnings(
+    graph: &CompilationGraph,
+) -> DiagnosticResult<(Program, Vec<crate::diagnostics::Diagnostic>)> {
     let analysis = analyze_compilation_graph_for_ide(graph);
-    if analysis.diagnostics.is_empty() {
-        Ok(analysis.resolved_program)
-    } else {
-        Err(analysis.diagnostics)
-    }
+    let warnings = crate::diagnostics::separate_errors(analysis.diagnostics)?;
+    Ok((analysis.resolved_program, warnings))
 }
 
 fn selected_context(graph: &CompilationGraph) -> CompilationContext {

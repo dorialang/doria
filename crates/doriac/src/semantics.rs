@@ -260,6 +260,9 @@ pub struct AssertionCompletionInfo {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticInfo {
+    /// Warnings and notes from checking a program that has no errors. They
+    /// do not stop compilation; every command reports them beside its result.
+    pub warnings: Vec<Diagnostic>,
     /// Compiler inputs that own this semantic analysis. Namespace and package
     /// identity deliberately remain independent.
     pub compilation_context: crate::names::CompilationContext,
@@ -1533,6 +1536,9 @@ fn finish_checked_analysis(
     );
     let mut analysis = SemanticAnalysis {
         info: SemanticInfo {
+            // The entry points that accept an analysis fill this from its
+            // diagnostics once they know no error is among them.
+            warnings: Vec::new(),
             compilation_context: checker.compilation_context,
             compilation_contexts: checker.compilation_contexts,
             source_semantic_contexts: checker.source_semantic_contexts,

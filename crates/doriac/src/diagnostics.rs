@@ -11,6 +11,21 @@ pub const DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 
 pub type DiagnosticResult<T> = Result<T, Vec<Diagnostic>>;
 
+/// Splits the findings of checking a program by Decision 0108's severity
+/// model: any error fails it, and warnings and notes alone do not. `Ok` holds
+/// the warnings and notes to report beside the result; `Err` holds every
+/// finding, in order.
+pub fn separate_errors(diagnostics: Vec<Diagnostic>) -> Result<Vec<Diagnostic>, Vec<Diagnostic>> {
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    {
+        Err(diagnostics)
+    } else {
+        Ok(diagnostics)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
     Error,

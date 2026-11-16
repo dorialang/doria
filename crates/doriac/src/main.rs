@@ -107,6 +107,31 @@ impl CliError {
     }
 }
 
+/// Reports the warnings of a command that succeeded. Warnings never stop
+/// compilation (Decision 0108's severity model). They go to standard error
+/// in every format, because standard output carries the command's own
+/// result; `check`, whose result is its findings, writes them itself.
+fn report_warnings(sources: WarningSources<'_>, warnings: &[Diagnostic], options: RenderOptions) {
+    if warnings.is_empty() {
+        return;
+    }
+    let rendered = match sources {
+        WarningSources::Source { path, text } => {
+            doriac::render_diagnostics_with_options(path, text, warnings, options)
+        }
+        WarningSources::Graph(map) => {
+            doriac::diagnostics::render_diagnostics_with_source_map(map, warnings, options)
+        }
+    };
+    eprintln!("{rendered}");
+}
+
+#[derive(Clone, Copy)]
+enum WarningSources<'a> {
+    Source { path: &'a str, text: &'a str },
+    Graph(&'a doriac::source_map::SourceMap),
+}
+
 impl From<String> for CliError {
     fn from(message: String) -> Self {
         Self::Message(message)
@@ -183,26 +208,30 @@ fn run() -> Result<ExitCode, CliError> {
             if let Some(plan_path) = build_plan_argument(&args)? {
                 let (_, graph) = load_cli_graph(plan_path, options)?;
                 let analysis = doriac::analyze_compilation_graph_for_ide(&graph);
-                if analysis.diagnostics.is_empty() {
-                    if options.format == DiagnosticFormat::Json {
-                        println!(
-                            "{}",
-                            doriac::diagnostics::render_diagnostics_with_source_map(
-                                &graph.source_map,
-                                &[],
-                                options,
-                            )
-                        );
-                    } else {
-                        println!("OK");
+                let warnings = match doriac::diagnostics::separate_errors(analysis.diagnostics) {
+                    Ok(warnings) => warnings,
+                    Err(diagnostics) => {
+                        return Err(CliError::graph_diagnostics(
+                            graph.source_map,
+                            diagnostics,
+                            options,
+                        ))
                     }
-                    return Ok(ExitCode::SUCCESS);
+                };
+                if options.format == DiagnosticFormat::Json {
+                    println!(
+                        "{}",
+                        doriac::diagnostics::render_diagnostics_with_source_map(
+                            &graph.source_map,
+                            &warnings,
+                            options,
+                        )
+                    );
+                } else {
+                    report_warnings(WarningSources::Graph(&graph.source_map), &warnings, options);
+                    println!("OK");
                 }
-                return Err(CliError::graph_diagnostics(
-                    graph.source_map,
-                    analysis.diagnostics,
-                    options,
-                ));
+                return Ok(ExitCode::SUCCESS);
             }
             let input = args
                 .first()
@@ -211,14 +240,22 @@ fn run() -> Result<ExitCode, CliError> {
                 return Err(format!("unknown check option `{option}`").into());
             }
             let (path, text) = read_source(input)?;
-            match doriac::check_source(path.clone(), text.clone()) {
-                Ok(_) => {
+            match doriac::check_source_with_warnings(path.clone(), text.clone()) {
+                Ok((_, warnings)) => {
                     if options.format == DiagnosticFormat::Json {
                         println!(
                             "{}",
-                            doriac::render_diagnostics_with_options(path, text, &[], options)
+                            doriac::render_diagnostics_with_options(path, text, &warnings, options)
                         );
                     } else {
+                        report_warnings(
+                            WarningSources::Source {
+                                path: &path,
+                                text: &text,
+                            },
+                            &warnings,
+                            options,
+                        );
                         println!("OK");
                     }
                     Ok(ExitCode::SUCCESS)
@@ -476,7 +513,7 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
             &out_path,
             performance_report.as_deref().map(Path::new),
         )?;
-        let (output, report) = if performance_report.is_some() {
+        let (output, report, warnings) = if performance_report.is_some() {
             let compilation = doriac::performance::compile_native_graph(
                 &graph,
                 plan_path,
@@ -490,17 +527,27 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
                     diagnostic_options,
                 )
             })?;
-            (compilation.output, Some(compilation.report))
+            (
+                compilation.output,
+                Some(compilation.report),
+                compilation.warnings,
+            )
         } else {
-            let output = doriac::compile_compilation_graph(&graph).map_err(|diagnostics| {
-                CliError::graph_diagnostics(
-                    graph.source_map.clone(),
-                    diagnostics,
-                    diagnostic_options,
-                )
-            })?;
-            (output, None)
+            let (output, warnings) = doriac::compile_compilation_graph_with_warnings(&graph)
+                .map_err(|diagnostics| {
+                    CliError::graph_diagnostics(
+                        graph.source_map.clone(),
+                        diagnostics,
+                        diagnostic_options,
+                    )
+                })?;
+            (output, None, warnings)
         };
+        report_warnings(
+            WarningSources::Graph(&graph.source_map),
+            &warnings,
+            diagnostic_options,
+        );
         write_backend_output(&out_path, output).map_err(|error| {
             CliError::graph_diagnostics(
                 graph.source_map.clone(),
@@ -543,7 +590,7 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
             NativeProfile::Fast
         },
     };
-    let (output, mut report) = if performance_report.is_some() {
+    let (output, mut report, warnings) = if performance_report.is_some() {
         let command = utf8_cli_arguments(&invocation)?;
         let compilation = doriac::performance::compile_native(
             path.clone(),
@@ -555,14 +602,30 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         .map_err(|diagnostics| {
             CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
         })?;
-        (compilation.output, Some(compilation.report))
+        (
+            compilation.output,
+            Some(compilation.report),
+            compilation.warnings,
+        )
     } else {
-        let output = doriac::compile_source_with_options(path.clone(), text.clone(), options)
-            .map_err(|diagnostics| {
-                CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
-            })?;
-        (output, None)
+        let (output, warnings) = doriac::compile_source_with_warnings(
+            path.clone(),
+            text.clone(),
+            options,
+        )
+        .map_err(|diagnostics| {
+            CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+        })?;
+        (output, None, warnings)
     };
+    report_warnings(
+        WarningSources::Source {
+            path: &path,
+            text: &text,
+        },
+        &warnings,
+        diagnostic_options,
+    );
 
     write_backend_output(&out_path, output).map_err(|error| {
         CliError::diagnostics(
@@ -792,41 +855,20 @@ fn ast_command(args: &[String]) -> Result<(), CliError> {
 fn metadata_command(args: &[String]) -> Result<(), CliError> {
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let (args, schema_version) = metadata_schema_version(args)?;
-    let document = (if let Some(plan_path) = build_plan_argument(&args)? {
+    let document = if let Some(plan_path) = build_plan_argument(&args)? {
         if args.len() != 2 {
             return Err(format!("unknown metadata option `{}`", args[2]).into());
         }
         let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
-        match schema_version {
-            1 => encode_metadata(&doriac::metadata_compilation_graph(&graph).map_err(
-                |diagnostics| {
-                    CliError::graph_diagnostics(
-                        graph.source_map.clone(),
-                        diagnostics,
-                        diagnostic_options,
-                    )
-                },
-            )?),
-            2 => encode_metadata(&doriac::metadata_compilation_graph_v2(&graph).map_err(
-                |diagnostics| {
-                    CliError::graph_diagnostics(
-                        graph.source_map.clone(),
-                        diagnostics,
-                        diagnostic_options,
-                    )
-                },
-            )?),
-            3 => encode_metadata(&doriac::metadata_compilation_graph_v3(&graph).map_err(
-                |diagnostics| {
-                    CliError::graph_diagnostics(
-                        graph.source_map.clone(),
-                        diagnostics,
-                        diagnostic_options,
-                    )
-                },
-            )?),
-            _ => unreachable!(),
-        }
+        let hir = doriac::lower_compilation_graph(&graph).map_err(|diagnostics| {
+            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
+        })?;
+        report_warnings(
+            WarningSources::Graph(&graph.source_map),
+            &hir.semantic_info.warnings,
+            diagnostic_options,
+        );
+        encode_metadata_document(&hir, graph.fingerprint.clone(), schema_version)?
     } else {
         let input = args
             .first()
@@ -835,42 +877,35 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
             return Err(format!("unknown metadata option `{option}`").into());
         }
         let (path, text) = read_source(input)?;
-        match schema_version {
-            1 => encode_metadata(
-                &doriac::metadata_source(path.clone(), text.clone()).map_err(|diagnostics| {
-                    CliError::diagnostics(
-                        path.clone(),
-                        text.clone(),
-                        diagnostics,
-                        diagnostic_options,
-                    )
-                })?,
-            ),
-            2 => encode_metadata(
-                &doriac::metadata_source_v2(path.clone(), text.clone()).map_err(|diagnostics| {
-                    CliError::diagnostics(
-                        path.clone(),
-                        text.clone(),
-                        diagnostics,
-                        diagnostic_options,
-                    )
-                })?,
-            ),
-            3 => encode_metadata(
-                &doriac::metadata_source_v3(path.clone(), text.clone()).map_err(|diagnostics| {
-                    CliError::diagnostics(
-                        path.clone(),
-                        text.clone(),
-                        diagnostics,
-                        diagnostic_options,
-                    )
-                })?,
-            ),
-            _ => unreachable!(),
-        }
-    })?;
+        let fingerprint = doriac::source_fingerprint(&path, &text);
+        let hir = doriac::lower_source(path.clone(), text.clone()).map_err(|diagnostics| {
+            CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+        })?;
+        report_warnings(
+            WarningSources::Source {
+                path: &path,
+                text: &text,
+            },
+            &hir.semantic_info.warnings,
+            diagnostic_options,
+        );
+        encode_metadata_document(&hir, fingerprint, schema_version)?
+    };
     println!("{document}");
     Ok(())
+}
+
+fn encode_metadata_document(
+    hir: &doriac::hir::Program,
+    fingerprint: String,
+    schema_version: u32,
+) -> Result<String, CliError> {
+    match schema_version {
+        1 => encode_metadata(&doriac::attributes::metadata_document(hir, fingerprint)),
+        2 => encode_metadata(&doriac::attributes::metadata_document_v2(hir, fingerprint)),
+        3 => encode_metadata(&doriac::attributes::metadata_document_v3(hir, fingerprint)),
+        _ => unreachable!("metadata_schema_version accepts versions 1 to 3"),
+    }
 }
 
 fn encode_metadata(document: &impl serde::Serialize) -> Result<String, CliError> {
@@ -913,6 +948,11 @@ fn hir_command(args: &[String]) -> Result<(), CliError> {
         let hir = doriac::lower_compilation_graph(&graph).map_err(|diagnostics| {
             CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
         })?;
+        report_warnings(
+            WarningSources::Graph(&graph.source_map),
+            &hir.semantic_info.warnings,
+            diagnostic_options,
+        );
         println!("{hir:#?}");
         return Ok(());
     }
@@ -921,8 +961,16 @@ fn hir_command(args: &[String]) -> Result<(), CliError> {
         .ok_or_else(|| "missing input file".to_string())?;
     let (path, text) = read_source(input)?;
     let hir = doriac::lower_source(path.clone(), text.clone()).map_err(|diagnostics| {
-        CliError::diagnostics(path, text, diagnostics, diagnostic_options)
+        CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
     })?;
+    report_warnings(
+        WarningSources::Source {
+            path: &path,
+            text: &text,
+        },
+        &hir.semantic_info.warnings,
+        diagnostic_options,
+    );
     println!("{hir:#?}");
     Ok(())
 }
@@ -931,9 +979,16 @@ fn mir_command(args: &[String]) -> Result<(), CliError> {
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     if let Some(plan_path) = build_plan_argument(&args)? {
         let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
-        let mir = doriac::lower_compilation_graph_to_mir(&graph).map_err(|diagnostics| {
+        let to_cli = |diagnostics| {
             CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
-        })?;
+        };
+        let hir = doriac::lower_compilation_graph(&graph).map_err(to_cli)?;
+        report_warnings(
+            WarningSources::Graph(&graph.source_map),
+            &hir.semantic_info.warnings,
+            diagnostic_options,
+        );
+        let mir = doriac::lower_hir_to_mir(&hir).map_err(to_cli)?;
         print!("{mir}");
         return Ok(());
     }
@@ -941,9 +996,19 @@ fn mir_command(args: &[String]) -> Result<(), CliError> {
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let (path, text) = read_source(input)?;
-    let mir = doriac::lower_source_to_mir(path.clone(), text.clone()).map_err(|diagnostics| {
-        CliError::diagnostics(path, text, diagnostics, diagnostic_options)
-    })?;
+    let to_cli = |diagnostics| {
+        CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+    };
+    let hir = doriac::lower_source(path.clone(), text.clone()).map_err(to_cli)?;
+    report_warnings(
+        WarningSources::Source {
+            path: &path,
+            text: &text,
+        },
+        &hir.semantic_info.warnings,
+        diagnostic_options,
+    );
+    let mir = doriac::lower_hir_to_mir(&hir).map_err(to_cli)?;
     print!("{mir}");
     Ok(())
 }
@@ -1249,9 +1314,19 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
         if graph.build_plan.compiler.target != doriac::build_plan::CompilerTarget::Native {
             return Err("running a build plan requires compiler.target `native`".into());
         }
-        let output = doriac::compile_compilation_graph(&graph).map_err(|diagnostics| {
-            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
-        })?;
+        let (output, warnings) =
+            doriac::compile_compilation_graph_with_warnings(&graph).map_err(|diagnostics| {
+                CliError::graph_diagnostics(
+                    graph.source_map.clone(),
+                    diagnostics,
+                    diagnostic_options,
+                )
+            })?;
+        report_warnings(
+            WarningSources::Graph(&graph.source_map),
+            &warnings,
+            diagnostic_options,
+        );
         let (status, runtime_payload) = execute_native_output(plan_path, output, program_args)?;
         if let Some(payload) = runtime_payload {
             let fallback_path = graph
@@ -1301,7 +1376,7 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
     } else {
         NativeProfile::Fast
     };
-    let output = doriac::compile_source_with_options(
+    let (output, warnings) = doriac::compile_source_with_warnings(
         path.clone(),
         text.clone(),
         CompileOptions::native(profile),
@@ -1309,6 +1384,14 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
     .map_err(|diagnostics| {
         CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
     })?;
+    report_warnings(
+        WarningSources::Source {
+            path: &path,
+            text: &text,
+        },
+        &warnings,
+        diagnostic_options,
+    );
 
     let (status, runtime_payload) = execute_native_output(input, output, program_args)?;
     let runtime_diagnostic = runtime_payload
