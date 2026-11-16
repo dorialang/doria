@@ -586,14 +586,19 @@ fn enum_surface_rejects_implicit_conversion_display_and_conformance() {
         "enum Priority: int { case Low = 1; } Priority $priority = Priority::Low; $priority->value = 2;",
         "E0578",
     );
-    diagnostic(
+    // A Copy enum is Hashable when its payloads are (Decision 0096), so a
+    // unit enum is a Set element and a Dictionary key.
+    for source in [
         "enum Status { case Ready; } Set<Status> $statuses = [Status::Ready];",
-        "E0523",
-    );
-    diagnostic(
         "enum Status { case Ready; } Dictionary<Status, string> $labels = [Status::Ready => \"ready\"];",
-        "E0523",
-    );
+    ] {
+        assert!(
+            findings(source)
+                .iter()
+                .all(|diagnostic| diagnostic.code != "E0523"),
+            "{source}"
+        );
+    }
 }
 
 #[test]
