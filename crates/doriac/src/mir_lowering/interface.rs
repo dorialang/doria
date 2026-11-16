@@ -1080,7 +1080,13 @@ fn build_entry(
         id,
         name: format!("{}::<interface-entry#{}>", implementation.name, table.id.0),
         source_span: span,
-        diagnostic_frame: mir::DiagnosticFrame::Forwarded(direct),
+        // A compiler-known implementation reports at its caller's site, and
+        // so does the entry that forwards to it.
+        diagnostic_frame: if span.source.is_compiler_owned() {
+            mir::DiagnosticFrame::Caller
+        } else {
+            mir::DiagnosticFrame::Forwarded(direct)
+        },
         method: None,
         virtual_slot: None,
         receiver_mode: None,

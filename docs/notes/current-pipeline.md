@@ -13,6 +13,13 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Compiler-known panic location, 2026-11-16 (Andrew: "Fix it in this beat
+  (Recommended)"). A function of a compiler-known module runs in its caller's
+  diagnostic frame (`mir::DiagnosticFrame::Caller`), so a panic it raises,
+  such as a negative position in `Console::moveTo` or `new Position`, is
+  reported at the user's call in the interpreter, Cranelift and LLVM output,
+  and its frame is left out of the trace. A closure written inside a
+  compiler-known module keeps its own frame.
 - Copy enum core conformance, 2026-11-16 (Decision 0096 implemented for
   enums; Decision 0114 amendment): Copy enums meet `Equatable`, `Hashable`
   and `Comparable` when their payloads do, ordered by declaration, then

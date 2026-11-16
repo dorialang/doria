@@ -443,6 +443,54 @@ fn run_keeps_program_output_separate_from_the_structured_runtime_outcome() {
     let _ = fs::remove_dir_all(temp_dir);
 }
 
+/// A panic raised inside a compiler-known module is reported at the user's
+/// call: `new Position(1, -2)` panics in the Term module, and the report
+/// names line 3 of `main.doria`. Each native profile is held to it.
+fn compiler_known_panic_is_reported_at_the_call(profile_arguments: &[&str]) {
+    let temp_dir = temp_dir_path(&format!("compiler-known-panic-{}", profile_arguments.len()));
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): void\n{\n    let $at = new Doria\\Std\\Term\\Position(1, -2);\n    echo $at->row;\n}\n",
+    )
+    .expect("source should be writable");
+    let mut arguments = vec!["run", "main.doria"];
+    arguments.extend_from_slice(profile_arguments);
+    arguments.extend([
+        "--diagnostic-format",
+        "concise",
+        "--diagnostic-color",
+        "never",
+    ]);
+    let output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(&arguments)
+        .output()
+        .expect("doriac binary should run");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert_eq!(output.status.code(), Some(101), "{stderr}");
+    assert!(
+        stderr.starts_with("main.doria:3:15: Panic["),
+        "{profile_arguments:?}: {stderr}"
+    );
+    assert!(!stderr.contains("compiler-known"), "{stderr}");
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn a_compiler_known_panic_is_reported_at_the_call_in_native_output() {
+    compiler_known_panic_is_reported_at_the_call(&[]);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_compiler_known_panic_is_reported_at_the_call_in_release_output() {
+    if !host_linker_is_available() {
+        return;
+    }
+    compiler_known_panic_is_reported_at_the_call(&["--release"]);
+}
+
 #[test]
 fn run_runtime_outcome_honours_concise_and_json_formats() {
     let temp_dir = temp_dir_path("runtime-outcome-formats");

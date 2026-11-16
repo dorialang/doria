@@ -4078,7 +4078,14 @@ fn lower_function(
         id: signature.id,
         name: inputs_method_name(function, class, inputs.semantic_info),
         source_span: function.span,
-        diagnostic_frame: mir::DiagnosticFrame::Authored,
+        // A function of a compiler-known module (Term, Time, Text and the
+        // others) runs in its caller's diagnostic frame, so a panic it raises
+        // is reported at the user's call, in every backend.
+        diagnostic_frame: if function.span.source.is_compiler_owned() {
+            mir::DiagnosticFrame::Caller
+        } else {
+            mir::DiagnosticFrame::Authored
+        },
         method: class.map(|class| mir::MethodIdentity {
             class,
             name: function.name.clone(),

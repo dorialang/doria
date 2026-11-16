@@ -1255,6 +1255,13 @@ fn a_negative_size_or_position_panics() {
         let output = run(&source, None);
         assert_eq!(output.exit_status, 101, "{value}");
         let panic = output.runtime_diagnostic.expect("the panic is reported");
+        // The Term module raises it; the report is at the user's `new`.
+        assert!(
+            !panic.span.source.is_compiler_owned()
+                && panic.span.start == source.find("new").expect("a construction"),
+            "{value}: {:?} in {source:?}",
+            panic.span
+        );
         assert!(
             panic.notes.iter().any(|note| note.contains(message)),
             "{value}: {panic:#?}"

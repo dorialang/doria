@@ -2270,15 +2270,17 @@ fn validate_diagnostic_frame(
     match function.diagnostic_frame {
         mir::DiagnosticFrame::Authored => unreachable!(),
         mir::DiagnosticFrame::Caller => {
-            if !interface_entry.is_some_and(|table| {
-                matches!(
-                    table.implementing_type,
-                    mir::ImplementingType::Collection(_)
-                        | mir::ImplementingType::CollectionIterator(_)
-                )
-            }) {
+            if !function.source_span.source.is_compiler_owned()
+                && !interface_entry.is_some_and(|table| {
+                    matches!(
+                        table.implementing_type,
+                        mir::ImplementingType::Collection(_)
+                            | mir::ImplementingType::CollectionIterator(_)
+                    )
+                })
+            {
                 return Err(malformed_mir(
-                    "caller diagnostic frame requires a collection interface entry",
+                    "caller diagnostic frame requires a compiler-known function or a collection interface entry",
                 ));
             }
         }

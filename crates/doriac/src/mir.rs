@@ -935,7 +935,8 @@ pub enum DiagnosticFrame {
     Authored,
     /// A dispatch adapter forwards to this authored implementation.
     Forwarded(FunctionId),
-    /// A compiler-owned collection entry executes at the caller's site.
+    /// A compiler-known function, or a compiler-owned collection entry,
+    /// executes at the caller's site.
     Caller,
 }
 
