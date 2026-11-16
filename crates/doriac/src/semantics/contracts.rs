@@ -862,7 +862,12 @@ impl Checker<'_> {
             Diagnostic::new(
                 "E0760",
                 format!(
-                    "primitive `{}` cannot inhabit an interface-typed slot",
+                    "{} `{}` cannot inhabit an interface-typed slot",
+                    if matches!(self.types.kind(value), TypeKind::Enum(_)) {
+                        "enum"
+                    } else {
+                        "primitive"
+                    },
                     self.types.display(value)
                 ),
                 span,
@@ -873,10 +878,17 @@ impl Checker<'_> {
         true
     }
 
+    /// Values whose conformance is compiler-known have no vtable to erase
+    /// into: primitives, and enums, which declare no `implements` clause and
+    /// conform to the core contracts as primitives do (Decision 0096).
     pub(super) fn primitive_interface_erasure_is_forbidden(&self, value: TypeId) -> bool {
         matches!(
             self.types.kind(value),
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
+            TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::Bool
+                | TypeKind::String
+                | TypeKind::Enum(_)
         )
     }
 
@@ -1241,6 +1253,7 @@ impl Checker<'_> {
                 }
             }
         }
+        self.check_specialized_collection_keys(body);
     }
 
     pub(super) fn trait_declaration(&self, name: &str) -> Option<&crate::ast::TraitDecl> {

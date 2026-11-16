@@ -26,6 +26,7 @@ mod concurrency;
 mod core_collection;
 mod core_value;
 mod diagnostic_sites;
+mod enum_core;
 mod expression_region;
 mod float_text;
 mod integers;
@@ -3037,6 +3038,7 @@ fn validate_type(
 }
 
 fn validate_resolved_type(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
+    enum_core::validate_collection(ty, span)?;
     match ty {
         ResolvedType::ByteRegion(_) => Ok(()),
         ResolvedType::SharedHandle(_, payload) => {
@@ -3324,6 +3326,9 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             "PHP validation revisited an expression subtree"
         );
     }
+    if let Some(ty) = semantic_info.expression_type(expr.span()) {
+        enum_core::validate_collection(ty, expr.span())?;
+    }
     match expr {
         Expr::Assertion(assertion) => {
             for operand in [
@@ -3456,6 +3461,12 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         } => {
             validate_expr(object, semantic_info)?;
             validate_arguments(args, semantic_info)?;
+            enum_core::validate_call(
+                semantic_info
+                    .plan
+                    .target(*span, semantic_info.substitutions),
+                *span,
+            )?;
             let receiver_type = semantic_info.expression_type(object.span());
             if receiver_type.is_some_and(is_stage23_runtime_type)
                 && !receiver_type.is_some_and(core_collection::uses_receiver)
@@ -11701,17 +11712,16 @@ fn emit_primitive_core_call(expr: &Expr, scopes: &PhpNameScopes) -> Option<Strin
     else {
         return None;
     };
-    if !matches!(
-        receiver,
-        ResolvedType::Integer(_)
-            | ResolvedType::Float(_)
-            | ResolvedType::Bool
-            | ResolvedType::String
-    ) {
+    if !receiver.uses_compiler_known_core_operations() {
         return None;
     }
     let operation = CoreValueOperation::from_requirement(requirement)?;
     let left = emit_expr(object, scopes);
+    if matches!(receiver, ResolvedType::Enum(_)) {
+        // PHP validation refuses an enum's hash and compare (B4601).
+        return (operation == CoreValueOperation::Equal)
+            .then(|| enum_core::equal(&left, &emit_expr(&args[0].value, scopes)));
+    }
     Some(match operation {
         CoreValueOperation::Equal => format!("({left} === {})", emit_expr(&args[0].value, scopes)),
         CoreValueOperation::Hash => {

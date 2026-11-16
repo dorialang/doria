@@ -13,6 +13,16 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Copy enum core conformance, 2026-11-16 (Decision 0096 implemented for
+  enums; Decision 0114 amendment): Copy enums meet `Equatable`, `Hashable`
+  and `Comparable` when their payloads do, ordered by declaration, then
+  payloads. One conformance question in the checker, one MIR lowering
+  (`mir_lowering/core_enum.rs`) for every native backend, one
+  `CollectionComparator::for_element`. Implementation boundaries, both
+  planned: E0783 for an enum with payload cases as a hashed or ordered
+  collection key or element (the core-comparator collections move a key as
+  one word), and B4601 for PHP output of an enum's `hash`, `compare` and
+  collection keys (equality is generated).
 - Term value constructors, 2026-11-16 (Decision 0140 amendment): `new Size`,
   `new Position`, `new KeyModifiers` and `KeyModifiers::none`. `new` on a
   compiler-known inline value is checked against its public constructor and

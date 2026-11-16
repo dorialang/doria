@@ -19,14 +19,9 @@ fn selected_primitive_requirement(span: Span, context: &LoweringContext<'_>) -> 
     else {
         return None;
     };
-    matches!(
-        receiver,
-        ResolvedType::Integer(_)
-            | ResolvedType::Float(_)
-            | ResolvedType::Bool
-            | ResolvedType::String
-    )
-    .then_some(requirement)
+    receiver
+        .uses_compiler_known_core_operations()
+        .then_some(requirement)
 }
 
 pub(super) fn selects_primitive_call(expr: &hir::Expr, context: &LoweringContext<'_>) -> bool {
@@ -58,6 +53,52 @@ pub(super) fn primitive_call(
         .first()
         .map(|argument| materialize_operand(&argument.value, context))
         .transpose()?;
+    let result = operate(operation, receiver, other, *span, context)?;
+    Ok(Some(result))
+}
+
+/// One core value operation on materialized values, chosen by their type: a
+/// primitive, a Copy enum, or a class or interface value through [`invoke`].
+/// Every path that needs equality, a hash or an order for a value asks here.
+pub(super) fn operate(
+    operation: CoreValueOperation,
+    receiver: (mir::LocalId, mir::Type),
+    other: Option<(mir::LocalId, mir::Type)>,
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<mir::Rvalue> {
+    if super::core_enum::is_enum(receiver.1) {
+        return super::core_enum::operation(operation, receiver, other, span, context);
+    }
+    if matches!(
+        receiver.1,
+        mir::Type::Scalar(
+            mir::ScalarType::Integer(_) | mir::ScalarType::Float(_) | mir::ScalarType::Bool
+        ) | mir::Type::String
+    ) {
+        return primitive_operation(operation, receiver, other, span, context);
+    }
+    invoke(
+        operation,
+        local_rvalue(receiver.0, receiver.1, false),
+        other
+            .map(|(local, ty)| local_rvalue(local, ty, false))
+            .into_iter()
+            .collect(),
+        span,
+        false,
+        context,
+    )
+}
+
+fn primitive_operation(
+    operation: CoreValueOperation,
+    receiver: (mir::LocalId, mir::Type),
+    other: Option<(mir::LocalId, mir::Type)>,
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<mir::Rvalue> {
+    let span = &span;
     let result = match operation {
         CoreValueOperation::Equal => {
             mir::Rvalue::Value(mir::ValueExpression::Bool(primitive_compare(
@@ -102,7 +143,7 @@ pub(super) fn primitive_call(
             )]);
         }
     };
-    Ok(Some(result))
+    Ok(result)
 }
 
 fn primitive_compare(
@@ -967,6 +1008,14 @@ pub(super) fn invoke(
     consume_result: bool,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if super::core_enum::is_enum(receiver.ty()) {
+        let receiver = materialize_value(receiver, context);
+        let other = args
+            .into_iter()
+            .next()
+            .map(|argument| materialize_value(argument, context));
+        return super::core_enum::operation(operation, receiver, other, span, context);
+    }
     let target = selected_target(operation, receiver.ty(), span, context).ok_or_else(|| {
         vec![unsupported(
             span,

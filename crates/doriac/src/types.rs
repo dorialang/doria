@@ -1089,6 +1089,20 @@ pub enum ResolvedType {
     Unsupported,
 }
 
+impl ResolvedType {
+    /// Whether this type answers the core value contracts (Equatable,
+    /// Comparable, Hashable) with compiler-known operations instead of a
+    /// declared implementation: the primitives and enums (Decision 0096).
+    /// The checker decides which of these conform to which contract; this
+    /// says only that no class method is selected.
+    pub const fn uses_compiler_known_core_operations(&self) -> bool {
+        matches!(
+            self,
+            Self::Integer(_) | Self::Float(_) | Self::Bool | Self::String | Self::Enum(_)
+        )
+    }
+}
+
 pub(crate) fn resolved_type_is_symbolic(ty: &ResolvedType) -> bool {
     match ty {
         ResolvedType::TypeParameter(_) => true,

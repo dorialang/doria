@@ -724,6 +724,58 @@ function main(): void {
 }
 
 #[test]
+fn php_compares_enum_values_exactly_and_refuses_their_order_and_hash() {
+    let enums = "enum Focus { case Search; case List; } enum Cell { case Empty; case Glyph(string $text, int $width); }";
+    let source = format!(
+        r#"{enums}
+function same<T implements Equatable<T>>(T $left, T $right): bool {{ return $left->equals($right); }}
+function main(): void {{
+    echo same(Focus::List, Focus::List) ? "y" : "n";
+    echo same(Focus::List, Focus::Search) ? "y" : "n";
+    echo same(Cell::Glyph("a", 1), Cell::Glyph("a", 1)) ? "y" : "n";
+    echo same(Cell::Glyph("a", 1), Cell::Glyph("a", 2)) ? "y" : "n";
+    echo same(Cell::Empty, Cell::Empty) ? "y" : "n";
+    echo "\n";
+}}
+"#
+    );
+    let program = doriac::lower_source_to_mir("enum-equality.doria", &source).unwrap();
+    let expected = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(expected.stdout, b"ynyny\n");
+    let php = doriac::compile_source_to_php("enum-equality.doria", &source).unwrap();
+    assert!(php.contains("__doria_equal("), "{php}");
+    let script = format!(
+        "{}\n{}();",
+        php.strip_prefix("<?php").unwrap(),
+        php_function_name("main")
+    );
+    let output = php_execution::Script::new(&script)
+        .command(&[])
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, expected.stdout, "{output:?}");
+
+    for body in [
+        "function order<T implements Comparable<T>>(T $left, T $right): Ordering { return $left->compare($right); } function main(): void { order(Focus::List, Focus::Search); }",
+        "function code<T implements Hashable>(T $value): uint64 { return $value->hash(); } function main(): void { code(Cell::Empty); }",
+        "function main(): void { writable Set<Focus> $seen = Set::from([]); $seen->add(Focus::List); }",
+        "function main(): void { writable Dictionary<Focus, int> $counts = []; $counts[Focus::List] = 1; }",
+        "function main(): void { writable SortedSet<Focus> $sorted = SortedSet::from([]); $sorted->add(Focus::List); }",
+    ] {
+        let source = format!("{enums} {body}");
+        doriac::check_source("enum-core.doria", &source)
+            .expect("PHP compatibility limitations must not affect Doria checking");
+        let diagnostics = doriac::compile_source_to_php("enum-core.doria", &source)
+            .expect_err("PHP output must refuse an enum order, hash or key it does not generate");
+        assert_eq!(diagnostics[0].code, "B4601", "{body}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].title,
+            "PHP Target Cannot Order Or Hash Enum Values Yet"
+        );
+    }
+}
+
+#[test]
 fn runtime_generated_time_and_cancellation_errors_use_the_checked_carrier() {
     let artifact = doriac::compile_source(
         "runtime-error-carriers.doria",

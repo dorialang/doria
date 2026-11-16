@@ -95,7 +95,7 @@ checked trait composition, including selected aliases, composer-bound `self`,
 and retained iterator-source provenance. Primitive interface erasure remains
 rejected (E0760); E0493, E0758, and E0759 are reserved.
 
-Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
+Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096). A Copy enum conforms to each of them when every payload of every case does; its cases order by declaration, then by their payloads from left to right (0114 amendment), and `<`/`>` stay unavailable on enums. An enum value cannot fill an interface slot (E0760).
 
 ### Shared ownership
 The escape hatch when single ownership does not fit (caches, graphs, back-references). Details: §3.3, decision 0106. Stage 25a Slices 1 through 4 implement the grammar/type model, both disjoint families, runtime-checked access guards, collision projection, complete payload matrix, backend parity, and tooling integration.
@@ -198,6 +198,11 @@ payload. `Set` and `Dictionary` require a Hashable element or key;
 `SortedSet`, `SortedDictionary`, and `PriorityQueue` require a Comparable element
 or key. Nullable equality and duplication remain available where required by
 unconstrained element or value positions, but supply no null hash or ordering.
+
+A unit enum is a key or element of all five. An enum with payload cases in
+those positions is part of Doria and not implemented by this compiler yet
+(E0783); PHP output does not generate enum keys, `hash` or `compare` yet
+(B4601).
 
 ---
 

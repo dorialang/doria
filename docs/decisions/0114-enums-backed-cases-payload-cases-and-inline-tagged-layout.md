@@ -220,6 +220,15 @@ Different enum types cannot compare, even when backing values match. An enum
 cannot compare directly with its backing value. Enums have no ordered
 comparison and do not implicitly become numeric or string types.
 
+> **Amendment, 2026-11-16 (order of Copy enums):** Andrew ruled on a card:
+> "Declaration order, then payloads (Recommended)". A Copy enum is
+> `Comparable` under Decision 0096: its cases compare in declaration order,
+> and two values of the same case compare their payloads from left to right.
+> `<`, `<=`, `>` and `>=` stay unavailable on enums, as this section says; the
+> order is used only through `Comparable` constraints, `compare`, and the
+> ordered collections. Tags still follow declaration order and stay
+> unobservable; the order is defined by the declaration, not by a tag value.
+
 ## Nullability
 
 `?Enum` uses the existing non-class nullable representation: a presence value
@@ -243,6 +252,16 @@ generic arguments. Equality-based membership compares case identity.
 This decision does not invent automatic `Hashable` or `Comparable`
 conformance. Enum keys, sets, sorted sets, and priority queues remain governed
 by their existing constraints. Payload-enum storage lands in Slice 2.
+
+> **Amendment, 2026-11-16:** Decision 0096 is now implemented for Copy enums,
+> so a Copy enum is `Hashable` and `Comparable` when every payload is, and the
+> existing constraints admit it. A unit enum is a key or element of `Set`,
+> `Dictionary`, `SortedSet`, `SortedDictionary` and `PriorityQueue`. An enum
+> with payload cases in those positions is part of Doria; this compiler does
+> not implement it yet and reports E0783 (an implementation boundary: the
+> core-comparator collections store a key in one word). PHP output compares
+> enum values exactly and reports B4601 for their order, their hash and enum
+> keys, which it does not generate yet.
 
 ## Constants, Statics, And Defaults
 

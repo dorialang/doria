@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 mod callable_contracts;
+mod collection_keys;
 pub mod composition;
 mod composition_availability;
 pub mod composition_rename;
@@ -732,16 +733,11 @@ impl CallableTarget {
                         implementations: Vec::new(),
                     });
                 }
-                if matches!(
-                    receiver,
-                    ResolvedType::Integer(_)
-                        | ResolvedType::Float(_)
-                        | ResolvedType::Bool
-                        | ResolvedType::String
-                ) && crate::compiler_known_contracts::CoreValueOperation::from_requirement(
-                    *requirement,
-                )
-                .is_some()
+                if receiver.uses_compiler_known_core_operations()
+                    && crate::compiler_known_contracts::CoreValueOperation::from_requirement(
+                        *requirement,
+                    )
+                    .is_some()
                 {
                     return Some(Self::ConstrainedMethod {
                         receiver,
@@ -2893,6 +2889,7 @@ struct Checker<'program> {
     constrained_display_calls: HashSet<Span>,
     display_conversion_sites: HashSet<Span>,
     core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
+    symbolic_collection_keys: Vec<collection_keys::SymbolicKey>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
     pending_enum_constructions: HashMap<Span, GenericInference>,
     pending_availability_calls: HashMap<(Span, Span), conditional_capabilities::AvailabilityCall>,
@@ -3747,6 +3744,7 @@ impl<'program> Checker<'program> {
             constrained_display_calls: HashSet::new(),
             display_conversion_sites: HashSet::new(),
             core_operation_calls: HashMap::new(),
+            symbolic_collection_keys: Vec::new(),
             pending_generic_calls: HashMap::new(),
             pending_enum_constructions: HashMap::new(),
             pending_availability_calls: HashMap::new(),
@@ -22135,6 +22133,7 @@ impl<'program> Checker<'program> {
         if self.nominal_identity_depth > 0 {
             return;
         }
+        self.check_collection_key_storage(ty, span, role, "Hashable");
         if self.select_core_operation(
             ty,
             crate::compiler_known_contracts::CoreValueOperation::Hash,
@@ -22147,11 +22146,10 @@ impl<'program> Checker<'program> {
             );
             return;
         }
+        if self.primitive_satisfies_compiler_constraint(ty, "Hashable") {
+            return;
+        }
         let diagnostic = match self.types.kind(ty) {
-            TypeKind::Integer(_)
-            | TypeKind::String
-            | TypeKind::Bool
-            | TypeKind::Unknown => return,
             TypeKind::TypeParameter(parameter)
                 if self.type_parameter_has_constraint(parameter, "Hashable") =>
             {
@@ -22345,6 +22343,7 @@ impl<'program> Checker<'program> {
         if self.nominal_identity_depth > 0 {
             return;
         }
+        self.check_collection_key_storage(ty, span, role, "Comparable");
         if self.select_core_operation(
             ty,
             crate::compiler_known_contracts::CoreValueOperation::Compare,
@@ -22352,11 +22351,10 @@ impl<'program> Checker<'program> {
         ) {
             return;
         }
+        if self.primitive_satisfies_compiler_constraint(ty, "Comparable") {
+            return;
+        }
         let diagnostic = match self.types.kind(ty) {
-            TypeKind::Integer(_)
-            | TypeKind::String
-            | TypeKind::Bool
-            | TypeKind::Unknown => return,
             TypeKind::TypeParameter(parameter)
                 if self.type_parameter_has_constraint(parameter, "Comparable") =>
             {
@@ -22551,7 +22549,42 @@ impl<'program> Checker<'program> {
         )
     }
 
+    /// Compiler-known conformance to a core value contract (Decision 0096):
+    /// the integers, `bool` and `string` are Equatable, Comparable and
+    /// Hashable; floats are Equatable only; a Copy enum conforms to a contract
+    /// when every payload of every case does. The checker's constraint,
+    /// hash-key and ordered-collection checks all ask this one question.
     fn primitive_satisfies_compiler_constraint(&self, ty: TypeId, constraint: &str) -> bool {
+        self.compiler_known_conformance(ty, constraint, &mut Vec::new())
+    }
+
+    fn compiler_known_conformance(
+        &self,
+        ty: TypeId,
+        constraint: &str,
+        visiting: &mut Vec<TypeId>,
+    ) -> bool {
+        if let (TypeKind::Enum(enum_type), "Equatable" | "Comparable" | "Hashable") =
+            (self.types.kind(ty), constraint)
+        {
+            let Some(definition) = self.enum_definition(enum_type) else {
+                return false;
+            };
+            if !definition.capabilities.copy || visiting.contains(&ty) {
+                return false;
+            }
+            visiting.push(ty);
+            let payloads = definition
+                .cases
+                .iter()
+                .flat_map(|case| case.payload.iter().map(|field| field.ty))
+                .collect::<Vec<_>>();
+            let conforms = payloads
+                .into_iter()
+                .all(|payload| self.compiler_known_conformance(payload, constraint, visiting));
+            visiting.pop();
+            return conforms;
+        }
         match constraint {
             "Equatable" => matches!(
                 self.types.kind(ty),

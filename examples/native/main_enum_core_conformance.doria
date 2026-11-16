@@ -1,0 +1,62 @@
+// Copy enums are Equatable, Hashable and Comparable with no implements clause
+// (Decision 0096). Cases order by declaration, then by their payloads from
+// left to right; `<` and `>` stay unavailable on enums (Decision 0114).
+enum Focus { case Search; case List; case Detail; }
+enum Cell { case Empty; case Glyph(string $text, int $width); }
+
+function find<T implements Equatable<T>>(List<T> $items, T $item): int
+{
+    writable int $index = 0;
+    foreach ($items as T $candidate) {
+        if ($candidate->equals($item)) {
+            return $index;
+        }
+        $index++;
+    }
+    return -1;
+}
+
+function order<T implements Comparable<T>>(T $left, T $right): int
+{
+    return match ($left->compare($right)) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    };
+}
+
+function sameHash<T implements Hashable>(T $left, T $right): bool
+{
+    return $left->hash() == $right->hash();
+}
+
+function main(): void
+{
+    List<Focus> $ring = [Focus::Search, Focus::List, Focus::Detail];
+    echo "{find($ring, Focus::Detail)} {find($ring, Focus::Search)}\n";
+    List<Cell> $cells = [Cell::Empty, Cell::Glyph("a", 1)];
+    echo "{find($cells, Cell::Glyph("a", 1))} {find($cells, Cell::Glyph("a", 2))}\n";
+    echo "{order(Focus::Search, Focus::Detail)} {order(Focus::Detail, Focus::List)} {order(Focus::List, Focus::List)}\n";
+    echo "{order(Cell::Empty, Cell::Glyph("a", 1))} {order(Cell::Glyph("b", 1), Cell::Glyph("a", 2))} {order(Cell::Glyph("a", 1), Cell::Glyph("a", 2))} {order(Cell::Glyph("a", 2), Cell::Glyph("a", 2))}\n";
+    echo "{sameHash(Cell::Glyph("x", 1), Cell::Glyph("x", 1))} {sameHash(Focus::List, Focus::List)}\n";
+    writable Set<Focus> $seen = Set::from([]);
+    $seen->add(Focus::List);
+    $seen->add(Focus::List);
+    $seen->add(Focus::Search);
+    writable Dictionary<Focus, string> $labels = [];
+    $labels[Focus::Detail] = "detail";
+    $labels[Focus::Search] = "search";
+    writable SortedSet<Focus> $sorted = SortedSet::from([]);
+    $sorted->add(Focus::Detail);
+    $sorted->add(Focus::Search);
+    $sorted->add(Focus::List);
+    echo "{$seen->count} {$labels[Focus::Search]}";
+    foreach ($sorted as Focus $focus) {
+        echo " " . match ($focus) {
+            Focus::Search => "S",
+            Focus::List => "L",
+            Focus::Detail => "D",
+        };
+    }
+    echo "\n";
+}

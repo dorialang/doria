@@ -1267,18 +1267,7 @@ fn static_value_matches(
 }
 
 fn valid_collection_comparator(ty: mir::Type) -> Option<mir::CollectionComparator> {
-    match ty {
-        mir::Type::Scalar(mir::ScalarType::Integer(integer)) if integer.is_signed() => Some(
-            mir::CollectionComparator::SignedInteger(integer.bit_width() as u8),
-        ),
-        mir::Type::Scalar(mir::ScalarType::Integer(integer)) => Some(
-            mir::CollectionComparator::UnsignedInteger(integer.bit_width() as u8),
-        ),
-        mir::Type::Scalar(mir::ScalarType::Bool) => Some(mir::CollectionComparator::Bool),
-        mir::Type::String => Some(mir::CollectionComparator::StringBytes),
-        mir::Type::Class(_) | mir::Type::Interface(_) => Some(mir::CollectionComparator::Core),
-        _ => None,
-    }
+    mir::CollectionComparator::for_element(ty)
 }
 
 fn collection_type_is_copy(ty: mir::Type) -> bool {

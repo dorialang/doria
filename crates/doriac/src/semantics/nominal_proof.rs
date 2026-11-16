@@ -290,9 +290,14 @@ impl Checker<'_> {
         if !self.is_core_interface(&target.name) {
             return false;
         }
+        // Primitives and Copy enums conform without a declaration (Decision 0096).
         if matches!(
             self.types.kind(query.subject),
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
+            TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::Bool
+                | TypeKind::String
+                | TypeKind::Enum(_)
         ) && self.primitive_satisfies_compiler_constraint(query.subject, &target.name)
         {
             return match target.name.as_str() {

@@ -388,6 +388,30 @@ pub enum CollectionComparator {
     Core,
 }
 
+impl CollectionComparator {
+    /// How a hashed or ordered collection compares elements of `ty`: by the
+    /// value's bits for the primitives, and through the core value operations
+    /// for classes, interfaces and Copy enums (Decision 0096). Lowering and
+    /// validation both ask this one function.
+    pub const fn for_element(ty: Type) -> Option<Self> {
+        match ty {
+            Type::Scalar(ScalarType::Integer(integer)) if integer.is_signed() => {
+                Some(Self::SignedInteger(integer.bit_width() as u8))
+            }
+            Type::Scalar(ScalarType::Integer(integer)) => {
+                Some(Self::UnsignedInteger(integer.bit_width() as u8))
+            }
+            Type::Scalar(ScalarType::Bool) => Some(Self::Bool),
+            Type::String => Some(Self::StringBytes),
+            Type::Class(_)
+            | Type::Interface(_)
+            | Type::Scalar(ScalarType::Enum(_))
+            | Type::PayloadEnum(_) => Some(Self::Core),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionType {
     pub id: CollectionTypeId,
