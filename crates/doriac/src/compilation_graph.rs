@@ -1034,17 +1034,29 @@ fn selected_context(graph: &CompilationGraph) -> CompilationContext {
         .unwrap_or_default()
 }
 
-fn visible_packages(graph: &CompilationGraph, source: &GraphSource) -> BTreeSet<String> {
-    let package_name = source.package.display_name();
-    let mut visible = BTreeSet::from([package_name.to_string()]);
-    let Some(package) = graph.packages.get(package_name) else {
-        return visible;
-    };
-    visible.extend(package.normal_dependencies.iter().cloned());
+/// Packages whose declarations `source` may name: its own package and the
+/// package's direct dependencies, including development dependencies for
+/// development sources.
+pub fn visible_packages(graph: &CompilationGraph, source: &GraphSource) -> BTreeSet<String> {
     let development = source.scope == SourceScope::Development
         || source.generated_for == Some(GeneratedFor::Development);
+    package_visible_packages(graph, source.package.display_name(), development)
+}
+
+/// Packages whose declarations a source of `package` may name, for a source
+/// that is not in the graph yet, such as a file an editor is about to create.
+pub fn package_visible_packages(
+    graph: &CompilationGraph,
+    package: &str,
+    development: bool,
+) -> BTreeSet<String> {
+    let mut visible = BTreeSet::from([package.to_string()]);
+    let Some(node) = graph.packages.get(package) else {
+        return visible;
+    };
+    visible.extend(node.normal_dependencies.iter().cloned());
     if development {
-        visible.extend(package.development_dependencies.iter().cloned());
+        visible.extend(node.development_dependencies.iter().cloned());
     }
     visible
 }
