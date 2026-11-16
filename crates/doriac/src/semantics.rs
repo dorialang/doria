@@ -812,6 +812,16 @@ pub struct SemanticAnalysis {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+impl SemanticAnalysis {
+    /// Places findings from an earlier phase, such as name resolution,
+    /// before this analysis's own.
+    pub fn with_leading_diagnostics(mut self, mut leading: Vec<Diagnostic>) -> Self {
+        leading.append(&mut self.diagnostics);
+        self.diagnostics = leading;
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassSemanticInfo {
     pub id: ClassId,

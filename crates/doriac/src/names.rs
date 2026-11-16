@@ -461,16 +461,15 @@ pub fn compiler_known_attribute_id(name: &str) -> GlobalSymbolId {
     }
 }
 
+/// Resolves a program; only an error fails it. Use
+/// [`resolve_program_for_ide`] to receive warnings with the result.
 pub fn resolve_program(
     program: &Program,
     context: &CompilationContext,
 ) -> DiagnosticResult<ResolvedProgram> {
     let analysis = resolve_program_for_ide(program, context);
-    if analysis.diagnostics.is_empty() {
-        Ok(analysis.resolved)
-    } else {
-        Err(analysis.diagnostics)
-    }
+    crate::diagnostics::separate_errors(analysis.diagnostics)?;
+    Ok(analysis.resolved)
 }
 
 pub fn resolve_program_for_ide(
