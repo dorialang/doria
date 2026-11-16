@@ -434,6 +434,48 @@ fn reports_each_context_and_only_keywords_the_parser_accepts() {
         &["return"],
         &["break", "continue"],
     ));
+    for (name, marked, replaced) in [
+        ("nullable return type", "function find(): ?Win|", "Win"),
+        (
+            "nullable parameter type",
+            "function find(int $a, ?Wi|",
+            "Wi",
+        ),
+        ("nullable type argument", "function find(): List<?Wi|", "Wi"),
+        (
+            "nullable local type",
+            "function f(): void\n{\n    ?Wi|",
+            "Wi",
+        ),
+    ] {
+        cases.push(Case {
+            replaced,
+            ..case(
+                name,
+                marked,
+                TYPE,
+                &["int", "string", "bool"],
+                &["resource", "null", "object", "xor", "return"],
+            )
+        });
+    }
+    cases.push(Case {
+        replaced: "br",
+        ..case(
+            "statement start keeps only accepted type keywords",
+            format!("{BODY}br|"),
+            C::Statement { in_loop: false },
+            &["int", "string", "null", "return"],
+            &["object", "resource", "void", "break"],
+        )
+    });
+    cases.push(case(
+        "member start keeps only accepted type keywords",
+        "class A\n{\n    |",
+        C::MemberDeclaration,
+        &["int", "string", "function"],
+        &["object", "resource", "void", "null"],
+    ));
     cases.push(case(
         "after a closed block comment",
         "/* done */ |",

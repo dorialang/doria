@@ -13,6 +13,16 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Callback-provenance solver scaling, 2026-11-16. `doriac metadata` on
+  doria-tui ran 1 h 46 min at 6.2 GB: the nonblocking call-context solver
+  gave every call a context keyed by its caller, so contexts grew with the
+  number of call paths. A call now gets a caller-keyed context only when a
+  callable can cross it (a parameter or result type that can hold one, a
+  callback invocation, a closure environment); other calls share one
+  context per callee and specialization. Value and field propagation follow
+  each value's own edges. Remaining exposure: calls that do pass callables
+  stay keyed by caller, so a deep fan of such calls still multiplies
+  contexts.
 - Compiler-known panic location, 2026-11-16 (Andrew: "Fix it in this beat
   (Recommended)"). A function of a compiler-known module runs in its caller's
   diagnostic frame (`mir::DiagnosticFrame::Caller`), so a panic it raises,

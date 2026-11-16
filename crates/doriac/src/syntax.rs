@@ -32,7 +32,8 @@
 //!   only on a constructor parameter (`constructor_roles_allowed`, E0737 and
 //!   E0738 otherwise), and only the type keywords the checker accepts as a type
 //!   there (`null`, `object` and `resource` never; only a class type after
-//!   `new`; no `void` for a parameter). At a name being declared, a keyword
+//!   `new`; no `void` for a parameter; outside a type position no `object`,
+//!   `resource` or `void`, and `null` only as the literal). At a name being declared, a keyword
 //!   is offered only when a name still follows it, such as `writable` after
 //!   `let`; a keyword that would itself be the name is not.
 //!
@@ -223,6 +224,26 @@ fn fits(path: &str, prefix: &str, context: &CompletionContext, keyword: &str) ->
     let Some(kind) = keyword_kind(keyword) else {
         return false;
     };
+    // Outside a type position a type keyword starts a typed declaration, so
+    // only a type the checker accepts there is offered: never `object` or
+    // `resource`, and `void` only as a return type. `null` stays where an
+    // expression may begin, as the literal.
+    if !matches!(context, CompletionContext::Type { .. }) {
+        let expression_may_begin = matches!(
+            context,
+            CompletionContext::TopLevel
+                | CompletionContext::Statement { .. }
+                | CompletionContext::Expression { .. }
+        );
+        if let Some(name) = crate::parser::type_keyword_name(&kind) {
+            if kind == TokenKind::Void
+                || crate::types::rejected_type_name(name)
+                    .is_some_and(|rejected| !(rejected.literal && expression_may_begin))
+            {
+                return false;
+            }
+        }
+    }
     match context {
         CompletionContext::TopLevel | CompletionContext::Statement { in_loop: false } => {
             !matches!(kind, TokenKind::Break | TokenKind::Continue)

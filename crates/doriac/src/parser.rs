@@ -5677,6 +5677,12 @@ impl Parser {
             constructor_roles_allowed: false,
         });
         let nullable = self.match_kind(&TokenKind::Question);
+        // After `?` the type itself follows.
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let token = self.advance().clone();
         let token = if matches!(token.kind, TokenKind::Backslash) {
             self.report_leading_namespace_separator(token.span);
