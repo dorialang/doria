@@ -25,10 +25,16 @@
 //!   token the parser tested right after it. At a name position the parser rejects
 //!   keywords it does not take as names and accepts those it does, such as
 //!   `use` as a function name or `writable` after `let`.
-//! - **What is not covered.** Keywords that the parser accepts and the checker
-//!   rejects are offered: `break` and `continue` outside a loop (E0422) and a
-//!   constructor parameter role on an ordinary parameter (E0737). The context
-//!   reports `constructor_roles_allowed` for the latter.
+//! - **What the grammar does not decide.** The parser takes some keywords
+//!   that the language then rejects, and the context carries what is needed
+//!   to leave them out: `break` and `continue` only inside a loop
+//!   (`Statement { in_loop }`, E0421 and E0422 otherwise), constructor roles
+//!   only on a constructor parameter (`constructor_roles_allowed`, E0737 and
+//!   E0738 otherwise), and only the type keywords the checker accepts as a type
+//!   there (`null`, `object` and `resource` never; only a class type after
+//!   `new`; no `void` for a parameter). At a name being declared, a keyword
+//!   is offered only when a name still follows it, such as `writable` after
+//!   `let`; a keyword that would itself be the name is not.
 //!
 //! ```
 //! use doriac::syntax::{completion_context, CompletionContext};
@@ -42,7 +48,7 @@
 
 use std::ops::Range;
 
-use crate::lexer::{Lexer, TokenKind, KEYWORDS};
+use crate::lexer::{keyword_kind, Lexer, TokenKind, KEYWORDS};
 use crate::source::SourceFile;
 
 /// The kind of word that may be written at a cursor.
@@ -55,8 +61,9 @@ pub enum CompletionContext {
     TopLevel,
     /// The start of a member in a class, interface, trait or enum body.
     MemberDeclaration,
-    /// The start of a statement in a block.
-    Statement,
+    /// The start of a statement in a block. `in_loop` is true inside a loop
+    /// body, where `break` and `continue` may be written.
+    Statement { in_loop: bool },
     /// Inside an expression. `after_operand` is true after a complete operand,
     /// where only an operator or the end of the expression may follow; it is
     /// false where an operand begins.
@@ -76,12 +83,18 @@ pub enum CompletionContext {
     DeclarationName,
     /// A segment of a qualified name: after `namespace` or `use`, or after a
     /// `\` in any name. `qualifier` is the path already written, ending in `\`
-    /// when it is not empty.
-    NamespacePath { qualifier: String },
+    /// when it is not empty. `declarations_allowed` is false in the name of a
+    /// `namespace` declaration, which names only namespaces, and true where
+    /// the path may end at a class, function or other declaration.
+    NamespacePath {
+        qualifier: String,
+        declarations_allowed: bool,
+    },
     /// A property or method name after `->` or `?->`.
     Member,
     /// A static member name after `::`. `qualifier` is the class, `self` or
-    /// `parent` before it.
+    /// `parent` before it, the enum of a match pattern, or the trait of a
+    /// trait adaptation.
     Static { qualifier: String },
     /// A variable being referenced: a word starting with `$` where an
     /// expression may begin.
@@ -153,7 +166,9 @@ pub fn completion_context(path: &str, source: &str, offset: usize) -> CursorComp
     }
     let parsed = crate::parser::Parser::new(tokens).completion_context();
     let context = match parsed {
-        Some(CompletionContext::Statement | CompletionContext::Expression { .. }) if variable => {
+        Some(CompletionContext::Statement { .. } | CompletionContext::Expression { .. })
+            if variable =>
+        {
             CompletionContext::Variable
         }
         Some(CompletionContext::DeclarationName) if variable => CompletionContext::DeclarationName,
@@ -161,8 +176,13 @@ pub fn completion_context(path: &str, source: &str, offset: usize) -> CursorComp
         Some(context) => context,
         None => CompletionContext::Continuation,
     };
-    let keywords = if takes_keywords(&context) {
-        accepted_keywords(path, &source[..name_start])
+    // A word that starts with `$` is a variable, never a keyword.
+    let keywords = if !variable && takes_keywords(&context) {
+        let prefix = &source[..name_start];
+        accepted_keywords(path, prefix)
+            .into_iter()
+            .filter(|keyword| fits(path, prefix, &context, keyword))
+            .collect()
     } else {
         Vec::new()
     };
@@ -177,13 +197,66 @@ pub fn completion_context(path: &str, source: &str, offset: usize) -> CursorComp
     }
 }
 
-/// No keyword can be written inside a comment, a string or a number, or after
-/// the `$` of a variable.
+/// No keyword can be written inside a comment, a string or a number, after
+/// the `$` of a variable, or as a member name after `->` or `::`: a keyword
+/// the parser takes there is the member's name.
 const fn takes_keywords(context: &CompletionContext) -> bool {
     !matches!(
         context,
-        CompletionContext::None | CompletionContext::Variable
+        CompletionContext::None
+            | CompletionContext::Variable
+            | CompletionContext::Member
+            | CompletionContext::Static { .. }
     )
+}
+
+/// The parser's context at the end of `text`, with no keyword trials.
+fn parsed_context(path: &str, text: &str) -> Option<CompletionContext> {
+    let source = SourceFile::new(path, text);
+    let tokens = Lexer::new(&source).lex().ok()?;
+    crate::parser::Parser::new(tokens).completion_context()
+}
+
+/// Whether a keyword the parser takes at the end of `prefix` is one the
+/// language accepts there (see the module documentation).
+fn fits(path: &str, prefix: &str, context: &CompletionContext, keyword: &str) -> bool {
+    let Some(kind) = keyword_kind(keyword) else {
+        return false;
+    };
+    match context {
+        CompletionContext::TopLevel | CompletionContext::Statement { in_loop: false } => {
+            !matches!(kind, TokenKind::Break | TokenKind::Continue)
+        }
+        CompletionContext::Type {
+            new_expression,
+            parameter_modifiers_allowed,
+            constructor_roles_allowed,
+        } => {
+            if crate::parser::CONSTRUCTOR_ROLE_KEYWORDS.contains(&kind) {
+                return *constructor_roles_allowed;
+            }
+            let Some(name) = crate::parser::type_keyword_name(&kind) else {
+                return true;
+            };
+            crate::types::rejected_type_name(name).is_none()
+                && (!new_expression || kind == TokenKind::SelfType)
+                && !(*parameter_modifiers_allowed && kind == TokenKind::Void)
+        }
+        // A modifier before the name leaves a name to write; a keyword the
+        // parser takes as the name itself would replace the user's name.
+        CompletionContext::DeclarationName => {
+            let separator = if prefix
+                .ends_with(|character: char| character.is_ascii_alphanumeric() || character == '_')
+            {
+                " "
+            } else {
+                ""
+            };
+            parsed_context(path, &format!("{prefix}{separator}{keyword} "))
+                == Some(CompletionContext::DeclarationName)
+        }
+        _ => true,
+    }
 }
 
 /// The keywords the parser accepts at the end of `prefix`: for each keyword,

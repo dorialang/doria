@@ -2009,3 +2009,35 @@ impl TypeRegistry {
         self.intern(kind)
     }
 }
+
+/// A type keyword the language does not accept as a type, with the
+/// diagnostic the checker reports for it. Completion offers none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedTypeName {
+    pub code: &'static str,
+    pub message: &'static str,
+    pub help: Option<&'static str>,
+}
+
+pub fn rejected_type_name(name: &str) -> Option<RejectedTypeName> {
+    Some(match name {
+        "null" => RejectedTypeName {
+            code: "E0431",
+            message: "`null` is a literal, not a type name",
+            help: Some("write `?T` with a concrete type, such as `?string` or `?Person`"),
+        },
+        "object" => RejectedTypeName {
+            code: "E0401",
+            message: "`object` does not exist as a Doria type",
+            help: Some(
+                "use a concrete class type, or `mixed` at a dynamic boundary and narrow it with `is`",
+            ),
+        },
+        "resource" => RejectedTypeName {
+            code: "E0432",
+            message: "`resource` is reserved for PHP interop through the future Phase I bridge and is not a Doria value type",
+            help: None,
+        },
+        _ => return None,
+    })
+}

@@ -37,9 +37,17 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
   context comes from marks at parser entry points; each keyword is tried
   through the real parser. The keyword table is declared once in the lexer
   (`lexer::KEYWORDS`, `lexer::keyword_kind`). The language server reads this
-  instead of its token heuristics. Not covered: keywords the checker rejects
-  after the parser takes them (`break`/`continue` outside a loop, E0422; a
-  constructor role on an ordinary parameter, E0737).
+  instead of its token heuristics. Amended 2026-11-16: the context reports
+  `Statement { in_loop }` and `NamespacePath { declarations_allowed }`, and
+  the keyword list leaves out what the checker rejects after the parser takes
+  it: `break`/`continue` outside a loop (E0421/E0422), a constructor role on
+  an ordinary parameter (E0737/E0738), the type keywords the checker rejects
+  (`types::rejected_type_name`: `null`, `object`, `resource`), non-class types
+  after `new`, `void` for a parameter, keywords at a `$` word or after `->`
+  or `::`,
+  and keywords that would be the declared name itself. Type arguments, enum
+  cases in match patterns and trait adaptation methods report their
+  contexts.
 - String display width, 2026-11-15, for the `Doria\Tui` library that the
   plan's approved sequence puts after Stage 46. Decision 0146 adds
   `$text->displayWidth`: terminal cells per grapheme cluster, 2 for an East

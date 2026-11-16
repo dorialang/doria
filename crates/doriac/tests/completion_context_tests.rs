@@ -93,11 +93,13 @@ fn reports_each_context_and_only_keywords_the_parser_accepts() {
         case(
             "statement",
             format!("{BODY}|"),
-            C::Statement,
+            C::Statement { in_loop: false },
             &[
                 "if", "while", "foreach", "return", "let", "echo", "new", "true",
             ],
             &[
+                "break",
+                "continue",
                 "case",
                 "implements",
                 "extends",
@@ -109,7 +111,7 @@ fn reports_each_context_and_only_keywords_the_parser_accepts() {
         case(
             "statement after unfinished code",
             format!("{BODY}let $a = 1\n    let $b = 2;\n    |"),
-            C::Statement,
+            C::Statement { in_loop: false },
             &["if", "return", "let"],
             &["case", "implements", "xor"],
         ),
@@ -187,6 +189,7 @@ fn reports_each_context_and_only_keywords_the_parser_accepts() {
             "namespace |",
             C::NamespacePath {
                 qualifier: String::new(),
+                declarations_allowed: false,
             },
             &[],
             &["class"],
@@ -196,6 +199,7 @@ fn reports_each_context_and_only_keywords_the_parser_accepts() {
             "use Doria\\Std\\|",
             C::NamespacePath {
                 qualifier: "Doria\\Std\\".to_string(),
+                declarations_allowed: true,
             },
             &[],
             &["class"],
@@ -260,6 +264,176 @@ fn reports_each_context_and_only_keywords_the_parser_accepts() {
             &["xor"],
         )
     });
+    const TYPE: CompletionContext = CompletionContext::Type {
+        new_expression: false,
+        parameter_modifiers_allowed: false,
+        constructor_roles_allowed: false,
+    };
+    const NOT_TYPES: &[&str] = &["resource", "null", "object", "xor", "use", "not"];
+    for (name, marked) in [
+        (
+            "implemented interface argument",
+            "class Report<T> implements Read<|",
+        ),
+        ("parent class argument", "class Report<T> extends Parent<|"),
+        ("used trait argument", "class Report<T> { uses Format<|"),
+        (
+            "second type argument",
+            "class Report<T> implements Pair<List<int>, |",
+        ),
+    ] {
+        cases.push(case(
+            name,
+            marked,
+            TYPE,
+            &["int", "string", "bool", "function"],
+            NOT_TYPES,
+        ));
+    }
+    // In a body, `List < not $x` also reads as a comparison, so the
+    // parser takes `not` there; only the rejected type names are left out.
+    cases.push(case(
+        "local type argument",
+        "function f(): void\n{\n    List<|",
+        TYPE,
+        &["int", "string", "bool"],
+        &["resource", "null", "object"],
+    ));
+    cases.push(case(
+        "return type",
+        "function f(): |",
+        TYPE,
+        &["int", "void", "string"],
+        NOT_TYPES,
+    ));
+    cases.push(case(
+        "class type after new",
+        format!("{BODY}let $x = new |"),
+        C::Type {
+            new_expression: true,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        },
+        &[],
+        &[
+            "int", "void", "null", "function", "resource", "object", "string", "bool",
+        ],
+    ));
+    cases.push(case(
+        "ordinary parameter",
+        "function ordinary(|",
+        PARAMETER,
+        &["writable", "take", "int"],
+        &[
+            "internal",
+            "override",
+            "parameter",
+            "void",
+            "resource",
+            "null",
+            "object",
+        ],
+    ));
+    cases.push(case(
+        "match arm case",
+        format!("{BODY}string $label = match ($status) {{ Status::|"),
+        C::Static {
+            qualifier: "Status".to_string(),
+        },
+        &[],
+        &["xor"],
+    ));
+    cases.push(case(
+        "trait adaptation method",
+        "class Report { uses Source<int> { Source<int>::|",
+        C::Static {
+            qualifier: "Source".to_string(),
+        },
+        &[],
+        &["use", "xor"],
+    ));
+    cases.push(Case {
+        replaced: "$w",
+        ..case(
+            "let variable name",
+            format!("{BODY}let $w|"),
+            C::DeclarationName,
+            &[],
+            &["writable"],
+        )
+    });
+    cases.push(case(
+        "let modifier",
+        format!("{BODY}let |"),
+        C::DeclarationName,
+        &["writable"],
+        &["use", "xor"],
+    ));
+    cases.push(Case {
+        replaced: "u",
+        ..case(
+            "function name",
+            "function u|",
+            C::DeclarationName,
+            &[],
+            &["use", "once", "writable"],
+        )
+    });
+    cases.push(case(
+        "member after arrow",
+        format!("{BODY}$x->|"),
+        C::Member,
+        &[],
+        &["use", "not"],
+    ));
+    cases.push(case(
+        "namespace path segment",
+        "namespace App\\|",
+        C::NamespacePath {
+            qualifier: "App\\".to_string(),
+            declarations_allowed: false,
+        },
+        &[],
+        &["class"],
+    ));
+    cases.push(case(
+        "import path segment",
+        "use App\\|",
+        C::NamespacePath {
+            qualifier: "App\\".to_string(),
+            declarations_allowed: true,
+        },
+        &[],
+        &["class"],
+    ));
+    for (name, loop_head) in [
+        ("while body", "while (true) {\n        "),
+        ("foreach body", "foreach ($items as int $item) {\n        "),
+        (
+            "for body",
+            "for (writable int $i = 0; $i < 3; $i++) {\n        ",
+        ),
+        ("do body", "do {\n        "),
+        (
+            "if inside a loop",
+            "while (true) {\n        if (true) {\n            ",
+        ),
+    ] {
+        cases.push(case(
+            name,
+            format!("{BODY}{loop_head}|"),
+            C::Statement { in_loop: true },
+            &["break", "continue", "return"],
+            &["case", "xor"],
+        ));
+    }
+    cases.push(case(
+        "closure inside a loop",
+        format!("{BODY}while (true) {{\n        let $f = function(): void {{\n            |"),
+        C::Statement { in_loop: false },
+        &["return"],
+        &["break", "continue"],
+    ));
     cases.push(case(
         "after a closed block comment",
         "/* done */ |",
@@ -346,10 +520,24 @@ fn never_offered(context: &CompletionContext) -> &'static [&'static str] {
         CompletionContext::Expression {
             after_operand: false,
         } => &["xor", "and", "or", "implements", "extends", "return"],
-        CompletionContext::Statement => &["case", "implements", "extends", "insteadof", "xor"],
-        // `break` and `continue` parse at the top level; the checker rejects
-        // them there (E0422).
-        CompletionContext::TopLevel => &["case", "implements", "extends", "xor"],
+        CompletionContext::Statement { in_loop } => {
+            if *in_loop {
+                &["case", "implements", "extends", "insteadof", "xor"]
+            } else {
+                &[
+                    "break",
+                    "continue",
+                    "case",
+                    "implements",
+                    "extends",
+                    "insteadof",
+                    "xor",
+                ]
+            }
+        }
+        CompletionContext::TopLevel => {
+            &["break", "continue", "case", "implements", "extends", "xor"]
+        }
         _ => &[],
     }
 }
@@ -427,4 +615,58 @@ fn replaying_the_terminal_example_offers_only_keywords_that_fit() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The keywords completion leaves out because the checker rejects them are
+/// the ones these diagnostics report: E0421/E0422 for `break` and `continue`
+/// outside a loop, E0737 and E0738 for a constructor role on an ordinary
+/// parameter, and
+/// E0431, E0401 and E0432 for `null`, `object` and `resource` as types.
+#[test]
+fn the_filter_leaves_out_exactly_what_the_checker_rejects() {
+    for (source, code) in [
+        ("function main(): void { break; }", "E0421"),
+        ("function main(): void { continue; }", "E0422"),
+        (
+            "function main(): void { while (true) { let $f = function(): void { break; }; } }",
+            "E0421",
+        ),
+        (
+            "function ordinary(internal int $x): void {} function main(): void {}",
+            "E0737",
+        ),
+        (
+            "function ordinary(override int $x): void {} function main(): void {}",
+            "E0738",
+        ),
+        (
+            "function ordinary(parameter int $x): void {} function main(): void {}",
+            "E0737",
+        ),
+        (
+            "function f(null $x): void {} function main(): void {}",
+            "E0431",
+        ),
+        (
+            "function f(object $x): void {} function main(): void {}",
+            "E0401",
+        ),
+        (
+            "function f(resource $x): void {} function main(): void {}",
+            "E0432",
+        ),
+    ] {
+        let errors = doriac::check_source("filter.doria", source)
+            .expect_err("the checker rejects what completion leaves out");
+        assert!(
+            errors.iter().any(|error| error.code == code),
+            "{source}: expected {code}, got {errors:?}"
+        );
+    }
+    // Inside a loop the same transfers are accepted.
+    doriac::check_source(
+        "filter.doria",
+        "function main(): void { while (true) { break; } foreach ([1] as int $x) { continue; } }",
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}"));
 }

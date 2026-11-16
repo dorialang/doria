@@ -25,6 +25,13 @@ pub struct Parser {
     /// tokens. A construct marks the cursor only while no diagnostic has been
     /// added since, so recovery from an error at the cursor marks nothing.
     cursor_arrival: Option<usize>,
+    /// How many loop bodies enclose the statement being parsed, counted
+    /// from the innermost function or closure body. Completion reports it,
+    /// so `break` and `continue` are offered only inside a loop.
+    loop_depth: usize,
+    /// True while parsing the name after `namespace`, which names only
+    /// namespaces, never a declaration.
+    declaring_namespace: bool,
     /// `Some` while asking whether the parser accepts the token at an index.
     token_trial: Option<TokenTrial>,
     /// The token kinds a trial's parse paths tested right after the trial
@@ -91,6 +98,8 @@ impl Parser {
             diagnostics: Vec::new(),
             completion: None,
             cursor_arrival: None,
+            loop_depth: 0,
+            declaring_namespace: false,
             token_trial: None,
             trial_followers: std::cell::RefCell::new(Vec::new()),
         }
@@ -338,6 +347,7 @@ impl Parser {
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
         self.mark_cursor(crate::syntax::CompletionContext::NamespacePath {
             qualifier: String::new(),
+            declarations_allowed: false,
         });
         let keyword_span = self.previous().span;
         if self.check(&TokenKind::Semicolon) || self.is_at_end() {
@@ -351,7 +361,10 @@ impl Parser {
             );
             return None;
         }
-        let name = self.expect_qualified_name_ref("expected namespace name")?;
+        self.declaring_namespace = true;
+        let name = self.expect_qualified_name_ref("expected namespace name");
+        self.declaring_namespace = false;
+        let name = name?;
         if self.check(&TokenKind::Backslash) {
             self.report_incomplete_qualified_name("namespace name");
             return None;
@@ -382,6 +395,7 @@ impl Parser {
     fn parse_use_decl(&mut self) -> Option<UseDecl> {
         self.mark_cursor(crate::syntax::CompletionContext::NamespacePath {
             qualifier: String::new(),
+            declarations_allowed: true,
         });
         let keyword_span = self.previous().span;
         if self.check(&TokenKind::Function) || self.check(&TokenKind::Const) {
@@ -1650,7 +1664,7 @@ impl Parser {
                 statements: vec![statement],
             })
         } else {
-            FunctionBody::Block(self.parse_block()?)
+            FunctionBody::Block(self.parse_callable_body()?)
         };
         Some(PropertyHook {
             kind,
@@ -1813,7 +1827,7 @@ impl Parser {
                 semicolon_span: self.previous().span,
             }
         } else {
-            FunctionBody::Block(self.parse_block()?)
+            FunctionBody::Block(self.parse_callable_body()?)
         };
         let span = self.span(start, body.span().end);
         Some(FunctionDecl {
@@ -2255,6 +2269,9 @@ impl Parser {
         let separator_span = self
             .expect(TokenKind::DoubleColon, "expected `::` after adapted trait")?
             .span;
+        self.mark_cursor(crate::syntax::CompletionContext::Static {
+            qualifier: origin.name.clone(),
+        });
         let text = self.expect_callable_name("expected trait method name")?;
         let method = NameRef {
             text,
@@ -2335,10 +2352,7 @@ impl Parser {
         let attributes = self.parse_attribute_groups()?;
         let start = self.peek().span.start;
         let mut authored_roles = Vec::new();
-        while matches!(
-            self.peek().kind,
-            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
-        ) {
+        while CONSTRUCTOR_ROLE_KEYWORDS.contains(&self.peek().kind) {
             authored_roles.push(self.advance().clone());
         }
         let duplicate_role = authored_roles.len() > 1
@@ -2711,7 +2725,7 @@ impl Parser {
             );
             return None;
         }
-        let block = self.parse_block()?;
+        let block = self.parse_callable_body()?;
         let span = self.span(keyword_span.start, block.span.end);
         Some(Expr::Closure(Box::new(ClosureExpression {
             form: ClosureForm::AnonymousBlock,
@@ -2990,7 +3004,9 @@ impl Parser {
         let mut statements = Vec::new();
 
         loop {
-            self.mark_cursor(crate::syntax::CompletionContext::Statement);
+            self.mark_cursor(crate::syntax::CompletionContext::Statement {
+                in_loop: self.loop_depth > 0,
+            });
             if self.check(&TokenKind::RightBrace) || self.is_at_end() {
                 break;
             }
@@ -3584,6 +3600,22 @@ impl Parser {
         })
     }
 
+    /// A loop body: `break` and `continue` may appear in it.
+    fn parse_loop_body(&mut self) -> Option<Block> {
+        self.loop_depth += 1;
+        let body = self.parse_block();
+        self.loop_depth -= 1;
+        body
+    }
+
+    /// A function or closure body starts outside every loop.
+    fn parse_callable_body(&mut self) -> Option<Block> {
+        let enclosing = std::mem::take(&mut self.loop_depth);
+        let body = self.parse_block();
+        self.loop_depth = enclosing;
+        body
+    }
+
     fn parse_while(&mut self) -> Option<WhileStmt> {
         let start = self.previous().span.start;
         self.parse_while_after_keyword(start, None)
@@ -3597,7 +3629,7 @@ impl Parser {
         self.expect(TokenKind::LeftParen, "expected `(` after while")?;
         let condition = self.parse_expression()?;
         self.expect(TokenKind::RightParen, "expected `)` after while condition")?;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         let finally = self.parse_optional_finally()?;
         let end = finally
             .as_ref()
@@ -3613,7 +3645,7 @@ impl Parser {
 
     fn parse_do_while(&mut self) -> Option<DoWhileStmt> {
         let start = self.previous().span.start;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         self.expect(TokenKind::While, "expected `while` after `do` block")?;
         self.expect(TokenKind::LeftParen, "expected `(` after while")?;
         let condition = self.parse_expression()?;
@@ -3775,7 +3807,7 @@ impl Parser {
         };
 
         self.expect(TokenKind::RightParen, "expected `)` after for clauses")?;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         let span = self.span(start, body.span.end);
         Some(ForStmt {
             initializer,
@@ -3897,7 +3929,7 @@ impl Parser {
             (None, first)
         };
         self.expect(TokenKind::RightParen, "expected `)` after foreach bindings")?;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         let span = self.span(start, body.span.end);
         Some(Stmt::Foreach(Box::new(ForeachStmt {
             iterable,
@@ -4518,6 +4550,9 @@ impl Parser {
             )?;
             let qualifier_span = self.span(qualifier_token.span.start, self.previous().span.end);
             if self.match_kind(&TokenKind::DoubleColon) {
+                self.mark_cursor(crate::syntax::CompletionContext::Static {
+                    qualifier: name.clone(),
+                });
                 let case_token = self.advance().clone();
                 let TokenKind::Identifier(case) = case_token.kind else {
                     self.error("expected enum case after `::`", case_token.span);
@@ -5441,6 +5476,13 @@ impl Parser {
     }
 
     fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
+        // Every type position, type arguments included, is a place a type is
+        // written. An enclosing parameter or `new` marks first, with its flags.
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let nullable = self.match_kind(&TokenKind::Question);
         let token = self.advance().clone();
         let token = if matches!(token.kind, TokenKind::Backslash) {
@@ -5493,25 +5535,12 @@ impl Parser {
             }
         } else {
             let (name, source_name) = match token.kind {
-                TokenKind::Void => ("void".to_string(), None),
-                TokenKind::IntType => ("int".to_string(), None),
-                TokenKind::Int8Type => ("int8".to_string(), None),
-                TokenKind::Int16Type => ("int16".to_string(), None),
-                TokenKind::Int32Type => ("int32".to_string(), None),
-                TokenKind::Int64Type => ("int64".to_string(), None),
-                TokenKind::UInt8Type => ("uint8".to_string(), None),
-                TokenKind::UInt16Type => ("uint16".to_string(), None),
-                TokenKind::UInt32Type => ("uint32".to_string(), None),
-                TokenKind::UInt64Type => ("uint64".to_string(), None),
-                TokenKind::FloatType => ("float".to_string(), None),
-                TokenKind::Float32Type => ("float32".to_string(), None),
-                TokenKind::Float64Type => ("float64".to_string(), None),
-                TokenKind::StringType => ("string".to_string(), None),
-                TokenKind::BoolType => ("bool".to_string(), None),
-                TokenKind::Null => ("null".to_string(), None),
-                TokenKind::Object => ("object".to_string(), None),
-                TokenKind::Resource => ("resource".to_string(), None),
-                TokenKind::SelfType => ("self".to_string(), None),
+                ref keyword if type_keyword_name(keyword).is_some() => (
+                    type_keyword_name(keyword)
+                        .expect("checked type keyword")
+                        .to_string(),
+                    None,
+                ),
                 TokenKind::Identifier(name) => {
                     let source_name = self.finish_qualified_name_ref(name, token.span)?;
                     if self.check(&TokenKind::Backslash) {
@@ -5829,6 +5858,7 @@ impl Parser {
                 self.current + 1,
                 crate::syntax::CompletionContext::NamespacePath {
                     qualifier: format!("{}\\", name.canonical()),
+                    declarations_allowed: !self.declaring_namespace,
                 },
             );
         }
@@ -6080,6 +6110,43 @@ pub(crate) fn token_text(kind: &TokenKind) -> Option<String> {
         other => token_name(other).to_string(),
     })
 }
+
+/// The keywords that name a type, and the type each names. The parser reads
+/// a type keyword through this table; completion asks it which keywords are
+/// types.
+pub(crate) fn type_keyword_name(kind: &TokenKind) -> Option<&'static str> {
+    Some(match kind {
+        TokenKind::Void => "void",
+        TokenKind::IntType => "int",
+        TokenKind::Int8Type => "int8",
+        TokenKind::Int16Type => "int16",
+        TokenKind::Int32Type => "int32",
+        TokenKind::Int64Type => "int64",
+        TokenKind::UInt8Type => "uint8",
+        TokenKind::UInt16Type => "uint16",
+        TokenKind::UInt32Type => "uint32",
+        TokenKind::UInt64Type => "uint64",
+        TokenKind::FloatType => "float",
+        TokenKind::Float32Type => "float32",
+        TokenKind::Float64Type => "float64",
+        TokenKind::StringType => "string",
+        TokenKind::BoolType => "bool",
+        TokenKind::Null => "null",
+        TokenKind::Object => "object",
+        TokenKind::Resource => "resource",
+        TokenKind::SelfType => "self",
+        TokenKind::Function => "function",
+        _ => return None,
+    })
+}
+
+/// The constructor parameter roles (Decision 0131), written before a
+/// parameter's type.
+pub(crate) const CONSTRUCTOR_ROLE_KEYWORDS: [TokenKind; 3] = [
+    TokenKind::Internal,
+    TokenKind::Override,
+    TokenKind::Parameter,
+];
 
 fn token_name(kind: &TokenKind) -> &'static str {
     match kind {

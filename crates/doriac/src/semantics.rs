@@ -21817,22 +21817,22 @@ impl<'program> Checker<'program> {
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
             "Bytes" => self.resolve_zero_arg_type(ty, span, TypeKind::Bytes),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
-            "null" => self.reject_type_ref_with_help(
-                ty,
-                span,
-                "E0431",
-                "`null` is a literal, not a type name",
-                "write `?T` with a concrete type, such as `?string` or `?Person`",
-            ),
+            name if crate::types::rejected_type_name(name).is_some() => {
+                let rejected =
+                    crate::types::rejected_type_name(name).expect("checked rejected type name");
+                match rejected.help {
+                    Some(help) => self.reject_type_ref_with_help(
+                        ty,
+                        span,
+                        rejected.code,
+                        rejected.message,
+                        help,
+                    ),
+                    None => self.reject_type_ref(ty, span, rejected.code, rejected.message),
+                }
+            }
             "mixed" => self.resolve_zero_arg_type(ty, span, TypeKind::Mixed),
             "Error" => self.resolve_zero_arg_type(ty, span, TypeKind::Error),
-            "object" => self.reject_type_ref_with_help(
-                ty,
-                span,
-                "E0401",
-                "`object` does not exist as a Doria type",
-                "use a concrete class type, or `mixed` at a dynamic boundary and narrow it with `is`",
-            ),
             "array" => self.reject_type_ref_with_help(
                 ty,
                 span,
@@ -21857,12 +21857,6 @@ impl<'program> Checker<'program> {
                     format!("Doria spells this `{replacement}<T>`"),
                 )
             }
-            "resource" => self.reject_type_ref(
-                ty,
-                span,
-                "E0432",
-                "`resource` is reserved for PHP interop through the future Phase I bridge and is not a Doria value type",
-            ),
             name if self.enums.contains_key(name) => {
                 let definition = self.enums.get(name).expect("enum existence checked").clone();
                 if !self.expect_type_arg_count(ty, definition.type_params.len(), span) {
