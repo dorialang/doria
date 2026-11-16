@@ -1,5 +1,7 @@
 //! Shared helpers for the implementation-private native function ABI.
 
+pub mod c_abi;
+
 use crate::mir;
 
 pub(crate) fn call_return_type(

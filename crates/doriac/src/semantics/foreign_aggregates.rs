@@ -640,3 +640,72 @@ impl<'program> Checker<'program> {
         })
     }
 }
+
+/// The C layout of `ty` on `target` (Decision 0148 sections 5 and 6), or
+/// `None` when it has none: a type that cannot cross the C boundary,
+/// `Opaque`, a foreign struct declared without fields, or an aggregate that
+/// contains itself (reported by `check_foreign_aggregate_cycles`).
+pub(crate) fn foreign_c_type(
+    types: &TypeRegistry,
+    aggregates: &HashMap<String, ForeignAggregateInfo>,
+    ty: TypeId,
+    target: crate::c_layout::CTarget,
+) -> Option<crate::c_layout::CType> {
+    foreign_c_type_within(types, aggregates, ty, target, &mut Vec::new())
+}
+
+fn foreign_c_type_within(
+    types: &TypeRegistry,
+    aggregates: &HashMap<String, ForeignAggregateInfo>,
+    ty: TypeId,
+    target: crate::c_layout::CTarget,
+    enclosing: &mut Vec<String>,
+) -> Option<crate::c_layout::CType> {
+    use crate::c_layout::{CRecord, CScalar, CType};
+    let scalar = |scalar| Some(CType::Scalar(scalar));
+    match types.kind(ty) {
+        TypeKind::Integer(integer) => scalar(CScalar::Integer {
+            bytes: integer.storage_bytes() as u8,
+            signed: integer.is_signed(),
+        }),
+        TypeKind::Float(float) => scalar(CScalar::Float {
+            bytes: float.storage_bytes() as u8,
+        }),
+        TypeKind::Bool => scalar(CScalar::Bool),
+        TypeKind::Foreign(ForeignType::Pointer { .. } | ForeignType::Function(_)) => {
+            scalar(CScalar::Pointer)
+        }
+        TypeKind::Nullable(inner)
+            if matches!(
+                types.kind(*inner),
+                TypeKind::Foreign(ForeignType::Pointer { .. } | ForeignType::Function(_))
+            ) =>
+        {
+            scalar(CScalar::Pointer)
+        }
+        TypeKind::Foreign(ForeignType::Boundary(boundary)) => scalar(target.boundary(*boundary)),
+        TypeKind::Foreign(ForeignType::FixedArray { element, length }) => Some(CType::Array {
+            element: Box::new(foreign_c_type_within(
+                types, aggregates, *element, target, enclosing,
+            )?),
+            length: *length,
+        }),
+        TypeKind::Foreign(ForeignType::Aggregate(aggregate)) => {
+            if enclosing.contains(&aggregate.name) {
+                return None;
+            }
+            let info = aggregates.get(&aggregate.name)?;
+            let declared = info.fields.as_ref()?;
+            enclosing.push(aggregate.name.clone());
+            let fields = declared
+                .iter()
+                .map(|field| foreign_c_type_within(types, aggregates, field.ty, target, enclosing))
+                .collect::<Option<Vec<_>>>();
+            enclosing.pop();
+            Some(CType::Record(std::sync::Arc::new(CRecord::new(
+                info.kind, fields?,
+            )?)))
+        }
+        _ => None,
+    }
+}

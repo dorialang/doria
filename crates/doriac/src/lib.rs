@@ -19,6 +19,7 @@ pub mod backend;
 pub mod build_plan;
 pub mod builtins;
 pub mod byte_intrinsics;
+pub mod c_layout;
 mod checked_effects;
 mod generic_inference;
 pub use checked_effects::{CheckedEffectClass, CheckedEffectProfile};

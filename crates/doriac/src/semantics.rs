@@ -3383,6 +3383,7 @@ fn semantic_layout_shape(
     ty: TypeId,
     enum_layouts: &HashMap<EnumType<TypeId>, EnumLayout>,
     classes: &HashMap<String, ClassInfo>,
+    aggregates: &HashMap<String, foreign_aggregates::ForeignAggregateInfo>,
 ) -> Option<LayoutShape> {
     const POINTER: u32 = 8;
     let scalar = |bytes| LayoutShape {
@@ -3433,24 +3434,20 @@ fn semantic_layout_shape(
                 }
             }
         }),
-        // Pointers and C function pointers are one word; C boundary values
-        // whose width is the same on every tier-1 target have it here, and the
-        // rest have a target layout (Decision 0148 section 5).
-        TypeKind::Foreign(foreign) => match foreign {
-            crate::foreign::ForeignType::Pointer { .. }
-            | crate::foreign::ForeignType::Function(_) => Some(scalar(POINTER)),
-            crate::foreign::ForeignType::Boundary(
-                crate::foreign::CBoundaryType::Size
-                | crate::foreign::CBoundaryType::PointerDifference,
-            ) => Some(scalar(POINTER)),
-            crate::foreign::ForeignType::Boundary(crate::foreign::CBoundaryType::Char) => {
-                Some(scalar(1))
-            }
-            crate::foreign::ForeignType::Boundary(_)
-            | crate::foreign::ForeignType::Aggregate(_)
-            | crate::foreign::ForeignType::FixedArray { .. }
-            | crate::foreign::ForeignType::Opaque => None,
-        },
+        // Foreign values have the target C layout (Decision 0148 sections 5
+        // and 6); `Opaque` has none.
+        TypeKind::Foreign(_) => {
+            let layout = foreign_aggregates::foreign_c_type(
+                types,
+                aggregates,
+                ty,
+                crate::c_layout::CTarget::host(),
+            )?;
+            Some(LayoutShape {
+                size: u32::try_from(layout.size()).ok()?,
+                align: u32::try_from(layout.align()).ok()?,
+            })
+        }
         TypeKind::Nullable(inner) => {
             let inner_kind = types.kind(*inner);
             if matches!(
@@ -3499,7 +3496,7 @@ fn semantic_layout_shape(
             ) {
                 return Some(scalar(POINTER));
             }
-            let payload = semantic_layout_shape(types, *inner, enum_layouts, classes)?;
+            let payload = semantic_layout_shape(types, *inner, enum_layouts, classes, aggregates)?;
             let align = POINTER.max(payload.align);
             let payload_offset = checked_layout_align(POINTER, payload.align)?;
             let size = checked_layout_align(payload_offset.checked_add(payload.size)?, align)?;
@@ -6544,6 +6541,7 @@ impl<'program> Checker<'program> {
                                     field.ty,
                                     &layouts,
                                     &self.classes,
+                                    &self.foreign.aggregates,
                                 )
                             })
                             .collect::<Option<Vec<_>>>()
