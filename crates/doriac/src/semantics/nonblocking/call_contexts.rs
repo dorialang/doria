@@ -1,11 +1,51 @@
 //! Instantiate callback provenance at call sites. Formal parameters and returned
 //! closures must not join unrelated callers; stored properties remain shared facts.
+//!
+//! Only a callable value can carry provenance across a call, so a call gets a
+//! context of its own caller only when a callable can cross it: through a
+//! parameter, the result, a callback invocation, or a closure environment. Any
+//! other call shares one context per callee and specialization. Keying every
+//! call by its caller instead would give each call path through the program a
+//! context of its own, which grows exponentially with call depth.
 
 use super::*;
 use crate::semantics::callable_contracts::BodyInstance;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ScopedValue(Option<usize>, Value);
+
+/// The value flows between scoped values, with each value's successors and
+/// predecessors, so propagation follows a value's own edges instead of
+/// rescanning every edge.
+#[derive(Default)]
+struct Flows {
+    edges: HashSet<(ScopedValue, ScopedValue)>,
+    successors: HashMap<ScopedValue, Vec<ScopedValue>>,
+    predecessors: HashMap<ScopedValue, Vec<ScopedValue>>,
+}
+
+impl Flows {
+    fn insert(&mut self, (source, target): (ScopedValue, ScopedValue)) -> bool {
+        if !self.edges.insert((source, target)) {
+            return false;
+        }
+        self.successors.entry(source).or_default().push(target);
+        self.predecessors.entry(target).or_default().push(source);
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn successors(&self, value: ScopedValue) -> &[ScopedValue] {
+        self.successors.get(&value).map_or(&[], Vec::as_slice)
+    }
+
+    fn predecessors(&self, value: ScopedValue) -> &[ScopedValue] {
+        self.predecessors.get(&value).map_or(&[], Vec::as_slice)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Origin {
@@ -25,8 +65,8 @@ struct Context {
 
 #[derive(PartialEq, Eq, Hash)]
 struct Instance {
-    caller: usize,
-    site: Span,
+    /// The caller context and call site, for a call a callable can cross.
+    caller: Option<(usize, Span)>,
     body: Span,
     environment: Option<usize>,
     bindings: Vec<(String, ResolvedType)>,
@@ -38,7 +78,7 @@ struct Solver<'a, 'program> {
     contexts: Vec<Context>,
     instances: HashMap<Instance, usize>,
     parameters: HashMap<Span, Vec<Option<BindingId>>>,
-    flows: HashSet<(ScopedValue, ScopedValue)>,
+    flows: Flows,
     origins: HashMap<ScopedValue, HashSet<Origin>>,
     unknown: HashSet<ScopedValue>,
     /// Caller context, callee context, and the call site in the caller.
@@ -77,7 +117,7 @@ fn resolve_with_roots(checker: &Checker<'_>, graph: &Graph, roots: Roots) -> Res
         contexts: Vec::new(),
         instances: HashMap::new(),
         parameters: HashMap::new(),
-        flows: HashSet::new(),
+        flows: Flows::default(),
         origins: HashMap::new(),
         unknown: HashSet::new(),
         edges: HashSet::new(),
@@ -327,11 +367,7 @@ impl Solver<'_, '_> {
             if !visited.insert(value) {
                 continue;
             }
-            pending.extend(
-                self.flows
-                    .iter()
-                    .filter_map(|(source, target)| (*target == value).then_some(*source)),
-            );
+            pending.extend(self.flows.predecessors(value));
         }
         let mut context = Some(caller);
         let mut callers = Vec::new();
@@ -602,9 +638,11 @@ impl Solver<'_, '_> {
             .map(|(name, ty)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
         identity_bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        let crosses = environment.is_some()
+            || call.callee.is_some()
+            || self.callable_crosses(caller, call, body, &instance);
         let key = Instance {
-            caller,
-            site: call.site,
+            caller: crosses.then_some((caller, call.site)),
             body: effective,
             environment,
             bindings: identity_bindings,
@@ -667,6 +705,101 @@ impl Solver<'_, '_> {
                     self.flows.insert((parameter, argument));
                 }
             }
+        }
+    }
+
+    /// Whether a callable value can cross this call: a parameter or the
+    /// result whose type can hold one.
+    fn callable_crosses(
+        &self,
+        caller: usize,
+        call: &Call,
+        body: Span,
+        instance: &BodyInstance,
+    ) -> bool {
+        let result = self
+            .checker
+            .expression_types
+            .get(&call.site)
+            .map(|ty| self.contexts[caller].instance.substitute(ty));
+        if result.is_none_or(|ty| self.holds_callable(&ty, &mut HashSet::new())) {
+            return true;
+        }
+        self.parameters[&body].iter().any(|binding| {
+            binding
+                .and_then(|binding| {
+                    self.checker.binding_resolution.declarations_by_id[&binding]
+                        .source_type
+                        .as_ref()
+                })
+                .is_none_or(|ty| self.holds_callable(&instance.substitute(ty), &mut HashSet::new()))
+        })
+    }
+
+    /// Whether a value of `ty` can hold a callable in storage that is scoped
+    /// to a context. A class or interface keeps its properties as shared
+    /// facts, so only its type arguments are followed; an unresolved type
+    /// parameter or `mixed` may hold anything.
+    fn holds_callable(&self, ty: &ResolvedType, visited: &mut HashSet<ResolvedType>) -> bool {
+        if !visited.insert(ty.clone()) {
+            return false;
+        }
+        match ty {
+            ResolvedType::Void
+            | ResolvedType::Integer(_)
+            | ResolvedType::Float(_)
+            | ResolvedType::String
+            | ResolvedType::Bytes
+            | ResolvedType::ByteRegion(_)
+            | ResolvedType::Bool
+            | ResolvedType::Null
+            | ResolvedType::Error => false,
+            ResolvedType::Nullable(inner)
+            | ResolvedType::TypedArray(inner)
+            | ResolvedType::List(inner)
+            | ResolvedType::Set(inner)
+            | ResolvedType::SortedSet(inner)
+            | ResolvedType::PriorityQueue(inner)
+            | ResolvedType::Deque(inner)
+            | ResolvedType::SharedHandle(_, inner) => self.holds_callable(inner, visited),
+            ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
+                self.holds_callable(key, visited) || self.holds_callable(value, visited)
+            }
+            ResolvedType::Class(class) | ResolvedType::Interface(class) => class
+                .arguments
+                .iter()
+                .any(|argument| self.holds_callable(argument, visited)),
+            ResolvedType::Enum(enum_type) => {
+                if enum_type
+                    .arguments
+                    .iter()
+                    .any(|argument| self.holds_callable(argument, visited))
+                {
+                    return true;
+                }
+                let Some(definition) = self.checker.enums.get(&enum_type.name) else {
+                    return true;
+                };
+                let arguments = definition
+                    .type_params
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .zip(enum_type.arguments.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                definition.cases.iter().any(|case| {
+                    case.payload.iter().any(|field| {
+                        self.holds_callable(
+                            &crate::types::substitute_resolved_type(
+                                &self.checker.types.resolved(field.ty),
+                                &arguments,
+                            ),
+                            visited,
+                        )
+                    })
+                })
+            }
+            // A callable, `mixed`, or a type not resolved here.
+            _ => true,
         }
     }
 
@@ -763,13 +896,7 @@ impl Solver<'_, '_> {
                 self.unknown.len(),
                 self.cleanups.len(),
             );
-            for (source, target) in &self.flows {
-                let incoming = self.origins.get(source).cloned().unwrap_or_default();
-                self.origins.entry(*target).or_default().extend(incoming);
-                if self.unknown.contains(source) {
-                    self.unknown.insert(*target);
-                }
-            }
+            self.propagate_values();
             self.propagate_fields();
             for caller in 0..self.contexts.len() {
                 let owner = self.contexts[caller].body;
@@ -856,14 +983,39 @@ impl Solver<'_, '_> {
         }
     }
 
+    /// Saturates origins and unknown provenance along the value flows: a
+    /// value is revisited only when what reaches it grows.
+    fn propagate_values(&mut self) {
+        let mut pending = self
+            .origins
+            .keys()
+            .chain(self.unknown.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        while let Some(source) = pending.pop() {
+            let unknown = self.unknown.contains(&source);
+            let origins = self.origins.get(&source).cloned().unwrap_or_default();
+            for target in self.flows.successors(source).to_vec() {
+                let mut grew = unknown && self.unknown.insert(target);
+                if !origins.is_empty() {
+                    let reached = self.origins.entry(target).or_default();
+                    let before = reached.len();
+                    reached.extend(origins.iter().copied());
+                    grew |= reached.len() != before;
+                }
+                if grew {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+
     fn propagate_fields(&mut self) {
         // Match construction and extraction through ordinary alias/call flows.
         // Saturating finite value edges also handles nested/recursive aggregates
-        // without inventing an unbounded stack of symbolic field paths.
-        let mut successors = HashMap::<ScopedValue, Vec<ScopedValue>>::new();
-        for (source, target) in &self.flows {
-            successors.entry(*source).or_default().push(*target);
-        }
+        // without inventing an unbounded stack of symbolic field paths. Each
+        // aggregate's reachable extractions are found once, for every field
+        // packed into it.
         let mut extractions = HashMap::<ScopedValue, Vec<(ScopedValue, StoredField)>>::new();
         for (source, target, field) in &self.unpacked_fields {
             extractions
@@ -874,7 +1026,12 @@ impl Solver<'_, '_> {
                 self.unknown.insert(*target);
             }
         }
+        let mut packed = HashMap::<ScopedValue, Vec<(ScopedValue, &StoredField)>>::new();
         for (value, aggregate, field) in &self.packed_fields {
+            packed.entry(*aggregate).or_default().push((*value, field));
+        }
+        let mut found = Vec::new();
+        for (aggregate, values) in &packed {
             let mut pending = vec![*aggregate];
             let mut seen = HashSet::new();
             while let Some(current) = pending.pop() {
@@ -882,12 +1039,17 @@ impl Solver<'_, '_> {
                     continue;
                 }
                 for (target, selected) in extractions.get(&current).into_iter().flatten() {
-                    if selected.overlaps(field) {
-                        self.flows.insert((*value, *target));
+                    for (value, field) in values {
+                        if selected.overlaps(field) {
+                            found.push((*value, *target));
+                        }
                     }
                 }
-                pending.extend(successors.get(&current).into_iter().flatten());
+                pending.extend(self.flows.successors(current));
             }
+        }
+        for flow in found {
+            self.flows.insert(flow);
         }
     }
 }
