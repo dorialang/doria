@@ -2221,6 +2221,7 @@ fn check_selected_program(
         active_assignment_writes: HashSet::new(),
         active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
+        unsafe_pins: Vec::new(),
         when_result_modes: Vec::new(),
         conditional_borrow_sources: HashMap::new(),
         flow_facts,
@@ -3569,6 +3570,16 @@ struct ActiveBorrow {
     span: Span,
 }
 
+/// The places pointers formed inside one unsafe context pin until the
+/// context ends (Decision 0148 section 7).
+#[derive(Debug, Default)]
+struct UnsafePins {
+    /// The lexical depth of the context's own scope. A binding declared
+    /// deeper is destroyed before the context ends.
+    depth: usize,
+    pins: Vec<ActiveBorrow>,
+}
+
 #[derive(Debug, Clone)]
 struct Flow {
     falls_through: bool,
@@ -3673,6 +3684,8 @@ struct Checker<'a> {
     active_assignment_writes: HashSet<BorrowPlace>,
     active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
+    /// Innermost last; a closure body starts with none.
+    unsafe_pins: Vec<UnsafePins>,
     when_result_modes: Vec<UseMode>,
     conditional_borrow_sources: HashMap<Span, ConditionalBorrowSources>,
     flow_facts: &'a FactsByUse,
@@ -4276,8 +4289,15 @@ impl Checker<'_> {
         return_move_type: bool,
     ) -> Flow {
         match statement {
-            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
-                self.check_block(block, scopes, return_move_type, true)
+            Stmt::Block(block) => self.check_block(block, scopes, return_move_type, true),
+            Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                self.unsafe_pins.push(UnsafePins {
+                    depth: scopes.lexical_depth() + 1,
+                    pins: Vec::new(),
+                });
+                let flow = self.check_block(block, scopes, return_move_type, true);
+                self.unsafe_pins.pop();
+                flow
             }
             Stmt::VarDecl(decl) => {
                 let declaration_name = decl
@@ -5947,10 +5967,15 @@ impl Checker<'_> {
                             ),
                         );
                     }
-                    if let Some(conflict) = self.active_borrows.iter().find(|borrow| {
-                        borrow.root.overlaps(root_key)
-                            && (access == BorrowAccess::Writable || borrow.mode == UseMode::Write)
-                    }) {
+                    let conflict = self
+                        .live_borrows()
+                        .find(|borrow| {
+                            borrow.root.overlaps(root_key)
+                                && (access == BorrowAccess::Writable
+                                    || borrow.mode == UseMode::Write)
+                        })
+                        .cloned();
+                    if let Some(conflict) = conflict {
                         invalid = true;
                         self.diagnostics.push(
                             Diagnostic::new(
@@ -6071,11 +6096,11 @@ impl Checker<'_> {
                         ),
                     );
                 }
-                if let Some(conflict) = self
-                    .active_borrows
-                    .iter()
+                let conflict = self
+                    .live_borrows()
                     .find(|borrow| root_keys.iter().any(|key| borrow.root.overlaps(key)))
-                {
+                    .cloned();
+                if let Some(conflict) = conflict {
                     invalid = true;
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -7272,8 +7297,14 @@ impl Checker<'_> {
             Expr::This { span } if scopes.get("this").is_some() => {
                 self.use_binding("this", *span, scopes, mode);
             }
-            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
-                self.use_expr(expr, scopes, mode)
+            Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
+            Expr::Unsafe { expr, .. } => {
+                self.unsafe_pins.push(UnsafePins {
+                    depth: scopes.lexical_depth(),
+                    pins: Vec::new(),
+                });
+                self.use_expr(expr, scopes, mode);
+                self.unsafe_pins.pop();
             }
             // Extraction gives away the whole consumed receiver: its other
             // fields are destroyed at once, so no later use of it remains valid.
@@ -7469,6 +7500,11 @@ impl Checker<'_> {
                 span,
                 ..
             } => {
+                if let Some(access) = crate::pointer_intrinsics::formation(qualifier, method) {
+                    self.form_pointer(access, args, *span, scopes);
+                    self.record_exceptional_exits(*span, scopes);
+                    return;
+                }
                 if matches!(
                     qualifier,
                     ast::StaticQualifier::Class(class_name)
@@ -7709,7 +7745,10 @@ impl Checker<'_> {
                     self.acquire_closure(closure, scopes);
                 }
                 if self.closure_values.contains_key(&closure_id) {
+                    // An unsafe context does not extend into a closure body.
+                    let pins = std::mem::take(&mut self.unsafe_pins);
                     self.analyze_closure_body(closure, scopes);
+                    self.unsafe_pins = pins;
                 }
             }
             Expr::CallableCall {
@@ -9569,9 +9608,7 @@ impl Checker<'_> {
             return;
         }
         let Some(existing) = self
-            .active_borrows
-            .iter()
-            .rev()
+            .live_borrows()
             .find(|borrow| borrow.root.overlaps(root) && borrow_modes_conflict(borrow.mode, mode))
             .cloned()
         else {
@@ -9607,14 +9644,97 @@ impl Checker<'_> {
         );
     }
 
-    fn check_give_against_active_borrows(&mut self, root: &BorrowPlace, span: Span) {
-        if let Some(existing) = self
-            .active_borrows
-            .iter()
-            .rev()
-            .find(|borrow| borrow.root.overlaps(root))
-            .cloned()
+    /// `Ptr::to($place)` or `MutPtr::to($place)`: the place is read, or
+    /// written as an assignment target is, then pinned until the innermost enclosing
+    /// unsafe context ends (Decision 0148 section 7). Within the context it
+    /// cannot be given away or used in a way that conflicts with the pin.
+    /// Forming another pointer to a place the context already pins with at
+    /// least that access adds nothing: pointers are Copy, so a second one
+    /// aliases no more than a copy of the first.
+    fn form_pointer(
+        &mut self,
+        access: crate::foreign::PointerAccess,
+        args: &[Argument],
+        span: Span,
+        scopes: &mut Scopes,
+    ) {
+        let Some(place) = args.first().map(|argument| &argument.value) else {
+            return;
+        };
+        let mode = match access {
+            crate::foreign::PointerAccess::Read => UseMode::Read,
+            crate::foreign::PointerAccess::Write => UseMode::Write,
+        };
+        let roots = self.borrow_root_keys(place, scopes);
+        let pinned = !roots.is_empty()
+            && roots.iter().all(|root| {
+                self.unsafe_pins
+                    .iter()
+                    .flat_map(|context| &context.pins)
+                    .any(|pin| {
+                        pin.root == *root && (pin.mode == UseMode::Write || mode == UseMode::Read)
+                    })
+            });
+        if pinned {
+            return;
+        }
+        // The place itself is used, as an assignment target is: a
+        // `MutPtr::to` place must be writable.
+        self.use_expr(place, scopes, mode);
+        let Some(context) = self.unsafe_pins.last() else {
+            // Checking reports a formation outside an unsafe context.
+            return;
+        };
+        let context_depth = context.depth;
+        if let Some((name, binding)) = pointer_place_root(place)
+            .and_then(|name| scopes.get(name).map(|binding| (name, binding)))
         {
+            if binding.scope_depth > context_depth {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0762",
+                        format!(
+                            "`${name}` is destroyed at the end of its block, before the unsafe context that pins it ends"
+                        ),
+                        place.span(),
+                    )
+                    .with_title("Value Cannot Outlive Borrowed Source")
+                    .with_explanation(
+                        "A pointer to a Doria place is valid until the innermost enclosing unsafe context ends, and the place stays in place for that long.",
+                    )
+                    .with_help("declare the local before the unsafe context, or form the pointer in an unsafe context inside its block"),
+                );
+                return;
+            }
+        }
+        let pins = roots
+            .into_iter()
+            .map(|root| ActiveBorrow { root, mode, span })
+            .collect::<Vec<_>>();
+        self.unsafe_pins
+            .last_mut()
+            .expect("an unsafe context is active")
+            .pins
+            .extend(pins);
+    }
+
+    /// The accesses in effect: those of the current call, then the places
+    /// unsafe contexts pin, latest first.
+    fn live_borrows(&self) -> impl Iterator<Item = &ActiveBorrow> {
+        self.active_borrows.iter().rev().chain(
+            self.unsafe_pins
+                .iter()
+                .rev()
+                .flat_map(|context| context.pins.iter().rev()),
+        )
+    }
+
+    fn check_give_against_active_borrows(&mut self, root: &BorrowPlace, span: Span) {
+        let existing = self
+            .live_borrows()
+            .find(|borrow| borrow.root.overlaps(root))
+            .cloned();
+        if let Some(existing) = existing {
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0471",
@@ -10574,6 +10694,16 @@ impl Checker<'_> {
         } else {
             UseMode::Read
         }
+    }
+}
+
+/// The local a pointer formation addresses, through fields and properties.
+fn pointer_place_root(place: &Expr) -> Option<&str> {
+    match place {
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => pointer_place_root(expr),
+        Expr::PropertyAccess { object, .. } => pointer_place_root(object),
+        Expr::Variable { name, .. } => Some(name),
+        _ => None,
     }
 }
 

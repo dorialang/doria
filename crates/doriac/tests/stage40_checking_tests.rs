@@ -665,3 +665,259 @@ fn fixed_length_array_fields_are_zero_filled_until_regions_land() {
         "Fixed-Length Array Fields Cannot Be Read Yet"
     );
 }
+
+const POINTERS: &str = r#"
+use Doria\Std\Ffi\{CChar, CLong, CSize, MutPtr, Opaque, Ptr};
+
+extern "C" struct Point
+{
+    int32 $x;
+    int32 $y;
+}
+
+extern "C" struct Handle;
+
+extern "C"
+{
+    /** @safety Any size. */
+    function allocate(CSize $size): MutPtr<Opaque>;
+    /** @safety A handle from `openHandle`. */
+    function openHandle(): MutPtr<Handle>;
+    /** @safety A valid callback. */
+    function find(Ptr<CChar> $name): Ptr<Opaque>;
+}
+"#;
+
+fn pointer_program(body: &str) -> String {
+    format!("{POINTERS}function main(): void {{ writable int32 $value = 3; writable Point $point = new Point(x: 1, y: 2); {body} }}")
+}
+
+#[test]
+fn pointer_members_have_their_types() {
+    for body in [
+        "unsafe { let $pointer = MutPtr::to($value); $pointer->write(7); int32 $read = $pointer->read(); echo $read; }",
+        "unsafe { let $pointer = MutPtr::to($value); $pointer->writeUnaligned(7); int32 $read = $pointer->readUnaligned(); echo $read; }",
+        "unsafe { let $pointer = Ptr::to($value); Ptr<int32> $next = $pointer->offset(1); Ptr<int32> $byte = $pointer->byteOffset(4); echo $next == $byte; }",
+        "unsafe { let $field = MutPtr::to($point->y); $field->write(5); } unsafe { Point $copy = Ptr::to($point)->read(); echo $copy->x; }",
+        "unsafe { let $pointer = MutPtr::to($value); Ptr<uint8> $bytes = Ptr::cast($pointer); MutPtr<uint8> $writable = MutPtr::cast($pointer); echo $bytes->address == $writable->address; }",
+        "unsafe { ?Ptr<int64> $absent = Ptr::fromAddress(0); echo $absent == null; }",
+        "unsafe { let $address = find(Ptr::cast(Ptr::to($value))); extern \"C\" function(int32): int32 $callback = Ptr::toFunction($address); echo $callback(3); }",
+        "unsafe { let $memory = allocate(CSize::from(8)); MutPtr<uint8> $bytes = MutPtr::cast($memory); let $skipped = $memory->byteOffset(4); echo $bytes->address < $skipped->address; }",
+        "let $readonly = Ptr::from(unsafe(MutPtr::to($value))); echo $readonly->address;",
+        "unsafe { let $pointer = MutPtr::to($value); let $same = MutPtr::to($value); echo $pointer == $same; }",
+    ] {
+        let source = pointer_program(body);
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+}
+
+#[test]
+fn pointer_operations_need_an_unsafe_context() {
+    for (body, operation) in [
+        ("let $pointer = Ptr::to($value);", "forming a pointer"),
+        (
+            "let $pointer = unsafe(Ptr::to($value)); echo $pointer->read();",
+            "reading through a pointer",
+        ),
+        (
+            "let $pointer = unsafe(MutPtr::to($value)); $pointer->write(1);",
+            "writing through a pointer",
+        ),
+        (
+            "let $pointer = unsafe(Ptr::to($value)); let $next = $pointer->offset(1);",
+            "offsetting a pointer",
+        ),
+        (
+            "let $pointer = unsafe(Ptr::to($value)); Ptr<uint8> $bytes = Ptr::cast($pointer);",
+            "converting a pointer",
+        ),
+        (
+            "?Ptr<int32> $pointer = Ptr::fromAddress(16);",
+            "converting an address to a pointer",
+        ),
+    ] {
+        let diagnostic = only(&pointer_program(body), "E0785");
+        assert!(
+            diagnostic.message.contains(operation),
+            "{body}: {diagnostic:#?}"
+        );
+    }
+    let safe = pointer_program(
+        "let $pointer = unsafe(MutPtr::to($value)); echo $pointer->address; let $readonly = Ptr::from($pointer); echo $readonly == Ptr::from($pointer);",
+    );
+    assert!(codes(&safe).is_empty(), "{:#?}", findings(&safe));
+}
+
+#[test]
+fn reading_writing_and_offsetting_need_a_pointee_with_a_size() {
+    for body in [
+        "unsafe { let $memory = allocate(CSize::from(8)); echo $memory->read(); }",
+        "unsafe { let $memory = allocate(CSize::from(8)); let $next = $memory->offset(1); }",
+        "unsafe { let $handle = openHandle(); let $copy = $handle->readUnaligned(); }",
+    ] {
+        let diagnostic = only(&pointer_program(body), "E0800");
+        assert_eq!(
+            diagnostic.title,
+            "Pointer Operation Needs A Pointee With A Size"
+        );
+    }
+    let bytes = pointer_program(
+        "unsafe { let $handle = openHandle(); let $next = $handle->byteOffset(16); echo $next->address; }",
+    );
+    assert!(codes(&bytes).is_empty(), "{:#?}", findings(&bytes));
+}
+
+#[test]
+fn a_pointer_addresses_a_place_of_an_ffi_safe_type() {
+    for body in [
+        "unsafe { let $pointer = Ptr::to(3); }",
+        "unsafe { let $pointer = Ptr::to(Int32::from(3)); }",
+    ] {
+        let diagnostic = only(&pointer_program(body), "E0801");
+        assert_eq!(diagnostic.title, "Pointer Source Is Not A Place");
+    }
+    let text = pointer_program("let $text = \"zlib\"; unsafe { let $pointer = Ptr::to($text); }");
+    assert!(codes(&text).contains(&"E0786"), "{:#?}", findings(&text));
+}
+
+#[test]
+fn a_conversion_takes_its_target_from_the_expected_type() {
+    for body in [
+        "unsafe { let $pointer = MutPtr::to($value); let $bytes = Ptr::cast($pointer); }",
+        "unsafe { let $pointer = MutPtr::to($value); int $number = Ptr::cast($pointer); }",
+        "unsafe { let $address = Ptr::fromAddress(16); }",
+        "unsafe { let $function = Ptr::toFunction(find(Ptr::cast(Ptr::to($value)))); }",
+    ] {
+        let diagnostic = only(&pointer_program(body), "E0802");
+        assert_eq!(diagnostic.title, "Pointer Conversion Needs A Target Type");
+    }
+}
+
+#[test]
+fn pointers_have_only_their_own_members() {
+    let write = only(
+        &pointer_program("unsafe { let $pointer = Ptr::to($value); $pointer->write(1); }"),
+        "E0304",
+    );
+    assert!(
+        write.helps.iter().any(|help| help.contains("MutPtr<T>")),
+        "{write:#?}"
+    );
+    let property = only(
+        &pointer_program("let $pointer = unsafe(Ptr::to($value)); echo $pointer->adress;"),
+        "E0303",
+    );
+    assert_eq!(property.title, "Unknown Property");
+    let ordering = only(
+        &pointer_program(
+            "let $pointer = unsafe(Ptr::to($value)); let $less = $pointer < $pointer;",
+        ),
+        "E0441",
+    );
+    assert_eq!(
+        ordering.title,
+        "Foreign Value Has No Arithmetic Or Ordering"
+    );
+}
+
+#[test]
+fn forming_a_pointer_pins_its_place_until_the_unsafe_context_ends() {
+    let conflicting = [
+        "unsafe { let $pointer = Ptr::to($value); $value = 4; }",
+        "unsafe { let $pointer = MutPtr::to($value); echo $value; }",
+        "unsafe { let $pointer = Ptr::to($value); let $writable = MutPtr::to($value); }",
+        "writable int $round = 0; unsafe { while ($round < 2) { $round++; echo $value; let $pointer = MutPtr::to($value); } }",
+    ];
+    for body in conflicting {
+        let diagnostic = only(&pointer_program(body), "E0477");
+        assert_eq!(diagnostic.title, "Conflicting Access", "{body}");
+    }
+    for body in [
+        "unsafe { let $pointer = MutPtr::to($value); $pointer->write(4); } $value = 5; echo $value;",
+        "unsafe { let $pointer = MutPtr::to($value); let $again = MutPtr::to($value); let $readonly = Ptr::to($value); }",
+        "unsafe { let $pointer = Ptr::to($value); echo $value; }",
+    ] {
+        let source = pointer_program(body);
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let capture = pointer_program(
+        "unsafe { let $pointer = MutPtr::to($value); let $read = function(): int32 with ($value) { return $value; }; }",
+    );
+    assert!(
+        codes(&capture).contains(&"E0654"),
+        "{:#?}",
+        findings(&capture)
+    );
+    let inner = only(
+        &pointer_program(
+            "unsafe { { writable int32 $inner = 1; let $pointer = MutPtr::to($inner); } }",
+        ),
+        "E0762",
+    );
+    assert_eq!(inner.title, "Value Cannot Outlive Borrowed Source");
+    let readonly = only(
+        &pointer_program("int32 $fixed = 1; unsafe { let $pointer = MutPtr::to($fixed); }"),
+        "E0479",
+    );
+    assert!(readonly.message.contains("$fixed"));
+}
+
+#[test]
+fn boundary_values_convert_explicitly_and_compare_only_for_equality() {
+    for body in [
+        "let $long = CLong::from(5); ?CLong $maybe = CLong::tryFrom(-1); echo $long == CLong::from(5); echo $maybe == null;",
+        "let $size = CSize::from($value); int64 $length = Int64::from($size); uint8 $small = UInt8::from($size); echo $length;",
+    ] {
+        let source = pointer_program(body);
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let boundary = only(
+        &pointer_program("let $long = CLong::from(CSize::from(1));"),
+        "E0443",
+    );
+    assert!(
+        boundary
+            .helps
+            .iter()
+            .any(|help| help.contains("Int64::from")),
+        "{boundary:#?}"
+    );
+    only(&pointer_program("let $long = CLong::from(1.5);"), "E0443");
+    let arithmetic = only(
+        &pointer_program("let $long = CLong::from(5); let $next = $long + $long;"),
+        "E0441",
+    );
+    assert_eq!(
+        arithmetic.title,
+        "Foreign Value Has No Arithmetic Or Ordering"
+    );
+    only(
+        &pointer_program("let $long = CLong::parse(\"5\");"),
+        "E0304",
+    );
+}
+
+#[test]
+fn pointer_operations_report_that_they_cannot_be_built_yet() {
+    let source = "use Doria\\Std\\Ffi\\{CLong, Ptr}; function main(): void { writable int32 $value = 1; let $pointer = unsafe(Ptr::to($value)); let $long = CLong::from(2); }";
+    assert!(codes(source).is_empty(), "{:#?}", findings(source));
+    let diagnostics = doriac::compile_source(
+        "ffi.doria",
+        source.to_string(),
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("pointer operations cannot be built yet");
+    let titles = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0784")
+        .map(|diagnostic| diagnostic.title.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        titles,
+        [
+            "Pointer Operations Cannot Be Built Yet",
+            "C Boundary Conversions Cannot Be Built Yet"
+        ],
+        "{diagnostics:#?}"
+    );
+}

@@ -13,6 +13,7 @@ mod enum_specialization_tests;
 pub(crate) mod executable_effects;
 mod foreign_aggregates;
 mod foreign_checks;
+mod foreign_pointers;
 mod instantiation;
 mod interface_witnesses;
 mod nominal_proof;
@@ -11898,6 +11899,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if self.record_pointer_method_argument_types(object_ty, method, args) {
+            return;
+        }
         if let TypeKind::List(element) = self.types.kind(object_ty).clone() {
             if matches!(method, "map" | "filter" | "reduce") {
                 self.record_list_algorithm_argument_types(
@@ -13317,6 +13321,9 @@ impl<'program> Checker<'program> {
                 if self
                     .check_foreign_field_read(object_ty, property, *member_span, *span, *null_safe)
                     .is_some()
+                    || self
+                        .check_pointer_property(object_ty, property, *member_span, *null_safe)
+                        .is_some()
                 {
                     return;
                 }
@@ -13421,6 +13428,17 @@ impl<'program> Checker<'program> {
                     args,
                     *null_safe,
                     *member_span,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
+                if self.check_pointer_method_call(
+                    object,
+                    method,
+                    *member_span,
+                    args,
                     *span,
                     scopes,
                     method_context,
@@ -16902,6 +16920,9 @@ impl<'program> Checker<'program> {
         span: Span,
         operation: &str,
     ) {
+        if self.report_foreign_operand(left, span) || self.report_foreign_operand(right, span) {
+            return;
+        }
         self.diagnostics.push(
             Diagnostic::new(
                 "E0441",
@@ -19520,6 +19541,9 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_name.as_str();
+        if self.check_foreign_companion_call(class_name, access, args, scopes, method_context) {
+            return;
+        }
         if let Some(definition) = self.enums.get(class_name).cloned() {
             self.check_enum_case_call(&definition, access, args, scopes, method_context);
             return;
@@ -19720,9 +19744,13 @@ impl<'program> Checker<'program> {
             let argument = &args[0].value;
             self.contextualize_integer_literals(argument, IntegerType::Int64);
             let argument_ty = self.infer_expr_type(argument, scopes, method_context);
+            // C boundary values convert to every fixed-width integer
+            // (Decision 0148 section 5).
             if !matches!(
                 self.types.kind(argument_ty),
-                TypeKind::Integer(_) | TypeKind::Unknown
+                TypeKind::Integer(_)
+                    | TypeKind::Foreign(crate::foreign::ForeignType::Boundary(_))
+                    | TypeKind::Unknown
             ) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0443",
@@ -23705,6 +23733,9 @@ impl<'program> Checker<'program> {
                 if let Some(field) = self.foreign_field_type(object_ty, property, *null_safe) {
                     return field;
                 }
+                if let Some(ty) = self.pointer_property_type(object_ty, property, *null_safe) {
+                    return ty;
+                }
                 if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                     return self
                         .trait_property(&owner, property)
@@ -23777,6 +23808,9 @@ impl<'program> Checker<'program> {
                     return self.types.intern_resolved(&call.result_type.clone());
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some(result) = self.pointer_method_type(object_ty, method, *null_safe) {
+                    return result;
+                }
                 if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                     let result = self
                         .trait_method(&owner, method)
@@ -23883,6 +23917,16 @@ impl<'program> Checker<'program> {
                 else {
                     return self.types.unknown();
                 };
+                if let Some(result) = self.foreign_companion_call_type(
+                    &class_name,
+                    method,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return result;
+                }
                 if let Some(definition) = self.enums.get(&class_name) {
                     let template = self
                         .types

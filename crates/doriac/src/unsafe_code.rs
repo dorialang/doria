@@ -281,6 +281,36 @@ impl Finder {
                     ),
                 )
             }
+            // Every pointer and boundary value comes from a gated
+            // declaration or type, or from one of these calls.
+            Expr::StaticCall {
+                qualifier: StaticQualifier::Class(class),
+                method,
+                span,
+                ..
+            } if self.gate == Gate::Execution => {
+                match crate::pointer_intrinsics::ForeignCompanion::from_class_name(class) {
+                    Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(access)) => self
+                        .report(
+                            *span,
+                            "Pointer Operations Cannot Be Built Yet",
+                            format!(
+                                "`{}::{method}` is part of Doria; this compiler does not build pointer operations yet",
+                                access.short_name()
+                            ),
+                        ),
+                    Some(crate::pointer_intrinsics::ForeignCompanion::Boundary(boundary)) => self
+                        .report(
+                            *span,
+                            "C Boundary Conversions Cannot Be Built Yet",
+                            format!(
+                                "`{}::{method}` is part of Doria; this compiler does not build C boundary values yet",
+                                boundary.short_name()
+                            ),
+                        ),
+                    None => {}
+                }
+            }
             Expr::Closure(closure) => {
                 if let ClosureBody::Block(body) = &closure.body {
                     self.block(body);
