@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes). Nothing here is implemented; delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and section 14 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -64,6 +64,15 @@ without saying which accesses conflict, and the first implementation made a
 writable pin exclude every other access. Andrew ruled on 2026-11-16: "Pins
 stop moves, not field access (Recommended)". Section 7 states the rule, and
 section 23's marshalling paragraph follows it.
+
+### Amendment: Variadic Calls In The Fast Profile (2026-11-17)
+
+Section 14 binds a variadic C function per arity but did not say how each
+native profile makes the call. Cranelift 0.134 cannot express one: it cannot
+set `%al` to the count of vector registers a System V x86_64 variadic call
+uses, and it cannot place Apple arm64 variadic arguments in their 8-byte
+stack slots. Andrew ruled on 2026-11-17: "Runtime trampoline for Cranelift
+(Recommended)". Section 14 states the rule.
 
 ## Context
 
@@ -550,6 +559,12 @@ extern "C"
 
 - Parameters after the fixed ones must already have their promoted C types: no
   `float32`, no integer narrower than 32 bits, no `bool`.
+- LLVM calls a variadic function directly. Cranelift calls it through a small
+  per-platform variadic call trampoline in `doria-rt`, built ahead of time,
+  passing the function's address and a description of the argument layout
+  from the shared classification; the trampoline places each argument as the
+  target's convention requires. Both profiles accept the same programs
+  (amendment of 2026-11-17).
 
 Consequence: every call stays fully typed, and Apple arm64's stack placement of
 variadic arguments is known at the declaration.
