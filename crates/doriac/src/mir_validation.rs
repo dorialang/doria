@@ -6509,6 +6509,19 @@ fn validate_pointer_operation(
             }
             Some(pointer)
         }
+        mir::PointerOperation::RegionData { region, align } => {
+            if !matches!(local_in(function, *region)?.ty, mir::Type::ByteRegion(_)) {
+                return Err(malformed_mir(
+                    "a region pointer reads a present region local",
+                ));
+            }
+            if !align.is_power_of_two() {
+                return Err(malformed_mir(
+                    "an empty region's pointer is aligned for its element",
+                ));
+            }
+            Some(pointer)
+        }
         mir::PointerOperation::FromAddress { address } => {
             if address.ty() != IntegerType::UInt64 {
                 return Err(malformed_mir("a pointer is formed from a uint64 address"));
@@ -14488,7 +14501,10 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 | mir::PointerOperation::FromAddress { address: value } => {
                     collect_integer_class_local_accesses(value, &mut accesses)
                 }
-                mir::PointerOperation::AddressOf { local, .. } => accesses.resource_read(*local),
+                mir::PointerOperation::AddressOf { local, .. }
+                | mir::PointerOperation::RegionData { region: local, .. } => {
+                    accesses.resource_read(*local)
+                }
                 mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => {}
             }
         }
@@ -20452,7 +20468,8 @@ fn statement_observes_property(
             }
             mir::PointerOperation::Read { .. }
             | mir::PointerOperation::Address { .. }
-            | mir::PointerOperation::AddressOf { .. } => false,
+            | mir::PointerOperation::AddressOf { .. }
+            | mir::PointerOperation::RegionData { .. } => false,
         },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,

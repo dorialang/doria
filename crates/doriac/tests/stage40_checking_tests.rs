@@ -941,6 +941,72 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
     assert!(readonly.message.contains("$fixed"));
 }
 
+fn region_program(body: &str) -> String {
+    format!(
+        "use Doria\\Std\\Ffi\\{{MutPtr, Ptr}}; use Doria\\Std\\Io\\{{ByteRegion, WritableByteRegion}}; function consume(take Bytes $bytes): void {{}} function main(): void {{ writable Bytes $buffer = Bytes::allocate(8); {body} }}"
+    )
+}
+
+#[test]
+fn a_region_pointer_needs_an_unsafe_context_and_pins_the_storage() {
+    // Decision 0148 section 7: `pointer` on both byte regions and
+    // `writablePointer` with writable access to a writable one; forming
+    // either pins the region's storage until the unsafe context ends.
+    for body in [
+        "unsafe { Ptr<uint8> $data = $buffer->getRegion(0, 4)->pointer; echo $data->read(); }",
+        "let $region = $buffer->getRegion(2, 4); unsafe { let $data = $region->pointer; let $again = $region->pointer; echo $data == $again; } echo $buffer[0];",
+        "writable WritableByteRegion $region = $buffer->getWritableRegion(0, 4); unsafe { MutPtr<uint8> $data = $region->writablePointer; $data->write(UInt8::from(1)); Ptr<uint8> $read = $region->pointer; echo $read->read(); }",
+        "let $text = \"Doria\"; unsafe { Ptr<uint8> $data = $text->byteRegion->pointer; echo $data->read(); }",
+        "unsafe { let $data = $buffer->getRegion(0, 4)->pointer; echo $buffer[1]; }",
+        "unsafe { let $data = $buffer->getRegion(0, 4)->pointer; } consume($buffer);",
+    ] {
+        let source = region_program(body);
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let outside = only(
+        &region_program("let $region = $buffer->getRegion(0, 4); let $data = $region->pointer;"),
+        "E0785",
+    );
+    assert!(outside.message.contains("forming a pointer to a region"));
+    let readonly = only(
+        &region_program(
+            "let $region = $buffer->getWritableRegion(0, 4); unsafe { let $data = $region->writablePointer; }",
+        ),
+        "E0479",
+    );
+    assert!(readonly.message.contains("$region"), "{readonly:#?}");
+    assert!(!codes(&region_program(
+        "let $region = $buffer->getRegion(0, 4); unsafe { let $data = $region->writablePointer; }"
+    ))
+    .is_empty());
+    let moved = only(
+        &region_program(
+            "unsafe { let $data = $buffer->getRegion(0, 4)->pointer; consume($buffer); }",
+        ),
+        "E0477",
+    );
+    assert_eq!(moved.title, "Pinned Value Cannot Be Moved Or Replaced");
+    let replaced = only(
+        &region_program(
+            "unsafe { let $data = $buffer->getRegion(0, 4)->pointer; $buffer = Bytes::allocate(2); }",
+        ),
+        "E0477",
+    );
+    assert_eq!(replaced.title, "Pinned Value Cannot Be Moved Or Replaced");
+    let temporary = only(
+        &region_program("unsafe { let $data = Bytes::allocate(4)->getRegion(0, 4)->pointer; }"),
+        "E0762",
+    );
+    assert_eq!(temporary.title, "Value Cannot Outlive Borrowed Source");
+    let inner = only(
+        &region_program(
+            "unsafe { { let $local = Bytes::allocate(4); let $data = $local->getRegion(0, 4)->pointer; } }",
+        ),
+        "E0762",
+    );
+    assert_eq!(inner.title, "Value Cannot Outlive Borrowed Source");
+}
+
 #[test]
 fn boundary_values_convert_explicitly_and_compare_only_for_equality() {
     for body in [

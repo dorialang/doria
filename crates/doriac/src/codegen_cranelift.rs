@@ -20824,6 +20824,15 @@ fn lower_pointer_operation(
                 builder.ins().iadd_imm_u(place, *offset as i64)
             }))
         }
+        mir::PointerOperation::RegionData { region, align } => {
+            let (data, _) =
+                lower_byte_region_local(builder, *region, false, resources)?.byte_region()?;
+            let empty = builder.ins().icmp_imm_u(IntCC::Equal, data, 0);
+            let aligned = builder.ins().iconst(pointer, *align as i64);
+            Some(LoweredValue::Single(
+                builder.ins().select(empty, aligned, data),
+            ))
+        }
         mir::PointerOperation::FromAddress { address } => {
             let address = lower_integer_expression(builder, address, resources)?;
             let present = builder.ins().icmp_imm_u(IntCC::NotEqual, address, 0);

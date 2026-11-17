@@ -106,6 +106,18 @@ pub(super) fn expression(
             span,
             ..
         } => {
+            if matches!(property.as_str(), "pointer" | "writablePointer")
+                && matches!(context.expression_type(object)?, mir::Type::ByteRegion(_))
+            {
+                let region = byte_region::local(object, false, context)?;
+                let target = context.declare_return_temp(POINTER, false);
+                context.push_statement(mir::Statement::Pointer {
+                    target: Some(target),
+                    operation: mir::PointerOperation::RegionData { region, align: 1 },
+                    span: *span,
+                });
+                return Ok(Some(local_rvalue(target, POINTER, false)));
+            }
             let Some((access, _)) = pointer_type(object, context) else {
                 return Ok(None);
             };

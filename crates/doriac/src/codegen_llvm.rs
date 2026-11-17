@@ -22349,6 +22349,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into(),
                 )
             }
+            mir::PointerOperation::RegionData { region, align } => {
+                let (data, _) =
+                    self.byte_region_parts(self.lower_byte_region_local(*region, false)?)?;
+                let int = self.context.i64_type();
+                let data = build(self.builder.build_ptr_to_int(data, int, "region.pointer"))?;
+                let empty = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    data,
+                    int.const_zero(),
+                    "region.pointer.empty",
+                ))?;
+                Some(build(self.builder.build_select(
+                    empty,
+                    int.const_int(*align, false),
+                    data,
+                    "region.pointer",
+                ))?)
+            }
             mir::PointerOperation::FromAddress { address } => {
                 let address = self.lower_integer_expression(address)?;
                 let present = build(self.builder.build_int_compare(

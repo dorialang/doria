@@ -815,3 +815,51 @@ function main(): void
     // `uint16[3]` takes bytes 0 to 5; `int32` is aligned to byte 8.
     assert_runs_natively(&source, "12 7 0 0 7 9");
 }
+
+#[test]
+fn a_region_pointer_gives_c_the_storage_itself() {
+    let source = format!(
+        "{POINTER}use Doria\\Std\\Ffi\\CSize;
+use Doria\\Std\\Io\\WritableByteRegion;
+
+extern \"C\"
+{{
+    /** @safety `$memory` is writable for `$count` bytes. */
+    function memset(MutPtr<uint8> $memory, int32 $value, CSize $count): MutPtr<uint8>;
+}}
+
+function main(): void
+{{
+    writable Bytes $buffer = Bytes::allocate(6);
+    unsafe {{
+        writable WritableByteRegion $region = $buffer->getWritableRegion(1, 4);
+        let $data = $region->writablePointer;
+        let $filled = memset($data, 65, CSize::from(4));
+        echo $filled == $data;
+        echo \" \";
+        echo $region->pointer->address == $data->address;
+    }}
+    echo \" \" . $buffer[0] . \" \" . $buffer[1] . \" \" . $buffer[4] . \" \" . $buffer[5];
+    unsafe {{
+        let $whole = $buffer->getRegion(0, 6)->pointer;
+        let $part = $buffer->getRegion(2, 3)->pointer;
+        echo \" \" . ($part->address - $whole->address);
+        echo \" \" . $part->read();
+    }}
+    let $empty = Bytes::allocate(0);
+    unsafe {{
+        echo \" \" . ($empty->getRegion(0, 0)->pointer->address != UInt64::from(0));
+        let $end = $buffer->getRegion(6, 0)->pointer;
+        echo \" \" . ($end->address - $buffer->getRegion(0, 6)->pointer->address);
+    }}
+    let $text = \"Doria\";
+    unsafe {{
+        echo \" \" . $text->byteRegion->pointer->offset(1)->read();
+    }}
+}}
+"
+    );
+    // memset writes 65 into bytes 1 to 4 of the buffer itself: C receives
+    // the storage's address, and no copy is made.
+    assert_runs_natively(&source, "true true 0 65 65 0 2 65 true 6 111");
+}

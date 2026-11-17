@@ -6331,6 +6331,12 @@ pub enum PointerOperation {
     /// a foreign struct or union. Checking pins that place for the
     /// enclosing unsafe context.
     AddressOf { local: LocalId, offset: u64 },
+    /// `$region->pointer` and `$region->writablePointer` (section 7): the
+    /// address of the first element of the region local `region`. An empty
+    /// region may have no storage; its pointer is then `align`, a non-null
+    /// address aligned for the element, which must not be dereferenced.
+    /// Checking pins the region's storage for the enclosing unsafe context.
+    RegionData { region: LocalId, align: u64 },
 }
 
 impl PointerOperation {
@@ -6341,7 +6347,7 @@ impl PointerOperation {
             | Self::Write { pointer, .. }
             | Self::Offset { pointer, .. }
             | Self::Address { pointer } => Some(*pointer),
-            Self::FromAddress { .. } | Self::AddressOf { .. } => None,
+            Self::FromAddress { .. } | Self::AddressOf { .. } | Self::RegionData { .. } => None,
         }
     }
 }
@@ -7373,7 +7379,8 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             PointerOperation::FromAddress { address } => integer_class_temporary_capacity(address),
             PointerOperation::Read { .. }
             | PointerOperation::Address { .. }
-            | PointerOperation::AddressOf { .. } => 0,
+            | PointerOperation::AddressOf { .. }
+            | PointerOperation::RegionData { .. } => 0,
         },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
@@ -10861,6 +10868,13 @@ impl fmt::Display for Statement {
                     }
                     PointerOperation::AddressOf { local, offset } => {
                         write!(formatter, "pointer_to(local{} @{offset})", local.0)
+                    }
+                    PointerOperation::RegionData { region, align } => {
+                        write!(
+                            formatter,
+                            "region_pointer(local{}, empty @{align})",
+                            region.0
+                        )
                     }
                 }
             }

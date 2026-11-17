@@ -28,6 +28,9 @@ pub struct ByteIntrinsic {
     pub writable_place: bool,
     /// Reads fixed descriptor metadata without accessing the selected bytes.
     pub descriptor_metadata: bool,
+    /// What the member does when it needs an unsafe context, completing
+    /// "… needs an unsafe context"; `None` for a safe member.
+    pub unsafe_operation: Option<&'static str>,
     pub documentation: &'static str,
 }
 
@@ -72,10 +75,10 @@ pub fn type_documentation(ty: &ResolvedType) -> Option<&'static str> {
             "Owned, fixed-length mutable byte storage (Move), with byte-wise equality. `allocate` creates zero-initialized storage; `fromArray` and `toArray` explicitly copy between `Bytes` and `uint8[]`. `length` counts bytes. Indexing reads `uint8`; writes require writable access. `getRegion` and `getWritableRegion` borrow the storage without copying or extending its lifetime.",
         ),
         ResolvedType::ByteRegion(ByteRegionKind::Readonly) => Some(
-            "Readonly borrowed byte region (Copy), carried inline without owning storage or retaining a runtime reference count. `length` counts bytes; indexing reads `uint8`. `getRegion` reborrows a subregion. The source must outlive every use and cannot be mutated, moved, or destroyed while borrowed. A writable binding does not make this region writable.",
+            "Readonly borrowed byte region (Copy), carried inline without owning storage or retaining a runtime reference count. `length` counts bytes; indexing reads `uint8`. `getRegion` reborrows a subregion. In an unsafe context `pointer` gives the address of its first byte for C. The source must outlive every use and cannot be mutated, moved, or destroyed while borrowed. A writable binding does not make this region writable.",
         ),
         ResolvedType::ByteRegion(ByteRegionKind::Writable) => Some(
-            "Exclusive borrowed byte region (Move), carried inline without owning storage or retaining a runtime reference count. `length` counts bytes; indexing reads `uint8`. Indexed writes and `getWritableRegion` require writable access. `getRegion` creates a readonly reborrow. `copyFrom` copies another region's bytes into this one and `copyWithin` moves bytes inside it, both in bulk. The source must outlive every use; its complete place remains exclusively borrowed. Subregions do not establish disjoint ownership.",
+            "Exclusive borrowed byte region (Move), carried inline without owning storage or retaining a runtime reference count. `length` counts bytes; indexing reads `uint8`. Indexed writes and `getWritableRegion` require writable access. `getRegion` creates a readonly reborrow. `copyFrom` copies another region's bytes into this one and `copyWithin` moves bytes inside it, both in bulk. In an unsafe context `pointer` and, with writable access, `writablePointer` give the address of its first byte for C. The source must outlive every use; its complete place remains exclusively borrowed. Subregions do not establish disjoint ownership.",
         ),
         _ => None,
     }
@@ -92,6 +95,8 @@ pub fn members(receiver: &ResolvedType, kind: ByteMemberKind) -> Vec<ByteIntrins
         "copyWithin",
         "length",
         "byteRegion",
+        "pointer",
+        "writablePointer",
         "[]",
     ]
     .into_iter()
@@ -117,6 +122,7 @@ fn string_member(name: &str) -> Option<ByteIntrinsic> {
         accepts_named_arguments: false,
         writable_place: false,
         descriptor_metadata: false,
+        unsafe_operation: None,
         documentation: entry.documentation,
     })
 }
@@ -140,6 +146,7 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
         accepts_named_arguments: false,
         writable_place: false,
         descriptor_metadata: false,
+        unsafe_operation: None,
         documentation: "",
     };
     match name {
@@ -218,6 +225,45 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
             spec.accepts_named_arguments = true;
             spec.receiver_mode = Some(ReceiverMode::Writable);
             spec.documentation = "Copies `length` bytes starting at `offset` to `destination` inside this region. The ranges may overlap. Both ranges must lie within the region; invalid bounds panic. Requires writable access to this region.";
+        }
+        // Decision 0148 section 7: the address of the region's first byte,
+        // valid until the innermost enclosing unsafe context ends. Forming
+        // it pins the region's storage for that context.
+        "pointer" | "writablePointer"
+            if matches!(receiver, ResolvedType::ByteRegion(_))
+                && (name == "pointer" || writable_storage) =>
+        {
+            let writable = name == "writablePointer";
+            spec.name = if writable {
+                "writablePointer"
+            } else {
+                "pointer"
+            };
+            spec.kind = ByteMemberKind::Property;
+            spec.receiver_mode = Some(if writable {
+                ReceiverMode::Writable
+            } else {
+                ReceiverMode::Readonly
+            });
+            spec.return_type =
+                ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Pointer {
+                    access: if writable {
+                        crate::foreign::PointerAccess::Write
+                    } else {
+                        crate::foreign::PointerAccess::Read
+                    },
+                    pointee: byte,
+                }));
+            spec.unsafe_operation = Some(if writable {
+                "forming a writable pointer to a region"
+            } else {
+                "forming a pointer to a region"
+            });
+            spec.documentation = if writable {
+                "The address of this region's first byte, with write access (`MutPtr<uint8>`), for C functions that fill a buffer. Needs an unsafe context and writable access to the region. The region's storage stays in place, and cannot be moved, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context. An empty region gives a non-null address that must not be dereferenced."
+            } else {
+                "The address of this region's first byte (`Ptr<uint8>`), for C functions that read a buffer. Needs an unsafe context. The region's storage stays in place, and cannot be moved, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context. An empty region gives a non-null address that must not be dereferenced."
+            };
         }
         "length" => {
             spec.name = "length";

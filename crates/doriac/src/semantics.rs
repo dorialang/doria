@@ -25097,6 +25097,13 @@ impl<'program> Checker<'program> {
             TypeKind::Nullable(inner) => *inner,
             _ => ty,
         };
+        if let Some(operation) = crate::byte_intrinsics::member(&self.types.resolved(ty), property)
+            .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Property)
+            .and_then(|member| member.unsafe_operation)
+        {
+            self.require_unsafe(span, operation);
+            return;
+        }
         if let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() {
             let definition = self.enum_definition(&enum_type);
             if property == "value" && definition.is_some_and(|value| value.backing_type.is_some()) {

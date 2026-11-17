@@ -7363,10 +7363,15 @@ impl Checker<'_> {
             } => self.use_expr(object, scopes, UseMode::Give),
             Expr::PropertyAccess {
                 object,
+                property,
                 span,
                 null_safe,
                 ..
             } => {
+                if let Some(writable) = self.region_pointer_member(object, property) {
+                    self.form_region_pointer(object, writable, *span, scopes);
+                    return;
+                }
                 if let Some(signature) = self.getter_signature(expr) {
                     let execution = self.method_call_execution(*null_safe, object);
                     self.use_call_args(*span, Some(object), &[], &signature, execution, scopes);
@@ -9752,6 +9757,82 @@ impl Checker<'_> {
                 );
                 return;
             }
+        }
+        let context = self
+            .unsafe_pins
+            .last_mut()
+            .expect("an unsafe context is active");
+        for root in roots {
+            if !context.pins.iter().any(|pin| pin.root == root) {
+                context.pins.push(ActiveBorrow { root, mode, span });
+            }
+        }
+    }
+
+    /// `Some(writable)` when `$object->property` forms a pointer to a
+    /// region's storage: `pointer` (`false`) or `writablePointer` (`true`).
+    fn region_pointer_member(&self, object: &Expr, property: &str) -> Option<bool> {
+        let ty = self.resolved_type(object)?;
+        let ty = match ty {
+            ResolvedType::Nullable(inner) => inner.as_ref(),
+            ty => ty,
+        };
+        crate::byte_intrinsics::member(ty, property)
+            .filter(|member| {
+                member.kind == crate::byte_intrinsics::ByteMemberKind::Property
+                    && member.unsafe_operation.is_some()
+            })
+            .map(|member| member.receiver_mode == Some(crate::symbols::ReceiverMode::Writable))
+    }
+
+    /// `$region->pointer` or `$region->writablePointer` (Decision 0148
+    /// section 7): the region is read, or used with writable access, and the
+    /// region and the storage it borrows are pinned until the innermost
+    /// enclosing unsafe context ends, as `Ptr::to` pins its place. The
+    /// storage, not the region descriptor, is what the pointer addresses, so
+    /// the storage must outlive the context.
+    fn form_region_pointer(
+        &mut self,
+        region: &Expr,
+        writable: bool,
+        span: Span,
+        scopes: &mut Scopes,
+    ) {
+        let (mode, access) = if writable {
+            (UseMode::Write, BorrowAccess::Writable)
+        } else {
+            (UseMode::Read, BorrowAccess::Readonly)
+        };
+        let mut roots = self.borrow_root_keys(region, scopes);
+        let loans = self.reborrow_source_loans(region, scopes, access);
+        for loan in &loans {
+            for (place, _) in loan.places() {
+                roots.push(place.clone());
+            }
+        }
+        let pins = std::mem::take(&mut self.unsafe_pins);
+        self.use_expr(region, scopes, mode);
+        self.unsafe_pins = pins;
+        let Some(context) = self.unsafe_pins.last() else {
+            // Checking reports a formation outside an unsafe context.
+            return;
+        };
+        let context_depth = context.depth;
+        if let Some(loan) = loans.iter().find(|loan| loan.source_depth > context_depth) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0762",
+                    "the storage this region borrows is destroyed before the unsafe context that pins it ends",
+                    region.span(),
+                )
+                .with_title("Value Cannot Outlive Borrowed Source")
+                .with_explanation(
+                    "A pointer to a region's storage is valid until the innermost enclosing unsafe context ends, and the storage stays in place for that long.",
+                )
+                .with_related(loan.capture_span, "The Region Borrows This Storage")
+                .with_help("keep the storage in a local declared before the unsafe context, or form the pointer in an unsafe context inside the storage's block"),
+            );
+            return;
         }
         let context = self
             .unsafe_pins
