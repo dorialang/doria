@@ -11,7 +11,9 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, StructType};
+use inkwell::types::{
+    AnyType, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, StructType,
+};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue as LlvmFloatValue,
     FunctionValue, GlobalValue, InstructionValue, IntValue, PointerValue, StructValue,
@@ -22383,7 +22385,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         target: Option<mir::LocalId>,
     ) -> Result<(), BackendError> {
         use crate::c_layout::CScalar;
-        use crate::native_abi::c_abi::{self, ArgumentPassing, Extension, ReturnPassing};
+        use crate::native_abi::c_abi::{
+            self, Extension, PartClass, PartType, PhysicalParameter, PhysicalReturn,
+        };
         let platform = crate::c_layout::CTarget::host();
         let (parameters, return_type) = foreign
             .c_signature(&self.program.foreign_aggregates, platform)
@@ -22407,44 +22411,88 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 CScalar::Pointer => pointer.into(),
             }
         };
-        let mut parameter_scalars = Vec::with_capacity(classification.parameters.len());
-        for passing in &classification.parameters {
-            let ArgumentPassing::Scalar(scalar) = passing else {
-                return Err(malformed_mir(
-                    "a foreign call passes scalars and pointers until foreign aggregates are built",
-                ));
-            };
-            parameter_scalars.push(*scalar);
-        }
-        let result = match &classification.return_value {
-            ReturnPassing::Void => None,
-            ReturnPassing::Scalar(scalar) => Some(*scalar),
-            ReturnPassing::Registers(_) | ReturnPassing::Indirect => {
-                return Err(malformed_mir(
-                    "a foreign call returns a scalar or pointer until foreign aggregates are built",
-                ))
+        let physical = c_abi::physical_signature(platform, &parameters, &classification);
+        let part_type = |ty: PartType| -> BasicTypeEnum<'ctx> {
+            match ty {
+                PartType::Integer64 => word.into(),
+                PartType::Float32 => self.context.f32_type().into(),
+                PartType::Float64 => self.context.f64_type().into(),
             }
         };
-        let parameter_types = parameter_scalars
-            .iter()
-            .map(|scalar| c_type(*scalar).into())
-            .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
-        // The callee's bits above a narrow result are not relied on.
-        let function_type = match result {
-            Some(scalar) => c_type(scalar).fn_type(&parameter_types, false),
-            None => self.context.void_type().fn_type(&parameter_types, false),
+        let image_type = |size: u64| self.context.i8_type().array_type(size as u32);
+        let attribute = |name: &str, value: u64| {
+            self.context.create_enum_attribute(
+                inkwell::attributes::Attribute::get_named_enum_kind_id(name),
+                value,
+            )
         };
-        let extension = |index: usize| {
-            c_abi::extension(parameter_scalars[index]).map(|extension| {
-                let name = match extension {
-                    Extension::Sign => "signext",
-                    Extension::Zero => "zeroext",
-                };
-                self.context.create_enum_attribute(
-                    inkwell::attributes::Attribute::get_named_enum_kind_id(name),
-                    0,
+        let type_attribute = |name: &str, size: u64| {
+            self.context.create_type_attribute(
+                inkwell::attributes::Attribute::get_named_enum_kind_id(name),
+                image_type(size).as_any_type_enum(),
+            )
+        };
+        let target_type = match target {
+            Some(target) => Some(local_in(self.function, target)?.ty),
+            None => None,
+        };
+        let result_size = match target_type {
+            Some(mir::Type::ForeignAggregate(aggregate)) => u64::from(aggregate.size),
+            _ => 0,
+        };
+        let mut parameter_types = Vec::with_capacity(physical.parameters.len());
+        let mut attributes = Vec::new();
+        for (index, parameter) in physical.parameters.iter().enumerate() {
+            let index = index as u32;
+            parameter_types.push(match parameter {
+                PhysicalParameter::ResultAddress => {
+                    attributes.push((index, type_attribute("sret", result_size)));
+                    pointer.into()
+                }
+                PhysicalParameter::Scalar { scalar, .. } => {
+                    if let Some(extension) = c_abi::extension(*scalar) {
+                        let name = match extension {
+                            Extension::Sign => "signext",
+                            Extension::Zero => "zeroext",
+                        };
+                        attributes.push((index, attribute(name, 0)));
+                    }
+                    c_type(*scalar)
+                }
+                PhysicalParameter::Part { ty, .. } => part_type(*ty),
+                PhysicalParameter::Padding(PartClass::Integer) => word.into(),
+                PhysicalParameter::Padding(PartClass::Float) => self.context.f64_type().into(),
+                PhysicalParameter::StackImage { size, .. } => {
+                    attributes.push((index, type_attribute("byval", *size)));
+                    attributes.push((index, attribute("align", 8)));
+                    pointer.into()
+                }
+                PhysicalParameter::CopyAddress { .. } => pointer.into(),
+            });
+        }
+        let parameter_types = parameter_types
+            .into_iter()
+            .map(BasicMetadataTypeEnum::from)
+            .collect::<Vec<_>>();
+        // The callee's bits above a narrow result are not relied on.
+        let function_type = match &physical.return_value {
+            PhysicalReturn::Scalar(scalar) => c_type(*scalar).fn_type(&parameter_types, false),
+            PhysicalReturn::Parts(parts) if parts.len() == 1 => {
+                part_type(parts[0].1).fn_type(&parameter_types, false)
+            }
+            PhysicalReturn::Parts(parts) => self
+                .context
+                .struct_type(
+                    &parts
+                        .iter()
+                        .map(|(_, ty)| part_type(*ty))
+                        .collect::<Vec<_>>(),
+                    false,
                 )
-            })
+                .fn_type(&parameter_types, false),
+            PhysicalReturn::Void | PhysicalReturn::Indirect => {
+                self.context.void_type().fn_type(&parameter_types, false)
+            }
         };
         let declared = match self.module.get_function(&foreign.symbol) {
             Some(function) => function,
@@ -22454,54 +22502,58 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     function_type,
                     Some(Linkage::External),
                 );
-                for index in 0..parameter_scalars.len() {
-                    if let Some(attribute) = extension(index) {
-                        function.add_attribute(AttributeLoc::Param(index as u32), attribute);
-                    }
+                for (index, attribute) in &attributes {
+                    function.add_attribute(AttributeLoc::Param(*index), *attribute);
                 }
                 function
             }
         };
-        let mut values = Vec::with_capacity(args.len());
-        for (local, scalar) in args.iter().zip(&parameter_scalars) {
-            let ty = local_in(self.function, *local)?.ty;
-            let slot = local_slot(&self.local_slots, *local)?;
-            let loaded = build(self.builder.build_load(
-                llvm_type(self.context, self.target_data, self.program, ty),
-                slot,
-                "foreign.argument",
-            ))?;
-            let value: BasicValueEnum<'ctx> = match (ty, scalar) {
-                // A null `?Ptr<T>` is address zero.
-                (mir::Type::NullableScalar(_), CScalar::Pointer) => {
-                    let (present, payload) = self.nullable_parts(loaded.into_struct_value())?;
-                    let present = build(self.builder.build_int_compare(
-                        IntPredicate::NE,
-                        present,
-                        present.get_type().const_zero(),
-                        "foreign.argument.present",
-                    ))?;
-                    let address = build(self.builder.build_select(
-                        present,
-                        payload.into_int_value(),
-                        word.const_zero(),
-                        "foreign.argument.address",
-                    ))?
-                    .into_int_value();
-                    build(self.builder.build_int_to_ptr(
-                        address,
-                        pointer,
-                        "foreign.argument.pointer",
-                    ))?
-                    .into()
+        let mut images = HashMap::new();
+        let mut values = Vec::with_capacity(physical.parameters.len());
+        for parameter in &physical.parameters {
+            let value: BasicValueEnum<'ctx> = match parameter {
+                PhysicalParameter::ResultAddress => {
+                    let target =
+                        target.ok_or_else(|| malformed_mir("an indirect result has a target"))?;
+                    local_slot(&self.local_slots, target)?.into()
                 }
-                (_, CScalar::Pointer) => build(self.builder.build_int_to_ptr(
-                    loaded.into_int_value(),
-                    pointer,
-                    "foreign.argument.pointer",
-                ))?
-                .into(),
-                _ => loaded,
+                PhysicalParameter::Scalar { argument, scalar } => {
+                    self.foreign_scalar_argument(args, *argument, *scalar)?
+                }
+                PhysicalParameter::Part {
+                    argument,
+                    offset,
+                    ty,
+                } => {
+                    let image = self.foreign_argument_image(args, *argument, &mut images)?;
+                    let offset = u32::try_from(*offset)
+                        .map_err(|_| malformed_mir("an argument part lies past its image"))?;
+                    let address = self.byte_offset(image, offset, "foreign.argument.part")?;
+                    build(
+                        self.builder
+                            .build_load(part_type(*ty), address, "foreign.part"),
+                    )?
+                }
+                PhysicalParameter::Padding(PartClass::Integer) => word.const_zero().into(),
+                PhysicalParameter::Padding(PartClass::Float) => {
+                    self.context.f64_type().const_zero().into()
+                }
+                PhysicalParameter::StackImage { argument, .. } => self
+                    .foreign_argument_image(args, *argument, &mut images)?
+                    .into(),
+                PhysicalParameter::CopyAddress { argument } => {
+                    let (aggregate, source) = self.foreign_aggregate_argument(args, *argument)?;
+                    let copy = self.entry_foreign_aggregate_alloca(aggregate, "foreign.copy")?;
+                    self.copy_memory_value(
+                        copy,
+                        source,
+                        native_closure_abi::NativeLayout {
+                            size: aggregate.size,
+                            align: aggregate.align,
+                        },
+                    )?;
+                    copy.into()
+                }
             };
             values.push(value.into());
         }
@@ -22515,19 +22567,60 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "foreign.call",
             ))?
         };
-        for index in 0..parameter_scalars.len() {
-            if let Some(attribute) = extension(index) {
-                call.add_attribute(AttributeLoc::Param(index as u32), attribute);
-            }
+        for (index, attribute) in &attributes {
+            call.add_attribute(AttributeLoc::Param(*index), *attribute);
         }
-        let (Some(target), Some(scalar)) = (target, result) else {
+        let Some(target) = target else {
             return Ok(());
         };
-        let returned = call
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| malformed_mir("a foreign call with a result produced none"))?;
-        let ty = local_in(self.function, target)?.ty;
+        let ty = target_type.expect("a target has a type");
+        let returned = || {
+            call.try_as_basic_value()
+                .basic()
+                .ok_or_else(|| malformed_mir("a foreign call with a result produced none"))
+        };
+        let scalar = match &physical.return_value {
+            PhysicalReturn::Scalar(scalar) => *scalar,
+            PhysicalReturn::Parts(parts) => {
+                let mir::Type::ForeignAggregate(aggregate) = ty else {
+                    return Err(malformed_mir("register parts return a foreign aggregate"));
+                };
+                let size = c_abi::padded_image_size(u64::from(aggregate.size));
+                let buffer = self.entry_alloca(image_type(size), "foreign.result.image")?;
+                set_alloca_alignment(buffer, 8)?;
+                let returned = returned()?;
+                for (index, (offset, _)) in parts.iter().enumerate() {
+                    let value = if parts.len() == 1 {
+                        returned
+                    } else {
+                        build(self.builder.build_extract_value(
+                            returned.into_struct_value(),
+                            index as u32,
+                            "foreign.result.part",
+                        ))?
+                    };
+                    let offset = u32::try_from(*offset)
+                        .map_err(|_| malformed_mir("a result part lies past its image"))?;
+                    let address = self.byte_offset(buffer, offset, "foreign.result.part")?;
+                    build(self.builder.build_store(address, value))?;
+                }
+                let slot = local_slot(&self.local_slots, target)?;
+                return self.copy_memory_value(
+                    slot,
+                    buffer,
+                    native_closure_abi::NativeLayout {
+                        size: aggregate.size,
+                        align: aggregate.align,
+                    },
+                );
+            }
+            // The callee wrote the result into the target's storage.
+            PhysicalReturn::Indirect => return Ok(()),
+            PhysicalReturn::Void => {
+                return Err(malformed_mir("a void foreign call assigns no result"))
+            }
+        };
+        let returned = returned()?;
         let value: BasicValueEnum<'ctx> = match scalar {
             // C `_Bool` is 0 or 1; any other byte still reads as `true`.
             CScalar::Bool => {
@@ -22573,6 +22666,115 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let slot = local_slot(&self.local_slots, target)?;
         build(self.builder.build_store(slot, value))?;
         Ok(())
+    }
+
+    /// A scalar argument of a foreign call, as C receives it: a null
+    /// `?Ptr<T>` is address zero.
+    fn foreign_scalar_argument(
+        &mut self,
+        args: &[mir::LocalId],
+        argument: usize,
+        scalar: crate::c_layout::CScalar,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        use crate::c_layout::CScalar;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let word = self.context.i64_type();
+        let local = *args
+            .get(argument)
+            .ok_or_else(|| malformed_mir("a foreign call passes every argument"))?;
+        let ty = local_in(self.function, local)?.ty;
+        let slot = local_slot(&self.local_slots, local)?;
+        let loaded = build(self.builder.build_load(
+            llvm_type(self.context, self.target_data, self.program, ty),
+            slot,
+            "foreign.argument",
+        ))?;
+        Ok(match (ty, scalar) {
+            (mir::Type::NullableScalar(_), CScalar::Pointer) => {
+                let (present, payload) = self.nullable_parts(loaded.into_struct_value())?;
+                let present = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    present,
+                    present.get_type().const_zero(),
+                    "foreign.argument.present",
+                ))?;
+                let address = build(self.builder.build_select(
+                    present,
+                    payload.into_int_value(),
+                    word.const_zero(),
+                    "foreign.argument.address",
+                ))?
+                .into_int_value();
+                build(
+                    self.builder
+                        .build_int_to_ptr(address, pointer, "foreign.argument.pointer"),
+                )?
+                .into()
+            }
+            (_, CScalar::Pointer) => build(self.builder.build_int_to_ptr(
+                loaded.into_int_value(),
+                pointer,
+                "foreign.argument.pointer",
+            ))?
+            .into(),
+            _ => loaded,
+        })
+    }
+
+    /// The foreign aggregate type and slot of a foreign call's argument.
+    fn foreign_aggregate_argument(
+        &self,
+        args: &[mir::LocalId],
+        argument: usize,
+    ) -> Result<(mir::ForeignAggregateType, PointerValue<'ctx>), BackendError> {
+        let local = *args
+            .get(argument)
+            .ok_or_else(|| malformed_mir("a foreign call passes every argument"))?;
+        let mir::Type::ForeignAggregate(aggregate) = local_in(self.function, local)?.ty else {
+            return Err(malformed_mir(
+                "a foreign call moves only a foreign aggregate by its image",
+            ));
+        };
+        Ok((aggregate, local_slot(&self.local_slots, local)?))
+    }
+
+    /// A zero-padded copy of an aggregate argument's memory image, whole
+    /// 8-byte registers long (`c_abi::padded_image_size`), made once per
+    /// call.
+    fn foreign_argument_image(
+        &mut self,
+        args: &[mir::LocalId],
+        argument: usize,
+        images: &mut HashMap<usize, PointerValue<'ctx>>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        if let Some(image) = images.get(&argument) {
+            return Ok(*image);
+        }
+        let (aggregate, source) = self.foreign_aggregate_argument(args, argument)?;
+        let size = crate::native_abi::c_abi::padded_image_size(u64::from(aggregate.size));
+        let image = self.entry_alloca(
+            self.context.i8_type().array_type(size as u32),
+            "foreign.argument.image",
+        )?;
+        set_alloca_alignment(image, 8)?;
+        let length = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(size, false);
+        build(
+            self.builder
+                .build_memset(image, 8, self.context.i8_type().const_zero(), length),
+        )?;
+        self.copy_memory_value(
+            image,
+            source,
+            native_closure_abi::NativeLayout {
+                size: aggregate.size,
+                align: aggregate.align,
+            },
+        )?;
+        images.insert(argument, image);
+        Ok(image)
     }
 
     /// The address a pointer local holds.
@@ -26170,6 +26372,14 @@ fn llvm_type<'ctx>(
             context.i8_type().array_type(aggregate.size).into()
         }
     }
+}
+
+/// Aligns an entry-block alloca to `align` bytes.
+fn set_alloca_alignment(slot: PointerValue<'_>, align: u32) -> Result<(), BackendError> {
+    slot.as_instruction_value()
+        .ok_or_else(|| backend_failure("an alloca has no instruction"))?
+        .set_alignment(align)
+        .map_err(|error| backend_failure(format!("failed to align an alloca: {error}")))
 }
 
 fn class_uses_open_carrier(program: &mir::Program, class: crate::class_layout::ClassId) -> bool {

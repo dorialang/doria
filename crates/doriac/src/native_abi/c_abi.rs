@@ -46,8 +46,16 @@ pub enum ArgumentPassing {
     /// image.
     Registers(Vec<RegisterPart>),
     /// The value's memory image, rounded up to `size` bytes, in the
-    /// argument area on the stack.
-    Stack { size: u64, align: u64 },
+    /// argument area on the stack. `closed` is the register class the
+    /// convention has closed for this and every later argument of the class
+    /// (an AArch64 argument that did not fit); `None` when the convention
+    /// leaves the registers to later arguments (System V's memory class)
+    /// or places every argument on the stack (an Apple arm64 variadic one).
+    Stack {
+        size: u64,
+        align: u64,
+        closed: Option<PartClass>,
+    },
     /// A pointer to a copy the caller makes, passed as a pointer argument;
     /// `on_stack` places that pointer on the stack (an Apple arm64 variadic
     /// argument).
@@ -216,6 +224,7 @@ fn system_v_parameters(parameters: &[CType], return_value: &ReturnPassing) -> Ve
                 let stack = ArgumentPassing::Stack {
                     size: aggregate.size().div_ceil(8) * 8,
                     align: aggregate.align().max(8),
+                    closed: None,
                 };
                 let Some(parts) = system_v_parts(aggregate) else {
                     return stack;
@@ -346,9 +355,10 @@ fn aarch64_parameters(
         .iter()
         .enumerate()
         .map(|(index, ty)| {
-            let slot = |ty: &CType| ArgumentPassing::Stack {
+            let slot = |ty: &CType, closed| ArgumentPassing::Stack {
                 size: ty.size().div_ceil(8) * 8,
                 align: 8,
+                closed,
             };
             // Apple arm64 passes every variadic argument on the stack, one
             // 8-byte slot each; a composite over 16 bytes by reference.
@@ -356,15 +366,15 @@ fn aarch64_parameters(
                 return if !matches!(ty, CType::Scalar(_)) && ty.size() > 16 {
                     ArgumentPassing::IndirectCopy { on_stack: true }
                 } else {
-                    slot(ty)
+                    slot(ty, None)
                 };
             }
             match ty {
                 CType::Scalar(scalar) => {
-                    let file = if scalar.is_float() {
-                        &mut floats
+                    let (file, class) = if scalar.is_float() {
+                        (&mut floats, PartClass::Float)
                     } else {
-                        &mut integers
+                        (&mut integers, PartClass::Integer)
                     };
                     let backend_register = file.backend_has_register();
                     if file.take(1) || !backend_register {
@@ -373,6 +383,7 @@ fn aarch64_parameters(
                         ArgumentPassing::Stack {
                             size: scalar.size(),
                             align: scalar.size(),
+                            closed: Some(class),
                         }
                     }
                 }
@@ -381,7 +392,7 @@ fn aarch64_parameters(
                         return if floats.take(parts.len()) {
                             ArgumentPassing::Registers(parts)
                         } else {
-                            slot(aggregate)
+                            slot(aggregate, Some(PartClass::Float))
                         };
                     }
                     if aggregate.size() > 16 {
@@ -394,12 +405,242 @@ fn aarch64_parameters(
                     if integers.take(parts.len()) {
                         ArgumentPassing::Registers(parts)
                     } else {
-                        slot(aggregate)
+                        slot(aggregate, Some(PartClass::Integer))
                     }
                 }
             }
         })
         .collect()
+}
+
+// The backend signature ------------------------------------------------------
+
+/// How a backend types one register's worth of an aggregate's memory image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PartType {
+    /// A 64-bit integer register; a part narrower than 8 bytes travels in
+    /// its low bytes.
+    Integer64,
+    Float32,
+    Float64,
+}
+
+impl RegisterPart {
+    pub const fn part_type(self) -> PartType {
+        match (self.class, self.size) {
+            (PartClass::Integer, _) => PartType::Integer64,
+            (PartClass::Float, 4) => PartType::Float32,
+            (PartClass::Float, _) => PartType::Float64,
+        }
+    }
+}
+
+/// One value of the signature both native backends declare for a foreign
+/// call, in order. Each names the argument it comes from by index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PhysicalParameter {
+    /// The address of the caller's storage for an indirect result: the
+    /// first argument on System V and Windows x64, `x8` on AArch64
+    /// ([`indirect_return_takes_first_argument`]). It comes first.
+    ResultAddress,
+    /// A scalar argument, widened as [`extension`] says.
+    Scalar { argument: usize, scalar: CScalar },
+    /// The register's worth of an argument's memory image at `offset`.
+    Part {
+        argument: usize,
+        offset: u64,
+        ty: PartType,
+    },
+    /// A register of `class` the callee does not read. The convention has
+    /// closed that class, so the parameters after it travel on the stack;
+    /// padding the registers that remain makes a backend place them there.
+    Padding(PartClass),
+    /// An argument's memory image, `size` bytes, which the backend copies
+    /// into the stack argument area (Cranelift's struct argument, LLVM's
+    /// `byval`), leaving the registers to later arguments.
+    StackImage { argument: usize, size: u64 },
+    /// The address of a copy of the argument the caller makes.
+    CopyAddress { argument: usize },
+}
+
+/// How a backend receives the result of a foreign call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PhysicalReturn {
+    Void,
+    Scalar(CScalar),
+    /// One returned register per part, each the part of the result's
+    /// memory image at its offset.
+    Parts(Vec<(u64, PartType)>),
+    /// The callee writes the result to the storage
+    /// [`PhysicalParameter::ResultAddress`] names.
+    Indirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PhysicalSignature {
+    pub parameters: Vec<PhysicalParameter>,
+    pub return_value: PhysicalReturn,
+}
+
+/// The bytes a backend reserves for an argument's or result's memory image
+/// when it moves the image by register parts or stack chunks: the C size
+/// rounded up to whole 8-byte registers, zero beyond the value.
+pub const fn padded_image_size(size: u64) -> u64 {
+    size.div_ceil(8) * 8
+}
+
+/// The registers of each class an AArch64 backend fills in argument order.
+const AARCH64_ARGUMENT_REGISTERS: usize = 8;
+
+/// The one signature both native backends declare for a classified foreign
+/// call (Decision 0148 section 6): which value travels in each backend
+/// parameter and how the result returns. Both backends place a parameter in
+/// the next register of its class while one is free, and otherwise on the
+/// stack in order, so padding the remaining registers of a class the
+/// convention has closed places an AArch64 stack argument where the
+/// convention does; System V's memory class uses a stack image instead,
+/// because later arguments still use the registers.
+/// `parameters` are the C types `classification` classified.
+pub fn physical_signature(
+    target: CTarget,
+    parameter_types: &[CType],
+    classification: &SignatureClassification,
+) -> PhysicalSignature {
+    let aarch64 = matches!(
+        target.calling_convention(),
+        CCallingConvention::Aapcs64 | CCallingConvention::AppleArm64
+    );
+    let mut parameters = Vec::new();
+    if classification.return_value == ReturnPassing::Indirect {
+        parameters.push(PhysicalParameter::ResultAddress);
+    }
+    // Registers a backend has filled, by class, which only AArch64 padding
+    // reads; the result address travels in `x8` there.
+    let mut used = RegisterUse::default();
+    for (argument, passing) in classification.parameters.iter().enumerate() {
+        match passing {
+            ArgumentPassing::Scalar(scalar) => used.push(
+                &mut parameters,
+                PhysicalParameter::Scalar {
+                    argument,
+                    scalar: *scalar,
+                },
+            ),
+            ArgumentPassing::Registers(parts) => {
+                for part in parts {
+                    used.push(
+                        &mut parameters,
+                        PhysicalParameter::Part {
+                            argument,
+                            offset: part.offset,
+                            ty: part.part_type(),
+                        },
+                    );
+                }
+            }
+            ArgumentPassing::Stack { size, closed, .. } if aarch64 => {
+                if let Some(class) = closed {
+                    used.pad(&mut parameters, *class);
+                }
+                let ty = match closed {
+                    Some(PartClass::Float) => PartType::Float64,
+                    _ => PartType::Integer64,
+                };
+                // A scalar keeps its own type, so a backend gives it the
+                // convention's slot size; an image moves in 8-byte chunks.
+                if let Some(CType::Scalar(scalar)) = parameter_types.get(argument) {
+                    let scalar = *scalar;
+                    used.push(
+                        &mut parameters,
+                        PhysicalParameter::Scalar { argument, scalar },
+                    );
+                } else {
+                    for chunk in 0..size / 8 {
+                        used.push(
+                            &mut parameters,
+                            PhysicalParameter::Part {
+                                argument,
+                                offset: chunk * 8,
+                                ty,
+                            },
+                        );
+                    }
+                }
+            }
+            ArgumentPassing::Stack { size, .. } => used.push(
+                &mut parameters,
+                PhysicalParameter::StackImage {
+                    argument,
+                    size: *size,
+                },
+            ),
+            ArgumentPassing::IndirectCopy { on_stack } => {
+                if *on_stack {
+                    used.pad(&mut parameters, PartClass::Integer);
+                }
+                used.push(&mut parameters, PhysicalParameter::CopyAddress { argument });
+            }
+        }
+    }
+    let return_value = match &classification.return_value {
+        ReturnPassing::Void => PhysicalReturn::Void,
+        ReturnPassing::Scalar(scalar) => PhysicalReturn::Scalar(*scalar),
+        ReturnPassing::Registers(parts) => PhysicalReturn::Parts(
+            parts
+                .iter()
+                .map(|part| (part.offset, part.part_type()))
+                .collect(),
+        ),
+        ReturnPassing::Indirect => PhysicalReturn::Indirect,
+    };
+    PhysicalSignature {
+        parameters,
+        return_value,
+    }
+}
+
+/// The registers of each class a backend has filled with parameters.
+#[derive(Default)]
+struct RegisterUse {
+    integers: usize,
+    floats: usize,
+}
+
+impl RegisterUse {
+    fn count(&mut self, class: PartClass) -> &mut usize {
+        match class {
+            PartClass::Integer => &mut self.integers,
+            PartClass::Float => &mut self.floats,
+        }
+    }
+
+    fn push(&mut self, parameters: &mut Vec<PhysicalParameter>, parameter: PhysicalParameter) {
+        let class = match &parameter {
+            PhysicalParameter::Scalar { scalar, .. } if scalar.is_float() => Some(PartClass::Float),
+            PhysicalParameter::Scalar { .. } | PhysicalParameter::CopyAddress { .. } => {
+                Some(PartClass::Integer)
+            }
+            PhysicalParameter::Part {
+                ty: PartType::Integer64,
+                ..
+            } => Some(PartClass::Integer),
+            PhysicalParameter::Part { .. } => Some(PartClass::Float),
+            PhysicalParameter::Padding(class) => Some(*class),
+            PhysicalParameter::ResultAddress | PhysicalParameter::StackImage { .. } => None,
+        };
+        if let Some(class) = class {
+            let count = self.count(class);
+            *count = (*count + 1).min(AARCH64_ARGUMENT_REGISTERS);
+        }
+        parameters.push(parameter);
+    }
+
+    /// Fills every remaining register of `class` with padding.
+    fn pad(&mut self, parameters: &mut Vec<PhysicalParameter>, class: PartClass) {
+        while *self.count(class) < AARCH64_ARGUMENT_REGISTERS {
+            self.push(parameters, PhysicalParameter::Padding(class));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,11 +748,19 @@ mod tests {
         assert_eq!(classification.return_value, ReturnPassing::Indirect);
         assert_eq!(
             classification.parameters[5],
-            ArgumentPassing::Stack { size: 16, align: 8 }
+            ArgumentPassing::Stack {
+                size: 16,
+                align: 8,
+                closed: None
+            }
         );
         assert_eq!(
             classify(LINUX_X86, &[large], None, None).parameters,
-            [ArgumentPassing::Stack { size: 24, align: 8 }]
+            [ArgumentPassing::Stack {
+                size: 24,
+                align: 8,
+                closed: None
+            }]
         );
         assert!(indirect_return_takes_first_argument(
             LINUX_X86.calling_convention()
@@ -602,11 +851,19 @@ mod tests {
         // on the stack too, although one register is still free.
         assert_eq!(
             classification.parameters[7],
-            ArgumentPassing::Stack { size: 16, align: 8 }
+            ArgumentPassing::Stack {
+                size: 16,
+                align: 8,
+                closed: Some(PartClass::Integer)
+            }
         );
         assert_eq!(
             classification.parameters[8],
-            ArgumentPassing::Stack { size: 4, align: 4 }
+            ArgumentPassing::Stack {
+                size: 4,
+                align: 4,
+                closed: Some(PartClass::Integer)
+            }
         );
         // System V keeps the register for later arguments.
         let classification = classify(LINUX_X86, &parameters[2..], None, None);
@@ -632,8 +889,16 @@ mod tests {
             classification.parameters,
             [
                 ArgumentPassing::Scalar(CScalar::Pointer),
-                ArgumentPassing::Stack { size: 8, align: 8 },
-                ArgumentPassing::Stack { size: 8, align: 8 },
+                ArgumentPassing::Stack {
+                    size: 8,
+                    align: 8,
+                    closed: None
+                },
+                ArgumentPassing::Stack {
+                    size: 8,
+                    align: 8,
+                    closed: None
+                },
             ]
         );
         // AAPCS64 on Linux passes variadic arguments as fixed ones.
@@ -669,5 +934,98 @@ mod tests {
             None
         );
         assert_eq!(extension(CScalar::Pointer), None);
+    }
+
+    #[test]
+    fn the_backend_signature_pads_closed_aarch64_registers_before_stack_arguments() {
+        let pair = record(vec![INT64, INT64]);
+        let mut parameters = vec![INT64; 7];
+        parameters.push(pair);
+        parameters.push(INT32);
+        let classification = classify(LINUX_ARM, &parameters, None, None);
+        let signature = physical_signature(LINUX_ARM, &parameters, &classification);
+        // Seven scalars, one padding register, the pair's image in two
+        // stack chunks, and the last scalar on the stack after them.
+        assert_eq!(
+            signature.parameters[7..],
+            [
+                PhysicalParameter::Padding(PartClass::Integer),
+                PhysicalParameter::Part {
+                    argument: 7,
+                    offset: 0,
+                    ty: PartType::Integer64
+                },
+                PhysicalParameter::Part {
+                    argument: 7,
+                    offset: 8,
+                    ty: PartType::Integer64
+                },
+                PhysicalParameter::Scalar {
+                    argument: 8,
+                    scalar: CScalar::Integer {
+                        bytes: 4,
+                        signed: true
+                    }
+                },
+            ]
+        );
+        // A homogeneous float aggregate that does not fit moves as float
+        // chunks, leaving the integer registers to later arguments.
+        let vector = record(vec![FLOAT64, FLOAT64]);
+        let mut parameters = vec![FLOAT64; 7];
+        parameters.push(vector);
+        parameters.push(INT32);
+        let classification = classify(MAC_ARM, &parameters, None, None);
+        let signature = physical_signature(MAC_ARM, &parameters, &classification);
+        assert_eq!(
+            signature.parameters[7..10],
+            [
+                PhysicalParameter::Padding(PartClass::Float),
+                PhysicalParameter::Part {
+                    argument: 7,
+                    offset: 0,
+                    ty: PartType::Float64
+                },
+                PhysicalParameter::Part {
+                    argument: 7,
+                    offset: 8,
+                    ty: PartType::Float64
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_backend_signature_places_results_and_large_arguments_by_convention() {
+        let large = record(vec![INT64, INT64, INT64]);
+        let mixed = record(vec![INT32, FLOAT32, FLOAT64]);
+        let parameters = [large.clone(), mixed, INT32];
+        for target in [LINUX_X86, LINUX_ARM, WINDOWS] {
+            let classification = classify(target, &parameters, Some(&large), None);
+            let signature = physical_signature(target, &parameters, &classification);
+            assert_eq!(signature.parameters[0], PhysicalParameter::ResultAddress);
+            assert_eq!(signature.return_value, PhysicalReturn::Indirect);
+            let large_argument = &signature.parameters[1];
+            match target.calling_convention() {
+                CCallingConvention::SystemV => assert_eq!(
+                    *large_argument,
+                    PhysicalParameter::StackImage {
+                        argument: 0,
+                        size: 24
+                    }
+                ),
+                _ => assert_eq!(
+                    *large_argument,
+                    PhysicalParameter::CopyAddress { argument: 0 }
+                ),
+            }
+        }
+        let classification = classify(LINUX_X86, &parameters[1..], Some(&parameters[1]), None);
+        let signature = physical_signature(LINUX_X86, &parameters[1..], &classification);
+        assert_eq!(
+            signature.return_value,
+            PhysicalReturn::Parts(vec![(0, PartType::Integer64), (8, PartType::Float64)])
+        );
+        assert_eq!(padded_image_size(12), 16);
     }
 }

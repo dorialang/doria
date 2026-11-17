@@ -322,20 +322,6 @@ pub(super) fn lower_extern_body(
         mir::ReturnType::Value(ty) => Some(ty),
         mir::ReturnType::Void => None,
     };
-    if parameter_types
-        .iter()
-        .chain(result.as_ref())
-        .any(|ty| matches!(ty, mir::Type::ForeignAggregate(_)))
-    {
-        return Err(vec![crate::unsafe_code::unbuilt_form(
-            function.span,
-            "Foreign Structs And Unions Cannot Cross The C Boundary By Value Yet",
-            format!(
-                "passing or returning a foreign struct or union by value in `{}` is part of Doria; this compiler does not build it yet",
-                binding.symbol
-            ),
-        )]);
-    }
     let foreign = mir::ForeignFunction {
         symbol: binding.symbol.clone(),
         library: binding.library.clone(),

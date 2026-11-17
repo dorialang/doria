@@ -20855,7 +20855,10 @@ fn lower_foreign_call(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     use crate::c_layout::CScalar;
-    use crate::native_abi::c_abi::{self, ArgumentPassing, Extension, ReturnPassing};
+    use crate::native_abi::c_abi::{
+        self, Extension, PartClass, PartType, PhysicalParameter, PhysicalReturn,
+    };
+    use cranelift_codegen::ir::ArgumentPurpose;
     let pointer = resources.module.target_config().pointer_type();
     let platform = crate::c_layout::CTarget::host();
     let (parameters, return_type) = foreign
@@ -20867,6 +20870,7 @@ fn lower_foreign_call(
         return_type.as_ref(),
         foreign.fixed_parameters,
     );
+    let physical = c_abi::physical_signature(platform, &parameters, &classification);
     let clif = |scalar: CScalar| match scalar {
         CScalar::Integer { bytes: 1, .. } | CScalar::Bool => types::I8,
         CScalar::Integer { bytes: 2, .. } => types::I16,
@@ -20875,47 +20879,118 @@ fn lower_foreign_call(
         CScalar::Float { .. } => types::F64,
         CScalar::Integer { .. } | CScalar::Pointer => pointer,
     };
-    let mut signature = resources.module.make_signature();
-    for passing in &classification.parameters {
-        let ArgumentPassing::Scalar(scalar) = passing else {
-            return Err(malformed_mir(
-                "a foreign call passes scalars and pointers until foreign aggregates are built",
-            ));
-        };
-        let parameter = AbiParam::new(clif(*scalar));
-        signature.params.push(match c_abi::extension(*scalar) {
-            Some(Extension::Sign) => parameter.sext(),
-            Some(Extension::Zero) => parameter.uext(),
-            None => parameter,
-        });
-    }
-    let result = match &classification.return_value {
-        ReturnPassing::Void => None,
-        ReturnPassing::Scalar(scalar) => {
-            // The callee's bits above a narrow result are not relied on.
-            signature.returns.push(AbiParam::new(clif(*scalar)));
-            Some(*scalar)
-        }
-        ReturnPassing::Registers(_) | ReturnPassing::Indirect => {
-            return Err(malformed_mir(
-                "a foreign call returns a scalar or pointer until foreign aggregates are built",
-            ))
-        }
+    let part_clif = |ty: PartType| match ty {
+        PartType::Integer64 => types::I64,
+        PartType::Float32 => types::F32,
+        PartType::Float64 => types::F64,
     };
-    let mut values = Vec::with_capacity(args.len());
-    for local in args {
-        let ty = local_definition(resources.program, resources.function_id, *local)?.ty;
-        let slot = local_slot(resources.local_slots, *local)?;
-        values.push(
-            match load_lowered_from_stack(builder, resources.program, ty, slot, pointer) {
-                // A null `?Ptr<T>` is address zero.
-                LoweredValue::Nullable { present, payload } => {
-                    let null = builder.ins().iconst(pointer, 0);
-                    builder.ins().select(present, payload, null)
-                }
-                value => value.single()?,
-            },
-        );
+    let target_type = match target {
+        Some(target) => {
+            Some(local_definition(resources.program, resources.function_id, target)?.ty)
+        }
+        None => None,
+    };
+    let mut signature = resources.module.make_signature();
+    let mut images = HashMap::new();
+    let mut values = Vec::with_capacity(physical.parameters.len());
+    for parameter in &physical.parameters {
+        match parameter {
+            PhysicalParameter::ResultAddress => {
+                signature
+                    .params
+                    .push(AbiParam::special(pointer, ArgumentPurpose::StructReturn));
+                let target =
+                    target.ok_or_else(|| malformed_mir("an indirect result has a target"))?;
+                let slot = local_slot(resources.local_slots, target)?;
+                values.push(builder.ins().stack_addr(pointer, slot, 0));
+            }
+            PhysicalParameter::Scalar { argument, scalar } => {
+                let parameter = AbiParam::new(clif(*scalar));
+                signature.params.push(match c_abi::extension(*scalar) {
+                    Some(Extension::Sign) => parameter.sext(),
+                    Some(Extension::Zero) => parameter.uext(),
+                    None => parameter,
+                });
+                let local = foreign_argument_local(args, *argument)?;
+                let ty = local_definition(resources.program, resources.function_id, local)?.ty;
+                let slot = local_slot(resources.local_slots, local)?;
+                values.push(
+                    match load_lowered_from_stack(builder, resources.program, ty, slot, pointer) {
+                        // A null `?Ptr<T>` is address zero.
+                        LoweredValue::Nullable { present, payload } => {
+                            let null = builder.ins().iconst(pointer, 0);
+                            builder.ins().select(present, payload, null)
+                        }
+                        value => value.single()?,
+                    },
+                );
+            }
+            PhysicalParameter::Part {
+                argument,
+                offset,
+                ty,
+            } => {
+                signature.params.push(AbiParam::new(part_clif(*ty)));
+                let image =
+                    foreign_argument_image(builder, args, *argument, &mut images, resources)?;
+                values.push(builder.ins().load(
+                    part_clif(*ty),
+                    MemFlagsData::trusted(),
+                    image,
+                    *offset as i32,
+                ));
+            }
+            PhysicalParameter::Padding(class) => {
+                let (ty, value) = match class {
+                    PartClass::Integer => (types::I64, builder.ins().iconst(types::I64, 0)),
+                    PartClass::Float => (types::F64, builder.ins().f64const(Ieee64::with_bits(0))),
+                };
+                signature.params.push(AbiParam::new(ty));
+                values.push(value);
+            }
+            PhysicalParameter::StackImage { argument, size } => {
+                let size = u32::try_from(*size)
+                    .map_err(|_| malformed_mir("a stack argument image exceeds u32"))?;
+                signature.params.push(AbiParam::special(
+                    pointer,
+                    ArgumentPurpose::StructArgument(size),
+                ));
+                values.push(foreign_argument_image(
+                    builder,
+                    args,
+                    *argument,
+                    &mut images,
+                    resources,
+                )?);
+            }
+            PhysicalParameter::CopyAddress { argument } => {
+                signature.params.push(AbiParam::new(pointer));
+                let (aggregate, source) =
+                    foreign_aggregate_argument(builder, args, *argument, resources)?;
+                let copy = create_call_storage(
+                    builder,
+                    mir::Type::ForeignAggregate(aggregate),
+                    resources,
+                )?;
+                copy_foreign_aggregate(
+                    builder,
+                    copy,
+                    source,
+                    aggregate,
+                    AggregateAccess::Storage,
+                    pointer,
+                );
+                values.push(copy);
+            }
+        }
+    }
+    match &physical.return_value {
+        // The callee's bits above a narrow result are not relied on.
+        PhysicalReturn::Scalar(scalar) => signature.returns.push(AbiParam::new(clif(*scalar))),
+        PhysicalReturn::Parts(parts) => signature
+            .returns
+            .extend(parts.iter().map(|(_, ty)| AbiParam::new(part_clif(*ty)))),
+        PhysicalReturn::Void | PhysicalReturn::Indirect => {}
     }
     let call = match resources.module.get_name(&foreign.symbol) {
         Some(cranelift_module::FuncOrDataId::Func(id))
@@ -20950,11 +21025,45 @@ fn lower_foreign_call(
             builder.ins().call(reference, &values)
         }
     };
-    let (Some(target), Some(scalar)) = (target, result) else {
+    let (Some(target), Some(ty)) = (target, target_type) else {
         return Ok(());
     };
+    let scalar = match &physical.return_value {
+        PhysicalReturn::Scalar(scalar) => *scalar,
+        PhysicalReturn::Parts(parts) => {
+            let mir::Type::ForeignAggregate(aggregate) = ty else {
+                return Err(malformed_mir("register parts return a foreign aggregate"));
+            };
+            let size = c_abi::padded_image_size(u64::from(aggregate.size)) as u32;
+            let image = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                size,
+                3,
+            ));
+            let image = builder.ins().stack_addr(pointer, image, 0);
+            let results = builder.inst_results(call).to_vec();
+            for ((offset, _), value) in parts.iter().zip(results) {
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), value, image, *offset as i32);
+            }
+            let slot = local_slot(resources.local_slots, target)?;
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_foreign_aggregate(
+                builder,
+                destination,
+                image,
+                aggregate,
+                AggregateAccess::Storage,
+                pointer,
+            );
+            return Ok(());
+        }
+        // The callee wrote the result into the target's slot.
+        PhysicalReturn::Indirect => return Ok(()),
+        PhysicalReturn::Void => return Err(malformed_mir("a void foreign call assigns no result")),
+    };
     let value = builder.inst_results(call)[0];
-    let ty = local_definition(resources.program, resources.function_id, target)?.ty;
     let value = match (scalar, ty) {
         // C `_Bool` is 0 or 1; any other byte still reads as `true`.
         (CScalar::Bool, _) => {
@@ -20971,6 +21080,72 @@ fn lower_foreign_call(
     };
     let slot = local_slot(resources.local_slots, target)?;
     store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)
+}
+
+fn foreign_argument_local(
+    args: &[mir::LocalId],
+    argument: usize,
+) -> Result<mir::LocalId, BackendError> {
+    args.get(argument)
+        .copied()
+        .ok_or_else(|| malformed_mir("a foreign call passes every argument"))
+}
+
+/// The foreign aggregate type and slot address of a foreign call's
+/// argument.
+fn foreign_aggregate_argument(
+    builder: &mut FunctionBuilder,
+    args: &[mir::LocalId],
+    argument: usize,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<(mir::ForeignAggregateType, Value), BackendError> {
+    let local = foreign_argument_local(args, argument)?;
+    let mir::Type::ForeignAggregate(aggregate) =
+        local_definition(resources.program, resources.function_id, local)?.ty
+    else {
+        return Err(malformed_mir(
+            "a foreign call moves only a foreign aggregate by its image",
+        ));
+    };
+    let slot = local_slot(resources.local_slots, local)?;
+    let pointer = resources.module.target_config().pointer_type();
+    Ok((aggregate, builder.ins().stack_addr(pointer, slot, 0)))
+}
+
+/// A zero-padded copy of an aggregate argument's memory image, whole
+/// 8-byte registers long (`c_abi::padded_image_size`), made once per call.
+fn foreign_argument_image(
+    builder: &mut FunctionBuilder,
+    args: &[mir::LocalId],
+    argument: usize,
+    images: &mut HashMap<usize, Value>,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    if let Some(image) = images.get(&argument) {
+        return Ok(*image);
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let (aggregate, source) = foreign_aggregate_argument(builder, args, argument, resources)?;
+    let size = crate::native_abi::c_abi::padded_image_size(u64::from(aggregate.size)) as u32;
+    let slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+    let image = builder.ins().stack_addr(pointer, slot, 0);
+    let zero = builder.ins().iconst(types::I64, 0);
+    for offset in (0..size).step_by(8) {
+        builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero, image, offset as i32);
+    }
+    copy_foreign_aggregate(
+        builder,
+        image,
+        source,
+        aggregate,
+        AggregateAccess::Storage,
+        pointer,
+    );
+    images.insert(argument, image);
+    Ok(image)
 }
 
 /// Panics with P1702 unless `address` is a multiple of `align`, the

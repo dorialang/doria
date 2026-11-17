@@ -675,3 +675,143 @@ fn an_aligned_aggregate_access_at_a_misaligned_address_panics_with_p1702() {
         assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
     }
 }
+
+const DIVISION: &str = r#"
+use Doria\Std\Ffi\CLong;
+
+extern "C" struct Division
+{
+    int32 $quotient;
+    int32 $remainder;
+}
+
+extern "C" struct LongDivision
+{
+    CLong $quotient;
+    CLong $remainder;
+}
+
+extern "C" struct WideDivision
+{
+    int64 $quotient;
+    int64 $remainder;
+}
+
+extern "C"
+{
+    /** @safety `$divisor` is not zero and the quotient fits. */
+    function div(int32 $dividend, int32 $divisor): Division;
+
+    /** @safety `$divisor` is not zero and the quotient fits. */
+    function ldiv(CLong $dividend, CLong $divisor): LongDivision;
+
+    /** @safety `$divisor` is not zero and the quotient fits. */
+    function lldiv(int64 $dividend, int64 $divisor): WideDivision;
+}
+"#;
+
+#[test]
+fn foreign_calls_return_structs_by_value() {
+    // `div_t` returns in one register on every tier-1 target, `ldiv_t` in
+    // one (Windows) or two, and `lldiv_t` in two or, on Windows x64,
+    // through the caller's result storage.
+    let source = format!(
+        "{DIVISION}
+function main(): void
+{{
+    unsafe {{
+        let $small = div(17, 5);
+        echo $small->quotient . \" \" . $small->remainder . \" \";
+        let $long = ldiv(CLong::from(-29), CLong::from(4));
+        echo Int64::from($long->quotient) . \" \" . Int64::from($long->remainder) . \" \";
+        let $wide = lldiv(9000000000000, 7);
+        echo $wide->quotient . \" \" . $wide->remainder;
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "3 2 -7 -1 1285714285714 2");
+}
+
+/// System V x86_64 and AArch64 pass a 16-byte struct of two integer
+/// words in the two registers its fields would take as separate
+/// arguments, and a struct of one `float64` in the register a `float64`
+/// takes; Windows x64 passes the first by reference. These bindings call
+/// C runtime functions through those equivalent signatures. Arguments that
+/// travel on the stack or by reference are tested where Doria links a
+/// library that takes them (`#[Library]`).
+#[cfg(not(windows))]
+#[test]
+fn foreign_calls_pass_structs_by_value_in_registers() {
+    let source = format!(
+        "{POINTER}
+use Doria\\Std\\Ffi\\{{CSize, LinkName, Opaque}};
+
+extern \"C\" struct Fill
+{{
+    MutPtr<Opaque> $memory;
+    int64 $value;
+}}
+
+extern \"C\" struct Scale
+{{
+    float64 $value;
+}}
+
+extern \"C\"
+{{
+    /** @safety `$fill->memory` is writable for `$count` bytes. */
+    #[LinkName(\"memset\")]
+    function fill(Fill $fill, CSize $count): MutPtr<Opaque>;
+
+    /** @safety Any value. */
+    #[LinkName(\"ldexp\")]
+    function scale(Scale $value, int32 $exponent): float64;
+}}
+
+function main(): void
+{{
+    writable int64 $target = 0;
+    unsafe {{
+        MutPtr<Opaque> $memory = MutPtr::cast(MutPtr::to($target));
+        let $filled = fill(new Fill(memory: $memory, value: 1), CSize::from(3));
+        echo $filled == $memory;
+    }}
+    echo \" \" . $target . \" \";
+    unsafe {{
+        echo Float::toInt(scale(new Scale(value: 1.5), 4));
+    }}
+}}
+"
+    );
+    // memset writes three bytes of 1: 0x010101.
+    assert_runs_natively(&source, "true 65793 24");
+}
+
+#[test]
+fn an_omitted_fixed_length_array_field_is_zero_filled() {
+    let source = format!(
+        "{POINTER}
+extern \"C\" struct Tip
+{{
+    uint16[3] $text;
+    int32 $length = 7;
+}}
+
+function main(): void
+{{
+    writable Tip $tip = new Tip();
+    echo Tip::SIZE . \" \" . $tip->length . \" \";
+    unsafe {{
+        MutPtr<uint16> $text = MutPtr::cast(MutPtr::to($tip));
+        echo $text->read() . \" \" . $text->offset(2)->read() . \" \";
+        $text->offset(1)->write(UInt16::from(9));
+        Ptr<int32> $length = Ptr::cast(Ptr::from($text)->byteOffset(8));
+        echo $length->read() . \" \" . Ptr::from($text)->offset(1)->read();
+    }}
+}}
+"
+    );
+    // `uint16[3]` takes bytes 0 to 5; `int32` is aligned to byte 8.
+    assert_runs_natively(&source, "12 7 0 0 7 9");
+}
