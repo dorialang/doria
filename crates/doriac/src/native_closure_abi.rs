@@ -831,6 +831,7 @@ pub const fn direct_value_slots(ty: mir::Type) -> DirectValueSlots {
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => DirectValueSlots::integer(1),
     }
 }
@@ -858,9 +859,11 @@ pub const fn returns_through_result_slot(return_type: mir::ReturnType, checked: 
     match return_type {
         mir::ReturnType::Void => false,
         mir::ReturnType::Value(_) if checked => true,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
-            true
-        }
+        mir::ReturnType::Value(
+            mir::Type::PayloadEnum(_)
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::ForeignAggregate(_),
+        ) => true,
         mir::ReturnType::Value(ty) => !direct_value_slots(ty).fits(DIRECT_RETURN_SLOTS),
     }
 }
@@ -1028,6 +1031,27 @@ pub fn environment_layout(
     })
 }
 
+/// The layout of a value that lives in memory and travels by its address:
+/// a payload enum, nullable or not, or a foreign struct or union. Both
+/// native backends copy such a value by its bytes, wherever it is stored.
+pub const fn memory_value_layout(ty: mir::Type) -> Option<NativeLayout> {
+    match ty {
+        mir::Type::PayloadEnum(payload) => Some(NativeLayout {
+            size: payload.size,
+            align: payload.align,
+        }),
+        mir::Type::NullablePayloadEnum(payload) => Some(NativeLayout {
+            size: payload.nullable_size,
+            align: payload.align,
+        }),
+        mir::Type::ForeignAggregate(aggregate) => Some(NativeLayout {
+            size: aggregate.size,
+            align: aggregate.align,
+        }),
+        _ => None,
+    }
+}
+
 pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
     if ty.shared_interface().is_some() {
         return NativeLayout {
@@ -1081,6 +1105,10 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
         },
         mir::Type::NullablePayloadEnum(ty) => NativeLayout {
             size: ty.nullable_size,
+            align: ty.align,
+        },
+        mir::Type::ForeignAggregate(ty) => NativeLayout {
+            size: ty.size,
             align: ty.align,
         },
         mir::Type::String

@@ -612,6 +612,7 @@ fn void_program() -> Program {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),

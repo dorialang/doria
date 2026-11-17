@@ -334,6 +334,9 @@ pub struct SemanticInfo {
     /// The binding of each extern declaration, keyed by its declaration span
     /// (Decision 0148 sections 14 to 18).
     pub foreign_bindings: HashMap<Span, crate::foreign::ForeignBinding>,
+    /// Every foreign struct and union by canonical name (Decision 0148
+    /// section 6).
+    pub foreign_aggregates: HashMap<String, crate::foreign::ForeignAggregateFacts>,
     pub retained_callables: HashMap<Span, crate::ownership::RetainedCallableInfo>,
     /// Concrete ownership facts for generic bodies whose erasures depend on Copy/Move.
     pub(crate) specialized_ownership: specialized_ownership::FactsByInstance,
@@ -1518,6 +1521,7 @@ fn finish_checked_analysis(
         }
     }
     let callable_admissions = checker.checked_callable_admissions();
+    let foreign_aggregates = checker.foreign_aggregate_facts();
     let member_declarations = callable_contracts::member_declarations(program);
     let virtual_dispatch = if checker
         .diagnostics
@@ -1587,6 +1591,7 @@ fn finish_checked_analysis(
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
+            foreign_aggregates,
             retained_callables,
             specialized_ownership,
             specialized_return_borrows: checker.specialized_return_borrow_seed,
@@ -3908,6 +3913,7 @@ impl<'program> Checker<'program> {
         self.predeclare_classes();
         self.collect_foreign_aggregates();
         self.check_foreign_aggregate_cycles();
+        self.record_foreign_layout_constants();
         self.collect_enums();
         self.collect_classes();
         self.collect_interface_declarations();

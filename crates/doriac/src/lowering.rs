@@ -77,10 +77,15 @@ fn lower_checked_program_with_semantics(
     let mut items = Vec::with_capacity(program.items.len());
     let mut diagnostics = Vec::new();
     for item in &program.items {
-        // An extern block's declarations are items of their own.
+        // An extern block's declarations are items of their own. A foreign
+        // struct or union is a layout, which checking records with its fields
+        // (`SemanticInfo::foreign_aggregates`); it has no executable item.
         if matches!(
             item,
-            ast::Item::Interface(_) | ast::Item::Trait(_) | ast::Item::ExternBlock(_)
+            ast::Item::Interface(_)
+                | ast::Item::Trait(_)
+                | ast::Item::ExternBlock(_)
+                | ast::Item::ForeignAggregate(_)
         ) {
             continue;
         }
@@ -707,27 +712,18 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
     match item {
         ast::Item::Class(class_decl) => lower_class(class_decl).map(hir::Item::Class),
         ast::Item::Enum(enum_decl) => Ok(hir::Item::Enum(lower_enum(enum_decl))),
-        ast::Item::Interface(_) | ast::Item::Trait(_) | ast::Item::ExternBlock(_) => {
-            unreachable!("compile-time declarations and extern blocks do not enter HIR")
+        ast::Item::Interface(_)
+        | ast::Item::Trait(_)
+        | ast::Item::ExternBlock(_)
+        | ast::Item::ForeignAggregate(_) => {
+            unreachable!(
+                "compile-time declarations, extern blocks and foreign layouts do not enter HIR"
+            )
         }
         ast::Item::Function(function) => lower_function(function, None).map(hir::Item::Function),
         ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
-        ast::Item::ForeignAggregate(ast::ForeignAggregateDecl { span, .. }) => {
-            Err(unsafe_code_before_lowering(*span))
-        }
         ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement, None))),
     }
-}
-
-/// Foreign aggregates have no executable form yet; the execution gate at
-/// the start of lowering (`crate::unsafe_code`) stops every program that
-/// contains one, so reaching item lowering with one is a compiler defect.
-fn unsafe_code_before_lowering(span: crate::source::Span) -> Diagnostic {
-    Diagnostic::internal_compiler_error(
-        "foreign aggregate reached lowering",
-        "a foreign struct or union reached HIR lowering, which has no form for it",
-        span,
-    )
 }
 
 fn lower_enum(enum_decl: &ast::EnumDecl) -> hir::EnumDecl {

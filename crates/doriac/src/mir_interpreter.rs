@@ -1937,6 +1937,7 @@ impl<'a> Interpreter<'a> {
                 let definition = local_in(function, target)?;
                 self.queue_assignment_origin(function, target, &value)?;
                 match (definition.ty, value) {
+                    (mir::Type::ForeignAggregate(_), _) => return Err(foreign_aggregate_refusal()),
                     (mir::Type::String, mir::Rvalue::String(expression)) => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
@@ -2653,6 +2654,7 @@ impl<'a> Interpreter<'a> {
                     "the interpreter runs foreign calls through the native companion library",
                 ));
             }
+            mir::Statement::ForeignField { .. } => return Err(foreign_aggregate_refusal()),
         }
         Ok(StepOutcome::Continue)
     }
@@ -3297,6 +3299,7 @@ impl<'a> Interpreter<'a> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableFunction(value)),
+                mir::Rvalue::ForeignAggregate(_) => return Err(foreign_aggregate_refusal()),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -20315,6 +20318,15 @@ fn block_in(
         .get(id.0)
         .filter(|block| block.id == id)
         .ok_or_else(|| InterpreterError::new(format!("MIR BlockId block{} does not exist", id.0)))
+}
+
+/// Foreign structs and unions run through the native companion library
+/// (Decision 0148 sections 22 and 23); `unsafe_code::companion_operations`
+/// refuses a program with one before it runs.
+fn foreign_aggregate_refusal() -> InterpreterError {
+    InterpreterError::new(
+        "the interpreter runs foreign structs and unions through the native companion library",
+    )
 }
 
 #[cfg(test)]

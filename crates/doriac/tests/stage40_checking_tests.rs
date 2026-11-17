@@ -999,18 +999,20 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
         ["Pointer Operations Cannot Run In The Interpreter Yet"],
         "{diagnostics:#?}"
     );
-    let field = "use Doria\\Std\\Ffi\\Ptr; extern \"C\" struct Point { int32 $x; } function main(): void { writable Point $point = new Point(x: 1); let $pointer = unsafe(Ptr::to($point->x)); }";
+    // A pointer to a foreign struct field builds; one to a class property
+    // does not yet.
+    let property = "use Doria\\Std\\Ffi\\Ptr; class Box { int32 $count = 0; } function main(): void { let $box = new Box(); let $pointer = unsafe(Ptr::to($box->count)); }";
     let diagnostics = doriac::compile_source(
         "ffi.doria",
-        field.to_string(),
+        property.to_string(),
         doriac::backend::BackendTarget::Native,
     )
-    .expect_err("a pointer to a field cannot be built yet");
+    .expect_err("a pointer to a property cannot be built yet");
     assert!(
         diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Pointers To Fields And Properties Cannot Be Built Yet"),
+                && diagnostic.title == "Pointers To Properties Cannot Be Built Yet"),
         "{diagnostics:#?}"
     );
 }

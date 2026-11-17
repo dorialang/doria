@@ -100,6 +100,7 @@ pub struct Program {
     pub function_types: Vec<FunctionType>,
     pub closure_descriptors: Vec<ClosureDescriptor>,
     pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
+    pub foreign_aggregates: Vec<ForeignAggregateDefinition>,
     pub functions: Vec<Function>,
     /// The validated process entry. Libraries deliberately have no entry.
     pub selected_entry: Option<FunctionId>,
@@ -123,6 +124,7 @@ impl PartialEq for Program {
             && self.function_types == other.function_types
             && self.closure_descriptors == other.closure_descriptors
             && self.closure_environment_layouts == other.closure_environment_layouts
+            && self.foreign_aggregates == other.foreign_aggregates
             && self.functions == other.functions
             && self.selected_entry == other.selected_entry
             && self.entry == other.entry
@@ -1358,6 +1360,42 @@ pub enum Type {
     Function(FunctionTypeId),
     NullableFunction(FunctionTypeId),
     ClosureEnvironment(Option<ClosureEnvironmentLayoutId>),
+    /// A foreign struct or union (Decision 0148 section 6): an inline Copy
+    /// value held in memory with its C layout. It needs no cleanup.
+    ForeignAggregate(ForeignAggregateType),
+}
+
+/// A foreign struct or union as a value type: its definition and the size
+/// and alignment of its C layout on the native target, so storage for one
+/// is sized without a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForeignAggregateType {
+    pub id: ForeignAggregateId,
+    pub size: u32,
+    pub align: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ForeignAggregateId(pub usize);
+
+/// A foreign struct or union of the program: its canonical name and its C
+/// layout on the native target, which field accesses, the C ABI
+/// classification and MIR validation read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAggregateDefinition {
+    pub id: ForeignAggregateId,
+    pub name: String,
+    pub layout: std::sync::Arc<crate::c_layout::CRecord>,
+}
+
+impl ForeignAggregateDefinition {
+    pub fn ty(&self) -> ForeignAggregateType {
+        ForeignAggregateType {
+            id: self.id,
+            size: u32::try_from(self.layout.size).expect("a lowered foreign layout fits in u32"),
+            align: u32::try_from(self.layout.align).expect("a lowered foreign layout fits in u32"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1852,6 +1890,47 @@ pub enum Rvalue {
     NullablePayloadEnum(NullablePayloadEnumExpression),
     Function(FunctionExpression),
     NullableFunction(NullableFunctionExpression),
+    ForeignAggregate(ForeignAggregateExpression),
+}
+
+/// A foreign struct or union value (Decision 0148 section 6). Each form
+/// produces the value's bytes; storing one copies them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignAggregateExpression {
+    /// `new Name(...)`: every byte zero, then each field stored at its
+    /// offset in order. A union stores at most one member.
+    Construct {
+        ty: ForeignAggregateType,
+        fields: Vec<ForeignFieldValue>,
+        span: Span,
+    },
+    /// A copy of the value `local` holds.
+    Local {
+        ty: ForeignAggregateType,
+        local: LocalId,
+    },
+    Call {
+        ty: ForeignAggregateType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+    },
+}
+
+impl ForeignAggregateExpression {
+    pub const fn ty(&self) -> ForeignAggregateType {
+        match self {
+            Self::Construct { ty, .. } | Self::Local { ty, .. } | Self::Call { ty, .. } => *ty,
+        }
+    }
+}
+
+/// One field a construction stores: `value`, of the field's type, at
+/// `offset` bytes from the start of the aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignFieldValue {
+    pub offset: u64,
+    pub value: Rvalue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1915,6 +1994,7 @@ impl Rvalue {
             Self::NullablePayloadEnum(value) => Type::NullablePayloadEnum(value.ty()),
             Self::Function(value) => Type::Function(value.function_type()),
             Self::NullableFunction(value) => Type::NullableFunction(value.function_type()),
+            Self::ForeignAggregate(value) => Type::ForeignAggregate(value.ty()),
         }
     }
 
@@ -1947,7 +2027,8 @@ impl Rvalue {
             | Self::SharedReferenceAccess(_)
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => None,
+            | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_) => None,
         }
     }
 
@@ -1979,6 +2060,7 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2040,6 +2122,7 @@ impl Rvalue {
             | Self::NullableCollection(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2081,6 +2164,7 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => false,
         }
@@ -2124,7 +2208,10 @@ impl Rvalue {
                 matches!(value.ty(), ScalarType::Inline(ty) if ty.requires_owned_cleanup())
                     && !value.owned_inline_temporary()
             }
-            Self::Value(_) | Self::String(_) | Self::NullableString(_) => false,
+            Self::Value(_)
+            | Self::String(_)
+            | Self::NullableString(_)
+            | Self::ForeignAggregate(_) => false,
         }
     }
 
@@ -2362,6 +2449,7 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2501,7 +2589,10 @@ impl Rvalue {
                 place:
                     PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
                 ..
-            }) => Some(*local),
+            })
+            | Self::ForeignAggregate(ForeignAggregateExpression::Local { local, .. }) => {
+                Some(*local)
+            }
             _ => None,
         }
     }
@@ -2534,6 +2625,7 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => MixedOwnership::None,
         }
@@ -6113,6 +6205,27 @@ pub enum Statement {
         target: Option<LocalId>,
         span: Span,
     },
+    /// One field access of the foreign struct or union `aggregate` holds
+    /// (Decision 0148 section 6): the field, or the nested field, whose C
+    /// layout starts `offset` bytes into the aggregate. A union member
+    /// starts at offset zero, so reading one reads the bytes written last
+    /// through any member.
+    ForeignField {
+        aggregate: LocalId,
+        offset: u64,
+        access: ForeignFieldAccess,
+        span: Span,
+    },
+}
+
+/// What a `Statement::ForeignField` does. The field's type is the type of
+/// `target` or of `value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignFieldAccess {
+    /// Copies the field into `target`.
+    Read { target: LocalId },
+    /// Stores `value` into the field.
+    Write { value: Rvalue },
 }
 
 /// A C function as a foreign call reaches it: its symbol and its C
@@ -6135,15 +6248,16 @@ impl ForeignFunction {
     /// no C form a foreign call carries.
     pub fn c_signature(
         &self,
+        aggregates: &[ForeignAggregateDefinition],
         target: crate::c_layout::CTarget,
     ) -> Option<(Vec<crate::c_layout::CType>, Option<crate::c_layout::CType>)> {
         let parameters = self
             .parameters
             .iter()
-            .map(|ty| foreign_c_type(*ty, target))
+            .map(|ty| foreign_c_type(*ty, aggregates, target))
             .collect::<Option<Vec<_>>>()?;
         let return_type = match self.return_type {
-            Some(ty) => Some(foreign_c_type(ty, target)?),
+            Some(ty) => Some(foreign_c_type(ty, aggregates, target)?),
             None => None,
         };
         Some((parameters, return_type))
@@ -6151,12 +6265,18 @@ impl ForeignFunction {
 }
 
 /// The C layout of a MIR value that crosses the C boundary: a scalar with a
-/// C layout, or a pointer, whose null is address zero.
+/// C layout, a pointer, whose null is address zero, or a foreign struct or
+/// union with the layout its definition records.
 pub fn foreign_c_type(
     ty: Type,
+    aggregates: &[ForeignAggregateDefinition],
     target: crate::c_layout::CTarget,
 ) -> Option<crate::c_layout::CType> {
     use crate::c_layout::{CScalar, CType};
+    if let Type::ForeignAggregate(aggregate) = ty {
+        let definition = aggregates.get(aggregate.id.0)?;
+        return (definition.ty() == aggregate).then(|| CType::Record(definition.layout.clone()));
+    }
     let scalar = match ty {
         Type::Scalar(ScalarType::Integer(integer)) => CScalar::Integer {
             bytes: (integer.bit_width() / 8) as u8,
@@ -6177,8 +6297,9 @@ pub fn foreign_c_type(
 }
 
 /// What a `Statement::Pointer` does. Every pointer is the inline pointer
-/// value of the local it names; `ty` is the scalar the C layout reads or
-/// writes, with alignment equal to its size.
+/// value of the local it names; `ty` is what the C layout reads or writes:
+/// a scalar, aligned to its size, or a foreign struct or union, aligned as
+/// its layout is (`native_abi::pointee_layout`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerOperation {
     /// `read` and `readUnaligned`: the value of type `ty` at the address.
@@ -6204,10 +6325,12 @@ pub enum PointerOperation {
     Address { pointer: LocalId },
     /// `Ptr::fromAddress`: `?Ptr`, absent for address zero.
     FromAddress { address: IntegerExpression },
-    /// `Ptr::to($local)` and `MutPtr::to($local)`: the address of the place
-    /// the local names, its own storage or the place it borrows. Checking
-    /// pins that place for the enclosing unsafe context.
-    AddressOf { local: LocalId },
+    /// `Ptr::to($place)` and `MutPtr::to($place)`: the address of the place
+    /// the local names, its own storage or the place it borrows, `offset`
+    /// bytes in: zero for the whole local, a field's offset for a field of
+    /// a foreign struct or union. Checking pins that place for the
+    /// enclosing unsafe context.
+    AddressOf { local: LocalId, offset: u64 },
 }
 
 impl PointerOperation {
@@ -7240,6 +7363,10 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropFunction { .. }
         | Statement::WriteStreamBytes { .. } => 0,
         Statement::ForeignCall { .. } => 0,
+        Statement::ForeignField { access, .. } => match access {
+            ForeignFieldAccess::Read { .. } => 0,
+            ForeignFieldAccess::Write { value } => rvalue_class_temporary_capacity(value),
+        },
         Statement::Pointer { operation, .. } => match operation {
             PointerOperation::Write { value, .. } => rvalue_class_temporary_capacity(value),
             PointerOperation::Offset { count, .. } => integer_class_temporary_capacity(count),
@@ -7493,6 +7620,16 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             }
             Rvalue::Function(value) => function_class_temporary_capacity(value),
             Rvalue::NullableFunction(value) => nullable_function_class_temporary_capacity(value),
+            Rvalue::ForeignAggregate(value) => match value {
+                ForeignAggregateExpression::Construct { fields, .. } => fields
+                    .iter()
+                    .map(|field| rvalue_class_temporary_capacity(&field.value))
+                    .sum(),
+                ForeignAggregateExpression::Call { args, .. } => {
+                    args.iter().map(rvalue_class_temporary_capacity).sum()
+                }
+                ForeignAggregateExpression::Local { .. } => 0,
+            },
         }
 }
 
@@ -8569,6 +8706,7 @@ impl fmt::Display for Type {
             Type::NullablePayloadEnum(ty) => {
                 write!(formatter, "?payload-enum#{}", ty.id.0)
             }
+            Type::ForeignAggregate(ty) => write!(formatter, "foreign-aggregate#{}", ty.id.0),
             Type::Function(function_type) => {
                 write!(formatter, "function-type#{}", function_type.0)
             }
@@ -8893,6 +9031,27 @@ impl fmt::Display for Rvalue {
             }
             Rvalue::Function(value) => write!(formatter, "{value}"),
             Rvalue::NullableFunction(value) => write!(formatter, "{value}"),
+            Rvalue::ForeignAggregate(value) => match value {
+                ForeignAggregateExpression::Construct { ty, fields, .. } => {
+                    let fields = fields
+                        .iter()
+                        .map(|field| format!("@{}: {}", field.offset, field.value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(formatter, "foreign_aggregate#{}{{{fields}}}", ty.id.0)
+                }
+                ForeignAggregateExpression::Local { local, .. } => {
+                    write!(formatter, "copy local{}", local.0)
+                }
+                ForeignAggregateExpression::Call { function, args, .. } => {
+                    let args = args
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(formatter, "call fn{}({args})", function.0)
+                }
+            },
         }
     }
 }
@@ -10700,11 +10859,28 @@ impl fmt::Display for Statement {
                     PointerOperation::FromAddress { address } => {
                         write!(formatter, "pointer_from_address({address})")
                     }
-                    PointerOperation::AddressOf { local } => {
-                        write!(formatter, "pointer_to(local{})", local.0)
+                    PointerOperation::AddressOf { local, offset } => {
+                        write!(formatter, "pointer_to(local{} @{offset})", local.0)
                     }
                 }
             }
+            Statement::ForeignField {
+                aggregate,
+                offset,
+                access,
+                ..
+            } => match access {
+                ForeignFieldAccess::Read { target } => write!(
+                    formatter,
+                    "local{} = foreign_field(local{}, @{offset})",
+                    target.0, aggregate.0
+                ),
+                ForeignFieldAccess::Write { value } => write!(
+                    formatter,
+                    "foreign_field(local{}, @{offset}) = {value}",
+                    aggregate.0
+                ),
+            },
             Statement::ForeignCall {
                 function,
                 args,

@@ -172,6 +172,15 @@ pub(crate) fn direct_call_result(
             args,
             return_borrow,
         }),
+        // A foreign struct or union is a Copy value without loans.
+        Type::ForeignAggregate(ty) => {
+            Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+            })
+        }
         Type::NullablePayloadEnum(ty) => {
             Rvalue::NullablePayloadEnum(NullablePayloadEnumExpression::Call {
                 span,
@@ -516,6 +525,9 @@ pub(crate) fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -
                 local,
                 transfer,
             })
+        }
+        mir::Type::ForeignAggregate(ty) => {
+            mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Local { ty, local })
         }
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are compiler-private and cannot be source rvalues")

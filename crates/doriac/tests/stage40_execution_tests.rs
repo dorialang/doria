@@ -205,6 +205,7 @@ fn assert_interpreter_reports_companion(mir: &doriac::mir::Program) {
             && [
                 "Pointer Operations Cannot Run In The Interpreter Yet",
                 "Foreign Calls Cannot Run In The Interpreter Yet",
+                "Foreign Structs And Unions Cannot Run In The Interpreter Yet",
             ]
             .contains(&diagnostic.title.as_str())),
         "{companion:#?}"
@@ -458,4 +459,219 @@ function main(): void
     // `fill` and `clear` bind one symbol with two signatures: the second
     // calls the address the first imports.
     assert_runs_natively(&source, "7 123456 5 97 true 120 105 5");
+}
+
+const AGGREGATES: &str = r#"
+extern "C" struct Color
+{
+    uint8 $red;
+    uint8 $green;
+    uint8 $blue;
+    uint8 $alpha = 255;
+}
+
+extern "C" struct Sample
+{
+    uint8 $tag;
+    int64 $value;
+    uint16 $extra;
+}
+
+extern "C" struct Pixel
+{
+    int32 $x;
+    int32 $y;
+    Color $color;
+    float64 $weight;
+    bool $visible;
+}
+
+extern "C" union Word
+{
+    uint32 $whole;
+    uint8 $low;
+    float32 $ratio;
+    Color $color;
+}
+"#;
+
+#[test]
+fn foreign_structs_and_unions_build_copy_and_change_their_fields() {
+    let source = format!(
+        "{AGGREGATES}
+function brighter(Color $color, uint8 $step): Color
+{{
+    writable Color $result = $color;
+    $result->red = $result->red + $step;
+    return $result;
+}}
+
+function moved(Pixel $pixel): Pixel
+{{
+    writable Pixel $copy = $pixel;
+    $copy->x += 5;
+    $copy->y++;
+    $copy->color->blue = 99;
+    return $copy;
+}}
+
+function main(): void
+{{
+    let $color = new Color(red: 10, green: 20, blue: 30);
+    echo $color->red . \" \" . $color->alpha . \" \";
+    let $bright = brighter($color, 5);
+    echo $bright->red . \" \" . $color->red . \" \";
+    writable Pixel $pixel = new Pixel(x: 1, y: 2, color: $color, weight: 1.5, visible: true);
+    let $other = moved($pixel);
+    echo $other->x . \" \" . $other->y . \" \" . $other->color->blue . \" \" . $pixel->color->blue . \" \";
+    echo $pixel->visible . \" \" . Float::toInt($pixel->weight * 2.0) . \" \";
+    $pixel->color = $bright;
+    echo $pixel->color->red . \" \" . moved($pixel)->color->red . \" \";
+    echo Color::SIZE . \" \" . Color::ALIGNMENT . \" \" . Sample::SIZE . \" \" . Sample::ALIGNMENT . \" \" . Pixel::SIZE . \" \" . Word::SIZE . \" \";
+    writable Word $word = new Word();
+    unsafe {{
+        echo $word->whole . \" \";
+    }}
+    $word->whole = 258;
+    unsafe {{
+        echo $word->low . \" \";
+    }}
+    let $named = new Word(color: new Color(red: 1, green: 2, blue: 3, alpha: 4));
+    unsafe {{
+        echo $named->whole;
+    }}
+}}
+"
+    );
+    // Every tier-1 target is little-endian and lays these out alike.
+    assert_runs_natively(
+        &source,
+        "10 255 15 10 6 3 99 30 true 3 15 15 4 1 24 8 32 4 0 2 67305985",
+    );
+}
+
+#[test]
+fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
+    for (body, position) in [
+        ("class Holder { Color $color; function __construct(Color $initial) { $this->color = $initial; } }", "a property"),
+        ("function main(): void { ?Color $maybe = null; }", "a nullable value"),
+        ("function keep(Color[] $colors): void {}", "a nullable value"),
+        ("enum Paint { case Solid(Color $color); }", "an enum payload"),
+        ("function main(): void { let $show = function(Color $color): void {}; }", "a closure parameter"),
+        (
+            "function main(): void { let $color = new Color(red: 1, green: 2, blue: 3); let $show = function(): void with ($color) { echo $color->red; }; $show(); }",
+            "a closure capture",
+        ),
+    ] {
+        let source = format!("{AGGREGATES}{body}");
+        let diagnostics = doriac::compile_source(
+            "stage40.doria",
+            source,
+            doriac::backend::BackendTarget::Native,
+        )
+        .expect_err("the form cannot be built yet");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Foreign Aggregates Cannot Be Built Here Yet"
+                && diagnostic.message.contains(position)),
+            "{body}: {diagnostics:#?}"
+        );
+    }
+    let boxed = format!(
+        "{AGGREGATES}function main(): void {{ mixed $value = new Color(red: 1, green: 2, blue: 3); }}"
+    );
+    let diagnostics = doriac::compile_source(
+        "stage40.doria",
+        boxed,
+        doriac::backend::BackendTarget::Native,
+    )
+    .expect_err("a foreign aggregate cannot be boxed as `mixed` yet");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Foreign Aggregates Cannot Be Built Here Yet"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn the_interpreter_and_php_output_report_foreign_aggregates() {
+    let source = format!(
+        "{AGGREGATES}function main(): void {{ let $color = new Color(red: 1, green: 2, blue: 3); echo $color->red; }}"
+    );
+    let debug = doriac::compile_source(
+        "stage40.doria",
+        source.clone(),
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter runs foreign aggregates through the companion");
+    assert!(
+        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
+        "{debug:#?}"
+    );
+    let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+        .expect_err("PHP output takes the C data model through the companion");
+    assert!(
+        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
+        "{php:#?}"
+    );
+    let constant = format!("{AGGREGATES}function main(): void {{ echo Color::SIZE; }}");
+    let php = doriac::compile_source(
+        "stage40.doria",
+        constant,
+        doriac::backend::BackendTarget::Php,
+    )
+    .expect_err("PHP output takes the C data model through the companion");
+    assert!(
+        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
+        "{php:#?}"
+    );
+}
+
+#[test]
+fn pointers_read_and_write_whole_aggregates_and_their_fields() {
+    let source = format!(
+        "{POINTER}{AGGREGATES}
+function main(): void
+{{
+    writable Pixel $pixel = new Pixel(x: 1, y: 2, color: new Color(red: 3, green: 4, blue: 5), weight: 0.5, visible: false);
+    unsafe {{
+        let $whole = MutPtr::to($pixel);
+        Pixel $copy = $whole->read();
+        echo $copy->x . \" \" . $copy->color->blue . \" \";
+        writable Pixel $changed = $copy;
+        $changed->y = 40;
+        $whole->write($changed);
+        echo $pixel->y . \" \";
+        let $green = MutPtr::to($pixel->color->green);
+        $green->write(UInt8::from(77));
+        echo $pixel->color->green . \" \";
+        let $color = MutPtr::to($pixel->color);
+        Color $read = $color->read();
+        echo $read->green . \" \" . $whole->read()->color->green . \" \";
+        Ptr<Pixel> $base = Ptr::from($whole);
+        echo $base->offset(1)->address - $base->address;
+        let $y = MutPtr::to($pixel->y);
+        $y->writeUnaligned(9);
+        echo \" \" . $y->readUnaligned() . \" \" . $pixel->y . \" \";
+        MutPtr<uint8> $bytes = MutPtr::cast($whole);
+        echo $bytes->offset(8)->read();
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "1 5 40 77 77 77 32 9 9 3");
+}
+
+#[test]
+fn an_aligned_aggregate_access_at_a_misaligned_address_panics_with_p1702() {
+    for body in [
+        "?Ptr<Sample> $pointer = Ptr::fromAddress(4100); if ($pointer != null) { Sample $sample = $pointer->read(); echo $sample->tag; }",
+        "?Ptr<Sample> $pointer = Ptr::fromAddress(4100); if ($pointer != null) { MutPtr<Sample> $mutable = MutPtr::cast($pointer); $mutable->write(new Sample(tag: 1, value: 2, extra: 3)); }",
+    ] {
+        let source = format!("{POINTER}{AGGREGATES}function main(): void {{ unsafe {{ {body} }} }}");
+        assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
+    }
 }

@@ -21,6 +21,8 @@ pub(super) struct ForeignField {
     pub(super) name: String,
     pub(super) ty: TypeId,
     pub(super) has_default: bool,
+    /// The declared default's constant value.
+    pub(super) default: Option<crate::const_eval::ConstValue>,
     pub(super) span: Span,
 }
 
@@ -121,6 +123,7 @@ impl<'program> Checker<'program> {
                 None,
             );
             self.require_foreign_field_type(ty, field.type_span);
+            let mut default_value = None;
             if let Some(default) = &field.default {
                 if declaration.kind == ForeignAggregateKind::Union {
                     self.diagnostics.push(
@@ -132,7 +135,8 @@ impl<'program> Checker<'program> {
                         .with_title("Union Member Cannot Have A Default"),
                     );
                 } else {
-                    self.check_foreign_field_default(declaration, field, ty, default);
+                    default_value =
+                        self.check_foreign_field_default(declaration, field, ty, default);
                 }
             }
             fields.push(ForeignField {
@@ -143,6 +147,7 @@ impl<'program> Checker<'program> {
                         self.types.kind(ty),
                         TypeKind::Foreign(ForeignType::FixedArray { .. })
                     ),
+                default: default_value,
                 span: field.span,
             });
         }
@@ -190,15 +195,13 @@ impl<'program> Checker<'program> {
         field: &crate::ast::ForeignFieldDecl,
         ty: TypeId,
         default: &Expr,
-    ) {
-        if let Some(value) = crate::const_eval::evaluate_parameter_default(
+    ) -> Option<crate::const_eval::ConstValue> {
+        let Some(value) = crate::const_eval::evaluate_parameter_default(
             &self.const_evaluation,
             default,
             &field.ty,
             None,
-        ) {
-            let _ = value;
-        } else {
+        ) else {
             self.diagnostics.push(
                 Diagnostic::new(
                     FIELD_CODE,
@@ -215,8 +218,8 @@ impl<'program> Checker<'program> {
                 )
                 .with_title("Foreign Field Default Is Not Constant"),
             );
-            return;
-        }
+            return None;
+        };
         let scopes = ScopeStack::new();
         self.record_expected_expression_type(default, ty);
         if !self.is_expr_assignable(ty, default, &scopes, None) {
@@ -234,7 +237,9 @@ impl<'program> Checker<'program> {
                 )
                 .with_title("Foreign Field Default Type Mismatch"),
             );
+            return None;
         }
+        Some(value)
     }
 
     /// The type of a foreign aggregate name, or `None` for another name.
@@ -371,6 +376,12 @@ impl<'program> Checker<'program> {
                     return true;
                 }
             }
+        }
+        // Each argument is an expression in its own right, as for every
+        // call: its own subexpressions, such as a nested construction, are
+        // checked before the argument is bound to its field.
+        for argument in args {
+            self.check_expr(&argument.value, scopes, method_context);
         }
         self.check_call_arguments(
             &format!("`new {short}`"),
@@ -638,6 +649,89 @@ impl<'program> Checker<'program> {
                 _ => false,
             }
         })
+    }
+}
+
+impl Checker<'_> {
+    /// Records `Name::SIZE` and `Name::ALIGNMENT` of every foreign aggregate
+    /// with a layout as class constants with the native target's values, so
+    /// every consumer of constant values reads them as it reads any other
+    /// class constant.
+    pub(super) fn record_foreign_layout_constants(&mut self) {
+        let mut constants = Vec::new();
+        for (name, facts) in self.foreign_aggregate_facts() {
+            let declaration = self.foreign.aggregates[&name].declaration;
+            for member in ["SIZE", "ALIGNMENT"] {
+                let Some(value) = facts
+                    .layout_constant(member)
+                    .and_then(|value| i64::try_from(value).ok())
+                else {
+                    continue;
+                };
+                constants.push((
+                    crate::const_eval::ConstKey::Class {
+                        class_name: name.clone(),
+                        name: member.to_string(),
+                    },
+                    crate::const_eval::EvaluatedDecl {
+                        value: crate::const_eval::ConstValue::Integer(IntegerValue::from_bits(
+                            IntegerType::Int64,
+                            value as u64,
+                        )),
+                        ty: crate::const_eval::ConstType::Integer(IntegerType::Int64),
+                        access: crate::ast::MemberAccess::External,
+                        writable: false,
+                        span: declaration,
+                    },
+                ));
+            }
+        }
+        self.const_evaluation.values.extend(constants);
+    }
+
+    /// The facts MIR lowering builds foreign aggregates from, by name.
+    pub(super) fn foreign_aggregate_facts(
+        &mut self,
+    ) -> HashMap<String, crate::foreign::ForeignAggregateFacts> {
+        let aggregates = self.foreign.aggregates.clone();
+        aggregates
+            .iter()
+            .map(|(name, info)| {
+                let fields = info
+                    .fields
+                    .iter()
+                    .flatten()
+                    .map(|field| crate::foreign::ForeignFieldFacts {
+                        name: field.name.clone(),
+                        ty: self.types.resolved(field.ty),
+                        default: field.default.clone(),
+                    })
+                    .collect();
+                let ty = self.types.intern(TypeKind::Foreign(ForeignType::Aggregate(
+                    ForeignAggregateType {
+                        name: name.clone(),
+                        kind: info.kind,
+                    },
+                )));
+                let layout = match foreign_c_type(
+                    &self.types,
+                    &aggregates,
+                    ty,
+                    crate::c_layout::CTarget::host(),
+                ) {
+                    Some(crate::c_layout::CType::Record(record)) => Some(record),
+                    _ => None,
+                };
+                (
+                    name.clone(),
+                    crate::foreign::ForeignAggregateFacts {
+                        kind: info.kind,
+                        fields,
+                        layout,
+                    },
+                )
+            })
+            .collect()
     }
 }
 

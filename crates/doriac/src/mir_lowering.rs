@@ -18,10 +18,7 @@ use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType
 use crate::semantics::executable_effects::InstanceEffects;
 use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
 use crate::source::Span;
-use crate::types::{
-    resolve_nominal_kinds, resolved_type_is_symbolic, substitute_resolved_type, ClassType,
-    ResolvedType,
-};
+use crate::types::{resolved_type_is_symbolic, substitute_resolved_type, ClassType, ResolvedType};
 use crate::{hir, mir};
 
 mod byte_region;
@@ -55,7 +52,7 @@ impl ClassIds {
         ty: ResolvedType,
         registry: &NativeTypeRegistry,
     ) -> ResolvedType {
-        resolve_nominal_kinds(ty, &self.enums, &registry.interface_ids)
+        lowering_nominal_kinds(ty, &self.enums, registry)
     }
 
     fn mir_enum_type(&self, source_type: &crate::enums::EnumType) -> Option<mir::Type> {
@@ -65,6 +62,36 @@ impl ClassIds {
             mir::Type::PayloadEnum,
         ))
     }
+}
+
+/// The checked kind of every nominal name in source type syntax: an enum,
+/// an interface, a foreign struct or union (Decision 0148 section 6), or a
+/// class.
+fn lowering_nominal_kinds(
+    ty: ResolvedType,
+    enums: &HashMap<ClassType<ResolvedType>, crate::enums::EnumType>,
+    registry: &NativeTypeRegistry,
+) -> ResolvedType {
+    crate::types::resolve_nominal_kinds_with(ty, &|nominal| {
+        if let Some(definition) = enums.get(&nominal) {
+            ResolvedType::Enum(definition.clone())
+        } else if registry.interface_ids.contains_key(&nominal) {
+            ResolvedType::Interface(nominal)
+        } else if let Some(kind) = registry
+            .foreign_aggregate_kinds
+            .get(&nominal.name)
+            .filter(|_| nominal.arguments.is_empty())
+        {
+            ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Aggregate(
+                crate::foreign::ForeignAggregateType {
+                    name: nominal.name,
+                    kind: *kind,
+                },
+            )))
+        } else {
+            ResolvedType::Class(nominal)
+        }
+    })
 }
 
 type NativeFunctionSignature = (
@@ -290,6 +317,11 @@ struct NativeTypeRegistry {
     interface_vtables: Vec<mir::InterfaceVtable>,
     interface_methods: HashMap<interface::MethodKey, interface::CallPlan>,
     error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
+    /// Every foreign struct and union with a C layout, by canonical name.
+    foreign_aggregate_types: HashMap<String, mir::ForeignAggregateType>,
+    /// Every foreign struct and union, with or without a body.
+    foreign_aggregate_kinds: HashMap<String, crate::ast::ForeignAggregateKind>,
+    foreign_aggregates: Vec<mir::ForeignAggregateDefinition>,
 }
 
 impl mir::return_adaptation::TypeFacts for NativeTypeRegistry {
@@ -350,6 +382,31 @@ impl NativeTypeRegistry {
                 .collect(),
             ..Self::default()
         };
+        registry.foreign_aggregate_kinds = semantic_info
+            .foreign_aggregates
+            .iter()
+            .map(|(name, facts)| (name.clone(), facts.kind))
+            .collect();
+        let mut aggregates = semantic_info
+            .foreign_aggregates
+            .iter()
+            .filter_map(|(name, facts)| Some((name, facts.layout.clone()?)))
+            .filter(|(_, layout)| {
+                u32::try_from(layout.size).is_ok() && u32::try_from(layout.align).is_ok()
+            })
+            .collect::<Vec<_>>();
+        aggregates.sort_by_key(|(name, _)| *name);
+        for (name, layout) in aggregates {
+            let definition = mir::ForeignAggregateDefinition {
+                id: mir::ForeignAggregateId(registry.foreign_aggregates.len()),
+                name: name.clone(),
+                layout,
+            };
+            registry
+                .foreign_aggregate_types
+                .insert(name.clone(), definition.ty());
+            registry.foreign_aggregates.push(definition);
+        }
         registry.interface_types.push(mir::InterfaceType::error());
         registry.interface_ids.insert(
             crate::types::InterfaceType::new("Error", Vec::new()),
@@ -1144,6 +1201,12 @@ fn build_closure_plans(
                             capture.declaration_span,
                         )]
                     })?;
+                    if matches!(ty, mir::Type::ForeignAggregate(_)) {
+                        return Err(vec![crate::unsafe_code::misplaced_aggregate(
+                            capture.declaration_span,
+                            "a closure capture",
+                        )]);
+                    }
                     let storage = match acquisition.kind {
                         CaptureAcquisitionKind::ReadonlyLease => {
                             mir::ClosureEnvironmentStorage::ReadonlyBorrow
@@ -2517,6 +2580,7 @@ fn lower_program_impl(
         function_types,
         interface_types,
         interface_vtables,
+        foreign_aggregates,
         ..
     } = collection_registry;
     let mut program = mir::Program {
@@ -2567,6 +2631,7 @@ fn lower_program_impl(
         function_types,
         closure_descriptors,
         closure_environment_layouts,
+        foreign_aggregates,
         functions,
         selected_entry,
         entry,
@@ -2674,21 +2739,28 @@ fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String>
 
 /// The MIR form of a foreign type (Decision 0148). A C boundary value is the
 /// integer of its width and signedness on the native target; a data or C
-/// function pointer is the one-word inline pointer value. Foreign forms
-/// without a MIR form yet return `None`, and the execution gate in
-/// `crate::unsafe_code` stops programs that use them.
+/// function pointer is the one-word inline pointer value; a foreign struct
+/// or union is the aggregate with its C layout. Foreign forms without a MIR
+/// form yet return `None`, and the execution gate in `crate::unsafe_code`
+/// stops programs that use them.
 fn foreign_mir_type(
     foreign: &crate::foreign::ForeignType<crate::types::ResolvedType>,
+    registry: &NativeTypeRegistry,
 ) -> Option<mir::Type> {
     use crate::foreign::ForeignType;
     match foreign {
+        ForeignType::Aggregate(aggregate) => registry
+            .foreign_aggregate_types
+            .get(&aggregate.name)
+            .copied()
+            .map(mir::Type::ForeignAggregate),
         ForeignType::Boundary(boundary) => Some(mir::Type::Scalar(mir::ScalarType::Integer(
             crate::c_layout::CTarget::host().boundary_integer(*boundary),
         ))),
         ForeignType::Pointer { .. } | ForeignType::Function(_) => Some(mir::Type::Scalar(
             mir::ScalarType::Inline(crate::inline_value::InlineValueType::Pointer),
         )),
-        ForeignType::Opaque | ForeignType::Aggregate(_) | ForeignType::FixedArray { .. } => None,
+        ForeignType::Opaque | ForeignType::FixedArray { .. } => None,
     }
 }
 
@@ -2710,7 +2782,7 @@ fn intern_resolved_collection_types(
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::ByteRegion(kind) => mir::Type::ByteRegion(*kind),
         ResolvedType::Mixed => mir::Type::Mixed,
-        ResolvedType::Foreign(foreign) => foreign_mir_type(foreign)?,
+        ResolvedType::Foreign(foreign) => foreign_mir_type(foreign, collections)?,
         ResolvedType::Error => mir::Type::ERROR,
         ResolvedType::Function(function) => {
             if let Some(id) = collections.function_ids.get(function.as_ref()) {
@@ -2977,7 +3049,8 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::NullablePayloadEnum(_)
                 | mir::Type::NullableFunction(_)
-                | mir::Type::ClosureEnvironment(_) => return None,
+                | mir::Type::ClosureEnvironment(_)
+                | mir::Type::ForeignAggregate(_) => return None,
             }
         }
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
@@ -3699,6 +3772,7 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         mir::Type::Function(_) => Some(FieldType::Function),
         mir::Type::NullableFunction(_) => Some(FieldType::NullableFunction),
         mir::Type::ClosureEnvironment(_) => None,
+        mir::Type::ForeignAggregate(_) => None,
     }
 }
 
@@ -8267,6 +8341,9 @@ fn lower_collection_foreach_in_scope(
             mir::Type::ClosureEnvironment(_) => {
                 unreachable!("closure environments are not source collection elements")
             }
+            mir::Type::ForeignAggregate(_) => {
+                unreachable!("the execution gate keeps foreign aggregates out of collections")
+            }
             mir::Type::NullableMixed
             | mir::Type::NullableClass(_)
             | mir::Type::NullableSharedReference(_)
@@ -8628,6 +8705,9 @@ fn collection_value_rvalue(
         )),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
+        }
+        mir::Type::ForeignAggregate(_) => {
+            unreachable!("the execution gate keeps foreign aggregates out of collections")
         }
         mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
@@ -10409,11 +10489,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let resolved = resolve_nominal_kinds(
-            resolved,
-            &enum_types,
-            &self.collection_registry.interface_ids,
-        );
+        let resolved = lowering_nominal_kinds(resolved, &enum_types, &self.collection_registry);
         self.mir_resolved_type(&resolved)
     }
 
@@ -10631,7 +10707,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
-            ResolvedType::Foreign(foreign) => foreign_mir_type(foreign),
+            ResolvedType::Foreign(foreign) => foreign_mir_type(foreign, &self.collection_registry),
             ResolvedType::Error => Some(mir::Type::ERROR),
             ResolvedType::ByteRegion(kind) => Some(mir::Type::ByteRegion(*kind)),
             ResolvedType::Function(_) => {
@@ -10826,6 +10902,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullablePayloadEnum(_)
                 | mir::Type::NullableFunction(_)) => Some(already),
                 mir::Type::ClosureEnvironment(_) => None,
+                mir::Type::ForeignAggregate(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
@@ -11125,7 +11202,9 @@ fn lower_grouped_var_decl(
                 context,
             )?),
         ),
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+        mir::Type::ByteRegion(_)
+        | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_) => {
             lower_rvalue_as_expected(&decl.initializer, ty, context)?
         }
         mir::Type::Scalar(scalar) => {
@@ -11626,6 +11705,18 @@ fn lower_assignment(
     if property_hooks::lower_assignment(assignment, context)? {
         return Ok(());
     }
+    let update = if assignment.op == hir::AssignOp::Assign {
+        foreign::FieldUpdate::Assign(&assignment.value)
+    } else {
+        foreign::FieldUpdate::Compound {
+            op: &assignment.op,
+            value: &assignment.value,
+            span: assignment.span,
+        }
+    };
+    if foreign::field_write(&assignment.target, update, context)? {
+        return Ok(());
+    }
     materialize_nested_collection_places(&assignment.target, true, context)?;
     if assignment.op != hir::AssignOp::Assign {
         let (place, scalar_type) = lower_scalar_place(&assignment.target, context)?;
@@ -11771,6 +11862,13 @@ fn lower_increment(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     if property_hooks::lower_increment(increment, context)? {
+        return Ok(());
+    }
+    let update = foreign::FieldUpdate::Increment {
+        op: &increment.op,
+        span: increment.span,
+    };
+    if foreign::field_write(&increment.target, update, context)? {
         return Ok(());
     }
     materialize_nested_collection_places(&increment.target, true, context)?;
@@ -13854,6 +13952,10 @@ fn lower_display_string_expression(
             expr.span(),
             "payload enum values do not have an implicit display representation",
         )]),
+        mir::Type::ForeignAggregate(_) => Err(vec![unsupported(
+            expr.span(),
+            "foreign structs and unions do not have a display representation",
+        )]),
         mir::Type::WritableSharedReference(_) | mir::Type::WritableWeakReference(_) => {
             Err(vec![unsupported(
                 expr.span(),
@@ -14184,6 +14286,7 @@ fn hoist_argument_temporary(
         {
             context.declare_borrowed_temp(ty, false)
         }
+        mir::Type::ForeignAggregate(_) => context.declare_borrowed_temp(ty, false),
         // Borrow-mode payload enums can be source-level Copy while still
         // containing managed fields. Staging their view does not acquire
         // those fields, so it must not introduce a second drop obligation.
@@ -17755,6 +17858,12 @@ fn lower_is_condition(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
+        mir::Type::ForeignAggregate(_) => {
+            return Err(vec![unsupported(
+                expr.span(),
+                "a foreign struct or union is never null and has one type",
+            )]);
+        }
     };
     Ok(result)
 }
@@ -18031,6 +18140,10 @@ fn lower_concrete_is_presence(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
+        mir::Type::ForeignAggregate(_) => Err(vec![unsupported(
+            expr.span(),
+            "a foreign struct or union is never null and has one type",
+        )]),
     }
 }
 
@@ -19857,6 +19970,9 @@ fn lower_rvalue_as_expected(
         mir::Type::PayloadEnum(ty) => {
             lower_payload_enum_expression(expr, ty, true, context).map(mir::Rvalue::PayloadEnum)
         }
+        mir::Type::ForeignAggregate(ty) => {
+            foreign::aggregate_expression(expr, ty, context).map(mir::Rvalue::ForeignAggregate)
+        }
         mir::Type::NullablePayloadEnum(ty) => {
             lower_nullable_payload_enum_expression(expr, ty, true, context)
                 .map(mir::Rvalue::NullablePayloadEnum)
@@ -20182,7 +20298,10 @@ fn borrowed_stored_property_rvalue(
             field!(NullableSharedReferenceAccess, NullableSharedReferenceAccessExpression,
                 payload: payload, writable: matches!(ty, Type::NullableWritableSharedReferenceAccess(_)))
         }
-        Type::ByteRegion(_) | Type::NullableByteRegion(_) | Type::ClosureEnvironment(_) => {
+        Type::ByteRegion(_)
+        | Type::NullableByteRegion(_)
+        | Type::ClosureEnvironment(_)
+        | Type::ForeignAggregate(_) => {
             return Err(vec![unsupported(
                 span,
                 "this type has no stored-property MIR representation",
@@ -20476,6 +20595,9 @@ fn materialize_checked_rvalue(
         return Ok(Some(value));
     }
     if let Some(value) = foreign::expression(expr, expected, context)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = foreign::field_read(expr, expected, context)? {
         return Ok(Some(value));
     }
     if matches!(
@@ -22188,6 +22310,10 @@ fn lower_mixed_expression(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
+        mir::Type::ForeignAggregate(_) => Err(vec![crate::unsafe_code::misplaced_aggregate(
+            expr.span(),
+            "a `mixed` value",
+        )]),
     }
 }
 
@@ -22237,6 +22363,10 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments cannot be tested as source values")
         }
+        mir::Type::ForeignAggregate(_) => Err(vec![crate::unsafe_code::misplaced_aggregate(
+            span,
+            "a `mixed` value",
+        )]),
     }
 }
 
@@ -23416,6 +23546,9 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
+        }
+        mir::Type::ForeignAggregate(_) => {
+            unreachable!("the execution gate keeps foreign aggregates out of collections")
         }
         mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
@@ -24683,6 +24816,9 @@ fn nullable_collection_access_rvalue(
         ),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
+        }
+        mir::Type::ForeignAggregate(_) => {
+            unreachable!("the execution gate keeps foreign aggregates out of collections")
         }
         mir::Type::Collection(payload) | mir::Type::NullableCollection(payload) => Ok(
             mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::CollectionGet {

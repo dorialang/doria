@@ -14,6 +14,7 @@ mod call_origins;
 mod closure_storage;
 mod core_value;
 mod exact_return;
+mod foreign_aggregates;
 mod inline_values;
 mod iteration;
 mod iterator_storage;
@@ -1796,6 +1797,10 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
                 align: layout.align,
             }
         }
+        mir::Type::ForeignAggregate(ty) => FieldType::Aggregate {
+            size: ty.size,
+            align: ty.align,
+        },
     }
 }
 
@@ -2548,6 +2553,10 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
         validate_payload_enum_type(program, payload)?;
         return Ok(());
     }
+    if let mir::Type::ForeignAggregate(aggregate) = ty {
+        foreign_aggregates::definition_in(program, aggregate)?;
+        return Ok(());
+    }
     if let Some(payload) = ty.shared_payload() {
         reject_stored_request(program, payload.ty())?;
         if matches!(
@@ -2905,6 +2914,18 @@ fn validate_statement(
                 (_, mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_)) => Err(
                     malformed_mir("byte region assigned to a different carrier type"),
                 ),
+                (
+                    mir::Type::ForeignAggregate(expected),
+                    mir::Rvalue::ForeignAggregate(expression),
+                ) if expression.ty() == expected => {
+                    foreign_aggregates::validate_expression(program, function, expression)
+                }
+                (mir::Type::ForeignAggregate(_), _) | (_, mir::Rvalue::ForeignAggregate(_)) => {
+                    Err(malformed_mir(format!(
+                        "local{} and its foreign aggregate value have different types",
+                        target.0
+                    )))
+                }
                 (mir::Type::PayloadEnum(expected), mir::Rvalue::PayloadEnum(expression))
                     if expression.ty() == expected =>
                 {
@@ -4155,7 +4176,15 @@ fn validate_statement(
             args,
             target,
             ..
-        } => validate_foreign_call(function, foreign, args, *target),
+        } => validate_foreign_call(program, function, foreign, args, *target),
+        mir::Statement::ForeignField {
+            aggregate,
+            offset,
+            access,
+            ..
+        } => foreign_aggregates::validate_field_access(
+            program, function, *aggregate, *offset, access,
+        ),
         mir::Statement::DropFunction {
             local,
             function_type,
@@ -6430,20 +6459,22 @@ fn validate_pointer_operation(
             return Err(malformed_mir("a pointer operation reads a pointer local"));
         }
     }
-    let accessed = |ty: mir::Type| match ty {
-        mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar).is_some(),
-        _ => false,
+    let accessed = |ty: mir::Type| {
+        if let mir::Type::ForeignAggregate(aggregate) = ty {
+            foreign_aggregates::definition_in(program, aggregate)?;
+        }
+        Ok::<_, BackendError>(crate::native_abi::pointee_layout(ty).is_some())
     };
     let result = match operation {
         mir::PointerOperation::Read { ty, .. } => {
-            if !accessed(*ty) {
-                return Err(malformed_mir("a pointer reads a scalar with a C layout"));
+            if !accessed(*ty)? {
+                return Err(malformed_mir("a pointer reads a value with a C layout"));
             }
             Some(*ty)
         }
         mir::PointerOperation::Write { value, .. } => {
-            if !accessed(value.ty()) {
-                return Err(malformed_mir("a pointer writes a scalar with a C layout"));
+            if !accessed(value.ty())? {
+                return Err(malformed_mir("a pointer writes a value with a C layout"));
             }
             validate_rvalue(program, function, value)?;
             None
@@ -6460,10 +6491,20 @@ fn validate_pointer_operation(
         mir::PointerOperation::Address { .. } => Some(mir::Type::Scalar(mir::ScalarType::Integer(
             IntegerType::UInt64,
         ))),
-        mir::PointerOperation::AddressOf { local } => {
-            if !accessed(local_in(function, *local)?.ty) {
+        mir::PointerOperation::AddressOf { local, offset } => {
+            let ty = local_in(function, *local)?.ty;
+            if !accessed(ty)? {
                 return Err(malformed_mir(
-                    "a pointer addresses a local of a scalar with a C layout",
+                    "a pointer addresses a local of a value with a C layout",
+                ));
+            }
+            let inside = match ty {
+                mir::Type::ForeignAggregate(aggregate) => *offset < u64::from(aggregate.size),
+                _ => *offset == 0,
+            };
+            if !inside {
+                return Err(malformed_mir(
+                    "a pointer to a place addresses a byte of that place",
                 ));
             }
             Some(pointer)
@@ -6492,6 +6533,7 @@ fn validate_pointer_operation(
 /// (Decision 0148 sections 14 and 15). A variadic binding's fixed count is
 /// at most its parameter count.
 fn validate_foreign_call(
+    program: &mir::Program,
     function: &mir::Function,
     foreign: &mir::ForeignFunction,
     args: &[mir::LocalId],
@@ -6503,7 +6545,11 @@ fn validate_foreign_call(
         ));
     }
     let target_platform = crate::c_layout::CTarget::host();
-    if foreign.symbol.is_empty() || foreign.c_signature(target_platform).is_none() {
+    if foreign.symbol.is_empty()
+        || foreign
+            .c_signature(&program.foreign_aggregates, target_platform)
+            .is_none()
+    {
         return Err(malformed_mir(
             "a foreign call names a symbol and passes only values with a C form",
         ));
@@ -6614,6 +6660,9 @@ fn validate_rvalue(
         mir::Rvalue::Function(value) => validate_function_expression(program, function, value),
         mir::Rvalue::NullableFunction(value) => {
             validate_nullable_function_expression(program, function, value)
+        }
+        mir::Rvalue::ForeignAggregate(value) => {
+            foreign_aggregates::validate_expression(program, function, value)
         }
     }?;
     let mut accesses = ClassLocalAccesses::default();
@@ -12698,6 +12747,19 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullableFunction(value) => {
             collect_nullable_function_class_local_accesses(value, accesses)
         }
+        mir::Rvalue::ForeignAggregate(value) => match value {
+            mir::ForeignAggregateExpression::Construct { fields, .. } => {
+                for field in fields {
+                    collect_rvalue_class_local_accesses(&field.value, accesses);
+                }
+            }
+            mir::ForeignAggregateExpression::Local { local, .. } => accesses.resource_read(*local),
+            mir::ForeignAggregateExpression::Call { args, .. } => {
+                for arg in args {
+                    collect_rvalue_class_local_accesses(arg, accesses);
+                }
+            }
+        },
     }
 }
 
@@ -14406,6 +14468,14 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 accesses.resource_read(*local);
             }
         }
+        mir::Statement::ForeignField {
+            aggregate, access, ..
+        } => {
+            accesses.resource_read(*aggregate);
+            if let mir::ForeignFieldAccess::Write { value } = access {
+                collect_rvalue_class_local_accesses(value, &mut accesses);
+            }
+        }
         mir::Statement::Pointer { operation, .. } => {
             if let Some(pointer) = operation.pointer() {
                 accesses.resource_read(pointer);
@@ -14418,7 +14488,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 | mir::PointerOperation::FromAddress { address: value } => {
                     collect_integer_class_local_accesses(value, &mut accesses)
                 }
-                mir::PointerOperation::AddressOf { local } => accesses.resource_read(*local),
+                mir::PointerOperation::AddressOf { local, .. } => accesses.resource_read(*local),
                 mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => {}
             }
         }
@@ -20366,6 +20436,12 @@ fn statement_observes_property(
 ) -> bool {
     match statement {
         mir::Statement::SetDiagnosticSite { .. } | mir::Statement::ForeignCall { .. } => false,
+        mir::Statement::ForeignField { access, .. } => match access {
+            mir::ForeignFieldAccess::Read { .. } => false,
+            mir::ForeignFieldAccess::Write { value } => {
+                rvalue_observes_property(value, receiver, property)
+            }
+        },
         mir::Statement::Pointer { operation, .. } => match operation {
             mir::PointerOperation::Write { value, .. } => {
                 rvalue_observes_property(value, receiver, property)
@@ -20666,6 +20742,15 @@ fn rvalue_observes_property(
         mir::Rvalue::NullablePayloadEnum(value) => {
             nullable_payload_enum_observes_property(value, receiver, property)
         }
+        mir::Rvalue::ForeignAggregate(value) => match value {
+            mir::ForeignAggregateExpression::Construct { fields, .. } => fields
+                .iter()
+                .any(|field| rvalue_observes_property(&field.value, receiver, property)),
+            mir::ForeignAggregateExpression::Call { args, .. } => args
+                .iter()
+                .any(|arg| rvalue_observes_property(arg, receiver, property)),
+            mir::ForeignAggregateExpression::Local { .. } => false,
+        },
     }
 }
 
@@ -24442,6 +24527,11 @@ fn validate_null_safe_call(
         mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "null-safe calls cannot expose closure environments",
+            ));
+        }
+        mir::Type::ForeignAggregate(_) => {
+            return Err(malformed_mir(
+                "a foreign struct or union has no nullable form for a null-safe call",
             ));
         }
         mir::Type::NullableScalar(_)

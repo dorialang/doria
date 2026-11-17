@@ -594,7 +594,9 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
             })
         }
         mir::Type::NullableScalar(_) => Some(16),
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => None,
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_) => None,
     }
 }
 
@@ -644,6 +646,22 @@ pub fn function_symbol(function: &mir::Function) -> String {
 
 /// The C size, equal to its alignment, of a scalar a raw pointer reads and
 /// writes (Decision 0148 section 4); `None` for a scalar without a C layout.
+/// The size and alignment of a value a pointer reads or writes (Decision
+/// 0148 section 4): a scalar with a C layout, whose alignment is its size,
+/// or a foreign struct or union with its C layout.
+pub(crate) const fn pointee_layout(ty: crate::mir::Type) -> Option<(u64, u64)> {
+    match ty {
+        crate::mir::Type::Scalar(scalar) => match pointee_scalar_size(scalar) {
+            Some(size) => Some((size, size)),
+            None => None,
+        },
+        crate::mir::Type::ForeignAggregate(aggregate) => {
+            Some((aggregate.size as u64, aggregate.align as u64))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) const fn pointee_scalar_size(scalar: crate::mir::ScalarType) -> Option<u64> {
     use crate::mir::ScalarType;
     match scalar {
@@ -867,4 +885,3 @@ mod tests {
         assert_eq!(align_of::<usize>(), doria_rt::DR_COLLECTION_ALIGN);
     }
 }
-

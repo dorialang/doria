@@ -16,7 +16,7 @@ use crate::ast::transform::{Transform, Transformable};
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::source::Span;
-use crate::types::TypeRef;
+use crate::types::{TypeArgumentRef, TypeRef};
 
 /// The diagnostic for an accepted Decision 0148 form this compiler does not
 /// implement yet.
@@ -72,6 +72,34 @@ pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Di
         )
 }
 
+/// The E0784 diagnostic for a foreign struct or union in `position`, a
+/// place no execution target builds one yet, found after checking: a value
+/// boxed as `mixed`, or a closure capture.
+pub fn misplaced_aggregate(span: Span, position: &str) -> Diagnostic {
+    let (title, message) = misplaced_aggregate_text(position);
+    unbuilt_form(span, title, message)
+}
+
+fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
+    (
+        "Foreign Aggregates Cannot Be Built Here Yet",
+        format!(
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results and pointer targets, and not here yet"
+        ),
+    )
+}
+
+/// The E0784 diagnostic for a checked form no execution target builds yet,
+/// for a gate that runs after checking, where the form's types are known.
+pub fn unbuilt_form(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
+    let mut finder = Finder::new(Gate::Execution);
+    finder.report(span, title, message);
+    finder
+        .diagnostics
+        .pop()
+        .expect("a reported form has its diagnostic")
+}
+
 /// One E0784 diagnostic per MIR operation the native targets build and the
 /// interpreter runs through the native companion library, in program order.
 pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
@@ -91,6 +119,14 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
                         "Foreign Calls Cannot Run In The Interpreter Yet",
                         "foreign calls are part of Doria; the interpreter does not run them yet",
                     ),
+                    crate::mir::Statement::ForeignField { span, .. }
+                    | crate::mir::Statement::AssignLocal {
+                        value:
+                            crate::mir::Rvalue::ForeignAggregate(
+                                crate::mir::ForeignAggregateExpression::Construct { span, .. },
+                            ),
+                        ..
+                    } => (span, AGGREGATE_TITLE, AGGREGATE_MESSAGE),
                     _ => continue,
                 };
                 if seen.insert(*span) {
@@ -98,9 +134,27 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
                 }
             }
         }
+        // Every foreign aggregate value comes from a construction, a
+        // pointer read or a foreign call; a function that only passes one
+        // on is reported where it is declared.
+        let holds_aggregate = function
+            .locals
+            .iter()
+            .any(|local| matches!(local.ty, crate::mir::Type::ForeignAggregate(_)));
+        if holds_aggregate && diagnostics.is_empty() && seen.insert(function.source_span) {
+            diagnostics.push(companion_form(
+                function.source_span,
+                AGGREGATE_TITLE,
+                AGGREGATE_MESSAGE,
+            ));
+        }
     }
     diagnostics
 }
+
+const AGGREGATE_TITLE: &str = "Foreign Structs And Unions Cannot Run In The Interpreter Yet";
+const AGGREGATE_MESSAGE: &str =
+    "foreign structs and unions are part of Doria; the interpreter does not run them yet";
 
 /// One E0784 diagnostic per extern declaration whose binding no execution
 /// target builds yet, in source order: one in a block with `#[Library]`, a
@@ -137,6 +191,14 @@ pub fn unbuildable_bindings(
 /// One E0784 diagnostic per checked form that no execution target runs yet.
 pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
     let mut finder = Finder::new(Gate::Execution);
+    finder.aggregates = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ForeignAggregate(aggregate) => Some(aggregate.name.clone()),
+            _ => None,
+        })
+        .collect();
     for item in &program.items {
         finder.item(item);
     }
@@ -147,6 +209,8 @@ struct Finder {
     gate: Gate,
     seen: HashSet<Span>,
     diagnostics: Vec<Diagnostic>,
+    /// The canonical names of the program's foreign structs and unions.
+    aggregates: HashSet<String>,
 }
 
 impl Finder {
@@ -155,6 +219,29 @@ impl Finder {
             gate,
             seen: HashSet::new(),
             diagnostics: Vec::new(),
+            aggregates: HashSet::new(),
+        }
+    }
+
+    /// Reports a foreign struct or union `ty` holds where no execution
+    /// target builds one yet: anywhere in a property or enum payload type
+    /// (`anywhere`), otherwise nullable, as a type argument other than a
+    /// pointer's pointee, or in a function type. Locals, parameters,
+    /// results and pointees build.
+    fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
+        if self.gate != Gate::Execution || self.aggregates.is_empty() {
+            return;
+        }
+        let misplaced = match anywhere {
+            Some(_) => mentions_aggregate(ty, &self.aggregates),
+            None => aggregate_outside_value_position(ty, &self.aggregates, true),
+        };
+        if misplaced {
+            let position = anywhere.unwrap_or(
+                "a nullable value, a type argument other than a pointer's pointee, or a function type",
+            );
+            let (title, message) = misplaced_aggregate_text(position);
+            self.report(span, title, message);
         }
     }
 
@@ -213,6 +300,7 @@ impl Finder {
             Item::Enum(declaration) => {
                 for case in &declaration.cases {
                     for field in &case.payload {
+                        self.misplaced_aggregate(&field.ty, field.span, Some("an enum payload"));
                         self.type_refs(&mut field.ty.clone(), field.span);
                     }
                     if let Some(value) = &case.backing_value {
@@ -231,21 +319,9 @@ impl Finder {
             // cannot be built yet are reported from the checked facts
             // ([`unbuildable_bindings`]).
             Item::ExternBlock(_) => {}
-            Item::ForeignAggregate(aggregate) => {
-                if self.gate == Gate::Execution {
-                    self.report(
-                        aggregate.span,
-                        match aggregate.kind {
-                            ForeignAggregateKind::Struct => "Foreign Structs Cannot Be Built Yet",
-                            ForeignAggregateKind::Union => "Foreign Unions Cannot Be Built Yet",
-                        },
-                        format!(
-                            "`extern \"C\" {}` is part of Doria; this compiler does not build foreign layouts yet",
-                            aggregate.kind.keyword()
-                        ),
-                    );
-                }
-            }
+            // A foreign layout builds; fixed-length array fields report
+            // where a program reads or writes them, at checking.
+            Item::ForeignAggregate(_) => {}
             Item::Statement(statement) => self.statement(statement),
         }
     }
@@ -267,6 +343,7 @@ impl Finder {
     }
 
     fn property(&mut self, property: &PropertyDecl) {
+        self.misplaced_aggregate(&property.ty, property.span, Some("a property"));
         self.type_refs(&mut property.ty.clone(), property.span);
         if let Some(initializer) = &property.initializer {
             self.expression(initializer);
@@ -349,46 +426,17 @@ impl Finder {
                     ),
                 )
             }
-            // Every pointer and boundary value comes from a gated
-            // declaration or type, or from one of these calls.
-            Expr::StaticCall {
-                qualifier: StaticQualifier::Class(class),
-                method,
-                args,
-                span,
-                ..
-            } if self.gate == Gate::Execution => {
-                match crate::pointer_intrinsics::ForeignCompanion::from_class_name(class) {
-                    // The native targets build every other pointer
-                    // operation; the interpreter and PHP output report them.
-                    // A pointer to a local builds; one to a field or
-                    // property does not yet.
-                    Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(access))
-                        if crate::pointer_intrinsics::formation(
-                            &StaticQualifier::Class(class.clone()),
-                            method,
-                        )
-                        .is_some()
-                            && !args.first().is_some_and(|argument| {
-                                matches!(ungrouped(&argument.value), Expr::Variable { .. })
-                            }) =>
-                    {
-                        self.report(
-                            *span,
-                            "Pointers To Fields And Properties Cannot Be Built Yet",
-                            format!(
-                                "`{}::{method}` of a field or property is part of Doria; this compiler does not build it yet",
-                                access.short_name()
-                            ),
-                        )
-                    }
-                    Some(crate::pointer_intrinsics::ForeignCompanion::Pointer(_)) => {}
-                    // Every target builds boundary conversions; PHP output
-                    // reports them itself.
-                    Some(crate::pointer_intrinsics::ForeignCompanion::Boundary(_)) | None => {}
-                }
-            }
             Expr::Closure(closure) => {
+                for parameter in &closure.parameters {
+                    self.misplaced_aggregate(
+                        &parameter.ty,
+                        parameter.span,
+                        Some("a closure parameter"),
+                    );
+                }
+                if let Some(result) = &closure.return_type {
+                    self.misplaced_aggregate(&result.ty, closure.span, Some("a closure result"));
+                }
                 if let ClosureBody::Block(body) = &closure.body {
                     self.block(body);
                 }
@@ -403,6 +451,9 @@ impl Finder {
         }
         let mut types = TypeFinder::default();
         node.transform(&mut types);
+        for ty in std::mem::take(&mut types.named) {
+            self.misplaced_aggregate(&ty, span, None);
+        }
         if types.foreign {
             self.report(
                 span,
@@ -416,10 +467,14 @@ impl Finder {
 #[derive(Default)]
 struct TypeFinder {
     foreign: bool,
+    /// Every outermost type the node names, for the aggregate placement
+    /// check, which reads nested types itself.
+    named: Vec<TypeRef>,
 }
 
 impl Transform for TypeFinder {
     fn type_ref(&mut self, ty: &mut TypeRef) {
+        self.named.push(ty.clone());
         if ty
             .function
             .as_ref()
@@ -436,10 +491,43 @@ impl Transform for TypeFinder {
     }
 }
 
-/// `expr` without the parentheses and `unsafe(...)` around it.
-fn ungrouped(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => ungrouped(expr),
-        _ => expr,
+/// Whether `ty` names a foreign struct or union anywhere.
+fn mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
+    aggregates.contains(&ty.name)
+        || ty.arguments.iter().any(|argument| match argument {
+            TypeArgumentRef::Type(inner) => mentions_aggregate(inner, aggregates),
+            TypeArgumentRef::Value(_) => false,
+        })
+        || ty.function.as_ref().is_some_and(|function| {
+            function
+                .parameters
+                .iter()
+                .any(|parameter| mentions_aggregate(&parameter.ty, aggregates))
+                || mentions_aggregate(&function.return_type, aggregates)
+        })
+}
+
+/// Whether `ty` holds a foreign struct or union other than by value in a
+/// value position or as a pointer's pointee.
+fn aggregate_outside_value_position(
+    ty: &TypeRef,
+    aggregates: &HashSet<String>,
+    value_position: bool,
+) -> bool {
+    if aggregates.contains(&ty.name) && (!value_position || ty.nullable) {
+        return true;
     }
+    let pointer = crate::foreign::PointerAccess::from_source_name(&ty.name).is_some();
+    ty.arguments.iter().any(|argument| match argument {
+        TypeArgumentRef::Type(inner) => {
+            aggregate_outside_value_position(inner, aggregates, pointer)
+        }
+        TypeArgumentRef::Value(_) => false,
+    }) || ty.function.as_ref().is_some_and(|function| {
+        function
+            .parameters
+            .iter()
+            .any(|parameter| mentions_aggregate(&parameter.ty, aggregates))
+            || mentions_aggregate(&function.return_type, aggregates)
+    })
 }

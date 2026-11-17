@@ -995,10 +995,7 @@ fn parameter_uses_pointer_abi(
     (closure_entry
         && !matches!(ty, mir::Type::ClosureEnvironment(_))
         && mode == mir::FunctionParameterMode::Writable)
-        || matches!(
-            ty,
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-        )
+        || native_closure_abi::memory_value_layout(ty).is_some()
 }
 
 fn parameter_integer_extension(
@@ -1218,13 +1215,12 @@ fn define_function<'ctx>(
     for local in &function.locals {
         let ty = llvm_type(context, target_data, program, local.ty);
         let slot = build(builder.build_alloca(ty, &format!("local{}", local.id.0)))?;
-        if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = local.ty
-        {
+        if let Some(layout) = native_closure_abi::memory_value_layout(local.ty) {
             slot.as_instruction_value()
-                .ok_or_else(|| backend_failure("payload enum alloca has no instruction"))?
-                .set_alignment(payload.align)
+                .ok_or_else(|| backend_failure("in-memory local alloca has no instruction"))?
+                .set_alignment(layout.align)
                 .map_err(|error| {
-                    backend_failure(format!("failed to align payload enum local: {error}"))
+                    backend_failure(format!("failed to align in-memory local: {error}"))
                 })?;
         }
         build(builder.build_store(slot, ty.const_zero()))?;
@@ -1309,18 +1305,15 @@ fn define_function<'ctx>(
             && function.parameter_modes[index] == mir::FunctionParameterMode::Writable
         {
             let address = value.into_pointer_value();
-            if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
-                local.ty
-            {
-                let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+            if let Some(layout) = native_closure_abi::memory_value_layout(local.ty) {
                 let size = context
                     .ptr_sized_int_type(target_data, None)
-                    .const_int(u64::from(payload.storage_size(nullable)), false);
+                    .const_int(u64::from(layout.size), false);
                 build(builder.build_memcpy(
                     destination,
-                    payload.align,
+                    layout.align,
                     address,
-                    payload.align,
+                    layout.align,
                     size,
                 ))?;
             } else {
@@ -1334,17 +1327,15 @@ fn define_function<'ctx>(
             writable_parameter_addresses.insert(*parameter, address);
             continue;
         }
-        if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = local.ty
-        {
-            let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+        if let Some(layout) = native_closure_abi::memory_value_layout(local.ty) {
             let size = context
                 .ptr_sized_int_type(target_data, None)
-                .const_int(u64::from(payload.storage_size(nullable)), false);
+                .const_int(u64::from(layout.size), false);
             build(builder.build_memcpy(
                 destination,
-                payload.align,
+                layout.align,
                 value.into_pointer_value(),
-                payload.align,
+                layout.align,
                 size,
             ))?;
         } else {
@@ -2732,6 +2723,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    /// Copies a value that lives in memory (`memory_value_layout`) by its
+    /// bytes.
+    fn copy_memory_value(
+        &self,
+        destination: PointerValue<'ctx>,
+        source: PointerValue<'ctx>,
+        layout: native_closure_abi::NativeLayout,
+    ) -> Result<(), BackendError> {
+        let size = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(layout.size), false);
+        build(
+            self.builder
+                .build_memcpy(destination, layout.align, source, layout.align, size),
+        )?;
+        Ok(())
+    }
+
     fn zero_payload_bytes(
         &self,
         destination: PointerValue<'ctx>,
@@ -3266,15 +3276,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     field.ty,
                     binding_storage == mir::ClosureEnvironmentStorage::WritableBorrow,
                 )?;
-            } else if let mir::Type::PayloadEnum(payload)
-            | mir::Type::NullablePayloadEnum(payload) = field.ty
-            {
-                self.copy_payload_bytes(
-                    target_slot,
-                    place,
-                    payload,
-                    matches!(field.ty, mir::Type::NullablePayloadEnum(_)),
-                )?;
+            } else if let Some(layout) = native_closure_abi::memory_value_layout(field.ty) {
+                self.copy_memory_value(target_slot, place, layout)?;
             } else {
                 let value = build(self.builder.build_load(
                     llvm_type(self.context, self.target_data, self.program, field.ty),
@@ -3486,10 +3489,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         // only an addressable view of the already-evaluated carrier. Inline
         // enums already have caller storage; other carriers use a fixed entry
         // slot so repeated loop execution never grows the stack.
-        let address = if matches!(
-            ty,
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-        ) {
+        let address = if native_closure_abi::memory_value_layout(ty).is_some() {
             evaluated.into_pointer_value()
         } else {
             let address = self.entry_alloca(
@@ -5131,6 +5131,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 target,
                 ..
             } => self.lower_foreign_call(function, args, *target)?,
+            mir::Statement::ForeignField {
+                aggregate,
+                offset,
+                access,
+                ..
+            } => self.lower_foreign_field(*aggregate, *offset, access)?,
             mir::Statement::DropFunction { local, .. } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let carrier = build(self.builder.build_load(
@@ -5521,6 +5527,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         if index > 0 {
                             self.retain_payload_enum_at(destination, payload, nullable)?;
                         }
+                    } else if let Some(layout) = native_closure_abi::memory_value_layout(ty) {
+                        self.copy_memory_value(destination, value.into_pointer_value(), layout)?;
                     } else {
                         build(self.builder.build_store(destination, value))?;
                         if index > 0 {
@@ -5685,15 +5693,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 if let Some((descriptor, home)) = home {
                     self.store_borrow_home(descriptor, home)?;
                 }
-                if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
-                    local.ty
-                {
-                    self.copy_payload_bytes(
-                        slot,
-                        value.into_pointer_value(),
-                        payload,
-                        matches!(local.ty, mir::Type::NullablePayloadEnum(_)),
-                    )?;
+                if let Some(layout) = native_closure_abi::memory_value_layout(local.ty) {
+                    self.copy_memory_value(slot, value.into_pointer_value(), layout)?;
                 } else {
                     build(self.builder.build_store(slot, value))?;
                 }
@@ -5711,15 +5712,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.sync_borrowed_string_capture(home, slot, local.ty)?;
                     } else if native_closure_abi::borrow_home_type_key(local.ty) != 0 {
                         self.sync_nominal_borrow_home(home, slot, local.ty)?;
-                    } else if let mir::Type::PayloadEnum(payload)
-                    | mir::Type::NullablePayloadEnum(payload) = local.ty
-                    {
-                        self.copy_payload_bytes(
-                            address,
-                            slot,
-                            payload,
-                            matches!(local.ty, mir::Type::NullablePayloadEnum(_)),
-                        )?;
+                    } else if let Some(layout) = native_closure_abi::memory_value_layout(local.ty) {
+                        self.copy_memory_value(address, slot, layout)?;
                     } else {
                         let current = build(self.builder.build_load(
                             llvm_type(self.context, self.target_data, self.program, local.ty),
@@ -6011,9 +6005,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         | mir::Type::Interface(_)
                         | mir::Type::NullableInterface(_) => None,
                         mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
-                        mir::Type::ClosureEnvironment(_) => {
+                        mir::Type::ClosureEnvironment(_) | mir::Type::ForeignAggregate(_) => {
                             return Err(malformed_mir(
-                                "closure environment pointer is not a property value",
+                                "closure environment pointer or foreign aggregate is not a property value",
                             ));
                         }
                     }
@@ -6561,15 +6555,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .return_address
                     .filter(|_| self.function.has_checked_transport())
                 {
-                    if let mir::Type::PayloadEnum(payload)
-                    | mir::Type::NullablePayloadEnum(payload) = expression.ty()
-                    {
-                        self.copy_payload_bytes(
-                            destination,
-                            value.into_pointer_value(),
-                            payload,
-                            matches!(expression.ty(), mir::Type::NullablePayloadEnum(_)),
-                        )?;
+                    if let Some(layout) = native_closure_abi::memory_value_layout(expression.ty()) {
+                        self.copy_memory_value(destination, value.into_pointer_value(), layout)?;
                     } else {
                         build(self.builder.build_store(destination, value))?;
                     }
@@ -6585,18 +6572,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 if let Some(destination) = self.return_address {
                     // A payload enum, or a value wider than the direct return
                     // budget, goes to the caller's result slot.
-                    if let mir::Type::PayloadEnum(payload)
-                    | mir::Type::NullablePayloadEnum(payload) = expression.ty()
-                    {
+                    if let Some(layout) = native_closure_abi::memory_value_layout(expression.ty()) {
                         self.cleanup_mixed_locals()?;
                         self.cleanup_class_locals()?;
                         self.cleanup_string_locals()?;
-                        self.copy_payload_bytes(
-                            destination,
-                            value.into_pointer_value(),
-                            payload,
-                            matches!(expression.ty(), mir::Type::NullablePayloadEnum(_)),
-                        )?;
+                        self.copy_memory_value(destination, value.into_pointer_value(), layout)?;
                     } else {
                         build(self.builder.build_store(destination, value))?;
                         self.cleanup_mixed_locals()?;
@@ -6609,12 +6589,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
-                if matches!(
-                    expression.ty(),
-                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-                ) {
+                if native_closure_abi::memory_value_layout(expression.ty()).is_some() {
                     return Err(malformed_mir(
-                        "payload enum return has no hidden result address",
+                        "an in-memory value's return has no hidden result address",
                     ));
                 }
                 build(self.builder.build_return(Some(&value)))?;
@@ -9902,13 +9879,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         value: BasicValueEnum<'ctx>,
         ty: mir::Type,
     ) -> Result<(), BackendError> {
-        if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = ty {
-            return self.copy_payload_bytes(
-                address,
-                value.into_pointer_value(),
-                payload,
-                matches!(ty, mir::Type::NullablePayloadEnum(_)),
-            );
+        if let Some(layout) = native_closure_abi::memory_value_layout(ty) {
+            return self.copy_memory_value(address, value.into_pointer_value(), layout);
         }
         build(self.builder.build_store(address, value))?;
         Ok(())
@@ -10126,6 +10098,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
                 "closure environment pointer reached ordinary value cleanup",
             )),
+            mir::Type::ForeignAggregate(_) => Ok(()),
             mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                 let value = build(self.builder.build_load(
                     error_carrier_type(self.context),
@@ -11094,9 +11067,125 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullablePayloadEnum(value) => {
                 Ok(self.lower_nullable_payload_enum_expression(value)?.into())
             }
+            mir::Rvalue::ForeignAggregate(value) => {
+                Ok(self.lower_foreign_aggregate_expression(value)?.into())
+            }
         }?;
         self.remember_explicit_borrow_home(expression, value)?;
         Ok(value)
+    }
+
+    /// The address of a foreign struct or union value: fresh storage for a
+    /// construction, the callee's result storage for a call, or the slot of
+    /// the local a copy reads, which the consumer copies from (Decision 0148
+    /// section 6).
+    fn lower_foreign_aggregate_expression(
+        &mut self,
+        expression: &mir::ForeignAggregateExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        match expression {
+            mir::ForeignAggregateExpression::Construct { ty, fields, .. } => {
+                let address = self.entry_foreign_aggregate_alloca(*ty, "foreign.construct")?;
+                let size = self
+                    .context
+                    .ptr_sized_int_type(self.target_data, None)
+                    .const_int(u64::from(ty.size), false);
+                build(self.builder.build_memset(
+                    address,
+                    ty.align,
+                    self.context.i8_type().const_zero(),
+                    size,
+                ))?;
+                for field in fields {
+                    let value = self.lower_rvalue(&field.value)?;
+                    let offset = u32::try_from(field.offset).map_err(|_| {
+                        malformed_mir("a foreign field offset exceeds its aggregate")
+                    })?;
+                    let field_address = self.byte_offset(address, offset, "foreign.field")?;
+                    self.store_value_at_address(field_address, value, field.value.ty())?;
+                }
+                Ok(address)
+            }
+            mir::ForeignAggregateExpression::Local { local, .. } => {
+                local_slot(&self.local_slots, *local)
+            }
+            mir::ForeignAggregateExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => Ok(self
+                .lower_call_at(*function, args, true, *span)?
+                .ok_or_else(|| malformed_mir("a foreign aggregate call returned void"))?
+                .into_pointer_value()),
+        }
+    }
+
+    fn entry_foreign_aggregate_alloca(
+        &self,
+        ty: mir::ForeignAggregateType,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let slot = self.entry_alloca(self.context.i8_type().array_type(ty.size), name)?;
+        slot.as_instruction_value()
+            .ok_or_else(|| backend_failure("foreign aggregate alloca has no instruction"))?
+            .set_alignment(ty.align)
+            .map_err(|error| {
+                backend_failure(format!("failed to align a foreign aggregate slot: {error}"))
+            })?;
+        Ok(slot)
+    }
+
+    /// One field read or write of the foreign struct or union in
+    /// `aggregate`'s slot, `offset` bytes from its start.
+    fn lower_foreign_field(
+        &mut self,
+        aggregate: mir::LocalId,
+        offset: u64,
+        access: &mir::ForeignFieldAccess,
+    ) -> Result<(), BackendError> {
+        let base = local_slot(&self.local_slots, aggregate)?;
+        let offset = u32::try_from(offset)
+            .map_err(|_| malformed_mir("a foreign field offset exceeds its aggregate"))?;
+        let address = self.byte_offset(base, offset, "foreign.field")?;
+        match access {
+            mir::ForeignFieldAccess::Read { target } => {
+                let ty = local_in(self.function, *target)?.ty;
+                let target_slot = local_slot(&self.local_slots, *target)?;
+                if let Some(layout) = native_closure_abi::memory_value_layout(ty) {
+                    return self.copy_memory_value(target_slot, address, layout);
+                }
+                let loaded = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, self.program, ty),
+                    address,
+                    "foreign.field.read",
+                ))?;
+                // A `_Bool` read from C memory is true for any nonzero byte.
+                let value = if ty == mir::Type::Scalar(mir::ScalarType::Bool) {
+                    let byte = loaded.into_int_value();
+                    let set = build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        byte,
+                        byte.get_type().const_zero(),
+                        "foreign.field.bool",
+                    ))?;
+                    build(self.builder.build_int_z_extend(
+                        set,
+                        self.context.i8_type(),
+                        "foreign.field.bool.byte",
+                    ))?
+                    .into()
+                } else {
+                    loaded
+                };
+                build(self.builder.build_store(target_slot, value))?;
+                Ok(())
+            }
+            mir::ForeignFieldAccess::Write { value } => {
+                let lowered = self.lower_rvalue(value)?;
+                self.store_value_at_address(address, lowered, value.ty())
+            }
+        }
     }
 
     fn lower_interface_upcast(
@@ -12037,6 +12126,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::NullableFunction(_)
             | mir::Type::ByteRegion(_)
             | mir::Type::NullableByteRegion(_)
+            | mir::Type::ForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
                     "function, region, and closure-environment values do not support collection comparison",
@@ -12129,6 +12219,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::NullableFunction(_)
             | mir::Type::ByteRegion(_)
             | mir::Type::NullableByteRegion(_)
+            | mir::Type::ForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
                 "aggregate carriers cannot use scalar collection transport",
             )),
@@ -12235,6 +12326,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::NullableFunction(_)
             | mir::Type::ByteRegion(_)
             | mir::Type::NullableByteRegion(_)
+            | mir::Type::ForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
                     "function carriers require aggregate collection transport",
@@ -16061,7 +16153,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::Scalar(_)
             | mir::Type::NullableScalar(_)
             | mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_) => Ok(()),
+            | mir::Type::NullableByteRegion(_)
+            | mir::Type::ForeignAggregate(_) => Ok(()),
             mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
                 self.drop_function_carrier(value.into_struct_value())
             }
@@ -22092,6 +22185,44 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
         };
         let result: Option<BasicValueEnum<'ctx>> = match operation {
+            // A foreign struct or union moves by its bytes, checked against
+            // its layout's alignment.
+            mir::PointerOperation::Read {
+                pointer,
+                ty: mir::Type::ForeignAggregate(aggregate),
+                aligned,
+            } => {
+                let address = self.pointer_local(*pointer)?;
+                let memory = self.checked_pointer_memory(
+                    address,
+                    u64::from(aggregate.align),
+                    *aligned,
+                    span,
+                )?;
+                let target = target.ok_or_else(|| malformed_mir("a pointer read has a target"))?;
+                let slot = local_slot(&self.local_slots, target)?;
+                self.copy_pointer_aggregate(slot, memory, *aggregate, *aligned, true)?;
+                return Ok(());
+            }
+            mir::PointerOperation::Write {
+                pointer,
+                value,
+                aligned,
+            } if matches!(value.ty(), mir::Type::ForeignAggregate(_)) => {
+                let mir::Type::ForeignAggregate(aggregate) = value.ty() else {
+                    unreachable!("matched above");
+                };
+                let source = self.lower_rvalue(value)?.into_pointer_value();
+                let address = self.pointer_local(*pointer)?;
+                let memory = self.checked_pointer_memory(
+                    address,
+                    u64::from(aggregate.align),
+                    *aligned,
+                    span,
+                )?;
+                self.copy_pointer_aggregate(memory, source, aggregate, *aligned, false)?;
+                None
+            }
             mir::PointerOperation::Read {
                 pointer,
                 ty,
@@ -22200,8 +22331,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::PointerOperation::Address { pointer } => {
                 Some(self.pointer_local(*pointer)?.into())
             }
-            mir::PointerOperation::AddressOf { local } => {
-                let place = self.closure_source_address(*local)?;
+            mir::PointerOperation::AddressOf { local, offset } => {
+                let mut place = self.closure_source_address(*local)?;
+                if *offset != 0 {
+                    let offset = u32::try_from(*offset)
+                        .map_err(|_| malformed_mir("a field offset exceeds its aggregate"))?;
+                    place = self.byte_offset(place, offset, "pointer.to.field")?;
+                }
                 Some(
                     build(self.builder.build_ptr_to_int(
                         place,
@@ -22250,7 +22386,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         use crate::native_abi::c_abi::{self, ArgumentPassing, Extension, ReturnPassing};
         let platform = crate::c_layout::CTarget::host();
         let (parameters, return_type) = foreign
-            .c_signature(platform)
+            .c_signature(&self.program.foreign_aggregates, platform)
             .ok_or_else(|| malformed_mir("a foreign call passes only values with a C form"))?;
         let classification = c_abi::classify(
             platform,
@@ -22451,18 +22587,52 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     /// The memory at `address`, after P1702's alignment test for an aligned
     /// access to a pointee of `size` bytes, whose alignment is its size.
+    /// Copies a foreign struct or union between compiler storage and the
+    /// memory a pointer addresses (`from_pointer` says which side that is),
+    /// assuming the layout's alignment of the pointer side only for an
+    /// aligned access.
+    fn copy_pointer_aggregate(
+        &self,
+        destination: PointerValue<'ctx>,
+        source: PointerValue<'ctx>,
+        aggregate: mir::ForeignAggregateType,
+        aligned: bool,
+        from_pointer: bool,
+    ) -> Result<(), BackendError> {
+        let pointer_align = if aligned { aggregate.align } else { 1 };
+        let (destination_align, source_align) = if from_pointer {
+            (aggregate.align, pointer_align)
+        } else {
+            (pointer_align, aggregate.align)
+        };
+        let size = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(aggregate.size), false);
+        build(self.builder.build_memcpy(
+            destination,
+            destination_align,
+            source,
+            source_align,
+            size,
+        ))?;
+        Ok(())
+    }
+
+    /// The memory `address` names, after a P1702 test that it is a multiple
+    /// of `align`, the pointee's alignment, for an aligned access.
     fn checked_pointer_memory(
         &mut self,
         address: IntValue<'ctx>,
-        size: u64,
+        align: u64,
         aligned: bool,
         span: crate::source::Span,
     ) -> Result<PointerValue<'ctx>, BackendError> {
-        if aligned && size > 1 {
+        if aligned && align > 1 {
             let word = self.context.i64_type();
             let low = build(self.builder.build_and(
                 address,
-                word.const_int(size - 1, false),
+                word.const_int(align - 1, false),
                 "pointer.misalignment",
             ))?;
             let misaligned = build(self.builder.build_int_compare(
@@ -23314,15 +23484,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         llvm_type(self.context, self.target_data, self.program, argument.ty()),
                         "writable.argument.carrier",
                     )?;
-                    if let mir::Type::PayloadEnum(payload)
-                    | mir::Type::NullablePayloadEnum(payload) = argument.ty()
-                    {
-                        self.copy_payload_bytes(
-                            address,
-                            value.into_pointer_value(),
-                            payload,
-                            matches!(argument.ty(), mir::Type::NullablePayloadEnum(_)),
-                        )?;
+                    if let Some(layout) = native_closure_abi::memory_value_layout(argument.ty()) {
+                        self.copy_memory_value(address, value.into_pointer_value(), layout)?;
                     } else {
                         build(self.builder.build_store(address, value))?;
                     }
@@ -23350,10 +23513,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 } else {
                     self.closure_source_address(local)?
                 };
-                let value = if matches!(
-                    argument.ty(),
-                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-                ) {
+                let value = if native_closure_abi::memory_value_layout(argument.ty()).is_some() {
                     address.into()
                 } else {
                     build(self.builder.build_load(
@@ -23819,10 +23979,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let mir::ReturnType::Value(ty) = physical_return else {
                     unreachable!()
                 };
-                if matches!(
-                    ty,
-                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-                ) {
+                if native_closure_abi::memory_value_layout(ty).is_some() {
                     Some(result.into())
                 } else {
                     Some(build(self.builder.build_load(
@@ -25824,6 +25981,7 @@ fn collection_storage_type<'ctx>(
         | mir::Type::NullableFunction(_)
         | mir::Type::ByteRegion(_)
         | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "function carriers require aggregate collection storage",
@@ -26007,6 +26165,9 @@ fn llvm_type<'ctx>(
         mir::Type::PayloadEnum(payload) => context.i8_type().array_type(payload.size).into(),
         mir::Type::NullablePayloadEnum(payload) => {
             context.i8_type().array_type(payload.nullable_size).into()
+        }
+        mir::Type::ForeignAggregate(aggregate) => {
+            context.i8_type().array_type(aggregate.size).into()
         }
     }
 }

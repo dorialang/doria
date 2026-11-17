@@ -796,7 +796,8 @@ fn append_type_abi_params(
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => {
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_) => {
             params.push(AbiParam::new(pointer_type));
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -1001,9 +1002,11 @@ fn lowered_from_direct_results(
                 payload: nullable_payload_from_doria_abi(builder, payload, ty),
             }
         }
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_) => {
             return Err(malformed_mir(
-                "a payload enum returns through its result slot",
+                "a payload enum or foreign aggregate returns through its result slot",
             ))
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -1673,6 +1676,13 @@ fn define_function(
                         ty.align.trailing_zeros() as u8,
                     )))
                 }
+                mir::Type::ForeignAggregate(ty) => {
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        ty.size,
+                        ty.align.trailing_zeros() as u8,
+                    )))
+                }
                 mir::Type::ClosureEnvironment(_) => {
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
@@ -2287,6 +2297,14 @@ fn initialize_locals(
             builder.call_memset(frontend_config, address, zero, size);
             continue;
         }
+        if let mir::Type::ForeignAggregate(ty) = local.ty {
+            let slot = local_slot(slots, local.id)?;
+            let address = builder.ins().stack_addr(pointer_type, slot, 0);
+            let zero = builder.ins().iconst(types::I8, 0);
+            let size = builder.ins().iconst(pointer_type, i64::from(ty.size));
+            builder.call_memset(frontend_config, address, zero, size);
+            continue;
+        }
         let zero = match local.ty {
             mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
                 let zero = builder.ins().iconst(pointer_type, 0);
@@ -2370,7 +2388,9 @@ fn initialize_locals(
                 zero_inline_bytes(builder, address, layout.size, pointer_type);
                 zero
             }
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => unreachable!(),
+            mir::Type::PayloadEnum(_)
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::ForeignAggregate(_) => unreachable!(),
         };
         builder
             .ins()
@@ -2448,6 +2468,18 @@ fn bind_parameters(
                 destination,
                 first,
                 payload.storage_size(matches!(ty, mir::Type::NullablePayloadEnum(_))),
+                pointer_type,
+            );
+        } else if let mir::Type::ForeignAggregate(aggregate) = ty {
+            // The caller passes the address of its value; the callee keeps
+            // its own copy, as every Copy argument is.
+            let destination = builder.ins().stack_addr(pointer_type, slot, 0);
+            copy_foreign_aggregate(
+                builder,
+                destination,
+                first,
+                aggregate,
+                AggregateAccess::Storage,
                 pointer_type,
             );
         } else if matches!(ty, mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -4001,6 +4033,12 @@ fn lower_statement(
             target,
             ..
         } => lower_foreign_call(builder, function, args, *target, resources)?,
+        mir::Statement::ForeignField {
+            aggregate,
+            offset,
+            access,
+            ..
+        } => lower_foreign_field(builder, *aggregate, *offset, access, resources)?,
         mir::Statement::DropFunction { local, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
@@ -4894,9 +4932,9 @@ fn lower_statement(
                     | mir::Type::Interface(_)
                     | mir::Type::NullableInterface(_) => None,
                     mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
-                    mir::Type::ClosureEnvironment(_) => {
+                    mir::Type::ClosureEnvironment(_) | mir::Type::ForeignAggregate(_) => {
                         return Err(malformed_mir(
-                            "closure environment pointer reached a Doria property",
+                            "closure environment pointer or foreign aggregate reached a Doria property",
                         ));
                     }
                 }
@@ -5588,7 +5626,9 @@ fn load_lowered_from_stack(
             slot,
             0,
         )),
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_) => {
             LoweredValue::Single(builder.ins().stack_addr(pointer, slot, 0))
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -5671,6 +5711,17 @@ fn store_lowered_to_stack(
                 destination,
                 value.single()?,
                 payload.storage_size(nullable),
+                pointer,
+            );
+        }
+        mir::Type::ForeignAggregate(aggregate) => {
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_foreign_aggregate(
+                builder,
+                destination,
+                value.single()?,
+                aggregate,
+                AggregateAccess::Storage,
                 pointer,
             );
         }
@@ -5764,9 +5815,9 @@ fn load_lowered_from_address(
             address,
             0,
         )),
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
-            LoweredValue::Single(address)
-        }
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_) => LoweredValue::Single(address),
         mir::Type::Class(class) | mir::Type::NullableClass(class)
             if class_uses_open_carrier(program, class) =>
         {
@@ -5847,6 +5898,14 @@ fn store_lowered_to_address(
                 pointer,
             );
         }
+        mir::Type::ForeignAggregate(aggregate) => copy_foreign_aggregate(
+            builder,
+            address,
+            value.single()?,
+            aggregate,
+            AggregateAccess::Storage,
+            pointer,
+        ),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::Interface(_)
@@ -8824,6 +8883,9 @@ fn lower_rvalue(
             lower_nullable_payload_enum_expression(builder, value, resources)
                 .map(LoweredValue::Single)
         }
+        mir::Rvalue::ForeignAggregate(value) => {
+            lower_foreign_aggregate_expression(builder, value, resources).map(LoweredValue::Single)
+        }
     }?;
     let function = &resources.program.functions[resources.function_id.0];
     if expression.is_null_value() && expression.ty().has_move_ownership() {
@@ -9502,10 +9564,7 @@ fn materialize_owned_borrow_home(
     resources: &LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
-    let address = if matches!(
-        ty,
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-    ) {
+    let address = if native_closure_abi::memory_value_layout(ty).is_some() {
         // Inline aggregate results already have stable native storage.
         value.single()?
     } else {
@@ -10197,6 +10256,203 @@ fn create_payload_storage(
     builder
         .ins()
         .stack_addr(resources.module.target_config().pointer_type(), slot, 0)
+}
+
+/// What a foreign aggregate copy may assume of the memory it reads and
+/// writes: compiler storage is aligned and never faults; memory a pointer
+/// addresses may fault, and is aligned only for an aligned access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateAccess {
+    Storage,
+    Pointer { aligned: bool },
+}
+
+/// Copies at most this many units in straight-line code; a larger
+/// aggregate copies in a loop, so code size stays independent of the
+/// aggregate's size.
+const FOREIGN_AGGREGATE_UNROLLED_UNITS: u32 = 16;
+
+/// The memory unit a foreign aggregate copy or fill moves: its alignment up
+/// to 8 bytes. A C layout's size is a multiple of its alignment, so the
+/// units cover it exactly.
+fn foreign_aggregate_unit(
+    ty: mir::ForeignAggregateType,
+    access: AggregateAccess,
+) -> (ClifType, u32, MemFlagsData) {
+    let unit = ty.align.min(8);
+    let clif = match unit {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        _ => types::I64,
+    };
+    let flags = match access {
+        AggregateAccess::Storage => MemFlagsData::trusted(),
+        AggregateAccess::Pointer { aligned: true } => MemFlagsData::new().with_aligned(),
+        AggregateAccess::Pointer { aligned: false } => MemFlagsData::new(),
+    };
+    (clif, unit, flags)
+}
+
+/// Applies `step` to every unit of a foreign aggregate, at each unit's byte
+/// offset as a value of `pointer` type.
+fn for_each_foreign_aggregate_unit(
+    builder: &mut FunctionBuilder,
+    ty: mir::ForeignAggregateType,
+    unit: u32,
+    pointer: ClifType,
+    mut step: impl FnMut(&mut FunctionBuilder, Value),
+) {
+    let units = ty.size / unit;
+    if units <= FOREIGN_AGGREGATE_UNROLLED_UNITS {
+        for index in 0..units {
+            let offset = builder.ins().iconst(pointer, i64::from(index * unit));
+            step(builder, offset);
+        }
+        return;
+    }
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(body, pointer);
+    let start = builder.ins().iconst(pointer, 0);
+    builder.ins().jump(body, &[BlockArg::Value(start)]);
+    builder.switch_to_block(body);
+    let offset = builder.block_params(body)[0];
+    step(builder, offset);
+    let next = builder.ins().iadd_imm_u(offset, i64::from(unit));
+    let more = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThan, next, i64::from(ty.size));
+    builder
+        .ins()
+        .brif(more, body, &[BlockArg::Value(next)], done, &[]);
+    builder.switch_to_block(done);
+}
+
+/// Copies the bytes of a foreign struct or union of type `ty` from
+/// `source` to `destination`.
+fn copy_foreign_aggregate(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    ty: mir::ForeignAggregateType,
+    access: AggregateAccess,
+    pointer: ClifType,
+) {
+    let (clif, unit, flags) = foreign_aggregate_unit(ty, access);
+    for_each_foreign_aggregate_unit(builder, ty, unit, pointer, |builder, offset| {
+        let from = builder.ins().iadd(source, offset);
+        let to = builder.ins().iadd(destination, offset);
+        let value = builder.ins().load(clif, flags, from, 0);
+        builder.ins().store(flags, value, to, 0);
+    });
+}
+
+/// Sets every byte of the foreign struct or union at `address` to zero.
+fn zero_foreign_aggregate(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    ty: mir::ForeignAggregateType,
+    pointer: ClifType,
+) {
+    let (clif, unit, flags) = foreign_aggregate_unit(ty, AggregateAccess::Storage);
+    let zero = builder.ins().iconst(clif, 0);
+    for_each_foreign_aggregate_unit(builder, ty, unit, pointer, |builder, offset| {
+        let to = builder.ins().iadd(address, offset);
+        builder.ins().store(flags, zero, to, 0);
+    });
+}
+
+/// The address of a foreign struct or union value: fresh storage for a
+/// construction or call result, or the slot of the local a copy reads,
+/// which the consumer copies from (Decision 0148 section 6).
+fn lower_foreign_aggregate_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::ForeignAggregateExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::ForeignAggregateExpression::Construct { ty, fields, .. } => {
+            let address =
+                create_call_storage(builder, mir::Type::ForeignAggregate(*ty), resources)?;
+            zero_foreign_aggregate(builder, address, *ty, pointer);
+            for field in fields {
+                let value = lower_rvalue(builder, &field.value, resources)?;
+                let field_address = builder.ins().iadd_imm_u(address, field.offset as i64);
+                store_foreign_field(builder, field.value.ty(), field_address, value, resources)?;
+            }
+            Ok(address)
+        }
+        mir::ForeignAggregateExpression::Local { local, .. } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            Ok(builder.ins().stack_addr(pointer, slot, 0))
+        }
+        mir::ForeignAggregateExpression::Call {
+            function,
+            args,
+            span,
+            ..
+        } => lower_function_call_at(builder, *function, args, *span, resources)?
+            .ok_or_else(|| malformed_mir("a foreign aggregate call returned void"))?
+            .single(),
+    }
+}
+
+/// Stores a field value at its address inside a foreign struct or union.
+/// `bool` is the C `_Bool` byte, 0 or 1, as every Doria `bool` is stored.
+fn store_foreign_field(
+    builder: &mut FunctionBuilder,
+    ty: mir::Type,
+    address: Value,
+    value: LoweredValue,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    store_lowered_to_address(builder, resources.program, ty, address, value, pointer)
+}
+
+/// One field read or write of the foreign struct or union in `aggregate`'s
+/// slot, `offset` bytes from its start.
+fn lower_foreign_field(
+    builder: &mut FunctionBuilder,
+    aggregate: mir::LocalId,
+    offset: u64,
+    access: &mir::ForeignFieldAccess,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, aggregate)?;
+    let base = builder.ins().stack_addr(pointer, slot, 0);
+    let address = builder.ins().iadd_imm_u(base, offset as i64);
+    match access {
+        mir::ForeignFieldAccess::Read { target } => {
+            let ty = local_definition(resources.program, resources.function_id, *target)?.ty;
+            let value = load_lowered_from_address(builder, resources.program, ty, address, pointer);
+            let value = normalize_foreign_bool(builder, ty, value)?;
+            let target_slot = local_slot(resources.local_slots, *target)?;
+            store_lowered_to_stack(builder, resources.program, ty, target_slot, value, pointer)
+        }
+        mir::ForeignFieldAccess::Write { value } => {
+            let lowered = lower_rvalue(builder, value, resources)?;
+            store_foreign_field(builder, value.ty(), address, lowered, resources)
+        }
+    }
+}
+
+/// A `_Bool` read from C memory is true for any nonzero byte (an
+/// assumption on record for pointer reads, applied to fields alike).
+fn normalize_foreign_bool(
+    builder: &mut FunctionBuilder,
+    ty: mir::Type,
+    value: LoweredValue,
+) -> Result<LoweredValue, BackendError> {
+    if ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+        return Ok(value);
+    }
+    let byte = value.single()?;
+    let truth = builder.ins().icmp_imm_u(IntCC::NotEqual, byte, 0);
+    Ok(LoweredValue::Single(truth))
 }
 
 fn zero_inline_bytes(builder: &mut FunctionBuilder, address: Value, size: u32, pointer: ClifType) {
@@ -12159,7 +12415,8 @@ fn lower_drop_value_at_address(
         mir::Type::Scalar(_)
         | mir::Type::NullableScalar(_)
         | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_) => Ok(()),
+        | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_) => Ok(()),
         mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "closure environment pointer reached ordinary value cleanup",
         )),
@@ -12325,8 +12582,9 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         | mir::Type::NullableFunction(_)
         | mir::Type::ByteRegion(_)
         | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
-            "function, region, and closure-environment values do not support collection comparison",
+            "function, region, foreign aggregate and closure-environment values do not support collection comparison",
         )),
     }
 }
@@ -12398,6 +12656,7 @@ fn value_to_collection_word(
         | mir::Type::NullableFunction(_)
         | mir::Type::ByteRegion(_)
         | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
@@ -12472,6 +12731,7 @@ fn collection_word_to_value(
         | mir::Type::NullableFunction(_)
         | mir::Type::ByteRegion(_)
         | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
@@ -15565,7 +15825,8 @@ fn lower_drop_stored_value(
         mir::Type::Scalar(_)
         | mir::Type::NullableScalar(_)
         | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_) => Ok(()),
+        | mir::Type::NullableByteRegion(_)
+        | mir::Type::ForeignAggregate(_) => Ok(()),
         mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "closure environment pointer reached stored-value cleanup",
         )),
@@ -20425,6 +20686,65 @@ fn lower_pointer_operation(
         _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
     };
     let result = match operation {
+        // A foreign struct or union moves by its bytes, checked against
+        // its layout's alignment.
+        mir::PointerOperation::Read {
+            pointer: local,
+            ty: mir::Type::ForeignAggregate(aggregate),
+            aligned,
+        } => {
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(
+                    builder,
+                    address,
+                    u64::from(aggregate.align),
+                    span,
+                    resources,
+                )?;
+            }
+            let target = target.ok_or_else(|| malformed_mir("a pointer read has a target"))?;
+            let slot = local_slot(resources.local_slots, target)?;
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_foreign_aggregate(
+                builder,
+                destination,
+                address,
+                *aggregate,
+                AggregateAccess::Pointer { aligned: *aligned },
+                pointer,
+            );
+            return Ok(());
+        }
+        mir::PointerOperation::Write {
+            pointer: local,
+            value,
+            aligned,
+        } if matches!(value.ty(), mir::Type::ForeignAggregate(_)) => {
+            let mir::Type::ForeignAggregate(aggregate) = value.ty() else {
+                unreachable!("matched above");
+            };
+            let source = lower_rvalue(builder, value, resources)?.single()?;
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(
+                    builder,
+                    address,
+                    u64::from(aggregate.align),
+                    span,
+                    resources,
+                )?;
+            }
+            copy_foreign_aggregate(
+                builder,
+                address,
+                source,
+                aggregate,
+                AggregateAccess::Pointer { aligned: *aligned },
+                pointer,
+            );
+            None
+        }
         mir::PointerOperation::Read {
             pointer: local,
             ty,
@@ -20495,11 +20815,14 @@ fn lower_pointer_operation(
         mir::PointerOperation::Address { pointer: local } => Some(LoweredValue::Single(
             address_of(builder, *local, resources)?,
         )),
-        mir::PointerOperation::AddressOf { local } => {
+        mir::PointerOperation::AddressOf { local, offset } => {
             refresh_borrowed_local(builder, *local, resources)?;
-            Some(LoweredValue::Single(closure_source_address(
-                builder, *local, resources,
-            )?))
+            let place = closure_source_address(builder, *local, resources)?;
+            Some(LoweredValue::Single(if *offset == 0 {
+                place
+            } else {
+                builder.ins().iadd_imm_u(place, *offset as i64)
+            }))
         }
         mir::PointerOperation::FromAddress { address } => {
             let address = lower_integer_expression(builder, address, resources)?;
@@ -20536,7 +20859,7 @@ fn lower_foreign_call(
     let pointer = resources.module.target_config().pointer_type();
     let platform = crate::c_layout::CTarget::host();
     let (parameters, return_type) = foreign
-        .c_signature(platform)
+        .c_signature(&resources.program.foreign_aggregates, platform)
         .ok_or_else(|| malformed_mir("a foreign call passes only values with a C form"))?;
     let classification = c_abi::classify(
         platform,
@@ -20650,19 +20973,20 @@ fn lower_foreign_call(
     store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)
 }
 
-/// Panics with P1702 unless `address` is aligned for a pointee of `size`
-/// bytes, whose alignment is its size.
+/// Panics with P1702 unless `address` is a multiple of `align`, the
+/// pointee's alignment: a scalar's size, or a foreign aggregate's layout
+/// alignment.
 fn lower_pointer_alignment_check(
     builder: &mut FunctionBuilder,
     address: Value,
-    size: u64,
+    align: u64,
     span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
-    if size <= 1 {
+    if align <= 1 {
         return Ok(());
     }
-    let misaligned = builder.ins().band_imm_u(address, (size - 1) as i64);
+    let misaligned = builder.ins().band_imm_u(address, (align - 1) as i64);
     let misaligned = builder.ins().icmp_imm_u(IntCC::NotEqual, misaligned, 0);
     lower_panic_if_code(
         builder,

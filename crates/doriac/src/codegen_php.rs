@@ -1648,6 +1648,11 @@ fn php_mir_type(
         }
         mir::Type::Function(_) => "__DoriaFunctionValue".to_string(),
         mir::Type::NullableFunction(_) => "?__DoriaFunctionValue".to_string(),
+        // PHP output reports every foreign-typed expression before it
+        // reaches MIR types (Decision 0148 section 23).
+        mir::Type::ForeignAggregate(_) => {
+            unreachable!("PHP output reports foreign structs and unions first")
+        }
         mir::Type::Collection(id) | mir::Type::NullableCollection(id) => {
             let nullable = matches!(ty, mir::Type::NullableCollection(_));
             let definition = &program.collection_types[id.0];
@@ -3343,6 +3348,24 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
     if let Some(ty) = semantic_info.expression_type(expr.span()) {
         foreign_value(ty, expr.span())?;
         enum_core::validate_collection(ty, expr.span())?;
+    }
+    if let Expr::StaticMember {
+        class_name, span, ..
+    } = expr
+    {
+        if semantic_info
+            .semantic
+            .foreign_aggregates
+            .contains_key(class_name)
+        {
+            return Err(BackendError::from_diagnostics(vec![
+                crate::unsafe_code::companion_form(
+                    *span,
+                    "Foreign Layouts Cannot Be Built For PHP Output Yet",
+                    "the size and alignment of a foreign struct or union are part of Doria; PHP output does not build them yet",
+                ),
+            ]));
+        }
     }
     match expr {
         Expr::Assertion(assertion) => {

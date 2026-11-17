@@ -258,3 +258,48 @@ pub fn type_names() -> impl Iterator<Item = &'static str> {
 pub fn is_type_name(name: &str) -> bool {
     type_names().any(|candidate| candidate == name)
 }
+
+/// What checking establishes about one foreign struct or union (Decision
+/// 0148 section 6): its fields in declaration order and, when it has a body,
+/// its C layout on the native target. MIR lowering builds the aggregate's
+/// MIR definition, its construction and its field accesses from these facts
+/// alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAggregateFacts {
+    pub kind: ForeignAggregateKind,
+    /// Empty for an incomplete type declared without a body.
+    pub fields: Vec<ForeignFieldFacts>,
+    /// `None` for an incomplete type, and for one whose layout does not
+    /// exist (an aggregate that contains itself, reported by checking).
+    pub layout: Option<std::sync::Arc<crate::c_layout::CRecord>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignFieldFacts {
+    pub name: String,
+    pub ty: crate::types::ResolvedType,
+    /// The declared constant default. A fixed-length array field has none:
+    /// omitted, it is zero-filled.
+    pub default: Option<crate::const_eval::ConstValue>,
+}
+
+impl ForeignAggregateFacts {
+    /// The index of the field `name` and its facts.
+    pub fn field(&self, name: &str) -> Option<(usize, &ForeignFieldFacts)> {
+        self.fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == name)
+    }
+
+    /// `SIZE` or `ALIGNMENT` of the layout; `None` for any other member or
+    /// an aggregate without a layout.
+    pub fn layout_constant(&self, member: &str) -> Option<u64> {
+        let layout = self.layout.as_ref()?;
+        match member {
+            "SIZE" => Some(layout.size),
+            "ALIGNMENT" => Some(layout.align),
+            _ => None,
+        }
+    }
+}
