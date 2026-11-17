@@ -331,6 +331,9 @@ pub struct SemanticInfo {
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
+    /// The binding of each extern declaration, keyed by its declaration span
+    /// (Decision 0148 sections 14 to 18).
+    pub foreign_bindings: HashMap<Span, crate::foreign::ForeignBinding>,
     pub retained_callables: HashMap<Span, crate::ownership::RetainedCallableInfo>,
     /// Concrete ownership facts for generic bodies whose erasures depend on Copy/Move.
     pub(crate) specialized_ownership: specialized_ownership::FactsByInstance,
@@ -1583,6 +1586,7 @@ fn finish_checked_analysis(
             whens: checker.whens,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
+            foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
             retained_callables,
             specialized_ownership,
             specialized_return_borrows: checker.specialized_return_borrow_seed,

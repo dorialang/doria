@@ -80,19 +80,58 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
     for function in &program.functions {
         for block in &function.blocks {
             for statement in &block.statements {
-                if let crate::mir::Statement::Pointer { span, .. } = statement {
-                    if seen.insert(*span) {
-                        diagnostics.push(companion_form(
-                            *span,
-                            "Pointer Operations Cannot Run In The Interpreter Yet",
-                            "pointer operations are part of Doria; the interpreter does not run them yet",
-                        ));
-                    }
+                let (span, title, message) = match statement {
+                    crate::mir::Statement::Pointer { span, .. } => (
+                        span,
+                        "Pointer Operations Cannot Run In The Interpreter Yet",
+                        "pointer operations are part of Doria; the interpreter does not run them yet",
+                    ),
+                    crate::mir::Statement::ForeignCall { span, .. } => (
+                        span,
+                        "Foreign Calls Cannot Run In The Interpreter Yet",
+                        "foreign calls are part of Doria; the interpreter does not run them yet",
+                    ),
+                    _ => continue,
+                };
+                if seen.insert(*span) {
+                    diagnostics.push(companion_form(*span, title, message));
                 }
             }
         }
     }
     diagnostics
+}
+
+/// One E0784 diagnostic per extern declaration whose binding no execution
+/// target builds yet, in source order: one in a block with `#[Library]`, a
+/// variadic one, and one that captures a system code.
+pub fn unbuildable_bindings(
+    bindings: &std::collections::HashMap<Span, crate::foreign::ForeignBinding>,
+) -> Vec<Diagnostic> {
+    let mut finder = Finder::new(Gate::Execution);
+    for (span, binding) in bindings {
+        let symbol = &binding.symbol;
+        if let Some(library) = &binding.library {
+            finder.report(
+                *span,
+                "Native Libraries Cannot Be Linked Yet",
+                format!("`{symbol}` binds the native library `{library}`, which is part of Doria; this compiler does not link native libraries yet"),
+            );
+        } else if binding.fixed_parameters.is_some() {
+            finder.report(
+                *span,
+                "Variadic Foreign Functions Cannot Be Built Yet",
+                format!("the variadic binding of `{symbol}` is part of Doria; this compiler does not build variadic foreign calls yet"),
+            );
+        } else if binding.system_code.is_some() {
+            finder.report(
+                *span,
+                "System Code Capture Cannot Be Built Yet",
+                format!("capturing the system code `{symbol}` leaves is part of Doria; this compiler does not build it yet"),
+            );
+        }
+    }
+    finder.finish()
 }
 
 /// One E0784 diagnostic per checked form that no execution target runs yet.
@@ -188,15 +227,10 @@ impl Finder {
                 }
                 self.expression(&constant.initializer);
             }
-            Item::ExternBlock(block) => {
-                if self.gate == Gate::Execution {
-                    self.report(
-                        block.span,
-                        "Extern Blocks Cannot Be Built Yet",
-                        "`extern \"C\" { ... }` is part of Doria; this compiler does not build foreign calls yet",
-                    );
-                }
-            }
+            // Each declaration is an `Item::Function`; the bindings that
+            // cannot be built yet are reported from the checked facts
+            // ([`unbuildable_bindings`]).
+            Item::ExternBlock(_) => {}
             Item::ForeignAggregate(aggregate) => {
                 if self.gate == Gate::Execution {
                     self.report(
@@ -258,8 +292,7 @@ impl Finder {
                         function.name.rsplit('\\').next().unwrap_or(&function.name)
                     ),
                 ),
-                FunctionLinkage::Foreign { .. } => return,
-                FunctionLinkage::Doria => {}
+                FunctionLinkage::Foreign { .. } | FunctionLinkage::Doria => {}
             }
         }
         let mut signature = function.clone();

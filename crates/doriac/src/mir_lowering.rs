@@ -25,13 +25,13 @@ use crate::types::{
 use crate::{hir, mir};
 
 mod byte_region;
-mod foreign;
 #[cfg(test)]
 pub(crate) mod conditional_results;
 mod core_collection;
 mod core_enum;
 mod core_ordered;
 mod core_value;
+mod foreign;
 mod inline_value;
 mod interface;
 mod iteration;
@@ -3966,6 +3966,14 @@ fn lower_function(
                 }
             }
         }
+    } else if function.foreign {
+        foreign::lower_extern_body(
+            function,
+            &params,
+            &signature.parameter_types,
+            signature.return_type,
+            &mut context,
+        )?;
     } else if function.name == "__construct" {
         lower_constructor_function_body(function, signature.return_type, &mut context)?;
     } else {
@@ -4102,8 +4110,10 @@ fn lower_function(
         source_span: function.span,
         // A function of a compiler-known module (Term, Time, Text and the
         // others) runs in its caller's diagnostic frame, so a panic it raises
-        // is reported at the user's call, in every backend.
-        diagnostic_frame: if function.span.source.is_compiler_owned() {
+        // is reported at the user's call, in every backend. An extern
+        // declaration's function is its foreign call alone, which the Call
+        // Path shows at the Doria call.
+        diagnostic_frame: if function.span.source.is_compiler_owned() || function.foreign {
             mir::DiagnosticFrame::Caller
         } else {
             mir::DiagnosticFrame::Authored
@@ -28646,7 +28656,9 @@ fn lower_integer_expression(
             args,
             span,
             ..
-        } if method == "from" && crate::foreign::CBoundaryType::from_source_name(class_name).is_some() => {
+        } if method == "from"
+            && crate::foreign::CBoundaryType::from_source_name(class_name).is_some() =>
+        {
             let boundary = crate::foreign::CBoundaryType::from_source_name(class_name)
                 .expect("guarded boundary companion name");
             let value = lower_boundary_conversion_source(boundary, ty, args, *span, context)?;

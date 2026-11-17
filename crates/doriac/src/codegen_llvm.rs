@@ -2009,7 +2009,11 @@ fn define_process_main<'ctx>(
         .try_as_basic_value()
         .basic()
         .ok_or_else(|| backend_failure("doria-rt process entry returned no status"))?;
-    if cfg!(windows) {
+    // A Windows program without foreign code enters at `main` without a C
+    // runtime and leaves through ExitProcess. One with foreign code enters
+    // through the C runtime's startup, which `main`'s return leaves
+    // through, as on Unix (Decision 0148 section 20).
+    if cfg!(windows) && !program.links_foreign_code() {
         let exit = module.get_function(PROCESS_EXIT).unwrap_or_else(|| {
             module.add_function(
                 PROCESS_EXIT,
@@ -5121,6 +5125,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 operation,
                 span,
             } => self.lower_pointer_operation(*target, operation, *span)?,
+            mir::Statement::ForeignCall {
+                function,
+                args,
+                target,
+                ..
+            } => self.lower_foreign_call(function, args, *target)?,
             mir::Statement::DropFunction { local, .. } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let carrier = build(self.builder.build_load(
@@ -22148,10 +22158,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let compare = |this: &Self, predicate, left, right, name| {
                     build(this.builder.build_int_compare(predicate, left, right, name))
                 };
-                let negative =
-                    compare(self, IntPredicate::SLT, bytes, word.const_zero(), "offset.negative")?;
-                let wrapped_down =
-                    compare(self, IntPredicate::UGT, moved, address, "offset.wrapped.down")?;
+                let negative = compare(
+                    self,
+                    IntPredicate::SLT,
+                    bytes,
+                    word.const_zero(),
+                    "offset.negative",
+                )?;
+                let wrapped_down = compare(
+                    self,
+                    IntPredicate::UGT,
+                    moved,
+                    address,
+                    "offset.wrapped.down",
+                )?;
                 let wrapped_up =
                     compare(self, IntPredicate::ULT, moved, address, "offset.wrapped.up")?;
                 let wrapped = build(self.builder.build_select(
@@ -22161,13 +22181,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "offset.wrapped",
                 ))?
                 .into_int_value();
-                let null = compare(self, IntPredicate::EQ, moved, word.const_zero(), "offset.null")?;
-                let leaves = build(self.builder.build_or(scaled_overflow, wrapped, "offset.leaves"))?;
+                let null = compare(
+                    self,
+                    IntPredicate::EQ,
+                    moved,
+                    word.const_zero(),
+                    "offset.null",
+                )?;
+                let leaves = build(self.builder.build_or(
+                    scaled_overflow,
+                    wrapped,
+                    "offset.leaves",
+                ))?;
                 let leaves = build(self.builder.build_or(leaves, null, "offset.leaves"))?;
                 self.lower_panic_if_code(leaves, crate::foreign::POINTER_ADDRESS_PANIC_CODE, span)?;
                 Some(moved.into())
             }
-            mir::PointerOperation::Address { pointer } => Some(self.pointer_local(*pointer)?.into()),
+            mir::PointerOperation::Address { pointer } => {
+                Some(self.pointer_local(*pointer)?.into())
+            }
             mir::PointerOperation::AddressOf { local } => {
                 let place = self.closure_source_address(*local)?;
                 Some(
@@ -22202,10 +22234,219 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    /// Calls the C function an extern declaration binds (Decision 0148
+    /// sections 14 and 15) under the target's C convention, as the shared
+    /// classification (`native_abi::c_abi`) places each value. Each symbol
+    /// is declared once, with the type of its first call; a binding of the
+    /// same symbol with another signature (`#[LinkName]`) calls the
+    /// declared address through its own type.
+    fn lower_foreign_call(
+        &mut self,
+        foreign: &mir::ForeignFunction,
+        args: &[mir::LocalId],
+        target: Option<mir::LocalId>,
+    ) -> Result<(), BackendError> {
+        use crate::c_layout::CScalar;
+        use crate::native_abi::c_abi::{self, ArgumentPassing, Extension, ReturnPassing};
+        let platform = crate::c_layout::CTarget::host();
+        let (parameters, return_type) = foreign
+            .c_signature(platform)
+            .ok_or_else(|| malformed_mir("a foreign call passes only values with a C form"))?;
+        let classification = c_abi::classify(
+            platform,
+            &parameters,
+            return_type.as_ref(),
+            foreign.fixed_parameters,
+        );
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let word = self.context.i64_type();
+        let c_type = |scalar: CScalar| -> BasicTypeEnum<'ctx> {
+            match scalar {
+                CScalar::Integer { bytes: 1, .. } | CScalar::Bool => self.context.i8_type().into(),
+                CScalar::Integer { bytes: 2, .. } => self.context.i16_type().into(),
+                CScalar::Integer { bytes: 4, .. } => self.context.i32_type().into(),
+                CScalar::Integer { .. } => word.into(),
+                CScalar::Float { bytes: 4 } => self.context.f32_type().into(),
+                CScalar::Float { .. } => self.context.f64_type().into(),
+                CScalar::Pointer => pointer.into(),
+            }
+        };
+        let mut parameter_scalars = Vec::with_capacity(classification.parameters.len());
+        for passing in &classification.parameters {
+            let ArgumentPassing::Scalar(scalar) = passing else {
+                return Err(malformed_mir(
+                    "a foreign call passes scalars and pointers until foreign aggregates are built",
+                ));
+            };
+            parameter_scalars.push(*scalar);
+        }
+        let result = match &classification.return_value {
+            ReturnPassing::Void => None,
+            ReturnPassing::Scalar(scalar) => Some(*scalar),
+            ReturnPassing::Registers(_) | ReturnPassing::Indirect => {
+                return Err(malformed_mir(
+                    "a foreign call returns a scalar or pointer until foreign aggregates are built",
+                ))
+            }
+        };
+        let parameter_types = parameter_scalars
+            .iter()
+            .map(|scalar| c_type(*scalar).into())
+            .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
+        // The callee's bits above a narrow result are not relied on.
+        let function_type = match result {
+            Some(scalar) => c_type(scalar).fn_type(&parameter_types, false),
+            None => self.context.void_type().fn_type(&parameter_types, false),
+        };
+        let extension = |index: usize| {
+            c_abi::extension(parameter_scalars[index]).map(|extension| {
+                let name = match extension {
+                    Extension::Sign => "signext",
+                    Extension::Zero => "zeroext",
+                };
+                self.context.create_enum_attribute(
+                    inkwell::attributes::Attribute::get_named_enum_kind_id(name),
+                    0,
+                )
+            })
+        };
+        let declared = match self.module.get_function(&foreign.symbol) {
+            Some(function) => function,
+            None => {
+                let function = self.module.add_function(
+                    &foreign.symbol,
+                    function_type,
+                    Some(Linkage::External),
+                );
+                for index in 0..parameter_scalars.len() {
+                    if let Some(attribute) = extension(index) {
+                        function.add_attribute(AttributeLoc::Param(index as u32), attribute);
+                    }
+                }
+                function
+            }
+        };
+        let mut values = Vec::with_capacity(args.len());
+        for (local, scalar) in args.iter().zip(&parameter_scalars) {
+            let ty = local_in(self.function, *local)?.ty;
+            let slot = local_slot(&self.local_slots, *local)?;
+            let loaded = build(self.builder.build_load(
+                llvm_type(self.context, self.target_data, self.program, ty),
+                slot,
+                "foreign.argument",
+            ))?;
+            let value: BasicValueEnum<'ctx> = match (ty, scalar) {
+                // A null `?Ptr<T>` is address zero.
+                (mir::Type::NullableScalar(_), CScalar::Pointer) => {
+                    let (present, payload) = self.nullable_parts(loaded.into_struct_value())?;
+                    let present = build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        present,
+                        present.get_type().const_zero(),
+                        "foreign.argument.present",
+                    ))?;
+                    let address = build(self.builder.build_select(
+                        present,
+                        payload.into_int_value(),
+                        word.const_zero(),
+                        "foreign.argument.address",
+                    ))?
+                    .into_int_value();
+                    build(self.builder.build_int_to_ptr(
+                        address,
+                        pointer,
+                        "foreign.argument.pointer",
+                    ))?
+                    .into()
+                }
+                (_, CScalar::Pointer) => build(self.builder.build_int_to_ptr(
+                    loaded.into_int_value(),
+                    pointer,
+                    "foreign.argument.pointer",
+                ))?
+                .into(),
+                _ => loaded,
+            };
+            values.push(value.into());
+        }
+        let call = if declared.get_type() == function_type {
+            build(self.builder.build_call(declared, &values, "foreign.call"))?
+        } else {
+            build(self.builder.build_indirect_call(
+                function_type,
+                declared.as_global_value().as_pointer_value(),
+                &values,
+                "foreign.call",
+            ))?
+        };
+        for index in 0..parameter_scalars.len() {
+            if let Some(attribute) = extension(index) {
+                call.add_attribute(AttributeLoc::Param(index as u32), attribute);
+            }
+        }
+        let (Some(target), Some(scalar)) = (target, result) else {
+            return Ok(());
+        };
+        let returned = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| malformed_mir("a foreign call with a result produced none"))?;
+        let ty = local_in(self.function, target)?.ty;
+        let value: BasicValueEnum<'ctx> = match scalar {
+            // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+            CScalar::Bool => {
+                let byte = returned.into_int_value();
+                let set = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    byte,
+                    byte.get_type().const_zero(),
+                    "foreign.result.bool",
+                ))?;
+                build(self.builder.build_int_z_extend(
+                    set,
+                    self.context.i8_type(),
+                    "foreign.result.bool.byte",
+                ))?
+                .into()
+            }
+            CScalar::Pointer => {
+                let address = build(self.builder.build_ptr_to_int(
+                    returned.into_pointer_value(),
+                    word,
+                    "foreign.result.address",
+                ))?;
+                if matches!(ty, mir::Type::NullableScalar(_)) {
+                    let present = build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        address,
+                        word.const_zero(),
+                        "foreign.result.present",
+                    ))?;
+                    let present = build(self.builder.build_int_z_extend(
+                        present,
+                        self.context.ptr_sized_int_type(self.target_data, None),
+                        "foreign.result.present.word",
+                    ))?;
+                    self.nullable_value(present, address.into())?.into()
+                } else {
+                    address.into()
+                }
+            }
+            _ => returned,
+        };
+        let slot = local_slot(&self.local_slots, target)?;
+        build(self.builder.build_store(slot, value))?;
+        Ok(())
+    }
+
     /// The address a pointer local holds.
     fn pointer_local(&mut self, local: mir::LocalId) -> Result<IntValue<'ctx>, BackendError> {
         let slot = local_slot(&self.local_slots, local)?;
-        Ok(build(self.builder.build_load(self.context.i64_type(), slot, "pointer"))?.into_int_value())
+        Ok(build(
+            self.builder
+                .build_load(self.context.i64_type(), slot, "pointer"),
+        )?
+        .into_int_value())
     }
 
     /// The memory at `address`, after P1702's alignment test for an aligned
@@ -22230,7 +22471,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 word.const_zero(),
                 "pointer.misaligned",
             ))?;
-            self.lower_panic_if_code(misaligned, crate::foreign::POINTER_ALIGNMENT_PANIC_CODE, span)?;
+            self.lower_panic_if_code(
+                misaligned,
+                crate::foreign::POINTER_ALIGNMENT_PANIC_CODE,
+                span,
+            )?;
         }
         build(self.builder.build_int_to_ptr(
             address,
@@ -22508,7 +22753,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let present = match self.conversion_out_of_range(source, target, value)? {
             Some(out_of_range) => {
                 let fits = build(self.builder.build_not(out_of_range, "convert.fits"))?;
-                build(self.builder.build_int_z_extend(fits, word, "convert.present"))?
+                build(
+                    self.builder
+                        .build_int_z_extend(fits, word, "convert.present"),
+                )?
             }
             None => word.const_int(1, false),
         };

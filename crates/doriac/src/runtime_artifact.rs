@@ -29,6 +29,7 @@ struct EmbeddedRuntimeSet {
 }
 
 static EMBEDDED_RUNTIMES: OnceLock<EmbeddedRuntimeSet> = OnceLock::new();
+static EMBEDDED_CRT_RUNTIMES: OnceLock<EmbeddedRuntimeSet> = OnceLock::new();
 static EMBEDDED_SHARED_RUNTIME: OnceLock<EmbeddedRuntimeProfile> = OnceLock::new();
 static NEXT_EMBEDDED_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -54,6 +55,63 @@ pub fn register_embedded_runtimes(
             metadata: release_metadata,
         },
     });
+}
+
+/// Register the Windows CRT-hosted runtime archives compiled into the
+/// standalone `doriac` binary, which programs with foreign code link
+/// (Decision 0148 section 20). Only a Windows compiler carries them.
+pub fn register_embedded_crt_runtimes(
+    debug_archive: &'static [u8],
+    debug_metadata: &'static str,
+    release_archive: &'static [u8],
+    release_metadata: &'static str,
+) {
+    let _ = EMBEDDED_CRT_RUNTIMES.set(EmbeddedRuntimeSet {
+        debug: EmbeddedRuntimeProfile {
+            archive: debug_archive,
+            metadata: debug_metadata,
+        },
+        release: EmbeddedRuntimeProfile {
+            archive: release_archive,
+            metadata: release_metadata,
+        },
+    });
+}
+
+/// Which C runtime a program's runtime archive is built for (Decision 0148
+/// section 20). Windows has two archives: a program without foreign code
+/// links the freestanding one, which supplies the few C support symbols
+/// generated code needs and enters at `main`; a program with foreign code
+/// links the CRT-hosted one and the C runtime. Every Unix archive is hosted
+/// by the platform C library, so both select the one archive there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeHosting {
+    Freestanding,
+    CrtHosted,
+}
+
+impl RuntimeHosting {
+    pub fn for_program(program: &crate::mir::Program) -> Self {
+        if program.links_foreign_code() {
+            Self::CrtHosted
+        } else {
+            Self::Freestanding
+        }
+    }
+
+    /// Whether this hosting selects the CRT-hosted Windows archive.
+    const fn selects_crt_archive(self) -> bool {
+        cfg!(windows) && matches!(self, Self::CrtHosted)
+    }
+
+    /// The feature set the selected archive's identity records.
+    fn feature_set(self) -> &'static [&'static str] {
+        if self.selects_crt_archive() {
+            &[]
+        } else {
+            &["standalone-windows-support"]
+        }
+    }
 }
 
 pub fn register_embedded_shared_runtime(library: &'static [u8], metadata: &'static str) {
@@ -387,7 +445,10 @@ impl RuntimeArtifact {
     }
 }
 
-pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
+pub fn locate(
+    profile: NativeProfile,
+    hosting: RuntimeHosting,
+) -> Result<RuntimeArtifact, BackendError> {
     let current_executable = env::current_exe().map_err(|error| {
         BackendError::new(format!(
             "doria-rt static library was not found: failed to locate doriac: {error}\nhelp: build it with `cargo build -p doria-rt` or set DORIA_RT_PATH"
@@ -401,7 +462,7 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
     let explicit_override = env::var_os("DORIA_RT_PATH");
     let expectation = RuntimeExpectation::current(profile);
     if let Some((path, document)) =
-        embedded_runtime_candidate(profile, explicit_override.as_deref())?
+        embedded_runtime_candidate(profile, hosting, explicit_override.as_deref())?
     {
         // Materialization proved these bytes are the embedded archive and
         // that they match this document; only compatibility remains to check.
@@ -416,6 +477,7 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
             path,
             RuntimeOrigin::CompilerBundled,
             &expectation,
+            hosting,
             Some(metadata),
             false,
         );
@@ -423,7 +485,7 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
     resolve(
         explicit_override.as_deref(),
         &current_executable,
-        compiler_built_runtime(profile),
+        compiler_built_runtime(profile, hosting),
         workspace,
         target_override.as_deref(),
         if cfg!(all(windows, target_env = "msvc")) {
@@ -433,23 +495,31 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
         },
         profile_directory(profile),
         &expectation,
+        hosting,
     )
 }
 
 fn embedded_runtime_candidate(
     profile: NativeProfile,
+    hosting: RuntimeHosting,
     explicit_override: Option<&OsStr>,
 ) -> Result<Option<(PathBuf, &'static str)>, BackendError> {
     if explicit_override.is_some() {
         return Ok(None);
     }
-    materialize_embedded_runtime(profile)
+    materialize_embedded_runtime(profile, hosting)
 }
 
 fn materialize_embedded_runtime(
     profile: NativeProfile,
+    hosting: RuntimeHosting,
 ) -> Result<Option<(PathBuf, &'static str)>, BackendError> {
-    let Some(runtimes) = EMBEDDED_RUNTIMES.get() else {
+    let registry = if hosting.selects_crt_archive() {
+        &EMBEDDED_CRT_RUNTIMES
+    } else {
+        &EMBEDDED_RUNTIMES
+    };
+    let Some(runtimes) = registry.get() else {
         return Ok(None);
     };
     let embedded = match profile {
@@ -606,10 +676,19 @@ fn unique_materialization_directory(cache_root: &Path, digest: &str) -> PathBuf 
     ))
 }
 
-fn compiler_built_runtime(profile: NativeProfile) -> Option<&'static Path> {
-    match profile {
-        NativeProfile::Fast => option_env!("DORIA_RT_BUILT_DEBUG_PATH").map(Path::new),
-        NativeProfile::Release => option_env!("DORIA_RT_BUILT_RELEASE_PATH").map(Path::new),
+fn compiler_built_runtime(
+    profile: NativeProfile,
+    hosting: RuntimeHosting,
+) -> Option<&'static Path> {
+    match (profile, hosting.selects_crt_archive()) {
+        (NativeProfile::Fast, false) => option_env!("DORIA_RT_BUILT_DEBUG_PATH").map(Path::new),
+        (NativeProfile::Release, false) => {
+            option_env!("DORIA_RT_BUILT_RELEASE_PATH").map(Path::new)
+        }
+        (NativeProfile::Fast, true) => option_env!("DORIA_RT_BUILT_DEBUG_CRT_PATH").map(Path::new),
+        (NativeProfile::Release, true) => {
+            option_env!("DORIA_RT_BUILT_RELEASE_CRT_PATH").map(Path::new)
+        }
     }
 }
 
@@ -693,6 +772,7 @@ fn resolve(
     archive_format: ArchiveFormat,
     profile: &str,
     expectation: &RuntimeExpectation,
+    hosting: RuntimeHosting,
 ) -> Result<RuntimeArtifact, BackendError> {
     let filename = runtime_filename(archive_format);
 
@@ -709,7 +789,7 @@ fn resolve(
         let origin = RuntimeOrigin::ExplicitOverride;
         let metadata = load_metadata(&candidate)
             .map_err(|detail| invalid_metadata_error(&candidate, origin, &detail))?;
-        return accept(candidate, origin, expectation, metadata);
+        return accept(candidate, origin, expectation, hosting, metadata);
     }
 
     for (candidate, origin) in candidates(
@@ -729,7 +809,12 @@ fn resolve(
         if metadata.is_none() && !origin.is_deliberate() {
             continue;
         }
-        return accept(candidate, origin, expectation, metadata);
+        // Only this compiler's build makes the CRT-hosted archive; an
+        // installed or workspace archive is the freestanding one.
+        if hosting.selects_crt_archive() && origin != RuntimeOrigin::CompilerBundled {
+            continue;
+        }
+        return accept(candidate, origin, expectation, hosting, metadata);
     }
     Err(not_found_error(None))
 }
@@ -744,9 +829,10 @@ fn accept(
     path: PathBuf,
     origin: RuntimeOrigin,
     expectation: &RuntimeExpectation,
+    hosting: RuntimeHosting,
     metadata: Option<RuntimeMetadata>,
 ) -> Result<RuntimeArtifact, BackendError> {
-    accept_checked(path, origin, expectation, metadata, true)
+    accept_checked(path, origin, expectation, hosting, metadata, true)
 }
 
 /// `verify_integrity` is false only for an archive whose bytes were already
@@ -755,6 +841,7 @@ fn accept_checked(
     path: PathBuf,
     origin: RuntimeOrigin,
     expectation: &RuntimeExpectation,
+    hosting: RuntimeHosting,
     metadata: Option<RuntimeMetadata>,
     verify_integrity: bool,
 ) -> Result<RuntimeArtifact, BackendError> {
@@ -765,6 +852,13 @@ fn accept_checked(
                 field: "artifact kind",
                 expected: "static".into(),
                 found: "shared".into(),
+            });
+        }
+        if metadata.feature_set != hosting.feature_set() {
+            mismatches.push(Mismatch {
+                field: "feature set",
+                expected: hosting.feature_set().join(", "),
+                found: metadata.feature_set.join(", "),
             });
         }
         if verify_integrity {
@@ -1033,6 +1127,7 @@ mod tests {
             ArchiveFormat::Gnu,
             profile,
             &expectation(),
+            RuntimeHosting::Freestanding,
         )
     }
 
@@ -1291,6 +1386,7 @@ mod tests {
                 profile: String::new(),
                 revision: String::new(),
             },
+            RuntimeHosting::Freestanding,
         )
         .expect("a compiler without expectations should not reject a runtime");
         assert_eq!(resolved.path, compiler_built);
@@ -1398,8 +1494,12 @@ mod tests {
     #[test]
     fn explicit_override_skips_embedded_runtime_materialization() {
         assert_eq!(
-            embedded_runtime_candidate(NativeProfile::Fast, Some(OsStr::new("runtime")))
-                .expect("explicit runtime selection must not materialize the embedded archive"),
+            embedded_runtime_candidate(
+                NativeProfile::Fast,
+                RuntimeHosting::Freestanding,
+                Some(OsStr::new("runtime"))
+            )
+            .expect("explicit runtime selection must not materialize the embedded archive"),
             None
         );
     }
@@ -1515,9 +1615,9 @@ mod tests {
             return;
         }
 
-        let debug = compiler_built_runtime(NativeProfile::Fast)
+        let debug = compiler_built_runtime(NativeProfile::Fast, RuntimeHosting::Freestanding)
             .expect("a bundled build should carry a debug runtime");
-        let release = compiler_built_runtime(NativeProfile::Release)
+        let release = compiler_built_runtime(NativeProfile::Release, RuntimeHosting::Freestanding)
             .expect("a bundled build should carry a release runtime");
         assert_ne!(debug, release);
         assert_eq!(

@@ -28,7 +28,11 @@ pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
-    let unexecutable = crate::unsafe_code::unexecutable_forms(program);
+    let mut unexecutable = crate::unsafe_code::unexecutable_forms(program);
+    unexecutable.extend(crate::unsafe_code::unbuildable_bindings(
+        &semantic_info.foreign_bindings,
+    ));
+    unexecutable.sort_by_key(|diagnostic| (diagnostic.span.source.0, diagnostic.span.start));
     if !unexecutable.is_empty() {
         return Err(unexecutable);
     }
@@ -73,7 +77,11 @@ fn lower_checked_program_with_semantics(
     let mut items = Vec::with_capacity(program.items.len());
     let mut diagnostics = Vec::new();
     for item in &program.items {
-        if matches!(item, ast::Item::Interface(_) | ast::Item::Trait(_)) {
+        // An extern block's declarations are items of their own.
+        if matches!(
+            item,
+            ast::Item::Interface(_) | ast::Item::Trait(_) | ast::Item::ExternBlock(_)
+        ) {
             continue;
         }
         let composed;
@@ -699,26 +707,25 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
     match item {
         ast::Item::Class(class_decl) => lower_class(class_decl).map(hir::Item::Class),
         ast::Item::Enum(enum_decl) => Ok(hir::Item::Enum(lower_enum(enum_decl))),
-        ast::Item::Interface(_) | ast::Item::Trait(_) => {
-            unreachable!("compile-time declarations do not enter HIR")
+        ast::Item::Interface(_) | ast::Item::Trait(_) | ast::Item::ExternBlock(_) => {
+            unreachable!("compile-time declarations and extern blocks do not enter HIR")
         }
         ast::Item::Function(function) => lower_function(function, None).map(hir::Item::Function),
         ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
-        ast::Item::ExternBlock(ast::ExternBlock { span, .. })
-        | ast::Item::ForeignAggregate(ast::ForeignAggregateDecl { span, .. }) => {
+        ast::Item::ForeignAggregate(ast::ForeignAggregateDecl { span, .. }) => {
             Err(unsafe_code_before_lowering(*span))
         }
         ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement, None))),
     }
 }
 
-/// Foreign declarations have no executable form yet; the execution gate at
+/// Foreign aggregates have no executable form yet; the execution gate at
 /// the start of lowering (`crate::unsafe_code`) stops every program that
-/// contains them, so reaching item lowering with one is a compiler defect.
+/// contains one, so reaching item lowering with one is a compiler defect.
 fn unsafe_code_before_lowering(span: crate::source::Span) -> Diagnostic {
     Diagnostic::internal_compiler_error(
-        "foreign declaration reached lowering",
-        "an extern block, foreign aggregate or foreign function reached HIR lowering, which has no form for it",
+        "foreign aggregate reached lowering",
+        "a foreign struct or union reached HIR lowering, which has no form for it",
         span,
     )
 }
@@ -897,6 +904,7 @@ fn lower_function(
     function: &ast::FunctionDecl,
     class_name: Option<ClassContext<'_>>,
 ) -> Result<hir::FunctionDecl, Diagnostic> {
+    let foreign = matches!(function.body, ast::FunctionBody::Foreign { .. });
     let (body, intrinsic) = match &function.body {
         ast::FunctionBody::Block(body) => (lower_block(body, class_name), None),
         ast::FunctionBody::Intrinsic {
@@ -909,9 +917,15 @@ fn lower_function(
             },
             Some(*implementation),
         ),
-        ast::FunctionBody::Foreign { semicolon_span } => {
-            return Err(unsafe_code_before_lowering(*semicolon_span))
-        }
+        // The call to the C function is the body, which MIR lowering
+        // builds from the declaration's checked binding.
+        ast::FunctionBody::Foreign { semicolon_span } => (
+            hir::Block {
+                statements: Vec::new(),
+                span: *semicolon_span,
+            },
+            None,
+        ),
         _ => {
             return Err(Diagnostic::new(
                 "E0749",
@@ -968,6 +982,7 @@ fn lower_function(
         test_assertion_checked_effects: Vec::new(),
         body,
         intrinsic,
+        foreign,
         modifier_prefix_span: function.modifier_prefix_span,
         span: function.span,
     })

@@ -159,6 +159,20 @@ fn main() -> ExitCode {
         )),
     );
 
+    #[cfg(all(feature = "bundled-runtime", windows))]
+    doriac::runtime_artifact::register_embedded_crt_runtimes(
+        include_bytes!(env!("DORIA_RT_BUILT_DEBUG_CRT_PATH")),
+        include_str!(concat!(
+            env!("DORIA_RT_BUILT_DEBUG_CRT_PATH"),
+            ".doria-runtime.json"
+        )),
+        include_bytes!(env!("DORIA_RT_BUILT_RELEASE_CRT_PATH")),
+        include_str!(concat!(
+            env!("DORIA_RT_BUILT_RELEASE_CRT_PATH"),
+            ".doria-runtime.json"
+        )),
+    );
+
     #[cfg(feature = "bundled-runtime")]
     doriac::runtime_artifact::register_embedded_shared_runtime(
         include_bytes!(env!("DORIA_RT_BUILT_SHARED_PATH")),

@@ -62,7 +62,8 @@ fn assert_panics_everywhere(source: &str, stdout: &str, code: &str) {
     }
 }
 
-const BOUNDARY: &str = "use Doria\\Std\\Ffi\\{CChar, CLong, CPointerDifference, CSize, CUnsignedLong, CWideChar};\n";
+const BOUNDARY: &str =
+    "use Doria\\Std\\Ffi\\{CChar, CLong, CPointerDifference, CSize, CUnsignedLong, CWideChar};\n";
 
 #[test]
 fn boundary_values_convert_compare_and_convert_back() {
@@ -156,15 +157,14 @@ function main(): void
 #[test]
 fn php_output_reports_that_it_does_not_build_boundary_values_yet() {
     let source = format!("{BOUNDARY}function main(): void {{ let $size = CSize::from(1); }}");
-    let diagnostics = doriac::compile_source(
-        "stage40.doria",
-        source,
-        doriac::backend::BackendTarget::Php,
-    )
-    .expect_err("PHP output does not build boundary values yet");
+    let diagnostics =
+        doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+            .expect_err("PHP output does not build boundary values yet");
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "C Boundary Values Cannot Be Built For PHP Output Yet"),
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "C Boundary Values Cannot Be Built For PHP Output Yet"),
         "{diagnostics:#?}"
     );
 }
@@ -202,12 +202,16 @@ fn assert_interpreter_reports_companion(mir: &doriac::mir::Program) {
     let companion = doriac::unsafe_code::companion_operations(mir);
     assert!(
         companion.iter().all(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
+            && [
+                "Pointer Operations Cannot Run In The Interpreter Yet",
+                "Foreign Calls Cannot Run In The Interpreter Yet",
+            ]
+            .contains(&diagnostic.title.as_str())),
         "{companion:#?}"
     );
     assert!(!companion.is_empty());
-    let error = interpret(mir).expect_err("the interpreter runs pointers through the companion");
-    assert!(error.to_string().contains("pointer operations"), "{error}");
+    let error = interpret(mir).expect_err("the interpreter runs unsafe code through the companion");
+    assert!(error.to_string().contains(&companion[0].message), "{error}");
 }
 
 const POINTER: &str = "use Doria\\Std\\Ffi\\{MutPtr, Ptr};\n";
@@ -255,10 +259,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(
-        &source,
-        "true 4096 4108 4088 4102 4101 4104 true true true",
-    );
+    assert_runs_natively(&source, "true 4096 4108 4088 4102 4101 4104 true true true");
 }
 
 #[test]
@@ -305,12 +306,8 @@ fn the_interpreter_and_php_output_report_pointer_operations() {
             && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
         "{debug:#?}"
     );
-    let php = doriac::compile_source(
-        "stage40.doria",
-        source,
-        doriac::backend::BackendTarget::Php,
-    )
-    .expect_err("PHP output runs pointers through the companion");
+    let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+        .expect_err("PHP output runs pointers through the companion");
     assert!(
         php.iter().any(|diagnostic| diagnostic.code == "E0784"
             && diagnostic.title == "Pointers Cannot Be Built For PHP Output Yet"),
@@ -385,4 +382,80 @@ function main(): void {{
 "
     );
     assert_runs_natively(&parameters, "8 1 5 5 9 10");
+}
+
+const C_LIBRARY: &str = r#"
+use Doria\Std\Ffi\{CChar, CLong, CSize, LinkName, MutPtr, Opaque, Ptr};
+
+extern "C"
+{
+    /** @safety Any value but the least `int32`. */
+    function abs(int32 $value): int32;
+
+    /** @safety Any value but the least `CLong`. */
+    function labs(CLong $value): CLong;
+
+    /** @safety `$text` points to a NUL-terminated string. */
+    function strlen(Ptr<CChar> $text): CSize;
+
+    /** @safety The memory is released once, with `free`. */
+    function malloc(CSize $size): ?MutPtr<Opaque>;
+
+    /** @safety `$memory` is null, or came from `malloc` and is not used again. */
+    function free(?MutPtr<Opaque> $memory): void;
+
+    /** @safety `$memory` is writable for `$count` bytes. */
+    #[LinkName("memset")]
+    function fill(MutPtr<Opaque> $memory, int32 $value, CSize $count): MutPtr<Opaque>;
+
+    /** @safety `$memory` is writable for `$count` bytes. */
+    #[LinkName("memset")]
+    function clear(MutPtr<Opaque> $memory, int32 $value, CSize $count): void;
+}
+"#;
+
+#[test]
+fn foreign_calls_reach_the_platform_c_runtime() {
+    let source = format!(
+        "{C_LIBRARY}
+function main(): void
+{{
+    unsafe {{
+        echo abs(-7);
+        echo \" \";
+        echo Int64::from(labs(CLong::from(-123456)));
+        echo \" \";
+        ?MutPtr<Opaque> $memory = malloc(CSize::from(16));
+        if ($memory != null) {{
+            let $block = $memory;
+            clear($block, 0, CSize::from(16));
+            MutPtr<uint8> $bytes = MutPtr::cast($block);
+            $bytes->write(UInt8::from(68));
+            $bytes->offset(1)->write(UInt8::from(111));
+            $bytes->offset(2)->write(UInt8::from(114));
+            $bytes->offset(3)->write(UInt8::from(105));
+            $bytes->offset(4)->write(UInt8::from(97));
+            Ptr<CChar> $text = Ptr::cast(Ptr::from($bytes));
+            echo UInt64::from(strlen($text));
+            echo \" \";
+            echo $bytes->offset(4)->read();
+            echo \" \";
+            let $filled = fill($block, 120, CSize::from(3));
+            echo $filled == $block;
+            echo \" \";
+            echo $bytes->read();
+            echo \" \";
+            echo $bytes->offset(3)->read();
+            echo \" \";
+            echo UInt64::from(strlen($text));
+        }}
+        free($memory);
+        free(null);
+    }}
+}}
+"
+    );
+    // `fill` and `clear` bind one symbol with two signatures: the second
+    // calls the address the first imports.
+    assert_runs_natively(&source, "7 123456 5 97 true 120 105 5");
 }

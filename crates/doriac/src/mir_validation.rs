@@ -2273,7 +2273,10 @@ fn validate_diagnostic_frame(
     match function.diagnostic_frame {
         mir::DiagnosticFrame::Authored => unreachable!(),
         mir::DiagnosticFrame::Caller => {
+            // An extern declaration's function is its foreign call alone;
+            // the Call Path shows the Doria call (Decision 0148 section 13).
             if !function.source_span.source.is_compiler_owned()
+                && !function.is_foreign_binding()
                 && !interface_entry.is_some_and(|table| {
                     matches!(
                         table.implementing_type,
@@ -4147,6 +4150,12 @@ fn validate_statement(
         mir::Statement::Pointer {
             target, operation, ..
         } => validate_pointer_operation(program, function, *target, operation),
+        mir::Statement::ForeignCall {
+            function: foreign,
+            args,
+            target,
+            ..
+        } => validate_foreign_call(function, foreign, args, *target),
         mir::Statement::DropFunction {
             local,
             function_type,
@@ -6448,9 +6457,9 @@ fn validate_pointer_operation(
             validate_integer_expression(program, function, count)?;
             Some(pointer)
         }
-        mir::PointerOperation::Address { .. } => {
-            Some(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)))
-        }
+        mir::PointerOperation::Address { .. } => Some(mir::Type::Scalar(mir::ScalarType::Integer(
+            IntegerType::UInt64,
+        ))),
         mir::PointerOperation::AddressOf { local } => {
             if !accessed(local_in(function, *local)?.ty) {
                 return Err(malformed_mir(
@@ -6474,6 +6483,56 @@ fn validate_pointer_operation(
         (None, None) => Ok(()),
         _ => Err(malformed_mir(
             "a pointer operation assigns its result to a local of its type",
+        )),
+    }
+}
+
+/// A foreign call passes one local of each parameter's type, every one with
+/// a C form, and assigns its result to a local of the return type
+/// (Decision 0148 sections 14 and 15). A variadic binding's fixed count is
+/// at most its parameter count.
+fn validate_foreign_call(
+    function: &mir::Function,
+    foreign: &mir::ForeignFunction,
+    args: &[mir::LocalId],
+    target: Option<mir::LocalId>,
+) -> Result<(), BackendError> {
+    if function.owns_diagnostic_frame() {
+        return Err(malformed_mir(
+            "a foreign call is the body of an extern declaration, which runs in its caller's frame",
+        ));
+    }
+    let target_platform = crate::c_layout::CTarget::host();
+    if foreign.symbol.is_empty() || foreign.c_signature(target_platform).is_none() {
+        return Err(malformed_mir(
+            "a foreign call names a symbol and passes only values with a C form",
+        ));
+    }
+    if foreign
+        .fixed_parameters
+        .is_some_and(|fixed| fixed > foreign.parameters.len())
+    {
+        return Err(malformed_mir(
+            "a variadic foreign call has no more fixed parameters than parameters",
+        ));
+    }
+    if args.len() != foreign.parameters.len() {
+        return Err(malformed_mir(
+            "a foreign call passes one argument per parameter",
+        ));
+    }
+    for (local, ty) in args.iter().zip(&foreign.parameters) {
+        if local_in(function, *local)?.ty != *ty {
+            return Err(malformed_mir(
+                "a foreign call passes a local of each parameter's type",
+            ));
+        }
+    }
+    match (target, foreign.return_type) {
+        (Some(target), Some(ty)) if local_in(function, target)?.ty == ty => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(malformed_mir(
+            "a foreign call assigns its result to a local of its return type",
         )),
     }
 }
@@ -14342,6 +14401,11 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
     let mut accesses = ClassLocalAccesses::default();
     match statement {
         mir::Statement::SetDiagnosticSite { .. } => {}
+        mir::Statement::ForeignCall { args, .. } => {
+            for local in args {
+                accesses.resource_read(*local);
+            }
+        }
         mir::Statement::Pointer { operation, .. } => {
             if let Some(pointer) = operation.pointer() {
                 accesses.resource_read(pointer);
@@ -20301,7 +20365,7 @@ fn statement_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match statement {
-        mir::Statement::SetDiagnosticSite { .. } => false,
+        mir::Statement::SetDiagnosticSite { .. } | mir::Statement::ForeignCall { .. } => false,
         mir::Statement::Pointer { operation, .. } => match operation {
             mir::PointerOperation::Write { value, .. } => {
                 rvalue_observes_property(value, receiver, property)

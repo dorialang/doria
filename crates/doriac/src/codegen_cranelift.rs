@@ -2956,7 +2956,11 @@ fn define_process_main(
         }
         let call = builder.ins().call(runtime, &runtime_args);
         let status = builder.inst_results(call)[0];
-        if cfg!(windows) {
+        // A Windows program without foreign code enters at `main` without a
+        // C runtime and leaves through ExitProcess. One with foreign code
+        // enters through the C runtime's startup, which `main`'s return
+        // leaves through, as on Unix (Decision 0148 section 20).
+        if cfg!(windows) && !program.links_foreign_code() {
             let mut exit_signature = module.make_signature();
             exit_signature.params.push(AbiParam::new(types::I32));
             let exit_id = module
@@ -3991,6 +3995,12 @@ fn lower_statement(
             operation,
             span,
         } => lower_pointer_operation(builder, *target, operation, *span, resources)?,
+        mir::Statement::ForeignCall {
+            function,
+            args,
+            target,
+            ..
+        } => lower_foreign_call(builder, function, args, *target, resources)?,
         mir::Statement::DropFunction { local, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
@@ -19766,7 +19776,9 @@ fn lower_nullable_scalar_expression(
                 payload: position,
             })
         }
-        mir::NullableScalarExpression::TryConvert { ty: target, value, .. } => {
+        mir::NullableScalarExpression::TryConvert {
+            ty: target, value, ..
+        } => {
             let source = value.ty();
             let value = lower_integer_expression(builder, value, resources)?;
             Ok(lower_integer_try_conversion(
@@ -20423,9 +20435,10 @@ fn lower_pointer_operation(
             if *aligned {
                 lower_pointer_alignment_check(builder, address, size, span, resources)?;
             }
-            let value = builder
-                .ins()
-                .load(clif_scalar_type(scalar), MemFlagsData::new(), address, 0);
+            let value =
+                builder
+                    .ins()
+                    .load(clif_scalar_type(scalar), MemFlagsData::new(), address, 0);
             // C `_Bool` is 0 or 1; any other byte still reads as `true`.
             let value = if scalar == mir::ScalarType::Bool {
                 builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
@@ -20462,7 +20475,9 @@ fn lower_pointer_operation(
             // past either end of the address space, or reaching zero,
             // leaves every address a `Ptr<T>` can hold.
             let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, bytes, 0);
-            let wrapped_down = builder.ins().icmp(IntCC::UnsignedGreaterThan, moved, address);
+            let wrapped_down = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, moved, address);
             let wrapped_up = builder.ins().icmp(IntCC::UnsignedLessThan, moved, address);
             let wrapped = builder.ins().select(negative, wrapped_down, wrapped_up);
             let null = builder.ins().icmp_imm_u(IntCC::Equal, moved, 0);
@@ -20477,9 +20492,9 @@ fn lower_pointer_operation(
             )?;
             Some(LoweredValue::Single(moved))
         }
-        mir::PointerOperation::Address { pointer: local } => {
-            Some(LoweredValue::Single(address_of(builder, *local, resources)?))
-        }
+        mir::PointerOperation::Address { pointer: local } => Some(LoweredValue::Single(
+            address_of(builder, *local, resources)?,
+        )),
         mir::PointerOperation::AddressOf { local } => {
             refresh_borrowed_local(builder, *local, resources)?;
             Some(LoweredValue::Single(closure_source_address(
@@ -20501,6 +20516,138 @@ fn lower_pointer_operation(
         store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)?;
     }
     Ok(())
+}
+
+/// Calls the C function an extern declaration binds (Decision 0148 sections
+/// 14 and 15) under the target's C convention, as the shared
+/// classification (`native_abi::c_abi`) places each value. Each symbol is
+/// imported once, with the signature of its first call; a binding of the
+/// same symbol with another signature (`#[LinkName]`) calls the imported
+/// address through its own signature.
+fn lower_foreign_call(
+    builder: &mut FunctionBuilder,
+    foreign: &mir::ForeignFunction,
+    args: &[mir::LocalId],
+    target: Option<mir::LocalId>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    use crate::c_layout::CScalar;
+    use crate::native_abi::c_abi::{self, ArgumentPassing, Extension, ReturnPassing};
+    let pointer = resources.module.target_config().pointer_type();
+    let platform = crate::c_layout::CTarget::host();
+    let (parameters, return_type) = foreign
+        .c_signature(platform)
+        .ok_or_else(|| malformed_mir("a foreign call passes only values with a C form"))?;
+    let classification = c_abi::classify(
+        platform,
+        &parameters,
+        return_type.as_ref(),
+        foreign.fixed_parameters,
+    );
+    let clif = |scalar: CScalar| match scalar {
+        CScalar::Integer { bytes: 1, .. } | CScalar::Bool => types::I8,
+        CScalar::Integer { bytes: 2, .. } => types::I16,
+        CScalar::Integer { bytes: 4, .. } => types::I32,
+        CScalar::Float { bytes: 4 } => types::F32,
+        CScalar::Float { .. } => types::F64,
+        CScalar::Integer { .. } | CScalar::Pointer => pointer,
+    };
+    let mut signature = resources.module.make_signature();
+    for passing in &classification.parameters {
+        let ArgumentPassing::Scalar(scalar) = passing else {
+            return Err(malformed_mir(
+                "a foreign call passes scalars and pointers until foreign aggregates are built",
+            ));
+        };
+        let parameter = AbiParam::new(clif(*scalar));
+        signature.params.push(match c_abi::extension(*scalar) {
+            Some(Extension::Sign) => parameter.sext(),
+            Some(Extension::Zero) => parameter.uext(),
+            None => parameter,
+        });
+    }
+    let result = match &classification.return_value {
+        ReturnPassing::Void => None,
+        ReturnPassing::Scalar(scalar) => {
+            // The callee's bits above a narrow result are not relied on.
+            signature.returns.push(AbiParam::new(clif(*scalar)));
+            Some(*scalar)
+        }
+        ReturnPassing::Registers(_) | ReturnPassing::Indirect => {
+            return Err(malformed_mir(
+                "a foreign call returns a scalar or pointer until foreign aggregates are built",
+            ))
+        }
+    };
+    let mut values = Vec::with_capacity(args.len());
+    for local in args {
+        let ty = local_definition(resources.program, resources.function_id, *local)?.ty;
+        let slot = local_slot(resources.local_slots, *local)?;
+        values.push(
+            match load_lowered_from_stack(builder, resources.program, ty, slot, pointer) {
+                // A null `?Ptr<T>` is address zero.
+                LoweredValue::Nullable { present, payload } => {
+                    let null = builder.ins().iconst(pointer, 0);
+                    builder.ins().select(present, payload, null)
+                }
+                value => value.single()?,
+            },
+        );
+    }
+    let call = match resources.module.get_name(&foreign.symbol) {
+        Some(cranelift_module::FuncOrDataId::Func(id))
+            if resources
+                .module
+                .declarations()
+                .get_function_decl(id)
+                .signature
+                != signature =>
+        {
+            let address = resources.module.declare_func_in_func(id, builder.func);
+            let address = builder.ins().func_addr(pointer, address);
+            let reference = builder.import_signature(signature);
+            builder.ins().call_indirect(reference, address, &values)
+        }
+        Some(cranelift_module::FuncOrDataId::Func(id)) => {
+            let reference = resources.module.declare_func_in_func(id, builder.func);
+            builder.ins().call(reference, &values)
+        }
+        Some(cranelift_module::FuncOrDataId::Data(_)) => {
+            return Err(malformed_mir(format!(
+                "the foreign symbol {} names data of this object",
+                foreign.symbol
+            )))
+        }
+        None => {
+            let id = resources
+                .module
+                .declare_function(&foreign.symbol, Linkage::Import, &signature)
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let reference = resources.module.declare_func_in_func(id, builder.func);
+            builder.ins().call(reference, &values)
+        }
+    };
+    let (Some(target), Some(scalar)) = (target, result) else {
+        return Ok(());
+    };
+    let value = builder.inst_results(call)[0];
+    let ty = local_definition(resources.program, resources.function_id, target)?.ty;
+    let value = match (scalar, ty) {
+        // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+        (CScalar::Bool, _) => {
+            LoweredValue::Single(builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0))
+        }
+        (CScalar::Pointer, mir::Type::NullableScalar(_)) => {
+            let present = builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0);
+            LoweredValue::Nullable {
+                present: builder.ins().uextend(pointer, present),
+                payload: value,
+            }
+        }
+        _ => LoweredValue::Single(value),
+    };
+    let slot = local_slot(resources.local_slots, target)?;
+    store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)
 }
 
 /// Panics with P1702 unless `address` is aligned for a pointee of `size`

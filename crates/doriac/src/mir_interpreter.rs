@@ -2648,6 +2648,11 @@ impl<'a> Interpreter<'a> {
                     "the interpreter runs pointer operations through the native companion library",
                 ));
             }
+            mir::Statement::ForeignCall { .. } => {
+                return Err(InterpreterError::new(
+                    "the interpreter runs foreign calls through the native companion library",
+                ));
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -7459,10 +7464,9 @@ impl<'a> Interpreter<'a> {
                     target: ty,
                     operation_span: span,
                     primary_span: value_span,
-                    code: boundary.map_or(
-                        IntegerPanic::ConversionOutOfRange.code(),
-                        |_| crate::foreign::BOUNDARY_CONVERSION_PANIC_CODE,
-                    ),
+                    code: boundary.map_or(IntegerPanic::ConversionOutOfRange.code(), |_| {
+                        crate::foreign::BOUNDARY_CONVERSION_PANIC_CODE
+                    }),
                 });
                 frame.tasks.push(EvaluationTask::Integer(*value));
             }

@@ -497,19 +497,60 @@ function main(): void {}
 }
 
 #[test]
-fn checked_foreign_code_reports_that_it_cannot_be_built_yet() {
+fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
     let source = format!("{ABS}function main(): void {{ echo unsafe(abs(-3)); }}");
     assert!(codes(&source).is_empty(), "{:#?}", findings(&source));
-    let diagnostics =
-        doriac::compile_source("ffi.doria", source, doriac::backend::BackendTarget::Debug)
-            .expect_err("foreign calls cannot be built yet");
+    let diagnostics = doriac::compile_source(
+        "ffi.doria",
+        source.clone(),
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter calls C through the native companion");
     assert!(
         diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Extern Blocks Cannot Be Built Yet"),
+                && diagnostic.title == "Foreign Calls Cannot Run In The Interpreter Yet"),
         "{diagnostics:#?}"
     );
+    let diagnostics =
+        doriac::compile_source("ffi.doria", source, doriac::backend::BackendTarget::Php)
+            .expect_err("PHP output calls C through the native companion");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Foreign Calls Cannot Be Built For PHP Output Yet"),
+        "{diagnostics:#?}"
+    );
+
+    for (declaration, title) in [
+        (
+            "#[Library(\"zlib\")] extern \"C\" { /** @safety Any value. */ function zlibVersion(): Ptr<CChar>; }",
+            "Native Libraries Cannot Be Linked Yet",
+        ),
+        (
+            "extern \"C\" { /** @safety Any value. */ #[LinkName(\"printf\")] #[Variadic(fixedParameters: 1)] function printInteger(Ptr<CChar> $format, int32 $value): int32; }",
+            "Variadic Foreign Functions Cannot Be Built Yet",
+        ),
+        (
+            "extern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::Errno)] function close(int32 $descriptor): int32; }",
+            "System Code Capture Cannot Be Built Yet",
+        ),
+    ] {
+        let source = format!(
+            "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, Library, LinkName, Ptr, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
+        );
+        assert!(codes(&source).is_empty(), "{title}: {:#?}", findings(&source));
+        let diagnostics = doriac::lower_source_to_mir("ffi.doria", source)
+            .expect_err("the binding cannot be built yet");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0784" && diagnostic.title == title),
+            "{title}: {diagnostics:#?}"
+        );
+    }
 
     let unsafe_only = "/** @safety None. */ unsafe function tick(): int { return 1; } function main(): void { echo unsafe(tick()); }";
     let output = doriac::compile_source_to_debug("tick.doria", unsafe_only)
@@ -966,8 +1007,10 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
     )
     .expect_err("a pointer to a field cannot be built yet");
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Pointers To Fields And Properties Cannot Be Built Yet"),
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Pointers To Fields And Properties Cannot Be Built Yet"),
         "{diagnostics:#?}"
     );
 }

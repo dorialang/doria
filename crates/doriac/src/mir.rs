@@ -194,6 +194,12 @@ impl SelectedTarget {
 }
 
 impl Program {
+    /// Whether the executable links foreign code: any foreign call,
+    /// including one of the platform C runtime (Decision 0148 section 20).
+    pub fn links_foreign_code(&self) -> bool {
+        self.functions.iter().any(Function::is_foreign_binding)
+    }
+
     pub fn source_by_id(&self, id: SourceId) -> Option<&SourceFile> {
         self.sources
             .iter()
@@ -1025,6 +1031,17 @@ impl Function {
 
     pub fn owns_diagnostic_frame(&self) -> bool {
         self.diagnostic_frame == DiagnosticFrame::Authored
+    }
+
+    /// Whether this is an extern declaration's function, whose body is its
+    /// foreign call (Decision 0148 section 15).
+    pub fn is_foreign_binding(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            block
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::ForeignCall { .. }))
+        })
     }
 
     pub fn uses_virtual_receiver_abi(&self) -> bool {
@@ -6085,6 +6102,78 @@ pub enum Statement {
         operation: PointerOperation,
         span: Span,
     },
+    /// A call to the C function an extern declaration binds (Decision 0148
+    /// sections 14 and 15), passing `args` by copy and assigning its
+    /// result, if it has one, to `target`. It is the whole body of the
+    /// declaration's MIR function, so every Doria call reaches C through
+    /// the ordinary call path.
+    ForeignCall {
+        function: Box<ForeignFunction>,
+        args: Vec<LocalId>,
+        target: Option<LocalId>,
+        span: Span,
+    },
+}
+
+/// A C function as a foreign call reaches it: its symbol and its C
+/// signature over MIR types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForeignFunction {
+    pub symbol: String,
+    /// The `#[Library]` logical name; `None` is the platform C runtime.
+    pub library: Option<String>,
+    pub parameters: Vec<Type>,
+    /// `None` for `void`.
+    pub return_type: Option<Type>,
+    /// `Some(n)` for a variadic binding with `n` fixed parameters.
+    pub fixed_parameters: Option<usize>,
+}
+
+impl ForeignFunction {
+    /// The C layout of each parameter and of the result, which
+    /// [`crate::native_abi::c_abi::classify`] takes. `None` when a type has
+    /// no C form a foreign call carries.
+    pub fn c_signature(
+        &self,
+        target: crate::c_layout::CTarget,
+    ) -> Option<(Vec<crate::c_layout::CType>, Option<crate::c_layout::CType>)> {
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|ty| foreign_c_type(*ty, target))
+            .collect::<Option<Vec<_>>>()?;
+        let return_type = match self.return_type {
+            Some(ty) => Some(foreign_c_type(ty, target)?),
+            None => None,
+        };
+        Some((parameters, return_type))
+    }
+}
+
+/// The C layout of a MIR value that crosses the C boundary: a scalar with a
+/// C layout, or a pointer, whose null is address zero.
+pub fn foreign_c_type(
+    ty: Type,
+    target: crate::c_layout::CTarget,
+) -> Option<crate::c_layout::CType> {
+    use crate::c_layout::{CScalar, CType};
+    let scalar = match ty {
+        Type::Scalar(ScalarType::Integer(integer)) => CScalar::Integer {
+            bytes: (integer.bit_width() / 8) as u8,
+            signed: integer.is_signed(),
+        },
+        Type::Scalar(ScalarType::Float(float)) => CScalar::Float {
+            bytes: (float.bit_width() / 8) as u8,
+        },
+        Type::Scalar(ScalarType::Bool) => CScalar::Bool,
+        Type::Scalar(ScalarType::Inline(crate::inline_value::InlineValueType::Pointer))
+        | Type::NullableScalar(ScalarType::Inline(crate::inline_value::InlineValueType::Pointer)) => {
+            CScalar::Pointer
+        }
+        _ => return None,
+    };
+    debug_assert_eq!(target.pointer_bytes(), 8);
+    Some(CType::Scalar(scalar))
 }
 
 /// What a `Statement::Pointer` does. Every pointer is the inline pointer
@@ -7150,6 +7239,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropCollection { .. }
         | Statement::DropFunction { .. }
         | Statement::WriteStreamBytes { .. } => 0,
+        Statement::ForeignCall { .. } => 0,
         Statement::Pointer { operation, .. } => match operation {
             PointerOperation::Write { value, .. } => rvalue_class_temporary_capacity(value),
             PointerOperation::Offset { count, .. } => integer_class_temporary_capacity(count),
@@ -10599,7 +10689,11 @@ impl fmt::Display for Statement {
                         pointer,
                         count,
                         scale,
-                    } => write!(formatter, "pointer_offset(local{}, {count} * {scale})", pointer.0),
+                    } => write!(
+                        formatter,
+                        "pointer_offset(local{}, {count} * {scale})",
+                        pointer.0
+                    ),
                     PointerOperation::Address { pointer } => {
                         write!(formatter, "pointer_address(local{})", pointer.0)
                     }
@@ -10610,6 +10704,26 @@ impl fmt::Display for Statement {
                         write!(formatter, "pointer_to(local{})", local.0)
                     }
                 }
+            }
+            Statement::ForeignCall {
+                function,
+                args,
+                target,
+                ..
+            } => {
+                if let Some(target) = target {
+                    write!(formatter, "local{} = ", target.0)?;
+                }
+                let args = args
+                    .iter()
+                    .map(|local| format!("local{}", local.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "foreign_call {}({args})", function.symbol)?;
+                if let Some(library) = &function.library {
+                    write!(formatter, " in {library}")?;
+                }
+                Ok(())
             }
             Statement::DropInlineValue {
                 local,

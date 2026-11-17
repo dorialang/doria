@@ -2867,6 +2867,20 @@ fn validate_function(
             function.name
         )));
     }
+    // PHP output calls C through the native companion library (Decision
+    // 0148 section 23), which this compiler does not build yet.
+    if function.foreign {
+        return Err(BackendError::from_diagnostics(vec![
+            crate::unsafe_code::companion_form(
+                function.span,
+                "Foreign Calls Cannot Be Built For PHP Output Yet",
+                format!(
+                    "the extern declaration `{}` is part of Doria; PHP output does not call foreign functions yet",
+                    function.name
+                ),
+            ),
+        ]));
+    }
     for (parameter_index, param) in function.params.iter().enumerate() {
         validate_type(&param.ty, param.span, semantic_info)?;
         if param.default.is_some() {

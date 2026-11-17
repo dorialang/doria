@@ -1,4 +1,5 @@
-//! Raw pointer operations (Decision 0148 section 4).
+//! Raw pointer operations and extern declaration bodies (Decision 0148
+//! sections 4, 14 and 15).
 //!
 //! A pointer is the one-word inline value `InlineValueType::Pointer`; its
 //! pointee type and access are checking facts that MIR does not carry. Each
@@ -74,7 +75,10 @@ pub(super) fn expression(
                         1
                     };
                     let [count] = argument_values(args)[..] else {
-                        return Err(vec![unsupported(*span, "a pointer offset has one argument")]);
+                        return Err(vec![unsupported(
+                            *span,
+                            "a pointer offset has one argument",
+                        )]);
                     };
                     let count = lower_integer_expression(count, context)?;
                     let target = context.declare_return_temp(POINTER, false);
@@ -105,8 +109,7 @@ pub(super) fn expression(
             let Some((access, _)) = pointer_type(object, context) else {
                 return Ok(None);
             };
-            if pointer_intrinsics::instance_member(access, property)
-                .map(|member| member.operation)
+            if pointer_intrinsics::instance_member(access, property).map(|member| member.operation)
                 != Some(PointerOperation::Address)
             {
                 return Ok(None);
@@ -179,10 +182,7 @@ pub(super) fn expression(
                 }
                 _ => Err(vec![unsupported(
                     *span,
-                    format!(
-                        "`{}::{method}` is not built yet",
-                        access.short_name()
-                    ),
+                    format!("`{}::{method}` is not built yet", access.short_name()),
                 )]),
             }
         }
@@ -265,7 +265,11 @@ fn pointee_type(
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Type> {
     match context.mir_resolved_type(pointee) {
-        Some(ty @ mir::Type::Scalar(scalar)) if crate::native_abi::pointee_scalar_size(scalar).is_some() => Ok(ty),
+        Some(ty @ mir::Type::Scalar(scalar))
+            if crate::native_abi::pointee_scalar_size(scalar).is_some() =>
+        {
+            Ok(ty)
+        }
         _ => Err(vec![unsupported(
             span,
             "reading and writing foreign structs and unions through a pointer is not built yet",
@@ -274,9 +278,60 @@ fn pointee_type(
 }
 
 /// The size of `T` in `offset`'s scaling.
-fn pointee_size(pointee: &ResolvedType, span: Span, context: &LoweringContext) -> DiagnosticResult<u64> {
+fn pointee_size(
+    pointee: &ResolvedType,
+    span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<u64> {
     let mir::Type::Scalar(scalar) = pointee_type(pointee, span, context)? else {
         unreachable!("a pointee type is a scalar");
     };
     Ok(crate::native_abi::pointee_scalar_size(scalar).expect("a pointee scalar has a C size"))
+}
+
+/// The body of an extern declaration's MIR function (Decision 0148 sections
+/// 14 and 15): one foreign call of its C function with the parameters, whose
+/// result, if any, the function returns. Every Doria call of the declaration
+/// is an ordinary call of this function.
+pub(super) fn lower_extern_body(
+    function: &hir::FunctionDecl,
+    params: &[mir::LocalId],
+    parameter_types: &[mir::Type],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let Some(binding) = context.semantic_info.foreign_bindings.get(&function.span) else {
+        return Err(vec![Diagnostic::internal_compiler_error(
+            "extern declaration has no binding",
+            format!(
+                "checking recorded no foreign binding for the extern declaration `{}`",
+                function.name
+            ),
+            function.span,
+        )]);
+    };
+    let result = match return_type {
+        mir::ReturnType::Value(ty) => Some(ty),
+        mir::ReturnType::Void => None,
+    };
+    let foreign = mir::ForeignFunction {
+        symbol: binding.symbol.clone(),
+        library: binding.library.clone(),
+        parameters: parameter_types.to_vec(),
+        return_type: result,
+        fixed_parameters: binding.fixed_parameters,
+    };
+    let target = result.map(|ty| context.declare_return_temp(ty, false));
+    context.push_statement(mir::Statement::ForeignCall {
+        function: Box::new(foreign),
+        args: params.to_vec(),
+        target,
+        span: function.span,
+    });
+    context.cleanup_scopes_from(0);
+    context.terminate_current(match (target, result) {
+        (Some(local), Some(ty)) => mir::Terminator::Return(local_rvalue(local, ty, false)),
+        _ => mir::Terminator::ReturnVoid,
+    });
+    Ok(())
 }

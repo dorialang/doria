@@ -114,6 +114,42 @@ impl CBoundaryType {
     }
 }
 
+/// Where `#[CaptureSystemCode]` reads the code a foreign call leaves
+/// (section 16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemCodeSource {
+    Errno,
+    WindowsLastError,
+}
+
+impl SystemCodeSource {
+    pub fn from_case_name(case: &str) -> Option<Self> {
+        match case {
+            "Errno" => Some(Self::Errno),
+            "WindowsLastError" => Some(Self::WindowsLastError),
+            _ => None,
+        }
+    }
+}
+
+/// How one extern declaration binds its C function (sections 14 to 16 and
+/// 18). The checker derives it from the declaration and its block; MIR
+/// lowering builds the declaration's foreign call from it, and the
+/// execution gate reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForeignBinding {
+    /// The symbol the call links to: the `#[LinkName]` argument, otherwise
+    /// the declaration's Doria name.
+    pub symbol: String,
+    /// The block's `#[Library]` logical name. `None` binds the platform C
+    /// runtime (section 15).
+    pub library: Option<String>,
+    /// `#[Variadic(fixedParameters: n)]`: the count of fixed parameters.
+    pub fixed_parameters: Option<usize>,
+    /// `#[CaptureSystemCode(source)]`.
+    pub system_code: Option<SystemCodeSource>,
+}
+
 /// A C function pointer type, `extern "C" function(T...): R` (section 12).
 /// It has no invocation mode, ownership modes or checked effects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

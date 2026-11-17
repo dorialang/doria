@@ -103,6 +103,7 @@ pub(crate) fn synthetic_constructors(program: &hir::Program) -> Vec<(String, hir
                         span,
                     },
                     intrinsic: None,
+                    foreign: false,
                     modifier_prefix_span: span,
                     span,
                 },

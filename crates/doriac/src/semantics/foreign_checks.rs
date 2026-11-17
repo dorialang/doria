@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::attributes::{AttributeTarget, AttributeValueKind};
-use crate::foreign::{CBoundaryType, CFunctionType, ForeignType, PointerAccess};
+use crate::foreign::{
+    CBoundaryType, CFunctionType, ForeignBinding, ForeignType, PointerAccess, SystemCodeSource,
+};
 
 pub(super) const UNSAFE_OPERATION_CODE: &str = "E0785";
 pub(super) const NOT_FFI_SAFE_CODE: &str = "E0786";
@@ -44,6 +46,8 @@ pub(super) struct ForeignState {
     /// Declarations every call of which needs an unsafe context: `unsafe
     /// function`s, unsafe interface requirements and extern declarations.
     unsafe_callables: HashSet<Span>,
+    /// The binding of each extern declaration, by declaration span.
+    pub(super) bindings: HashMap<Span, ForeignBinding>,
 }
 
 impl<'program> Checker<'program> {
@@ -478,14 +482,26 @@ impl<'program> Checker<'program> {
             }
         }
         let link_names = self.foreign_link_names();
+        let libraries = self.foreign_string_arguments(crate::compiler_known_ffi::LIBRARY);
+        let fixed_parameters = self.variadic_fixed_parameters();
+        let system_codes = self
+            .foreign_attribute_arguments(crate::compiler_known_ffi::CAPTURE_SYSTEM_CODE)
+            .into_iter()
+            .filter_map(|(span, value)| match value {
+                AttributeValueKind::Enum { case } => {
+                    SystemCodeSource::from_case_name(&case).map(|source| (span, source))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut symbols: HashMap<String, Vec<(&FunctionDecl, bool)>> = HashMap::new();
         for item in &program.items {
             let Item::Function(function) = item else {
                 continue;
             };
             match &function.linkage {
-                FunctionLinkage::Foreign { block } => {
-                    let block = blocks.get(block).copied();
+                FunctionLinkage::Foreign { block: block_span } => {
+                    let block = blocks.get(block_span).copied();
                     self.check_foreign_signature(function, "an extern declaration");
                     let link_name = link_names.get(&function.span).cloned();
                     let symbol = link_name.clone().unwrap_or_else(|| {
@@ -497,6 +513,17 @@ impl<'program> Checker<'program> {
                             .to_string()
                     });
                     self.check_foreign_symbol(function, &symbol, link_name.is_some());
+                    self.foreign.bindings.insert(
+                        function.span,
+                        ForeignBinding {
+                            symbol: symbol.clone(),
+                            library: libraries.get(block_span).cloned(),
+                            fixed_parameters: fixed_parameters
+                                .get(&function.span)
+                                .and_then(|count| usize::try_from(*count).ok()),
+                            system_code: system_codes.get(&function.span).copied(),
+                        },
+                    );
                     symbols
                         .entry(symbol)
                         .or_default()
@@ -722,7 +749,13 @@ impl<'program> Checker<'program> {
 
     /// The `#[LinkName]` symbol of each foreign declaration that has one.
     fn foreign_link_names(&self) -> HashMap<Span, String> {
-        self.foreign_attribute_arguments(crate::compiler_known_ffi::LINK_NAME)
+        self.foreign_string_arguments(crate::compiler_known_ffi::LINK_NAME)
+    }
+
+    /// The string argument of every application of the attribute class
+    /// `class`, keyed by the declaration or block span it applies to.
+    fn foreign_string_arguments(&self, class: &str) -> HashMap<Span, String> {
+        self.foreign_attribute_arguments(class)
             .into_iter()
             .filter_map(|(span, value)| match value {
                 AttributeValueKind::String(symbol) => Some((span, symbol)),
@@ -899,10 +932,9 @@ impl<'program> Checker<'program> {
         self.check_variadic_declarations();
     }
 
-    fn check_variadic_declarations(&mut self) {
-        let program = self.program;
-        let fixed = self
-            .foreign_attribute_arguments(crate::compiler_known_ffi::VARIADIC)
+    /// The `fixedParameters` count of every `#[Variadic]` declaration.
+    fn variadic_fixed_parameters(&self) -> HashMap<Span, i64> {
+        self.foreign_attribute_arguments(crate::compiler_known_ffi::VARIADIC)
             .into_iter()
             .filter_map(|(span, value)| match value {
                 AttributeValueKind::Integer { value } => {
@@ -910,7 +942,12 @@ impl<'program> Checker<'program> {
                 }
                 _ => None,
             })
-            .collect::<HashMap<_, _>>();
+            .collect()
+    }
+
+    fn check_variadic_declarations(&mut self) {
+        let program = self.program;
+        let fixed = self.variadic_fixed_parameters();
         for item in &program.items {
             let Item::Function(function) = item else {
                 continue;

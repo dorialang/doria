@@ -38,9 +38,10 @@ pub fn generate_executable(
         NativeProfile::Fast => codegen_cranelift::lower_mir_to_object(program)?,
         NativeProfile::Release => lower_release_object(program)?,
     };
-    let runtime = runtime_artifact::locate(profile)?;
+    let hosting = runtime_artifact::RuntimeHosting::for_program(program);
+    let runtime = runtime_artifact::locate(profile, hosting)?;
     let runtime_path = runtime.path;
-    link_object(&object_bytes, &runtime_path)
+    link_object(&object_bytes, &runtime_path, hosting)
 }
 
 pub(crate) fn generate_executable_with_performance(
@@ -73,13 +74,14 @@ pub(crate) fn generate_executable_with_performance(
         .sum();
 
     let started = Instant::now();
-    let runtime = runtime_artifact::locate(profile)?;
+    let hosting = runtime_artifact::RuntimeHosting::for_program(program);
+    let runtime = runtime_artifact::locate(profile, hosting)?;
     let runtime_path = runtime.path.clone();
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
     let (executable, linker, link_command) =
-        link_object_with_metadata(&object_bytes, &runtime_path)?;
+        link_object_with_metadata(&object_bytes, &runtime_path, hosting)?;
     let linking = started.elapsed();
     Ok((
         executable,
@@ -129,13 +131,18 @@ fn lower_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError
     ))
 }
 
-fn link_object(object_bytes: &[u8], runtime_path: &Path) -> Result<Vec<u8>, BackendError> {
-    link_object_with_metadata(object_bytes, runtime_path).map(|(bytes, _, _)| bytes)
+fn link_object(
+    object_bytes: &[u8],
+    runtime_path: &Path,
+    hosting: runtime_artifact::RuntimeHosting,
+) -> Result<Vec<u8>, BackendError> {
+    link_object_with_metadata(object_bytes, runtime_path, hosting).map(|(bytes, _, _)| bytes)
 }
 
 fn link_object_with_metadata(
     object_bytes: &[u8],
     runtime_path: &Path,
+    hosting: runtime_artifact::RuntimeHosting,
 ) -> Result<(Vec<u8>, String, Vec<String>), BackendError> {
     let temp_stem = unique_temp_stem();
     let object_path = temp_stem.with_extension(object_extension());
@@ -144,13 +151,14 @@ fn link_object_with_metadata(
     fs::write(&object_path, object_bytes)
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
 
-    let (linker, arguments) = match invoke_linker(&object_path, runtime_path, &executable_path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            cleanup_temp_artifacts(&object_path, &executable_path);
-            return Err(error);
-        }
-    };
+    let (linker, arguments) =
+        match invoke_linker(&object_path, runtime_path, &executable_path, hosting) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                cleanup_temp_artifacts(&object_path, &executable_path);
+                return Err(error);
+            }
+        };
     let executable_bytes = match fs::read(&executable_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -172,6 +180,7 @@ fn invoke_linker(
     object_path: &Path,
     runtime_path: &Path,
     executable_path: &Path,
+    hosting: runtime_artifact::RuntimeHosting,
 ) -> Result<(String, Vec<String>), BackendError> {
     // Cranelift emits a host object from MIR, then the host toolchain links it.
     // Doria does not generate C source or use C semantics as an oracle.
@@ -183,9 +192,12 @@ fn invoke_linker(
         cc_is_set,
         cfg!(windows),
         msvc_host,
-        object_path,
-        runtime_path,
-        executable_path,
+        LinkInputs {
+            object: object_path,
+            runtime: runtime_path,
+            executable: executable_path,
+            hosting,
+        },
     );
     let mut command = Command::new(&linker);
     command.args(&arguments);
@@ -469,16 +481,56 @@ fn default_linker(msvc_host: bool) -> &'static str {
     }
 }
 
+/// What one executable link combines: the generated object, the selected
+/// runtime archive and the C runtime it is hosted by, and the output.
+#[derive(Debug, Clone, Copy)]
+struct LinkInputs<'a> {
+    object: &'a Path,
+    runtime: &'a Path,
+    executable: &'a Path,
+    hosting: runtime_artifact::RuntimeHosting,
+}
+
 fn linker_arguments(
     linker: &str,
     cc_is_set: bool,
     windows: bool,
     msvc_host: bool,
-    object_path: &Path,
-    runtime_path: &Path,
-    executable_path: &Path,
+    inputs: LinkInputs<'_>,
 ) -> Vec<OsString> {
-    if windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker)) {
+    let LinkInputs {
+        object: object_path,
+        runtime: runtime_path,
+        executable: executable_path,
+        hosting,
+    } = inputs;
+    let msvc_driver =
+        windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker));
+    if msvc_driver && hosting == runtime_artifact::RuntimeHosting::CrtHosted {
+        // A program with foreign code links the C runtime and enters
+        // through its startup, which calls `main` and leaves through the
+        // CRT's exit (Decision 0148 section 20): the Universal CRT
+        // dynamically (`ucrt.lib` in place of the static `libucrt.lib` that
+        // `libcmt.lib` names), so clean machines need no redistributable,
+        // and the startup code and vcruntime statically. The runtime archive
+        // is the CRT-hosted one, which defines none of the CRT's symbols.
+        return vec![
+            OsString::from("/nologo"),
+            object_path.as_os_str().to_os_string(),
+            runtime_path.as_os_str().to_os_string(),
+            OsString::from(format!("/Fe:{}", executable_path.display())),
+            OsString::from("/link"),
+            OsString::from("/SUBSYSTEM:CONSOLE"),
+            OsString::from("libcmt.lib"),
+            OsString::from("libvcruntime.lib"),
+            OsString::from("ucrt.lib"),
+            OsString::from("/NODEFAULTLIB:libucrt.lib"),
+            OsString::from("kernel32.lib"),
+            OsString::from("shell32.lib"),
+            OsString::from("bcrypt.lib"),
+        ];
+    }
+    if msvc_driver {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
         // Make Doria's process wrapper the executable entrypoint instead of
         // relying on CRT startup. On normal completion the wrapper calls
@@ -538,9 +590,12 @@ mod tests {
             false,
             true,
             true,
-            Path::new("main.obj"),
-            Path::new("doria_rt.lib"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+            },
         );
 
         assert_eq!(
@@ -561,15 +616,53 @@ mod tests {
     }
 
     #[test]
+    fn windows_programs_with_foreign_code_link_the_hybrid_c_runtime() {
+        let args = linker_arguments(
+            "cl.exe",
+            false,
+            true,
+            true,
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::CrtHosted,
+            },
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/nologo"),
+                OsString::from("main.obj"),
+                OsString::from("doria_rt.lib"),
+                OsString::from("/Fe:main.exe"),
+                OsString::from("/link"),
+                OsString::from("/SUBSYSTEM:CONSOLE"),
+                OsString::from("libcmt.lib"),
+                OsString::from("libvcruntime.lib"),
+                OsString::from("ucrt.lib"),
+                OsString::from("/NODEFAULTLIB:libucrt.lib"),
+                OsString::from("kernel32.lib"),
+                OsString::from("shell32.lib"),
+                OsString::from("bcrypt.lib"),
+            ]
+        );
+    }
+
+    #[test]
     fn windows_clang_cl_uses_msvc_compiler_driver_arguments() {
         let args = linker_arguments(
             "clang-cl.exe",
             true,
             true,
             true,
-            Path::new("main.obj"),
-            Path::new("doria_rt.lib"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+            },
         );
 
         assert_eq!(
@@ -596,9 +689,12 @@ mod tests {
             true,
             true,
             true,
-            Path::new("main.obj"),
-            Path::new("doria_rt.lib"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+            },
         );
 
         assert_eq!(
@@ -621,9 +717,12 @@ mod tests {
             false,
             true,
             false,
-            Path::new("main.obj"),
-            Path::new("libdoria_rt.a"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("libdoria_rt.a"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+            },
         );
 
         assert_eq!(
