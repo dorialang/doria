@@ -359,16 +359,30 @@ function main(): void
     // Every tier-1 target is little-endian.
     assert_runs_natively(&source, "7 7 5 true 511");
 
-    // A writable parameter stands for its caller's place, which this
-    // compiler does not address yet.
-    let parameter = format!(
-        "{POINTER}function bump(writable int32 $count): void {{ unsafe {{ MutPtr::to($count)->write(8); }} }} function main(): void {{ writable int32 $value = 1; bump($value); }}"
+    // A writable Copy parameter of a function is the callee's own copy
+    // (SPEC: Copy arguments keep their Copy behavior), so a pointer to it
+    // addresses that copy. A writable closure parameter and a writable
+    // capture name the caller's place, so a write through a pointer to
+    // either is what the caller reads next.
+    let parameters = format!(
+        "{POINTER}function bump(writable int32 $count): void {{ unsafe {{ MutPtr::to($count)->write(8); }} echo $count . \" \"; }}
+function main(): void {{
+    writable int32 $value = 1;
+    bump($value);
+    echo $value . \" \";
+    let $set = function(writable int32 $target): void {{ unsafe {{ MutPtr::to($target)->write(5); }} echo $target . \" \"; }};
+    $set($value);
+    echo $value . \" \";
+    writable int32 $captured = 2;
+    writable function writable(): void $raise = function(): void with (writable $captured) {{
+        unsafe {{ MutPtr::to($captured)->write(9); }}
+        echo $captured . \" \";
+        $captured = $captured + 1;
+    }};
+    $raise();
+    echo $captured;
+}}
+"
     );
-    let diagnostics = doriac::lower_source_to_mir("stage40.doria", parameter)
-        .expect_err("a pointer to a writable parameter is not built yet");
-    assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Pointers To Writable Parameters Cannot Be Built Yet"),
-        "{diagnostics:#?}"
-    );
+    assert_runs_natively(&parameters, "8 1 5 5 9 10");
 }

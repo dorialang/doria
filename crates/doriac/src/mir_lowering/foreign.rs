@@ -156,16 +156,6 @@ pub(super) fn expression(
                         )]);
                     };
                     let local = context.lookup_local(name, *place)?;
-                    if context.borrowed_place_bindings.contains(&local) {
-                        return Err(vec![crate::unsafe_code::not_built_yet(
-                            *span,
-                            "Pointers To Writable Parameters Cannot Be Built Yet",
-                            format!(
-                                "`{}::to(${name})` of a writable parameter or capture is part of Doria; this compiler does not build it yet",
-                                access.short_name()
-                            ),
-                        )]);
-                    }
                     let target = context.declare_return_temp(POINTER, false);
                     context.push_statement(mir::Statement::Pointer {
                         target: Some(target),

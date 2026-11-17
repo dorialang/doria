@@ -95,17 +95,6 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// The E0784 diagnostic for a checked form no execution target builds yet,
-/// for a stage of compilation after the gates, which knows more than the
-/// source shows.
-pub fn not_built_yet(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
-    Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
-        .with_title(title)
-        .with_explanation(
-            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks; this compiler cannot build or run this form yet.",
-        )
-}
-
 /// One E0784 diagnostic per checked form that no execution target runs yet.
 pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
     let mut finder = Finder::new(Gate::Execution);
