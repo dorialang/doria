@@ -24,6 +24,10 @@ pub const POINTER_ALIGNMENT_PANIC_CODE: &str = "P1702";
 /// address space or reaches zero, which no `Ptr<T>` holds (section 4).
 pub const POINTER_ADDRESS_PANIC_CODE: &str = "P1703";
 
+/// The panic of a construction that supplies a fixed-length array field
+/// `T[N]` from a region whose length is not `N` (section 6).
+pub const ARRAY_FIELD_LENGTH_PANIC_CODE: &str = "P1704";
+
 /// Read access (`Ptr<T>`) or read and write access (`MutPtr<T>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PointerAccess {

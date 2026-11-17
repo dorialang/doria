@@ -695,15 +695,35 @@ fn foreign_aggregates_cross_the_c_boundary_by_value_and_by_pointer() {
 }
 
 #[test]
-fn fixed_length_array_fields_are_zero_filled_until_regions_land() {
-    let declaration = "extern \"C\" struct Tip { uint16[128] $text; int32 $length; }";
-    let built = format!("{declaration} function main(): void {{ let $tip = new Tip(length: 0); echo $tip->length; }}");
-    assert!(codes(&built).is_empty(), "{:#?}", findings(&built));
-    let read = format!("{declaration} function main(): void {{ let $tip = new Tip(length: 0); let $text = $tip->text; }}");
-    let diagnostic = only(&read, "E0784");
-    assert_eq!(
-        diagnostic.title,
-        "Fixed-Length Array Fields Cannot Be Read Yet"
+fn fixed_length_array_fields_read_and_are_supplied_as_regions() {
+    // Decision 0148 section 6 with the amendment of 2026-11-16.
+    let declaration = "extern \"C\" struct Tip { uint16[3] $text; int32 $length; }";
+    for body in [
+        "let $tip = new Tip(length: 0); ArrayRegion<uint16> $text = $tip->text; echo $text->length;",
+        "writable Tip $tip = new Tip(length: 0); writable WritableArrayRegion<uint16> $text = $tip->text; $text[0] = UInt16::from(1); echo $tip->text[0];",
+        "writable Tip $tip = new Tip(length: 0); $tip->text[1] = UInt16::from(7); $tip->text[1] += UInt16::from(1);",
+        "uint16[] $letters = [72, 105, 33]; let $tip = new Tip(text: $letters->getRegion(0, 3), length: 3); echo $tip->text[2];",
+        "uint16[] $letters = [72, 105, 33, 0]; let $count = 3; let $tip = new Tip(text: $letters->getRegion(0, $count), length: 3);",
+        "let $first = new Tip(length: 0); let $second = new Tip(text: $first->text, length: 1);",
+    ] {
+        let source = format!("{declaration} function main(): void {{ {body} }}");
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let known = only(
+        &format!("{declaration} function main(): void {{ uint16[] $letters = [72, 105, 33, 0]; let $tip = new Tip(text: $letters->getRegion(0, 4), length: 4); }}"),
+        "E0803",
+    );
+    assert_eq!(known.title, "Array Region Length Does Not Match The Field");
+    // A readonly place gives a readonly region.
+    let readonly = codes(&format!(
+        "{declaration} function main(): void {{ let $tip = new Tip(length: 0); $tip->text[0] = UInt16::from(1); }}"
+    ));
+    assert!(!readonly.is_empty());
+    let assigned = findings(&format!("{declaration} function main(): void {{ uint16[] $letters = [1, 2, 3]; writable Tip $tip = new Tip(length: 0); $tip->text = $letters->getRegion(0, 3); }}"));
+    assert!(
+        assigned.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Fixed-Length Array Fields Cannot Be Assigned Yet"),
+        "{assigned:#?}"
     );
 }
 

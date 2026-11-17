@@ -1496,6 +1496,11 @@ impl SharedAccessType {
 }
 
 impl Type {
+    /// A present region with writable access.
+    pub const fn is_writable_region(self) -> bool {
+        matches!(self, Self::Region(region) if region.is_writable())
+    }
+
     pub const ERROR: Self = Self::Interface(InterfaceTypeId::ERROR);
     pub const NULLABLE_ERROR: Self = Self::NullableInterface(InterfaceTypeId::ERROR);
 
@@ -1970,6 +1975,11 @@ impl ForeignAggregateExpression {
 pub struct ForeignFieldValue {
     pub offset: u64,
     pub value: Rvalue,
+    /// A fixed-length array field `T[N]` supplied from a region (Decision
+    /// 0148 section 6, amended 2026-11-16): `Some(N)`, and `value` is a
+    /// readonly typed array region whose `N` elements are copied. Another
+    /// length panics with P1704 at the construction.
+    pub copied_elements: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6263,6 +6273,10 @@ pub enum ForeignFieldAccess {
     Read { target: LocalId },
     /// Stores `value` into the field.
     Write { value: Rvalue },
+    /// A fixed-length array field `T[N]` as a typed array region of its
+    /// `length` elements (section 6), assigned to `target`. The region
+    /// borrows the aggregate; checking keeps the aggregate in place.
+    Region { target: LocalId, length: u64 },
 }
 
 /// A C function as a foreign call reaches it: its symbol and its C
@@ -7406,7 +7420,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::WriteStreamBytes { .. } => 0,
         Statement::ForeignCall { .. } => 0,
         Statement::ForeignField { access, .. } => match access {
-            ForeignFieldAccess::Read { .. } => 0,
+            ForeignFieldAccess::Read { .. } | ForeignFieldAccess::Region { .. } => 0,
             ForeignFieldAccess::Write { value } => rvalue_class_temporary_capacity(value),
         },
         Statement::Pointer { operation, .. } => match operation {
@@ -10935,6 +10949,11 @@ impl fmt::Display for Statement {
                     formatter,
                     "foreign_field(local{}, @{offset}) = {value}",
                     aggregate.0
+                ),
+                ForeignFieldAccess::Region { target, length } => write!(
+                    formatter,
+                    "local{} = foreign_field_region(local{}, @{offset}, {length})",
+                    target.0, aggregate.0
                 ),
             },
             Statement::ForeignCall {

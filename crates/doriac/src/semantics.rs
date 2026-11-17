@@ -13332,7 +13332,16 @@ impl<'program> Checker<'program> {
                 );
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if self
-                    .check_foreign_field_read(object_ty, property, *member_span, *span, *null_safe)
+                    .check_foreign_field_read(
+                        object,
+                        object_ty,
+                        property,
+                        *member_span,
+                        *span,
+                        *null_safe,
+                        scopes,
+                        method_context,
+                    )
                     .is_some()
                     || self
                         .check_pointer_property(object_ty, property, *member_span, *null_safe)
@@ -21331,7 +21340,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn object_path_access(
+    pub(super) fn object_path_access(
         &mut self,
         expr: &Expr,
         scopes: &ScopeStack,
@@ -21403,6 +21412,12 @@ impl<'program> Checker<'program> {
                     return ObjectPathAccess::Readonly;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                // A field of a foreign struct or union is part of the value,
+                // writable exactly when the containing place is (Decision
+                // 0148 section 6).
+                if self.aggregate_of(object_ty).is_some() {
+                    return parent_access;
+                }
                 let writable =
                     if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                         self.trait_property(&owner, property)
@@ -23757,7 +23772,14 @@ impl<'program> Checker<'program> {
                     return result;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
-                if let Some(field) = self.foreign_field_type(object_ty, property, *null_safe) {
+                if let Some(field) = self.foreign_field_type(
+                    object,
+                    object_ty,
+                    property,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
                     return field;
                 }
                 if let Some(ty) = self.pointer_property_type(object_ty, property, *null_safe) {

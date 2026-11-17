@@ -984,3 +984,78 @@ fn array_regions_report_what_cannot_be_built_yet() {
         "{diagnostics:#?}"
     );
 }
+
+#[test]
+fn fixed_length_array_fields_are_regions_over_the_aggregate() {
+    let source = format!(
+        "{POINTER}
+extern \"C\" struct Tip
+{{
+    uint16[3] $text;
+    int32 $length = 7;
+}}
+
+function total(ArrayRegion<uint16> $values): int
+{{
+    writable int $sum = 0;
+    for (writable int $index = 0; $index < $values->length; $index++) {{
+        $sum += Int64::from($values[$index]);
+    }}
+    return $sum;
+}}
+
+function supply(ArrayRegion<uint16> $source): Tip
+{{
+    return new Tip(text: $source);
+}}
+
+function main(): void
+{{
+    uint16[] $letters = [72, 105, 33, 0];
+    writable Tip $tip = new Tip(text: $letters->getRegion(0, 3));
+    echo $tip->text[0] . \" \" . $tip->text[2] . \" \" . $tip->text->length . \" \" . $tip->length;
+    $tip->text[1] = UInt16::from(9);
+    $tip->text[2] += UInt16::from(1);
+    echo \" \" . total($tip->text->getRegion(0, 3));
+    let $copy = $tip;
+    $tip->text[0] = UInt16::from(1);
+    echo \" \" . $copy->text[0];
+    unsafe {{
+        Ptr<uint16> $text = $tip->text->pointer;
+        Ptr<int32> $length = Ptr::cast($text->byteOffset(8));
+        echo \" \" . $text->offset(1)->read() . \" \" . $length->read();
+    }}
+    let $empty = new Tip();
+    echo \" \" . total($empty->text);
+    let $fromRegion = supply($letters->getRegion(1, 3));
+    echo \" \" . $fromRegion->text[0];
+}}
+"
+    );
+    assert_runs_natively(&source, "72 33 3 7 115 72 9 7 0 105");
+    let mismatch = format!(
+        "{POINTER}
+extern \"C\" struct Tip
+{{
+    uint16[3] $text;
+}}
+
+function supply(ArrayRegion<uint16> $source): Tip
+{{
+    return new Tip(text: $source);
+}}
+
+function main(): void
+{{
+    uint16[] $letters = [72, 105];
+    let $tip = supply($letters->getRegion(0, 2));
+    echo $tip->text[0];
+}}
+"
+    );
+    assert_panics_natively(
+        &mismatch,
+        "P1704",
+        "Array Region Length Does Not Match The Field",
+    );
+}

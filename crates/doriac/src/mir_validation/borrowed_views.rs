@@ -1040,6 +1040,13 @@ impl State {
                     mir::CoreCollectionOperation::KeyAt { target, .. }
                     | mir::CoreCollectionOperation::ValueAt { target, .. },
             } => Some((*target, self.roots[collection.0].clone())),
+            // A fixed-length array field's region views the aggregate that
+            // holds the field (Decision 0148 section 6).
+            mir::Statement::ForeignField {
+                aggregate,
+                access: mir::ForeignFieldAccess::Region { target, .. },
+                ..
+            } => Some((*target, self.roots[aggregate.0].clone())),
             mir::Statement::AssignLocal { target, value }
                 if !local_in(function, *target)?.owned =>
             {
@@ -1086,6 +1093,11 @@ impl State {
         let assigned_view_parents = match statement {
             mir::Statement::AssignLocal { value, .. } => Self::value_parents(program, value)?,
             mir::Statement::CoreCollection { collection, .. } => HashSet::from([*collection]),
+            mir::Statement::ForeignField {
+                aggregate,
+                access: mir::ForeignFieldAccess::Region { .. },
+                ..
+            } => HashSet::from([*aggregate]),
             _ => HashSet::new(),
         };
         let assigned_storage = match statement {

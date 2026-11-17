@@ -11189,7 +11189,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         expression: &mir::ForeignAggregateExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         match expression {
-            mir::ForeignAggregateExpression::Construct { ty, fields, .. } => {
+            mir::ForeignAggregateExpression::Construct { ty, fields, span } => {
                 let address = self.entry_foreign_aggregate_alloca(*ty, "foreign.construct")?;
                 let size = self
                     .context
@@ -11207,7 +11207,49 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         malformed_mir("a foreign field offset exceeds its aggregate")
                     })?;
                     let field_address = self.byte_offset(address, offset, "foreign.field")?;
-                    self.store_value_at_address(field_address, value, field.value.ty())?;
+                    let Some(count) = field.copied_elements else {
+                        self.store_value_at_address(field_address, value, field.value.ty())?;
+                        continue;
+                    };
+                    // A fixed-length array field copies a region of exactly
+                    // its element count (section 6, amended 2026-11-16).
+                    let mir::Type::Region(region) = field.value.ty() else {
+                        return Err(malformed_mir("a copied field is supplied from a region"));
+                    };
+                    let (_, stride) = crate::native_abi::array_region_element(self.program, region)
+                        .ok_or_else(|| malformed_mir("a copied field views built elements"))?;
+                    let (data, length) = self.byte_region_parts(value.into_struct_value())?;
+                    let word = self.context.ptr_sized_int_type(self.target_data, None);
+                    let mismatch = build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        length,
+                        word.const_int(count, false),
+                        "foreign.field.copy.mismatch",
+                    ))?;
+                    self.lower_panic_if_code(
+                        mismatch,
+                        crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
+                        *span,
+                    )?;
+                    let pointer = self.context.ptr_type(AddressSpace::default());
+                    self.call_runtime(
+                        crate::native_abi::ARRAY_REGION_COPY,
+                        &[
+                            pointer.into(),
+                            word.into(),
+                            pointer.into(),
+                            word.into(),
+                            word.into(),
+                        ],
+                        Some(word.into()),
+                        &[
+                            field_address.into(),
+                            length.into(),
+                            data.into(),
+                            length.into(),
+                            word.const_int(u64::from(stride), false).into(),
+                        ],
+                    )?;
                 }
                 Ok(address)
             }
@@ -11289,6 +11331,30 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::ForeignFieldAccess::Write { value } => {
                 let lowered = self.lower_rvalue(value)?;
                 self.store_value_at_address(address, lowered, value.ty())
+            }
+            mir::ForeignFieldAccess::Region { target, length } => {
+                let ty = local_in(self.function, *target)?.ty;
+                let region_type =
+                    llvm_type(self.context, self.target_data, self.program, ty).into_struct_type();
+                let word = self.context.ptr_sized_int_type(self.target_data, None);
+                let region = build(self.builder.build_insert_value(
+                    region_type.get_undef(),
+                    address,
+                    0,
+                    "foreign.field.region.data",
+                ))?;
+                let region = build(self.builder.build_insert_value(
+                    region,
+                    word.const_int(*length, false),
+                    1,
+                    "foreign.field.region",
+                ))?;
+                let target_slot = local_slot(&self.local_slots, *target)?;
+                build(
+                    self.builder
+                        .build_store(target_slot, region.into_struct_value()),
+                )?;
+                Ok(())
             }
         }
     }

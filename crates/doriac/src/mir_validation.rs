@@ -20486,7 +20486,7 @@ fn statement_observes_property(
     match statement {
         mir::Statement::SetDiagnosticSite { .. } | mir::Statement::ForeignCall { .. } => false,
         mir::Statement::ForeignField { access, .. } => match access {
-            mir::ForeignFieldAccess::Read { .. } => false,
+            mir::ForeignFieldAccess::Read { .. } | mir::ForeignFieldAccess::Region { .. } => false,
             mir::ForeignFieldAccess::Write { value } => {
                 rvalue_observes_property(value, receiver, property)
             }

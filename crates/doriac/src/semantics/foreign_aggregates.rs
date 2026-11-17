@@ -283,7 +283,7 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn aggregate_of(&self, ty: TypeId) -> Option<(String, ForeignAggregateInfo)> {
+    pub(super) fn aggregate_of(&self, ty: TypeId) -> Option<(String, ForeignAggregateInfo)> {
         let ty = match self.types.kind(ty) {
             TypeKind::Nullable(inner) => *inner,
             _ => ty,
@@ -354,26 +354,49 @@ impl<'program> Checker<'program> {
                 declaration: Some(field.span),
             })
             .collect::<Vec<_>>();
-        for argument in args {
-            let target = match &argument.name {
-                Some(name) => fields.iter().find(|field| field.name == name.text),
-                None => None,
-            };
-            if let Some(field) = target {
-                if matches!(
-                    self.types.kind(field.ty),
-                    TypeKind::Foreign(ForeignType::FixedArray { .. })
-                ) {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            crate::unsafe_code::NOT_AVAILABLE_CODE,
-                            "copying an `ArrayRegion<T>` into a fixed-length array field is part of Doria; this compiler does not implement it yet",
-                            argument.span,
-                        )
-                        .with_title("Fixed-Length Array Fields Cannot Be Supplied Yet")
-                        .with_help("omit the field: it is zero-filled"),
-                    );
-                    return true;
+        // A fixed-length array field is supplied from a readonly region of
+        // its element count (section 6, amended 2026-11-16); a length known
+        // here that differs is E0803, any other mismatch panics (P1704).
+        let mut params = params;
+        for (param, field) in params.iter_mut().zip(fields.iter()) {
+            if let TypeKind::Foreign(ForeignType::FixedArray { element, length }) =
+                self.types.kind(field.ty).clone()
+            {
+                param.ty = self.types.intern(TypeKind::ArrayRegion(
+                    crate::types::ByteRegionKind::Readonly,
+                    element,
+                ));
+                let supplied = args
+                    .iter()
+                    .enumerate()
+                    .find(|(position, argument)| match &argument.name {
+                        Some(name) => name.text == field.name,
+                        None => fields
+                            .get(*position)
+                            .is_some_and(|by_position| by_position.name == field.name),
+                    });
+                if let Some((_, argument)) = supplied {
+                    if let Some(known) =
+                        self.known_region_length(&argument.value, scopes, method_context)
+                    {
+                        if known != length {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0803",
+                                    format!(
+                                        "the field `${}` holds {length} elements, and this region has {known}",
+                                        field.name
+                                    ),
+                                    argument.value.span(),
+                                )
+                                .with_title("Array Region Length Does Not Match The Field")
+                                .with_help(format!(
+                                    "supply a region of {length} elements, or omit the field, which is zero-filled, and copy into it with `copyFrom`"
+                                )),
+                            );
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -394,44 +417,79 @@ impl<'program> Checker<'program> {
         true
     }
 
+    /// The element count of a region expression when checking can see it:
+    /// a `getRegion` or `getWritableRegion` with a constant length, or a
+    /// fixed-length array field.
+    fn known_region_length(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<u64> {
+        match expr {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.known_region_length(expr, scopes, method_context)
+            }
+            Expr::MethodCall { method, args, .. }
+                if matches!(method.as_str(), "getRegion" | "getWritableRegion") =>
+            {
+                let length = args
+                    .iter()
+                    .find(|argument| {
+                        argument
+                            .name
+                            .as_ref()
+                            .is_some_and(|name| name.text == "length")
+                    })
+                    .or_else(|| args.get(1).filter(|argument| argument.name.is_none()))?;
+                match &length.value {
+                    Expr::Int { value, .. } => value.replace('_', "").parse().ok(),
+                    _ => None,
+                }
+            }
+            Expr::PropertyAccess {
+                object, property, ..
+            } => {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                let (_, info) = self.aggregate_of(object_ty)?;
+                match self.types.kind(info.field(property)?.ty) {
+                    TypeKind::Foreign(ForeignType::FixedArray { length, .. }) => Some(*length),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The type of a field read, or `None` when `object_ty` is not a
     /// foreign aggregate.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn check_foreign_field_read(
         &mut self,
+        object: &Expr,
         object_ty: TypeId,
         property: &str,
         member_span: Span,
         span: Span,
         null_safe: bool,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let (name, info) = self.aggregate_of(object_ty)?;
-        let Some(field) = info.field(property).cloned() else {
+        if info.field(property).is_none() {
             self.report_unknown_foreign_field(&name, &info, property, member_span);
-            return Some(self.types.unknown());
-        };
-        if matches!(
-            self.types.kind(field.ty),
-            TypeKind::Foreign(ForeignType::FixedArray { .. })
-        ) {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    crate::unsafe_code::NOT_AVAILABLE_CODE,
-                    "reading a fixed-length array field as an `ArrayRegion<T>` is part of Doria; this compiler does not implement it yet",
-                    span,
-                )
-                .with_title("Fixed-Length Array Fields Cannot Be Read Yet"),
-            );
             return Some(self.types.unknown());
         }
         if info.kind == ForeignAggregateKind::Union {
             self.require_unsafe(span, &format!("reading the union member `${property}`"));
         }
-        Some(
-            if null_safe && matches!(self.types.kind(object_ty), TypeKind::Nullable(_)) {
-                self.types.intern(TypeKind::Nullable(field.ty))
-            } else {
-                field.ty
-            },
+        self.foreign_field_type(
+            object,
+            object_ty,
+            property,
+            null_safe,
+            scopes,
+            method_context,
         )
     }
 
@@ -457,10 +515,13 @@ impl<'program> Checker<'program> {
             self.diagnostics.push(
                 Diagnostic::new(
                     crate::unsafe_code::NOT_AVAILABLE_CODE,
-                    "writing a fixed-length array field through a `WritableArrayRegion<T>` is part of Doria; this compiler does not implement it yet",
+                    "assigning a whole fixed-length array field is not available in this compiler",
                     span,
                 )
-                .with_title("Fixed-Length Array Fields Cannot Be Written Yet"),
+                .with_title("Fixed-Length Array Fields Cannot Be Assigned Yet")
+                .with_help(format!(
+                    "write through the field's region instead: `$value->{property}[0] = $element;` or `$value->{property}->copyFrom($source);`"
+                )),
             );
             return Some(None);
         }
@@ -522,23 +583,37 @@ impl<'program> Checker<'program> {
 
     /// The type a field read has, without reporting anything; `None` when
     /// `object_ty` is not a foreign aggregate.
+    ///
+    /// A fixed-length array field `T[N] $name` reads as a region of its `N`
+    /// elements that borrows the containing value (section 6): a
+    /// `WritableArrayRegion<T>` from a writable place, an `ArrayRegion<T>`
+    /// otherwise.
     pub(super) fn foreign_field_type(
         &mut self,
+        object: &Expr,
         object_ty: TypeId,
         property: &str,
         null_safe: bool,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let (_, info) = self.aggregate_of(object_ty)?;
         let Some(field) = info.field(property) else {
             return Some(self.types.unknown());
         };
-        if matches!(
-            self.types.kind(field.ty),
-            TypeKind::Foreign(ForeignType::FixedArray { .. })
-        ) {
-            return Some(self.types.unknown());
+        let mut ty = field.ty;
+        if let TypeKind::Foreign(ForeignType::FixedArray { element, .. }) =
+            self.types.kind(ty).clone()
+        {
+            let access = if self.object_path_access(object, scopes, method_context)
+                == ObjectPathAccess::Writable
+            {
+                crate::types::ByteRegionKind::Writable
+            } else {
+                crate::types::ByteRegionKind::Readonly
+            };
+            ty = self.types.intern(TypeKind::ArrayRegion(access, element));
         }
-        let ty = field.ty;
         Some(
             if null_safe && matches!(self.types.kind(object_ty), TypeKind::Nullable(_)) {
                 self.types.intern(TypeKind::Nullable(ty))

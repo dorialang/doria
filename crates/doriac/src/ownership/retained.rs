@@ -1470,6 +1470,21 @@ impl Checker<'_> {
             } => self
                 .resolved_type(object)
                 .and_then(|ty| crate::types::ByteRegionKind::property_result(ty, property))
+                // A fixed-length array field of a foreign struct or union
+                // is a region over the containing value (Decision 0148
+                // section 6).
+                .or_else(|| {
+                    let receiver = self.resolved_type(object)?;
+                    let is_aggregate = matches!(
+                        receiver,
+                        ResolvedType::Foreign(foreign)
+                            if matches!(foreign.as_ref(), crate::foreign::ForeignType::Aggregate(_))
+                    );
+                    match self.resolved_type(expr)? {
+                        ResolvedType::ArrayRegion(kind, _) if is_aggregate => Some(*kind),
+                        _ => None,
+                    }
+                })
                 .map(|kind| (object, kind)),
             _ => None,
         };

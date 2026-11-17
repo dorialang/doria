@@ -61,6 +61,41 @@ fn validate_field(
 
 use crate::c_layout::CTarget;
 
+/// A fixed-length array field `T[length]` at `offset`, viewed or supplied
+/// through the typed array region type `region`, whose element the
+/// targets build.
+fn validate_array_field(
+    program: &mir::Program,
+    aggregate: mir::ForeignAggregateType,
+    offset: u64,
+    region: mir::Type,
+    length: u64,
+) -> Result<(), BackendError> {
+    let mir::Type::Region(region) = region else {
+        return Err(malformed_mir(
+            "a fixed-length array field is viewed through a region",
+        ));
+    };
+    let (element, _) = crate::native_abi::array_region_element(program, region)
+        .ok_or_else(|| malformed_mir("a fixed-length array field region views built elements"))?;
+    let element = mir::foreign_c_type(element, &program.foreign_aggregates, CTarget::host())
+        .ok_or_else(|| malformed_mir("a fixed-length array element has a C layout"))?;
+    let expected = crate::c_layout::CType::Array {
+        element: Box::new(element),
+        length,
+    };
+    if !has_field(
+        &definition_in(program, aggregate)?.layout,
+        offset,
+        &expected,
+    ) {
+        return Err(malformed_mir(format!(
+            "the foreign aggregate has no fixed-length array field of {length} elements at offset {offset}"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_field_access(
     program: &mir::Program,
     function: &mir::Function,
@@ -87,6 +122,15 @@ pub(super) fn validate_field_access(
             validate_field(program, aggregate_type, offset, value.ty())?;
             validate_rvalue(program, function, value)
         }
+        mir::ForeignFieldAccess::Region { target, length } => {
+            let target = local_in(function, *target)?;
+            if target.ty.is_writable_region() && !local_in(function, aggregate)?.writable {
+                return Err(malformed_mir(
+                    "a writable fixed-length array field region names a readonly local",
+                ));
+            }
+            validate_array_field(program, aggregate_type, offset, target.ty, *length)
+        }
     }
 }
 
@@ -106,7 +150,17 @@ pub(super) fn validate_expression(
                 ));
             }
             for field in fields {
-                validate_field(program, ty, field.offset, field.value.ty())?;
+                match field.copied_elements {
+                    Some(length) => {
+                        if field.value.ty().is_writable_region() {
+                            return Err(malformed_mir(
+                                "a fixed-length array field is copied from a readonly region",
+                            ));
+                        }
+                        validate_array_field(program, ty, field.offset, field.value.ty(), length)?
+                    }
+                    None => validate_field(program, ty, field.offset, field.value.ty())?,
+                }
                 validate_rvalue(program, function, &field.value)?;
             }
             Ok(())

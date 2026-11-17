@@ -10455,14 +10455,55 @@ fn lower_foreign_aggregate_expression(
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
-        mir::ForeignAggregateExpression::Construct { ty, fields, .. } => {
+        mir::ForeignAggregateExpression::Construct { ty, fields, span } => {
             let address =
                 create_call_storage(builder, mir::Type::ForeignAggregate(*ty), resources)?;
             zero_foreign_aggregate(builder, address, *ty, pointer);
             for field in fields {
                 let value = lower_rvalue(builder, &field.value, resources)?;
                 let field_address = builder.ins().iadd_imm_u(address, field.offset as i64);
-                store_foreign_field(builder, field.value.ty(), field_address, value, resources)?;
+                match field.copied_elements {
+                    // A fixed-length array field copies a region of exactly
+                    // its element count (section 6, amended 2026-11-16).
+                    Some(count) => {
+                        let mir::Type::Region(region) = field.value.ty() else {
+                            return Err(malformed_mir("a copied field is supplied from a region"));
+                        };
+                        let (_, stride) =
+                            crate::native_abi::array_region_element(resources.program, region)
+                                .ok_or_else(|| {
+                                    malformed_mir("a copied field views built elements")
+                                })?;
+                        let (data, length) = value.byte_region()?;
+                        let mismatch =
+                            builder
+                                .ins()
+                                .icmp_imm_u(IntCC::NotEqual, length, count as i64);
+                        lower_panic_if_code(
+                            builder,
+                            mismatch,
+                            crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
+                            *span,
+                            resources,
+                        )?;
+                        let stride = builder.ins().iconst(pointer, i64::from(stride));
+                        runtime_call(
+                            builder,
+                            crate::native_abi::ARRAY_REGION_COPY,
+                            &[pointer, pointer, pointer, pointer, pointer],
+                            Some(pointer),
+                            &[field_address, length, data, length, stride],
+                            resources,
+                        )?;
+                    }
+                    None => store_foreign_field(
+                        builder,
+                        field.value.ty(),
+                        field_address,
+                        value,
+                        resources,
+                    )?,
+                }
             }
             Ok(address)
         }
@@ -10518,6 +10559,22 @@ fn lower_foreign_field(
         mir::ForeignFieldAccess::Write { value } => {
             let lowered = lower_rvalue(builder, value, resources)?;
             store_foreign_field(builder, value.ty(), address, lowered, resources)
+        }
+        mir::ForeignFieldAccess::Region { target, length } => {
+            let ty = local_definition(resources.program, resources.function_id, *target)?.ty;
+            let length = builder.ins().iconst(pointer, *length as i64);
+            let target_slot = local_slot(resources.local_slots, *target)?;
+            store_lowered_to_stack(
+                builder,
+                resources.program,
+                ty,
+                target_slot,
+                LoweredValue::ByteRegion {
+                    data: address,
+                    length,
+                },
+                pointer,
+            )
         }
     }
 }
