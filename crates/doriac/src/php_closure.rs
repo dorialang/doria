@@ -342,9 +342,7 @@ pub(crate) fn parameter_uses_cell(function: &mir::FunctionType, index: usize) ->
             borrow.kind == mir::ReturnBorrowKind::Value
                 && !matches!(
                     function.return_type,
-                    mir::ReturnType::Value(
-                        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-                    )
+                    mir::ReturnType::Value(mir::Type::Region(_) | mir::Type::NullableRegion(_))
                 )
                 && borrow.source == mir::BorrowSource::Parameter(index)
         })

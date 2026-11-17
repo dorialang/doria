@@ -226,8 +226,8 @@ impl Program {
             return false;
         }
         match ty {
-            Type::ByteRegion(_)
-            | Type::NullableByteRegion(_)
+            Type::Region(_)
+            | Type::NullableRegion(_)
             | Type::Function(_)
             | Type::NullableFunction(_) => true,
             Type::PayloadEnum(payload) | Type::NullablePayloadEnum(payload) => {
@@ -1331,8 +1331,11 @@ pub struct Local {
 pub enum Type {
     Scalar(ScalarType),
     String,
-    ByteRegion(ByteRegionKind),
-    NullableByteRegion(ByteRegionKind),
+    /// A borrowed region: a byte region over `Bytes` or a string's bytes,
+    /// or a typed array region over a `T[]` (Decisions 0110 and 0148
+    /// section 8). Both are the inline data pointer and length.
+    Region(RegionType),
+    NullableRegion(RegionType),
     Mixed,
     NullableScalar(ScalarType),
     NullableString,
@@ -1363,6 +1366,36 @@ pub enum Type {
     /// A foreign struct or union (Decision 0148 section 6): an inline Copy
     /// value held in memory with its C layout. It needs no cleanup.
     ForeignAggregate(ForeignAggregateType),
+}
+
+/// What a region views and the access it grants (Decision 0110's byte
+/// regions, generalized to typed array regions by Decision 0148 section 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionType {
+    pub access: ByteRegionKind,
+    /// The `T[]` whose elements a typed array region views; `None` for a
+    /// byte region over `Bytes` or a string's UTF-8 bytes.
+    pub array: Option<CollectionTypeId>,
+}
+
+impl RegionType {
+    /// A byte region with `access`.
+    pub const fn bytes(access: ByteRegionKind) -> Self {
+        Self {
+            access,
+            array: None,
+        }
+    }
+
+    pub const fn is_writable(self) -> bool {
+        self.access.is_writable()
+    }
+
+    /// The same view with `access`, as a readonly reborrow of a writable
+    /// region has.
+    pub const fn with_access(self, access: ByteRegionKind) -> Self {
+        Self { access, ..self }
+    }
 }
 
 /// A foreign struct or union as a value type: its definition and the size
@@ -1508,8 +1541,14 @@ impl Type {
         matches!(
             self,
             Self::Mixed
-                | Self::ByteRegion(ByteRegionKind::Writable)
-                | Self::NullableByteRegion(ByteRegionKind::Writable)
+                | Self::Region(RegionType {
+                    access: ByteRegionKind::Writable,
+                    ..
+                })
+                | Self::NullableRegion(RegionType {
+                    access: ByteRegionKind::Writable,
+                    ..
+                })
                 | Self::NullableMixed
                 | Self::Interface(_)
                 | Self::NullableInterface(_)
@@ -1638,8 +1677,8 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
-    ByteRegionLength(LocalId),
-    ByteRegionIndex {
+    RegionLength(LocalId),
+    RegionIndex {
         region: LocalId,
         index: Box<Rvalue>,
         index_span: Span,
@@ -1864,8 +1903,8 @@ impl NullableFunctionExpression {
 pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
-    ByteRegion(ByteRegionExpression),
-    NullableByteRegion(NullableByteRegionExpression),
+    Region(RegionExpression),
+    NullableRegion(NullableRegionExpression),
     Mixed(MixedExpression),
     NullableScalar(NullableScalarExpression),
     NullableString(NullableStringExpression),
@@ -1964,8 +2003,8 @@ impl Rvalue {
         match self {
             Self::Value(value) => Type::Scalar(value.ty()),
             Self::String(_) => Type::String,
-            Self::ByteRegion(value) => Type::ByteRegion(value.kind()),
-            Self::NullableByteRegion(value) => Type::NullableByteRegion(value.kind()),
+            Self::Region(value) => Type::Region(value.kind()),
+            Self::NullableRegion(value) => Type::NullableRegion(value.kind()),
             Self::Mixed(_) => Type::Mixed,
             Self::NullableScalar(value) => Type::NullableScalar(value.ty()),
             Self::NullableString(_) => Type::NullableString,
@@ -2006,8 +2045,8 @@ impl Rvalue {
             | Self::NullableCollection(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2036,8 +2075,8 @@ impl Rvalue {
         match self {
             Self::Collection(value) => value.owned_temporary_collection(),
             Self::NullableCollection(value) => value.owned_temporary_collection(),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2106,8 +2145,8 @@ impl Rvalue {
                     OwnedSharedTemporary::ReadonlyAccess
                 })
             }
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2140,8 +2179,8 @@ impl Rvalue {
         match self {
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2175,8 +2214,8 @@ impl Rvalue {
             return false;
         }
         match self {
-            Self::ByteRegion(value) => value.borrows_descriptor(),
-            Self::NullableByteRegion(value) => value.borrows_descriptor(),
+            Self::Region(value) => value.borrows_descriptor(),
+            Self::NullableRegion(value) => value.borrows_descriptor(),
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
             Self::Collection(value) => value.owned_temporary_collection().is_none(),
@@ -2222,7 +2261,7 @@ impl Rvalue {
         matches!(
             self,
             Self::NullableScalar(NullableScalarExpression::Null(_))
-                | Self::NullableByteRegion(NullableByteRegionExpression::Null { .. })
+                | Self::NullableRegion(NullableRegionExpression::Null { .. })
                 | Self::NullableCollection(NullableCollectionExpression::Null(_))
                 | Self::NullableSharedReference(NullableSharedReferenceExpression::Null(_))
                 | Self::NullableWeakReference(NullableWeakReferenceExpression::Null(_))
@@ -2288,26 +2327,26 @@ impl Rvalue {
                 NullableScalarExpression::Local { local, .. } => Some(*local),
                 _ => None,
             },
-            Self::ByteRegion(ByteRegionExpression::Local {
+            Self::Region(RegionExpression::Local {
                 local,
                 transfer: true,
                 ..
             })
-            | Self::NullableByteRegion(NullableByteRegionExpression::Local {
+            | Self::NullableRegion(NullableRegionExpression::Local {
                 local,
                 transfer: true,
                 ..
             }) => Some(*local),
-            Self::ByteRegion(ByteRegionExpression::AssumePresent { value, .. }) => match &**value {
-                NullableByteRegionExpression::Local {
+            Self::Region(RegionExpression::AssumePresent { value, .. }) => match &**value {
+                NullableRegionExpression::Local {
                     local,
                     transfer: true,
                     ..
                 } => Some(*local),
                 _ => None,
             },
-            Self::NullableByteRegion(NullableByteRegionExpression::Present(value)) => match value {
-                ByteRegionExpression::Local {
+            Self::NullableRegion(NullableRegionExpression::Present(value)) => match value {
+                RegionExpression::Local {
                     local,
                     transfer: true,
                     ..
@@ -2427,8 +2466,8 @@ impl Rvalue {
                 transfer: true,
                 ..
             }) => Some(*local),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2516,10 +2555,8 @@ impl Rvalue {
                 NullableScalarExpression::Local { local, .. } => Some(*local),
                 _ => None,
             },
-            Self::ByteRegion(ByteRegionExpression::Local { local, .. })
-            | Self::NullableByteRegion(NullableByteRegionExpression::Local { local, .. }) => {
-                Some(*local)
-            }
+            Self::Region(RegionExpression::Local { local, .. })
+            | Self::NullableRegion(NullableRegionExpression::Local { local, .. }) => Some(*local),
             Self::String(
                 StringExpression::Local(local)
                 | StringExpression::NullableLocalAssumeNonNull(local),
@@ -2601,8 +2638,8 @@ impl Rvalue {
         match self {
             Self::Mixed(value) => value.ownership(),
             Self::NullableMixed(value) => value.ownership(),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::NullableScalar(_)
@@ -4001,9 +4038,9 @@ impl SharedReferenceAccessExpression {
 
 /// A region owns only its inline descriptor, never its source byte storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ByteRegionExpression {
+pub enum RegionExpression {
     CollectionIndex {
-        kind: ByteRegionKind,
+        kind: RegionType,
         collection: LocalId,
         index: Box<Rvalue>,
         index_span: Span,
@@ -4011,37 +4048,37 @@ pub enum ByteRegionExpression {
         remove: bool,
     },
     Region {
-        kind: ByteRegionKind,
+        kind: RegionType,
         source: Box<Rvalue>,
         offset: Box<Rvalue>,
         length: Box<Rvalue>,
         span: Span,
     },
     Local {
-        kind: ByteRegionKind,
+        kind: RegionType,
         local: LocalId,
         transfer: bool,
     },
     Call {
-        kind: ByteRegionKind,
+        kind: RegionType,
         function: FunctionId,
         args: Vec<Rvalue>,
         span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     AssumePresent {
-        kind: ByteRegionKind,
-        value: Box<NullableByteRegionExpression>,
+        kind: RegionType,
+        value: Box<NullableRegionExpression>,
     },
     Coalesce {
-        kind: ByteRegionKind,
-        left: Box<NullableByteRegionExpression>,
-        right: Box<ByteRegionExpression>,
+        kind: RegionType,
+        left: Box<NullableRegionExpression>,
+        right: Box<RegionExpression>,
     },
 }
 
-impl ByteRegionExpression {
-    pub const fn kind(&self) -> ByteRegionKind {
+impl RegionExpression {
+    pub const fn kind(&self) -> RegionType {
         match self {
             Self::Region { kind, .. }
             | Self::Local { kind, .. }
@@ -4067,9 +4104,9 @@ impl ByteRegionExpression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NullableByteRegionExpression {
+pub enum NullableRegionExpression {
     CollectionIndex {
-        kind: ByteRegionKind,
+        kind: RegionType,
         collection: LocalId,
         index: Box<Rvalue>,
         index_span: Span,
@@ -4077,23 +4114,23 @@ pub enum NullableByteRegionExpression {
         remove: bool,
     },
     CollectionGet {
-        kind: ByteRegionKind,
+        kind: RegionType,
         collection: LocalId,
         key: Box<Rvalue>,
         index_span: Span,
         access: NullableCollectionAccess,
     },
     Null {
-        kind: ByteRegionKind,
+        kind: RegionType,
     },
-    Present(ByteRegionExpression),
+    Present(RegionExpression),
     Local {
-        kind: ByteRegionKind,
+        kind: RegionType,
         local: LocalId,
         transfer: bool,
     },
     Call {
-        kind: ByteRegionKind,
+        kind: RegionType,
         function: FunctionId,
         args: Vec<Rvalue>,
         span: Span,
@@ -4101,8 +4138,8 @@ pub enum NullableByteRegionExpression {
     },
 }
 
-impl NullableByteRegionExpression {
-    pub const fn kind(&self) -> ByteRegionKind {
+impl NullableRegionExpression {
+    pub const fn kind(&self) -> RegionType {
         match self {
             Self::Null { kind }
             | Self::Local { kind, .. }
@@ -5258,7 +5295,7 @@ pub enum IntegerExpression {
     /// `WritableByteRegion::copyFrom`: copies the leading bytes of the
     /// readonly `source` region into the writable `destination` region and
     /// yields the count copied, the smaller of the two lengths.
-    CopyByteRegion {
+    CopyRegion {
         destination: Box<Rvalue>,
         source: Box<Rvalue>,
         span: Span,
@@ -5395,12 +5432,12 @@ impl PartialEq for IntegerExpression {
                 },
             ) => left_enum == right_enum && left == right,
             (
-                Self::CopyByteRegion {
+                Self::CopyRegion {
                     destination: left_destination,
                     source: left_source,
                     ..
                 },
-                Self::CopyByteRegion {
+                Self::CopyRegion {
                     destination: right_destination,
                     source: right_source,
                     ..
@@ -5426,7 +5463,7 @@ impl IntegerExpression {
             | Self::Call { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
             Self::FloatToInt { .. } | Self::InlineWord(_) => IntegerType::Int64,
-            Self::EnumBacking { .. } | Self::CopyByteRegion { .. } | Self::Terminal { .. } => {
+            Self::EnumBacking { .. } | Self::CopyRegion { .. } | Self::Terminal { .. } => {
                 IntegerType::Int64
             }
         }
@@ -5871,7 +5908,7 @@ pub enum BoolExpression {
         target: ClassId,
     },
     NullableCollectionIsPresent(Box<NullableCollectionExpression>),
-    NullableByteRegionIsPresent(Box<NullableByteRegionExpression>),
+    NullableByteRegionIsPresent(Box<NullableRegionExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
     NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
     NullableWritableSharedReferenceIsPresent(Box<NullableWritableSharedReferenceExpression>),
@@ -5971,7 +6008,7 @@ pub enum Statement {
     EndBorrow {
         local: LocalId,
     },
-    AssignByteRegionIndex {
+    AssignRegionIndex {
         region: LocalId,
         index: Rvalue,
         value: Rvalue,
@@ -6706,8 +6743,7 @@ impl RetainedSourcesPlan {
         contract: Option<ReturnBorrow>,
         source: impl Fn(BorrowSource) -> LocalId,
     ) {
-        let ReturnType::Value(Type::ByteRegion(_) | Type::NullableByteRegion(_)) = return_type
-        else {
+        let ReturnType::Value(Type::Region(_) | Type::NullableRegion(_)) = return_type else {
             return;
         };
         let Some(borrow) = contract.filter(|borrow| borrow.kind == ReturnBorrowKind::Retained)
@@ -7328,7 +7364,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::CollectionSet { key, value, .. } => {
             rvalue_class_temporary_capacity(key) + rvalue_class_temporary_capacity(value)
         }
-        Statement::AssignByteRegionIndex { index, value, .. }
+        Statement::AssignRegionIndex { index, value, .. }
         | Statement::AssignCollectionIndex { index, value, .. } => {
             rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
         }
@@ -7499,10 +7535,8 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
         )
         + match value {
             Rvalue::Value(value) => value_class_temporary_capacity(value),
-            Rvalue::ByteRegion(value) => byte_region_class_temporary_capacity(value),
-            Rvalue::NullableByteRegion(value) => {
-                nullable_byte_region_class_temporary_capacity(value)
-            }
+            Rvalue::Region(value) => byte_region_class_temporary_capacity(value),
+            Rvalue::NullableRegion(value) => nullable_byte_region_class_temporary_capacity(value),
             Rvalue::String(value) => string_class_temporary_capacity(value),
             Rvalue::Mixed(value) => mixed_class_temporary_capacity(value),
             Rvalue::NullableScalar(value) => nullable_scalar_class_temporary_capacity(value),
@@ -7640,12 +7674,10 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
         }
 }
 
-fn byte_region_class_temporary_capacity(value: &ByteRegionExpression) -> usize {
+fn byte_region_class_temporary_capacity(value: &RegionExpression) -> usize {
     match value {
-        ByteRegionExpression::CollectionIndex { index, .. } => {
-            rvalue_class_temporary_capacity(index)
-        }
-        ByteRegionExpression::Region {
+        RegionExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
+        RegionExpression::Region {
             source,
             offset,
             length,
@@ -7655,29 +7687,29 @@ fn byte_region_class_temporary_capacity(value: &ByteRegionExpression) -> usize {
                 + rvalue_class_temporary_capacity(offset)
                 + rvalue_class_temporary_capacity(length)
         }
-        ByteRegionExpression::Local { .. } => 0,
-        ByteRegionExpression::Call { args, .. } => {
+        RegionExpression::Local { .. } => 0,
+        RegionExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
-        ByteRegionExpression::AssumePresent { value, .. } => {
+        RegionExpression::AssumePresent { value, .. } => {
             nullable_byte_region_class_temporary_capacity(value)
         }
-        ByteRegionExpression::Coalesce { left, right, .. } => {
+        RegionExpression::Coalesce { left, right, .. } => {
             nullable_byte_region_class_temporary_capacity(left)
                 + byte_region_class_temporary_capacity(right)
         }
     }
 }
 
-fn nullable_byte_region_class_temporary_capacity(value: &NullableByteRegionExpression) -> usize {
+fn nullable_byte_region_class_temporary_capacity(value: &NullableRegionExpression) -> usize {
     match value {
-        NullableByteRegionExpression::CollectionIndex { index: key, .. }
-        | NullableByteRegionExpression::CollectionGet { key, .. } => {
+        NullableRegionExpression::CollectionIndex { index: key, .. }
+        | NullableRegionExpression::CollectionGet { key, .. } => {
             rvalue_class_temporary_capacity(key)
         }
-        NullableByteRegionExpression::Null { .. } | NullableByteRegionExpression::Local { .. } => 0,
-        NullableByteRegionExpression::Present(value) => byte_region_class_temporary_capacity(value),
-        NullableByteRegionExpression::Call { args, .. } => {
+        NullableRegionExpression::Null { .. } | NullableRegionExpression::Local { .. } => 0,
+        NullableRegionExpression::Present(value) => byte_region_class_temporary_capacity(value),
+        NullableRegionExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
     }
@@ -8157,7 +8189,7 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
             nullable_scalar_class_temporary_capacity(left) + integer_class_temporary_capacity(right)
         }
         IntegerExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
-        IntegerExpression::CopyByteRegion {
+        IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -8656,13 +8688,27 @@ impl fmt::Display for Local {
     }
 }
 
+impl fmt::Display for RegionType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.array {
+            None => write!(formatter, "{}", self.access.source_name()),
+            Some(array) => write!(
+                formatter,
+                "{}<collection#{}>",
+                self.access.array_source_name(),
+                array.0
+            ),
+        }
+    }
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
-            Type::ByteRegion(kind) => write!(formatter, "{}", kind.source_name()),
-            Type::NullableByteRegion(kind) => write!(formatter, "?{}", kind.source_name()),
+            Type::Region(region) => write!(formatter, "{region}"),
+            Type::NullableRegion(region) => write!(formatter, "?{region}"),
             Type::Mixed => write!(formatter, "mixed"),
             Type::NullableScalar(ty) => write!(formatter, "?{ty}"),
             Type::NullableString => write!(formatter, "?string"),
@@ -8751,8 +8797,8 @@ impl fmt::Display for BasicBlock {
 impl fmt::Display for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ByteRegionLength(local) => write!(formatter, "region_length(local{})", local.0),
-            Self::ByteRegionIndex { region, index, .. } => {
+            Self::RegionLength(local) => write!(formatter, "region_length(local{})", local.0),
+            Self::RegionIndex { region, index, .. } => {
                 write!(formatter, "region local{}[{index}]", region.0)
             }
             Operand::CollectionIteratorPosition { receiver, vtable } => write!(
@@ -8797,8 +8843,8 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ByteRegion(value) => write!(formatter, "{value}"),
-            Self::NullableByteRegion(value) => write!(formatter, "{value}"),
+            Self::Region(value) => write!(formatter, "{value}"),
+            Self::NullableRegion(value) => write!(formatter, "{value}"),
             Self::Interface(InterfaceExpression {
                 value: InterfaceValue::FromValue { value, vtable },
                 ..
@@ -9185,7 +9231,7 @@ impl fmt::Display for NullableFunctionExpression {
     }
 }
 
-impl fmt::Display for ByteRegionExpression {
+impl fmt::Display for RegionExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CollectionIndex {
@@ -9208,11 +9254,7 @@ impl fmt::Display for ByteRegionExpression {
                 offset,
                 length,
                 ..
-            } => write!(
-                formatter,
-                "{}({source}, {offset}, {length})",
-                kind.source_name()
-            ),
+            } => write!(formatter, "{kind}({source}, {offset}, {length})"),
             Self::Local {
                 local, transfer, ..
             } => write!(
@@ -9236,7 +9278,7 @@ impl fmt::Display for ByteRegionExpression {
     }
 }
 
-impl fmt::Display for NullableByteRegionExpression {
+impl fmt::Display for NullableRegionExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CollectionIndex {
@@ -9890,7 +9932,7 @@ impl fmt::Display for IntegerExpression {
         match self {
             Self::InlineWord(value) => write!(formatter, "inlineWord({value})"),
             IntegerExpression::Use { ty, operand } => match operand {
-                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: {ty}")
                 }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
@@ -9969,7 +10011,7 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::EnumBacking { enum_id, value } => {
                 write!(formatter, "enum_backing<{:?}>({value})", enum_id)
             }
-            IntegerExpression::CopyByteRegion {
+            IntegerExpression::CopyRegion {
                 destination,
                 source,
                 ..
@@ -10014,7 +10056,7 @@ impl fmt::Display for FloatExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Use { ty, operand } => match operand {
-                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: {ty}")
                 }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
@@ -10201,7 +10243,7 @@ impl fmt::Display for BoolExpression {
             Self::NullableByteRegionIsPresent(value) => write!(formatter, "is_present({value})"),
             Self::NominalIs { local, target } => write!(formatter, "local{} is {target}", local.0),
             Self::Use { operand } => match operand {
-                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: bool")
                 }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: bool"),
@@ -10534,7 +10576,7 @@ impl fmt::Display for Statement {
                 request.0, outcome.0
             ),
             Self::EndBorrow { local } => write!(formatter, "end_borrow local{}", local.0),
-            Self::AssignByteRegionIndex {
+            Self::AssignRegionIndex {
                 region,
                 index,
                 value,

@@ -194,8 +194,7 @@ impl State {
                     {
                         HashSet::from([Source::input(
                             local.id,
-                            byte_regions::kind(local.ty)
-                                .is_some_and(mir::ByteRegionKind::is_writable),
+                            byte_regions::kind(local.ty).is_some_and(mir::RegionType::is_writable),
                             if byte_regions::kind(local.ty).is_some() {
                                 mir::RetainedLifetime::LastUse
                             } else {
@@ -963,7 +962,7 @@ impl State {
             | mir::Statement::AssignCollectionIndex { .. }
             | mir::Statement::CollectionClear { .. }
             | mir::Statement::AssignProperty { .. }
-            | mir::Statement::AssignByteRegionIndex { .. }
+            | mir::Statement::AssignRegionIndex { .. }
             | mir::Statement::CopyWithinByteRegion { .. } => true,
             _ => false,
         }
@@ -989,7 +988,7 @@ impl State {
                 }
                 Ok(())
             }
-            mir::Statement::AssignByteRegionIndex { region, .. }
+            mir::Statement::AssignRegionIndex { region, .. }
             | mir::Statement::CopyWithinByteRegion { region, .. } => self.conflicts(*region),
             _ => Ok(()),
         }
@@ -2201,7 +2200,7 @@ pub(super) fn validate(
             returned_selectors.extend(state.returned_storage_selectors(program, value)?);
             returned_storage.push(state.returned_storage(program, function, value)?);
             let sources = retained::value_sources(program, value, &state.roots, &state.loans)?;
-            if matches!(value.ty(), mir::Type::ByteRegion(_)) && sources.is_empty() {
+            if matches!(value.ty(), mir::Type::Region(_)) && sources.is_empty() {
                 return Err(malformed_mir(
                     "byte region return has no retained source provenance",
                 ));

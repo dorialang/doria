@@ -1032,11 +1032,11 @@ function main(): void {}
                     source: Source::File(object),
                     prepared: false,
                     region: ByteRegionValue {
-                        kind: if reading {
+                        kind: mir::RegionType::bytes(if reading {
                             crate::types::ByteRegionKind::Writable
                         } else {
                             crate::types::ByteRegionKind::Readonly
-                        },
+                        }),
                         nullable: false,
                         source: Some(CollectionElementPlace {
                             collection: 1,

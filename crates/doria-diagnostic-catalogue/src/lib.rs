@@ -57,11 +57,10 @@ pub const DIAGNOSTIC_CODES: &[&str] = &[
     "I2901", "I3001", "I3002", "I7101", "L0001", "L0002", "M1101", "M1102", "P0001", "P0002",
     "P0017", "P0018", "P0019", "P0020", "P0021", "P1000", "P1001", "P1101", "P1102", "P1103",
     "P1104", "P1105", "P1106", "P1107", "P1108", "P1109", "P1110", "P1111", "P1201", "P1202",
-    "P1203", "P1204", "P1205", "P1206", "P1301", "P1302", "P1303", "P1304", "P1310", "P1311",
-    "P1312", "P1313", "P1320", "P1321", "P1322", "P1401", "P1402", "P1403", "P1404", "P1405",
-    "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601", "P1701", "P1702", "P1703",
-    "R1000",
-    "R1001",
+    "P1203", "P1204", "P1205", "P1206", "P1301", "P1302", "P1303", "P1304", "P1305", "P1310",
+    "P1311", "P1312", "P1313", "P1320", "P1321", "P1322", "P1401", "P1402", "P1403", "P1404",
+    "P1405", "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601",
+    "P1701", "P1702", "P1703", "R1000", "R1001",
 ];
 
 /// Codes that once identified a diagnostic and that no compiler raises any
@@ -829,6 +828,19 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         domain: "bytes",
         primary_label: "Invalid Byte Region",
         explanation: "The offset and requested length must be nonnegative and fit within the source byte buffer or region.",
+        process_status: 101,
+        fact_names: &[
+            BYTE_REGION_OFFSET_FACT,
+            BYTE_REGION_REQUESTED_LENGTH_FACT,
+            BYTE_BUFFER_LENGTH_FACT,
+        ],
+    },
+    RuntimeCatalogueEntry {
+        code: "P1305",
+        title: "Array Region Is Out Of Bounds",
+        domain: "collection",
+        primary_label: "Invalid Array Region",
+        explanation: "The offset and requested length must be nonnegative and fit within the source typed array or array region.",
         process_status: 101,
         fact_names: &[
             BYTE_REGION_OFFSET_FACT,

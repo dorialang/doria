@@ -401,8 +401,14 @@ mod tests {
     #[test]
     fn borrow_cleanup_is_not_a_native_value_destructor() {
         for ty in [
-            Type::ByteRegion(crate::mir::ByteRegionKind::Writable),
-            Type::NullableByteRegion(crate::mir::ByteRegionKind::Writable),
+            Type::Region(crate::mir::RegionType {
+                access: crate::mir::ByteRegionKind::Writable,
+                array: None,
+            }),
+            Type::NullableRegion(crate::mir::RegionType {
+                access: crate::mir::ByteRegionKind::Writable,
+                array: None,
+            }),
         ] {
             assert!(ty.requires_owned_cleanup());
             assert!(!crate::native_closure_abi::needs_drop(ty));

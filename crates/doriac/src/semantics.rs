@@ -3342,7 +3342,7 @@ fn semantic_type_capabilities(
             needs_drop: true,
             equality: true,
         },
-        TypeKind::ByteRegion(kind) => EnumCapabilities {
+        TypeKind::ByteRegion(kind) | TypeKind::ArrayRegion(kind, _) => EnumCapabilities {
             copy: !kind.is_writable(),
             trivial_copy: !kind.is_writable(),
             needs_drop: false,
@@ -3403,7 +3403,10 @@ fn semantic_layout_shape(
         TypeKind::Integer(value) => Some(scalar(value.storage_bytes())),
         TypeKind::Float(value) => Some(scalar(value.storage_bytes())),
         TypeKind::Bool => Some(scalar(1)),
-        TypeKind::ByteRegion(_) | TypeKind::Error | TypeKind::Interface(_) => Some(LayoutShape {
+        TypeKind::ByteRegion(_)
+        | TypeKind::ArrayRegion(_, _)
+        | TypeKind::Error
+        | TypeKind::Interface(_) => Some(LayoutShape {
             size: POINTER * 2,
             align: POINTER,
         }),
@@ -4593,6 +4596,7 @@ impl<'program> Checker<'program> {
             | TypeKind::Void
             | TypeKind::Bytes
             | TypeKind::ByteRegion(_)
+            | TypeKind::ArrayRegion(_, _)
             | TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
@@ -12703,6 +12707,7 @@ impl<'program> Checker<'program> {
             TypeKind::Void
             | TypeKind::Nullable(_)
             | TypeKind::ByteRegion(_)
+            | TypeKind::ArrayRegion(_, _)
             | TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
@@ -17513,7 +17518,7 @@ impl<'program> Checker<'program> {
     fn type_is_move_type(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
-            TypeKind::ByteRegion(kind) => kind.is_writable(),
+            TypeKind::ByteRegion(kind) | TypeKind::ArrayRegion(kind, _) => kind.is_writable(),
             // Copy requires checked capabilities for this exact application.
             // An unmaterialized generic application retains conservative ownership.
             TypeKind::Enum(enum_type) => self
@@ -22044,6 +22049,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::SharedHandle(_, _)
                 | TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
+                | TypeKind::ArrayRegion(_, _)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -22210,6 +22216,19 @@ impl<'program> Checker<'program> {
                 let element =
                     self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.types.intern(TypeKind::TypedArray(element))
+            }
+            name if crate::types::ByteRegionKind::from_array_source_name(name).is_some() => {
+                let kind = crate::types::ByteRegionKind::from_array_source_name(name)
+                    .expect("an array region name has its access");
+                if !self.expect_type_arg_count(ty, 1, span) {
+                    for arg in ty.type_arguments() {
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
+                    }
+                    return self.types.unknown();
+                }
+                let element =
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
+                self.types.intern(TypeKind::ArrayRegion(kind, element))
             }
             "List" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
@@ -24353,6 +24372,7 @@ impl<'program> Checker<'program> {
                 TypeKind::Error
                 | TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
+                | TypeKind::ArrayRegion(_, _)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -25305,6 +25325,7 @@ impl<'program> Checker<'program> {
             kind,
             TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
+                | TypeKind::ArrayRegion(_, _)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -26519,6 +26540,7 @@ impl<'program> Checker<'program> {
                         | TypeKind::SharedHandle(_, _)
                         | TypeKind::Bytes
                         | TypeKind::ByteRegion(_)
+                        | TypeKind::ArrayRegion(_, _)
                 ) || (operation == "property access"
                     && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
                 if !member_receiver {

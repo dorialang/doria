@@ -2780,7 +2780,14 @@ fn intern_resolved_collection_types(
         ResolvedType::Bool => mir::Type::Scalar(mir::ScalarType::Bool),
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
-        ResolvedType::ByteRegion(kind) => mir::Type::ByteRegion(*kind),
+        ResolvedType::ByteRegion(kind) => mir::Type::Region(mir::RegionType::bytes(*kind)),
+        ResolvedType::ArrayRegion(kind, element) => {
+            let element = intern_resolved_collection_types(element, class_ids, collections)?;
+            mir::Type::Region(mir::RegionType {
+                access: *kind,
+                array: Some(collections.intern(mir::CollectionKind::TypedArray, None, element)),
+            })
+        }
         ResolvedType::Mixed => mir::Type::Mixed,
         ResolvedType::Foreign(foreign) => foreign_mir_type(foreign, collections)?,
         ResolvedType::Error => mir::Type::ERROR,
@@ -3011,7 +3018,7 @@ fn intern_resolved_collection_types(
             match intern_resolved_collection_types(inner, class_ids, collections)? {
                 mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
                 mir::Type::String => mir::Type::NullableString,
-                mir::Type::ByteRegion(kind) => mir::Type::NullableByteRegion(kind),
+                mir::Type::Region(kind) => mir::Type::NullableRegion(kind),
                 mir::Type::Mixed => mir::Type::NullableMixed,
                 mir::Type::Interface(interface) => mir::Type::NullableInterface(interface),
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
@@ -3036,7 +3043,7 @@ fn intern_resolved_collection_types(
                     mir::Type::NullableCollection(collection)
                 }
                 mir::Type::NullableScalar(_)
-                | mir::Type::NullableByteRegion(_)
+                | mir::Type::NullableRegion(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableInterface(_)
@@ -3680,8 +3687,8 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         return Some(FieldType::SharedInterface);
     }
     match ty {
-        mir::Type::ByteRegion(kind) => Some(FieldType::ByteRegion(kind)),
-        mir::Type::NullableByteRegion(kind) => Some(FieldType::NullableByteRegion(kind)),
+        mir::Type::Region(kind) => Some(FieldType::ByteRegion(kind.access)),
+        mir::Type::NullableRegion(kind) => Some(FieldType::NullableByteRegion(kind.access)),
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
@@ -3887,7 +3894,10 @@ fn lower_function(
                         group: params[0],
                         key: params[1],
                     },
-                    Some(mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly)),
+                    Some(mir::Type::NullableRegion(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None,
+                    })),
                     function.span,
                     &mut context,
                 )?;
@@ -6860,8 +6870,8 @@ fn assertion_condition(
 
 fn null_rvalue_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::Rvalue> {
     let value = match ty {
-        mir::Type::NullableByteRegion(kind) => {
-            mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Null { kind })
+        mir::Type::NullableRegion(kind) => {
+            mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Null { kind })
         }
         mir::Type::NullableScalar(ty) => {
             mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Null(ty))
@@ -8301,8 +8311,8 @@ fn lower_collection_foreach_in_scope(
     context.current_block = Some(update_block);
     if foreach.value_binding.writable && projection == CollectionForeachProjection::Main {
         match definition.value {
-            mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_)
+            mir::Type::Region(_)
+            | mir::Type::NullableRegion(_)
             | mir::Type::Scalar(_)
             | mir::Type::String
             | mir::Type::NullableScalar(_)
@@ -8467,8 +8477,8 @@ fn collection_value_rvalue(
     index_span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
-        mir::Type::ByteRegion(kind) => Ok(mir::Rvalue::ByteRegion(
-            mir::ByteRegionExpression::CollectionIndex {
+        mir::Type::Region(kind) => Ok(mir::Rvalue::Region(
+            mir::RegionExpression::CollectionIndex {
                 kind,
                 collection,
                 index: Box::new(index),
@@ -8477,8 +8487,8 @@ fn collection_value_rvalue(
                 remove: false,
             },
         )),
-        mir::Type::NullableByteRegion(kind) => Ok(mir::Rvalue::NullableByteRegion(
-            mir::NullableByteRegionExpression::CollectionIndex {
+        mir::Type::NullableRegion(kind) => Ok(mir::Rvalue::NullableRegion(
+            mir::NullableRegionExpression::CollectionIndex {
                 kind,
                 collection,
                 index: Box::new(index),
@@ -8723,9 +8733,7 @@ fn collection_value_rvalue(
 
 fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<mir::Rvalue> {
     match ty {
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
-            Ok(local_rvalue(local, ty, false))
-        }
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) => Ok(local_rvalue(local, ty, false)),
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::Local(local),
@@ -9205,9 +9213,7 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
         return DropObligation::SharedAccess(local, access.payload, access.writable);
     }
     match ty {
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
-            DropObligation::EndBorrow(local)
-        }
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) => DropObligation::EndBorrow(local),
         mir::Type::Class(class) | mir::Type::NullableClass(class) => {
             DropObligation::Class(local, class)
         }
@@ -10709,7 +10715,24 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Mixed => Some(mir::Type::Mixed),
             ResolvedType::Foreign(foreign) => foreign_mir_type(foreign, &self.collection_registry),
             ResolvedType::Error => Some(mir::Type::ERROR),
-            ResolvedType::ByteRegion(kind) => Some(mir::Type::ByteRegion(*kind)),
+            ResolvedType::ByteRegion(kind) => {
+                Some(mir::Type::Region(mir::RegionType::bytes(*kind)))
+            }
+            ResolvedType::ArrayRegion(kind, element) => self
+                .mir_resolved_type(element)
+                .and_then(|element| {
+                    self.collection_registry.ids.get(&(
+                        mir::CollectionKind::TypedArray,
+                        None,
+                        element,
+                    ))
+                })
+                .map(|array| {
+                    mir::Type::Region(mir::RegionType {
+                        access: *kind,
+                        array: Some(*array),
+                    })
+                }),
             ResolvedType::Function(_) => {
                 let ResolvedType::Function(function) =
                     substitute_resolved_type(ty, &self.type_substitutions)
@@ -10857,7 +10880,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Nullable(inner) => match self.mir_resolved_type(inner)? {
                 mir::Type::Scalar(ty) => Some(mir::Type::NullableScalar(ty)),
                 mir::Type::String => Some(mir::Type::NullableString),
-                mir::Type::ByteRegion(kind) => Some(mir::Type::NullableByteRegion(kind)),
+                mir::Type::Region(kind) => Some(mir::Type::NullableRegion(kind)),
                 mir::Type::Mixed => Some(mir::Type::NullableMixed),
                 mir::Type::Interface(interface) => Some(mir::Type::NullableInterface(interface)),
                 mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
@@ -10887,7 +10910,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
-                | mir::Type::NullableByteRegion(_)
+                | mir::Type::NullableRegion(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableInterface(_)
@@ -11202,9 +11225,7 @@ fn lower_grouped_var_decl(
                 context,
             )?),
         ),
-        mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_)
-        | mir::Type::ForeignAggregate(_) => {
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) | mir::Type::ForeignAggregate(_) => {
             lower_rvalue_as_expected(&decl.initializer, ty, context)?
         }
         mir::Type::Scalar(scalar) => {
@@ -11439,7 +11460,7 @@ enum ScalarPlace {
         property: crate::class_layout::PropertyId,
     },
     Static(mir::StaticId),
-    ByteRegionIndex {
+    RegionIndex {
         region: mir::LocalId,
         index: mir::Rvalue,
         index_span: Span,
@@ -11465,11 +11486,11 @@ impl ScalarPlace {
                 property: *property,
             },
             Self::Static(id) => mir::Operand::Static(*id),
-            Self::ByteRegionIndex {
+            Self::RegionIndex {
                 region,
                 index,
                 index_span,
-            } => mir::Operand::ByteRegionIndex {
+            } => mir::Operand::RegionIndex {
                 region: *region,
                 index: Box::new(index.clone()),
                 index_span: *index_span,
@@ -11530,11 +11551,11 @@ impl ScalarPlace {
                 target,
                 value: mir::Rvalue::Value(value),
             },
-            Self::ByteRegionIndex {
+            Self::RegionIndex {
                 region,
                 index,
                 index_span,
-            } => mir::Statement::AssignByteRegionIndex {
+            } => mir::Statement::AssignRegionIndex {
                 region,
                 index,
                 value: mir::Rvalue::Value(value),
@@ -11647,21 +11668,19 @@ fn lower_scalar_place(
             index,
             span,
         } => {
-            if matches!(
-                context.expression_type(collection)?,
-                mir::Type::ByteRegion(_)
-            ) {
+            if let mir::Type::Region(region_type) = context.expression_type(collection)? {
+                let element = byte_region::element_scalar(region_type, *span, context)?;
                 let region = byte_region::local(collection, true, context)?;
                 let index_type = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
                 let index = lower_rvalue_as_expected(index, index_type, context)?;
                 let (index, index_type) = core_value::materialize_value(index, context);
                 return Ok((
-                    ScalarPlace::ByteRegionIndex {
+                    ScalarPlace::RegionIndex {
                         region,
                         index: local_rvalue(index, index_type, false),
                         index_span: *span,
                     },
-                    mir::ScalarType::Integer(IntegerType::UInt8),
+                    element,
                 ));
             }
             let (collection, collection_type) = lower_collection_local(collection, context)?;
@@ -11768,20 +11787,15 @@ fn lower_assignment(
         span,
     } = target
     {
-        if matches!(
-            context.expression_type(collection)?,
-            mir::Type::ByteRegion(_)
-        ) {
+        if let mir::Type::Region(region_type) = context.expression_type(collection)? {
+            let element = byte_region::element_scalar(region_type, *span, context)?;
             let region = byte_region::local(collection, true, context)?;
             let index_type = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
             let index = lower_rvalue_as_expected(index, index_type, context)?;
             let (index, index_type) = core_value::materialize_value(index, context);
-            let value = lower_rvalue_as_expected(
-                &assignment.value,
-                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
-                context,
-            )?;
-            context.push_statement(mir::Statement::AssignByteRegionIndex {
+            let value =
+                lower_rvalue_as_expected(&assignment.value, mir::Type::Scalar(element), context)?;
+            context.push_statement(mir::Statement::AssignRegionIndex {
                 region,
                 index: local_rvalue(index, index_type, false),
                 value,
@@ -13901,7 +13915,7 @@ fn lower_display_string_expression(
         return Ok(mir::StringExpression::Local(local));
     }
     match ty {
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => Err(vec![unsupported(
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) => Err(vec![unsupported(
             expr.span(),
             "byte regions do not have an implicit display representation",
         )]),
@@ -14255,7 +14269,7 @@ fn hoist_argument_temporary(
 ) -> mir::Rvalue {
     let borrowed_move_value = value.borrows_move_value();
     let local = match ty {
-        mir::Type::ByteRegion(kind) | mir::Type::NullableByteRegion(kind) => {
+        mir::Type::Region(kind) | mir::Type::NullableRegion(kind) => {
             let owned = kind.is_writable() && !borrowed_move_value;
             context.declare_checked_call_slot(ty, owned)
         }
@@ -16287,8 +16301,8 @@ fn match_presence_condition(
     ty: mir::Type,
 ) -> DiagnosticResult<mir::BoolExpression> {
     let condition = match ty {
-        mir::Type::NullableByteRegion(kind) => mir::BoolExpression::NullableByteRegionIsPresent(
-            Box::new(mir::NullableByteRegionExpression::Local {
+        mir::Type::NullableRegion(kind) => mir::BoolExpression::NullableByteRegionIsPresent(
+            Box::new(mir::NullableRegionExpression::Local {
                 kind,
                 local,
                 transfer: false,
@@ -16525,12 +16539,10 @@ fn narrowed_match_local_rvalue(
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
     let value = match (source, narrowed) {
-        (mir::Type::NullableByteRegion(source), mir::Type::ByteRegion(target))
-            if source == target =>
-        {
-            mir::Rvalue::ByteRegion(mir::ByteRegionExpression::AssumePresent {
+        (mir::Type::NullableRegion(source), mir::Type::Region(target)) if source == target => {
+            mir::Rvalue::Region(mir::RegionExpression::AssumePresent {
                 kind: target,
-                value: Box::new(mir::NullableByteRegionExpression::Local {
+                value: Box::new(mir::NullableRegionExpression::Local {
                     kind: target,
                     local,
                     transfer: transfer && target.is_writable(),
@@ -17405,7 +17417,7 @@ fn lower_null_comparison(
         context.expression_type(value)?
     };
     let present = match value_type {
-        mir::Type::NullableByteRegion(kind) => {
+        mir::Type::NullableRegion(kind) => {
             mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
                 byte_region::nullable_expression(value, kind, false, context)?,
             ))
@@ -17597,7 +17609,7 @@ fn lower_is_condition(
         });
     }
     let result = match value_type {
-        mir::Type::ByteRegion(_) => {
+        mir::Type::Region(_) => {
             let presence = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
                 presence
@@ -17605,11 +17617,11 @@ fn lower_is_condition(
                 evaluate_then_false(presence)
             }
         }
-        mir::Type::NullableByteRegion(kind) => {
+        mir::Type::NullableRegion(kind) => {
             let presence = mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
                 byte_region::nullable_expression(expr, kind, false, context)?,
             ));
-            if tested_type == mir::Type::ByteRegion(kind) {
+            if tested_type == mir::Type::Region(kind) {
                 presence
             } else {
                 evaluate_then_false(presence)
@@ -17975,12 +17987,12 @@ fn lower_concrete_is_presence(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     match value_type {
-        mir::Type::ByteRegion(kind) => Ok(mir::BoolExpression::NullableByteRegionIsPresent(
-            Box::new(mir::NullableByteRegionExpression::Present(
-                byte_region::expression(expr, kind, false, context)?,
-            )),
-        )),
-        mir::Type::NullableByteRegion(kind) => {
+        mir::Type::Region(kind) => Ok(mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
+            mir::NullableRegionExpression::Present(byte_region::expression(
+                expr, kind, false, context,
+            )?),
+        ))),
+        mir::Type::NullableRegion(kind) => {
             Ok(mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
                 byte_region::nullable_expression(expr, kind, false, context)?,
             )))
@@ -19871,12 +19883,12 @@ fn lower_rvalue_as_expected(
         return Ok(value);
     }
     match expected {
-        mir::Type::ByteRegion(kind) => {
-            byte_region::expression(expr, kind, true, context).map(mir::Rvalue::ByteRegion)
+        mir::Type::Region(kind) => {
+            byte_region::expression(expr, kind, true, context).map(mir::Rvalue::Region)
         }
-        mir::Type::NullableByteRegion(kind) => {
+        mir::Type::NullableRegion(kind) => {
             byte_region::nullable_expression(expr, kind, true, context)
-                .map(mir::Rvalue::NullableByteRegion)
+                .map(mir::Rvalue::NullableRegion)
         }
         mir::Type::Interface(interface) => {
             lower_interface_expression(expr, interface, true, context)
@@ -20014,8 +20026,8 @@ fn materialize_checked_call(
         if matches!(
             context.expression_type(object)?,
             mir::Type::Collection(_)
-                | mir::Type::ByteRegion(_)
-                | mir::Type::NullableByteRegion(_)
+                | mir::Type::Region(_)
+                | mir::Type::NullableRegion(_)
                 | mir::Type::NullableCollection(_)
                 | mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Collection(_))
                 | mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Collection(_))
@@ -20298,8 +20310,8 @@ fn borrowed_stored_property_rvalue(
             field!(NullableSharedReferenceAccess, NullableSharedReferenceAccessExpression,
                 payload: payload, writable: matches!(ty, Type::NullableWritableSharedReferenceAccess(_)))
         }
-        Type::ByteRegion(_)
-        | Type::NullableByteRegion(_)
+        Type::Region(_)
+        | Type::NullableRegion(_)
         | Type::ClosureEnvironment(_)
         | Type::ForeignAggregate(_) => {
             return Err(vec![unsupported(
@@ -21449,12 +21461,12 @@ fn lower_rvalue_as_borrowed(
             lower_nullable_inline_expression(expr, ty, false, context)
                 .map(mir::Rvalue::NullableScalar)
         }
-        mir::Type::ByteRegion(kind) => {
-            byte_region::expression(expr, kind, false, context).map(mir::Rvalue::ByteRegion)
+        mir::Type::Region(kind) => {
+            byte_region::expression(expr, kind, false, context).map(mir::Rvalue::Region)
         }
-        mir::Type::NullableByteRegion(kind) => {
+        mir::Type::NullableRegion(kind) => {
             byte_region::nullable_expression(expr, kind, false, context)
-                .map(mir::Rvalue::NullableByteRegion)
+                .map(mir::Rvalue::NullableRegion)
         }
         mir::Type::Interface(interface) => {
             lower_interface_expression(expr, interface, false, context)
@@ -22221,7 +22233,7 @@ fn lower_mixed_expression(
     }
 
     match context.expression_type(expr)? {
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) => {
             unreachable!("byte region boxing is rejected by semantic lifetime checking")
         }
         mir::Type::Scalar(_) => Ok(mir::MixedExpression::BoxValue(lower_value_expression(
@@ -22319,7 +22331,7 @@ fn lower_mixed_expression(
 
 fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedTag> {
     match ty {
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) => {
             unreachable!("byte regions have no retained mixed representation")
         }
         mir::Type::Scalar(mir::ScalarType::Bool) => Ok(mir::MixedTag::Bool),
@@ -23262,8 +23274,8 @@ fn collection_remove_at_rvalue(
     index_span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
-        mir::Type::ByteRegion(kind) => Ok(mir::Rvalue::ByteRegion(
-            mir::ByteRegionExpression::CollectionIndex {
+        mir::Type::Region(kind) => Ok(mir::Rvalue::Region(
+            mir::RegionExpression::CollectionIndex {
                 kind,
                 collection,
                 index: Box::new(index),
@@ -23272,8 +23284,8 @@ fn collection_remove_at_rvalue(
                 remove: true,
             },
         )),
-        mir::Type::NullableByteRegion(kind) => Ok(mir::Rvalue::NullableByteRegion(
-            mir::NullableByteRegionExpression::CollectionIndex {
+        mir::Type::NullableRegion(kind) => Ok(mir::Rvalue::NullableRegion(
+            mir::NullableRegionExpression::CollectionIndex {
                 kind,
                 collection,
                 index: Box::new(index),
@@ -24625,8 +24637,8 @@ fn nullable_collection_access_rvalue(
 ) -> DiagnosticResult<mir::Rvalue> {
     let key = Box::new(key);
     match value_type {
-        mir::Type::ByteRegion(kind) | mir::Type::NullableByteRegion(kind) => Ok(
-            mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::CollectionGet {
+        mir::Type::Region(kind) | mir::Type::NullableRegion(kind) => Ok(
+            mir::Rvalue::NullableRegion(mir::NullableRegionExpression::CollectionGet {
                 kind,
                 collection,
                 key,
@@ -28611,11 +28623,11 @@ fn lower_integer_expression(
             }
             if matches!(property.as_str(), "length" | "count") {
                 if property == "length"
-                    && matches!(context.expression_type(object)?, mir::Type::ByteRegion(_))
+                    && matches!(context.expression_type(object)?, mir::Type::Region(_))
                 {
                     return Ok(mir::IntegerExpression::Use {
                         ty,
-                        operand: mir::Operand::ByteRegionLength(byte_region::local(
+                        operand: mir::Operand::RegionLength(byte_region::local(
                             object, false, context,
                         )?),
                     });
@@ -28640,10 +28652,15 @@ fn lower_integer_expression(
         hir::Expr::Index {
             collection, index, ..
         } => {
-            if matches!(
-                context.expression_type(collection)?,
-                mir::Type::ByteRegion(_)
-            ) {
+            if let mir::Type::Region(region_type) = context.expression_type(collection)? {
+                if byte_region::element_scalar(region_type, expr.span(), context)?
+                    != mir::ScalarType::Integer(ty)
+                {
+                    return Err(vec![unsupported(
+                        expr.span(),
+                        "a region element read has the element's type",
+                    )]);
+                }
                 let region = byte_region::local(collection, false, context)?;
                 let index = lower_rvalue_as_expected(
                     index,
@@ -28652,7 +28669,7 @@ fn lower_integer_expression(
                 )?;
                 return Ok(mir::IntegerExpression::Use {
                     ty,
-                    operand: mir::Operand::ByteRegionIndex {
+                    operand: mir::Operand::RegionIndex {
                         region,
                         index: Box::new(index),
                         index_span: expr.span(),

@@ -821,7 +821,7 @@ impl Interpreter<'_> {
         };
         let region = match progress {
             Some(length) if length <= entry.region.length => ByteRegionValue {
-                kind: mir::ByteRegionKind::Readonly,
+                kind: mir::RegionType::bytes(mir::ByteRegionKind::Readonly),
                 nullable: true,
                 source: entry.region.source,
                 length,
@@ -831,7 +831,7 @@ impl Interpreter<'_> {
                     "completed read exceeds its retained buffer",
                 ));
             }
-            None => ByteRegionValue::absent(mir::ByteRegionKind::Readonly),
+            None => ByteRegionValue::absent(mir::RegionType::bytes(mir::ByteRegionKind::Readonly)),
         };
         Ok(CheckedIoResult::Success(Some(LocalValue::ByteRegion(
             region,
@@ -1892,11 +1892,11 @@ function main(): void {
     fn reuse_ranges_use_original_storage_and_preserve_it_on_rejection() {
         for reading in [true, false] {
             let buffer = ByteRegionValue {
-                kind: if reading {
+                kind: mir::RegionType::bytes(if reading {
                     mir::ByteRegionKind::Writable
                 } else {
                     mir::ByteRegionKind::Readonly
-                },
+                }),
                 nullable: false,
                 source: Some(CollectionElementPlace {
                     collection: 4,

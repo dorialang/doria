@@ -951,6 +951,13 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
         ResolvedType::Nullable(inner) => format!("?{}", metadata_type_name(inner)),
         ResolvedType::Bytes => "Bytes".to_string(),
         ResolvedType::ByteRegion(kind) => kind.source_name().to_string(),
+        ResolvedType::ArrayRegion(kind, element) => {
+            format!(
+                "{}<{}>",
+                kind.array_source_name(),
+                metadata_type_name(element)
+            )
+        }
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
         ResolvedType::TypeParameter(name) => {

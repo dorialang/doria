@@ -225,8 +225,8 @@ impl Storage {
                     local.ty,
                     mir::Type::Function(_)
                         | mir::Type::NullableFunction(_)
-                        | mir::Type::ByteRegion(_)
-                        | mir::Type::NullableByteRegion(_)
+                        | mir::Type::Region(_)
+                        | mir::Type::NullableRegion(_)
                 )
             {
                 storage.contents[local.id.0].inputs.insert(local.id);

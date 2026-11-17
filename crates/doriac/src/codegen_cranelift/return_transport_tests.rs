@@ -134,7 +134,7 @@ fn values_wider_than_the_budget_return_through_the_result_slot() {
     // Unchecked ?ByteRegion from a free function and a method, and ?Deadline.
     assert!(wide
         .iter()
-        .any(|ty| matches!(ty, mir::Type::NullableByteRegion(_))));
+        .any(|ty| matches!(ty, mir::Type::NullableRegion(_))));
     assert!(wide
         .iter()
         .any(|ty| matches!(ty, mir::Type::NullableScalar(mir::ScalarType::Inline(_)))));

@@ -1031,7 +1031,7 @@ function main(): void {}
                         contents:
                             mir::IoContents::String(mir::StringExpression::Display(
                                 mir::ValueExpression::Integer(mir::IntegerExpression::Use {
-                                    operand: mir::Operand::ByteRegionLength(region),
+                                    operand: mir::Operand::RegionLength(region),
                                     ..
                                 }),
                             )),
@@ -1482,7 +1482,7 @@ function main(): void {{
 #[test]
 fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collection_views() {
     use doriac::mir::{
-        ByteRegionKind, NullableByteRegionExpression, Rvalue, Statement, Terminator, Type,
+        ByteRegionKind, NullableRegionExpression, Rvalue, Statement, Terminator, Type,
     };
 
     for source in writable_region_collection_writeback_fixtures() {
@@ -1494,7 +1494,11 @@ fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collect
             .find(|function| {
                 function.closure.is_some()
                     && function.locals.iter().any(|local| {
-                        local.ty == Type::NullableByteRegion(ByteRegionKind::Writable)
+                        local.ty
+                            == Type::NullableRegion(doriac::mir::RegionType {
+                                access: ByteRegionKind::Writable,
+                                array: None,
+                            })
                             && function.is_writable_borrowed_place(local.id)
                     })
             })
@@ -1503,7 +1507,11 @@ fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collect
             .locals
             .iter()
             .find(|local| {
-                local.ty == Type::NullableByteRegion(ByteRegionKind::Writable)
+                local.ty
+                    == Type::NullableRegion(doriac::mir::RegionType {
+                        access: ByteRegionKind::Writable,
+                        array: None,
+                    })
                     && function.is_writable_borrowed_place(local.id)
             })
             .unwrap()
@@ -1516,8 +1524,8 @@ fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collect
             .statements
             .push(Statement::AssignLocal {
                 target,
-                value: Rvalue::NullableByteRegion(NullableByteRegionExpression::Null {
-                    kind: ByteRegionKind::Writable,
+                value: Rvalue::NullableRegion(NullableRegionExpression::Null {
+                    kind: doriac::mir::RegionType::bytes(ByteRegionKind::Writable),
                 }),
             });
         let error = doriac::mir_validation::validate_program(&program).expect_err(&format!(

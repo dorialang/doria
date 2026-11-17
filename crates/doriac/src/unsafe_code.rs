@@ -89,6 +89,19 @@ fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     )
 }
 
+/// The E0784 diagnostic for a typed array region (Decision 0148 section 8)
+/// over elements of `element`, a type no execution target builds a region
+/// over yet.
+pub fn unbuilt_region_element(span: Span, region: &str, element: &str) -> Diagnostic {
+    unbuilt_form(
+        span,
+        "Array Regions Of This Element Type Cannot Be Built Yet",
+        format!(
+            "`{region}<{element}>` is part of Doria; this compiler builds array regions over integer elements, and not over `{element}` yet"
+        ),
+    )
+}
+
 /// The E0784 diagnostic for a checked form no execution target builds yet,
 /// for a gate that runs after checking, where the form's types are known.
 pub fn unbuilt_form(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
@@ -270,12 +283,9 @@ impl Finder {
         );
     }
 
-    /// `Doria\Std\Ffi` members whose surface lands later, and typed array
-    /// regions.
+    /// `Doria\Std\Ffi` members whose surface lands later.
     fn pending_name(&mut self, canonical: &str, span: Span) {
-        let pending = crate::compiler_known_ffi::PENDING_TYPES.contains(&canonical)
-            || matches!(canonical, "ArrayRegion" | "WritableArrayRegion");
-        if pending {
+        if crate::compiler_known_ffi::PENDING_TYPES.contains(&canonical) {
             let short = canonical.rsplit('\\').next().unwrap_or(canonical);
             self.report(
                 span,

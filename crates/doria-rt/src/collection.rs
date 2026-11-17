@@ -760,6 +760,15 @@ pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
     (*collection).length
 }
 
+/// The element storage of a typed array and its element stride, for the
+/// typed array regions that view it (Decision 0148 section 8). A typed
+/// array is fixed-length and never rotates, so its elements are contiguous
+/// from the first.
+pub(crate) unsafe fn element_storage(collection: *const DrCollectionV1) -> (*mut u8, usize) {
+    debug_assert!((*collection).kind != KIND_DEQUE || (*collection).head == 0);
+    ((*collection).values, (*collection).value_stride)
+}
+
 pub(crate) unsafe fn assertion_value_at(
     collection: *const DrCollectionV1,
     index: usize,

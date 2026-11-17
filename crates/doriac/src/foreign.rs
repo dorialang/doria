@@ -259,6 +259,30 @@ pub fn is_type_name(name: &str) -> bool {
     type_names().any(|candidate| candidate == name)
 }
 
+/// Whether a value of `ty` crosses the C boundary unchanged (section 6):
+/// fixed-width integers and floats, `bool`, pointers and their nullable
+/// forms, the boundary types, C function pointers and foreign structs and
+/// unions.
+pub fn is_ffi_safe(ty: &crate::types::ResolvedType) -> bool {
+    use crate::types::ResolvedType;
+    match ty {
+        ResolvedType::Integer(_) | ResolvedType::Float(_) | ResolvedType::Bool => true,
+        ResolvedType::Foreign(foreign) => match foreign.as_ref() {
+            ForeignType::Pointer { .. }
+            | ForeignType::Boundary(_)
+            | ForeignType::Function(_)
+            | ForeignType::Aggregate(_) => true,
+            ForeignType::Opaque | ForeignType::FixedArray { .. } => false,
+        },
+        ResolvedType::Nullable(inner) => matches!(
+            inner.as_ref(),
+            ResolvedType::Foreign(foreign)
+                if matches!(foreign.as_ref(), ForeignType::Pointer { .. } | ForeignType::Function(_))
+        ),
+        _ => false,
+    }
+}
+
 /// What checking establishes about one foreign struct or union (Decision
 /// 0148 section 6): its fields in declaration order and, when it has a body,
 /// its C layout on the native target. MIR lowering builds the aggregate's

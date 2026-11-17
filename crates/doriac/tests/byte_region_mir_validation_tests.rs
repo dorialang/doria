@@ -99,11 +99,11 @@ function main(): void {
     {
         if let Statement::AssignLocal {
             target,
-            value: Rvalue::ByteRegion(mir::ByteRegionExpression::CollectionIndex { kind, .. }),
+            value: Rvalue::Region(mir::RegionExpression::CollectionIndex { kind, .. }),
         } = statement
         {
             if *target == selected {
-                *kind = ByteRegionKind::Writable;
+                *kind = mir::RegionType::bytes(ByteRegionKind::Writable);
                 changed = true;
             }
         }
@@ -645,7 +645,7 @@ function main(): void {
         snapshot,
         vec![
             Statement::EndBorrow { local: child },
-            Statement::AssignByteRegionIndex {
+            Statement::AssignRegionIndex {
                 region: parent,
                 index: integer(IntegerType::Int64, 0),
                 value: integer(IntegerType::UInt8, 9),
@@ -726,7 +726,7 @@ fn resource_reads_follow_nested_transfer_order() {
             let operand = if ty == "Bytes" {
                 mir::Operand::CollectionLength(value)
             } else {
-                mir::Operand::ByteRegionLength(value)
+                mir::Operand::RegionLength(value)
             };
             let read = mir::IntegerExpression::Use {
                 ty: IntegerType::Int64,
@@ -803,16 +803,16 @@ function main(): void {}
                 assume_non_null: false,
             });
             let region = if use_helper {
-                Rvalue::ByteRegion(mir::ByteRegionExpression::Call {
-                    kind: ByteRegionKind::Writable,
+                Rvalue::Region(mir::RegionExpression::Call {
+                    kind: mir::RegionType::bytes(ByteRegionKind::Writable),
                     function: helper.id,
                     args: vec![source],
                     span,
                     return_borrow: helper.return_borrow,
                 })
             } else {
-                Rvalue::ByteRegion(mir::ByteRegionExpression::Region {
-                    kind: ByteRegionKind::Writable,
+                Rvalue::Region(mir::RegionExpression::Region {
+                    kind: mir::RegionType::bytes(ByteRegionKind::Writable),
                     source: Box::new(source),
                     offset: Box::new(integer(IntegerType::Int64, 0)),
                     length: Box::new(integer(IntegerType::Int64, 2)),
@@ -964,7 +964,7 @@ fn missing_copy_region_scope_end_keeps_the_source_frozen() {
             target: used,
             value: Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
                 ty: IntegerType::UInt8,
-                operand: mir::Operand::ByteRegionIndex {
+                operand: mir::Operand::RegionIndex {
                     region: copy,
                     index: Box::new(integer(IntegerType::Int64, 0)),
                     index_span: doriac::source::Span::new(0, 0),
@@ -1035,7 +1035,7 @@ function main(): void {
     let assignment = function.blocks.iter_mut().flat_map(|block| &mut block.statements)
         .find(|statement| matches!(statement, Statement::AssignLocal { target, .. } if *target == moved)).unwrap();
     let Statement::AssignLocal {
-        value: Rvalue::ByteRegion(mir::ByteRegionExpression::Local { transfer, .. }),
+        value: Rvalue::Region(mir::RegionExpression::Local { transfer, .. }),
         ..
     } = assignment
     else {
@@ -1070,7 +1070,7 @@ function main(): void {
     insert_after_assignment(
         function,
         child,
-        vec![Statement::AssignByteRegionIndex {
+        vec![Statement::AssignRegionIndex {
             region: view,
             index: integer(IntegerType::Int64, 0),
             value: integer(IntegerType::UInt8, 5),
@@ -1117,7 +1117,10 @@ fn readonly_region_carrier_cannot_claim_move_ownership() {
     let copy = local(function, "copy");
     assert_eq!(
         function.locals[copy.0].ty,
-        Type::ByteRegion(ByteRegionKind::Readonly)
+        Type::Region(doriac::mir::RegionType {
+            access: ByteRegionKind::Readonly,
+            array: None
+        })
     );
     function.locals[copy.0].owned = true;
     reject(&program, "Copy byte region cannot own a descriptor");
@@ -1141,7 +1144,10 @@ function main(): void {
     let mut erased = 0;
     for signature in &mut program.function_types {
         if signature.return_type
-            == mir::ReturnType::Value(Type::ByteRegion(ByteRegionKind::Readonly))
+            == mir::ReturnType::Value(Type::Region(doriac::mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }))
         {
             assert_eq!(
                 signature.return_borrow.unwrap().kind,
@@ -1171,7 +1177,10 @@ function main(): void {}
     );
     for signature in &mut opaque.function_types {
         if signature.return_type
-            == mir::ReturnType::Value(Type::ByteRegion(ByteRegionKind::Readonly))
+            == mir::ReturnType::Value(Type::Region(doriac::mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }))
         {
             signature.return_borrow = None;
         }

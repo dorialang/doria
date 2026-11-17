@@ -80,6 +80,12 @@ pub fn type_documentation(ty: &ResolvedType) -> Option<&'static str> {
         ResolvedType::ByteRegion(ByteRegionKind::Writable) => Some(
             "Exclusive borrowed byte region (Move), carried inline without owning storage or retaining a runtime reference count. `length` counts bytes; indexing reads `uint8`. Indexed writes and `getWritableRegion` require writable access. `getRegion` creates a readonly reborrow. `copyFrom` copies another region's bytes into this one and `copyWithin` moves bytes inside it, both in bulk. In an unsafe context `pointer` and, with writable access, `writablePointer` give the address of its first byte for C. The source must outlive every use; its complete place remains exclusively borrowed. Subregions do not establish disjoint ownership.",
         ),
+        ResolvedType::ArrayRegion(ByteRegionKind::Readonly, _) => Some(
+            "Readonly borrowed view of elements of a `T[]` (Copy), carried inline without owning storage or retaining a runtime reference count. `length` counts elements; indexing reads `T`. `getRegion` reborrows a subregion. When `T` is FFI-safe, `pointer` gives the address of its first element in an unsafe context. The source must outlive every use and cannot be mutated, moved, or destroyed while borrowed.",
+        ),
+        ResolvedType::ArrayRegion(ByteRegionKind::Writable, _) => Some(
+            "Exclusive borrowed view of elements of a `T[]` (Move), carried inline without owning storage or retaining a runtime reference count. `length` counts elements; indexing reads `T`. Indexed writes and `getWritableRegion` require writable access. `getRegion` creates a readonly reborrow. `copyFrom` copies another region's elements into this one. When `T` is FFI-safe, `pointer` and, with writable access, `writablePointer` give the address of its first element in an unsafe context. The source's complete place remains exclusively borrowed.",
+        ),
         _ => None,
     }
 }
@@ -128,15 +134,39 @@ fn string_member(name: &str) -> Option<ByteIntrinsic> {
 }
 
 /// Exact receiver types only. Nullable access and shared forwarding are resolved by the caller.
+///
+/// Typed array regions (Decision 0148 section 8) mirror the byte regions:
+/// `T[]` has `getRegion` and `getWritableRegion` (its other members are the
+/// typed array's own), and `ArrayRegion<T>` and `WritableArrayRegion<T>`
+/// have the region members over elements of `T`, without `copyWithin`, with
+/// `pointer` and `writablePointer` when `T` is FFI-safe.
 pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
-    let writable_storage = match receiver {
-        ResolvedType::Bytes | ResolvedType::ByteRegion(ByteRegionKind::Writable) => true,
-        ResolvedType::ByteRegion(ByteRegionKind::Readonly) => false,
+    let byte = ResolvedType::Integer(IntegerType::UInt8);
+    let (writable_storage, element, typed) = match receiver {
+        ResolvedType::Bytes | ResolvedType::ByteRegion(ByteRegionKind::Writable) => {
+            (true, byte.clone(), false)
+        }
+        ResolvedType::ByteRegion(ByteRegionKind::Readonly) => (false, byte.clone(), false),
+        ResolvedType::TypedArray(element) => {
+            if !matches!(name, "getRegion" | "getWritableRegion") {
+                return None;
+            }
+            (true, element.as_ref().clone(), true)
+        }
+        ResolvedType::ArrayRegion(kind, element) => {
+            (kind.is_writable(), element.as_ref().clone(), true)
+        }
         ResolvedType::String => return string_member(name),
         _ => return None,
     };
+    let region = |kind: ByteRegionKind| {
+        if typed {
+            ResolvedType::ArrayRegion(kind, Box::new(element.clone()))
+        } else {
+            ResolvedType::ByteRegion(kind)
+        }
+    };
     let int = ResolvedType::Integer(IntegerType::Int64);
-    let byte = ResolvedType::Integer(IntegerType::UInt8);
     let mut spec = ByteIntrinsic {
         name: "",
         kind: ByteMemberKind::Method,
@@ -197,22 +227,36 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
             } else {
                 ReceiverMode::Readonly
             });
-            spec.return_type = ResolvedType::ByteRegion(if writable {
+            spec.return_type = region(if writable {
                 ByteRegionKind::Writable
             } else {
                 ByteRegionKind::Readonly
             });
-            spec.documentation = "Borrows a byte subregion without allocation, copying bytes, or extending the source lifetime. Offsets and lengths are nonnegative byte counts; an empty region at the end is valid. Invalid bounds panic. The result retains the source provenance and the borrow applies to the complete source place.";
+            spec.documentation = if typed {
+                "Borrows a region of elements without allocation, copying elements, or extending the source lifetime. Offsets and lengths are nonnegative element counts; an empty region at the end is valid. Invalid bounds panic. The result retains the source provenance and the borrow applies to the complete source place."
+            } else {
+                "Borrows a byte subregion without allocation, copying bytes, or extending the source lifetime. Offsets and lengths are nonnegative byte counts; an empty region at the end is valid. Invalid bounds panic. The result retains the source provenance and the borrow applies to the complete source place."
+            };
         }
-        "copyFrom" if matches!(receiver, ResolvedType::ByteRegion(ByteRegionKind::Writable)) => {
+        "copyFrom"
+            if matches!(
+                receiver,
+                ResolvedType::ByteRegion(ByteRegionKind::Writable)
+                    | ResolvedType::ArrayRegion(ByteRegionKind::Writable, _)
+            ) =>
+        {
             spec.name = "copyFrom";
             spec.parameters.push(ByteParameter {
                 name: "source",
-                ty: ResolvedType::ByteRegion(ByteRegionKind::Readonly),
+                ty: region(ByteRegionKind::Readonly),
             });
             spec.receiver_mode = Some(ReceiverMode::Writable);
             spec.return_type = int;
-            spec.documentation = "Copies bytes from the start of `source` to the start of this region and returns the count: the smaller of the two lengths. Neither region is resized and no storage is allocated. Requires writable access to this region.";
+            spec.documentation = if typed {
+                "Copies elements from the start of `source` to the start of this region and returns the count: the smaller of the two lengths. Neither region is resized and no storage is allocated. Requires writable access to this region."
+            } else {
+                "Copies bytes from the start of `source` to the start of this region and returns the count: the smaller of the two lengths. Neither region is resized and no storage is allocated. Requires writable access to this region."
+            };
         }
         "copyWithin" if matches!(receiver, ResolvedType::ByteRegion(ByteRegionKind::Writable)) => {
             spec.name = "copyWithin";
@@ -230,7 +274,9 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
         // valid until the innermost enclosing unsafe context ends. Forming
         // it pins the region's storage for that context.
         "pointer" | "writablePointer"
-            if matches!(receiver, ResolvedType::ByteRegion(_))
+            if (matches!(receiver, ResolvedType::ByteRegion(_))
+                || matches!(receiver, ResolvedType::ArrayRegion(..))
+                    && crate::foreign::is_ffi_safe(&element))
                 && (name == "pointer" || writable_storage) =>
         {
             let writable = name == "writablePointer";
@@ -252,14 +298,18 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
                     } else {
                         crate::foreign::PointerAccess::Read
                     },
-                    pointee: byte,
+                    pointee: element.clone(),
                 }));
             spec.unsafe_operation = Some(if writable {
                 "forming a writable pointer to a region"
             } else {
                 "forming a pointer to a region"
             });
-            spec.documentation = if writable {
+            spec.documentation = if typed && writable {
+                "The address of this region's first element, with write access (`MutPtr<T>`), for C functions that fill an array. Needs an unsafe context and writable access to the region. The region's storage stays in place, and cannot be moved, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context. An empty region gives a non-null address aligned for `T` that must not be dereferenced."
+            } else if typed {
+                "The address of this region's first element (`Ptr<T>`), for C functions that read an array. Needs an unsafe context. The region's storage stays in place, and cannot be moved, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context. An empty region gives a non-null address aligned for `T` that must not be dereferenced."
+            } else if writable {
                 "The address of this region's first byte, with write access (`MutPtr<uint8>`), for C functions that fill a buffer. Needs an unsafe context and writable access to the region. The region's storage stays in place, and cannot be moved, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context. An empty region gives a non-null address that must not be dereferenced."
             } else {
                 "The address of this region's first byte (`Ptr<uint8>`), for C functions that read a buffer. Needs an unsafe context. The region's storage stays in place, and cannot be moved, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context. An empty region gives a non-null address that must not be dereferenced."
@@ -270,7 +320,11 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
             spec.kind = ByteMemberKind::Property;
             spec.return_type = int;
             spec.descriptor_metadata = true;
-            spec.documentation = "Readonly number of bytes in this storage or region.";
+            spec.documentation = if typed {
+                "Readonly number of elements in this region."
+            } else {
+                "Readonly number of bytes in this storage or region."
+            };
         }
         "[]" => {
             spec.name = "[]";
@@ -279,9 +333,13 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
                 name: "index",
                 ty: int,
             });
-            spec.return_type = byte;
+            spec.return_type = element.clone();
             spec.writable_place = writable_storage;
-            spec.documentation = "Reads one byte by its zero-based index. Invalid bounds panic. Writes and read-modify-write require writable storage and writable access to the receiver.";
+            spec.documentation = if typed {
+                "Reads one element by its zero-based index. Invalid bounds panic as `T[]` indexing does. Writes require a writable region and writable access to it."
+            } else {
+                "Reads one byte by its zero-based index. Invalid bounds panic. Writes and read-modify-write require writable storage and writable access to the receiver."
+            };
         }
         _ => return None,
     }

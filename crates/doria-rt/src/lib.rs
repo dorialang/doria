@@ -170,8 +170,9 @@ pub struct DrStringV1 {
 }
 
 pub use byte_region::{
-    dr_v1_byte_region_copy, dr_v1_byte_region_copy_within, dr_v2_byte_region_get,
-    dr_v2_byte_region_set, dr_v2_byte_region_subregion, dr_v2_bytes_region,
+    dr_v1_array_region_copy, dr_v1_byte_region_copy, dr_v1_byte_region_copy_within,
+    dr_v2_array_region, dr_v2_array_region_element, dr_v2_array_region_subregion,
+    dr_v2_byte_region_get, dr_v2_byte_region_set, dr_v2_byte_region_subregion, dr_v2_bytes_region,
 };
 pub use bytes::DrBytesV1;
 pub use collection::{

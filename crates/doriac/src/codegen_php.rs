@@ -1479,10 +1479,7 @@ fn emit_php_closure_carrier(
                     .return_borrow
                     .is_some_and(|borrow| borrow.kind == mir::ReturnBorrowKind::Value)
                     && ty.has_move_ownership()
-                    && !matches!(
-                        ty,
-                        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-                    )
+                    && !matches!(ty, mir::Type::Region(_) | mir::Type::NullableRegion(_))
                 {
                     "__DoriaCell"
                 } else {
@@ -1615,8 +1612,8 @@ fn php_mir_type(
 ) -> String {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(_)) => "int".to_string(),
-        mir::Type::ByteRegion(_) => "__DoriaByteRegion".to_string(),
-        mir::Type::NullableByteRegion(_) => "?__DoriaByteRegion".to_string(),
+        mir::Type::Region(_) => "__DoriaByteRegion".to_string(),
+        mir::Type::NullableRegion(_) => "?__DoriaByteRegion".to_string(),
         mir::Type::Scalar(mir::ScalarType::Float(_)) => "float".to_string(),
         mir::Type::Scalar(mir::ScalarType::Bool) => "bool".to_string(),
         mir::Type::Scalar(mir::ScalarType::Enum(id)) => specialization.enum_symbol_by_id(id),
@@ -3347,6 +3344,7 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
     }
     if let Some(ty) = semantic_info.expression_type(expr.span()) {
         foreign_value(ty, expr.span())?;
+        array_region_value(ty, expr.span())?;
         enum_core::validate_collection(ty, expr.span())?;
     }
     if let Expr::StaticMember {
@@ -4095,6 +4093,22 @@ fn unsupported_collection_shape(span: Span, feature: impl Into<String>) -> Backe
         ),
         span,
     )])
+}
+
+/// PHP output does not build typed array regions (Decision 0148 section 8)
+/// yet; byte regions build.
+fn array_region_value(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
+    let region = match ty {
+        ResolvedType::Nullable(inner) => inner.as_ref(),
+        ty => ty,
+    };
+    match region {
+        ResolvedType::ArrayRegion(..) => Err(unsupported_collection_shape(
+            span,
+            "typed array regions (`ArrayRegion<T>` and `WritableArrayRegion<T>`)",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// PHP output runs unsafe code, and takes the target's C data model,
@@ -8400,6 +8414,7 @@ fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bo
         ResolvedType::Nullable(inner) => resolved_type_needs_php_drop(inner, scopes),
         ResolvedType::Void
         | ResolvedType::ByteRegion(_)
+        | ResolvedType::ArrayRegion(..)
         | ResolvedType::Integer(_)
         | ResolvedType::Float(_)
         | ResolvedType::String
@@ -11519,6 +11534,13 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
         ResolvedType::String => "string".to_string(),
         ResolvedType::Bytes => "Bytes".to_string(),
         ResolvedType::ByteRegion(kind) => kind.source_name().to_string(),
+        ResolvedType::ArrayRegion(kind, element) => {
+            format!(
+                "{}[{}]",
+                kind.array_source_name(),
+                resolved_type_identity(element)
+            )
+        }
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
         ResolvedType::Mixed => "mixed".to_string(),
@@ -12142,6 +12164,9 @@ fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
         ResolvedType::Nullable(inner) => php_nullable_type_hint(php_resolved_type(inner, scopes)),
         ResolvedType::Bytes => "__DoriaBytes".to_string(),
         ResolvedType::ByteRegion(_) => "__DoriaByteRegion".to_string(),
+        // PHP output does not build typed array regions yet; the program is
+        // rejected before emission, so no declaration uses this hint.
+        ResolvedType::ArrayRegion(..) => "mixed".to_string(),
         ResolvedType::TypedArray(_)
         | ResolvedType::List(_)
         | ResolvedType::Dictionary(_, _)

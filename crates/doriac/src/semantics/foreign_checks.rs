@@ -400,21 +400,7 @@ impl<'program> Checker<'program> {
 
     /// Whether a value of `ty` crosses the C boundary unchanged (section 6).
     pub(super) fn is_ffi_safe(&self, ty: TypeId) -> bool {
-        match self.types.kind(ty) {
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool => true,
-            TypeKind::Foreign(foreign) => match foreign {
-                ForeignType::Pointer { .. }
-                | ForeignType::Boundary(_)
-                | ForeignType::Function(_)
-                | ForeignType::Aggregate(_) => true,
-                ForeignType::Opaque | ForeignType::FixedArray { .. } => false,
-            },
-            TypeKind::Nullable(inner) => matches!(
-                self.types.kind(*inner),
-                TypeKind::Foreign(ForeignType::Pointer { .. } | ForeignType::Function(_))
-            ),
-            _ => false,
-        }
+        crate::foreign::is_ffi_safe(&self.types.resolved(ty))
     }
 
     /// Reports E0786 when `ty` is not FFI-safe, naming the type to use.

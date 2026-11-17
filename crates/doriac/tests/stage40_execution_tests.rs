@@ -863,3 +863,124 @@ function main(): void
     // the storage's address, and no copy is made.
     assert_runs_natively(&source, "true true 0 65 65 0 2 65 true 6 111");
 }
+
+const ARRAY_REGIONS: &str = "
+function total(ArrayRegion<int32> $values): int64
+{
+    writable int64 $sum = 0;
+    for (writable int $index = 0; $index < $values->length; $index++) {
+        $sum += Int64::from($values[$index]);
+    }
+    return $sum;
+}
+
+function fill(writable WritableArrayRegion<int32> $values, int32 $value): void
+{
+    for (writable int $index = 0; $index < $values->length; $index++) {
+        $values[$index] = $value;
+    }
+}
+";
+
+#[test]
+fn typed_array_regions_view_read_write_and_copy_elements_in_place() {
+    // Decision 0148 section 8: views over `T[]` that copy nothing.
+    let source = format!(
+        "{ARRAY_REGIONS}
+function main(): void
+{{
+    writable int32[] $numbers = [1, 2, 3, 4, 5, 6];
+    echo total($numbers->getRegion(1, 3));
+    {{
+        writable WritableArrayRegion<int32> $tail = $numbers->getWritableRegion(4, 2);
+        fill($tail, 7);
+        $tail[0] += 1;
+    }}
+    echo \" \" . $numbers[4] . \" \" . $numbers[5];
+    let $part = $numbers->getRegion(0, 6)->getRegion(2, 2);
+    echo \" \" . $part[0] . \" \" . $part[1] . \" \" . $part->length;
+    int32[] $other = [9, 10];
+    {{
+        writable WritableArrayRegion<int32> $front = $numbers->getWritableRegion(0, 3);
+        echo \" \" . $front->copyFrom($other->getRegion(0, 2));
+        let $inner = $front->getWritableRegion(2, 1);
+        echo \" \" . $inner->length;
+    }}
+    echo \" \" . $numbers[0] . \" \" . $numbers[1] . \" \" . $numbers[2];
+    writable uint16[] $wide = [1, 2, 3];
+    {{
+        writable WritableArrayRegion<uint16> $middle = $wide->getWritableRegion(1, 1);
+        $middle[0] = UInt16::from(65535);
+    }}
+    echo \" \" . $wide[1] . \" \" . $wide->getRegion(3, 0)->length;
+}}
+"
+    );
+    assert_runs_everywhere(&source, "9 8 7 3 4 2 2 1 9 10 3 65535 0");
+}
+
+#[test]
+fn array_region_bounds_panic_as_typed_arrays_do() {
+    assert_panics_everywhere(
+        "function main(): void { int32[] $numbers = [1, 2, 3]; echo \"a\"; let $region = $numbers->getRegion(2, 2); echo $region->length; }",
+        "a",
+        "P1305",
+    );
+    assert_panics_everywhere(
+        "function main(): void { int32[] $numbers = [1, 2, 3]; let $region = $numbers->getRegion(1, 2); echo $region[1]; echo $region[2]; }",
+        "3",
+        "P1310",
+    );
+}
+
+#[test]
+fn array_region_pointers_address_the_typed_array_storage() {
+    let source = format!(
+        "{POINTER}
+function main(): void
+{{
+    writable int32[] $numbers = [1, 2, 3, 4];
+    unsafe {{
+        let $first = $numbers->getRegion(1, 2)->pointer;
+        echo $first->read() . \" \" . $first->offset(1)->read();
+        let $whole = $numbers->getRegion(0, 4)->pointer;
+        echo \" \" . ($first->address - $whole->address);
+    }}
+    unsafe {{
+        writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(3, 1);
+        $region->writablePointer->write(40);
+    }}
+    echo \" \" . $numbers[3];
+    int64[] $empty = [];
+    unsafe {{
+        echo \" \" . ($empty->getRegion(0, 0)->pointer->address % UInt64::from(8));
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "2 3 4 40 0");
+}
+
+#[test]
+fn array_regions_report_what_cannot_be_built_yet() {
+    let strings = "function main(): void { string[] $names = [\"Ada\"]; let $region = $names->getRegion(0, 1); echo $region->length; }";
+    let diagnostics = doriac::lower_source_to_mir("stage40.doria", strings.to_string())
+        .expect_err("array regions of strings are not built yet");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Array Regions Of This Element Type Cannot Be Built Yet"),
+        "{diagnostics:#?}"
+    );
+    let source = format!("{ARRAY_REGIONS}function main(): void {{ int32[] $numbers = [1]; echo total($numbers->getRegion(0, 1)); }}");
+    let diagnostics =
+        doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+            .expect_err("PHP output does not build typed array regions yet");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "B2301"),
+        "{diagnostics:#?}"
+    );
+}

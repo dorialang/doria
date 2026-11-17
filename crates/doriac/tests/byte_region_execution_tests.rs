@@ -177,8 +177,8 @@ fn executes(body: &str, stdout: &str) {
 fn region_carriers_are_inline_and_nullable_presence_is_separate() {
     for kind in [ByteRegionKind::Readonly, ByteRegionKind::Writable] {
         for width in [4, 8] {
-            let ty = Type::ByteRegion(kind);
-            let nullable = Type::NullableByteRegion(kind);
+            let ty = Type::Region(doriac::mir::RegionType::bytes(kind));
+            let nullable = Type::NullableRegion(doriac::mir::RegionType::bytes(kind));
             assert_eq!(
                 doriac::native_abi::collection_value_width(ty, width),
                 Some(width * 2)
@@ -199,7 +199,7 @@ fn region_carriers_are_inline_and_nullable_presence_is_separate() {
             assert!(!doriac::native_closure_abi::needs_drop(nullable));
         }
         assert_eq!(
-            Type::ByteRegion(kind).has_move_ownership(),
+            Type::Region(doriac::mir::RegionType::bytes(kind)).has_move_ownership(),
             kind.is_writable()
         );
     }

@@ -2856,6 +2856,56 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok((data, length))
     }
 
+    /// The element type of a typed array region local and the
+    /// bounds-checked address of its element `index` (Decision 0148
+    /// section 8); `None` for a byte region.
+    fn typed_region_element(
+        &mut self,
+        region: mir::LocalId,
+        index: BasicValueEnum<'ctx>,
+        span: crate::source::Span,
+    ) -> Result<Option<(mir::Type, PointerValue<'ctx>)>, BackendError> {
+        let mir::Type::Region(region_type) = local_in(self.function, region)?.ty else {
+            return Err(malformed_mir(
+                "a region element access names a present region",
+            ));
+        };
+        if region_type.array.is_none() {
+            return Ok(None);
+        }
+        let (element, stride) = crate::native_abi::array_region_element(self.program, region_type)
+            .ok_or_else(|| {
+                malformed_mir("a typed array region views elements the targets build")
+            })?;
+        let value = self.lower_byte_region_local(region, false)?;
+        let (data, length) = self.byte_region_parts(value)?;
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let word = self.context.ptr_sized_int_type(self.target_data, None);
+        let address = self
+            .call_runtime(
+                crate::native_abi::ARRAY_REGION_ELEMENT,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    word.into(),
+                    self.context.i64_type().into(),
+                    word.into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    self.current_frame.into(),
+                    data.into(),
+                    length.into(),
+                    index.into(),
+                    word.const_int(u64::from(stride), false).into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("an array region element produced no address"))?
+            .into_pointer_value();
+        Ok(Some((element, address)))
+    }
+
     fn lower_byte_region_local(
         &self,
         local: mir::LocalId,
@@ -2878,13 +2928,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn lower_byte_region_expression(
         &mut self,
-        expression: &mir::ByteRegionExpression,
+        expression: &mir::RegionExpression,
     ) -> Result<StructValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let word = self.context.ptr_sized_int_type(self.target_data, None);
         let int = self.context.i64_type();
         match expression {
-            mir::ByteRegionExpression::CollectionIndex {
+            mir::RegionExpression::CollectionIndex {
                 collection,
                 index,
                 index_span,
@@ -2900,7 +2950,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     *positional,
                 )?
                 .into_struct_value()),
-            mir::ByteRegionExpression::Region {
+            mir::RegionExpression::Region {
                 source,
                 offset,
                 length,
@@ -2912,79 +2962,130 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let offset = self.lower_rvalue(offset)?.into_int_value();
                 let length = self.lower_rvalue(length)?.into_int_value();
                 self.set_active_panic_site(*span)?;
-                let data = if matches!(source_ty, mir::Type::ByteRegion(_)) {
-                    let (data, source_length) =
-                        self.byte_region_parts(source.into_struct_value())?;
-                    self.call_runtime(
-                        BYTE_REGION_SUBREGION,
-                        &[
-                            pointer.into(),
-                            pointer.into(),
-                            word.into(),
-                            int.into(),
-                            int.into(),
-                        ],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            data.into(),
-                            source_length.into(),
-                            offset.into(),
-                            length.into(),
-                        ],
-                    )?
-                } else if source_ty == mir::Type::String {
-                    // `string->byteRegion`: the string's own UTF-8 bytes,
-                    // bounded by the same subregion checks as any region.
-                    let data = self
-                        .call_runtime(
-                            STRING_DATA,
-                            &[pointer.into()],
+                let typed_stride = match expression.kind() {
+                    region if region.array.is_some() => Some(
+                        crate::native_abi::array_region_element(self.program, region)
+                            .ok_or_else(|| {
+                                malformed_mir(
+                                    "a typed array region views elements the targets build",
+                                )
+                            })?
+                            .1,
+                    ),
+                    _ => None,
+                };
+                let data =
+                    if let (Some(stride), mir::Type::Region(_)) = (typed_stride, source_ty) {
+                        let (data, source_length) =
+                            self.byte_region_parts(source.into_struct_value())?;
+                        self.call_runtime(
+                            crate::native_abi::ARRAY_REGION_SUBREGION,
+                            &[
+                                pointer.into(),
+                                pointer.into(),
+                                word.into(),
+                                int.into(),
+                                int.into(),
+                                word.into(),
+                            ],
                             Some(pointer.into()),
-                            &[source.into()],
+                            &[
+                                self.current_frame.into(),
+                                data.into(),
+                                source_length.into(),
+                                offset.into(),
+                                length.into(),
+                                word.const_int(u64::from(stride), false).into(),
+                            ],
                         )?
-                        .ok_or_else(|| backend_failure("string data produced no result"))?;
-                    let source_length = self
-                        .call_runtime(
-                            STRING_BYTE_LENGTH,
-                            &[pointer.into()],
-                            Some(word.into()),
-                            &[source.into()],
+                    } else if typed_stride.is_some() {
+                        // A `T[]`: the runtime knows its element storage.
+                        self.call_runtime(
+                            crate::native_abi::ARRAY_REGION,
+                            &[pointer.into(), pointer.into(), int.into(), int.into()],
+                            Some(pointer.into()),
+                            &[
+                                self.current_frame.into(),
+                                source.into(),
+                                offset.into(),
+                                length.into(),
+                            ],
                         )?
-                        .ok_or_else(|| backend_failure("string length produced no result"))?;
-                    self.call_runtime(
-                        BYTE_REGION_SUBREGION,
-                        &[
-                            pointer.into(),
-                            pointer.into(),
-                            word.into(),
-                            int.into(),
-                            int.into(),
-                        ],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            data.into(),
-                            source_length.into(),
-                            offset.into(),
-                            length.into(),
-                        ],
-                    )?
-                } else {
-                    self.call_runtime(
-                        BYTES_REGION,
-                        &[pointer.into(), pointer.into(), int.into(), int.into()],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            source.into(),
-                            offset.into(),
-                            length.into(),
-                        ],
-                    )?
-                }
-                .ok_or_else(|| backend_failure("byte region formation produced no data pointer"))?
-                .into_pointer_value();
+                    } else if matches!(source_ty, mir::Type::Region(_)) {
+                        let (data, source_length) =
+                            self.byte_region_parts(source.into_struct_value())?;
+                        self.call_runtime(
+                            BYTE_REGION_SUBREGION,
+                            &[
+                                pointer.into(),
+                                pointer.into(),
+                                word.into(),
+                                int.into(),
+                                int.into(),
+                            ],
+                            Some(pointer.into()),
+                            &[
+                                self.current_frame.into(),
+                                data.into(),
+                                source_length.into(),
+                                offset.into(),
+                                length.into(),
+                            ],
+                        )?
+                    } else if source_ty == mir::Type::String {
+                        // `string->byteRegion`: the string's own UTF-8 bytes,
+                        // bounded by the same subregion checks as any region.
+                        let data = self
+                            .call_runtime(
+                                STRING_DATA,
+                                &[pointer.into()],
+                                Some(pointer.into()),
+                                &[source.into()],
+                            )?
+                            .ok_or_else(|| backend_failure("string data produced no result"))?;
+                        let source_length = self
+                            .call_runtime(
+                                STRING_BYTE_LENGTH,
+                                &[pointer.into()],
+                                Some(word.into()),
+                                &[source.into()],
+                            )?
+                            .ok_or_else(|| backend_failure("string length produced no result"))?;
+                        self.call_runtime(
+                            BYTE_REGION_SUBREGION,
+                            &[
+                                pointer.into(),
+                                pointer.into(),
+                                word.into(),
+                                int.into(),
+                                int.into(),
+                            ],
+                            Some(pointer.into()),
+                            &[
+                                self.current_frame.into(),
+                                data.into(),
+                                source_length.into(),
+                                offset.into(),
+                                length.into(),
+                            ],
+                        )?
+                    } else {
+                        self.call_runtime(
+                            BYTES_REGION,
+                            &[pointer.into(), pointer.into(), int.into(), int.into()],
+                            Some(pointer.into()),
+                            &[
+                                self.current_frame.into(),
+                                source.into(),
+                                offset.into(),
+                                length.into(),
+                            ],
+                        )?
+                    }
+                    .ok_or_else(|| {
+                        backend_failure("byte region formation produced no data pointer")
+                    })?
+                    .into_pointer_value();
                 let length = build(self.builder.build_int_cast(
                     length,
                     word,
@@ -2992,10 +3093,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 self.byte_region_value(data, length)
             }
-            mir::ByteRegionExpression::Local {
+            mir::RegionExpression::Local {
                 local, transfer, ..
             } => self.lower_byte_region_local(*local, *transfer),
-            mir::ByteRegionExpression::Call {
+            mir::RegionExpression::Call {
                 function,
                 args,
                 span,
@@ -3004,13 +3105,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call_at(*function, args, true, *span)?
                 .ok_or_else(|| malformed_mir("byte region call produced no result"))?
                 .into_struct_value()),
-            mir::ByteRegionExpression::AssumePresent { value, .. } => {
+            mir::RegionExpression::AssumePresent { value, .. } => {
                 let value = self.lower_nullable_byte_region_expression(value)?;
                 let projected = self.nullable_parts(value)?.1.into_struct_value();
                 self.forward_evaluated_borrow_home(value.into(), projected.into());
                 Ok(projected)
             }
-            mir::ByteRegionExpression::Coalesce { left, right, .. } => {
+            mir::RegionExpression::Coalesce { left, right, .. } => {
                 let left = self.lower_nullable_byte_region_expression(left)?;
                 Ok(self
                     .lower_coalesce_payload(left, |lowerer| {
@@ -3023,10 +3124,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn lower_nullable_byte_region_expression(
         &mut self,
-        expression: &mir::NullableByteRegionExpression,
+        expression: &mir::NullableRegionExpression,
     ) -> Result<StructValue<'ctx>, BackendError> {
         match expression {
-            mir::NullableByteRegionExpression::CollectionIndex {
+            mir::NullableRegionExpression::CollectionIndex {
                 collection,
                 index,
                 index_span,
@@ -3042,7 +3143,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     *positional,
                 )?
                 .into_struct_value()),
-            mir::NullableByteRegionExpression::CollectionGet {
+            mir::NullableRegionExpression::CollectionGet {
                 kind,
                 collection,
                 key,
@@ -3052,30 +3153,30 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => Ok(self
                 .lower_nullable_aggregate_collection_get(
                     *index_span,
-                    mir::Type::NullableByteRegion(*kind),
+                    mir::Type::NullableRegion(*kind),
                     *collection,
                     key,
                     *access,
                 )?
                 .into_struct_value()),
-            mir::NullableByteRegionExpression::Null { kind } => Ok(llvm_type(
+            mir::NullableRegionExpression::Null { kind } => Ok(llvm_type(
                 self.context,
                 self.target_data,
                 self.program,
-                mir::Type::NullableByteRegion(*kind),
+                mir::Type::NullableRegion(*kind),
             )
             .const_zero()
             .into_struct_value()),
-            mir::NullableByteRegionExpression::Present(value) => {
+            mir::NullableRegionExpression::Present(value) => {
                 let value = self.lower_byte_region_expression(value)?;
                 let wrapped = self.nullable_value(self.present_word(true), value.into())?;
                 self.forward_evaluated_borrow_home(value.into(), wrapped.into());
                 Ok(wrapped)
             }
-            mir::NullableByteRegionExpression::Local {
+            mir::NullableRegionExpression::Local {
                 local, transfer, ..
             } => self.lower_byte_region_local(*local, *transfer),
-            mir::NullableByteRegionExpression::Call {
+            mir::NullableRegionExpression::Call {
                 function,
                 args,
                 span,
@@ -3765,18 +3866,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .const_int(1, false);
                 return Ok(self.nullable_value(present, value)?.into());
             }
-            (mir::Type::ByteRegion(source), mir::Type::NullableByteRegion(target))
-                if source == target =>
-            {
+            (mir::Type::Region(source), mir::Type::NullableRegion(target)) if source == target => {
                 let present = self
                     .context
                     .ptr_sized_int_type(self.target_data, None)
                     .const_int(1, false);
                 return Ok(self.nullable_value(present, value)?.into());
             }
-            (mir::Type::NullableByteRegion(source), mir::Type::ByteRegion(target))
-                if source == target =>
-            {
+            (mir::Type::NullableRegion(source), mir::Type::Region(target)) if source == target => {
                 let (present, payload) = self.nullable_parts(value.into_struct_value())?;
                 self.require_present_borrow(present)?;
                 return Ok(payload);
@@ -5415,37 +5512,43 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
             }
             mir::Statement::EndBorrow { .. } => {}
-            mir::Statement::AssignByteRegionIndex {
+            mir::Statement::AssignRegionIndex {
                 region,
                 index,
                 value,
                 index_span,
             } => {
-                let region = self.lower_byte_region_local(*region, false)?;
-                let (data, length) = self.byte_region_parts(region)?;
                 let index = self.lower_rvalue(index)?;
                 let value = self.lower_rvalue(value)?;
-                self.set_active_panic_site(*index_span)?;
-                let pointer = self.context.ptr_type(AddressSpace::default());
-                let word = self.context.ptr_sized_int_type(self.target_data, None);
-                self.call_runtime(
-                    BYTE_REGION_SET,
-                    &[
-                        pointer.into(),
-                        pointer.into(),
-                        word.into(),
-                        self.context.i64_type().into(),
-                        self.context.i8_type().into(),
-                    ],
-                    None,
-                    &[
-                        self.current_frame.into(),
-                        data.into(),
-                        length.into(),
-                        index.into(),
-                        value.into(),
-                    ],
-                )?;
+                if let Some((_, address)) =
+                    self.typed_region_element(*region, index, *index_span)?
+                {
+                    build(self.builder.build_store(address, value))?;
+                } else {
+                    let region = self.lower_byte_region_local(*region, false)?;
+                    let (data, length) = self.byte_region_parts(region)?;
+                    self.set_active_panic_site(*index_span)?;
+                    let pointer = self.context.ptr_type(AddressSpace::default());
+                    let word = self.context.ptr_sized_int_type(self.target_data, None);
+                    self.call_runtime(
+                        BYTE_REGION_SET,
+                        &[
+                            pointer.into(),
+                            pointer.into(),
+                            word.into(),
+                            self.context.i64_type().into(),
+                            self.context.i8_type().into(),
+                        ],
+                        None,
+                        &[
+                            self.current_frame.into(),
+                            data.into(),
+                            length.into(),
+                            index.into(),
+                            value.into(),
+                        ],
+                    )?;
+                }
             }
             mir::Statement::CopyWithinByteRegion {
                 region,
@@ -6002,8 +6105,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         }
                         mir::Type::Scalar(_)
                         | mir::Type::NullableScalar(_)
-                        | mir::Type::ByteRegion(_)
-                        | mir::Type::NullableByteRegion(_)
+                        | mir::Type::Region(_)
+                        | mir::Type::NullableRegion(_)
                         | mir::Type::Interface(_)
                         | mir::Type::NullableInterface(_) => None,
                         mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
@@ -10231,8 +10334,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::Type::Scalar(_)
             | mir::Type::NullableScalar(_)
-            | mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_) => Ok(()),
+            | mir::Type::Region(_)
+            | mir::Type::NullableRegion(_) => Ok(()),
         }
     }
 
@@ -11005,8 +11108,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.refresh_borrowed_local(local)?;
         }
         let value = match expression {
-            mir::Rvalue::ByteRegion(value) => Ok(self.lower_byte_region_expression(value)?.into()),
-            mir::Rvalue::NullableByteRegion(value) => {
+            mir::Rvalue::Region(value) => Ok(self.lower_byte_region_expression(value)?.into()),
+            mir::Rvalue::NullableRegion(value) => {
                 Ok(self.lower_nullable_byte_region_expression(value)?.into())
             }
             mir::Rvalue::Function(value) => Ok(self.lower_function_expression(value)?.into()),
@@ -12126,8 +12229,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::Type::Function(_)
             | mir::Type::NullableFunction(_)
-            | mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_)
+            | mir::Type::Region(_)
+            | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
@@ -12219,8 +12322,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )),
             mir::Type::Function(_)
             | mir::Type::NullableFunction(_)
-            | mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_)
+            | mir::Type::Region(_)
+            | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
                 "aggregate carriers cannot use scalar collection transport",
@@ -12326,8 +12429,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::Type::Function(_)
             | mir::Type::NullableFunction(_)
-            | mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_)
+            | mir::Type::Region(_)
+            | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
@@ -14174,7 +14277,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ))?;
             return Ok(self.nullable_value(present, payload)?.into());
         }
-        if matches!(definition.value, mir::Type::ByteRegion(_)) {
+        if matches!(definition.value, mir::Type::Region(_)) {
             let found = build(self.builder.build_load(
                 self.context.i8_type(),
                 found,
@@ -16154,8 +16257,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::Type::Scalar(_)
             | mir::Type::NullableScalar(_)
-            | mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_)
+            | mir::Type::Region(_)
+            | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_) => Ok(()),
             mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
                 self.drop_function_carrier(value.into_struct_value())
@@ -16221,8 +16324,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 definition.value,
                 mir::Type::Scalar(_)
                     | mir::Type::NullableScalar(_)
-                    | mir::Type::ByteRegion(_)
-                    | mir::Type::NullableByteRegion(_)
+                    | mir::Type::Region(_)
+                    | mir::Type::NullableRegion(_)
             );
         let scalar_keys = definition.key.is_none_or(|key| {
             matches!(key, mir::Type::Scalar(_)) && !native_closure_abi::needs_drop(key)
@@ -22032,19 +22135,49 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     })?
                     .into_int_value())
             }
-            mir::IntegerExpression::CopyByteRegion {
+            mir::IntegerExpression::CopyRegion {
                 destination,
                 source,
                 ..
             } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let word = self.context.ptr_sized_int_type(self.target_data, None);
+                let typed = match destination.ty() {
+                    mir::Type::Region(region) if region.array.is_some() => Some(
+                        crate::native_abi::array_region_element(self.program, region)
+                            .ok_or_else(|| {
+                                malformed_mir(
+                                    "a typed array region views elements the targets build",
+                                )
+                            })?
+                            .1,
+                    ),
+                    _ => None,
+                };
                 let destination = self.lower_rvalue(destination)?.into_struct_value();
                 let (destination_data, destination_length) = self.byte_region_parts(destination)?;
                 let source = self.lower_rvalue(source)?.into_struct_value();
                 let (source_data, source_length) = self.byte_region_parts(source)?;
-                let count = self
-                    .call_runtime(
+                let count = match typed {
+                    Some(stride) => self.call_runtime(
+                        crate::native_abi::ARRAY_REGION_COPY,
+                        &[
+                            pointer.into(),
+                            word.into(),
+                            pointer.into(),
+                            word.into(),
+                            word.into(),
+                        ],
+                        Some(word.into()),
+                        &[
+                            destination_data.into(),
+                            destination_length.into(),
+                            source_data.into(),
+                            source_length.into(),
+                            word.const_int(u64::from(stride), false).into(),
+                        ],
+                    )?,
+                    None => self.call_runtime(
                         BYTE_REGION_COPY,
                         &[pointer.into(), word.into(), pointer.into(), word.into()],
                         Some(word.into()),
@@ -22054,9 +22187,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             source_data.into(),
                             source_length.into(),
                         ],
-                    )?
-                    .ok_or_else(|| backend_failure("region copy produced no count"))?
-                    .into_int_value();
+                    )?,
+                }
+                .ok_or_else(|| backend_failure("region copy produced no count"))?
+                .into_int_value();
                 build(self.builder.build_int_z_extend_or_bit_cast(
                     count,
                     self.context.i64_type(),
@@ -23285,7 +23419,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<IntValue<'ctx>, BackendError> {
         self.refresh_borrowed_operand(operand)?;
         match operand {
-            mir::Operand::ByteRegionLength(region) if ty == IntegerType::Int64 => {
+            mir::Operand::RegionLength(region) if ty == IntegerType::Int64 => {
                 let region = self.lower_byte_region_local(*region, false)?;
                 let (_, length) = self.byte_region_parts(region)?;
                 build(self.builder.build_int_cast(
@@ -23294,7 +23428,32 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "byte-region.length.int",
                 ))
             }
-            mir::Operand::ByteRegionIndex {
+            mir::Operand::RegionIndex {
+                region,
+                index,
+                index_span,
+            } if matches!(
+                local_in(self.function, *region)?.ty,
+                mir::Type::Region(mir::RegionType { array: Some(_), .. })
+            ) =>
+            {
+                let index = self.lower_rvalue(index)?;
+                let (element, address) = self
+                    .typed_region_element(*region, index, *index_span)?
+                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+                if element != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
+                    return Err(malformed_mir(
+                        "a region element read has the element's type",
+                    ));
+                }
+                Ok(build(self.builder.build_load(
+                    integer_type(self.context, ty),
+                    address,
+                    "array-region.element",
+                ))?
+                .into_int_value())
+            }
+            mir::Operand::RegionIndex {
                 region,
                 index,
                 index_span,
@@ -26199,8 +26358,8 @@ fn collection_storage_type<'ctx>(
         }
         mir::Type::Function(_)
         | mir::Type::NullableFunction(_)
-        | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_)
+        | mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
         | mir::Type::ForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
@@ -26333,8 +26492,8 @@ fn llvm_type<'ctx>(
     }
     match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
-        mir::Type::ByteRegion(_) => byte_region_type(context, target_data).into(),
-        mir::Type::NullableByteRegion(_) => nullable_type(
+        mir::Type::Region(_) => byte_region_type(context, target_data).into(),
+        mir::Type::NullableRegion(_) => nullable_type(
             context,
             target_data,
             byte_region_type(context, target_data).into(),

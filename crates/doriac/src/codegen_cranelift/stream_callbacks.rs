@@ -345,7 +345,7 @@ fn emit(
                         builder.ins().store(flags, args[2], slot, 0);
                         slot
                     }
-                    mir::Type::ByteRegion(_) => {
+                    mir::Type::Region(_) => {
                         let slot = scratch(builder, pointer, pointer.bytes() * 2, pointer.bytes());
                         builder.ins().store(flags, data, slot, 0);
                         builder

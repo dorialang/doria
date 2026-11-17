@@ -3466,7 +3466,7 @@ fn signature(
                                 move_nominal_names,
                                 receiver_class,
                             ) || symbolic))
-                            || crate::types::ByteRegionKind::from_source_name(&param.ty.name)
+                            || crate::types::ByteRegionKind::from_region_name(&param.ty.name)
                                 .is_some(),
                         symbolic,
                     )
@@ -3477,7 +3477,7 @@ fn signature(
         .filter(|_| {
             function.return_type.as_ref().is_some_and(|ty| {
                 type_ref_is_move_type_with_nominals(ty, classes, move_nominal_names, receiver_class)
-                    || crate::types::ByteRegionKind::from_source_name(&ty.name).is_some()
+                    || crate::types::ByteRegionKind::from_region_name(&ty.name).is_some()
                     || type_ref_has_any_ownership_parameter(
                         ty,
                         &function.type_params,
@@ -3489,7 +3489,7 @@ fn signature(
             function
                 .return_type
                 .as_ref()
-                .and_then(|ty| crate::types::ByteRegionKind::from_source_name(&ty.name))
+                .and_then(|ty| crate::types::ByteRegionKind::from_region_name(&ty.name))
                 .map_or(borrow, |kind| ReturnBorrow {
                     source: borrow.source,
                     kind: ReturnBorrowKind::Retained,
@@ -11292,7 +11292,8 @@ pub(crate) fn resolved_type_is_move_type(
     move_enum_names: &MoveEnums,
 ) -> bool {
     match ty {
-        crate::types::ResolvedType::ByteRegion(kind) => kind.is_writable(),
+        crate::types::ResolvedType::ByteRegion(kind)
+        | crate::types::ResolvedType::ArrayRegion(kind, _) => kind.is_writable(),
         crate::types::ResolvedType::Class(class) => class.inline_copy_type().is_none(),
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
@@ -11506,7 +11507,7 @@ fn type_ref_is_move_type_with_nominals(
     // Every Stage 25a handle and access object is a move type (record 0106):
     // plain assignment transfers the handle and never silently retains.
     ty.function.is_some()
-        || crate::types::ByteRegionKind::from_source_name(&ty.name)
+        || crate::types::ByteRegionKind::from_region_name(&ty.name)
             .is_some_and(crate::types::ByteRegionKind::is_writable)
         || crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
         || type_ref_class_name(ty, classes, receiver_class).is_some()

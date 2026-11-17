@@ -1780,8 +1780,8 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::Collection(_) | mir::Type::NullableCollection(_) => FieldType::Collection,
         mir::Type::Function(_) => FieldType::Function,
         mir::Type::NullableFunction(_) => FieldType::NullableFunction,
-        mir::Type::ByteRegion(kind) => FieldType::ByteRegion(kind),
-        mir::Type::NullableByteRegion(kind) => FieldType::NullableByteRegion(kind),
+        mir::Type::Region(kind) => FieldType::ByteRegion(kind.access),
+        mir::Type::NullableRegion(kind) => FieldType::NullableByteRegion(kind.access),
         mir::Type::ClosureEnvironment(_) => FieldType::SharedReferenceAccess,
         mir::Type::PayloadEnum(ty) => {
             let layout = &program.enums[ty.id.0].layout;
@@ -2701,16 +2701,16 @@ fn validate_statement(
             }
             Ok(())
         }
-        mir::Statement::AssignByteRegionIndex {
+        mir::Statement::AssignRegionIndex {
             region,
             index,
             value,
             ..
         } => {
             byte_regions::validate_index(program, function, *region, index, true)?;
-            if value.ty() != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)) {
+            if value.ty() != byte_regions::element(program, function, *region)? {
                 return Err(malformed_mir(
-                    "byte region index assignment value must be uint8",
+                    "a region element assignment stores the region's element type",
                 ));
             }
             validate_rvalue(program, function, value)
@@ -2723,6 +2723,12 @@ fn validate_statement(
             ..
         } => {
             byte_regions::validate_index(program, function, *region, offset, true)?;
+            if matches!(
+                local_in(function, *region)?.ty,
+                mir::Type::Region(mir::RegionType { array: Some(_), .. })
+            ) {
+                return Err(malformed_mir("copyWithin moves bytes inside a byte region"));
+            }
             for operand in [length, destination] {
                 if operand.ty() != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)) {
                     return Err(malformed_mir("byte region copy bounds must be int"));
@@ -2900,20 +2906,18 @@ fn validate_statement(
                             mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => {
                                 ty.capabilities.needs_drop
                             }
-                            ty => {
-                                byte_regions::kind(ty).is_none_or(mir::ByteRegionKind::is_writable)
-                            }
+                            ty => byte_regions::kind(ty).is_none_or(mir::RegionType::is_writable),
                         },
                         ..declared_local.clone()
                     });
             let local = replacement_owner.as_ref().unwrap_or(declared_local);
             match (local.ty, value) {
-                (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_), _) => {
+                (mir::Type::Region(_) | mir::Type::NullableRegion(_), _) => {
                     byte_regions::validate_assignment(program, function, local, value)
                 }
-                (_, mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_)) => Err(
-                    malformed_mir("byte region assigned to a different carrier type"),
-                ),
+                (_, mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_)) => Err(malformed_mir(
+                    "byte region assigned to a different carrier type",
+                )),
                 (
                     mir::Type::ForeignAggregate(expected),
                     mir::Rvalue::ForeignAggregate(expression),
@@ -3456,8 +3460,14 @@ fn validate_statement(
                     | mir::Type::String
                     | mir::Type::NullableScalar(_)
                     | mir::Type::NullableString
-                    | mir::Type::ByteRegion(mir::ByteRegionKind::Readonly)
-                    | mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly)
+                    | mir::Type::Region(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None
+                    })
+                    | mir::Type::NullableRegion(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None
+                    })
                     | mir::Type::PayloadEnum(mir::PayloadEnumType {
                         capabilities: crate::enums::EnumCapabilities { copy: true, .. },
                         ..
@@ -4492,7 +4502,7 @@ fn validate_terminator(
                     require_owned_inline_claim(expression)?;
                 }
                 let absent = expression.is_null_value();
-                if byte_regions::kind(return_type).is_some_and(mir::ByteRegionKind::is_writable)
+                if byte_regions::kind(return_type).is_some_and(mir::RegionType::is_writable)
                     && expression.borrows_move_value()
                     && !absent
                 {
@@ -4949,7 +4959,10 @@ fn validate_terminator(
                     Some(mir::Type::PayloadEnum(*outcome))
                 }
                 mir::CheckedIoOperation::TransferGroupReadRegion { .. } => {
-                    Some(mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly))
+                    Some(mir::Type::NullableRegion(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None,
+                    }))
                 }
                 mir::CheckedIoOperation::ConfigureTransferPlan { class, .. }
                 | mir::CheckedIoOperation::WatchTransferPlan { class, .. }
@@ -5374,7 +5387,11 @@ fn validate_checked_io_operation(
             validate_owned_file_local(program, function, *file, false)?;
             validate_file_transfer_kind(program, function, *file, true)?;
             let destination = local_in(function, *destination)?;
-            if destination.ty != mir::Type::ByteRegion(mir::ByteRegionKind::Writable)
+            if destination.ty
+                != mir::Type::Region(mir::RegionType {
+                    access: mir::ByteRegionKind::Writable,
+                    array: None,
+                })
                 || !destination.writable
             {
                 return Err(malformed_mir(
@@ -5391,7 +5408,10 @@ fn validate_checked_io_operation(
             validate_owned_file_local(program, function, *file, false)?;
             validate_file_transfer_kind(program, function, *file, false)?;
             if local_in(function, *source)?.ty
-                != mir::Type::ByteRegion(mir::ByteRegionKind::Readonly)
+                != mir::Type::Region(mir::RegionType {
+                    access: mir::ByteRegionKind::Readonly,
+                    array: None,
+                })
             {
                 return Err(malformed_mir(
                     "file write requires readonly borrowed byte storage",
@@ -5410,7 +5430,9 @@ fn validate_checked_io_operation(
             } else {
                 mir::ByteRegionKind::Readonly
             };
-            if region.ty != mir::Type::ByteRegion(kind) || (stream.is_input() && !region.writable) {
+            if region.ty != mir::Type::Region(mir::RegionType::bytes(kind))
+                || (stream.is_input() && !region.writable)
+            {
                 return Err(malformed_mir(
                     "standard transfer requires its exact borrowed byte-region access",
                 ));
@@ -5446,7 +5468,9 @@ fn validate_checked_io_operation(
             } else {
                 mir::ByteRegionKind::Readonly
             };
-            if region.ty != mir::Type::ByteRegion(kind) || (read && !region.writable) {
+            if region.ty != mir::Type::Region(mir::RegionType::bytes(kind))
+                || (read && !region.writable)
+            {
                 return Err(malformed_mir(
                     "pending preparation requires its matching borrowed byte region",
                 ));
@@ -5875,7 +5899,7 @@ fn validate_indirect_arguments(
             )));
         }
         validate_rvalue(program, caller, argument)?;
-        if byte_regions::kind(parameter.ty).is_some_and(mir::ByteRegionKind::is_writable)
+        if byte_regions::kind(parameter.ty).is_some_and(mir::RegionType::is_writable)
             && parameter.mode == mir::FunctionParameterMode::Writable
         {
             byte_regions::require_writable(program, caller, argument)?;
@@ -6086,14 +6110,25 @@ fn validate_integer_expression(
             }
             validate_enum_expression(program, function, value)
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
         } => {
-            if destination.ty() != mir::Type::ByteRegion(mir::ByteRegionKind::Writable)
-                || source.ty() != mir::Type::ByteRegion(mir::ByteRegionKind::Readonly)
-            {
+            // Both regions view the same elements: bytes, or the elements
+            // of one typed array type the targets build regions over.
+            let same_view = match (destination.ty(), source.ty()) {
+                (mir::Type::Region(destination), mir::Type::Region(source)) => {
+                    destination.is_writable()
+                        && !source.is_writable()
+                        && destination.array == source.array
+                        && (destination.array.is_none()
+                            || crate::native_abi::array_region_element(program, destination)
+                                .is_some())
+                }
+                _ => false,
+            };
+            if !same_view {
                 return Err(malformed_mir(
                     "region copy needs a writable destination and a readonly source region",
                 ));
@@ -6435,8 +6470,8 @@ fn validate_enum_operand(
             validate_mixed_payload_operand(function, *mixed, *tag, expected)
         }
         mir::Operand::CollectionLength(_)
-        | mir::Operand::ByteRegionLength(_)
-        | mir::Operand::ByteRegionIndex { .. }
+        | mir::Operand::RegionLength(_)
+        | mir::Operand::RegionIndex { .. }
         | mir::Operand::CollectionKeyAt { .. }
         | mir::Operand::StringIntrinsic(_) => Err(malformed_mir(
             "enum expression uses an incompatible operand",
@@ -6510,7 +6545,7 @@ fn validate_pointer_operation(
             Some(pointer)
         }
         mir::PointerOperation::RegionData { region, align } => {
-            if !matches!(local_in(function, *region)?.ty, mir::Type::ByteRegion(_)) {
+            if !matches!(local_in(function, *region)?.ty, mir::Type::Region(_)) {
                 return Err(malformed_mir(
                     "a region pointer reads a present region local",
                 ));
@@ -6602,10 +6637,8 @@ fn validate_rvalue(
     expression: &mir::Rvalue,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::Rvalue::ByteRegion(value) => {
-            byte_regions::validate_expression(program, function, value)
-        }
-        mir::Rvalue::NullableByteRegion(value) => {
+        mir::Rvalue::Region(value) => byte_regions::validate_expression(program, function, value),
+        mir::Rvalue::NullableRegion(value) => {
             byte_regions::validate_nullable_expression(program, function, value)
         }
         mir::Rvalue::Value(value) => validate_value_expression(program, function, value),
@@ -11015,7 +11048,7 @@ fn infer_rvalue_return_borrow(
         };
     }
     match source {
-        mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_) => {
+        mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_) => {
             byte_regions::inferred_borrow(program, function, source)
         }
         mir::Rvalue::Interface(source) => {
@@ -12692,8 +12725,8 @@ fn collect_rvalue_class_local_accesses<'a>(
         accesses.independent_value(value);
     }
     match value {
-        mir::Rvalue::ByteRegion(value) => byte_regions::collect_expression(value, accesses),
-        mir::Rvalue::NullableByteRegion(value) => {
+        mir::Rvalue::Region(value) => byte_regions::collect_expression(value, accesses),
+        mir::Rvalue::NullableRegion(value) => {
             byte_regions::collect_nullable_expression(value, accesses)
         }
         mir::Rvalue::Value(value) => collect_value_class_local_accesses(value, accesses),
@@ -13679,8 +13712,8 @@ fn collect_operand_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match operand {
-        mir::Operand::ByteRegionLength(local) => accesses.resource_read(*local),
-        mir::Operand::ByteRegionIndex { region, index, .. } => {
+        mir::Operand::RegionLength(local) => accesses.resource_read(*local),
+        mir::Operand::RegionIndex { region, index, .. } => {
             accesses.resource_read(*region);
             collect_rvalue_class_local_accesses(index, accesses);
             accesses.contents_access(*region, false);
@@ -13765,7 +13798,7 @@ fn collect_integer_class_local_accesses<'a>(
         mir::IntegerExpression::EnumBacking { value, .. } => {
             collect_enum_class_local_accesses(value, accesses)
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -14515,7 +14548,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             accesses.resource_read(*outcome);
         }
         mir::Statement::EndBorrow { .. } => {}
-        mir::Statement::AssignByteRegionIndex {
+        mir::Statement::AssignRegionIndex {
             region,
             index,
             value,
@@ -16513,14 +16546,14 @@ fn rvalue_reads_collection_value_at(
                 ..
             },
         )
-        | mir::Rvalue::ByteRegion(mir::ByteRegionExpression::CollectionIndex {
+        | mir::Rvalue::Region(mir::RegionExpression::CollectionIndex {
             collection,
             index,
             positional,
             remove,
             ..
         })
-        | mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::CollectionIndex {
+        | mir::Rvalue::NullableRegion(mir::NullableRegionExpression::CollectionIndex {
             collection,
             index,
             positional,
@@ -18297,7 +18330,7 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
                     nullable_collection_expression_is_present(value, present)
                 }
-                (mir::Type::NullableByteRegion(_), mir::Rvalue::NullableByteRegion(value)) => {
+                (mir::Type::NullableRegion(_), mir::Rvalue::NullableRegion(value)) => {
                     byte_regions::nullable_present(value, present)
                 }
                 (mir::Type::NullableInterface(_), mir::Rvalue::NullableInterface(value)) => {
@@ -18329,7 +18362,7 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
                     nullable_collection_expression_is_present(value, present)
                 }
-                (mir::Type::NullableByteRegion(_), mir::Rvalue::NullableByteRegion(value)) => {
+                (mir::Type::NullableRegion(_), mir::Rvalue::NullableRegion(value)) => {
                     byte_regions::nullable_present(value, present)
                 }
                 (mir::Type::NullableInterface(_), mir::Rvalue::NullableInterface(value)) => {
@@ -18998,7 +19031,7 @@ fn apply_nullable_presence_condition(
             }
         }
         mir::BoolExpression::NullableByteRegionIsPresent(value) => {
-            if let mir::NullableByteRegionExpression::Local { local, .. } = value.as_ref() {
+            if let mir::NullableRegionExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
             }
         }
@@ -20473,7 +20506,7 @@ fn statement_observes_property(
         },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,
-        mir::Statement::AssignByteRegionIndex { index, value, .. } => {
+        mir::Statement::AssignRegionIndex { index, value, .. } => {
             rvalue_observes_property(index, receiver, property)
                 || rvalue_observes_property(value, receiver, property)
         }
@@ -20685,7 +20718,7 @@ fn rvalue_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_) => {
+        mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_) => {
             let mut accesses = ClassLocalAccesses::default();
             collect_rvalue_class_local_accesses(value, &mut accesses);
             let observed = accesses
@@ -21542,7 +21575,7 @@ fn integer_observes_property(
         mir::IntegerExpression::EnumBacking { value, .. } => {
             enum_observes_property(value, receiver, property)
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -22245,7 +22278,7 @@ fn validate_call_args_for_params(
                 ));
             }
             if parameter_definition.writable
-                && byte_regions::kind(parameter_type).is_some_and(mir::ByteRegionKind::is_writable)
+                && byte_regions::kind(parameter_type).is_some_and(mir::RegionType::is_writable)
             {
                 byte_regions::require_writable(program, caller, argument)?;
             }
@@ -22588,7 +22621,7 @@ fn escaping_class_local_borrows(
     argument: &mir::Rvalue,
 ) -> Result<Vec<mir::LocalId>, BackendError> {
     match argument {
-        mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_) => {
+        mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_) => {
             byte_regions::escaping(program, argument)
         }
         mir::Rvalue::Mixed(expression) => escaping_mixed_local_borrows(program, expression),
@@ -23632,9 +23665,9 @@ fn validate_integer_operand(
     operand: &mir::Operand,
 ) -> Result<(), BackendError> {
     match operand {
-        mir::Operand::ByteRegionLength(local) => {
+        mir::Operand::RegionLength(local) => {
             if ty != IntegerType::Int64
-                || !matches!(local_in(function, *local)?.ty, mir::Type::ByteRegion(_))
+                || !matches!(local_in(function, *local)?.ty, mir::Type::Region(_))
             {
                 return Err(malformed_mir(
                     "byte region length requires a non-null region and int result",
@@ -23642,9 +23675,13 @@ fn validate_integer_operand(
             }
             Ok(())
         }
-        mir::Operand::ByteRegionIndex { region, index, .. } => {
-            if ty != IntegerType::UInt8 {
-                return Err(malformed_mir("byte region index result must be uint8"));
+        mir::Operand::RegionIndex { region, index, .. } => {
+            if mir::Type::Scalar(mir::ScalarType::Integer(ty))
+                != byte_regions::element(program, function, *region)?
+            {
+                return Err(malformed_mir(
+                    "a region element read has the region's element type",
+                ));
             }
             byte_regions::validate_index(program, function, *region, index, false)
         }
@@ -23764,7 +23801,7 @@ fn validate_bool_operand(
 ) -> Result<(), BackendError> {
     let expected = mir::Type::Scalar(mir::ScalarType::Bool);
     match operand {
-        mir::Operand::ByteRegionLength(_) | mir::Operand::ByteRegionIndex { .. } => {
+        mir::Operand::RegionLength(_) | mir::Operand::RegionIndex { .. } => {
             Err(malformed_mir("byte region measurement is not bool"))
         }
         mir::Operand::CollectionIteratorPosition { .. } => {
@@ -23854,7 +23891,7 @@ fn validate_float_operand(
 ) -> Result<(), BackendError> {
     let expected = mir::Type::Scalar(mir::ScalarType::Float(ty));
     match operand {
-        mir::Operand::ByteRegionLength(_) | mir::Operand::ByteRegionIndex { .. } => {
+        mir::Operand::RegionLength(_) | mir::Operand::RegionIndex { .. } => {
             Err(malformed_mir("byte region measurement is not float"))
         }
         mir::Operand::CollectionIteratorPosition { .. } => {
@@ -24538,7 +24575,7 @@ fn validate_null_safe_call(
             ));
         }
         mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
-        mir::Type::ByteRegion(kind) => mir::Type::NullableByteRegion(kind),
+        mir::Type::Region(kind) => mir::Type::NullableRegion(kind),
         mir::Type::PayloadEnum(payload) => mir::Type::NullablePayloadEnum(payload),
         mir::Type::Function(function_type) => mir::Type::NullableFunction(function_type),
         mir::Type::ClosureEnvironment(_) => {
@@ -24552,7 +24589,7 @@ fn validate_null_safe_call(
             ));
         }
         mir::Type::NullableScalar(_)
-        | mir::Type::NullableByteRegion(_)
+        | mir::Type::NullableRegion(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableInterface(_)

@@ -106,12 +106,17 @@ impl Plan {
 
     fn field_type(&self, ty: mir::Type) -> Option<ResolvedType> {
         match ty {
-            mir::Type::ByteRegion(kind) => return Some(ResolvedType::ByteRegion(kind)),
-            mir::Type::NullableByteRegion(kind) => {
+            // PHP output builds byte regions; it rejects typed array
+            // regions before emission.
+            mir::Type::Region(kind) if kind.array.is_none() => {
+                return Some(ResolvedType::ByteRegion(kind.access))
+            }
+            mir::Type::NullableRegion(kind) if kind.array.is_none() => {
                 return Some(ResolvedType::Nullable(Box::new(ResolvedType::ByteRegion(
-                    kind,
+                    kind.access,
                 ))))
             }
+            mir::Type::Region(_) | mir::Type::NullableRegion(_) => return None,
             _ => {}
         }
         let (ty, nullable) = match ty {

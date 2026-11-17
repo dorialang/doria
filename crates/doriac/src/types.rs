@@ -123,6 +123,9 @@ pub(crate) fn resolve_nominal_kinds_with(
         ResolvedType::TypedArray(inner) => {
             ResolvedType::TypedArray(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
+        ResolvedType::ArrayRegion(kind, inner) => {
+            ResolvedType::ArrayRegion(kind, Box::new(resolve_nominal_kinds_with(*inner, resolve)))
+        }
         ResolvedType::List(inner) => {
             ResolvedType::List(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
@@ -298,6 +301,14 @@ fn resolve_type_ref(
             "[]" if arguments.len() == 1 => {
                 ResolvedType::TypedArray(Box::new(arguments[0].clone()))
             }
+            name if arguments.len() == 1
+                && ByteRegionKind::from_array_source_name(name).is_some() =>
+            {
+                ResolvedType::ArrayRegion(
+                    ByteRegionKind::from_array_source_name(name)?,
+                    Box::new(arguments[0].clone()),
+                )
+            }
             "List" if arguments.len() == 1 => ResolvedType::List(Box::new(arguments[0].clone())),
             "Dictionary" if arguments.len() == 2 => ResolvedType::Dictionary(
                 Box::new(arguments[0].clone()),
@@ -318,8 +329,7 @@ fn resolve_type_ref(
             name if arguments.len() == 1 => {
                 if let Some(kind) = crate::types::SharedHandleKind::from_source_name(name) {
                     ResolvedType::SharedHandle(kind, Box::new(arguments[0].clone()))
-                } else if let Some(access) = crate::foreign::PointerAccess::from_source_name(name)
-                {
+                } else if let Some(access) = crate::foreign::PointerAccess::from_source_name(name) {
                     ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Pointer {
                         access,
                         pointee: arguments[0].clone(),
@@ -1045,9 +1055,33 @@ impl ByteRegionKind {
             .find(|kind| kind.source_name() == name)
     }
 
+    /// The name of the typed array region with this access (Decision 0148
+    /// section 8): a core type beside `T[]`, spelled with its element.
+    pub const fn array_source_name(self) -> &'static str {
+        match self {
+            Self::Readonly => "ArrayRegion",
+            Self::Writable => "WritableArrayRegion",
+        }
+    }
+
+    pub fn from_array_source_name(name: &str) -> Option<Self> {
+        [Self::Readonly, Self::Writable]
+            .into_iter()
+            .find(|kind| kind.array_source_name() == name)
+    }
+
+    /// The access of a byte region or typed array region type name, as a
+    /// type reference spells it.
+    pub fn from_region_name(name: &str) -> Option<Self> {
+        Self::from_source_name(name).or_else(|| Self::from_array_source_name(name))
+    }
+
+    /// The access of a region type: a byte region or a typed array region,
+    /// which share one borrow model (Decision 0110, generalized by Decision
+    /// 0148 section 8).
     pub(crate) fn from_resolved(ty: &ResolvedType) -> Option<Self> {
         match ty {
-            ResolvedType::ByteRegion(kind) => Some(*kind),
+            ResolvedType::ByteRegion(kind) | ResolvedType::ArrayRegion(kind, _) => Some(*kind),
             ResolvedType::Nullable(inner) => Self::from_resolved(inner),
             _ => None,
         }
@@ -1097,6 +1131,8 @@ pub enum TypeKind {
     Mixed,
     Error,
     TypedArray(TypeId),
+    /// `ArrayRegion<T>` or `WritableArrayRegion<T>` over a `T[]`.
+    ArrayRegion(ByteRegionKind, TypeId),
     Unknown,
     Heterogeneous,
     EmptyCollection,
@@ -1142,6 +1178,9 @@ pub enum ResolvedType {
     InterfaceSelf(String),
     TraitSelf(String),
     TypedArray(Box<ResolvedType>),
+    /// `ArrayRegion<T>` or `WritableArrayRegion<T>`: a borrowed view of
+    /// elements of a `T[]` (Decision 0148 section 8).
+    ArrayRegion(ByteRegionKind, Box<ResolvedType>),
     List(Box<ResolvedType>),
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
     SortedDictionary(Box<ResolvedType>, Box<ResolvedType>),
@@ -1184,6 +1223,7 @@ pub(crate) fn resolved_type_is_symbolic(ty: &ResolvedType) -> bool {
         }
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
+        | ResolvedType::ArrayRegion(_, inner)
         | ResolvedType::List(inner)
         | ResolvedType::Set(inner)
         | ResolvedType::SortedSet(inner)
@@ -1266,6 +1306,14 @@ fn substitute_resolved_type_impl(
         ResolvedType::TypedArray(inner) => ResolvedType::TypedArray(Box::new(
             substitute_resolved_type_impl(inner, substitutions, trait_receiver),
         )),
+        ResolvedType::ArrayRegion(kind, inner) => ResolvedType::ArrayRegion(
+            *kind,
+            Box::new(substitute_resolved_type_impl(
+                inner,
+                substitutions,
+                trait_receiver,
+            )),
+        ),
         ResolvedType::List(inner) => ResolvedType::List(Box::new(substitute_resolved_type_impl(
             inner,
             substitutions,
@@ -1590,6 +1638,7 @@ mod specialization_tests {
         let constructors: &[fn(ResolvedType) -> ResolvedType] = &[
             |inner| ResolvedType::Nullable(Box::new(inner)),
             |inner| ResolvedType::TypedArray(Box::new(inner)),
+            |inner| ResolvedType::ArrayRegion(ByteRegionKind::Readonly, Box::new(inner)),
             |inner| ResolvedType::List(Box::new(inner)),
             |inner| ResolvedType::Dictionary(Box::new(inner.clone()), Box::new(inner)),
             |inner| ResolvedType::SortedDictionary(Box::new(inner.clone()), Box::new(inner)),
@@ -1688,6 +1737,7 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
     match ty {
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
+        | ResolvedType::ArrayRegion(_, inner)
         | ResolvedType::List(inner)
         | ResolvedType::Set(inner)
         | ResolvedType::SortedSet(inner)
@@ -1825,6 +1875,9 @@ impl TypeRegistry {
             TypeKind::Mixed => "mixed".to_string(),
             TypeKind::Error => "Error".to_string(),
             TypeKind::TypedArray(element) => format!("{}[]", self.display(*element)),
+            TypeKind::ArrayRegion(kind, element) => {
+                format!("{}<{}>", kind.array_source_name(), self.display(*element))
+            }
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
@@ -1966,6 +2019,9 @@ impl TypeRegistry {
             TypeKind::TypedArray(element) => {
                 ResolvedType::TypedArray(Box::new(self.resolved(*element)))
             }
+            TypeKind::ArrayRegion(kind, element) => {
+                ResolvedType::ArrayRegion(*kind, Box::new(self.resolved(*element)))
+            }
             TypeKind::List(element) => ResolvedType::List(Box::new(self.resolved(*element))),
             TypeKind::Dictionary(key, value) => ResolvedType::Dictionary(
                 Box::new(self.resolved(*key)),
@@ -2059,6 +2115,10 @@ impl TypeRegistry {
             ResolvedType::TypedArray(element) => {
                 let element = self.intern_resolved(element);
                 TypeKind::TypedArray(element)
+            }
+            ResolvedType::ArrayRegion(kind, element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::ArrayRegion(*kind, element)
             }
             ResolvedType::List(element) => {
                 let element = self.intern_resolved(element);

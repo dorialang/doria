@@ -1099,7 +1099,7 @@ function ordinary(writable ReadableFile $file, writable ReadRequest $request,
 #[test]
 fn a_selection_in_an_index_argument_precedes_the_actual_byte_read() {
     use doriac::mir::{
-        ByteRegionExpression, ByteRegionKind, ClassExpression, IntegerExpression, Operand, Rvalue,
+        ByteRegionKind, ClassExpression, IntegerExpression, Operand, RegionExpression, Rvalue,
         ValueExpression,
     };
     use doriac::types::IntegerType;
@@ -1150,8 +1150,8 @@ function observe(writable ReadableFile $file, writable ReadRequest $request,
             local: request,
             transfer: false,
         }),
-        Rvalue::ByteRegion(ByteRegionExpression::Local {
-            kind: ByteRegionKind::Writable,
+        Rvalue::Region(RegionExpression::Local {
+            kind: doriac::mir::RegionType::bytes(ByteRegionKind::Writable),
             local: region,
             transfer: false,
         }),
@@ -1165,7 +1165,7 @@ function observe(writable ReadableFile $file, writable ReadRequest $request,
         if let Statement::AssignLocal {
             value:
                 Rvalue::Value(ValueExpression::Integer(IntegerExpression::Use {
-                    operand: Operand::ByteRegionIndex { index, .. },
+                    operand: Operand::RegionIndex { index, .. },
                     ..
                 })),
             ..

@@ -394,6 +394,14 @@ pub const EDITION_2026_PRELUDE: &[PreludeEntry] = &[
         reserved: true,
     },
     PreludeEntry {
+        name: "ArrayRegion",
+        reserved: true,
+    },
+    PreludeEntry {
+        name: "WritableArrayRegion",
+        reserved: true,
+    },
+    PreludeEntry {
         name: "List",
         reserved: true,
     },

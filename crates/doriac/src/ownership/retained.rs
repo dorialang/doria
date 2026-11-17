@@ -122,7 +122,9 @@ impl SourceTypes {
 
     pub(crate) fn carries(&self, ty: &ResolvedType) -> bool {
         match ty {
-            ResolvedType::ByteRegion(_) | ResolvedType::Function(_) => true,
+            ResolvedType::ByteRegion(_)
+            | ResolvedType::ArrayRegion(..)
+            | ResolvedType::Function(_) => true,
             ResolvedType::Nullable(inner)
             | ResolvedType::TypedArray(inner)
             | ResolvedType::List(inner)

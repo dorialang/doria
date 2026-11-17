@@ -1082,3 +1082,42 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
         "{diagnostics:#?}"
     );
 }
+
+#[test]
+fn typed_array_regions_have_the_region_members() {
+    for body in [
+        "int32[] $numbers = [1, 2]; ArrayRegion<int32> $region = $numbers->getRegion(0, 2); int32 $first = $region[0]; int $length = $region->length; ArrayRegion<int32> $part = $region->getRegion(1, 1); echo $first; echo $length; echo $part[0];",
+        "writable int32[] $numbers = [1, 2]; writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 2); $region[1] = 5; int32[] $other = [3]; int $copied = $region->copyFrom($other->getRegion(0, 1)); echo $copied;",
+        "string[] $names = [\"Ada\"]; ArrayRegion<string> $region = $names->getRegion(0, 1); echo $region->length;",
+        "writable int32[] $numbers = [1]; unsafe { Ptr<int32> $data = $numbers->getRegion(0, 1)->pointer; } unsafe { writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 1); MutPtr<int32> $writable = $region->writablePointer; }",
+    ] {
+        let source = format!("use Doria\\Std\\Ffi\\{{MutPtr, Ptr}}; function main(): void {{ {body} }}");
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    for (body, code) in [
+        // A readonly region gives no writable access.
+        ("int32[] $numbers = [1]; let $region = $numbers->getRegion(0, 1); let $writable = $region->getWritableRegion(0, 1);", ""),
+        ("int32[] $numbers = [1]; let $region = $numbers->getRegion(0, 1); unsafe { let $data = $region->writablePointer; }", ""),
+        // `string` is not FFI-safe, so its region has no pointer.
+        ("string[] $names = [\"Ada\"]; let $region = $names->getRegion(0, 1); unsafe { let $data = $region->pointer; }", ""),
+        // Only byte regions move bytes inside themselves.
+        ("writable int32[] $numbers = [1, 2]; writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 2); $region->copyWithin(0, 1, 1);", ""),
+        ("int32[] $numbers = [1]; let $region = $numbers->getRegion(0, 1); let $data = $region->pointer;", "E0785"),
+    ] {
+        let found = codes(&format!("use Doria\\Std\\Ffi\\{{MutPtr, Ptr}}; function main(): void {{ {body} }}"));
+        assert!(!found.is_empty(), "{body} should not check");
+        if !code.is_empty() {
+            assert!(found.iter().all(|found| *found == code), "{body}: {found:?}");
+        }
+    }
+    // A pointer pins the array, so it cannot be lent as writable in the
+    // same unsafe context.
+    let pinned = only(
+        "use Doria\\Std\\Ffi\\Ptr; function main(): void { writable int32[] $numbers = [1]; unsafe { Ptr<int32> $data = $numbers->getRegion(0, 1)->pointer; let $region = $numbers->getWritableRegion(0, 1); } }",
+        "E0477",
+    );
+    assert_eq!(pinned.title, "Pinned Value Cannot Be Moved Or Replaced");
+    // A live writable region excludes other access to its source.
+    let conflict = codes("function main(): void { writable int32[] $numbers = [1, 2]; writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 2); echo $numbers[0]; $region[0] = 3; }");
+    assert!(!conflict.is_empty());
+}

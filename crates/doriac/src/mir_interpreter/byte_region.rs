@@ -1,10 +1,10 @@
 //! Non-owning region descriptors over the interpreter's existing Bytes storage.
 use super::*;
-use crate::types::ByteRegionKind;
+use crate::mir::RegionType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ByteRegionValue {
-    pub kind: ByteRegionKind,
+    pub kind: RegionType,
     pub nullable: bool,
     // Presence is independent of length; an empty region still has provenance.
     pub source: Option<CollectionElementPlace>,
@@ -14,13 +14,13 @@ pub(super) struct ByteRegionValue {
 impl ByteRegionValue {
     pub fn ty(self) -> mir::Type {
         if self.nullable {
-            mir::Type::NullableByteRegion(self.kind)
+            mir::Type::NullableRegion(self.kind)
         } else {
-            mir::Type::ByteRegion(self.kind)
+            mir::Type::Region(self.kind)
         }
     }
 
-    pub fn absent(kind: ByteRegionKind) -> Self {
+    pub fn absent(kind: RegionType) -> Self {
         Self {
             kind,
             nullable: true,
@@ -42,15 +42,15 @@ impl ByteRegionValue {
 
 #[derive(Debug, Clone)]
 pub(super) enum Task {
-    Value(mir::ByteRegionExpression),
-    Nullable(mir::NullableByteRegionExpression),
+    Value(mir::RegionExpression),
+    Nullable(mir::NullableRegionExpression),
     Build {
-        kind: ByteRegionKind,
+        kind: RegionType,
         span: Span,
     },
     Wrap,
     AssumePresent,
-    Coalesce(mir::ByteRegionExpression),
+    Coalesce(mir::RegionExpression),
     IsPresent,
     Length(mir::LocalId),
     Index {
@@ -129,7 +129,7 @@ impl Interpreter<'_> {
     ) -> Result<StepOutcome, InterpreterError> {
         match task {
             Task::Value(expression) => match expression {
-                mir::ByteRegionExpression::CollectionIndex {
+                mir::RegionExpression::CollectionIndex {
                     collection,
                     index,
                     index_span,
@@ -147,7 +147,7 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                     frame.tasks.push(EvaluationTask::Rvalue(*index));
                 }
-                mir::ByteRegionExpression::Local {
+                mir::RegionExpression::Local {
                     kind,
                     local,
                     transfer,
@@ -163,7 +163,7 @@ impl Interpreter<'_> {
                     }
                     self.push_region(value.present()?)?;
                 }
-                mir::ByteRegionExpression::Region {
+                mir::RegionExpression::Region {
                     kind,
                     source,
                     offset,
@@ -178,7 +178,7 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::Rvalue(*offset));
                     frame.tasks.push(EvaluationTask::Rvalue(*source));
                 }
-                mir::ByteRegionExpression::Call {
+                mir::RegionExpression::Call {
                     kind,
                     function,
                     args,
@@ -188,11 +188,11 @@ impl Interpreter<'_> {
                     self.queue_call(
                         function,
                         args,
-                        ReturnExpectation::Value(mir::Type::ByteRegion(kind)),
+                        ReturnExpectation::Value(mir::Type::Region(kind)),
                         span,
                     )?;
                 }
-                mir::ByteRegionExpression::AssumePresent { value, .. } => {
+                mir::RegionExpression::AssumePresent { value, .. } => {
                     let frame = self.current_frame_mut()?;
                     frame
                         .tasks
@@ -201,7 +201,7 @@ impl Interpreter<'_> {
                         .tasks
                         .push(EvaluationTask::ByteRegion(Task::Nullable(*value)));
                 }
-                mir::ByteRegionExpression::Coalesce { left, right, .. } => {
+                mir::RegionExpression::Coalesce { left, right, .. } => {
                     let frame = self.current_frame_mut()?;
                     frame
                         .tasks
@@ -212,7 +212,7 @@ impl Interpreter<'_> {
                 }
             },
             Task::Nullable(expression) => match expression {
-                mir::NullableByteRegionExpression::CollectionIndex {
+                mir::NullableRegionExpression::CollectionIndex {
                     collection,
                     index,
                     index_span,
@@ -230,7 +230,7 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                     frame.tasks.push(EvaluationTask::Rvalue(*index));
                 }
-                mir::NullableByteRegionExpression::CollectionGet {
+                mir::NullableRegionExpression::CollectionGet {
                     kind,
                     collection,
                     key,
@@ -240,23 +240,23 @@ impl Interpreter<'_> {
                     let frame = self.current_frame_mut()?;
                     frame.tasks.push(EvaluationTask::DictionaryGet {
                         collection,
-                        expected: mir::Type::ByteRegion(kind),
+                        expected: mir::Type::Region(kind),
                         access,
                     });
                     frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                     frame.tasks.push(EvaluationTask::Rvalue(*key));
                 }
-                mir::NullableByteRegionExpression::Null { kind } => {
+                mir::NullableRegionExpression::Null { kind } => {
                     self.push_region(ByteRegionValue::absent(kind))?
                 }
-                mir::NullableByteRegionExpression::Present(value) => {
+                mir::NullableRegionExpression::Present(value) => {
                     let frame = self.current_frame_mut()?;
                     frame.tasks.push(EvaluationTask::ByteRegion(Task::Wrap));
                     frame
                         .tasks
                         .push(EvaluationTask::ByteRegion(Task::Value(value)));
                 }
-                mir::NullableByteRegionExpression::Local {
+                mir::NullableRegionExpression::Local {
                     kind,
                     local,
                     transfer,
@@ -274,7 +274,7 @@ impl Interpreter<'_> {
                     }
                     self.push_region(value)?;
                 }
-                mir::NullableByteRegionExpression::Call {
+                mir::NullableRegionExpression::Call {
                     kind,
                     function,
                     args,
@@ -284,7 +284,7 @@ impl Interpreter<'_> {
                     self.queue_call(
                         function,
                         args,
-                        ReturnExpectation::Value(mir::Type::NullableByteRegion(kind)),
+                        ReturnExpectation::Value(mir::Type::NullableRegion(kind)),
                         span,
                     )?;
                 }
@@ -308,6 +308,24 @@ impl Interpreter<'_> {
                                 ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
                             },
                             bytes.entries().len(),
+                        )
+                    }
+                    // A `T[]` gives a typed array region over its elements.
+                    LocalValue::Collection(array)
+                        if kind.array == Some(array.ty)
+                            && self.program.collection_types[array.ty.0].kind
+                                == mir::CollectionKind::TypedArray =>
+                    {
+                        let (identity, generation) =
+                            self.register_borrowed_collection(Rc::downgrade(&array.entries));
+                        (
+                            CollectionElementPlace {
+                                collection: identity,
+                                generation,
+                                index: 0,
+                                ty: self.program.collection_types[array.ty.0].value,
+                            },
+                            array.entries().len(),
                         )
                     }
                     LocalValue::ByteRegion(region) => {
@@ -342,7 +360,11 @@ impl Interpreter<'_> {
                     });
                 let Some((offset, length)) = checked else {
                     return self.runtime_panic_step_with_facts_at(
-                        "P1304",
+                        if kind.array.is_some() {
+                            "P1305"
+                        } else {
+                            "P1304"
+                        },
                         span,
                         vec![
                             RuntimeFact {
@@ -482,9 +504,14 @@ impl Interpreter<'_> {
                 let region = self.region_local(region)?;
                 self.current_frame_mut()?.active_panic_site = span;
                 if index < 0 || index as u128 >= region.length as u128 {
+                    // A typed array region panics as `T[]` indexing does.
                     return self.collection_access_panic_step_at(
                         CollectionAccessError::Bounds {
-                            code: "P1301",
+                            code: if region.kind.array.is_some() {
+                                "P1310"
+                            } else {
+                                "P1301"
+                            },
                             index: index as i64,
                             length: region.length,
                         },
@@ -495,11 +522,9 @@ impl Interpreter<'_> {
                 let (entries, _) = self.collection_element_storage(base)?;
                 let position = base.index + index as usize;
                 if let Some(value) = replacement {
-                    if !region.kind.is_writable()
-                        || value.ty() != mir::ScalarType::Integer(IntegerType::UInt8)
-                    {
+                    if !region.kind.is_writable() || mir::Type::Scalar(value.ty()) != base.ty {
                         return Err(InterpreterError::new(
-                            "MIR region write has an invalid capability or byte type",
+                            "MIR region write has an invalid capability or element type",
                         ));
                     }
                     entries.borrow_mut()[position].1 = LocalValue::Scalar(value);

@@ -299,6 +299,7 @@ impl Checker<'_> {
             }
             ResolvedType::Nullable(inner)
             | ResolvedType::TypedArray(inner)
+            | ResolvedType::ArrayRegion(_, inner)
             | ResolvedType::List(inner)
             | ResolvedType::Set(inner)
             | ResolvedType::SortedSet(inner)

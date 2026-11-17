@@ -399,7 +399,7 @@ impl<'ctx> Emitter<'_, 'ctx> {
                             build(self.builder.build_store(slot, params[2]))?;
                             slot
                         }
-                        mir::Type::ByteRegion(_) => {
+                        mir::Type::Region(_) => {
                             let slot = build(
                                 self.builder
                                     .build_alloca(word.array_type(2), "stream.region.carrier"),

@@ -60,8 +60,8 @@ pub fn collection_uses_aggregate_storage(program: &mir::Program, ty: mir::Type) 
                 | mir::Type::NullableInterface(_)
                 | mir::Type::Function(_)
                 | mir::Type::NullableFunction(_)
-                | mir::Type::ByteRegion(_)
-                | mir::Type::NullableByteRegion(_)
+                | mir::Type::Region(_)
+                | mir::Type::NullableRegion(_)
         )
         || match ty {
             mir::Type::Class(class) | mir::Type::NullableClass(class) => program
@@ -175,6 +175,13 @@ pub const BYTE_REGION_GET: &str = "dr_v2_byte_region_get";
 pub const BYTE_REGION_SET: &str = "dr_v2_byte_region_set";
 pub const BYTE_REGION_COPY: &str = "dr_v1_byte_region_copy";
 pub const BYTE_REGION_COPY_WITHIN: &str = "dr_v1_byte_region_copy_within";
+/// Typed array regions (Decision 0148 section 8): formation from a `T[]`,
+/// subregions, the bounds-checked address of an element, and `copyFrom`,
+/// each scaled by the element stride the typed array stores.
+pub const ARRAY_REGION: &str = "dr_v2_array_region";
+pub const ARRAY_REGION_SUBREGION: &str = "dr_v2_array_region_subregion";
+pub const ARRAY_REGION_ELEMENT: &str = "dr_v2_array_region_element";
+pub const ARRAY_REGION_COPY: &str = "dr_v1_array_region_copy";
 /// Decision 0110 child processes: one checked transport for every `Child`
 /// intrinsic (operation tag, child payload, operand words, checked outputs).
 pub const CHECKED_PROCESS: &str = "dr_v1_checked_process";
@@ -580,9 +587,9 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
         mir::Type::Interface(_) | mir::Type::NullableInterface(_) => pointer_width.checked_mul(2),
-        mir::Type::ByteRegion(_) => pointer_width.checked_mul(2),
+        mir::Type::Region(_) => pointer_width.checked_mul(2),
         // An empty region may have a null data pointer and is still present.
-        mir::Type::NullableByteRegion(_) => pointer_width.checked_mul(3),
+        mir::Type::NullableRegion(_) => pointer_width.checked_mul(3),
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
         mir::Type::ClosureEnvironment(_) => Some(pointer_width),
         mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
@@ -598,6 +605,32 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::NullablePayloadEnum(_)
         | mir::Type::ForeignAggregate(_) => None,
     }
+}
+
+/// The stride of a typed array region's elements of type `element`, for
+/// the element types every execution target builds regions over: values
+/// copied bit for bit that the typed array stores at their own width
+/// (Decision 0148 section 8). `None` for an element type no target builds a
+/// region over yet.
+pub fn array_region_stride(element: mir::Type) -> Option<u8> {
+    match element {
+        // A scalar's stride is its width; pointer width does not enter it.
+        mir::Type::Scalar(mir::ScalarType::Integer(_)) => collection_value_width(element, 8),
+        _ => None,
+    }
+}
+
+/// The element type and element stride of the typed array region `region`;
+/// `None` for a byte region and for an element type no target builds.
+pub fn array_region_element(
+    program: &mir::Program,
+    region: mir::RegionType,
+) -> Option<(mir::Type, u8)> {
+    let array = program.collection_types.get(region.array?.0)?;
+    if array.kind != mir::CollectionKind::TypedArray {
+        return None;
+    }
+    Some((array.value, array_region_stride(array.value)?))
 }
 
 pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
@@ -622,7 +655,7 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
             Some(mir::Type::WritableSharedReferenceAccess(value))
         }
         mir::Type::NullableCollection(value) => Some(mir::Type::Collection(value)),
-        mir::Type::NullableByteRegion(kind) => Some(mir::Type::ByteRegion(kind)),
+        mir::Type::NullableRegion(kind) => Some(mir::Type::Region(kind)),
         mir::Type::NullableFunction(value) => Some(mir::Type::Function(value)),
         mir::Type::NullablePayloadEnum(value) => Some(mir::Type::PayloadEnum(value)),
         _ => None,

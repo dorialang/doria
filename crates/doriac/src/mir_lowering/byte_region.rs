@@ -1,40 +1,37 @@
 use super::*;
 
 pub(super) const fn is_type(ty: mir::Type) -> bool {
-    matches!(
-        ty,
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-    )
+    matches!(ty, mir::Type::Region(_) | mir::Type::NullableRegion(_))
 }
 
 pub(super) fn expression(
     expr: &hir::Expr,
-    kind: mir::ByteRegionKind,
+    kind: mir::RegionType,
     transfer: bool,
     context: &mut LoweringContext<'_>,
-) -> DiagnosticResult<mir::ByteRegionExpression> {
+) -> DiagnosticResult<mir::RegionExpression> {
     let transfer = transfer && kind.is_writable();
-    if let Some(mir::Rvalue::ByteRegion(value)) =
-        materialize_checked_rvalue(expr, mir::Type::ByteRegion(kind), transfer, context)?
+    if let Some(mir::Rvalue::Region(value)) =
+        materialize_checked_rvalue(expr, mir::Type::Region(kind), transfer, context)?
     {
         return Ok(value);
     }
     if is_branching_expr(expr) {
-        let mir::Rvalue::ByteRegion(value) =
-            lower_branching_rvalue(expr, mir::Type::ByteRegion(kind), transfer, context)?
+        let mir::Rvalue::Region(value) =
+            lower_branching_rvalue(expr, mir::Type::Region(kind), transfer, context)?
         else {
             unreachable!("region branch has the checked region type")
         };
         return Ok(value);
     }
     if let Some((collection, index, ty)) = lower_list_remove_at(expr, context)? {
-        if ty != mir::Type::ByteRegion(kind) {
+        if ty != mir::Type::Region(kind) {
             return Err(vec![unsupported(
                 expr.span(),
                 "region removal changes its checked type",
             )]);
         }
-        return Ok(mir::ByteRegionExpression::CollectionIndex {
+        return Ok(mir::RegionExpression::CollectionIndex {
             kind,
             collection,
             index: Box::new(index),
@@ -51,10 +48,10 @@ pub(super) fn expression(
             let (collection, index) = lower_collection_index_operand(
                 collection,
                 index,
-                mir::Type::ByteRegion(kind),
+                mir::Type::Region(kind),
                 context,
             )?;
-            Ok(mir::ByteRegionExpression::CollectionIndex {
+            Ok(mir::RegionExpression::CollectionIndex {
                 kind,
                 collection,
                 index: Box::new(index),
@@ -66,17 +63,15 @@ pub(super) fn expression(
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
-                mir::Type::ByteRegion(actual) if actual == kind => {
-                    Ok(mir::ByteRegionExpression::Local {
+                mir::Type::Region(actual) if actual == kind => Ok(mir::RegionExpression::Local {
+                    kind,
+                    local,
+                    transfer,
+                }),
+                mir::Type::NullableRegion(actual) if actual == kind => {
+                    Ok(mir::RegionExpression::AssumePresent {
                         kind,
-                        local,
-                        transfer,
-                    })
-                }
-                mir::Type::NullableByteRegion(actual) if actual == kind => {
-                    Ok(mir::ByteRegionExpression::AssumePresent {
-                        kind,
-                        value: Box::new(mir::NullableByteRegionExpression::Local {
+                        value: Box::new(mir::NullableRegionExpression::Local {
                             kind,
                             local,
                             transfer,
@@ -127,7 +122,7 @@ pub(super) fn expression(
             let offset = mir::Rvalue::Value(mir::ValueExpression::Integer(
                 mir::IntegerExpression::constant(crate::numeric::IntegerValue::from_bits(int, 0)),
             ));
-            Ok(mir::ByteRegionExpression::Region {
+            Ok(mir::RegionExpression::Region {
                 kind,
                 source: Box::new(source),
                 offset: Box::new(offset),
@@ -144,7 +139,7 @@ pub(super) fn expression(
         } if matches!(method.as_str(), "getRegion" | "getWritableRegion")
             && matches!(
                 context.expression_type(object)?,
-                mir::Type::ByteRegion(_) | mir::Type::Collection(_)
+                mir::Type::Region(_) | mir::Type::Collection(_)
             ) =>
         {
             let source_type = context.expression_type(object)?;
@@ -164,7 +159,7 @@ pub(super) fn expression(
         }
         _ => {
             let (signature, args) = call(expr, context)?;
-            Ok(mir::ByteRegionExpression::Call {
+            Ok(mir::RegionExpression::Call {
                 span: expr.span(),
                 kind,
                 function: signature.id,
@@ -177,19 +172,19 @@ pub(super) fn expression(
 
 pub(super) fn nullable_expression(
     expr: &hir::Expr,
-    kind: mir::ByteRegionKind,
+    kind: mir::RegionType,
     transfer: bool,
     context: &mut LoweringContext<'_>,
-) -> DiagnosticResult<mir::NullableByteRegionExpression> {
+) -> DiagnosticResult<mir::NullableRegionExpression> {
     let transfer = transfer && kind.is_writable();
-    if let Some(mir::Rvalue::NullableByteRegion(value)) =
-        materialize_checked_rvalue(expr, mir::Type::NullableByteRegion(kind), transfer, context)?
+    if let Some(mir::Rvalue::NullableRegion(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullableRegion(kind), transfer, context)?
     {
         return Ok(value);
     }
     if is_branching_expr(expr) {
-        let mir::Rvalue::NullableByteRegion(value) =
-            lower_branching_rvalue(expr, mir::Type::NullableByteRegion(kind), transfer, context)?
+        let mir::Rvalue::NullableRegion(value) =
+            lower_branching_rvalue(expr, mir::Type::NullableRegion(kind), transfer, context)?
         else {
             unreachable!("nullable region branch has the checked region type")
         };
@@ -198,13 +193,13 @@ pub(super) fn nullable_expression(
     if let Some((collection, key, stored, access)) =
         lower_collection_nullable_property(expr, context)?
     {
-        if !nullable_collection_value_matches(stored, mir::Type::ByteRegion(kind)) {
+        if !nullable_collection_value_matches(stored, mir::Type::Region(kind)) {
             return Err(vec![unsupported(
                 expr.span(),
                 "nullable region access changes its checked type",
             )]);
         }
-        return Ok(mir::NullableByteRegionExpression::CollectionGet {
+        return Ok(mir::NullableRegionExpression::CollectionGet {
             kind,
             collection,
             key: Box::new(key),
@@ -223,13 +218,13 @@ pub(super) fn nullable_expression(
         if let Some((collection, key, stored, access)) =
             lower_dictionary_get(object, method, args, context)?
         {
-            if !nullable_collection_value_matches(stored, mir::Type::ByteRegion(kind)) {
+            if !nullable_collection_value_matches(stored, mir::Type::Region(kind)) {
                 return Err(vec![unsupported(
                     expr.span(),
                     "nullable region access changes its checked type",
                 )]);
             }
-            return Ok(mir::NullableByteRegionExpression::CollectionGet {
+            return Ok(mir::NullableRegionExpression::CollectionGet {
                 kind,
                 collection,
                 key: Box::new(key),
@@ -240,11 +235,11 @@ pub(super) fn nullable_expression(
     }
     if let Some((collection, index, ty)) = lower_list_remove_at(expr, context)? {
         let value = collection_remove_at_rvalue(collection, index, ty, expr.span())?;
-        if let mir::Rvalue::NullableByteRegion(value) = value {
+        if let mir::Rvalue::NullableRegion(value) = value {
             return Ok(value);
         }
-        if let mir::Rvalue::ByteRegion(value) = value {
-            return Ok(mir::NullableByteRegionExpression::Present(value));
+        if let mir::Rvalue::Region(value) = value {
+            return Ok(mir::NullableRegionExpression::Present(value));
         }
         return Err(vec![unsupported(
             expr.span(),
@@ -252,18 +247,18 @@ pub(super) fn nullable_expression(
         )]);
     }
     match expr {
-        hir::Expr::Null { .. } => Ok(mir::NullableByteRegionExpression::Null { kind }),
+        hir::Expr::Null { .. } => Ok(mir::NullableRegionExpression::Null { kind }),
         hir::Expr::Grouped { expr, .. } => nullable_expression(expr, kind, transfer, context),
         hir::Expr::Index {
             collection, index, ..
-        } if context.expression_type(expr)? == mir::Type::NullableByteRegion(kind) => {
+        } if context.expression_type(expr)? == mir::Type::NullableRegion(kind) => {
             let (collection, index) = lower_collection_index_operand(
                 collection,
                 index,
-                mir::Type::NullableByteRegion(kind),
+                mir::Type::NullableRegion(kind),
                 context,
             )?;
-            Ok(mir::NullableByteRegionExpression::CollectionIndex {
+            Ok(mir::NullableRegionExpression::CollectionIndex {
                 kind,
                 collection,
                 index: Box::new(index),
@@ -281,7 +276,7 @@ pub(super) fn nullable_expression(
         } if matches!(method.as_str(), "getRegion" | "getWritableRegion")
             && matches!(
                 context.expression_type(object)?,
-                mir::Type::NullableByteRegion(_) | mir::Type::NullableCollection(_)
+                mir::Type::NullableRegion(_) | mir::Type::NullableCollection(_)
             ) =>
         {
             let source_type = context.expression_type(object)?;
@@ -298,7 +293,7 @@ pub(super) fn nullable_expression(
                 writable,
                 None,
                 *span,
-                Some((mir::Type::NullableByteRegion(kind), transfer)),
+                Some((mir::Type::NullableRegion(kind), transfer)),
                 |source, context| {
                     let source = narrowed_match_local_rvalue(
                         source,
@@ -308,14 +303,14 @@ pub(super) fn nullable_expression(
                         *span,
                         context,
                     )?;
-                    let value = mir::Rvalue::ByteRegion(form(kind, source, args, *span, context)?);
+                    let value = mir::Rvalue::Region(form(kind, source, args, *span, context)?);
                     let (local, ty) = core_value::materialize_value(value, context);
                     Ok(Some((local, ty, kind.is_writable())))
                 },
                 context,
             )?
             .expect("null-safe region operation has a value");
-            let mir::Rvalue::NullableByteRegion(value) = local_rvalue(result.0, result.1, result.2)
+            let mir::Rvalue::NullableRegion(value) = local_rvalue(result.0, result.1, result.2)
             else {
                 unreachable!()
             };
@@ -324,15 +319,15 @@ pub(super) fn nullable_expression(
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
-                mir::Type::NullableByteRegion(actual) if actual == kind => {
-                    Ok(mir::NullableByteRegionExpression::Local {
+                mir::Type::NullableRegion(actual) if actual == kind => {
+                    Ok(mir::NullableRegionExpression::Local {
                         kind,
                         local,
                         transfer,
                     })
                 }
-                mir::Type::ByteRegion(actual) if actual == kind => Ok(
-                    mir::NullableByteRegionExpression::Present(mir::ByteRegionExpression::Local {
+                mir::Type::Region(actual) if actual == kind => Ok(
+                    mir::NullableRegionExpression::Present(mir::RegionExpression::Local {
                         kind,
                         local,
                         transfer,
@@ -344,17 +339,16 @@ pub(super) fn nullable_expression(
                 )]),
             }
         }
-        _ if context.expression_type(expr)? == mir::Type::ByteRegion(kind) => {
-            expression(expr, kind, transfer, context)
-                .map(mir::NullableByteRegionExpression::Present)
+        _ if context.expression_type(expr)? == mir::Type::Region(kind) => {
+            expression(expr, kind, transfer, context).map(mir::NullableRegionExpression::Present)
         }
         _ => {
             let (signature, args) = call(expr, context)?;
             // A constrained call can select an implementation that narrows the
             // requirement's nullable region to a present one.
-            if signature.return_type == mir::ReturnType::Value(mir::Type::ByteRegion(kind)) {
-                return Ok(mir::NullableByteRegionExpression::Present(
-                    mir::ByteRegionExpression::Call {
+            if signature.return_type == mir::ReturnType::Value(mir::Type::Region(kind)) {
+                return Ok(mir::NullableRegionExpression::Present(
+                    mir::RegionExpression::Call {
                         span: expr.span(),
                         kind,
                         function: signature.id,
@@ -363,7 +357,7 @@ pub(super) fn nullable_expression(
                     },
                 ));
             }
-            Ok(mir::NullableByteRegionExpression::Call {
+            Ok(mir::NullableRegionExpression::Call {
                 span: expr.span(),
                 kind,
                 function: signature.id,
@@ -391,10 +385,14 @@ pub(super) fn copy_from(
     else {
         return Ok(None);
     };
-    let writable = mir::Type::ByteRegion(mir::ByteRegionKind::Writable);
-    if method != "copyFrom" || context.expression_type(object)? != writable {
-        return Ok(None);
-    }
+    // A byte region or a typed array region; the source views the same
+    // elements with readonly access.
+    let destination_type = match context.expression_type(object)? {
+        mir::Type::Region(region) if method == "copyFrom" && region.is_writable() => region,
+        _ => return Ok(None),
+    };
+    built_element(destination_type, *span, context)?;
+    let writable = mir::Type::Region(destination_type);
     let [source] = argument_values(args)[..] else {
         return Err(vec![unsupported(
             *span,
@@ -409,11 +407,11 @@ pub(super) fn copy_from(
     )?;
     let source = lower_call_argument(
         source,
-        mir::Type::ByteRegion(mir::ByteRegionKind::Readonly),
+        mir::Type::Region(destination_type.with_access(mir::ByteRegionKind::Readonly)),
         mir::FunctionParameterMode::Readonly,
         context,
     )?;
-    Ok(Some(mir::IntegerExpression::CopyByteRegion {
+    Ok(Some(mir::IntegerExpression::CopyRegion {
         destination: Box::new(destination),
         source: Box::new(source),
         span: *span,
@@ -438,7 +436,11 @@ pub(super) fn copy_within(
         return Ok(false);
     };
     if method != "copyWithin"
-        || context.expression_type(object)? != mir::Type::ByteRegion(mir::ByteRegionKind::Writable)
+        || context.expression_type(object)?
+            != mir::Type::Region(mir::RegionType {
+                access: mir::ByteRegionKind::Writable,
+                array: None,
+            })
     {
         return Ok(false);
     }
@@ -482,12 +484,12 @@ pub(super) fn copy_within(
 }
 
 fn form(
-    kind: mir::ByteRegionKind,
+    kind: mir::RegionType,
     source: mir::Rvalue,
     args: &[hir::Argument],
     span: Span,
     context: &mut LoweringContext<'_>,
-) -> DiagnosticResult<mir::ByteRegionExpression> {
+) -> DiagnosticResult<mir::RegionExpression> {
     let names = args
         .iter()
         .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
@@ -512,13 +514,53 @@ fn form(
             "byte region requires checked offset and length arguments",
         )]);
     };
-    Ok(mir::ByteRegionExpression::Region {
+    built_element(kind, span, context)?;
+    Ok(mir::RegionExpression::Region {
         kind,
         source: Box::new(source),
         offset: Box::new(offset),
         length: Box::new(length),
         span,
     })
+}
+
+/// The scalar type of the elements of `region`: `uint8` for a byte region,
+/// and the built element type of a typed array region (E0784 otherwise).
+pub(super) fn element_scalar(
+    region: mir::RegionType,
+    span: Span,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<mir::ScalarType> {
+    match built_element(region, span, context)? {
+        None => Ok(mir::ScalarType::Integer(IntegerType::UInt8)),
+        Some((mir::Type::Scalar(scalar), _)) => Ok(scalar),
+        Some(_) => Err(vec![unsupported(
+            span,
+            "a built region element is a scalar",
+        )]),
+    }
+}
+
+/// The element type and stride of a typed array region the execution
+/// targets build, or E0784 at `span` for an element type none builds yet.
+/// `None` for a byte region.
+pub(super) fn built_element(
+    region: mir::RegionType,
+    span: Span,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<Option<(mir::Type, u8)>> {
+    let Some(array) = region.array else {
+        return Ok(None);
+    };
+    let element = context.collection_type(array).value;
+    match crate::native_abi::array_region_stride(element) {
+        Some(stride) => Ok(Some((element, stride))),
+        None => Err(vec![crate::unsafe_code::unbuilt_region_element(
+            span,
+            region.access.array_source_name(),
+            &element.to_string(),
+        )]),
+    }
 }
 
 pub(super) fn nullable_length(
@@ -535,15 +577,14 @@ pub(super) fn nullable_length(
     else {
         return Ok(None);
     };
-    let mir::Type::NullableByteRegion(kind) = context.expression_type(object)? else {
+    let mir::Type::NullableRegion(kind) = context.expression_type(object)? else {
         return Ok(None);
     };
     if property != "length" {
         return Ok(None);
     }
     let ty = mir::ScalarType::Integer(IntegerType::Int64);
-    let source =
-        mir::Rvalue::NullableByteRegion(nullable_expression(object, kind, false, context)?);
+    let source = mir::Rvalue::NullableRegion(nullable_expression(object, kind, false, context)?);
     let selection = context.coalesce_selection(object);
     let result = materialize_null_safe_call(
         source,
@@ -553,9 +594,9 @@ pub(super) fn nullable_length(
         *span,
         Some((mir::Type::NullableScalar(ty), false)),
         |source, context| {
-            let present = mir::Rvalue::ByteRegion(mir::ByteRegionExpression::AssumePresent {
+            let present = mir::Rvalue::Region(mir::RegionExpression::AssumePresent {
                 kind,
-                value: Box::new(mir::NullableByteRegionExpression::Local {
+                value: Box::new(mir::NullableRegionExpression::Local {
                     kind,
                     local: source,
                     transfer: false,
@@ -564,7 +605,7 @@ pub(super) fn nullable_length(
             let (source, _) = core_value::materialize_value(present, context);
             let value = mir::Rvalue::Value(value_expression_from_operand(
                 ty,
-                mir::Operand::ByteRegionLength(source),
+                mir::Operand::RegionLength(source),
             ));
             let (local, ty) = core_value::materialize_value(value, context);
             Ok(Some((local, ty, false)))
@@ -615,7 +656,7 @@ pub(super) fn local(
     writable: bool,
     context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::LocalId> {
-    let mir::Type::ByteRegion(kind) = context.expression_type(expr)? else {
+    let mir::Type::Region(kind) = context.expression_type(expr)? else {
         return Err(vec![unsupported(
             expr.span(),
             "byte region access requires a present region",
@@ -623,11 +664,11 @@ pub(super) fn local(
     };
     if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
         let local = context.lookup_local(name, *span)?;
-        if context.local_type(local) == mir::Type::ByteRegion(kind) {
+        if context.local_type(local) == mir::Type::Region(kind) {
             return Ok(local);
         }
     }
-    let value = mir::Rvalue::ByteRegion(expression(expr, kind, false, context)?);
+    let value = mir::Rvalue::Region(expression(expr, kind, false, context)?);
     let (local, _) = core_value::materialize_value(value, context);
     context.locals[local.0].writable = writable;
     Ok(local)

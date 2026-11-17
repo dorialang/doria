@@ -1766,7 +1766,7 @@ impl<'a> Interpreter<'a> {
             mir::Statement::EndBorrow { local } => {
                 self.current_frame_mut()?.locals[local.0].take();
             }
-            mir::Statement::AssignByteRegionIndex {
+            mir::Statement::AssignRegionIndex {
                 region,
                 index,
                 value,
@@ -2212,7 +2212,7 @@ impl<'a> Interpreter<'a> {
                             "MIR collection local received a non-collection value",
                         ));
                     }
-                    (ty @ (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)), value) => {
+                    (ty @ (mir::Type::Region(_) | mir::Type::NullableRegion(_)), value) => {
                         if value.ty() != ty {
                             return Err(InterpreterError::new(
                                 "MIR region local received another value type",
@@ -3026,10 +3026,10 @@ impl<'a> Interpreter<'a> {
         // the syntactic return-borrow root would lose child/property aliases.
         let expression = match &task {
             EvaluationTask::ByteRegion(byte_region::Task::Value(value)) => {
-                Some(mir::Rvalue::ByteRegion(value.clone()))
+                Some(mir::Rvalue::Region(value.clone()))
             }
             EvaluationTask::ByteRegion(byte_region::Task::Nullable(value)) => {
-                Some(mir::Rvalue::NullableByteRegion(value.clone()))
+                Some(mir::Rvalue::NullableRegion(value.clone()))
             }
             EvaluationTask::Mixed(value) => Some(mir::Rvalue::Mixed(value.clone())),
             EvaluationTask::NullableMixed(value) => Some(mir::Rvalue::NullableMixed(value.clone())),
@@ -3184,11 +3184,11 @@ impl<'a> Interpreter<'a> {
                 self.current_frame_mut()?.values.set_place(Some(place))
             }
             EvaluationTask::Rvalue(expression) => match expression {
-                mir::Rvalue::ByteRegion(value) => self
+                mir::Rvalue::Region(value) => self
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::ByteRegion(byte_region::Task::Value(value))),
-                mir::Rvalue::NullableByteRegion(value) => {
+                mir::Rvalue::NullableRegion(value) => {
                     self.current_frame_mut()?
                         .tasks
                         .push(EvaluationTask::ByteRegion(byte_region::Task::Nullable(
@@ -4712,7 +4712,7 @@ impl<'a> Interpreter<'a> {
                     }
                 };
                 match (expected, value) {
-                    (mir::Type::ByteRegion(kind), Some(LocalValue::ByteRegion(mut value)))
+                    (mir::Type::Region(kind), Some(LocalValue::ByteRegion(mut value)))
                         if value.kind == kind =>
                     {
                         value.nullable = true;
@@ -4720,7 +4720,7 @@ impl<'a> Interpreter<'a> {
                             .values
                             .push(EvaluationValue::ByteRegion(value));
                     }
-                    (mir::Type::ByteRegion(kind), None) => {
+                    (mir::Type::Region(kind), None) => {
                         self.current_frame_mut()?
                             .values
                             .push(EvaluationValue::ByteRegion(ByteRegionValue::absent(kind)));
@@ -7511,7 +7511,7 @@ impl<'a> Interpreter<'a> {
                 frame.tasks.push(EvaluationTask::EnumBackingInt(enum_id));
                 frame.tasks.push(EvaluationTask::Enum(*value));
             }
-            mir::IntegerExpression::CopyByteRegion {
+            mir::IntegerExpression::CopyRegion {
                 destination,
                 source,
                 ..
@@ -13278,13 +13278,13 @@ impl<'a> Interpreter<'a> {
             }
         }
         let projected = match (ty, value) {
-            (mir::Type::ByteRegion(expected), LocalValue::ByteRegion(mut value))
+            (mir::Type::Region(expected), LocalValue::ByteRegion(mut value))
                 if expected == value.kind && value.source.is_some() =>
             {
                 value.nullable = false;
                 LocalValue::ByteRegion(value)
             }
-            (mir::Type::NullableByteRegion(expected), LocalValue::ByteRegion(mut value))
+            (mir::Type::NullableRegion(expected), LocalValue::ByteRegion(mut value))
                 if expected == value.kind =>
             {
                 value.nullable = true;
@@ -16002,7 +16002,7 @@ impl<'a> Interpreter<'a> {
         operand: &mir::Operand,
     ) -> Result<bool, InterpreterError> {
         match operand {
-            mir::Operand::ByteRegionLength(local) => {
+            mir::Operand::RegionLength(local) => {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::ByteRegion(byte_region::Task::Length(
@@ -16010,7 +16010,7 @@ impl<'a> Interpreter<'a> {
                     )));
                 Ok(true)
             }
-            mir::Operand::ByteRegionIndex {
+            mir::Operand::RegionIndex {
                 region,
                 index,
                 index_span,
@@ -16684,8 +16684,8 @@ impl<'a> Interpreter<'a> {
                 }
             }
             mir::Operand::CollectionLength(_)
-            | mir::Operand::ByteRegionLength(_)
-            | mir::Operand::ByteRegionIndex { .. }
+            | mir::Operand::RegionLength(_)
+            | mir::Operand::RegionIndex { .. }
             | mir::Operand::CollectionIndex { .. }
             | mir::Operand::CollectionKeyAt { .. } => Err(InterpreterError::new(
                 "MIR collection operand requires queued evaluation",
@@ -19109,9 +19109,7 @@ fn typed_null_value(ty: mir::Type) -> Result<LocalValue, InterpreterError> {
         mir::Type::NullableCollection(collection) => {
             LocalValue::Collection(CollectionValue::nullable(collection, None))
         }
-        mir::Type::NullableByteRegion(kind) => {
-            LocalValue::ByteRegion(ByteRegionValue::absent(kind))
-        }
+        mir::Type::NullableRegion(kind) => LocalValue::ByteRegion(ByteRegionValue::absent(kind)),
         mir::Type::NullablePayloadEnum(ty) => LocalValue::NullablePayloadEnum { ty, value: None },
         mir::Type::NullableFunction(function_type) => LocalValue::NullableFunction {
             function_type,
@@ -19238,7 +19236,7 @@ fn writable_payload_type(payload: mir::SharedPayload) -> mir::Type {
 
 fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
     match ty {
-        mir::Type::NullableByteRegion(kind) => Some(mir::Type::ByteRegion(kind)),
+        mir::Type::NullableRegion(kind) => Some(mir::Type::Region(kind)),
         mir::Type::NullableScalar(ty) => Some(mir::Type::Scalar(ty)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
@@ -20108,7 +20106,7 @@ fn assign_local(
         (mir::Type::Collection(expected), LocalValue::Collection(collection)) if expected == collection.ty
     ) || matches!(
         (definition.ty, &value),
-        (ty @ (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)), LocalValue::ByteRegion(region)) if ty == region.ty()
+        (ty @ (mir::Type::Region(_) | mir::Type::NullableRegion(_)), LocalValue::ByteRegion(region)) if ty == region.ty()
     ) || matches!(
         (definition.ty, &value),
         (mir::Type::NullableCollection(expected), LocalValue::Collection(collection))
