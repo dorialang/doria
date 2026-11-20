@@ -877,3 +877,222 @@ function main(): void {}
         "{undeclared:#?}"
     );
 }
+
+/// Interpreter, every native profile, and the exact stdout of each.
+fn assert_writable_copy_bindings_execute(source: &str, expected: &str) -> mir::Program {
+    let mir = doriac::lower_source_to_mir("indexed-foreach.doria", source)
+        .unwrap_or_else(|diagnostics| panic!("writable foreach should lower: {diagnostics:#?}"));
+    let output = doriac::mir_interpreter::interpret(&mir).expect("writable foreach should run");
+    assert!(output.runtime_diagnostic.is_none(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert_eq!(output.exit_status, 0);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, expected);
+    }
+    mir
+}
+
+#[test]
+fn writable_copy_bindings_store_on_every_exit_from_the_body() {
+    let source = r#"
+class Stop implements Error
+{
+    function __construct(string $message) {}
+}
+
+function bump(writable List<int> $values): void
+{
+    foreach ($values as writable int $value) {
+        $value = $value + 10;
+        if ($value > 0) { break; }
+    }
+}
+
+function early(writable int[] $values): int
+{
+    foreach ($values as writable int $value) {
+        $value = 99;
+        return 1;
+    }
+    return 0;
+}
+
+function skip(writable List<int> $values): void
+{
+    foreach ($values as int $index => writable int $value) {
+        $value += 100;
+        if ($index == 0) { continue; }
+        $value++;
+    }
+}
+
+function stop(writable List<int> $values): void throws Stop
+{
+    foreach ($values as writable int $value) {
+        $value = $value * 3;
+        throw new Stop("stopped");
+    }
+}
+
+function nested(writable List<List<int>> $rows, writable int[] $marks): int
+{
+    foreach ($rows as writable List<int> $row) {
+        foreach ($row as int $index => writable int $cell) {
+            foreach ($marks as writable int $mark) {
+                $mark = 7;
+                $cell = -1;
+                return 2;
+            }
+        }
+    }
+    return 0;
+}
+
+function settle(writable Dictionary<string, int> $totals): void
+{
+    foreach ($totals as string $name => writable int $total) {
+        $total -= 1;
+        if ($name == "a") { break; }
+    }
+    foreach ($totals as writable int $total) {
+        $total += 1000;
+        return;
+    }
+}
+
+function shout(writable List<string> $words): void
+{
+    foreach ($words as writable string $word) {
+        $word = "{$word}!";
+        break;
+    }
+}
+
+function main(): void
+{
+    writable List<int> $list = [1, 2];
+    bump($list);
+    echo "{$list[0]} {$list[1]}\n";
+    writable int[] $array = [5, 6];
+    early($array);
+    echo "{$array[0]} {$array[1]}\n";
+    writable List<int> $skipped = [1, 2];
+    skip($skipped);
+    echo "{$skipped[0]} {$skipped[1]}\n";
+    writable List<int> $thrown = [4, 5];
+    try {
+        stop($thrown);
+    } catch (Stop $error) {
+        echo "{$error->message} ";
+    }
+    echo "{$thrown[0]} {$thrown[1]}\n";
+    writable List<List<int>> $rows = [[1, 2]];
+    writable int[] $marks = [0, 0];
+    nested($rows, $marks);
+    echo "{$rows[0][0]} {$rows[0][1]} {$marks[0]} {$marks[1]}\n";
+    writable Dictionary<string, int> $totals = ["a" => 10, "b" => 20];
+    settle($totals);
+    foreach ($totals as string $name => int $total) { echo "{$name}={$total} "; }
+    echo "\n";
+    writable List<string> $words = ["hi", "yo"];
+    shout($words);
+    echo "{$words[0]} {$words[1]}\n";
+}
+"#;
+    let expected = "11 2\n99 6\n101 103\nstopped 12 5\n-1 2 7 0\na=1009 b=20 \nhi! yo\n";
+    let mir = assert_writable_copy_bindings_execute(source, expected);
+    // The store belongs to the body scope, so the update block only advances
+    // the position and never holds a write-back of its own.
+    let mut writable_loops = 0;
+    for function in &mir.functions {
+        for block in &function.blocks {
+            for statement in &block.statements {
+                let Statement::ControlFlowPlan(ControlFlowPlan::Foreach(plan)) = statement else {
+                    continue;
+                };
+                let update = &function.blocks[plan.update.0];
+                assert_eq!(update.statements.len(), 1, "{update:#?}");
+                writable_loops += usize::from(plan.value_writable);
+            }
+        }
+    }
+    assert_eq!(writable_loops, 10);
+    assert_php_keeps_writable_iteration_native(source);
+}
+
+#[test]
+fn writable_deque_bindings_store_on_every_exit_in_every_backend() {
+    let source = r#"
+function drain(writable Deque<int> $queue): void
+{
+    foreach ($queue as writable int $item) {
+        $item = $item + 5;
+        break;
+    }
+}
+
+function first(writable Deque<?int> $queue): int
+{
+    foreach ($queue as writable ?int $item) {
+        $item = 40;
+        return 1;
+    }
+    return 0;
+}
+
+function main(): void
+{
+    writable Deque<int> $queue = Deque::from([1, 2]);
+    drain($queue);
+    foreach ($queue as int $item) { echo "{$item} "; }
+    List<?int> $source = [null, 3];
+    writable Deque<?int> $nullable = Deque::from($source);
+    first($nullable);
+    foreach ($nullable as ?int $item) { echo "{$item ?? -1} "; }
+    echo "\n";
+}
+"#;
+    let expected = "6 2 40 3 \n";
+    assert_writable_copy_bindings_execute(source, expected);
+    // PHP lowers writable deque iteration to a PHP reference, which already
+    // writes through on every exit.
+    let php = doriac::compile_source(
+        "indexed-foreach.doria",
+        source,
+        doriac::backend::BackendTarget::Php,
+    )
+    .unwrap_or_else(|diagnostics| panic!("PHP compatibility output: {diagnostics:#?}"));
+    let directory = native_execution::ExecutionDirectory::new();
+    let path = directory.path().join("main.php");
+    doriac::backend::publish_output(&path, php).unwrap();
+    let Ok(output) = std::process::Command::new("php").arg(&path).output() else {
+        eprintln!("PHP unavailable; writable deque compatibility execution skipped");
+        return;
+    };
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
+
+#[test]
+fn writable_bindings_hold_the_collection_exclusively_for_the_body() {
+    for (case, body) in [
+        ("index read", "$value = 5; echo \"{$values[0]}\";"),
+        ("property read", "echo \"{$values->count}\";"),
+        ("mutation", "$values->add(3);"),
+    ] {
+        let source = format!(
+            "function main(): void {{ writable List<int> $values = [1, 2]; foreach ($values as writable int $value) {{ {body} }} }}"
+        );
+        let found = errors(&source);
+        assert!(
+            found.iter().any(|diagnostic| diagnostic.code == "E0477"),
+            "{case}: {found:#?}"
+        );
+    }
+    // A readonly binding still shares the collection with the body.
+    let readonly = errors(
+        "function main(): void { writable List<int> $values = [1, 2]; foreach ($values as int $value) { echo \"{$values[0]}{$values->count}\"; } }",
+    );
+    assert!(readonly.is_empty(), "{readonly:#?}");
+}

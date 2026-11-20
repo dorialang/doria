@@ -5598,7 +5598,15 @@ impl Checker<'_> {
         return_move_type: bool,
     ) -> Flow {
         let borrow_depth = self.active_borrows.len();
-        self.activate_place_borrow(&statement.iterable, UseMode::Read, scopes);
+        // A writable value binding names an element of the collection, so the
+        // body holds the collection's exclusive borrow (Decisions 0100, 0132):
+        // nothing else may read or write it until the body is left.
+        let mode = if statement.value_binding.writable {
+            UseMode::Write
+        } else {
+            UseMode::Read
+        };
+        self.activate_place_borrow(&statement.iterable, mode, scopes);
         scopes.push();
         if let Some(first_binding) = &statement.first_binding {
             self.declare_foreach_binding(first_binding, scopes);

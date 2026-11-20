@@ -8186,7 +8186,31 @@ fn lower_collection_foreach_in_scope(
         break_finalizer_depth: context.active_finalizers.len(),
         continue_sources: Vec::new(),
     });
+    let write_back = match projection {
+        CollectionForeachProjection::Main if foreach.value_binding.writable => element_write_back(
+            foreach,
+            value_local,
+            definition.value,
+            collection,
+            index_local,
+        )?,
+        CollectionForeachProjection::Main
+        | CollectionForeachProjection::Keys
+        | CollectionForeachProjection::Values => None,
+    };
     context.push_scope();
+    // The body scope owns the write-back, so normal completion and every
+    // structured exit from the body (continue, break, return, a routed checked
+    // error, a crossed finalizer) store the binding before the scope is left.
+    // The checked exclusive borrow of the collection means nothing can observe
+    // the slot between a write to the binding and that store.
+    if let Some(write_back) = write_back {
+        context
+            .scope_owned_locals
+            .last_mut()
+            .expect("the foreach body has an ownership scope")
+            .push(DropObligation::WriteBackElement(write_back));
+    }
     let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
     let body_fallthrough = context.current_block;
     context.pop_scope();
@@ -8197,61 +8221,6 @@ fn lower_collection_foreach_in_scope(
     }
 
     context.current_block = Some(update_block);
-    if foreach.value_binding.writable && projection == CollectionForeachProjection::Main {
-        match definition.value {
-            mir::Type::ByteRegion(_)
-            | mir::Type::NullableByteRegion(_)
-            | mir::Type::Scalar(_)
-            | mir::Type::String
-            | mir::Type::NullableScalar(_)
-            | mir::Type::NullableString
-            | mir::Type::Interface(_)
-            | mir::Type::NullableInterface(_)
-            | mir::Type::PayloadEnum(_)
-            | mir::Type::NullablePayloadEnum(_)
-            | mir::Type::Function(_)
-            | mir::Type::NullableFunction(_) => {
-                // Write back to the slot being iterated, matching the
-                // positional read above. Resolving by key here would search for
-                // the element again, and for a values-only pass there is no key
-                // to search with: `key` is None, so the offset would arrive
-                // where the key type is expected.
-                context.push_statement(mir::Statement::AssignCollectionIndex {
-                    index_span: foreach.span,
-                    positional: true,
-                    collection,
-                    index: offset.clone(),
-                    value: foreach_local_rvalue(value_local, definition.value)?,
-                });
-            }
-            mir::Type::Class(_)
-            | mir::Type::SharedReference(_)
-            | mir::Type::WeakReference(_)
-            | mir::Type::WritableSharedReference(_)
-            | mir::Type::WritableWeakReference(_)
-            | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_)
-            | mir::Type::Mixed
-            | mir::Type::Collection(_)
-            | mir::Type::NullableCollection(_) => {}
-            mir::Type::ClosureEnvironment(_) => {
-                unreachable!("closure environments are not source collection elements")
-            }
-            mir::Type::NullableMixed
-            | mir::Type::NullableClass(_)
-            | mir::Type::NullableSharedReference(_)
-            | mir::Type::NullableWeakReference(_)
-            | mir::Type::NullableWritableSharedReference(_)
-            | mir::Type::NullableWritableWeakReference(_) => {
-                return Err(vec![unsupported(
-                    foreach.span,
-                    "nullable collection elements are deferred beyond Stage 23 Slice 1",
-                )]);
-            }
-        }
-    }
     context.push_statement(mir::Statement::AssignLocal {
         target: index_local,
         value: mir::Rvalue::Value(mir::ValueExpression::Integer(
@@ -8301,6 +8270,68 @@ fn lower_collection_foreach_in_scope(
         ));
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
+}
+
+/// The store a writable foreach binding owes its slot when the body is left.
+/// Copy elements live in the binding's local; a move element binding borrows
+/// the element itself, so writes through it already reach the collection.
+fn element_write_back(
+    foreach: &hir::ForeachStmt,
+    binding: mir::LocalId,
+    ty: mir::Type,
+    collection: mir::LocalId,
+    position: mir::LocalId,
+) -> DiagnosticResult<Option<ElementWriteBack>> {
+    match ty {
+        mir::Type::ByteRegion(_)
+        | mir::Type::NullableByteRegion(_)
+        | mir::Type::Scalar(_)
+        | mir::Type::String
+        | mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::Interface(_)
+        | mir::Type::NullableInterface(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => {
+            let write_back = ElementWriteBack {
+                binding,
+                ty,
+                collection,
+                position,
+                span: foreach.span,
+            };
+            // Every exit edge emits this store, so reject an element shape it
+            // cannot express here, once, before the body is lowered.
+            write_back.statement()?;
+            Ok(Some(write_back))
+        }
+        mir::Type::Class(_)
+        | mir::Type::SharedReference(_)
+        | mir::Type::WeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
+        | mir::Type::Mixed
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => Ok(None),
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source collection elements")
+        }
+        mir::Type::NullableMixed
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
+            foreach.span,
+            "nullable collection elements are deferred beyond Stage 23 Slice 1",
+        )]),
+    }
 }
 
 fn collection_offset_rvalue(local: mir::LocalId) -> mir::Rvalue {
@@ -9070,8 +9101,14 @@ struct LoweringContext<'semantic> {
     return_borrow: Option<mir::ReturnBorrow>,
 }
 
+/// Work a lexical scope owes on every exit: normal completion and every
+/// structured exit (`break`, `continue`, `return`, a routed checked error and a
+/// crossed finalizer) emit these in reverse registration order.
 #[derive(Clone, Copy)]
 enum DropObligation {
+    /// A writable foreach binding over Copy elements holds the element's value
+    /// in its local; leaving the body stores it back into the slot it names.
+    WriteBackElement(ElementWriteBack),
     EndBorrow(mir::LocalId),
     String(mir::LocalId),
     Class(mir::LocalId, ClassId),
@@ -9086,6 +9123,30 @@ enum DropObligation {
     PayloadEnum(mir::LocalId, mir::PayloadEnumType, bool),
     InlineValue(mir::LocalId, crate::inline_value::InlineValueType, bool),
     Function(mir::LocalId, mir::FunctionTypeId, bool),
+}
+
+#[derive(Clone, Copy)]
+struct ElementWriteBack {
+    binding: mir::LocalId,
+    ty: mir::Type,
+    collection: mir::LocalId,
+    position: mir::LocalId,
+    span: Span,
+}
+
+impl ElementWriteBack {
+    fn statement(self) -> DiagnosticResult<mir::Statement> {
+        // Store to the slot being iterated, matching the positional read that
+        // established the binding. A values-only dictionary pass has no key to
+        // search with, and searching by key would find the element again.
+        Ok(mir::Statement::AssignCollectionIndex {
+            index_span: self.span,
+            positional: true,
+            collection: self.collection,
+            index: collection_offset_rvalue(self.position),
+            value: foreach_local_rvalue(self.binding, self.ty)?,
+        })
+    }
 }
 
 fn user_local_type_owns_value(ty: mir::Type) -> bool {
@@ -9452,6 +9513,9 @@ impl<'semantic> LoweringContext<'semantic> {
     fn emit_drop_obligations(&mut self, cleanup: &[DropObligation]) {
         for obligation in cleanup.iter().rev().copied() {
             self.push_statement(match obligation {
+                DropObligation::WriteBackElement(write_back) => write_back
+                    .statement()
+                    .expect("an element write-back is validated when its scope registers it"),
                 DropObligation::EndBorrow(local) => mir::Statement::EndBorrow { local },
                 DropObligation::String(local) => mir::Statement::DropString { local },
                 DropObligation::Class(local, class) => mir::Statement::DropClass {
