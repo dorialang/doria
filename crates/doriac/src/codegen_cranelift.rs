@@ -8979,6 +8979,32 @@ fn typed_region_element(
     Ok(Some((element, address)))
 }
 
+/// Element `index` of the typed array region `region`, read as `scalar`
+/// (Decision 0148 section 8). Every scalar family's operand reads region
+/// elements here. A `bool` element is true for any nonzero byte, as a
+/// `_Bool` read from C memory is, because a region may view a foreign
+/// aggregate's field.
+fn lower_typed_region_read(
+    builder: &mut FunctionBuilder,
+    region: mir::LocalId,
+    index: &mir::Rvalue,
+    index_span: crate::source::Span,
+    scalar: mir::ScalarType,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let index = lower_rvalue(builder, index, resources)?.single()?;
+    let (element, address) = typed_region_element(builder, region, index, index_span, resources)?
+        .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+    if element != mir::Type::Scalar(scalar) {
+        return Err(malformed_mir(
+            "a region element read has the element's type",
+        ));
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let value = load_lowered_from_address(builder, resources.program, element, address, pointer);
+    normalize_foreign_bool(builder, element, value)?.single()
+}
+
 fn lower_byte_region_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::RegionExpression,
@@ -21833,21 +21859,14 @@ fn lower_integer_operand(
             mir::Type::Region(mir::RegionType { array: Some(_), .. })
         ) =>
         {
-            let index = lower_rvalue(builder, index, resources)?.single()?;
-            let (element, address) =
-                typed_region_element(builder, *region, index, *index_span, resources)?
-                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
-            if element != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
-                return Err(malformed_mir(
-                    "a region element read has the element's type",
-                ));
-            }
-            Ok(builder.ins().load(
-                clif_integer_type(ty),
-                cranelift_codegen::ir::MachMemFlags::trusted(),
-                address,
-                0,
-            ))
+            lower_typed_region_read(
+                builder,
+                *region,
+                index,
+                *index_span,
+                mir::ScalarType::Integer(ty),
+                resources,
+            )
         }
         mir::Operand::RegionIndex {
             region,
@@ -22119,6 +22138,18 @@ fn lower_float_expression(
                 *collection,
                 offset,
                 mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+                resources,
+            ),
+            mir::Operand::RegionIndex {
+                region,
+                index,
+                index_span,
+            } => lower_typed_region_read(
+                builder,
+                *region,
+                index,
+                *index_span,
+                mir::ScalarType::Float(*ty),
                 resources,
             ),
             mir::Operand::MixedPayload { mixed, tag } => {
@@ -24401,6 +24432,18 @@ fn lower_bool_operand(
             mir::Type::Scalar(mir::ScalarType::Bool),
             resources,
         ),
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } => lower_typed_region_read(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::ScalarType::Bool,
+            resources,
+        ),
         mir::Operand::MixedPayload { mixed, tag } => {
             lower_mixed_payload(builder, *mixed, *tag, resources)
         }
@@ -24420,6 +24463,18 @@ fn lower_inline_operand(
     match operand {
         mir::Operand::Scalar(mir::ScalarValue::Inline(value)) if value.ty == ty => Ok(
             cranelift_scalar_constant(builder, mir::ScalarValue::Inline(*value)),
+        ),
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } => lower_typed_region_read(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::ScalarType::Inline(ty),
+            resources,
         ),
         mir::Operand::Local(local) => {
             if local_definition(resources.program, resources.function_id, *local)?.ty != expected {
@@ -24622,6 +24677,18 @@ fn lower_enum_operand(
             *collection,
             offset,
             expected,
+            resources,
+        ),
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } => lower_typed_region_read(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::ScalarType::Enum(enum_id),
             resources,
         ),
         mir::Operand::MixedPayload { mixed, tag } => {

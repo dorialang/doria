@@ -920,6 +920,129 @@ function main(): void
 }
 
 #[test]
+fn typed_array_regions_view_float_bool_and_enum_elements() {
+    // Decision 0148 section 8: a region over `T[]` for every element type
+    // stored bit for bit.
+    let source = "
+enum Suit
+{
+    case Hearts;
+    case Spades;
+}
+
+function letter(Suit $suit): string
+{
+    if ($suit == Suit::Hearts) {
+        return \"h\";
+    }
+    return \"s\";
+}
+
+function flag(bool $value): string
+{
+    if ($value) {
+        return \"t\";
+    }
+    return \"f\";
+}
+
+function sum(ArrayRegion<float> $values): float
+{
+    writable float $total = 0.0;
+    for (writable int $index = 0; $index < $values->length; $index++) {
+        $total += $values[$index];
+    }
+    return $total;
+}
+
+function main(): void
+{
+    writable float[] $wide = [0.5, 1.5, 2.5];
+    {
+        writable WritableArrayRegion<float> $tail = $wide->getWritableRegion(1, 2);
+        $tail[0] += 1.0;
+        echo \"{$tail[1]}\";
+    }
+    echo \" {$wide[1]} {sum($wide->getRegion(0, 3))}\";
+    float32[] $narrow = [0.25, 1.25];
+    let $narrowRegion = $narrow->getRegion(1, 1);
+    float32 $narrowValue = $narrowRegion[0];
+    echo \" {$narrowValue}\";
+    writable bool[] $flags = [true, false, false];
+    {
+        writable WritableArrayRegion<bool> $middle = $flags->getWritableRegion(1, 2);
+        $middle[0] = true;
+    }
+    let $flagRegion = $flags->getRegion(0, 3);
+    echo \" \" . flag($flagRegion[0]) . flag($flagRegion[1]) . flag($flagRegion[2]);
+    writable Suit[] $suits = [Suit::Hearts, Suit::Hearts];
+    {
+        writable WritableArrayRegion<Suit> $all = $suits->getWritableRegion(0, 2);
+        $all[1] = Suit::Spades;
+    }
+    let $suitRegion = $suits->getRegion(0, 2);
+    echo \" \" . letter($suitRegion[0]) . letter($suitRegion[1]);
+    float[] $source = [9.5];
+    {
+        writable WritableArrayRegion<float> $front = $wide->getWritableRegion(0, 1);
+        echo \" \" . $front->copyFrom($source->getRegion(0, 1));
+    }
+    echo \" {$wide[0]}\";
+}
+";
+    assert_runs_everywhere(source, "2.5 2.5 5.5 1.25 ttf hs 1 9.5");
+}
+
+#[test]
+fn typed_array_regions_view_pointer_elements() {
+    // Decision 0148 section 8 over `Ptr<T>[]`.
+    let source = format!(
+        "{POINTER}
+function main(): void
+{{
+    int32 $first = 4;
+    int32 $second = 5;
+    unsafe {{
+        writable Ptr<int32>[] $pointers = [Ptr::to($first), Ptr::to($first)];
+        {{
+            writable WritableArrayRegion<Ptr<int32>> $slots = $pointers->getWritableRegion(0, 2);
+            $slots[1] = Ptr::to($second);
+        }}
+        let $view = $pointers->getRegion(0, 2);
+        Ptr<int32> $one = $view[0];
+        Ptr<int32> $two = $view[1];
+        echo $one->read() . \" \" . $two->read();
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "4 5");
+    // Fixed-length array fields of float and bool elements (section 6).
+    let fields = "
+extern \"C\" struct Sample
+{
+    float32[2] $weights;
+    bool[2] $set;
+}
+
+function main(): void
+{
+    float32[] $weights = [0.5, 0.25];
+    writable Sample $sample = new Sample(weights: $weights->getRegion(0, 2));
+    $sample->set[1] = true;
+    $sample->weights[0] += 1.0;
+    float32 $first = $sample->weights[0];
+    float32 $second = $sample->weights[1];
+    echo \"{$first} {$second}\";
+    if ($sample->set[1] and not $sample->set[0]) {
+        echo \" set\";
+    }
+}
+";
+    assert_runs_natively(fields, "1.5 0.25 set");
+}
+
+#[test]
 fn array_region_bounds_panic_as_typed_arrays_do() {
     assert_panics_everywhere(
         "function main(): void { int32[] $numbers = [1, 2, 3]; echo \"a\"; let $region = $numbers->getRegion(2, 2); echo $region->length; }",

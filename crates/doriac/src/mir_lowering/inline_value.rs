@@ -303,17 +303,7 @@ pub(super) fn lower_expression_with_ownership(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
-            let (collection, index) =
-                lower_collection_index_operand(collection, index, expected, context)?;
-            mir::Operand::CollectionIndex {
-                index_span: expr.span(),
-                collection,
-                index: Box::new(index),
-                positional: false,
-                remove: false,
-            }
-        }
+        } => lower_scalar_index_operand(expr, collection, index, scalar, context)?,
         hir::Expr::StaticMember {
             class_name,
             member,

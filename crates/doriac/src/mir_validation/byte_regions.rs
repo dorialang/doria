@@ -348,6 +348,23 @@ pub(super) fn element(
     }
 }
 
+/// A read of element `index` of the region local `region` as `expected`,
+/// which every scalar family's operand shares (Decision 0148 section 8).
+pub(super) fn validate_element_read(
+    program: &mir::Program,
+    function: &mir::Function,
+    region: mir::LocalId,
+    index: &mir::Rvalue,
+    expected: mir::Type,
+) -> Result<(), BackendError> {
+    if element(program, function, region)? != expected {
+        return Err(malformed_mir(
+            "a region element read has the region's element type",
+        ));
+    }
+    validate_index(program, function, region, index, false)
+}
+
 pub(super) fn validate_index(
     program: &mir::Program,
     function: &mir::Function,

@@ -610,12 +610,22 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
 /// The stride of a typed array region's elements of type `element`, for
 /// the element types every execution target builds regions over: values
 /// copied bit for bit that the typed array stores at their own width
-/// (Decision 0148 section 8). `None` for an element type no target builds a
-/// region over yet.
+/// (Decision 0148 section 8). These are the integers (with the C boundary
+/// types), floats, `bool`, unit and backed enum tags, pointers, and the
+/// inline values with no cleanup. `None` for an element type no target
+/// builds a region over yet.
 pub fn array_region_stride(element: mir::Type) -> Option<u8> {
     match element {
         // A scalar's stride is its width; pointer width does not enter it.
-        mir::Type::Scalar(mir::ScalarType::Integer(_)) => collection_value_width(element, 8),
+        mir::Type::Scalar(
+            mir::ScalarType::Integer(_)
+            | mir::ScalarType::Float(_)
+            | mir::ScalarType::Bool
+            | mir::ScalarType::Enum(_),
+        ) => collection_value_width(element, 8),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) if !ty.requires_owned_cleanup() => {
+            collection_value_width(element, 8)
+        }
         _ => None,
     }
 }

@@ -2856,6 +2856,54 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok((data, length))
     }
 
+    /// A C `_Bool` byte as a Doria `bool`: 0 or 1, and any other byte reads
+    /// as `true`. Every read of memory C may have written (a pointer read,
+    /// a foreign field or result, a typed array region element) uses it.
+    fn normalize_c_bool(&self, byte: IntValue<'ctx>) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let set = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            byte,
+            byte.get_type().const_zero(),
+            "c.bool",
+        ))?;
+        Ok(build(
+            self.builder
+                .build_int_z_extend(set, self.context.i8_type(), "c.bool.byte"),
+        )?
+        .into())
+    }
+
+    /// Element `index` of the typed array region `region`, read as
+    /// `scalar` (Decision 0148 section 8). Every scalar family's operand
+    /// reads region elements here; a region may view a foreign aggregate's
+    /// field, so a `bool` element reads as a C `_Bool`.
+    fn lower_typed_region_read(
+        &mut self,
+        region: mir::LocalId,
+        index: &mir::Rvalue,
+        index_span: crate::source::Span,
+        scalar: mir::ScalarType,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let index = self.lower_rvalue(index)?;
+        let (element, address) = self
+            .typed_region_element(region, index, index_span)?
+            .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+        if element != mir::Type::Scalar(scalar) {
+            return Err(malformed_mir(
+                "a region element read has the element's type",
+            ));
+        }
+        let loaded = build(self.builder.build_load(
+            scalar_type(self.context, scalar),
+            address,
+            "array-region.element",
+        ))?;
+        if scalar == mir::ScalarType::Bool {
+            return self.normalize_c_bool(loaded.into_int_value());
+        }
+        Ok(loaded)
+    }
+
     /// The element type of a typed array region local and the
     /// bounds-checked address of its element `index` (Decision 0148
     /// section 8); `None` for a byte region.
@@ -11327,21 +11375,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     address,
                     "foreign.field.read",
                 ))?;
-                // A `_Bool` read from C memory is true for any nonzero byte.
                 let value = if ty == mir::Type::Scalar(mir::ScalarType::Bool) {
-                    let byte = loaded.into_int_value();
-                    let set = build(self.builder.build_int_compare(
-                        IntPredicate::NE,
-                        byte,
-                        byte.get_type().const_zero(),
-                        "foreign.field.bool",
-                    ))?;
-                    build(self.builder.build_int_z_extend(
-                        set,
-                        self.context.i8_type(),
-                        "foreign.field.bool.byte",
-                    ))?
-                    .into()
+                    self.normalize_c_bool(loaded.into_int_value())?
                 } else {
                     loaded
                 };
@@ -22462,21 +22497,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "pointer.read",
                 ))?;
                 set_access_alignment(loaded.as_instruction_value(), size, *aligned)?;
-                // C `_Bool` is 0 or 1; any other byte still reads as `true`.
                 Some(if scalar == mir::ScalarType::Bool {
-                    let byte = loaded.into_int_value();
-                    let set = build(self.builder.build_int_compare(
-                        IntPredicate::NE,
-                        byte,
-                        byte.get_type().const_zero(),
-                        "pointer.read.bool",
-                    ))?;
-                    build(self.builder.build_int_z_extend(
-                        set,
-                        self.context.i8_type(),
-                        "pointer.read.bool.byte",
-                    ))?
-                    .into()
+                    self.normalize_c_bool(loaded.into_int_value())?
                 } else {
                     loaded
                 })
@@ -22863,22 +22885,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         let returned = returned()?;
         let value: BasicValueEnum<'ctx> = match scalar {
-            // C `_Bool` is 0 or 1; any other byte still reads as `true`.
-            CScalar::Bool => {
-                let byte = returned.into_int_value();
-                let set = build(self.builder.build_int_compare(
-                    IntPredicate::NE,
-                    byte,
-                    byte.get_type().const_zero(),
-                    "foreign.result.bool",
-                ))?;
-                build(self.builder.build_int_z_extend(
-                    set,
-                    self.context.i8_type(),
-                    "foreign.result.bool.byte",
-                ))?
-                .into()
-            }
+            CScalar::Bool => self.normalize_c_bool(returned.into_int_value())?,
             CScalar::Pointer => {
                 let address = build(self.builder.build_ptr_to_int(
                     returned.into_pointer_value(),
@@ -23526,21 +23533,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 mir::Type::Region(mir::RegionType { array: Some(_), .. })
             ) =>
             {
-                let index = self.lower_rvalue(index)?;
-                let (element, address) = self
-                    .typed_region_element(*region, index, *index_span)?
-                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
-                if element != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
-                    return Err(malformed_mir(
-                        "a region element read has the element's type",
-                    ));
-                }
-                Ok(build(self.builder.build_load(
-                    integer_type(self.context, ty),
-                    address,
-                    "array-region.element",
-                ))?
-                .into_int_value())
+                Ok(self
+                    .lower_typed_region_read(
+                        *region,
+                        index,
+                        *index_span,
+                        mir::ScalarType::Integer(ty),
+                    )?
+                    .into_int_value())
             }
             mir::Operand::RegionIndex {
                 region,
@@ -23738,6 +23738,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_struct_value();
                     Ok(self.nullable_parts(value)?.1.into_float_value())
                 }
+                mir::Operand::RegionIndex {
+                    region,
+                    index,
+                    index_span,
+                } => Ok(self
+                    .lower_typed_region_read(
+                        *region,
+                        index,
+                        *index_span,
+                        mir::ScalarType::Float(*ty),
+                    )?
+                    .into_float_value()),
                 mir::Operand::MixedPayload { mixed, tag } => {
                     let mir::MixedTag::Float(float) = tag else {
                         return Err(malformed_mir("float mixed payload uses non-float tag"));
@@ -25757,6 +25769,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .into_struct_value();
                 Ok(self.nullable_parts(value)?.1.into_int_value())
             }
+            mir::Operand::RegionIndex {
+                region,
+                index,
+                index_span,
+            } => Ok(self
+                .lower_typed_region_read(*region, index, *index_span, mir::ScalarType::Bool)?
+                .into_int_value()),
             mir::Operand::MixedPayload { mixed, tag } => {
                 if !matches!(tag, mir::MixedTag::Bool) {
                     return Err(malformed_mir("bool mixed payload uses non-bool tag"));
@@ -25814,6 +25833,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     &[value.bits as u64, (value.bits >> 64) as u64]
                         [..ty.storage_bytes() as usize / 8],
                 )),
+            mir::Operand::RegionIndex {
+                region,
+                index,
+                index_span,
+            } => Ok(self
+                .lower_typed_region_read(*region, index, *index_span, mir::ScalarType::Inline(ty))?
+                .into_int_value()),
             mir::Operand::Local(local) => {
                 if local_in(self.function, *local)?.ty != expected {
                     return Err(malformed_mir(
@@ -25951,6 +25977,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .into_struct_value();
                 Ok(self.nullable_parts(value)?.1.into_int_value())
             }
+            mir::Operand::RegionIndex {
+                region,
+                index,
+                index_span,
+            } => Ok(self
+                .lower_typed_region_read(
+                    *region,
+                    index,
+                    *index_span,
+                    mir::ScalarType::Enum(enum_id),
+                )?
+                .into_int_value()),
             mir::Operand::MixedPayload { mixed, tag } => {
                 if *tag != mir::MixedTag::Enum(enum_id) {
                     return Err(malformed_mir("enum mixed payload uses another enum type"));

@@ -97,7 +97,7 @@ pub fn unbuilt_region_element(span: Span, region: &str, element: &str) -> Diagno
         span,
         "Array Regions Of This Element Type Cannot Be Built Yet",
         format!(
-            "`{region}<{element}>` is part of Doria; this compiler builds array regions over integer elements, and not over `{element}` yet"
+            "`{region}<{element}>` is part of Doria; this compiler builds array regions over numbers, `bool`, enum cases, pointers and other plain Copy values, and not over `{element}` yet"
         ),
     )
 }

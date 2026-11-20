@@ -17062,23 +17062,15 @@ fn lower_condition(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
-            let (collection, index) = lower_collection_index_operand(
+        } => Ok(mir::BoolExpression::Use {
+            operand: lower_scalar_index_operand(
+                expr,
                 collection,
                 index,
-                mir::Type::Scalar(mir::ScalarType::Bool),
+                mir::ScalarType::Bool,
                 context,
-            )?;
-            Ok(mir::BoolExpression::Use {
-                operand: mir::Operand::CollectionIndex {
-                    index_span: expr.span(),
-                    positional: false,
-                    collection,
-                    index: Box::new(index),
-                    remove: false,
-                },
-            })
-        }
+            )?,
+        }),
         hir::Expr::StaticMember {
             class_name,
             member,
@@ -18384,24 +18376,16 @@ fn lower_enum_expression(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
-            let (collection, index) = lower_collection_index_operand(
+        } => Ok(mir::EnumExpression::Use {
+            enum_id,
+            operand: lower_scalar_index_operand(
+                expr,
                 collection,
                 index,
-                mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
+                mir::ScalarType::Enum(enum_id),
                 context,
-            )?;
-            Ok(mir::EnumExpression::Use {
-                enum_id,
-                operand: mir::Operand::CollectionIndex {
-                    index_span: expr.span(),
-                    collection,
-                    index: Box::new(index),
-                    positional: false,
-                    remove: false,
-                },
-            })
-        }
+            )?,
+        }),
         hir::Expr::StaticMember {
             class_name,
             member,
@@ -24433,6 +24417,47 @@ fn expression_is_bytes(expr: &hir::Expr, context: &mut LoweringContext) -> bool 
     )
 }
 
+/// The operand that reads element `index` of `collection` in the indexed
+/// expression `expr` as `expected`: an element of a typed array region or
+/// byte region (Decision 0148 section 8), or an element of a collection.
+/// Every scalar family reads indexed elements through this one place.
+fn lower_scalar_index_operand(
+    expr: &hir::Expr,
+    collection: &hir::Expr,
+    index: &hir::Expr,
+    expected: mir::ScalarType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Operand> {
+    if let mir::Type::Region(region_type) = context.expression_type(collection)? {
+        if byte_region::element_scalar(region_type, expr.span(), context)? != expected {
+            return Err(vec![unsupported(
+                expr.span(),
+                "a region element read has the element's type",
+            )]);
+        }
+        let region = byte_region::local(collection, false, context)?;
+        let index = lower_rvalue_as_expected(
+            index,
+            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+            context,
+        )?;
+        return Ok(mir::Operand::RegionIndex {
+            region,
+            index: Box::new(index),
+            index_span: expr.span(),
+        });
+    }
+    let (collection, index) =
+        lower_collection_index_operand(collection, index, mir::Type::Scalar(expected), context)?;
+    Ok(mir::Operand::CollectionIndex {
+        index_span: expr.span(),
+        positional: false,
+        collection,
+        index: Box::new(index),
+        remove: false,
+    })
+}
+
 fn lower_collection_index_operand(
     collection_expr: &hir::Expr,
     index: &hir::Expr,
@@ -28253,24 +28278,16 @@ fn lower_float_expression(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
-            let (collection, index) = lower_collection_index_operand(
+        } => Ok(mir::FloatExpression::Use {
+            ty,
+            operand: lower_scalar_index_operand(
+                expr,
                 collection,
                 index,
-                mir::Type::Scalar(mir::ScalarType::Float(ty)),
+                mir::ScalarType::Float(ty),
                 context,
-            )?;
-            Ok(mir::FloatExpression::Use {
-                ty,
-                operand: mir::Operand::CollectionIndex {
-                    index_span: expr.span(),
-                    positional: false,
-                    collection,
-                    index: Box::new(index),
-                    remove: false,
-                },
-            })
-        }
+            )?,
+        }),
         hir::Expr::StaticMember {
             class_name,
             member,
@@ -28658,48 +28675,16 @@ fn lower_integer_expression(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
-            if let mir::Type::Region(region_type) = context.expression_type(collection)? {
-                if byte_region::element_scalar(region_type, expr.span(), context)?
-                    != mir::ScalarType::Integer(ty)
-                {
-                    return Err(vec![unsupported(
-                        expr.span(),
-                        "a region element read has the element's type",
-                    )]);
-                }
-                let region = byte_region::local(collection, false, context)?;
-                let index = lower_rvalue_as_expected(
-                    index,
-                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
-                    context,
-                )?;
-                return Ok(mir::IntegerExpression::Use {
-                    ty,
-                    operand: mir::Operand::RegionIndex {
-                        region,
-                        index: Box::new(index),
-                        index_span: expr.span(),
-                    },
-                });
-            }
-            let (collection, index) = lower_collection_index_operand(
+        } => Ok(mir::IntegerExpression::Use {
+            ty,
+            operand: lower_scalar_index_operand(
+                expr,
                 collection,
                 index,
-                mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+                mir::ScalarType::Integer(ty),
                 context,
-            )?;
-            Ok(mir::IntegerExpression::Use {
-                ty,
-                operand: mir::Operand::CollectionIndex {
-                    index_span: expr.span(),
-                    positional: false,
-                    collection,
-                    index: Box::new(index),
-                    remove: false,
-                },
-            })
-        }
+            )?,
+        }),
         hir::Expr::StaticMember {
             class_name,
             member,

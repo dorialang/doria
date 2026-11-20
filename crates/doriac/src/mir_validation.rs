@@ -6316,6 +6316,9 @@ fn validate_inline_value_expression(
             mir::Operand::MixedPayload { mixed, tag } => {
                 validate_mixed_payload_operand(function, *mixed, *tag, expected)
             }
+            mir::Operand::RegionIndex { region, index, .. } => {
+                byte_regions::validate_element_read(program, function, *region, index, expected)
+            }
             _ => Err(malformed_mir(
                 "inline value operand has another nominal type",
             )),
@@ -6469,9 +6472,11 @@ fn validate_enum_operand(
         mir::Operand::MixedPayload { mixed, tag } => {
             validate_mixed_payload_operand(function, *mixed, *tag, expected)
         }
+        mir::Operand::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(program, function, *region, index, expected)
+        }
         mir::Operand::CollectionLength(_)
         | mir::Operand::RegionLength(_)
-        | mir::Operand::RegionIndex { .. }
         | mir::Operand::CollectionKeyAt { .. }
         | mir::Operand::StringIntrinsic(_) => Err(malformed_mir(
             "enum expression uses an incompatible operand",
@@ -23675,16 +23680,13 @@ fn validate_integer_operand(
             }
             Ok(())
         }
-        mir::Operand::RegionIndex { region, index, .. } => {
-            if mir::Type::Scalar(mir::ScalarType::Integer(ty))
-                != byte_regions::element(program, function, *region)?
-            {
-                return Err(malformed_mir(
-                    "a region element read has the region's element type",
-                ));
-            }
-            byte_regions::validate_index(program, function, *region, index, false)
-        }
+        mir::Operand::RegionIndex { region, index, .. } => byte_regions::validate_element_read(
+            program,
+            function,
+            *region,
+            index,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+        ),
         mir::Operand::CollectionIteratorPosition { receiver, vtable } => {
             iteration::builtin_receiver(program, function, *receiver, *vtable, true)?;
             if ty != IntegerType::Int64 {
@@ -23801,8 +23803,9 @@ fn validate_bool_operand(
 ) -> Result<(), BackendError> {
     let expected = mir::Type::Scalar(mir::ScalarType::Bool);
     match operand {
-        mir::Operand::RegionLength(_) | mir::Operand::RegionIndex { .. } => {
-            Err(malformed_mir("byte region measurement is not bool"))
+        mir::Operand::RegionLength(_) => Err(malformed_mir("byte region measurement is not bool")),
+        mir::Operand::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(program, function, *region, index, expected)
         }
         mir::Operand::CollectionIteratorPosition { .. } => {
             Err(malformed_mir("iterator position is int, not bool"))
@@ -23891,8 +23894,9 @@ fn validate_float_operand(
 ) -> Result<(), BackendError> {
     let expected = mir::Type::Scalar(mir::ScalarType::Float(ty));
     match operand {
-        mir::Operand::RegionLength(_) | mir::Operand::RegionIndex { .. } => {
-            Err(malformed_mir("byte region measurement is not float"))
+        mir::Operand::RegionLength(_) => Err(malformed_mir("byte region measurement is not float")),
+        mir::Operand::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(program, function, *region, index, expected)
         }
         mir::Operand::CollectionIteratorPosition { .. } => {
             Err(malformed_mir("iterator position is int, not float"))
