@@ -832,6 +832,103 @@ impl<'program> Checker<'program> {
         }
     }
 
+    /// E0631 for a C-ABI function whose body can let the checked errors
+    /// `uncovered` escape, automatic I/O errors included (Decision 0148
+    /// section 12, amendment of 2026-11-20). C receives only the return
+    /// value, so the fix wraps the body in `try` with one `catch` per error.
+    pub(super) fn c_abi_escaping_errors(
+        &self,
+        function: &FunctionDecl,
+        uncovered: &[TypeId],
+    ) -> Diagnostic {
+        let short = function.name.rsplit('\\').next().unwrap_or(&function.name);
+        let displays = uncovered
+            .iter()
+            .map(|effect| self.types.display(*effect))
+            .collect::<Vec<_>>();
+        let listed = displays
+            .iter()
+            .map(|display| format!("`{display}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let returns_value = function
+            .return_type
+            .as_ref()
+            .is_some_and(|ty| ty.name != "void" || ty.function.is_some());
+        let mut diagnostic = Diagnostic::new(
+            "E0631",
+            format!("checked errors {listed} can leave `extern \"C\" function {short}`"),
+            function.span,
+        )
+        .with_title("C-ABI Functions Must Handle Every Checked Error")
+        .with_explanation(
+            "C calls this function and receives only its return value, so no checked error may leave the body, including the I/O errors of `echo` and other built-in operations.",
+        )
+        .with_help(if returns_value {
+            "catch each error inside the body with `try` and `catch`, and return the value C expects when the work fails"
+        } else {
+            "catch each error inside the body with `try` and `catch`"
+        });
+        if let Some(body) = function.body.as_block() {
+            if let Some(replacement) = self.body_wrapped_in_try(body.span, &displays) {
+                // Catching an error stops it silently, which may not be what
+                // the author intends; a value-returning body also needs a
+                // `return` in each catch that only the author can choose.
+                let applicability = if returns_value {
+                    FixApplicability::Informational
+                } else {
+                    FixApplicability::RequiresReview
+                };
+                diagnostic = diagnostic.with_structured_fix(
+                    "Handle The Errors Inside The Body",
+                    applicability,
+                    vec![FixEdit {
+                        source: DiagnosticSource::Current,
+                        span: body.span,
+                        replacement,
+                    }],
+                );
+            }
+        }
+        diagnostic
+    }
+
+    /// The braced body at `body` rewritten as one `try` block holding its
+    /// statements, followed by an empty `catch (<error> $error)` for each of
+    /// `errors`, indented one level inside the body's own indentation.
+    fn body_wrapped_in_try(&self, body: Span, errors: &[String]) -> Option<String> {
+        let text = self.source_slice(body)?;
+        let inner = text.strip_prefix('{')?.strip_suffix('}')?;
+        let source = self.source_texts.get(&body.source)?;
+        let line_start = source[..body.start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let base = source[line_start..body.start]
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .collect::<String>();
+        let inner = inner.trim_matches(|character| character == '\n' || character == '\r');
+        let inner = inner.trim_end();
+        let mut wrapped = format!("{{\n{base}    try {{\n");
+        if inner.contains('\n') {
+            for line in inner.lines() {
+                if line.trim().is_empty() {
+                    wrapped.push('\n');
+                } else {
+                    wrapped.push_str(&format!("    {line}\n"));
+                }
+            }
+        } else if !inner.trim().is_empty() {
+            wrapped.push_str(&format!("{base}        {}\n", inner.trim()));
+        }
+        wrapped.push_str(&format!("{base}    }}"));
+        for error in errors {
+            wrapped.push_str(&format!(" catch ({error} $error) {{\n{base}    }}"));
+        }
+        wrapped.push_str(&format!("\n{base}}}"));
+        Some(wrapped)
+    }
+
     /// The `#[LinkName]` symbol of each foreign declaration that has one.
     fn foreign_link_names(&self) -> HashMap<Span, String> {
         self.foreign_string_arguments(crate::compiler_known_ffi::LINK_NAME)

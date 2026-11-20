@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-ABI Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -86,6 +86,13 @@ states the rule.
 Section 9 said how `CString` and `Utf16String` are made and read but not
 whether they are Copy or Move values. Andrew ruled on 2026-11-20: "Move
 value owning its buffer (Recommended)". Section 9 states the rule.
+
+### Amendment: Checked Errors In C-ABI Functions (2026-11-20)
+
+Section 12 said a checked error must be handled inside a C-ABI function's
+body but not whether that includes Decision 0123's automatic I/O errors,
+which need no declaration elsewhere. Andrew ruled on 2026-11-20: "Checking
+error: catch it inside the body (Recommended)". Section 12 states the rule.
 
 ### Amendment: Typed Link Inputs (2026-11-20)
 
@@ -559,7 +566,11 @@ extern "C" function windowProcedure(Ptr<Opaque> $window, uint32 $message,
 - `Ptr::toFunction(Ptr<Opaque> $address)` (unsafe) converts an address from
   `dlsym` or `GetProcAddress` to the C function pointer type of the expected
   type.
-- A checked error must be handled inside the body. A panic aborts.
+- A checked error must be handled inside the body, including the automatic
+  I/O errors of Decision 0123 (`IoError` and `InvalidUtf8Error`, which `echo`
+  can raise). A body that can let one escape is a checking error reported at
+  the function, whose fix wraps the work in `try` with a `catch` for each
+  error (amendment of 2026-11-20). A panic aborts.
 - Stage 40 exports no symbol for a C-ABI function; C reaches it only through its
   address. Stage 41 reuses the same C entry machinery for exports.
 - Closures do not convert to C function pointers. State travels through a

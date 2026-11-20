@@ -1,7 +1,7 @@
 //! Stage 40 checking (Decision 0148): unsafe contexts, foreign declarations,
 //! C-ABI functions, C function pointer types and their diagnostics.
 
-use doriac::diagnostics::{Diagnostic, DiagnosticSeverity};
+use doriac::diagnostics::{Diagnostic, DiagnosticSeverity, FixApplicability};
 
 /// Every finding of checking `source`: its errors, or its warnings when it
 /// has no error.
@@ -1274,26 +1274,68 @@ extern \"C\" function visit(Ptr<Opaque> $item, int32 $depth): bool
 }
 
 #[test]
-fn a_c_abi_function_that_can_raise_an_io_error_reports_that_it_cannot_be_built_yet() {
-    // An automatic I/O effect (Decision 0123) has no way to reach C
-    // through a C entry (Decision 0148 section 12).
+fn a_c_abi_function_that_can_let_an_io_error_escape_is_a_checking_error() {
+    // Decision 0148 section 12 (amendment of 2026-11-20): no checked error
+    // leaves a C-ABI function, the automatic I/O errors of Decision 0123
+    // included, and the fix wraps the work in `try`.
     let source = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
-extern \"C\" function report(Ptr<Opaque> $item): int32
+extern \"C\" function report(Ptr<Opaque> $item): void
 {
     echo \"called\";
-    return 0;
 }
 function main(): void {}
 ";
-    assert!(codes(source).is_empty(), "{:#?}", findings(source));
-    let diagnostics = doriac::lower_source_to_mir("ffi.doria", source.to_string())
-        .expect_err("the C entry cannot carry an I/O error to C");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title
-                    == "C-ABI Functions That Can Raise I/O Errors Cannot Be Built Yet"),
-        "{diagnostics:#?}"
+    let diagnostic = only(source, "E0631");
+    assert_eq!(
+        diagnostic.title,
+        "C-ABI Functions Must Handle Every Checked Error"
     );
+    assert!(
+        diagnostic
+            .message
+            .contains("`Doria\\Std\\Io\\IoError` can leave `extern \"C\" function report`"),
+        "{diagnostic:#?}"
+    );
+    let [fix] = diagnostic.fixes.as_slice() else {
+        panic!("one fix: {diagnostic:#?}");
+    };
+    assert_eq!(fix.applicability, FixApplicability::RequiresReview);
+    let [edit] = fix.edits.as_slice() else {
+        panic!("one edit: {fix:#?}");
+    };
+    assert_eq!(
+        edit.replacement,
+        "{\n    try {\n        echo \"called\";\n    } catch (Doria\\Std\\Io\\IoError $error) {\n    }\n}"
+    );
+    let fixed = format!(
+        "{}{}{}",
+        &source[..edit.span.start],
+        edit.replacement,
+        &source[edit.span.end..]
+    );
+    assert!(codes(&fixed).is_empty(), "{:#?}", findings(&fixed));
+
+    // A helper's automatic I/O reaches the C-ABI function that calls it.
+    // The fix for a body that returns a value is guidance: each `catch`
+    // needs a `return` only the author can choose.
+    let through_helper = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
+function note(string $text): void { echo $text; }
+extern \"C\" function count(Ptr<Opaque> $item): int32
+{
+    note(\"counted\");
+    return 1;
+}
+function main(): void {}
+";
+    let diagnostic = only(through_helper, "E0631");
+    assert_eq!(
+        diagnostic.fixes.first().map(|fix| fix.applicability),
+        Some(FixApplicability::Informational),
+        "{diagnostic:#?}"
+    );
+    let caught = through_helper.replace(
+        "    note(\"counted\");\n    return 1;",
+        "    try {\n        note(\"counted\");\n    } catch (Doria\\Std\\Io\\IoError $error) {\n        return 0;\n    }\n    return 1;",
+    );
+    assert!(codes(&caught).is_empty(), "{:#?}", findings(&caught));
 }

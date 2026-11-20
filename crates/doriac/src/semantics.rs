@@ -9385,28 +9385,35 @@ impl<'program> Checker<'program> {
         declared: &[TypeId],
         observed: &CheckedEffectSet,
     ) {
-        // Authored reach: a destructor must catch whatever its own body may
-        // raise, not only what the closures and members it currently reaches
-        // happen to raise.
+        // Authored reach: a destructor or a C-ABI function must catch whatever
+        // its own body may raise, not only what the closures and members it
+        // currently reaches happen to raise. Neither lets any checked Error
+        // escape, automatic I/O included (Decision 0148 section 12, amendment
+        // of 2026-11-20).
+        let closed_boundary = function.name == "__destruct" || function.linkage.is_c_abi();
         let mut uncovered = Vec::new();
         for effect in observed.reach.iter().copied() {
             let resolved = self.types.resolved(effect);
             if crate::checked_effects::is_test_assertion_effect(&resolved)
-                || (function.name != "__destruct"
-                    && crate::checked_effects::is_ambient_io_effect(&resolved))
+                || (!closed_boundary && crate::checked_effects::is_ambient_io_effect(&resolved))
             {
                 continue;
             }
             // The effective signature includes inferred ambient transport for
-            // ABI lowering. Destructors still cannot let any checked Error
-            // escape, so that runtime profile must never count as an authored
-            // declaration satisfying the lifecycle boundary.
-            if function.name != "__destruct" && self.checked_error_type_covers(declared, effect) {
+            // ABI lowering. A closed boundary still cannot let any checked
+            // Error escape, so that runtime profile must never count as an
+            // authored declaration satisfying it.
+            if !closed_boundary && self.checked_error_type_covers(declared, effect) {
                 continue;
             }
             uncovered.push(effect);
         }
         if uncovered.is_empty() {
+            return;
+        }
+        if function.linkage.is_c_abi() {
+            let diagnostic = self.c_abi_escaping_errors(function, &uncovered);
+            self.diagnostics.push(diagnostic);
             return;
         }
 

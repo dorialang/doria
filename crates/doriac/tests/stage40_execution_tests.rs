@@ -1503,6 +1503,67 @@ function main(): void
 }
 
 #[test]
+fn a_c_abi_function_that_catches_its_io_errors_runs_as_a_qsort_callback() {
+    // Decision 0148 section 12 (amendment of 2026-11-20): a C-ABI function
+    // whose `echo` sits inside `try` with a `catch` for its I/O error lets
+    // no checked error reach C, so its C entry uses the ordinary call.
+    let source = "use Doria\\Std\\Ffi\\{CSize, MutPtr, Opaque, Ptr};
+
+extern \"C\" function compareLoudly(Ptr<Opaque> $left, Ptr<Opaque> $right): int32
+{
+    try {
+        echo \".\";
+    } catch (Doria\\Std\\Io\\IoError $error) {
+        return 0;
+    }
+    unsafe {
+        Ptr<int32> $first = Ptr::cast($left);
+        Ptr<int32> $second = Ptr::cast($right);
+        return $first->read() - $second->read();
+    }
+}
+
+extern \"C\"
+{
+    /** @safety `$base` holds `$count` elements of `$size` bytes each. */
+    function qsort(MutPtr<Opaque> $base, CSize $count, CSize $size,
+        extern \"C\" function(Ptr<Opaque>, Ptr<Opaque>): int32 $compare): void;
+}
+
+function main(): void
+{
+    writable int32[] $values = [3, 1, 2];
+    unsafe {
+        writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 3);
+        qsort(MutPtr::cast($region->writablePointer), CSize::from(3), CSize::from(4), compareLoudly);
+    }
+    echo \" \";
+    foreach ($values as int32 $value) {
+        echo $value;
+    }
+}
+";
+    let mir = program(source);
+    assert_interpreter_reports_companion(&mir);
+    for profile in NativeProfile::AVAILABLE {
+        let run = execute_native(&mir, *profile);
+        assert_eq!(run.status.code(), Some(0), "{profile:?}: {run:?}");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        // The number of comparisons is the C library's choice; each one
+        // prints a dot.
+        let (dots, sorted) = stdout
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("{profile:?}: {stdout}"));
+        assert!(
+            !dots.is_empty() && dots.chars().all(|character| character == '.'),
+            "{profile:?}: {stdout}"
+        );
+        assert_eq!(sorted, "123", "{profile:?}");
+        assert!(run.stderr.is_empty(), "{profile:?}: {run:?}");
+    }
+}
+
+#[test]
 fn a_c_entry_receives_and_returns_every_c_form() {
     // A C function pointer value holding a C entry's address calls it
     // under the C convention, so each value crosses the boundary twice:
