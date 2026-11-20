@@ -1152,6 +1152,46 @@ fn foreach_walks_typed_array_regions_in_index_order() {
 }
 
 #[test]
+fn a_writable_region_foreach_keeps_the_last_change_on_break_and_return() {
+    // Decision 0148 section 8: a writable region binding stores back through
+    // the foreach body's exit obligation, so leaving the body by `break` or
+    // `return` keeps the change made in that iteration.
+    let source =
+        "function bumpUntil(writable WritableArrayRegion<int32> $values, int32 $limit): int
+{
+    foreach ($values as int $index => writable int32 $value) {
+        $value += 100;
+        if ($value > $limit) {
+            return $index;
+        }
+    }
+    return -1;
+}
+
+function main(): void
+{
+    writable int32[] $numbers = [1, 2, 3, 4, 5];
+    {
+        let writable $front = $numbers->getWritableRegion(0, 4);
+        foreach ($front as writable int32 $value) {
+            $value = 7;
+            break;
+        }
+    }
+    {
+        let writable $rest = $numbers->getWritableRegion(1, 4);
+        echo bumpUntil($rest, 102);
+    }
+    echo \" \";
+    foreach ($numbers as int32 $value) {
+        echo $value . \",\";
+    }
+}
+";
+    assert_runs_everywhere(source, "1 7,102,103,4,5,");
+}
+
+#[test]
 fn typed_array_regions_view_read_write_and_copy_elements_in_place() {
     // Decision 0148 section 8: views over `T[]` that copy nothing.
     let source = format!(

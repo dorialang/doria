@@ -1559,6 +1559,13 @@ fn foreach_over_regions_checks_its_bindings_and_other_sources_are_not_iterable()
             "E0810",
             "Foreach Source Is Not Iterable",
         ),
+        // A writable binding holds the region's writable borrow for the body,
+        // as it holds a collection's.
+        (
+            "writable int32[] $numbers = [1]; let writable $view = $numbers->getWritableRegion(0, 1); foreach ($view as writable int32 $value) { echo $view[0]; }",
+            "E0477",
+            "Conflicting Access",
+        ),
     ] {
         let source = format!("function main(): void {{ {body} }}");
         let found = findings(&source);

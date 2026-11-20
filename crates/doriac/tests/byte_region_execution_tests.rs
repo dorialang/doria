@@ -286,6 +286,42 @@ function main(): void {
 }
 
 #[test]
+fn a_writable_byte_region_foreach_keeps_the_last_change_on_break_and_return() {
+    // Decision 0148 section 8: the store back into the region is owed on
+    // every exit from the body, including `break` and `return`.
+    executes(
+        r#"
+function markFirstAbove(writable WritableByteRegion $view, uint8 $limit): int {
+    foreach ($view as int $index => writable uint8 $byte) {
+        $byte += 10;
+        if ($byte > $limit) {
+            return $index;
+        }
+    }
+    return -1;
+}
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(3);
+    $bytes[1] = 5;
+    {
+        let writable $view = $bytes->getWritableRegion(0, 3);
+        foreach ($view as writable uint8 $byte) {
+            $byte = 9;
+            break;
+        }
+    }
+    {
+        let writable $view = $bytes->getWritableRegion(0, 3);
+        echo markFirstAbove($view, 18);
+    }
+    echo " {$bytes[0]},{$bytes[1]},{$bytes[2]}\n";
+}
+"#,
+        "0 19,5,0\n",
+    );
+}
+
+#[test]
 fn readonly_copies_and_writable_reborrows_reuse_the_same_bytes() {
     executes(
         r#"
