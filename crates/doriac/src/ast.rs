@@ -1218,6 +1218,9 @@ pub enum Expr {
         object: Box<Expr>,
         method: String,
         member_span: Span,
+        /// `$value->method<T>(...)` (Decision 0105, Amendment: Type
+        /// Arguments At The Call).
+        type_arguments: Option<CallTypeArguments>,
         args: Vec<Argument>,
         argument_list_span: Span,
         null_safe: bool,
@@ -1230,6 +1233,9 @@ pub enum Expr {
     },
     FunctionCall {
         name: String,
+        /// `name<T>(...)` (Decision 0105, Amendment: Type Arguments At The
+        /// Call).
+        type_arguments: Option<CallTypeArguments>,
         args: Vec<Argument>,
         span: Span,
     },
@@ -1247,6 +1253,9 @@ pub enum Expr {
         method: String,
         member_span: Span,
         member_sigil_span: Option<Span>,
+        /// `Class::method<T>(...)` (Decision 0105, Amendment: Type Arguments
+        /// At The Call).
+        type_arguments: Option<CallTypeArguments>,
         args: Vec<Argument>,
         argument_list_span: Span,
         span: Span,
@@ -1298,6 +1307,11 @@ pub enum Expr {
         span: Span,
     },
     When(Box<WhenExpression>),
+    /// `callee<A, B>(...)` whose type arguments are all plain or namespaced
+    /// names, which also reads as comparisons (Decision 0105, Amendment:
+    /// Type Arguments At The Call). Name resolution chooses the reading
+    /// once; no later stage sees this node.
+    TypeArgumentsOrComparison(Box<TypeArgumentsOrComparison>),
     Closure(Box<ClosureExpression>),
     /// `unsafe(<expression>)`: exactly that expression is an unsafe context,
     /// and the form yields its value (Decision 0148 section 2).
@@ -1394,6 +1408,43 @@ pub enum InterpolatedStringPart {
     Expr(Expr),
 }
 
+/// The type arguments a call states, from `<` to `>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallTypeArguments {
+    pub arguments: Vec<TypeRef>,
+    pub span: Span,
+}
+
+/// The two readings of `callee<A, B>(...)` when every type argument is a
+/// plain or namespaced name. `call` is the expression read with the type
+/// arguments; `comparison` is the same source read with `<` and `>` as
+/// comparisons, as the elements it forms: one, or in an argument list or
+/// collection literal one per comma between the names
+/// (`show($a->size < B, C > ($d))`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeArgumentsOrComparison {
+    /// The names between `<` and `>`, in source spelling.
+    pub names: Vec<CandidateTypeName>,
+    /// The `<` that opens the list; it identifies the candidate.
+    pub open_span: Span,
+    pub call: Expr,
+    pub comparison: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateTypeName {
+    pub name: String,
+    pub span: Span,
+}
+
+/// How name resolution reads a [`TypeArgumentsOrComparison`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallReading {
+    TypeArguments,
+    Comparison,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayElement {
     pub key: Option<Expr>,
@@ -1462,6 +1513,7 @@ impl Expr {
             | Expr::Match { span, .. }
             | Expr::Unsafe { span, .. } => *span,
             Expr::When(when) => when.span,
+            Expr::TypeArgumentsOrComparison(node) => node.span,
             Expr::Closure(closure) => closure.span,
         }
     }

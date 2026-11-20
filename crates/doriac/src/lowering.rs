@@ -1311,6 +1311,9 @@ fn lower_argument(argument: &ast::Argument, class_name: Option<ClassContext<'_>>
 
 fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Expr {
     match expr {
+        crate::ast::Expr::TypeArgumentsOrComparison(_) => {
+            unreachable!("name resolution classifies type arguments at a call")
+        }
         ast::Expr::Closure(closure) => hir::Expr::Closure(Box::new(hir::ClosureExpression {
             closure_id: crate::symbols::ClosureId::from_span(closure.span),
             form: closure.form,
@@ -1456,7 +1459,9 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             ty: lower_type_ref(ty, class_name),
             span: *span,
         },
-        ast::Expr::FunctionCall { name, args, span } => hir::Expr::FunctionCall {
+        ast::Expr::FunctionCall {
+            name, args, span, ..
+        } => hir::Expr::FunctionCall {
             name: name.clone(),
             args: args
                 .iter()

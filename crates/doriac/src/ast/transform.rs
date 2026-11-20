@@ -12,6 +12,9 @@ pub trait Transform: Sized {
     fn function(&mut self, function: &mut FunctionDecl) {
         function.walk(self);
     }
+    fn expr(&mut self, expr: &mut Expr) {
+        expr.walk(self);
+    }
 }
 
 pub trait Transformable {
@@ -94,6 +97,18 @@ macro_rules! structure {
         walk_struct!($ty { $($field),* });
         impl Transformable for $ty {
             fn transform<T: Transform>(&mut self, transform: &mut T) { self.walk(transform); }
+        }
+    };
+}
+macro_rules! walk_enumeration {
+    ($ty:ident { $($variant:ident $(($value:ident))? $({$($field:ident),* $(,)?})?),* $(,)? }) => {
+        impl $ty {
+            pub fn walk<T: Transform>(&mut self, transform: &mut T) {
+                match self { $(Self::$variant $(($value))? $({$($field),*})? => {
+                    $($value.transform(transform);)?
+                    $($($field.transform(transform);)*)?
+                }),* }
+            }
         }
     };
 }
@@ -493,23 +508,38 @@ structure!(ClosureCapture {
     span
 });
 enumeration!(ClosureBody { Expression { arrow_span, expression }, Block(value) });
-enumeration!(Expr {
+walk_enumeration!(Expr {
     Variable { name, span }, This { span }, Identifier { name, span }, String { value, span },
     InterpolatedString { parts, span }, Int { value, span }, Float { value, span },
     Bool { value, span }, Null { span }, Array { elements, span },
     ArrayRepeat { value, count, span }, Index { collection, index, span },
     PropertyAccess { object, property, member_span, null_safe, take_span, span },
-    MethodCall { object, method, member_span, args, argument_list_span, null_safe, span },
-    IsType { expr, ty, span }, FunctionCall { name, args, span },
+    MethodCall { object, method, member_span, type_arguments, args, argument_list_span,
+        null_safe, span },
+    IsType { expr, ty, span }, FunctionCall { name, type_arguments, args, span },
     CallableCall { callee, open_span, args, close_span, argument_list_span, span },
     StaticCall { qualifier, qualifier_span, method, member_span, member_sigil_span,
-        args, argument_list_span, span },
+        type_arguments, args, argument_list_span, span },
     StaticMember { qualifier, qualifier_span, member, member_span, member_sigil_span, span },
     New { class_type, args, shared, span }, Grouped { expr, span }, Unary { op, expr, span },
     Binary { left, op, right, span }, Range { start, end, inclusive, span },
     Match { scrutinee, mode, arms, origin, span }, When(value), Closure(value),
-    Unsafe { keyword_span, expr, span },
+    Unsafe { keyword_span, expr, span }, TypeArgumentsOrComparison(value),
 });
+impl Transformable for Expr {
+    fn transform<T: Transform>(&mut self, transform: &mut T) {
+        transform.expr(self);
+    }
+}
+structure!(CallTypeArguments { arguments, span });
+structure!(TypeArgumentsOrComparison {
+    names,
+    open_span,
+    call,
+    comparison,
+    span
+});
+structure!(CandidateTypeName { name, span });
 structure!(WhenExpression {
     given,
     result_type,

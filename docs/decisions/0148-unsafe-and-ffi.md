@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -168,6 +168,17 @@ own. Andrew answered the card on 2026-11-20: "Regions are iterable
 (Recommended)". Section 8 states the rule for `ArrayRegion<T>` and
 `WritableArrayRegion<T>`; it covers Decision 0110's `ByteRegion` and
 `WritableByteRegion` the same way, with `uint8` elements.
+
+### Amendment: Type Arguments For Handles (2026-11-20)
+
+Section 11 said `reclaim` and `borrow` take `T` from the expected type, so
+`let $counter = Handle::borrow($handle);` and
+`Handle::borrow($handle)->count` had no way to name the class. Andrew answered
+two cards on 2026-11-20: "Type argument at the call (Recommended)", then
+"Explicit type arguments for every generic call (Recommended)", recorded as
+Decision 0105's Amendment: Type Arguments At The Call. Each handle operation
+declares one type parameter `T`; `reclaim` and `borrow` read a stated `T`
+first and the expected type second. Section 11 states the rule.
 
 ## Context
 
@@ -615,8 +626,13 @@ region works with every region-taking API, including the Decision 0110 streams.
   `Handle::borrow($handle)` (readonly access to `T`),
   `SharedReference::borrow($handle)` and
   `WritableSharedReference::borrow($handle)`.
-- `T` comes from the expected type. A handle reclaimed or borrowed as the wrong
-  type or family is undefined behavior.
+- Each operation declares one type parameter `T`. `create` infers it from its
+  argument. `reclaim` and `borrow` take it from a type argument stated at the
+  call, `Handle::borrow<Counter>($handle)`, and otherwise from the expected
+  type; for the shared families the result is the family's reference to `T`,
+  as in `SharedReference::reclaim<Counter>($handle)`. A position that states
+  neither is E0808 (amendment of 2026-11-20). A handle reclaimed or borrowed
+  as the wrong type or family is undefined behavior.
 - A closed class's handle is its object pointer; `Handle::create` allocates
   nothing. An open class's handle points to a heap box holding the object and
   its class descriptor: `Handle::reclaim` frees the box and returns the value

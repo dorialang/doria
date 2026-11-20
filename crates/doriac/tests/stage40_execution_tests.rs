@@ -1192,6 +1192,40 @@ function main(): void
 }
 
 #[test]
+fn handle_operations_take_their_value_type_from_a_stated_type_argument() {
+    // Decision 0148 section 11 with Decision 0105, Amendment: Type Arguments
+    // At The Call: `reclaim<T>` and `borrow<T>` read `T` from the call, so
+    // the result needs no declared type.
+    let source = r#"
+use Doria\Std\Ffi\{Handle, Opaque, WritablePointer};
+
+class Counter
+{
+    function __construct(writable int $count) {}
+}
+
+function main(): void
+{
+    WritablePointer<Opaque> $handle = Handle::create<Counter>(new Counter(3));
+    unsafe {
+        let $borrowed = Handle::borrow<Counter>($handle);
+        echo $borrowed->count;
+        echo " " . Handle::borrow<Counter>($handle)->count;
+        let $back = Handle::reclaim<Counter>($handle);
+        echo " " . $back->count;
+    }
+    SharedReference<Counter> $shared = shared new Counter(7);
+    WritablePointer<Opaque> $claim = $shared->toHandle();
+    unsafe {
+        let $returned = SharedReference::reclaim<Counter>($claim);
+        echo " " . $returned->count;
+    }
+}
+"#;
+    assert_runs_natively(source, "3 3 3 7");
+}
+
+#[test]
 fn typed_array_regions_view_read_write_and_copy_elements_in_place() {
     // Decision 0148 section 8: views over `T[]` that copy nothing.
     let source = format!(

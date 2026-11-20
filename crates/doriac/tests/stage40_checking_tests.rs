@@ -1528,6 +1528,30 @@ fn a_handle_takes_its_value_and_to_handle_consumes_the_reference() {
 }
 
 #[test]
+fn handle_operations_accept_a_stated_value_type() {
+    // Decision 0148 section 11: each operation declares one type parameter;
+    // a stated argument comes before the expected type, and E0808 and E0807
+    // apply to it as they apply to the expected type.
+    let accepted = format!(
+        "{HANDLES}function main(): void {{ WritablePointer<Opaque> $handle = Handle::create<Counter>(new Counter(1)); SharedReference<Counter> $shared = shared new Counter(2); WritablePointer<Opaque> $claim = $shared->toHandle(); unsafe {{ let $counter = Handle::borrow<Counter>($handle); show($counter); echo Handle::borrow<Counter>($handle)->count; let $back = Handle::reclaim<Counter>($handle); let $again = SharedReference::reclaim<Counter>($claim); }} }}"
+    );
+    assert_eq!(
+        codes(&accepted),
+        Vec::<&str>::new(),
+        "{:#?}",
+        findings(&accepted)
+    );
+    for (body, code) in [
+        ("WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); unsafe { let $value = Handle::borrow<int>($handle); }", "E0808"),
+        ("WritablePointer<Opaque> $handle = Handle::create<int>(3);", "E0807"),
+        ("WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); unsafe { let $value = Handle::reclaim<Counter, Counter>($handle); }", "E0812"),
+    ] {
+        let source = format!("{HANDLES}function main(): void {{ {body} }}");
+        assert!(codes(&source).contains(&code), "{body}: {:#?}", findings(&source));
+    }
+}
+
+#[test]
 fn foreach_over_regions_checks_its_bindings_and_other_sources_are_not_iterable() {
     // Decision 0148 Amendment: Iterating Regions (2026-11-20). Checking
     // classifies the iterable once; a source no family classifies is E0810.

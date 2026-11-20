@@ -526,6 +526,17 @@ impl TypeRef {
         }
     }
 
+    /// A plain or namespaced name with no arguments, nullability or other
+    /// form, as `T`, `Counter` or `App\Model\User`; a type keyword such as
+    /// `int` is not one.
+    pub fn is_plain_name(&self) -> bool {
+        self.source_name.is_some()
+            && self.arguments.is_empty()
+            && !self.nullable
+            && self.function.is_none()
+            && self.grouped.is_none()
+    }
+
     pub fn array_of(element: TypeRef) -> Self {
         Self::generic("[]", vec![element])
     }

@@ -288,6 +288,193 @@ pub struct ResolvedProgram {
 pub struct ResolutionAnalysis {
     pub resolved: ResolvedProgram,
     pub diagnostics: Vec<Diagnostic>,
+    /// How each `callee<A, B>(...)` with only plain names reads, keyed by
+    /// the span of its `<` (Decision 0105, Amendment: Type Arguments At The
+    /// Call). The resolved program already reads this way; tooling applies it
+    /// to the authored tree with [`apply_call_readings`].
+    pub call_readings: HashMap<Span, CallReading>,
+}
+
+/// Replaces every [`TypeArgumentsOrComparison`] node in `program` with the
+/// reading name resolution chose for it, splicing a comparison reading that
+/// forms several arguments or collection elements into its list. Pushes
+/// E0515 where that leaves a positional argument after a named one, when
+/// `diagnostics` is given.
+pub fn apply_call_readings(
+    program: &mut Program,
+    readings: &HashMap<Span, CallReading>,
+    diagnostics: Option<&mut Vec<Diagnostic>>,
+) {
+    use crate::ast::transform::Transformable;
+    let mut apply = ApplyCallReadings {
+        readings,
+        diagnostics,
+    };
+    for attachment in &mut program.attributes {
+        for group in &mut attachment.groups {
+            for attribute in &mut group.attributes {
+                if let Some(list) = &mut attribute.argument_list {
+                    list.arguments.transform(&mut apply);
+                }
+            }
+        }
+    }
+    for item in &mut program.items {
+        match item {
+            Item::Class(class) => class.members.transform(&mut apply),
+            Item::Trait(declaration) => declaration.members.transform(&mut apply),
+            Item::Enum(definition) => {
+                for case in &mut definition.cases {
+                    case.backing_value.transform(&mut apply);
+                }
+            }
+            Item::Interface(declaration) => {
+                declaration.requirements.transform(&mut apply);
+                declaration.properties.transform(&mut apply);
+            }
+            Item::Function(function) => function.transform(&mut apply),
+            Item::Constant(constant) => constant.transform(&mut apply),
+            Item::ForeignAggregate(aggregate) => {
+                for field in aggregate.fields.iter_mut().flatten() {
+                    field.default.transform(&mut apply);
+                }
+            }
+            Item::Statement(statement) => statement.transform(&mut apply),
+            Item::ExternBlock(_) => {}
+        }
+    }
+}
+
+struct ApplyCallReadings<'a, 'd> {
+    readings: &'a HashMap<Span, CallReading>,
+    diagnostics: Option<&'d mut Vec<Diagnostic>>,
+}
+
+impl ApplyCallReadings<'_, '_> {
+    /// The expressions `expression` stands for: itself, or the chosen
+    /// reading's elements, each again read.
+    fn read(&self, expression: Expr) -> Vec<Expr> {
+        let Expr::TypeArgumentsOrComparison(node) = expression else {
+            return vec![expression];
+        };
+        let node = *node;
+        match self.readings.get(&node.open_span) {
+            Some(CallReading::TypeArguments) => self.read(node.call),
+            // A node resolution never reached (an unchosen reading's inner
+            // node) keeps today's comparison meaning.
+            Some(CallReading::Comparison) | None => node
+                .comparison
+                .into_iter()
+                .flat_map(|element| self.read(element))
+                .collect(),
+        }
+    }
+
+    fn read_arguments(&mut self, arguments: &mut Vec<Argument>) {
+        if !arguments
+            .iter()
+            .any(|argument| matches!(argument.value, Expr::TypeArgumentsOrComparison(_)))
+        {
+            return;
+        }
+        let mut read = Vec::with_capacity(arguments.len());
+        let mut named = None;
+        for argument in std::mem::take(arguments) {
+            let mut name = argument.name;
+            for value in self.read(argument.value) {
+                let span = match &name {
+                    Some(name) => name.span.merge(value.span()),
+                    None => value.span(),
+                };
+                match (&name, named) {
+                    (Some(current), _) => named = Some(current.span),
+                    (None, Some(named_span)) => {
+                        if let Some(diagnostics) = self.diagnostics.as_deref_mut() {
+                            diagnostics.push(
+                                Diagnostic::new(
+                                    "E0515",
+                                    "a positional argument cannot follow a named argument",
+                                    span,
+                                )
+                                .with_help(
+                                    "once a call uses a named argument, every following argument must also be named",
+                                )
+                                .with_related(named_span, "named argument appears here"),
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                }
+                read.push(Argument {
+                    name: name.take(),
+                    value,
+                    span,
+                });
+            }
+        }
+        *arguments = read;
+    }
+
+    fn read_elements(&self, elements: &mut Vec<ArrayElement>) {
+        let has_node = |element: &ArrayElement| {
+            matches!(element.value, Expr::TypeArgumentsOrComparison(_))
+                || matches!(element.key, Some(Expr::TypeArgumentsOrComparison(_)))
+        };
+        if !elements.iter().any(has_node) {
+            return;
+        }
+        let mut read = Vec::with_capacity(elements.len());
+        for element in std::mem::take(elements) {
+            match element.key {
+                // `a < B, C > (d) => v`: the last element is the key.
+                Some(key) => {
+                    let mut keys = self.read(key);
+                    let key = keys.pop().expect("a reading forms at least one element");
+                    read.extend(
+                        keys.into_iter()
+                            .map(|value| ArrayElement { key: None, value }),
+                    );
+                    let mut values = self.read(element.value).into_iter();
+                    read.push(ArrayElement {
+                        key: Some(key),
+                        value: values.next().expect("a reading forms at least one element"),
+                    });
+                    read.extend(values.map(|value| ArrayElement { key: None, value }));
+                }
+                None => read.extend(
+                    self.read(element.value)
+                        .into_iter()
+                        .map(|value| ArrayElement { key: None, value }),
+                ),
+            }
+        }
+        *elements = read;
+    }
+}
+
+impl crate::ast::transform::Transform for ApplyCallReadings<'_, '_> {
+    fn expr(&mut self, expr: &mut Expr) {
+        if matches!(expr, Expr::TypeArgumentsOrComparison(_)) {
+            let placeholder = Expr::Null { span: expr.span() };
+            let mut read = self.read(std::mem::replace(expr, placeholder));
+            assert_eq!(
+                read.len(),
+                1,
+                "only an argument or collection element reads as several expressions"
+            );
+            *expr = read.pop().expect("one reading");
+        }
+        match expr {
+            Expr::FunctionCall { args, .. }
+            | Expr::MethodCall { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::CallableCall { args, .. }
+            | Expr::New { args, .. } => self.read_arguments(args),
+            Expr::Array { elements, .. } => self.read_elements(elements),
+            _ => {}
+        }
+        expr.walk(self);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +810,7 @@ struct Resolver<'a> {
     external_causes: HashSet<String>,
     type_parameter_scopes: Vec<HashSet<String>>,
     environment: Option<&'a NameResolutionEnvironment>,
+    call_readings: HashMap<Span, CallReading>,
 }
 
 impl<'a> Resolver<'a> {
@@ -642,6 +830,7 @@ impl<'a> Resolver<'a> {
             unresolved: Vec::new(),
             external_causes: HashSet::new(),
             environment: None,
+            call_readings: HashMap::new(),
         }
     }
 
@@ -691,6 +880,11 @@ impl<'a> Resolver<'a> {
         }
         let mut program = self.authored.clone();
         self.normalize_program(&mut program);
+        apply_call_readings(
+            &mut program,
+            &self.call_readings,
+            Some(&mut self.diagnostics),
+        );
 
         let declarations = self
             .declarations
@@ -746,13 +940,20 @@ impl<'a> Resolver<'a> {
                 // A program with unsafe or foreign forms stops here, before an
                 // unimplemented name such as `Doria\Std\Ffi\Pointer` reads as an
                 // unknown one.
-                let unavailable = crate::unsafe_code::unchecked_forms(self.authored);
+                let unavailable = if self.call_readings.is_empty() {
+                    crate::unsafe_code::unchecked_forms(self.authored)
+                } else {
+                    let mut classified = self.authored.clone();
+                    apply_call_readings(&mut classified, &self.call_readings, None);
+                    crate::unsafe_code::unchecked_forms(&classified)
+                };
                 if unavailable.is_empty() {
                     self.diagnostics
                 } else {
                     unavailable
                 }
             },
+            call_readings: self.call_readings,
         }
     }
 
@@ -1650,6 +1851,91 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn normalize_call_type_arguments(&mut self, type_arguments: &mut Option<CallTypeArguments>) {
+        if let Some(list) = type_arguments {
+            for argument in &mut list.arguments {
+                self.normalize_type(argument, list.span, GlobalReferenceRole::Type);
+            }
+        }
+    }
+
+    /// The one place `callee<A, B>(...)` with only plain names is read
+    /// (Decision 0105, Amendment: Type Arguments At The Call): as stated
+    /// type arguments when every name resolves to a type and none to a
+    /// value, and otherwise as comparisons, as before type arguments at a
+    /// call existed. A name that is only a type cannot be a comparison
+    /// operand, so this needs no knowledge of the callee.
+    fn call_reading(&self, node: &TypeArgumentsOrComparison) -> CallReading {
+        if node.names.iter().all(|name| {
+            let (is_type, is_value) = self.candidate_name_meanings(&name.name);
+            is_type && !is_value
+        }) {
+            CallReading::TypeArguments
+        } else {
+            CallReading::Comparison
+        }
+    }
+
+    /// Whether `name` resolves to a type and whether it resolves to a value,
+    /// through the one resolution chain, without recording a reference.
+    fn candidate_name_meanings(&self, name: &str) -> (bool, bool) {
+        let type_parameter = !name.contains('\\')
+            && self
+                .type_parameter_scopes
+                .iter()
+                .any(|scope| scope.contains(name));
+        let canonical = if name.contains('\\') {
+            name.to_string()
+        } else if let Some(import) = self.imports.get(name) {
+            import.target.clone()
+        } else {
+            let current = self.namespace.as_ref().map_or_else(
+                || name.to_string(),
+                |namespace| format!("{namespace}\\{name}"),
+            );
+            if self.has_symbol(&current) {
+                current
+            } else {
+                name.to_string()
+            }
+        };
+        let kind = self
+            .declarations
+            .get(&canonical)
+            .map(|declaration| declaration.kind)
+            .or_else(|| {
+                self.environment
+                    .and_then(|environment| environment.declarations.get(&canonical))
+                    .map(|declaration| declaration.kind)
+            });
+        let (global_type, value) = match kind {
+            Some(
+                GlobalSymbolKind::Class
+                | GlobalSymbolKind::Enum
+                | GlobalSymbolKind::Interface
+                | GlobalSymbolKind::Trait
+                | GlobalSymbolKind::ForeignAggregate
+                | GlobalSymbolKind::CompilerKnownType,
+            ) => (true, false),
+            Some(
+                GlobalSymbolKind::Function
+                | GlobalSymbolKind::Constant
+                | GlobalSymbolKind::CompilerKnownIntrinsic
+                | GlobalSymbolKind::CompilerKnownTestDeclaration,
+            ) => (false, true),
+            Some(GlobalSymbolKind::CompilerKnownAttribute) => (false, false),
+            None => (
+                is_language_type_name(&canonical)
+                    || standard_type_identity(&canonical).is_some()
+                    || edition_prelude(self.context.edition)
+                        .iter()
+                        .any(|entry| entry.name == canonical),
+                Builtin::from_name(&canonical).is_some(),
+            ),
+        };
+        (type_parameter || global_type, value)
+    }
+
     fn normalize_arguments(&mut self, arguments: &mut [Argument]) {
         for argument in arguments {
             self.normalize_expression(&mut argument.value);
@@ -1850,15 +2136,39 @@ impl<'a> Resolver<'a> {
                 self.normalize_expression(index);
             }
             Expr::PropertyAccess { object, .. } => self.normalize_expression(object),
-            Expr::MethodCall { object, args, .. } => {
+            Expr::MethodCall {
+                object,
+                type_arguments,
+                args,
+                ..
+            } => {
                 self.normalize_expression(object);
+                self.normalize_call_type_arguments(type_arguments);
                 self.normalize_arguments(args);
+            }
+            Expr::TypeArgumentsOrComparison(node) => {
+                let reading = self.call_reading(node);
+                self.call_readings.insert(node.open_span, reading);
+                match reading {
+                    CallReading::TypeArguments => self.normalize_expression(&mut node.call),
+                    CallReading::Comparison => {
+                        for element in &mut node.comparison {
+                            self.normalize_expression(element);
+                        }
+                    }
+                }
             }
             Expr::IsType { expr, ty, span } => {
                 self.normalize_expression(expr);
                 self.normalize_type(ty, *span, GlobalReferenceRole::TypeTest);
             }
-            Expr::FunctionCall { name, args, span } => {
+            Expr::FunctionCall {
+                name,
+                type_arguments,
+                args,
+                span,
+            } => {
+                self.normalize_call_type_arguments(type_arguments);
                 let source_name = name.clone();
                 let source_span = self.occurrence_span(&source_name, *span);
                 if let Some(resolved) = self.resolve_name(
@@ -1878,6 +2188,7 @@ impl<'a> Resolver<'a> {
             Expr::StaticCall {
                 qualifier,
                 qualifier_span,
+                type_arguments,
                 args,
                 ..
             } => {
@@ -1886,6 +2197,7 @@ impl<'a> Resolver<'a> {
                     *qualifier_span,
                     GlobalReferenceRole::StaticQualifier,
                 );
+                self.normalize_call_type_arguments(type_arguments);
                 self.normalize_arguments(args);
             }
             Expr::StaticMember {

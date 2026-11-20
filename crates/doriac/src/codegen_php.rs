@@ -7603,7 +7603,10 @@ fn emit_statement_inner(
                 emit_assertion_statement(assertion, output, indent, scopes);
                 return;
             }
-            if let Expr::FunctionCall { name, args, span } = expr {
+            if let Expr::FunctionCall {
+                name, args, span, ..
+            } = expr
+            {
                 if name == "panic" && args.len() == 1 {
                     emit_panic(&args[0].value, *span, output, indent, scopes);
                     return;
@@ -10598,7 +10601,9 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 )
             },
         ),
-        Expr::FunctionCall { name, args, span } => emit_function_call(name, args, *span, scopes),
+        Expr::FunctionCall {
+            name, args, span, ..
+        } => emit_function_call(name, args, *span, scopes),
         Expr::StaticCall {
             class_name,
             method,

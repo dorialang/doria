@@ -182,10 +182,12 @@ pub fn analyze_source_for_ide_with_source_context(
 ) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
     let source = SourceFile::new(path, text);
     let context = source_context.compilation.clone();
-    let authored = parse_source_file(&source)?;
+    let mut authored = parse_source_file(&source)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
+    // Tooling reads the authored tree as name resolution read it.
+    names::apply_call_readings(&mut authored, &resolution.call_readings, None);
     resolution.resolved.program = augment_compiler_known(
         &resolution.resolved.program,
         &resolution.resolved.facts,
@@ -971,11 +973,12 @@ fn prepare_source(
 pub(crate) fn prepare_parsed_source(
     source: &SourceFile,
     context: CompilationContext,
-    authored: Program,
+    mut authored: Program,
 ) -> DiagnosticResult<PreparedSource> {
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let resolution = names::resolve_program_for_ide(&authored, &context);
+    names::apply_call_readings(&mut authored, &resolution.call_readings, None);
     let mut warnings = diagnostics::separate_errors(resolution.diagnostics)?;
     let mut resolved = resolution.resolved;
     resolved.program = augment_compiler_known(

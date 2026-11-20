@@ -752,6 +752,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
     // test callables, then close the final graph index including those generated
     // package functions before resolving dispatcher references.
     let mut preliminary_sources = BTreeMap::new();
+    let mut classified_sources = BTreeMap::new();
     let mut preliminary_combined = empty_program();
     for (identity, source) in &graph.sources {
         let context = compilation_context(source);
@@ -764,12 +765,22 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             complete: graph.completeness == GraphCompleteness::Complete,
             includes_resolved: true,
         };
-        let resolved = crate::names::resolve_program_in_graph_for_ide(
+        let resolution = crate::names::resolve_program_in_graph_for_ide(
             &source.authored,
             &context,
             &environment,
-        )
-        .resolved;
+        );
+        // Name resolution reads each `callee<A, B>(...)` once; every later
+        // pass, elaboration included, starts from the authored tree read
+        // that way (Decision 0105, Amendment: Type Arguments At The Call).
+        let mut classified = source.authored.clone();
+        crate::names::apply_call_readings(
+            &mut classified,
+            &resolution.call_readings,
+            Some(&mut diagnostics),
+        );
+        classified_sources.insert(identity.clone(), classified);
+        let resolved = resolution.resolved;
         append_program(&mut preliminary_combined, &resolved.program);
         preliminary_sources.insert(identity.clone(), resolved);
     }
@@ -789,8 +800,11 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         let preliminary = preliminary_sources
             .get(identity)
             .expect("every graph source has preliminary resolution");
+        let classified = classified_sources
+            .get(identity)
+            .expect("every graph source has a classified program");
         let elaboration = crate::testing::elaborate_source(
-            &source.authored,
+            classified,
             &preliminary.facts,
             &context,
             &preliminary_evaluation,
@@ -891,7 +905,12 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
                 facts.compiler_known.push(known);
             }
         }
-        authored_sources.insert(identity.clone(), source.authored.clone());
+        authored_sources.insert(
+            identity.clone(),
+            classified_sources
+                .remove(identity)
+                .expect("every graph source has a classified program"),
+        );
     }
     facts.namespace = selected_namespace;
     facts.namespace_declaration = selected_namespace_declaration;

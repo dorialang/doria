@@ -7352,6 +7352,9 @@ impl Checker<'_> {
 
     fn use_expr_inner(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
         match expr {
+            crate::ast::Expr::TypeArgumentsOrComparison(_) => {
+                unreachable!("name resolution classifies type arguments at a call")
+            }
             Expr::Variable { name, span } => self.use_binding(name, *span, scopes, mode),
             Expr::This { span } if scopes.get("this").is_some() => {
                 self.use_binding("this", *span, scopes, mode);
@@ -7454,7 +7457,9 @@ impl Checker<'_> {
                 self.active_assignment_writes
                     .extend(suspended_assignment_writes);
             }
-            Expr::FunctionCall { name, args, span } => {
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
                 self.use_call_args(*span, None, args, &signature, CallExecution::Always, scopes);
                 self.record_exceptional_exits(*span, scopes);
@@ -11149,6 +11154,9 @@ fn for_increment_uses_variable(increment: &ast::ForIncrement, name: &str) -> boo
 
 fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
     match expr {
+        crate::ast::Expr::TypeArgumentsOrComparison(_) => {
+            unreachable!("name resolution classifies type arguments at a call")
+        }
         Expr::Variable {
             name: candidate, ..
         } => candidate == name,

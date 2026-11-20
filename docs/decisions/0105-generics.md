@@ -4,6 +4,11 @@
 > traits. Concrete constrained calls remain monomorphized and static; only
 > deliberate interface erasure uses dynamic dispatch.
 
+> **Amendment of 2026-11-20 (Type Arguments At The Call):** a call may state
+> its type arguments, as in `first<int>($values)`. This reverses §2's "no
+> turbofish" sentence and the turbofish alternative; see the amendment at the
+> end of this record.
+
 **Status:** Accepted. Formalizes D9 and plan §4.5, which set the direction but
 left "the generics decision" explicitly unauthored. It **ratifies** the generic
 functions/methods already shipped at Stage 24 and **settles the class-specific
@@ -167,3 +172,77 @@ Decision 0130 permits a qualified generic class type as the single parent and
 records the substitution at each hierarchy edge. Concrete hierarchies and
 virtual method specializations remain monomorphized and invariant; inheritance
 does not add variance, boxing, or runtime type-argument lookup.
+
+## Amendment: Type Arguments At The Call (2026-11-20)
+
+Stage 40 needed a call to name a type that no argument carries:
+`Handle::reclaim` gives back a value whose type only the program knows
+(Decision 0148 section 11). Andrew answered two cards on 2026-11-20: "Type
+argument at the call (Recommended)", then "Explicit type arguments for every
+generic call (Recommended)".
+
+The rulings reverse two passages of this record. §2 said: "There is **no
+turbofish** (`f::<int>()` is not Doria syntax); where inference cannot
+determine a parameter, bind through a typed declaration (`List<int> $xs = …`)
+so the annotation supplies it." Alternatives Considered said: "**Turbofish
+`f::<int>()`.** Rejected — inference plus typed-declaration fallback covers the
+cases; a second explicit-argument syntax is surface without payoff."
+
+### Rule
+
+- Every generic call may state its type arguments after the callee's name:
+  `first<int>($values)`, `Factory::make<Token>($token)`,
+  `$factory->wrap<string>($text)`, `$values->map<string>($format)` and
+  `Handle::reclaim<Counter>($handle)`. The list uses the type's own `<...>`
+  spelling; `::<` is not Doria syntax.
+- A stated list names every type parameter of the callee, in declaration
+  order. A list of the wrong length (E0812) or a list on a callee that
+  declares no type parameters (E0811) is a compile error naming the fix.
+- Each stated argument is checked against its parameter's constraints, as an
+  inferred one is (E0535).
+- Stated arguments are fixed before the call's arguments are inferred;
+  inference fills only the parameters the call does not state, and every
+  argument is then checked against the substituted parameter types. A call
+  that states no list keeps argument inference and the expected-type
+  fallback, so a typed declaration still supplies a parameter the arguments
+  leave open.
+
+### Parsing
+
+- After a callee name, `<` begins a type argument list when the tokens up to
+  the matching `>` parse as types and `(` follows. `>>` closes two lists.
+- A list that contains anything other than a plain or namespaced name
+  (`int`, `?T`, `T[]`, `List<int>`) is a type argument list.
+- When every argument is a plain or namespaced name, the same tokens also
+  read as comparisons, because `<` and `>` share one precedence and associate
+  left: `$counter->value<LIMIT>($flag)` is `($counter->value < LIMIT) >
+  ($flag)`. The parser keeps both readings in one syntax-neutral node, and in
+  an argument list or collection literal the comparison reading forms one
+  element per comma between the names.
+- Name resolution classifies that node once: the type argument reading when
+  every name resolves to a type and none to a value, and otherwise the
+  comparison reading, as before this amendment. A name that resolves only to
+  a type cannot be a comparison operand, so the rule needs no knowledge of
+  the callee; a non-generic callee then reports E0811. Checking, lowering,
+  tooling and metadata read the classified tree and never decide again.
+
+These programs keep their comparison meaning, each with a test, where
+`LIMIT`, `MAX`, `B` and `C` are constants and `$flag` is a `bool`:
+
+```doria
+echo $counter->value < LIMIT > ($flag);
+echo $counter->value<LIMIT>($flag);
+show($a->size < B, C > ($d));
+bool[] $pair = [$a->size < B, C > ($d)];
+echo Config::MAX < LIMIT > ($flag);
+echo MAX < LIMIT > ($flag);
+```
+
+### Consequences
+
+- SPEC's generics section and the end-to-end plan's §4.5 and decision-record
+  entry follow this amendment.
+- Decision 0148 section 11 declares one type parameter on each handle
+  operation (its Amendment: Type Arguments For Handles).
+- The language server's parser-backed features read the classified tree; its
+  hover and completion text for generic calls needs the new form.

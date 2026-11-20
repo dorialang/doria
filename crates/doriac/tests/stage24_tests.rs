@@ -558,3 +558,241 @@ function main(): void {
     assert_eq!(output.stderr, b"");
     assert_eq!(output.stdout, b"22");
 }
+
+/// Runs `source` on the interpreter, every native profile and PHP output,
+/// expecting `stdout` and status 0 from each.
+fn assert_runs_on_every_target(path: &str, source: &str, stdout: &str) {
+    let mir = doriac::lower_source_to_mir(path, source)
+        .unwrap_or_else(|findings| panic!("{findings:#?}"));
+    let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap();
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&interpreted.stdout).into_owned(),
+            interpreted.exit_status
+        ),
+        (stdout.to_string(), 0),
+        "interpreter: {:?}",
+        interpreted.runtime_diagnostic
+    );
+    for &profile in doriac::backend::NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, stdout);
+    }
+    let php = doriac::compile_source_to_php(path, source).unwrap();
+    let body = format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").unwrap()
+    );
+    let output = php_execution::Script::new(&body)
+        .command(&[])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
+    assert_eq!(output.stderr, b"");
+}
+
+const STATED_GENERICS: &str = r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+
+    function get(): T
+    {
+        return $this->value;
+    }
+}
+
+class Factory
+{
+    static function make<T>(take T $value): Box<T>
+    {
+        return new Box<T>($value);
+    }
+
+    function wrap<T>(take T $value): Box<T>
+    {
+        return new Box<T>($value);
+    }
+
+    function plain(int $value): int
+    {
+        return $value;
+    }
+}
+
+function none<T>(): ?T
+{
+    return null;
+}
+
+function pick<T, U>(T $left, U $right): U
+{
+    return $right;
+}
+"#;
+
+#[test]
+fn calls_state_type_arguments_on_every_target() {
+    // Decision 0105, Amendment: Type Arguments At The Call. A type parameter
+    // that only the return type names, free functions, static and instance
+    // methods, a list with a nested `>>`, and List::map.
+    let source = format!(
+        r#"{STATED_GENERICS}
+function main(): void
+{{
+    let $missing = none<int>();
+    echo $missing ?? 7;
+    echo " " . pick<int, string>(1, "two");
+    echo " " . Factory::make<int>(5)->get();
+    let $factory = new Factory();
+    echo " " . $factory->wrap<string>("w")->get();
+    echo " " . pick<int, Box<Box<int>>>(1, new Box<Box<int>>(new Box<int>(9)))->get()->get();
+    List<int> $values = [1, 2, 3];
+    List<int> $doubled = $values->map<int>(fn(int $value) => $value * 2);
+    echo " " . $doubled[2];
+    int $total = $values->reduce<int>(0, function (writable int $sum, int $value): void {{
+        $sum += $value;
+    }});
+    echo " " . $total;
+}}
+"#
+    );
+    assert_runs_on_every_target("stated-type-arguments.doria", &source, "7 two 5 w 9 6 6");
+}
+
+#[test]
+fn plain_names_that_are_values_keep_their_comparison_meaning() {
+    // Decision 0105, Amendment: Type Arguments At The Call. `<` and `>` share
+    // one precedence, so these read as comparisons when a name between them
+    // is a value; name resolution keeps that reading.
+    let source = r#"
+const int LIMIT = 10;
+const int MAX = 5;
+const int B = 3;
+const int C = 4;
+
+class Counter
+{
+    function __construct(writable int $value) {}
+
+    function size(): int
+    {
+        return $this->value;
+    }
+}
+
+class Config
+{
+    const int MAX = 20;
+}
+
+function show(bool $left, bool $right): void
+{
+    echo $left . "," . $right . " ";
+}
+
+function main(): void
+{
+    let $counter = new Counter(4);
+    let $flag = false;
+    let $d = 1;
+    echo $counter->value < LIMIT > ($flag);
+    echo " ";
+    echo $counter->value<LIMIT>($flag);
+    echo " ";
+    show($counter->value < B, C > ($d));
+    show(left: $counter->value < B, right: C > ($d));
+    bool[] $pair = [$counter->value < B, C > ($d)];
+    echo "{$pair[0]}{$pair[1]} ";
+    echo Config::MAX < LIMIT > ($flag);
+    echo " ";
+    echo MAX < LIMIT > ($flag);
+}
+"#;
+    assert_runs_on_every_target(
+        "comparison-reading.doria",
+        source,
+        "true true false,true false,true falsetrue false true",
+    );
+}
+
+#[test]
+fn stated_type_arguments_are_checked_against_the_callee() {
+    for (body, code) in [
+        // Too many, too few, and on a callee with no type parameters.
+        ("echo pick<int>(1, 2);", "E0812"),
+        ("echo pick<int, int, int>(1, 2);", "E0812"),
+        ("echo plain<int>(1);", "E0811"),
+        (
+            "let $factory = new Factory(); echo $factory->plain<int>(1);",
+            "E0811",
+        ),
+        // A stated argument fixes the parameter, so the argument must fit it.
+        ("echo pick<int, string>(1, 2);", "E0408"),
+        // A stated argument meets the parameter's constraints.
+        ("echo sorted<float>(1.5);", "E0535"),
+    ] {
+        let source = format!(
+            "{STATED_GENERICS}
+function plain(int $value): int {{ return $value; }}
+function sorted<T implements Comparable>(T $value): T {{ return $value; }}
+function main(): void {{ {body} }}"
+        );
+        let found = diagnostics(&source);
+        assert!(
+            found.iter().any(|diagnostic| diagnostic.code == code),
+            "{body}: expected {code}, found {found:#?}"
+        );
+    }
+    let accepted = format!(
+        "{STATED_GENERICS}
+function main(): void {{ echo none<string>() ?? \"none\"; }}"
+    );
+    doriac::check_source("stated-type-arguments.doria", &accepted)
+        .unwrap_or_else(|findings| panic!("{findings:#?}"));
+}
+
+#[test]
+fn a_type_parameter_only_the_return_names_still_reports_when_nothing_states_it() {
+    let source = format!(
+        "{STATED_GENERICS}
+function main(): void {{ let $missing = none(); }}"
+    );
+    let found = diagnostics(&source);
+    let unresolved = found
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0531")
+        .unwrap_or_else(|| panic!("{found:#?}"));
+    assert!(
+        unresolved
+            .help
+            .iter()
+            .any(|help| help.contains("first<int>($values)")),
+        "{unresolved:#?}"
+    );
+}
+
+#[test]
+fn tooling_reads_the_authored_tree_as_name_resolution_read_it() {
+    // Decision 0105, Amendment: Type Arguments At The Call: the parser keeps
+    // both readings of `callee<A>(...)`, name resolution chooses one, and the
+    // authored program tooling receives holds only that reading.
+    let source = format!(
+        "{STATED_GENERICS}
+const int LIMIT = 3;
+function main(): void {{ echo none<int>() ?? 1; echo pick<int, bool>(1, 2<LIMIT>(false)); }}"
+    );
+    let (program, analysis) =
+        doriac::analyze_source_for_ide("tooling-readings.doria", source).expect("source parses");
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != doriac::diagnostics::DiagnosticSeverity::Error),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    let tree = format!("{program:?}");
+    assert!(!tree.contains("TypeArgumentsOrComparison"), "{tree}");
+    assert!(tree.contains("type_arguments: Some"), "{tree}");
+}

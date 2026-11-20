@@ -1,9 +1,11 @@
 //! Checking handles (Decision 0148 section 11).
 //!
 //! The members and their contracts are the table in
-//! [`crate::foreign_handles`]; this module types them. `reclaim` and
-//! `borrow` take their value type from the expected type, as
-//! `Pointer::cast` does.
+//! [`crate::foreign_handles`]; this module types them. Each operation
+//! declares one type parameter `T`: `create` infers it from its argument,
+//! and `reclaim` and `borrow` read it from a type argument stated at the
+//! call, then from the expected type (Decision 0105, Amendment: Type
+//! Arguments At The Call).
 
 use super::*;
 use crate::foreign::{ForeignType, PointerAccess};
@@ -76,7 +78,10 @@ impl<'program> Checker<'program> {
         }
         let parameter = match operation {
             HandleOperation::Create => {
-                let value = self.infer_expr_type(&args[0].value, scopes, method_context);
+                let value = match self.stated_type_argument_types(&callee, 1, access.span) {
+                    Some(stated) => stated[0],
+                    None => self.infer_expr_type(&args[0].value, scopes, method_context),
+                };
                 if !self.is_handle_class(value)
                     && !matches!(self.types.kind(value), TypeKind::Unknown)
                 {
@@ -85,7 +90,9 @@ impl<'program> Checker<'program> {
                         Diagnostic::new(
                             HANDLE_VALUE_CODE,
                             format!("{callee} hands an owned class value to C, and `{got}` is not a class"),
-                            args[0].value.span(),
+                            self.stated_type_arguments
+                                .get(&access.span)
+                                .map_or(args[0].value.span(), |stated| stated.span()),
                         )
                         .with_title("Handle Holds A Class Value")
                         .with_explanation(
@@ -132,14 +139,40 @@ impl<'program> Checker<'program> {
     /// The value type `reclaim` or `borrow` on `family` gives at `span`, from
     /// the expected type, without reporting: a class for `Handle`, and a
     /// reference of the family's kind for the shared references.
-    fn handle_target_type(&self, family: HandleFamily, span: Span) -> Option<TypeId> {
-        let expected = self.contextual_expression_types.get(&span).copied()?;
-        let fits = match (family, self.types.kind(expected)) {
-            (HandleFamily::Owned, _) => self.is_handle_class(expected),
-            (HandleFamily::Shared(kind), TypeKind::SharedHandle(target, _)) => *target == kind,
+    fn handle_target_type(
+        &mut self,
+        family: HandleFamily,
+        operation: HandleOperation,
+        span: Span,
+    ) -> Option<TypeId> {
+        let target = self
+            .stated_handle_target(family, operation, span)
+            .or_else(|| self.contextual_expression_types.get(&span).copied())?;
+        self.handle_target_fits(family, target).then_some(target)
+    }
+
+    /// The value type a call states as `reclaim<T>` or `borrow<T>`: `T` for
+    /// `Handle`, and the family's reference to `T` for a shared reference.
+    fn stated_handle_target(
+        &mut self,
+        family: HandleFamily,
+        operation: HandleOperation,
+        span: Span,
+    ) -> Option<TypeId> {
+        let callee = format!("`{}::{}`", family.companion(), operation.name(family));
+        let stated = self.stated_type_argument_types(&callee, 1, span)?[0];
+        Some(match family {
+            HandleFamily::Owned => stated,
+            HandleFamily::Shared(kind) => self.types.intern(TypeKind::SharedHandle(kind, stated)),
+        })
+    }
+
+    fn handle_target_fits(&self, family: HandleFamily, target: TypeId) -> bool {
+        match (family, self.types.kind(target)) {
+            (HandleFamily::Owned, _) => self.is_handle_class(target),
+            (HandleFamily::Shared(kind), TypeKind::SharedHandle(found, _)) => *found == kind,
             _ => false,
-        };
-        fits.then_some(expected)
+        }
     }
 
     /// The target of `reclaim` or `borrow`, or E0808 when the position
@@ -151,40 +184,35 @@ impl<'program> Checker<'program> {
         callee: &str,
         span: Span,
     ) -> Option<TypeId> {
-        if let Some(target) = self.handle_target_type(family, span) {
+        if let Some(target) = self.handle_target_type(family, operation, span) {
             return Some(target);
         }
         let wanted = match family {
             HandleFamily::Owned => "a class type".to_string(),
             HandleFamily::Shared(kind) => format!("a `{}<T>` type", kind.source_name()),
         };
-        let message = match self.contextual_expression_types.get(&span).copied() {
-            Some(expected) => format!(
-                "{callee} takes its value type from the expected type, and `{}` is not {wanted}",
-                self.types.display(expected)
+        let stated = self.stated_handle_target(family, operation, span);
+        let message = match stated.or_else(|| self.contextual_expression_types.get(&span).copied()) {
+            Some(found) => format!(
+                "{callee} takes its value type from its type argument or the expected type, and `{}` is not {wanted}",
+                self.types.display(found)
             ),
             None => format!(
-                "{callee} takes its value type from the expected type, and nothing here states one"
+                "{callee} takes its value type from its type argument or the expected type, and nothing here states one"
             ),
         };
-        let example = match family {
-            HandleFamily::Owned => format!(
-                "Counter $counter = Handle::{}($handle);",
-                operation.name(family)
-            ),
-            HandleFamily::Shared(kind) => format!(
-                "{0}<Counter> $counter = {0}::{1}($handle);",
-                kind.source_name(),
-                operation.name(family)
-            ),
-        };
+        let example = format!(
+            "{}::{}<Counter>($handle)",
+            family.companion(),
+            operation.name(family)
+        );
         self.diagnostics.push(
             Diagnostic::new(HANDLE_TARGET_CODE, message, span)
                 .with_title("Handle Needs A Value Type")
                 .with_explanation(
-                    "A handle is an untyped `WritablePointer<Opaque>`, so the type of the value it holds comes from where the result goes. Reclaiming or borrowing it as another type is undefined behavior.",
+                    "A handle is an untyped `WritablePointer<Opaque>`, so the type of the value it holds is stated at the call or comes from where the result goes. Reclaiming or borrowing it as another type is undefined behavior.",
                 )
-                .with_help(format!("declare the result with its type, as in `{example}`")),
+                .with_help(format!("state the value type at the call, as in `{example}`, or declare the result with its type")),
         );
         None
     }
@@ -205,7 +233,7 @@ impl<'program> Checker<'program> {
         Some(match operation {
             HandleOperation::Create => self.handle_type(),
             HandleOperation::Reclaim | HandleOperation::Borrow => self
-                .handle_target_type(family, span)
+                .handle_target_type(family, operation, span)
                 .unwrap_or_else(|| self.types.unknown()),
         })
     }

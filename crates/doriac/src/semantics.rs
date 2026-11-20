@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+mod call_type_arguments;
 mod callable_contracts;
 mod collection_keys;
 pub mod composition;
@@ -2944,6 +2945,8 @@ struct Checker<'program> {
     core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     symbolic_collection_keys: Vec<collection_keys::SymbolicKey>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
+    /// Type arguments stated at calls, keyed by the call's span.
+    stated_type_arguments: HashMap<Span, call_type_arguments::StatedTypeArguments>,
     pending_enum_constructions: HashMap<Span, GenericInference>,
     pending_availability_calls: HashMap<(Span, Span), conditional_capabilities::AvailabilityCall>,
     pending_relational_comparisons: Vec<(Span, TypeId, TypeId)>,
@@ -3857,6 +3860,7 @@ impl<'program> Checker<'program> {
             core_operation_calls: HashMap::new(),
             symbolic_collection_keys: Vec::new(),
             pending_generic_calls: HashMap::new(),
+            stated_type_arguments: HashMap::new(),
             pending_enum_constructions: HashMap::new(),
             pending_availability_calls: HashMap::new(),
             pending_relational_comparisons: Vec::new(),
@@ -3964,6 +3968,7 @@ impl<'program> Checker<'program> {
         self.check_nominal_conformances();
         self.validate_parent_constructor_protocols();
         self.report_unresolved_generic_calls();
+        self.report_unconsumed_type_arguments();
         self.check_pending_integer_literal_ranges();
         self.check_pending_class_conformances();
         self.publish_interface_specializations();
@@ -10153,7 +10158,9 @@ impl<'program> Checker<'program> {
                 let previous = self.allow_terminal_assertion;
                 self.allow_terminal_assertion = true;
                 match expr {
-                    Expr::FunctionCall { name, args, span } if name == "panic" => {
+                    Expr::FunctionCall {
+                        name, args, span, ..
+                    } if name == "panic" => {
                         for arg in args {
                             self.check_expr(&arg.value, scopes, method_context);
                         }
@@ -12188,6 +12195,7 @@ impl<'program> Checker<'program> {
         let bool_ty = self.types.intern(TypeKind::Bool);
         let void = self.types.intern(TypeKind::Void);
         let expected_result = self.contextual_expression_types.get(&span).copied();
+        let stated = self.stated_list_algorithm_type_argument(method, span);
         let make_callback = |checker: &mut Self, invocation_mode, parameters, return_type| {
             checker
                 .types
@@ -12201,9 +12209,11 @@ impl<'program> Checker<'program> {
         };
         match (method, args) {
             ("map", [callback]) => {
-                let result = expected_result.and_then(|result| match self.types.kind(result) {
-                    TypeKind::List(value) => Some(*value),
-                    _ => None,
+                let result = stated.or_else(|| {
+                    expected_result.and_then(|result| match self.types.kind(result) {
+                        TypeKind::List(value) => Some(*value),
+                        _ => None,
+                    })
                 });
                 if let Some(result) = result {
                     let callback_ty = make_callback(
@@ -12232,7 +12242,7 @@ impl<'program> Checker<'program> {
             }
             ("reduce", [initial, callback]) => {
                 let inferred = self.infer_expr_type(&initial.value, scopes, method_context);
-                let accumulator = expected_result.or_else(|| {
+                let accumulator = stated.or(expected_result).or_else(|| {
                     (!matches!(
                         self.types.kind(inferred),
                         TypeKind::Unknown | TypeKind::EmptyCollection
@@ -12340,7 +12350,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        if let Expr::FunctionCall { name, args, span } = expr {
+        if let Expr::FunctionCall {
+            name, args, span, ..
+        } = expr
+        {
             if name == crate::compiler_known_test::FAIL {
                 self.check_fail_assertion(args, *span, scopes, method_context);
                 return true;
@@ -13429,10 +13442,14 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         allow_range_expr: bool,
     ) {
+        self.register_stated_type_arguments(expr, method_context);
         if self.check_assertion_expression(expr, scopes, method_context) {
             return;
         }
         match expr {
+            crate::ast::Expr::TypeArgumentsOrComparison(_) => {
+                unreachable!("name resolution classifies type arguments at a call")
+            }
             Expr::Closure(closure) => {
                 self.check_closure_expression(closure, scopes, method_context);
             }
@@ -13625,6 +13642,7 @@ impl<'program> Checker<'program> {
                 args,
                 argument_list_span,
                 null_safe,
+                ..
             } => {
                 self.check_expr(object, scopes, method_context);
                 self.record_member_receiver_access(object, scopes, method_context);
@@ -13725,7 +13743,9 @@ impl<'program> Checker<'program> {
                 self.check_expr(expr, scopes, method_context);
                 self.check_is_type(expr, ty, *span, scopes, method_context);
             }
-            Expr::FunctionCall { name, args, span } => {
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => {
                 if crate::compiler_known_test::is_future_member(name) {
                     return;
                 }
@@ -20445,13 +20465,23 @@ impl<'program> Checker<'program> {
                 })
                 .collect::<Vec<_>>();
             if !definition.type_params.is_empty() {
+                let callee = format!("payload case `{}::{}`", definition.name, case.name);
+                let stated = self.stated_type_argument_bindings(
+                    &callee,
+                    &definition.type_params,
+                    access.span,
+                );
+                let stated_params = params
+                    .iter()
+                    .map(|param| self.substitute_param_info(param, &stated))
+                    .collect::<Vec<_>>();
                 let bindings = self.infer_generic_argument_bindings(
-                    &format!("payload case `{}::{}`", definition.name, case.name),
-                    &params,
+                    &callee,
+                    &stated_params,
                     args,
                     scopes,
                     method_context,
-                    &HashMap::new(),
+                    &stated,
                 );
                 self.begin_enum_construction(definition, &case.name, access.span, bindings);
                 let bindings = self.pending_enum_constructions[&access.span]
@@ -21080,6 +21110,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> FunctionInfo {
         if function.type_params.is_empty() {
+            self.stated_type_argument_bindings(callee, &[], span);
             return function.clone();
         }
         let bindings = self.infer_generic_call_bindings(
@@ -21133,6 +21164,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> MethodInfo {
         if method.type_params.is_empty() {
+            self.stated_type_argument_bindings(callee, &[], span);
             self.defer_callable_availability(method, &method.enclosing_type_bindings, span);
             return method.clone();
         }
@@ -21200,13 +21232,23 @@ impl<'program> Checker<'program> {
         declaration: Span,
         initial_bindings: &HashMap<String, TypeId>,
     ) -> HashMap<String, TypeId> {
+        // Stated type arguments are fixed first; the arguments then infer
+        // only the others (Decision 0105, Amendment: Type Arguments At The
+        // Call).
+        let stated = self.stated_type_argument_bindings(callee, type_params, span);
+        let params = params
+            .iter()
+            .map(|param| self.substitute_param_info(param, &stated))
+            .collect::<Vec<_>>();
+        let mut initial = initial_bindings.clone();
+        initial.extend(stated);
         let bindings = self.infer_generic_argument_bindings(
             callee,
-            params,
+            &params,
             args,
             scopes,
             method_context,
-            initial_bindings,
+            &initial,
         );
         self.pending_generic_calls.insert(
             span,
@@ -21431,7 +21473,7 @@ impl<'program> Checker<'program> {
                     *span,
                 )
                 .with_help(
-                    "bind the result through a typed declaration so the expected type determines the missing generic argument",
+                    "state the type arguments at the call, as in `first<int>($values)`, or bind the result through a typed declaration so the expected type determines them",
                 ),
             );
         }
@@ -23910,10 +23952,14 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
+        self.register_stated_type_arguments(expr, method_context);
         if self.assertions.contains_key(&expr.span()) {
             return self.types.intern(TypeKind::Void);
         }
         match expr {
+            crate::ast::Expr::TypeArgumentsOrComparison(_) => {
+                unreachable!("name resolution classifies type arguments at a call")
+            }
             Expr::Closure(closure) => self
                 .closure_types
                 .get(&closure.span)
@@ -25922,6 +25968,7 @@ impl<'program> Checker<'program> {
         }
 
         let callback_index = usize::from(method == "reduce");
+        let stated = self.stated_list_algorithm_type_argument(method, span);
         let callback = &args[callback_index].value;
         let callback_ty = self.infer_expr_type(callback, scopes, method_context);
         let TypeKind::Function(function) = self.types.kind(callback_ty).clone() else {
@@ -26025,6 +26072,18 @@ impl<'program> Checker<'program> {
                         &format!(
                             "an element parameter of type `{}`",
                             self.types.display(*element)
+                        ),
+                    );
+                    return;
+                }
+                if let Some(stated) = stated.filter(|stated| *stated != function.return_type) {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Return Type Mismatch",
+                        &format!(
+                            "a return type of `{}`, the type argument stated at the call",
+                            self.types.display(stated)
                         ),
                     );
                     return;
@@ -26166,6 +26225,18 @@ impl<'program> Checker<'program> {
                         callback.span(),
                         "Reduce Callback Must Return Void",
                         "a `void` return",
+                    );
+                    return;
+                }
+                if let Some(stated) = stated.filter(|stated| *stated != accumulator_parameter.ty) {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Type Mismatch",
+                        &format!(
+                            "a writable accumulator of type `{}`, the type argument stated at the call",
+                            self.types.display(stated)
+                        ),
                     );
                     return;
                 }
