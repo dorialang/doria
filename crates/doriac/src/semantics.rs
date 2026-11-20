@@ -8218,7 +8218,11 @@ impl<'program> Checker<'program> {
                 }
             }
 
-            if param.take && param.writable {
+            // On a promoted parameter `take` moves the argument into the new
+            // property and `writable` makes that property writable, as it does
+            // for a promoted Copy property (Decision 0083, 2026-11-20).
+            let promoted = function.name == "__construct" && param.constructor_role.is_promoted();
+            if param.take && param.writable && !promoted {
                 let span = param
                     .take_span
                     .zip(param.writable_span)
@@ -8231,7 +8235,7 @@ impl<'program> Checker<'program> {
                         span,
                     )
                     .with_help(
-                        "use `take` to give ownership to the callee, or `writable` for exclusive mutation without giving ownership",
+                        "use `take` to give ownership to the callee, or `writable` for exclusive mutation without giving ownership; only a promoted constructor parameter combines them, to own a writable property",
                     ),
                 );
             }
@@ -8253,9 +8257,15 @@ impl<'program> Checker<'program> {
                     .push(if let Some(writable_span) = param.writable_span {
                         diagnostic
                             .with_help(
-                                "promotion transfers ownership; replace `writable` with `take`",
+                                "promotion gives ownership directly to the new property; insert `take` to keep the property writable",
                             )
-                            .with_fix(writable_span, "take")
+                            .with_fix(
+                                Span {
+                                    end: writable_span.start,
+                                    ..writable_span
+                                },
+                                "take ",
+                            )
                     } else {
                         diagnostic
                         .with_help(
@@ -10342,6 +10352,52 @@ impl<'program> Checker<'program> {
                                 foreach.value_binding.span,
                             )
                             .with_title("Public Iteration Is Readonly"),
+                        );
+                    }
+                }
+                // A writable binding changes elements in place, so the walked
+                // collection must itself be writable, exactly as for a
+                // mutating collection method. Only these families yield
+                // writable elements; every other source reports its own rule,
+                // and an unresolved source has already been reported.
+                if foreach.value_binding.writable
+                    && dictionary_projection.is_none()
+                    && matches!(
+                        plan.family,
+                        ForeachIterableFamily::List
+                            | ForeachIterableFamily::TypedArray
+                            | ForeachIterableFamily::Dictionary
+                            | ForeachIterableFamily::SortedDictionary
+                            | ForeachIterableFamily::Deque
+                    )
+                {
+                    self.record_capture_requirement_for_expr(
+                        &foreach.iterable,
+                        scopes,
+                        CaptureRequirement::Writable,
+                    );
+                    if !self.is_writable_object_path(&foreach.iterable, scopes, method_context) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0201",
+                                "a writable foreach binding needs a writable collection",
+                                foreach.iterable.span(),
+                            )
+                            .with_title("Writable Foreach Needs A Writable Collection")
+                            .with_primary_label("This Collection Is Readonly")
+                            .with_related(
+                                foreach
+                                    .value_binding
+                                    .writable_span
+                                    .unwrap_or(foreach.value_binding.span),
+                                "Writable Binding Declared Here",
+                            )
+                            .with_explanation(
+                                "A `writable` foreach binding changes each element in place, so the collection it walks must be writable.",
+                            )
+                            .with_help(
+                                "declare the variable, parameter or property `writable` (a promoted owned property is `take writable`), call it from a `writable function` when it is a property of `$this`, or remove `writable` from the binding to only read the elements",
+                            ),
                         );
                     }
                 }

@@ -768,3 +768,62 @@ jobs:
           if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Call Path")) { throw "missing integer call path" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic[P1110]: Float To Integer Conversion Is Out Of Range")) { throw "missing float panic" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Call Path")) { throw "missing float call path" }
+
+  # The compiler other Doria repositories test against. doria-tui's CI
+  # downloads this artifact for the doria commit it pins, so a consumer run
+  # takes minutes and each commit's compiler is built once. Nothing is
+  # released. The build has no LLVM backend: that one links LLVM 18 at run
+  # time, which a consumer runner does not have. Cranelift, the interpreter
+  # and PHP output are all in it.
+  compiler-artifact:
+    name: compiler-artifact-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Build the release compiler
+        run: cargo build -p doriac --release --locked
+
+      # The binary must stand alone: run it from outside the checkout, where
+      # no build directory is near it, on a program that compiles natively.
+      - name: Check the compiler runs on its own
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/doriac-artifact"
+          mkdir -p "$staging"
+          binary=doriac
+          if [ "$RUNNER_OS" = "Windows" ]; then binary=doriac.exe; fi
+          cp "target/release/$binary" "$staging/$binary"
+          cp examples/native/main_arithmetic_42.doria "$staging/main.doria"
+          cd "$staging"
+          program=main
+          if [ "$RUNNER_OS" = "Windows" ]; then program=main.exe; fi
+          "./$binary" compile main.doria --target native --out "$program"
+          status=0
+          "./$program" || status=$?
+          if [ "$status" -ne 42 ]; then
+            echo "the standalone compiler's program exited $status, expected 42"
+            exit 1
+          fi
+          "./$binary" --version --json
+
+      - name: Upload the compiler
+        uses: actions/upload-artifact@v7
+        with:
+          name: doriac-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/doriac-artifact/doriac*
+          if-no-files-found: error
+          retention-days: 30
