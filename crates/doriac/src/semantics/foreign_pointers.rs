@@ -682,14 +682,13 @@ impl<'program> Checker<'program> {
             _ => return None,
         };
         let callee = format!("`{}::{member}`", pointer.short_name());
-        let stated = self.stated_type_argument_types(&callee, 1, span)?[0];
-        Some(match operation {
-            PointerOperation::ToFunction => stated,
-            _ => self.types.intern(TypeKind::Foreign(ForeignType::Pointer {
-                access: pointer,
-                pointee: stated,
-            })),
-        })
+        if operation == PointerOperation::ToFunction {
+            return Some(self.stated_type_argument_types(&callee, 1, span)?[0]);
+        }
+        let pointee = *self
+            .stated_type_argument_types_in_position(&callee, 1, span, TypePosition::Pointee)?
+            .first()?;
+        Some(self.pointer_type(pointer, pointee, span))
     }
 
     /// The target of a conversion, from a type argument stated at the call

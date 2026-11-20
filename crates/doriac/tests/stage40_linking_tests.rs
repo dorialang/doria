@@ -216,6 +216,19 @@ fn inputs_a_target_cannot_use_are_reported_where_the_library_is_used() {
 /// A schema-2 plan whose one package names `math` in `nativeLibraries`
 /// with a package-relative search path.
 fn schema_2_plan(native_libraries: &str, unsafe_policy: &str) -> String {
+    schema_2_plan_for_profile(native_libraries, unsafe_policy, NativeProfile::Fast)
+}
+
+/// [`schema_2_plan`] building with `profile`.
+fn schema_2_plan_for_profile(
+    native_libraries: &str,
+    unsafe_policy: &str,
+    profile: NativeProfile,
+) -> String {
+    let profile = match profile {
+        NativeProfile::Fast => "fast",
+        NativeProfile::Release => "release",
+    };
     format!(
         r#"{{
   "schemaVersion": 2,
@@ -250,7 +263,7 @@ fn schema_2_plan(native_libraries: &str, unsafe_policy: &str) -> String {
   ],
   "compiler": {{
     "target": "native",
-    "nativeProfile": "fast",
+    "nativeProfile": "{profile}",
     "targetTriple": null
   }}
 }}"#
@@ -401,4 +414,191 @@ fn a_build_plan_links_its_package_libraries_and_refuses_an_unenforced_deny_polic
         (diagnostics[0].code, diagnostics[0].title.as_str()),
         ("E0784", "Package Unsafe Policies Are Not Available Yet")
     );
+}
+
+/// Decision 0148 acceptance 1, 2, 4, 5, 6 and 11: the package in
+/// `examples/ffi/zlib` binds zlib, compresses through region pointers with
+/// no copy, streams through a foreign `z_stream` whose `uLong` fields follow
+/// the target, counts zlib's allocations in C-callable Doria functions that
+/// reach a shared counter through `opaque`, and reads a buffer `malloc`
+/// owns through an owner class's region.
+const ZLIB_PACKAGE: &str = include_str!("../../../examples/ffi/zlib/src/main.doria");
+
+const ZLIB_OUTPUT: &str = "bound true
+compress2 true
+smaller true
+uncompress true
+round trip true
+deflateInit_ true
+deflate true
+consumed true
+input address true
+output address true
+deflateEnd true
+stream round trip true
+counted deflate true
+allocations counted true
+every allocation released true
+foreign uncompress true
+foreign region true
+foreign buffer released
+Doria binds zlib. Doria binds zlib. Doria binds zlib. Doria binds zlib.
+";
+
+/// One way this host links zlib: its name, the direct flags and the
+/// schema-2 `inputs` and `runtimeFiles` Baton would write for them.
+struct ZlibLink {
+    name: &'static str,
+    flags: Vec<(&'static str, String)>,
+    plan: String,
+}
+
+/// The ways CI provisions zlib (Decision 0148 acceptance 3): the default
+/// search on Linux and macOS, and on Windows vcpkg's import library with its
+/// DLL and its static library.
+fn zlib_links() -> Vec<ZlibLink> {
+    if !cfg!(windows) {
+        return vec![ZlibLink {
+            name: "dynamic",
+            flags: vec![("--link-library", "zlib=z".to_string())],
+            plan: r#"[{ "name": "zlib", "link": "dynamic", "inputs": [{ "kind": "library", "name": "z" }] }]"#
+                .to_string(),
+        }];
+    }
+    let root = std::env::var_os("VCPKG_INSTALLATION_ROOT").unwrap_or_else(|| {
+        panic!(
+            "set VCPKG_INSTALLATION_ROOT to a vcpkg root after running \
+             `vcpkg install zlib:x64-windows zlib:x64-windows-static-md`"
+        )
+    });
+    let installed = Path::new(&root).join("installed");
+    let path = |triplet: &str, child: &str| {
+        installed
+            .join(triplet)
+            .join(child)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    };
+    let dynamic_lib = path("x64-windows", "lib");
+    let dll = path("x64-windows", "bin/zlib1.dll");
+    let static_lib = path("x64-windows-static-md", "lib");
+    vec![
+        ZlibLink {
+            name: "dynamic",
+            flags: vec![
+                ("--link-library", "zlib=zlib".to_string()),
+                ("--link-search", format!("zlib={dynamic_lib}")),
+                ("--runtime-file", format!("zlib={dll}")),
+            ],
+            plan: format!(
+                r#"[{{ "name": "zlib", "link": "dynamic", "inputs": [{{ "kind": "searchPath", "path": "{dynamic_lib}" }}, {{ "kind": "library", "name": "zlib" }}], "runtimeFiles": ["{dll}"] }}]"#
+            ),
+        },
+        ZlibLink {
+            name: "static",
+            flags: vec![
+                ("--link-library", "zlib=static:zlib".to_string()),
+                ("--link-search", format!("zlib={static_lib}")),
+            ],
+            plan: format!(
+                r#"[{{ "name": "zlib", "link": "static", "inputs": [{{ "kind": "searchPath", "path": "{static_lib}" }}, {{ "kind": "library", "name": "zlib" }}] }}]"#
+            ),
+        },
+    ]
+}
+
+/// Publishes an executable with its runtime files into `directory/bin` and
+/// runs it.
+fn publish_and_run(
+    directory: &ExecutionDirectory,
+    bytes: Vec<u8>,
+    runtime_files: Vec<std::path::PathBuf>,
+) -> std::process::Output {
+    let out = directory.path().join("bin").join(executable_name());
+    doriac::backend::publish_output(
+        &out,
+        BackendOutput::Executable {
+            extension: String::new(),
+            bytes,
+            runtime_files,
+        },
+    )
+    .unwrap();
+    run(&out)
+}
+
+#[test]
+fn the_zlib_package_links_from_direct_flags_on_both_profiles() {
+    let mir = program(ZLIB_PACKAGE);
+    for link in zlib_links() {
+        for profile in NativeProfile::AVAILABLE {
+            let executable = doriac::codegen_native::generate_linked_executable(
+                &mir,
+                *profile,
+                &linking(&link.flags),
+            )
+            .unwrap_or_else(|error| panic!("{} {profile:?}: {error:?}", link.name));
+            let directory = ExecutionDirectory::new();
+            let output = publish_and_run(&directory, executable.bytes, executable.runtime_files);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{} {profile:?}: {output:?}",
+                link.name
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                ZLIB_OUTPUT,
+                "{} {profile:?}",
+                link.name
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{} {profile:?}: {output:?}",
+                link.name
+            );
+        }
+    }
+}
+
+#[test]
+fn the_zlib_package_links_from_a_schema_2_plan_on_both_profiles() {
+    for link in zlib_links() {
+        for profile in NativeProfile::AVAILABLE {
+            let directory = ExecutionDirectory::new();
+            std::fs::create_dir_all(directory.path().join("src")).unwrap();
+            std::fs::write(directory.path().join("src/main.doria"), ZLIB_PACKAGE).unwrap();
+            let plan_path = directory.path().join("plan.json");
+            std::fs::write(
+                &plan_path,
+                schema_2_plan_for_profile(&link.plan, "allow", *profile),
+            )
+            .unwrap();
+            let (_, graph) = doriac::load_build_plan_file(&plan_path)
+                .unwrap_or_else(|error| panic!("{} {profile:?}: {error:#?}", link.name));
+            let BackendOutput::Executable {
+                bytes,
+                runtime_files,
+                ..
+            } = doriac::compile_compilation_graph(&graph)
+                .unwrap_or_else(|error| panic!("{} {profile:?}: {error:#?}", link.name))
+            else {
+                panic!("a native plan builds an executable");
+            };
+            let output = publish_and_run(&directory, bytes, runtime_files);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{} {profile:?}: {output:?}",
+                link.name
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                ZLIB_OUTPUT,
+                "{} {profile:?}",
+                link.name
+            );
+        }
+    }
 }

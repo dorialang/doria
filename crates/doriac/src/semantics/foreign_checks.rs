@@ -284,15 +284,7 @@ impl<'program> Checker<'program> {
                 TypePosition::Pointee,
                 declaring_class,
             );
-            let addressable = matches!(
-                self.types.kind(pointee),
-                TypeKind::Foreign(ForeignType::Opaque | ForeignType::Aggregate(_))
-            );
-            if !addressable {
-                self.require_ffi_safe(pointee, span, "a pointee");
-            }
-            self.types
-                .intern(TypeKind::Foreign(ForeignType::Pointer { access, pointee }))
+            self.pointer_type(access, pointee, span)
         } else if let Some(boundary) = boundary {
             self.resolve_zero_arg_type(ty, span, TypeKind::Foreign(ForeignType::Boundary(boundary)))
         } else {
@@ -310,6 +302,27 @@ impl<'program> Checker<'program> {
         } else {
             base
         })
+    }
+
+    /// `Pointer<T>` or `WritablePointer<T>` over a resolved pointee, which
+    /// is `Opaque`, a foreign aggregate or an FFI-safe type (section 3),
+    /// wherever the pointee is written: a type, or a type argument stated at
+    /// a pointer conversion.
+    pub(super) fn pointer_type(
+        &mut self,
+        access: PointerAccess,
+        pointee: TypeId,
+        span: Span,
+    ) -> TypeId {
+        let addressable = matches!(
+            self.types.kind(pointee),
+            TypeKind::Foreign(ForeignType::Opaque | ForeignType::Aggregate(_))
+        );
+        if !addressable {
+            self.require_ffi_safe(pointee, span, "a pointee");
+        }
+        self.types
+            .intern(TypeKind::Foreign(ForeignType::Pointer { access, pointee }))
     }
 
     fn report_foreign_type_placement(

@@ -4276,16 +4276,21 @@ impl Parser {
                 .get(&open_span)
                 .copied()
                 .unwrap_or(CallReading::TypeArguments);
-            self.call_candidates.push(CallCandidate {
+            let candidate = CallCandidate {
                 open_span,
                 names: self.candidate_names(open),
                 read_as,
-            });
+            };
             if read_as == CallReading::Comparison {
+                // Restoring drops the candidates recorded since the
+                // checkpoint, so this one is recorded after it: the tree
+                // keeps every candidate with the reading it was given.
                 self.restore_checkpoint(checkpoint);
                 self.completion = completion;
+                self.call_candidates.push(candidate);
                 return None;
             }
+            self.call_candidates.push(candidate);
         }
         Some(CallTypeArguments { arguments, span })
     }

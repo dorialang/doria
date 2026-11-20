@@ -888,7 +888,7 @@ fn a_conversion_takes_a_stated_target_before_the_expected_type() {
     // `fromAddress` and `toFunction` declare one type parameter, the pointee
     // or the C function pointer type.
     let accepted = pointer_program(
-        "unsafe { let $pointer = WritablePointer::to($value); echo Pointer::cast<int32>($pointer)->read(); let $bytes = WritablePointer::cast<uint8>($pointer); let $address = Pointer::fromAddress<int32>(16); let $function = Pointer::toFunction<extern \"C\" function(Pointer<Opaque>): ?Pointer<Opaque>>(Pointer::cast<Opaque>(Pointer::to($value))); }",
+        "unsafe { let $pointer = WritablePointer::to($value); echo Pointer::cast<int32>($pointer)->read(); let $bytes = WritablePointer::cast<uint8>($pointer); let $untyped = WritablePointer::cast<Opaque>($pointer); let $address = Pointer::fromAddress<int32>(16); let $function = Pointer::toFunction<extern \"C\" function(Pointer<Opaque>): ?Pointer<Opaque>>(Pointer::cast<Opaque>(Pointer::to($value))); }",
     );
     assert_eq!(
         codes(&accepted),
@@ -899,6 +899,8 @@ fn a_conversion_takes_a_stated_target_before_the_expected_type() {
     for (body, code) in [
         ("unsafe { let $function = Pointer::toFunction<int32>(Pointer::cast<Opaque>(Pointer::to($value))); }", "E0802"),
         ("unsafe { let $pointer = Pointer::cast<int32, int32>(Pointer::to($value)); }", "E0812"),
+        // A stated pointee meets the rule a written `Pointer<T>` meets.
+        ("unsafe { let $pointer = Pointer::cast<string>(Pointer::to($value)); }", "E0786"),
         ("unsafe { let $pointer = Pointer::to<int32>($value); }", "E0811"),
     ] {
         let source = pointer_program(body);

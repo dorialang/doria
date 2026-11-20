@@ -89,6 +89,19 @@ impl<'program> Checker<'program> {
         expected: usize,
         span: Span,
     ) -> Option<Vec<TypeId>> {
+        self.stated_type_argument_types_in_position(callee, expected, span, TypePosition::Value)
+    }
+
+    /// [`Self::stated_type_argument_types`] for a callee whose type
+    /// parameters each occupy `position`, as the pointee parameter of
+    /// `Pointer::cast` occupies [`TypePosition::Pointee`].
+    pub(super) fn stated_type_argument_types_in_position(
+        &mut self,
+        callee: &str,
+        expected: usize,
+        span: Span,
+        position: TypePosition,
+    ) -> Option<Vec<TypeId>> {
         let stated = self.stated_type_arguments.get_mut(&span)?;
         stated.consumed = true;
         let list = stated.list.clone();
@@ -102,9 +115,10 @@ impl<'program> Checker<'program> {
             list.arguments
                 .iter()
                 .map(|argument| {
-                    self.resolve_type_ref_with_class(
+                    self.resolve_type_ref_in_position(
                         argument,
                         list.span,
+                        position,
                         declaring_class.as_deref(),
                     )
                 })

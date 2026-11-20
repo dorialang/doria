@@ -781,7 +781,7 @@ fn tooling_reads_the_authored_tree_as_name_resolution_read_it() {
         "{STATED_GENERICS}
 const int LIMIT = 3;
 const int MAX = 2;
-function main(): void {{ let $factory = pick<Factory, Factory>(new Factory(), new Factory()); echo MAX<LIMIT>(false); }}"
+function main(): void {{ echo pick<Factory, Factory>(new Factory(), new Factory())->plain(1); echo MAX<LIMIT>(false); }}"
     );
     let (program, analysis) =
         doriac::analyze_source_for_ide("tooling-readings.doria", source).expect("source parses");
@@ -821,7 +821,7 @@ fn deeply_nested_candidates_parse_in_linear_time() {
         "{STATED_GENERICS}
 const int LIMIT = 3;
 const int MAX = 2;
-function main(): void {{ let $factory = {calls}; echo {comparisons}; }}"
+function main(): void {{ echo {calls}->plain(1); echo {comparisons}; }}"
     );
     let started = std::time::Instant::now();
     doriac::check_source("nested-candidates.doria", &source)
