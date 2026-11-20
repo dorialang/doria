@@ -340,8 +340,10 @@ pub(super) fn lower_extern_body(
         mir::ReturnType::Void => None,
     };
     let foreign = mir::ForeignFunction {
-        symbol: binding.symbol.clone(),
-        library: binding.library.clone(),
+        callee: mir::ForeignCallee::Symbol {
+            symbol: binding.symbol.clone(),
+            library: binding.library.clone(),
+        },
         parameters: parameter_types.to_vec(),
         return_type: result,
         fixed_parameters: binding.fixed_parameters,
@@ -359,6 +361,73 @@ pub(super) fn lower_extern_body(
         _ => mir::Terminator::ReturnVoid,
     });
     Ok(())
+}
+
+/// A call of a C function pointer value (Decision 0148 section 12), or
+/// `None` when `call` calls a Doria function value. The callee is
+/// evaluated first and then each argument from left to right, each copied
+/// into a local of its C parameter's type; one foreign call of the pointer
+/// follows. Its result, which a C function returns by value, is the call's
+/// unowned result local.
+pub(super) fn function_pointer_call(
+    call: &hir::CallableCall,
+    function_type: &ResolvedType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<Option<(mir::LocalId, mir::Type, bool)>>> {
+    let ResolvedType::Foreign(foreign) = function_type else {
+        return Ok(None);
+    };
+    let ForeignType::Function(signature) = foreign.as_ref() else {
+        return Ok(None);
+    };
+    let callee = lower_rvalue_as_expected(&call.callee, POINTER, context)?;
+    let (callee, _) = core_value::materialize_value(callee, context);
+    if call.args.len() != signature.parameters.len() {
+        return Err(vec![unsupported(
+            call.span,
+            "checking admitted a C function pointer call with another argument count",
+        )]);
+    }
+    let mut parameters = Vec::with_capacity(signature.parameters.len());
+    let mut args = Vec::with_capacity(call.args.len());
+    for (argument, parameter) in call.args.iter().zip(&signature.parameters) {
+        let ty = context.mir_resolved_type(parameter).ok_or_else(|| {
+            vec![unsupported(
+                argument.span,
+                "a C function pointer parameter has no MIR type",
+            )]
+        })?;
+        let value = lower_rvalue_as_expected(&argument.value, ty, context)?;
+        let (local, _) = core_value::materialize_value(value, context);
+        parameters.push(ty);
+        args.push(local);
+    }
+    let return_type = match &signature.return_type {
+        ResolvedType::Void => None,
+        ty => Some(context.mir_resolved_type(ty).ok_or_else(|| {
+            vec![unsupported(
+                call.span,
+                "a C function pointer result has no MIR type",
+            )]
+        })?),
+    };
+    let target = return_type.map(|ty| context.declare_return_temp(ty, false));
+    context.push_statement(mir::Statement::ForeignCall {
+        function: Box::new(mir::ForeignFunction {
+            callee: mir::ForeignCallee::Pointer(callee),
+            parameters,
+            return_type,
+            fixed_parameters: None,
+        }),
+        args,
+        target,
+        span: call.span,
+    });
+    Ok(Some(
+        target
+            .zip(return_type)
+            .map(|(local, ty)| (local, ty, false)),
+    ))
 }
 
 /// A field of a foreign struct or union as a place: the local holding the

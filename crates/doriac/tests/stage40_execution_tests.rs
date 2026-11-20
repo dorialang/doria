@@ -461,6 +461,78 @@ function main(): void
     assert_runs_natively(&source, "7 123456 5 97 true 120 105 5");
 }
 
+#[cfg(unix)]
+#[test]
+fn c_function_pointer_values_are_called_through_their_address() {
+    // Decision 0148 section 12: addresses from `dlsym`, converted with
+    // `Ptr::toFunction`, called with scalars and a struct result, held
+    // nullable, in a foreign struct field, and passed through a function.
+    let source = "
+use Doria\\Std\\Ffi\\{CChar, MutPtr, Opaque, Ptr};
+
+extern \"C\" struct Quotient
+{
+    int32 $quotient;
+    int32 $remainder;
+}
+
+extern \"C\" struct Table
+{
+    extern \"C\" function(int32): int32 $absolute;
+}
+
+extern \"C\"
+{
+    /** @safety `$path` is null or a NUL-terminated path. */
+    function dlopen(?Ptr<CChar> $path, int32 $mode): ?MutPtr<Opaque>;
+
+    /** @safety `$handle` came from `dlopen` and `$name` is NUL-terminated. */
+    function dlsym(MutPtr<Opaque> $handle, Ptr<CChar> $name): ?MutPtr<Opaque>;
+}
+
+function find(MutPtr<Opaque> $handle, uint8[] $name): Ptr<Opaque>
+{
+    unsafe {
+        ?MutPtr<Opaque> $symbol = dlsym($handle, Ptr::cast($name->getRegion(0, $name->length)->pointer));
+        if ($symbol == null) {
+            panic(\"no symbol\");
+        }
+        return Ptr::from($symbol);
+    }
+}
+
+function apply(extern \"C\" function(int32): int32 $function, int32 $value): int32
+{
+    return unsafe($function($value));
+}
+
+function main(): void
+{
+    unsafe {
+        ?MutPtr<Opaque> $program = dlopen(null, 1);
+        if ($program == null) {
+            panic(\"no program handle\");
+        }
+        let $handle = $program;
+        extern \"C\" function(int32): int32 $absolute = Ptr::toFunction(find($handle, [97, 98, 115, 0]));
+        echo $absolute(-5);
+        extern \"C\" function(int32, int32): Quotient $divide = Ptr::toFunction(find($handle, [100, 105, 118, 0]));
+        Quotient $result = $divide(17, 5);
+        echo \" \" . $result->quotient . \" \" . $result->remainder;
+        ?extern \"C\" function(int32): int32 $maybe = $absolute;
+        if ($maybe != null) {
+            echo \" \" . $maybe(-9);
+        }
+        let $table = new Table(absolute: $absolute);
+        let $fromField = $table->absolute;
+        echo \" \" . $fromField(-11);
+        echo \" \" . apply($absolute, -13);
+    }
+}
+";
+    assert_runs_natively(source, "5 3 2 9 11 13");
+}
+
 const AGGREGATES: &str = r#"
 extern "C" struct Color
 {

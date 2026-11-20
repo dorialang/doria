@@ -374,11 +374,25 @@ impl<'program> Checker<'program> {
                 "a C function pointer return",
             );
         }
-        self.types
+        let ty = self
+            .types
             .intern(TypeKind::Foreign(ForeignType::Function(CFunctionType {
                 parameters,
                 return_type,
-            })))
+            })));
+        // Every function type annotation records its checked type by span,
+        // which lowering and backends resolve the annotation through. A C
+        // function has no checked effects (section 12).
+        self.function_types_by_span.insert(
+            function.span,
+            super::FunctionTypeSemanticInfo {
+                ty: self.types.resolved(ty),
+                authored_checked_effects: Vec::new(),
+                ambient_checked_effects: Vec::new(),
+                test_assertion_checked_effects: Vec::new(),
+            },
+        );
+        ty
     }
 
     pub(super) fn check_foreign_abi(&mut self, abi: &str, span: Span) {

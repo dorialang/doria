@@ -22757,19 +22757,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.context.void_type().fn_type(&parameter_types, false)
             }
         };
-        let declared = match self.module.get_function(&foreign.symbol) {
-            Some(function) => function,
-            None => {
-                let function = self.module.add_function(
-                    &foreign.symbol,
-                    function_type,
-                    Some(Linkage::External),
-                );
-                for (index, attribute) in &attributes {
-                    function.add_attribute(AttributeLoc::Param(*index), *attribute);
-                }
-                function
+        // A declaration's symbol, or a C function pointer value (Decision
+        // 0148 section 12) called through its address.
+        let declared = match &foreign.callee {
+            mir::ForeignCallee::Symbol { symbol, .. } => {
+                Some(match self.module.get_function(symbol) {
+                    Some(function) => function,
+                    None => {
+                        let function = self.module.add_function(
+                            symbol,
+                            function_type,
+                            Some(Linkage::External),
+                        );
+                        for (index, attribute) in &attributes {
+                            function.add_attribute(AttributeLoc::Param(*index), *attribute);
+                        }
+                        function
+                    }
+                })
             }
+            mir::ForeignCallee::Pointer(_) => None,
         };
         let mut images = HashMap::new();
         let mut values = Vec::with_capacity(physical.parameters.len());
@@ -22820,15 +22827,33 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             };
             values.push(value.into());
         }
-        let call = if declared.get_type() == function_type {
-            build(self.builder.build_call(declared, &values, "foreign.call"))?
-        } else {
-            build(self.builder.build_indirect_call(
+        let address = match (declared, &foreign.callee) {
+            (Some(declared), _) if declared.get_type() == function_type => None,
+            (Some(declared), _) => Some(declared.as_global_value().as_pointer_value()),
+            (None, mir::ForeignCallee::Pointer(local)) => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let address = build(self.builder.build_load(word, slot, "foreign.pointer"))?;
+                Some(build(self.builder.build_int_to_ptr(
+                    address.into_int_value(),
+                    self.context.ptr_type(AddressSpace::default()),
+                    "foreign.pointer.address",
+                ))?)
+            }
+            (None, mir::ForeignCallee::Symbol { .. }) => {
+                return Err(malformed_mir("a foreign symbol call has its declaration"))
+            }
+        };
+        let call = match (declared, address) {
+            (Some(declared), None) => {
+                build(self.builder.build_call(declared, &values, "foreign.call"))?
+            }
+            (_, Some(address)) => build(self.builder.build_indirect_call(
                 function_type,
-                declared.as_global_value().as_pointer_value(),
+                address,
                 &values,
                 "foreign.call",
-            ))?
+            ))?,
+            (None, None) => unreachable!("a foreign call has a declaration or an address"),
         };
         for (index, attribute) in &attributes {
             call.add_attribute(AttributeLoc::Param(*index), *attribute);

@@ -197,9 +197,10 @@ impl SelectedTarget {
 
 impl Program {
     /// Whether the executable links foreign code: any foreign call,
-    /// including one of the platform C runtime (Decision 0148 section 20).
+    /// including one of the platform C runtime or of a C function pointer
+    /// (Decision 0148 section 20).
     pub fn links_foreign_code(&self) -> bool {
-        self.functions.iter().any(Function::is_foreign_binding)
+        self.functions.iter().any(Function::calls_foreign_code)
     }
 
     pub fn source_by_id(&self, id: SourceId) -> Option<&SourceFile> {
@@ -1036,13 +1037,27 @@ impl Function {
     }
 
     /// Whether this is an extern declaration's function, whose body is its
-    /// foreign call (Decision 0148 section 15).
+    /// foreign call of the declaration's symbol (Decision 0148 section 15).
     pub fn is_foreign_binding(&self) -> bool {
-        self.blocks.iter().any(|block| {
+        self.foreign_calls()
+            .any(|function| matches!(function.callee, ForeignCallee::Symbol { .. }))
+    }
+
+    /// Whether this function calls into C: an extern declaration's body,
+    /// or a call of a C function pointer value (section 12).
+    pub fn calls_foreign_code(&self) -> bool {
+        self.foreign_calls().next().is_some()
+    }
+
+    fn foreign_calls(&self) -> impl Iterator<Item = &ForeignFunction> {
+        self.blocks.iter().flat_map(|block| {
             block
                 .statements
                 .iter()
-                .any(|statement| matches!(statement, Statement::ForeignCall { .. }))
+                .filter_map(|statement| match statement {
+                    Statement::ForeignCall { function, .. } => Some(function.as_ref()),
+                    _ => None,
+                })
         })
     }
 
@@ -6241,11 +6256,13 @@ pub enum Statement {
         operation: PointerOperation,
         span: Span,
     },
-    /// A call to the C function an extern declaration binds (Decision 0148
-    /// sections 14 and 15), passing `args` by copy and assigning its
-    /// result, if it has one, to `target`. It is the whole body of the
-    /// declaration's MIR function, so every Doria call reaches C through
-    /// the ordinary call path.
+    /// A call into C (Decision 0148 sections 12, 14 and 15), passing
+    /// `args` by copy and assigning its result, if it has one, to
+    /// `target`. A call of the symbol an extern declaration binds is the
+    /// whole body of the declaration's MIR function, so every Doria call of
+    /// a declaration reaches C through the ordinary call path. A call of a
+    /// C function pointer value is a statement of the function that calls
+    /// it.
     ForeignCall {
         function: Box<ForeignFunction>,
         args: Vec<LocalId>,
@@ -6286,18 +6303,29 @@ pub enum ForeignFieldAccess {
     Region { target: LocalId, length: u64 },
 }
 
-/// A C function as a foreign call reaches it: its symbol and its C
-/// signature over MIR types.
+/// A C function as a foreign call reaches it: how the call finds it and
+/// its C signature over MIR types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForeignFunction {
-    pub symbol: String,
-    /// The `#[Library]` logical name; `None` is the platform C runtime.
-    pub library: Option<String>,
+    pub callee: ForeignCallee,
     pub parameters: Vec<Type>,
     /// `None` for `void`.
     pub return_type: Option<Type>,
     /// `Some(n)` for a variadic binding with `n` fixed parameters.
     pub fixed_parameters: Option<usize>,
+}
+
+/// Where a foreign call finds its C function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ForeignCallee {
+    /// The symbol an extern declaration binds, in the `#[Library]` logical
+    /// library `library`; `None` is the platform C runtime (section 15).
+    Symbol {
+        symbol: String,
+        library: Option<String>,
+    },
+    /// The C function pointer value (section 12) this pointer local holds.
+    Pointer(LocalId),
 }
 
 impl ForeignFunction {
@@ -10988,11 +11016,18 @@ impl fmt::Display for Statement {
                     .map(|local| format!("local{}", local.0))
                     .collect::<Vec<_>>()
                     .join(", ");
-                write!(formatter, "foreign_call {}({args})", function.symbol)?;
-                if let Some(library) = &function.library {
-                    write!(formatter, " in {library}")?;
+                match &function.callee {
+                    ForeignCallee::Symbol { symbol, library } => {
+                        write!(formatter, "foreign_call {symbol}({args})")?;
+                        if let Some(library) = library {
+                            write!(formatter, " in {library}")?;
+                        }
+                        Ok(())
+                    }
+                    ForeignCallee::Pointer(pointer) => {
+                        write!(formatter, "foreign_call *local{}({args})", pointer.0)
+                    }
                 }
-                Ok(())
             }
             Statement::DropInlineValue {
                 local,

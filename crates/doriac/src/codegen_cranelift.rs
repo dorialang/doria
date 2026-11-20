@@ -21218,7 +21218,19 @@ fn lower_foreign_call(
             .extend(parts.iter().map(|(_, ty)| AbiParam::new(part_clif(*ty)))),
         PhysicalReturn::Void | PhysicalReturn::Indirect => {}
     }
-    let call = match resources.module.get_name(&foreign.symbol) {
+    let symbol = match &foreign.callee {
+        mir::ForeignCallee::Symbol { symbol, .. } => symbol,
+        // A C function pointer value (Decision 0148 section 12) is called
+        // through its address with the same classified signature.
+        mir::ForeignCallee::Pointer(local) => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let address = builder.ins().stack_load(pointer, pointer, slot, 0);
+            let reference = builder.import_signature(signature);
+            let call = builder.ins().call_indirect(reference, address, &values);
+            return finish_foreign_call(builder, call, &physical, target, target_type, resources);
+        }
+    };
+    let call = match resources.module.get_name(symbol) {
         Some(cranelift_module::FuncOrDataId::Func(id))
             if resources
                 .module
@@ -21238,19 +21250,34 @@ fn lower_foreign_call(
         }
         Some(cranelift_module::FuncOrDataId::Data(_)) => {
             return Err(malformed_mir(format!(
-                "the foreign symbol {} names data of this object",
-                foreign.symbol
+                "the foreign symbol {symbol} names data of this object"
             )))
         }
         None => {
             let id = resources
                 .module
-                .declare_function(&foreign.symbol, Linkage::Import, &signature)
+                .declare_function(symbol, Linkage::Import, &signature)
                 .map_err(|error| backend_failure(error.to_string()))?;
             let reference = resources.module.declare_func_in_func(id, builder.func);
             builder.ins().call(reference, &values)
         }
     };
+    finish_foreign_call(builder, call, &physical, target, target_type, resources)
+}
+
+/// Stores the result of the foreign call `call` into `target` as its
+/// classified return value arrives.
+fn finish_foreign_call(
+    builder: &mut FunctionBuilder,
+    call: cranelift_codegen::ir::Inst,
+    physical: &crate::native_abi::c_abi::PhysicalSignature,
+    target: Option<mir::LocalId>,
+    target_type: Option<mir::Type>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    use crate::c_layout::CScalar;
+    use crate::native_abi::c_abi::{self, PhysicalReturn};
+    let pointer = resources.module.target_config().pointer_type();
     let (Some(target), Some(ty)) = (target, target_type) else {
         return Ok(());
     };

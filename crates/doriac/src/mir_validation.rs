@@ -6592,19 +6592,39 @@ fn validate_foreign_call(
     args: &[mir::LocalId],
     target: Option<mir::LocalId>,
 ) -> Result<(), BackendError> {
-    if function.owns_diagnostic_frame() {
-        return Err(malformed_mir(
-            "a foreign call is the body of an extern declaration, which runs in its caller's frame",
-        ));
+    match &foreign.callee {
+        mir::ForeignCallee::Symbol { symbol, .. } => {
+            if function.owns_diagnostic_frame() {
+                return Err(malformed_mir(
+                    "a foreign call of a symbol is the body of an extern declaration, which runs in its caller's frame",
+                ));
+            }
+            if symbol.is_empty() {
+                return Err(malformed_mir("a foreign call names a symbol"));
+            }
+        }
+        // A C function pointer value is one pointer word, and a call of
+        // one is never variadic (section 12).
+        mir::ForeignCallee::Pointer(pointer) => {
+            if local_in(function, *pointer)?.ty
+                != mir::Type::Scalar(mir::ScalarType::Inline(
+                    crate::inline_value::InlineValueType::Pointer,
+                ))
+                || foreign.fixed_parameters.is_some()
+            {
+                return Err(malformed_mir(
+                    "a C function pointer call reads a pointer local and is not variadic",
+                ));
+            }
+        }
     }
     let target_platform = crate::c_layout::CTarget::host();
-    if foreign.symbol.is_empty()
-        || foreign
-            .c_signature(&program.foreign_aggregates, target_platform)
-            .is_none()
+    if foreign
+        .c_signature(&program.foreign_aggregates, target_platform)
+        .is_none()
     {
         return Err(malformed_mir(
-            "a foreign call names a symbol and passes only values with a C form",
+            "a foreign call passes only values with a C form",
         ));
     }
     if foreign
@@ -14514,7 +14534,10 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
     let mut accesses = ClassLocalAccesses::default();
     match statement {
         mir::Statement::SetDiagnosticSite { .. } => {}
-        mir::Statement::ForeignCall { args, .. } => {
+        mir::Statement::ForeignCall { function, args, .. } => {
+            if let mir::ForeignCallee::Pointer(pointer) = function.callee {
+                accesses.resource_read(pointer);
+            }
             for local in args {
                 accesses.resource_read(*local);
             }

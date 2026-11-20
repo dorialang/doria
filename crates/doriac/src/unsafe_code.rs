@@ -464,19 +464,11 @@ impl Finder {
         for ty in std::mem::take(&mut types.named) {
             self.misplaced_aggregate(&ty, span, None);
         }
-        if types.foreign {
-            self.report(
-                span,
-                "C Function Pointer Types Cannot Be Built Yet",
-                "C function pointer types are part of Doria; this compiler does not build code that uses them yet",
-            );
-        }
     }
 }
 
 #[derive(Default)]
 struct TypeFinder {
-    foreign: bool,
     /// Every outermost type the node names, for the aggregate placement
     /// check, which reads nested types itself.
     named: Vec<TypeRef>,
@@ -485,14 +477,6 @@ struct TypeFinder {
 impl Transform for TypeFinder {
     fn type_ref(&mut self, ty: &mut TypeRef) {
         self.named.push(ty.clone());
-        if ty
-            .function
-            .as_ref()
-            .is_some_and(|function| function.c_abi.is_some())
-            || ty.fixed_array_parts().is_some()
-        {
-            self.foreign = true;
-        }
         ty.walk(self);
     }
 
@@ -508,13 +492,7 @@ fn mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
             TypeArgumentRef::Type(inner) => mentions_aggregate(inner, aggregates),
             TypeArgumentRef::Value(_) => false,
         })
-        || ty.function.as_ref().is_some_and(|function| {
-            function
-                .parameters
-                .iter()
-                .any(|parameter| mentions_aggregate(&parameter.ty, aggregates))
-                || mentions_aggregate(&function.return_type, aggregates)
-        })
+        || doria_function_mentions_aggregate(ty, aggregates)
 }
 
 /// Whether `ty` holds a foreign struct or union other than by value in a
@@ -533,11 +511,19 @@ fn aggregate_outside_value_position(
             aggregate_outside_value_position(inner, aggregates, pointer)
         }
         TypeArgumentRef::Value(_) => false,
-    }) || ty.function.as_ref().is_some_and(|function| {
-        function
-            .parameters
-            .iter()
-            .any(|parameter| mentions_aggregate(&parameter.ty, aggregates))
-            || mentions_aggregate(&function.return_type, aggregates)
+    }) || doria_function_mentions_aggregate(ty, aggregates)
+}
+
+/// Whether `ty` is a Doria function type whose signature names a foreign
+/// struct or union. A C function pointer type passes them by value, as an
+/// extern declaration does, and holds only an address (section 12).
+fn doria_function_mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
+    ty.function.as_ref().is_some_and(|function| {
+        function.c_abi.is_none()
+            && (function
+                .parameters
+                .iter()
+                .any(|parameter| mentions_aggregate(&parameter.ty, aggregates))
+                || mentions_aggregate(&function.return_type, aggregates))
     })
 }

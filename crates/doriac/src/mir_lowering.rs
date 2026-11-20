@@ -19723,6 +19723,9 @@ fn materialize_indirect_call(
         .get(&call.span)
         .expect("checked callable-value call has semantic metadata");
     let resolved = substitute_resolved_type(&info.function_type, &context.type_substitutions);
+    if let Some(result) = foreign::function_pointer_call(call, &resolved, context)? {
+        return Ok(result);
+    }
     let mir::Type::Function(function_type) = context
         .mir_resolved_type(&resolved)
         .expect("checked callable-value call has a concrete MIR type")
