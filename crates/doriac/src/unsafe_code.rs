@@ -370,19 +370,6 @@ impl Finder {
     }
 
     fn function(&mut self, function: &FunctionDecl) {
-        if self.gate == Gate::Execution {
-            match &function.linkage {
-                FunctionLinkage::CAbi { .. } => self.report(
-                    function.span,
-                    "C-ABI Functions Cannot Be Built Yet",
-                    format!(
-                        "`extern \"C\" function {}` is part of Doria; this compiler does not build C-ABI functions yet",
-                        function.name.rsplit('\\').next().unwrap_or(&function.name)
-                    ),
-                ),
-                FunctionLinkage::Foreign { .. } | FunctionLinkage::Doria => {}
-            }
-        }
         let mut signature = function.clone();
         signature.body = FunctionBody::Requirement {
             semicolon_span: function.span,

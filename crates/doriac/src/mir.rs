@@ -101,6 +101,11 @@ pub struct Program {
     pub closure_descriptors: Vec<ClosureDescriptor>,
     pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
     pub foreign_aggregates: Vec<ForeignAggregateDefinition>,
+    /// The C-ABI Doria functions (Decision 0148 section 12). Each has a C
+    /// entry under the target's C convention, which checks the calling
+    /// thread, links the Call Path to the outbound foreign call in
+    /// progress (section 13) and calls the function as Doria code does.
+    pub c_entries: Vec<FunctionId>,
     pub functions: Vec<Function>,
     /// The validated process entry. Libraries deliberately have no entry.
     pub selected_entry: Option<FunctionId>,
@@ -6470,6 +6475,10 @@ pub enum PointerOperation {
         pointer: LocalId,
         encoding: crate::foreign::ForeignStringEncoding,
     },
+    /// The name of a C-ABI Doria function as a value (section 12): the
+    /// address of the C entry of `function`, one of `Program::c_entries`,
+    /// as a C function pointer.
+    CEntryAddress { function: FunctionId },
 }
 
 impl PointerOperation {
@@ -6484,7 +6493,8 @@ impl PointerOperation {
             Self::FromAddress { .. }
             | Self::AddressOf { .. }
             | Self::RegionData { .. }
-            | Self::ForeignStringData { .. } => None,
+            | Self::ForeignStringData { .. }
+            | Self::CEntryAddress { .. } => None,
         }
     }
 }
@@ -7518,7 +7528,8 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             | PointerOperation::AddressOf { .. }
             | PointerOperation::RegionData { .. }
             | PointerOperation::ForeignStringData { .. }
-            | PointerOperation::ReadForeignString { .. } => 0,
+            | PointerOperation::ReadForeignString { .. }
+            | PointerOperation::CEntryAddress { .. } => 0,
         },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
@@ -11021,6 +11032,9 @@ impl fmt::Display for Statement {
                     }
                     PointerOperation::FromAddress { address } => {
                         write!(formatter, "pointer_from_address({address})")
+                    }
+                    PointerOperation::CEntryAddress { function } => {
+                        write!(formatter, "c_entry_address(function{})", function.0)
                     }
                     PointerOperation::AddressOf { local, offset } => {
                         write!(formatter, "pointer_to(local{} @{offset})", local.0)

@@ -39,6 +39,28 @@ pub(super) fn expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
     match unparenthesized_place(expr) {
+        // The name of a C-ABI Doria function is the address of its C entry
+        // (section 12).
+        hir::Expr::Identifier { name, span }
+            if context
+                .semantic_info
+                .c_abi_function_values
+                .contains_key(span) =>
+        {
+            let function = context.lookup_function(name, *span)?.id;
+            let target = context.declare_return_temp(POINTER, false);
+            context.push_statement(mir::Statement::Pointer {
+                target: Some(target),
+                operation: mir::PointerOperation::CEntryAddress { function },
+                span: *span,
+            });
+            let value = local_rvalue(target, POINTER, false);
+            Ok(Some(if expected == POINTER {
+                value
+            } else {
+                nullable_present_rvalue(value)
+            }))
+        }
         hir::Expr::MethodCall {
             object,
             method,

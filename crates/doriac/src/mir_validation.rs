@@ -40,6 +40,7 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     validate_error_metadata(program)?;
     validate_interface_metadata(program)?;
     validate_closure_metadata(program)?;
+    validate_c_entries(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
         if definition.id != crate::enums::EnumId(index) {
             return Err(malformed_mir(format!(
@@ -6485,6 +6486,58 @@ fn validate_enum_operand(
     }
 }
 
+/// Each C entry (Decision 0148 sections 12 and 13) is a distinct Doria
+/// function with its own diagnostic frame, no checked effects, and a C form
+/// for every parameter and its result, which its entry receives and returns
+/// under the target's C convention.
+fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
+    let mut seen = std::collections::HashSet::new();
+    for id in &program.c_entries {
+        let function = function_in(program, *id)?;
+        if !seen.insert(*id) {
+            return Err(malformed_mir("a C entry names its function once"));
+        }
+        if !function.owns_diagnostic_frame()
+            || function.method.is_some()
+            || function.closure.is_some()
+        {
+            return Err(malformed_mir(format!(
+                "the C entry of function{} calls a free Doria function with its own frame",
+                id.0
+            )));
+        }
+        if function.has_checked_transport() {
+            return Err(malformed_mir(format!(
+                "the C entry of function{} calls a function without checked effects",
+                id.0
+            )));
+        }
+        let target = crate::c_layout::CTarget::host();
+        let c_form = |ty| mir::foreign_c_type(ty, &program.foreign_aggregates, target).is_some();
+        let parameters = function
+            .params
+            .iter()
+            .map(|local| local_in(function, *local).map(|local| local.ty))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = match function.return_type {
+            mir::ReturnType::Value(ty) => c_form(ty),
+            mir::ReturnType::Void => true,
+        };
+        if !result
+            || !parameters.into_iter().all(c_form)
+            || function
+                .parameter_modes
+                .iter()
+                .any(|mode| *mode != mir::FunctionParameterMode::Readonly)
+        {
+            return Err(malformed_mir(
+                "a C entry passes only readonly values with a C form",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A pointer operation reads a pointer local and assigns a result of its
 /// own type (Decision 0148 section 4).
 fn validate_pointer_operation(
@@ -6579,6 +6632,14 @@ fn validate_pointer_operation(
             Some(pointer)
         }
         mir::PointerOperation::ReadForeignString { .. } => Some(mir::Type::NullableString),
+        mir::PointerOperation::CEntryAddress { function } => {
+            if !program.c_entries.contains(function) {
+                return Err(malformed_mir(
+                    "a C entry address names a C-ABI function of the program",
+                ));
+            }
+            Some(pointer)
+        }
         mir::PointerOperation::FromAddress { address } => {
             if address.ty() != IntegerType::UInt64 {
                 return Err(malformed_mir("a pointer is formed from a uint64 address"));
@@ -14632,7 +14693,8 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 }
                 mir::PointerOperation::Read { .. }
                 | mir::PointerOperation::Address { .. }
-                | mir::PointerOperation::ReadForeignString { .. } => {}
+                | mir::PointerOperation::ReadForeignString { .. }
+                | mir::PointerOperation::CEntryAddress { .. } => {}
             }
         }
         mir::Statement::CompletePendingRequest {
@@ -20599,7 +20661,8 @@ fn statement_observes_property(
             | mir::PointerOperation::AddressOf { .. }
             | mir::PointerOperation::RegionData { .. }
             | mir::PointerOperation::ForeignStringData { .. }
-            | mir::PointerOperation::ReadForeignString { .. } => false,
+            | mir::PointerOperation::ReadForeignString { .. }
+            | mir::PointerOperation::CEntryAddress { .. } => false,
         },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,

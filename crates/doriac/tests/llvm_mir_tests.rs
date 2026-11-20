@@ -791,6 +791,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        c_entries: Vec::new(),
         functions: vec![
             Function {
                 id: FunctionId(0),

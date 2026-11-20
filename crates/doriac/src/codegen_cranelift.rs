@@ -84,6 +84,7 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 
 const RUNTIME_RETURNED_TRAP: u8 = 1;
 
+mod c_entry;
 mod process;
 mod readiness_set;
 #[cfg(test)]
@@ -168,6 +169,7 @@ fn lower_validated_mir_to_object_for_isa(
             .map_err(|error| backend_failure(error.to_string()))?;
         function_ids.push(function_id);
     }
+    let c_entries = c_entry::declare(&mut module, program)?;
     let class_drop_function_ids = declare_class_drop_functions(&mut module, program)?;
     let collection_drop_function_ids = declare_collection_drop_functions(&mut module, program)?;
     let closure_drop_function_ids = declare_closure_drop_functions(&mut module, program)?;
@@ -226,6 +228,7 @@ fn lower_validated_mir_to_object_for_isa(
             &optimization.functions[function.id.0],
         )?;
     }
+    c_entry::define(&mut module, program, &c_entries, &function_ids)?;
     for class in &program.classes {
         define_class_drop_function(&mut module, program, class.id, &declarations)?;
     }
@@ -1808,12 +1811,13 @@ fn define_function(
                 pointer_bytes.trailing_zeros() as u8,
             ));
             let callable_name = program.diagnostic_callable_name(function);
+            let frame_data = frame_data_symbols(function.id);
             let function_name = define_named_data(
                 &mut builder,
                 callable_name.as_bytes(),
                 1,
                 module,
-                &format!("__doria_function_name_{}", function.id.0),
+                &frame_data.name,
             )?;
             builder
                 .ins()
@@ -1841,14 +1845,14 @@ fn define_function(
                 doria_source.path.as_bytes(),
                 1,
                 module,
-                &format!("__doria_source_path_{}", function.id.0),
+                &frame_data.path,
             )?;
             let source_text = define_named_data(
                 &mut builder,
                 doria_source.text.as_bytes(),
                 1,
                 module,
-                &format!("__doria_source_text_{}", function.id.0),
+                &frame_data.text,
             )?;
             for (word, value) in [
                 (3, source_path),
@@ -1978,6 +1982,22 @@ fn define_function(
         .map_err(|error| backend_failure(format!("{error:?}")))?;
     module.clear_context(&mut context);
     Ok(())
+}
+
+/// The data symbols of the function name, source path and source text that
+/// the diagnostic frame of `function` refers to.
+struct FrameDataSymbols {
+    name: String,
+    path: String,
+    text: String,
+}
+
+fn frame_data_symbols(function: mir::FunctionId) -> FrameDataSymbols {
+    FrameDataSymbols {
+        name: format!("__doria_function_name_{}", function.0),
+        path: format!("__doria_source_path_{}", function.0),
+        text: format!("__doria_source_text_{}", function.0),
+    }
 }
 
 fn define_class_drop_function(
@@ -2851,6 +2871,19 @@ fn define_process_main(
         let argv = builder.block_params(block)[1];
 
         let pointer_type = module.target_config().pointer_type();
+        // C may call back only on the thread running Doria code (Decision
+        // 0148 section 13).
+        if !program.c_entries.is_empty() {
+            let record = module
+                .declare_function(
+                    crate::native_abi::RECORD_DORIA_THREAD,
+                    Linkage::Import,
+                    &module.make_signature(),
+                )
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let record = module.declare_func_in_func(record, builder.func);
+            builder.ins().call(record, &[]);
+        }
         initialize_payload_statics(&mut builder, module, program, static_ids)?;
         let entry_ref = module.declare_func_in_func(entry_id, builder.func);
         let entry_pointer = builder.ins().func_addr(pointer_type, entry_ref);
@@ -21119,6 +21152,9 @@ fn lower_pointer_operation(
         mir::PointerOperation::ForeignStringData { string } => Some(LoweredValue::Single(
             lower_collection_pointer(builder, *string, resources)?,
         )),
+        mir::PointerOperation::CEntryAddress { function } => Some(LoweredValue::Single(
+            c_entry::address(builder, *function, resources)?,
+        )),
         mir::PointerOperation::ReadForeignString {
             pointer: local,
             encoding,
@@ -21167,11 +21203,7 @@ fn lower_foreign_call(
     target: Option<mir::LocalId>,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
-    use crate::c_layout::CScalar;
-    use crate::native_abi::c_abi::{
-        self, Extension, PartClass, PartType, PhysicalParameter, PhysicalReturn,
-    };
-    use cranelift_codegen::ir::ArgumentPurpose;
+    use crate::native_abi::c_abi::{self, PartClass, PartType, PhysicalParameter};
     let pointer = resources.module.target_config().pointer_type();
     let platform = crate::c_layout::CTarget::host();
     let (parameters, return_type) = foreign
@@ -21184,14 +21216,6 @@ fn lower_foreign_call(
         foreign.fixed_parameters,
     );
     let physical = c_abi::physical_signature(platform, &parameters, &classification);
-    let clif = |scalar: CScalar| match scalar {
-        CScalar::Integer { bytes: 1, .. } | CScalar::Bool => types::I8,
-        CScalar::Integer { bytes: 2, .. } => types::I16,
-        CScalar::Integer { bytes: 4, .. } => types::I32,
-        CScalar::Float { bytes: 4 } => types::F32,
-        CScalar::Float { .. } => types::F64,
-        CScalar::Integer { .. } | CScalar::Pointer => pointer,
-    };
     let part_clif = |ty: PartType| match ty {
         PartType::Integer64 => types::I64,
         PartType::Float32 => types::F32,
@@ -21203,27 +21227,18 @@ fn lower_foreign_call(
         }
         None => None,
     };
-    let mut signature = resources.module.make_signature();
+    let signature = c_entry::c_signature(resources.module, &physical);
     let mut images = HashMap::new();
     let mut values = Vec::with_capacity(physical.parameters.len());
     for parameter in &physical.parameters {
         match parameter {
             PhysicalParameter::ResultAddress => {
-                signature
-                    .params
-                    .push(AbiParam::special(pointer, ArgumentPurpose::StructReturn));
                 let target =
                     target.ok_or_else(|| malformed_mir("an indirect result has a target"))?;
                 let slot = local_slot(resources.local_slots, target)?;
                 values.push(builder.ins().stack_addr(pointer, slot, 0));
             }
-            PhysicalParameter::Scalar { argument, scalar } => {
-                let parameter = AbiParam::new(clif(*scalar));
-                signature.params.push(match c_abi::extension(*scalar) {
-                    Some(Extension::Sign) => parameter.sext(),
-                    Some(Extension::Zero) => parameter.uext(),
-                    None => parameter,
-                });
+            PhysicalParameter::Scalar { argument, .. } => {
                 let local = foreign_argument_local(args, *argument)?;
                 let ty = local_definition(resources.program, resources.function_id, local)?.ty;
                 let slot = local_slot(resources.local_slots, local)?;
@@ -21243,7 +21258,6 @@ fn lower_foreign_call(
                 offset,
                 ty,
             } => {
-                signature.params.push(AbiParam::new(part_clif(*ty)));
                 let image =
                     foreign_argument_image(builder, args, *argument, &mut images, resources)?;
                 values.push(builder.ins().load(
@@ -21253,21 +21267,11 @@ fn lower_foreign_call(
                     *offset as i32,
                 ));
             }
-            PhysicalParameter::Padding(class) => {
-                let (ty, value) = match class {
-                    PartClass::Integer => (types::I64, builder.ins().iconst(types::I64, 0)),
-                    PartClass::Float => (types::F64, builder.ins().f64const(Ieee64::with_bits(0))),
-                };
-                signature.params.push(AbiParam::new(ty));
-                values.push(value);
-            }
-            PhysicalParameter::StackImage { argument, size } => {
-                let size = u32::try_from(*size)
-                    .map_err(|_| malformed_mir("a stack argument image exceeds u32"))?;
-                signature.params.push(AbiParam::special(
-                    pointer,
-                    ArgumentPurpose::StructArgument(size),
-                ));
+            PhysicalParameter::Padding(class) => values.push(match class {
+                PartClass::Integer => builder.ins().iconst(types::I64, 0),
+                PartClass::Float => builder.ins().f64const(Ieee64::with_bits(0)),
+            }),
+            PhysicalParameter::StackImage { argument, .. } => {
                 values.push(foreign_argument_image(
                     builder,
                     args,
@@ -21277,7 +21281,6 @@ fn lower_foreign_call(
                 )?);
             }
             PhysicalParameter::CopyAddress { argument } => {
-                signature.params.push(AbiParam::new(pointer));
                 let (aggregate, source) =
                     foreign_aggregate_argument(builder, args, *argument, resources)?;
                 let copy = create_call_storage(
@@ -21297,14 +21300,16 @@ fn lower_foreign_call(
             }
         }
     }
-    match &physical.return_value {
-        // The callee's bits above a narrow result are not relied on.
-        PhysicalReturn::Scalar(scalar) => signature.returns.push(AbiParam::new(clif(*scalar))),
-        PhysicalReturn::Parts(parts) => signature
-            .returns
-            .extend(parts.iter().map(|(_, ty)| AbiParam::new(part_clif(*ty)))),
-        PhysicalReturn::Void | PhysicalReturn::Indirect => {}
-    }
+    // The Call Path record of this call (Decision 0148 section 13): the
+    // calling frame for its length, and the enclosing call's afterwards.
+    let record = c_entry::foreign_call_record(builder, resources.module)?;
+    let enclosing = builder
+        .ins()
+        .load(pointer, MemFlagsData::trusted(), record, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), resources.current_frame, record, 0);
+    let outbound = OutboundRecord { record, enclosing };
     let symbol = match &foreign.callee {
         mir::ForeignCallee::Symbol { symbol, .. } => symbol,
         // A C function pointer value (Decision 0148 section 12) is called
@@ -21319,6 +21324,7 @@ fn lower_foreign_call(
                 call,
                 &physical,
                 foreign.system_code,
+                outbound,
                 target,
                 target_type,
                 resources,
@@ -21362,21 +21368,33 @@ fn lower_foreign_call(
         call,
         &physical,
         foreign.system_code,
+        outbound,
         target,
         target_type,
         resources,
     )
 }
 
+/// The runtime's record of the outbound foreign call in progress, and the
+/// value it held before this call began.
+#[derive(Clone, Copy)]
+struct OutboundRecord {
+    record: Value,
+    enclosing: Value,
+}
+
 /// Captures the system code the foreign call `call` left, when its
 /// declaration asks for it (Decision 0148 section 16), before any other
-/// code runs; then stores the call's result into `target` as its
-/// classified return value arrives.
+/// code runs; restores the enclosing call's Call Path record (section 13);
+/// then stores the call's result into `target` as its classified return
+/// value arrives.
+#[allow(clippy::too_many_arguments)]
 fn finish_foreign_call(
     builder: &mut FunctionBuilder,
     call: cranelift_codegen::ir::Inst,
     physical: &crate::native_abi::c_abi::PhysicalSignature,
     system_code: Option<crate::foreign::SystemCodeSource>,
+    outbound: OutboundRecord,
     target: Option<mir::LocalId>,
     target_type: Option<mir::Type>,
     resources: &mut LoweringResources<'_, '_>,
@@ -21395,6 +21413,12 @@ fn finish_foreign_call(
             resources,
         )?;
     }
+    builder.ins().store(
+        MemFlagsData::trusted(),
+        outbound.enclosing,
+        outbound.record,
+        0,
+    );
     use crate::c_layout::CScalar;
     use crate::native_abi::c_abi::{self, PhysicalReturn};
     let pointer = resources.module.target_config().pointer_type();

@@ -213,6 +213,14 @@ pub const ARRAY_REGION_COPY: &str = "dr_v1_array_region_copy";
 /// and reads the stored code.
 pub const CAPTURE_SYSTEM_CODE: &str = "dr_v1_capture_system_code";
 pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
+/// Decision 0148 section 13: the runtime's record of the Doria frame of the
+/// outbound foreign call in progress, which generated code stores before
+/// and after every foreign call; the entry of a C-ABI function, which checks
+/// the thread and links the function's frame to that record; and the
+/// recording of the thread running Doria code at process entry.
+pub const FOREIGN_CALL_FRAME: &str = "dr_v1_foreign_call_frame";
+pub const ENTER_C_FUNCTION: &str = "dr_v1_enter_c_function";
+pub const RECORD_DORIA_THREAD: &str = "dr_v1_record_doria_thread";
 
 /// The runtime's number for a system code source, which
 /// `CAPTURE_SYSTEM_CODE` takes.

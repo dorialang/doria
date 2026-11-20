@@ -8716,6 +8716,7 @@ fn valid_void_program() -> Program {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),

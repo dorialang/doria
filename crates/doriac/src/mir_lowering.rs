@@ -2583,6 +2583,38 @@ fn lower_program_impl(
         foreign_aggregates,
         ..
     } = collection_registry;
+    // Each C-ABI Doria function has a C entry (Decision 0148 sections 12
+    // and 13), in function order.
+    let mut c_entries = Vec::new();
+    let mut unbuilt_entries = Vec::new();
+    for name in &program.semantic_info.c_abi_functions {
+        let Some(signature) = signatures.get(&FunctionInstanceKey {
+            name: name.clone(),
+            arguments: Vec::new(),
+        }) else {
+            continue;
+        };
+        // Checking rejects a declared effect a C-ABI function does not
+        // handle; an automatic I/O effect still reaches its C entry, which
+        // has no way to carry it to C.
+        if !signature.checked_effects.is_empty() {
+            let short = name.rsplit('\\').next().unwrap_or(name);
+            unbuilt_entries.push(crate::unsafe_code::unbuilt_form(
+                signature.source_declaration.unwrap_or_default(),
+                "C-ABI Functions That Can Raise I/O Errors Cannot Be Built Yet",
+                format!(
+                    "`extern \"C\" function {short}` can let an I/O error reach the C code that calls it, which is part of Doria; this compiler does not build such a function yet"
+                ),
+            ));
+            continue;
+        }
+        c_entries.push(signature.id);
+    }
+    if !unbuilt_entries.is_empty() {
+        unbuilt_entries.sort_by_key(|diagnostic| (diagnostic.span.source.0, diagnostic.span.start));
+        return Err(unbuilt_entries);
+    }
+    c_entries.sort_by_key(|id| id.0);
     let mut program = mir::Program {
         interface_types,
         interface_vtables,
@@ -2632,6 +2664,7 @@ fn lower_program_impl(
         closure_descriptors,
         closure_environment_layouts,
         foreign_aggregates,
+        c_entries,
         functions,
         selected_entry,
         entry,

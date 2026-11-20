@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 mod byte_io;
 mod byte_region;
 mod bytes;
+mod c_entry;
 mod cancellation;
 mod cancellation_signal;
 mod checked_io;

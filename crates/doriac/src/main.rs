@@ -1619,6 +1619,17 @@ fn decode_runtime_outcome_with_sources(
         }
         let frame_function = decoder.text(frame_function_length)?;
         let frame_path = decoder.text(frame_path_length)?;
+        // A frame with no source stands for foreign code between an
+        // outbound foreign call and the C entry it led to (Decision 0148
+        // section 13).
+        if frame_path.is_empty() {
+            frames.push(RuntimeOutcomeFrame {
+                function: frame_function,
+                source: DiagnosticSource::Unavailable,
+                span,
+            });
+            continue;
+        }
         let span = runtime_source_span(sources, &frame_path, span)?;
         frames.push(RuntimeOutcomeFrame {
             function: frame_function,
@@ -3082,6 +3093,34 @@ function relay(int $depth): void {
                 DiagnosticSource::Unavailable,
             );
         }
+    }
+
+    #[test]
+    fn runtime_transport_decodes_a_foreign_call_frame_without_a_source() {
+        // Decision 0148 section 13: the frame between an outbound foreign
+        // call and the C entry it led to has no source.
+        let mut payload = runtime_record("P1706", &[]);
+        payload[26..28].copy_from_slice(&3_u16.to_le_bytes());
+        for (function, path) in [
+            ("main", "main.doria"),
+            ("[foreign call]", ""),
+            ("main", "main.doria"),
+        ] {
+            payload.extend_from_slice(&(function.len() as u16).to_le_bytes());
+            payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&0_u64.to_le_bytes());
+            payload.extend_from_slice(&0_u64.to_le_bytes());
+            payload.extend_from_slice(function.as_bytes());
+            payload.extend_from_slice(path.as_bytes());
+        }
+        let sources = runtime_transport_source_map(SourceId(1));
+        let diagnostic =
+            decode_runtime_outcome_with_sources(&payload, "main.doria", Some(&sources)).unwrap();
+        let frames = &diagnostic.runtime_outcome.as_ref().unwrap().path;
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[1].function, "[foreign call]");
+        assert_eq!(frames[1].source, DiagnosticSource::Unavailable);
+        assert_ne!(frames[0].source, DiagnosticSource::Unavailable);
     }
 
     #[test]

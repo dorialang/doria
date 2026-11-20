@@ -1452,3 +1452,217 @@ fn php_output_reports_that_it_does_not_build_foreign_strings_yet() {
         "{diagnostics:#?}"
     );
 }
+
+const SORTING: &str = "use Doria\\Std\\Ffi\\{CSize, MutPtr, Opaque, Ptr};
+
+extern \"C\" function compareIntegers(Ptr<Opaque> $left, Ptr<Opaque> $right): int32
+{
+    unsafe {
+        Ptr<int32> $first = Ptr::cast($left);
+        Ptr<int32> $second = Ptr::cast($right);
+        let $a = $first->read();
+        let $b = $second->read();
+        if ($a < $b) {
+            return -1;
+        }
+        if ($a > $b) {
+            return 1;
+        }
+        return 0;
+    }
+}
+
+extern \"C\"
+{
+    /** @safety `$base` holds `$count` elements of `$size` bytes each. */
+    function qsort(MutPtr<Opaque> $base, CSize $count, CSize $size,
+        extern \"C\" function(Ptr<Opaque>, Ptr<Opaque>): int32 $compare): void;
+}
+";
+
+#[test]
+fn c_calls_a_c_abi_function_through_its_name_as_a_value() {
+    // Decision 0148 section 12: the name of a C-ABI function is the
+    // address of its C entry, which C calls under the C convention.
+    let source = format!(
+        "{SORTING}
+function main(): void
+{{
+    writable int32[] $values = [5, -3, 9, 1, 7, 1];
+    unsafe {{
+        writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 6);
+        qsort(MutPtr::cast($region->writablePointer), CSize::from(6), CSize::from(4), compareIntegers);
+    }}
+    foreach ($values as int32 $value) {{
+        echo $value . \" \";
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "-3 1 1 5 7 9 ");
+}
+
+#[test]
+fn a_c_entry_receives_and_returns_every_c_form() {
+    // A C function pointer value holding a C entry's address calls it
+    // under the C convention, so each value crosses the boundary twice:
+    // integers of every width, `bool`, `float32`, `float64`, pointers
+    // present and absent, and a struct in and out by value.
+    let source = "use Doria\\Std\\Ffi\\{CLong, MutPtr, Opaque, Ptr};
+
+extern \"C\" struct Pair
+{
+    int64 $first;
+    float64 $second;
+}
+
+extern \"C\" struct Wide
+{
+    int64 $a;
+    int64 $b;
+    int64 $c;
+}
+
+extern \"C\" function describe(int8 $small, uint16 $medium, bool $flag, float32 $ratio,
+    ?Ptr<Opaque> $address, CLong $count): int64
+{
+    writable int64 $total = Int64::from($small) + Int64::from($medium) + Int64::from($count);
+    if ($flag) {
+        $total += 1000;
+    }
+    if ($address == null) {
+        $total += 20000;
+    }
+    if ($ratio == 0.5) {
+        $total += 300000;
+    }
+    return $total;
+}
+
+extern \"C\" function swap(Pair $pair): Pair
+{
+    return new Pair(first: $pair->first * 2, second: $pair->second + 1.5);
+}
+
+extern \"C\" function widen(Wide $value, bool $negate): Wide
+{
+    if ($negate) {
+        return new Wide(a: -$value->a, b: -$value->b, c: -$value->c);
+    }
+    return $value;
+}
+
+extern \"C\" function absent(?Ptr<Opaque> $address): ?Ptr<Opaque>
+{
+    return $address;
+}
+
+function main(): void
+{
+    unsafe {
+        extern \"C\" function(int8, uint16, bool, float32, ?Ptr<Opaque>, CLong): int64 $describe = describe;
+        float32 $ratio = 0.5;
+        echo $describe(-5, 60000, true, $ratio, null, CLong::from(7)) . \" \";
+        extern \"C\" function(Pair): Pair $swap = swap;
+        let $swapped = $swap(new Pair(first: 3, second: 8.0));
+        echo $swapped->first . \" \" . $swapped->second . \" \";
+        extern \"C\" function(Wide, bool): Wide $widen = widen;
+        let $wide = $widen(new Wide(a: 1, b: 2, c: 3), true);
+        echo $wide->a;
+        echo $wide->b;
+        echo $wide->c;
+        echo \" \";
+        extern \"C\" function(?Ptr<Opaque>): ?Ptr<Opaque> $absent = absent;
+        echo $absent(null) == null;
+    }
+}
+";
+    assert_runs_natively(source, "381002 6 9.5 -1-2-3 true");
+}
+
+#[test]
+fn a_panic_in_a_callback_shows_the_foreign_call_in_its_call_path() {
+    // Decision 0148 section 13: the C entry links the callback's frame to
+    // the Doria frame of the outbound call, through a `[foreign call]`
+    // frame.
+    let source = format!(
+        "{SORTING}
+extern \"C\" function refuse(Ptr<Opaque> $left, Ptr<Opaque> $right): int32
+{{
+    panic(\"no comparisons\");
+}}
+
+function sort(writable int32[] $values): void
+{{
+    unsafe {{
+        writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 2);
+        qsort(MutPtr::cast($region->writablePointer), CSize::from(2), CSize::from(4), refuse);
+    }}
+}}
+
+function main(): void
+{{
+    writable int32[] $values = [2, 1];
+    sort($values);
+}}
+"
+    );
+    let mir = program(&source);
+    for profile in NativeProfile::AVAILABLE {
+        let run = execute_native(&mir, *profile);
+        assert_eq!(run.status.code(), Some(101), "{profile:?}: {run:?}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let path = stderr
+            .split("Call Path")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{profile:?}: {stderr}"));
+        let frames = path
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split(" \u{b7} ").next().unwrap_or(line))
+            .take_while(|line| !line.starts_with("Process Exited"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frames,
+            ["refuse", "[foreign call]", "sort", "main"],
+            "{profile:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_callback_on_another_thread_panics_with_p1706() {
+    // Decision 0148 section 13: C may call a C-ABI function only on the
+    // thread running Doria code.
+    let source = "use Doria\\Std\\Ffi\\{MutPtr, Opaque, Ptr};
+
+extern \"C\" function work(?MutPtr<Opaque> $context): ?MutPtr<Opaque>
+{
+    return $context;
+}
+
+extern \"C\"
+{
+    /** @safety `$thread` is writable for one `pthread_t`. */
+    function pthread_create(MutPtr<uint64> $thread, ?Ptr<Opaque> $attributes,
+        extern \"C\" function(?MutPtr<Opaque>): ?MutPtr<Opaque> $start,
+        ?MutPtr<Opaque> $context): int32;
+
+    /** @safety `$thread` came from `pthread_create` and was not joined. */
+    function pthread_join(uint64 $thread, ?MutPtr<Opaque> $result): int32;
+}
+
+function main(): void
+{
+    writable uint64 $thread = 0;
+    unsafe {
+        if (pthread_create(MutPtr::to($thread), null, work, null) == 0) {
+            pthread_join($thread, null);
+        }
+    }
+    echo \"joined\";
+}
+";
+    assert_panics_natively(source, "P1706", "C Called Doria From Another Thread");
+}

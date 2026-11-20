@@ -1240,3 +1240,60 @@ function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Ptr<CChar> 
     );
     assert!(findings(&pinned).is_empty(), "{:#?}", findings(&pinned));
 }
+
+#[test]
+fn a_c_abi_function_name_is_a_c_function_pointer_value() {
+    // Decision 0148 section 12: the name has the structural C function
+    // pointer type of the function's signature.
+    let callback = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
+extern \"C\" function visit(Ptr<Opaque> $item, int32 $depth): bool
+{
+    return $depth > 0;
+}
+";
+    let matching = format!(
+        "{callback}function main(): void {{ extern \"C\" function(Ptr<Opaque>, int32): bool $visitor = visit; ?extern \"C\" function(Ptr<Opaque>, int32): bool $maybe = visit; }}"
+    );
+    assert!(codes(&matching).is_empty(), "{:#?}", findings(&matching));
+    let mismatched = format!(
+        "{callback}function main(): void {{ extern \"C\" function(Ptr<Opaque>): bool $visitor = visit; }}"
+    );
+    assert!(!codes(&mismatched).is_empty(), "the signatures differ");
+    // The native targets build the C entry; the interpreter takes its
+    // address through the native companion library.
+    let diagnostics =
+        doriac::compile_source("ffi.doria", matching, doriac::backend::BackendTarget::Debug)
+            .expect_err("the interpreter forms C entry addresses through the companion");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_c_abi_function_that_can_raise_an_io_error_reports_that_it_cannot_be_built_yet() {
+    // An automatic I/O effect (Decision 0123) has no way to reach C
+    // through a C entry (Decision 0148 section 12).
+    let source = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
+extern \"C\" function report(Ptr<Opaque> $item): int32
+{
+    echo \"called\";
+    return 0;
+}
+function main(): void {}
+";
+    assert!(codes(source).is_empty(), "{:#?}", findings(source));
+    let diagnostics = doriac::lower_source_to_mir("ffi.doria", source.to_string())
+        .expect_err("the C entry cannot carry an I/O error to C");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title
+                    == "C-ABI Functions That Can Raise I/O Errors Cannot Be Built Yet"),
+        "{diagnostics:#?}"
+    );
+}

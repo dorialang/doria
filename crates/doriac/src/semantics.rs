@@ -334,6 +334,12 @@ pub struct SemanticInfo {
     /// The binding of each extern declaration, keyed by its declaration span
     /// (Decision 0148 sections 14 to 18).
     pub foreign_bindings: HashMap<Span, crate::foreign::ForeignBinding>,
+    /// The canonical names of the C-ABI Doria functions (Decision 0148
+    /// section 12).
+    pub c_abi_functions: HashSet<String>,
+    /// Each name of a C-ABI function used as a value, the address of its C
+    /// entry, by span, with the function's canonical name (section 12).
+    pub c_abi_function_values: HashMap<Span, String>,
     /// Every foreign struct and union by canonical name (Decision 0148
     /// section 6).
     pub foreign_aggregates: HashMap<String, crate::foreign::ForeignAggregateFacts>,
@@ -1591,6 +1597,8 @@ fn finish_checked_analysis(
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
+            c_abi_functions: std::mem::take(&mut checker.foreign.c_abi_functions),
+            c_abi_function_values: std::mem::take(&mut checker.foreign.c_abi_function_values),
             foreign_aggregates,
             retained_callables,
             specialized_ownership,
@@ -7048,6 +7056,9 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
+            if function.linkage.is_c_abi() {
+                self.foreign.c_abi_functions.insert(function.name.clone());
+            }
             self.functions.insert(function.name.clone(), signature);
         }
     }
@@ -13781,7 +13792,13 @@ impl<'program> Checker<'program> {
             Expr::When(_) => self.check_when_expression(expr, scopes, method_context),
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
-                if !self
+                // A C-ABI function's name is the address of its C entry
+                // (Decision 0148 section 12).
+                if self.foreign.c_abi_functions.contains(name) {
+                    self.foreign
+                        .c_abi_function_values
+                        .insert(*span, name.clone());
+                } else if !self
                     .const_evaluation
                     .values
                     .contains_key(&crate::const_eval::ConstKey::TopLevel(name.clone()))
@@ -23852,6 +23869,9 @@ impl<'program> Checker<'program> {
                 };
                 self.flow_narrowed_type(binding.declared_ty, binding.ty, *span, method_context)
             }
+            Expr::Identifier { name, .. } if self.foreign.c_abi_functions.contains(name) => self
+                .c_abi_function_value_type(name)
+                .unwrap_or_else(|| self.types.unknown()),
             Expr::Identifier { name, .. } => {
                 let key = crate::const_eval::ConstKey::TopLevel(name.clone());
                 let ty = self

@@ -192,6 +192,7 @@ unsafe extern "system" {
     // Errors.
     pub(crate) fn GetLastError() -> u32;
     pub(crate) fn GetCurrentProcessId() -> u32;
+    pub(crate) fn GetCurrentThreadId() -> u32;
     pub(crate) fn SetLastError(code: u32);
 
     // Handles.

@@ -48,6 +48,11 @@ pub(super) struct ForeignState {
     unsafe_callables: HashSet<Span>,
     /// The binding of each extern declaration, by declaration span.
     pub(super) bindings: HashMap<Span, ForeignBinding>,
+    /// The canonical names of the C-ABI Doria functions (section 12).
+    pub(super) c_abi_functions: HashSet<String>,
+    /// Each name of a C-ABI function used as a value, by its span, with the
+    /// function's canonical name (section 12).
+    pub(super) c_abi_function_values: HashMap<Span, String>,
 }
 
 impl<'program> Checker<'program> {
@@ -451,6 +456,28 @@ impl<'program> Checker<'program> {
         } else {
             self.types.unknown()
         })
+    }
+
+    /// The C function pointer type (section 12) the name of the C-ABI
+    /// function `name` has as a value, or `None` when `name` names none.
+    pub(super) fn c_abi_function_value_type(&mut self, name: &str) -> Option<TypeId> {
+        if !self.foreign.c_abi_functions.contains(name) {
+            return None;
+        }
+        let function = self.functions.get(name)?;
+        let parameters = function
+            .params
+            .iter()
+            .map(|parameter| parameter.ty)
+            .collect();
+        let return_type = function.return_ty;
+        Some(
+            self.types
+                .intern(TypeKind::Foreign(ForeignType::Function(CFunctionType {
+                    parameters,
+                    return_type,
+                }))),
+        )
     }
 
     pub(super) fn check_foreign_abi(&mut self, abi: &str, span: Span) {

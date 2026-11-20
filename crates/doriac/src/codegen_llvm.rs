@@ -89,6 +89,7 @@ use crate::native_abi::{
 use crate::native_closure_abi;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
+mod c_entry;
 mod process;
 mod readiness_set;
 mod stream_callbacks;
@@ -193,6 +194,7 @@ fn build_module<'ctx>(
 
     let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
     let functions = declare_functions(context, &module, &target_data, program)?;
+    let c_entries = c_entry::declare(context, &module, program)?;
     for function in &program.functions {
         let offset = native_closure_abi::NativeCallableSignaturePlan::direct(function)
             .source_parameter_offset() as u32;
@@ -280,6 +282,14 @@ fn build_module<'ctx>(
             &optimization.functions[function.id.0],
         )?;
     }
+    c_entry::define(
+        context,
+        &module,
+        &target_data,
+        program,
+        &c_entries,
+        &declarations,
+    )?;
     define_class_drop_functions(context, &module, &target_data, program, &declarations)?;
     define_collection_drop_functions(context, &module, &target_data, program, &declarations)?;
     define_closure_drop_functions(context, &module, &target_data, program, &declarations)?;
@@ -1374,12 +1384,9 @@ fn define_function<'ctx>(
         );
         let frame = build(builder.build_alloca(frame_type, "doria.frame.v2"))?;
         let callable_name = program.diagnostic_callable_name(function);
-        let function_name = define_bytes(
-            context,
-            module,
-            callable_name.as_bytes(),
-            &format!("__doria_function_name_{}", function.id.0),
-        );
+        let frame_data = frame_data_symbols(function.id);
+        let function_name =
+            define_bytes(context, module, callable_name.as_bytes(), &frame_data.name);
         let doria_source = program
             .source_for_span(function.source_span)
             .unwrap_or(&program.source);
@@ -1387,13 +1394,13 @@ fn define_function<'ctx>(
             context,
             module,
             doria_source.path.as_bytes(),
-            &format!("__doria_source_path_{}", function.id.0),
+            &frame_data.path,
         );
         let source_text = define_bytes(
             context,
             module,
             doria_source.text.as_bytes(),
-            &format!("__doria_source_text_{}", function.id.0),
+            &frame_data.text,
         );
         let frame_values: [BasicValueEnum<'ctx>; 11] = [
             parent.into(),
@@ -1853,6 +1860,16 @@ fn define_process_main<'ctx>(
     let builder = context.create_builder();
     let block = context.append_basic_block(main, "entry");
     builder.position_at_end(block);
+    // C may call back only on the thread running Doria code (Decision 0148
+    // section 13).
+    if !program.c_entries.is_empty() {
+        let record = module.add_function(
+            crate::native_abi::RECORD_DORIA_THREAD,
+            context.void_type().fn_type(&[], false),
+            Some(Linkage::External),
+        );
+        build(builder.build_call(record, &[], ""))?;
+    }
     initialize_payload_statics(
         context,
         module,
@@ -22680,6 +22697,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into(),
                 )
             }
+            mir::PointerOperation::CEntryAddress { function } => {
+                let entry = self
+                    .module
+                    .get_function(&c_entry::symbol(*function))
+                    .ok_or_else(|| malformed_mir("a C entry address names a declared C entry"))?;
+                Some(
+                    build(self.builder.build_ptr_to_int(
+                        entry.as_global_value().as_pointer_value(),
+                        word,
+                        "c.entry.address",
+                    ))?
+                    .into(),
+                )
+            }
             mir::PointerOperation::ReadForeignString { pointer, encoding } => {
                 let pointer_type = self.context.ptr_type(AddressSpace::default());
                 let address = self.pointer_local(*pointer)?;
@@ -22746,7 +22777,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         use crate::c_layout::CScalar;
         use crate::native_abi::c_abi::{
-            self, Extension, PartClass, PartType, PhysicalParameter, PhysicalReturn,
+            self, PartClass, PartType, PhysicalParameter, PhysicalReturn,
         };
         let platform = crate::c_layout::CTarget::host();
         let (parameters, return_type) = foreign
@@ -22758,40 +22789,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             return_type.as_ref(),
             foreign.fixed_parameters,
         );
-        let pointer = self.context.ptr_type(AddressSpace::default());
         let word = self.context.i64_type();
-        let c_type = |scalar: CScalar| -> BasicTypeEnum<'ctx> {
-            match scalar {
-                CScalar::Integer { bytes: 1, .. } | CScalar::Bool => self.context.i8_type().into(),
-                CScalar::Integer { bytes: 2, .. } => self.context.i16_type().into(),
-                CScalar::Integer { bytes: 4, .. } => self.context.i32_type().into(),
-                CScalar::Integer { .. } => word.into(),
-                CScalar::Float { bytes: 4 } => self.context.f32_type().into(),
-                CScalar::Float { .. } => self.context.f64_type().into(),
-                CScalar::Pointer => pointer.into(),
-            }
-        };
         let physical = c_abi::physical_signature(platform, &parameters, &classification);
-        let part_type = |ty: PartType| -> BasicTypeEnum<'ctx> {
-            match ty {
-                PartType::Integer64 => word.into(),
-                PartType::Float32 => self.context.f32_type().into(),
-                PartType::Float64 => self.context.f64_type().into(),
-            }
-        };
+        let part_type = |ty: PartType| c_entry::part_type(self.context, ty);
         let image_type = |size: u64| self.context.i8_type().array_type(size as u32);
-        let attribute = |name: &str, value: u64| {
-            self.context.create_enum_attribute(
-                inkwell::attributes::Attribute::get_named_enum_kind_id(name),
-                value,
-            )
-        };
-        let type_attribute = |name: &str, size: u64| {
-            self.context.create_type_attribute(
-                inkwell::attributes::Attribute::get_named_enum_kind_id(name),
-                image_type(size).as_any_type_enum(),
-            )
-        };
         let target_type = match target {
             Some(target) => Some(local_in(self.function, target)?.ty),
             None => None,
@@ -22800,60 +22801,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             Some(mir::Type::ForeignAggregate(aggregate)) => u64::from(aggregate.size),
             _ => 0,
         };
-        let mut parameter_types = Vec::with_capacity(physical.parameters.len());
-        let mut attributes = Vec::new();
-        for (index, parameter) in physical.parameters.iter().enumerate() {
-            let index = index as u32;
-            parameter_types.push(match parameter {
-                PhysicalParameter::ResultAddress => {
-                    attributes.push((index, type_attribute("sret", result_size)));
-                    pointer.into()
-                }
-                PhysicalParameter::Scalar { scalar, .. } => {
-                    if let Some(extension) = c_abi::extension(*scalar) {
-                        let name = match extension {
-                            Extension::Sign => "signext",
-                            Extension::Zero => "zeroext",
-                        };
-                        attributes.push((index, attribute(name, 0)));
-                    }
-                    c_type(*scalar)
-                }
-                PhysicalParameter::Part { ty, .. } => part_type(*ty),
-                PhysicalParameter::Padding(PartClass::Integer) => word.into(),
-                PhysicalParameter::Padding(PartClass::Float) => self.context.f64_type().into(),
-                PhysicalParameter::StackImage { size, .. } => {
-                    attributes.push((index, type_attribute("byval", *size)));
-                    attributes.push((index, attribute("align", 8)));
-                    pointer.into()
-                }
-                PhysicalParameter::CopyAddress { .. } => pointer.into(),
-            });
-        }
-        let parameter_types = parameter_types
-            .into_iter()
-            .map(BasicMetadataTypeEnum::from)
-            .collect::<Vec<_>>();
-        // The callee's bits above a narrow result are not relied on.
-        let function_type = match &physical.return_value {
-            PhysicalReturn::Scalar(scalar) => c_type(*scalar).fn_type(&parameter_types, false),
-            PhysicalReturn::Parts(parts) if parts.len() == 1 => {
-                part_type(parts[0].1).fn_type(&parameter_types, false)
-            }
-            PhysicalReturn::Parts(parts) => self
-                .context
-                .struct_type(
-                    &parts
-                        .iter()
-                        .map(|(_, ty)| part_type(*ty))
-                        .collect::<Vec<_>>(),
-                    false,
-                )
-                .fn_type(&parameter_types, false),
-            PhysicalReturn::Void | PhysicalReturn::Indirect => {
-                self.context.void_type().fn_type(&parameter_types, false)
-            }
-        };
+        let (function_type, attributes) =
+            c_entry::c_function_type(self.context, &physical, result_size);
         // A declaration's symbol, or a C function pointer value (Decision
         // 0148 section 12) called through its address.
         let declared = match &foreign.callee {
@@ -22940,6 +22889,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 return Err(malformed_mir("a foreign symbol call has its declaration"))
             }
         };
+        // The Call Path record of this call (Decision 0148 section 13): the
+        // calling frame for its length, and the enclosing call's afterwards.
+        let record = c_entry::foreign_call_record(self.context, self.module);
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let enclosing = build(
+            self.builder
+                .build_load(pointer, record, "foreign.call.enclosing"),
+        )?;
+        build(self.builder.build_store(record, self.current_frame))?;
         let call = match (declared, address) {
             (Some(declared), None) => {
                 build(self.builder.build_call(declared, &values, "foreign.call"))?
@@ -22972,6 +22930,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into()],
             )?;
         }
+        build(self.builder.build_store(record, enclosing))?;
         let Some(target) = target else {
             return Ok(());
         };
@@ -26911,6 +26870,22 @@ fn float_constant<'ctx>(context: &'ctx Context, value: FloatValue) -> LlvmFloatV
             .f32_type()
             .const_float(f64::from(f32::from_bits(value.bits as u32))),
         FloatType::Float64 => context.f64_type().const_float(f64::from_bits(value.bits)),
+    }
+}
+
+/// The globals of the function name, source path and source text that the
+/// diagnostic frame of `function` refers to.
+struct FrameDataSymbols {
+    name: String,
+    path: String,
+    text: String,
+}
+
+fn frame_data_symbols(function: mir::FunctionId) -> FrameDataSymbols {
+    FrameDataSymbols {
+        name: format!("__doria_function_name_{}", function.0),
+        path: format!("__doria_source_path_{}", function.0),
+        text: format!("__doria_source_text_{}", function.0),
     }
 }
 
