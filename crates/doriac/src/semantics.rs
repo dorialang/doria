@@ -22063,11 +22063,11 @@ impl<'program> Checker<'program> {
     }
 
     fn const_type_id(&mut self, ty: crate::const_eval::ConstType) -> TypeId {
-        if let crate::const_eval::ConstType::NullableInlineNominal(ty) = &ty {
+        if let crate::const_eval::ConstType::NullOnly(ty) = &ty {
             return self.resolve_type_ref(ty, Span::default());
         }
         let kind = match ty {
-            crate::const_eval::ConstType::NullableInlineNominal(_) => unreachable!(),
+            crate::const_eval::ConstType::NullOnly(_) => unreachable!(),
             crate::const_eval::ConstType::Inline(ty) => {
                 TypeKind::Class(ClassType::new(ty.name().to_string(), Vec::new()))
             }

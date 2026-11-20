@@ -1404,7 +1404,11 @@ pub enum ConstType {
     NullableEnum(EnumType),
     Inline(crate::inline_value::InlineValueType),
     NullableInline(crate::inline_value::InlineValueType),
-    NullableInlineNominal(Box<TypeRef>),
+    /// A nullable type with no constant values of its own, so `null` is its
+    /// only constant: the nullable runtime handles and keys, the nullable
+    /// pointers `?Ptr<T>` and `?MutPtr<T>`, and the nullable C function
+    /// pointer types (Decision 0148 sections 3 and 12).
+    NullOnly(Box<TypeRef>),
 }
 
 impl ConstType {
@@ -1455,7 +1459,7 @@ impl ConstType {
     fn accepts(&self, actual: &Self) -> bool {
         self == actual
             || match (self, actual) {
-                (Self::NullableInlineNominal(expected), Self::NullableInlineNominal(actual)) => {
+                (Self::NullOnly(expected), Self::NullOnly(actual)) => {
                     let substitutions = HashMap::new();
                     crate::types::resolved_type_ref_with_substitutions(expected, &substitutions)
                         .is_some_and(|expected| {
@@ -1473,7 +1477,7 @@ impl ConstType {
                 (Self::NullableEnum(expected), Self::Enum(actual)) => expected == actual,
                 (Self::NullableEnum(_), Self::Null) => true,
                 (Self::NullableInline(_), Self::Null) => true,
-                (Self::NullableInlineNominal(_), Self::Null) => true,
+                (Self::NullOnly(_), Self::Null) => true,
                 (Self::NullableInline(expected), Self::Inline(actual)) => expected == actual,
                 (Self::NullableInteger(expected), Self::Integer(actual)) => expected == actual,
                 (Self::NullableFloat(expected), Self::Float(actual)) => expected == actual,
@@ -1490,7 +1494,7 @@ impl ConstType {
                 | Self::NullableString
                 | Self::NullableEnum(_)
                 | Self::NullableInline(_)
-                | Self::NullableInlineNominal(_)
+                | Self::NullOnly(_)
         )
     }
 
@@ -1543,30 +1547,43 @@ impl fmt::Display for ConstType {
             }
             Self::Inline(ty) => formatter.write_str(ty.name()),
             Self::NullableInline(ty) => write!(formatter, "?{}", ty.name()),
-            Self::NullableInlineNominal(ty) => write!(formatter, "{ty}"),
+            Self::NullOnly(ty) => write!(formatter, "{ty}"),
         }
     }
 }
 
+/// Whether `null` is the only constant of the nullable type `ty`.
+fn has_only_null_constant(ty: &TypeRef) -> bool {
+    let pointer = ty.function.is_none()
+        && ty.arguments.len() == 1
+        && [crate::foreign::PTR, crate::foreign::MUT_PTR].contains(&ty.name.as_str());
+    let c_function = ty
+        .function
+        .as_ref()
+        .is_some_and(|function| function.c_abi.is_some());
+    ty.nullable
+        && (pointer
+            || c_function
+            || matches!(
+                crate::inline_value::InlineValueKind::for_nominal(&ty.name, ty.arguments.len()),
+                Some(
+                    crate::inline_value::InlineValueKind::RegistrationKey
+                        | crate::inline_value::InlineValueKind::ReadTransferKey
+                        | crate::inline_value::InlineValueKind::WriteTransferKey
+                        | crate::inline_value::InlineValueKind::WatchKey
+                        | crate::inline_value::InlineValueKind::WatchSource
+                        | crate::inline_value::InlineValueKind::CancellationToken
+                        | crate::inline_value::InlineValueKind::StandardInput
+                        | crate::inline_value::InlineValueKind::StandardOutput
+                        | crate::inline_value::InlineValueKind::StandardError
+                        | crate::inline_value::InlineValueKind::Terminal(_)
+                )
+            ))
+}
+
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
-    if ty.nullable
-        && matches!(
-            crate::inline_value::InlineValueKind::for_nominal(&ty.name, ty.arguments.len()),
-            Some(
-                crate::inline_value::InlineValueKind::RegistrationKey
-                    | crate::inline_value::InlineValueKind::ReadTransferKey
-                    | crate::inline_value::InlineValueKind::WriteTransferKey
-                    | crate::inline_value::InlineValueKind::WatchKey
-                    | crate::inline_value::InlineValueKind::WatchSource
-                    | crate::inline_value::InlineValueKind::CancellationToken
-                    | crate::inline_value::InlineValueKind::StandardInput
-                    | crate::inline_value::InlineValueKind::StandardOutput
-                    | crate::inline_value::InlineValueKind::StandardError
-                    | crate::inline_value::InlineValueKind::Terminal(_)
-            )
-        )
-    {
-        return Some(ConstType::NullableInlineNominal(Box::new(ty.clone())));
+    if has_only_null_constant(ty) {
+        return Some(ConstType::NullOnly(Box::new(ty.clone())));
     }
     if ty.arguments.is_empty() {
         if let Some(value) = crate::inline_value::InlineValueType::for_name(&ty.name) {

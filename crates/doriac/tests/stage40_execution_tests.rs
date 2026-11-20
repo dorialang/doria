@@ -922,6 +922,48 @@ function main(): void
 }
 
 #[test]
+fn null_is_the_constant_default_of_nullable_pointers() {
+    // Decision 0148 sections 6 and 15: foreign fields and extern parameters
+    // take constant defaults, and `null` is the one constant of a nullable
+    // pointer or C function pointer, as it is for an ordinary parameter.
+    let source = format!(
+        "{POINTER}use Doria\\Std\\Ffi\\{{CChar, CLong, CString}};
+
+extern \"C\" struct Link
+{{
+    int32 $value;
+    ?Ptr<Link> $next = null;
+    ?extern \"C\" function(int32): int32 $visit = null;
+}}
+
+extern \"C\"
+{{
+    /** @safety `$text` points to a NUL-terminated string. */
+    function strtol(Ptr<CChar> $text, ?MutPtr<Ptr<CChar>> $end = null, int32 $base = 10): CLong;
+}}
+
+function absent(?Ptr<int64> $pointer = null): bool
+{{
+    return $pointer == null;
+}}
+
+function main(): void
+{{
+    let $link = new Link(value: 3);
+    echo ($link->next == null) . \" \" . ($link->visit == null) . \" \" . absent() . \" \";
+    let $decimal = CString::from(\"42\");
+    let $hexadecimal = CString::from(\"ff\");
+    unsafe {{
+        echo Int64::from(strtol($decimal->pointer)) . \" \";
+        echo Int64::from(strtol($hexadecimal->pointer, base: 16));
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "true true true 42 255");
+}
+
+#[test]
 fn a_region_pointer_gives_c_the_storage_itself() {
     let source = format!(
         "{POINTER}use Doria\\Std\\Ffi\\CSize;
