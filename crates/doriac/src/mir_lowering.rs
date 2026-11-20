@@ -8057,39 +8057,70 @@ fn lower_foreach_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    if context
+    use crate::semantics::ForeachIterableFamily as Family;
+    // Checking classifies the iterable once (Decision 0132); lowering reads
+    // that plan and never derives the family again.
+    let family = context
         .semantic_info
         .foreach_loops
         .get(&foreach.span)
-        .is_some_and(|plan| {
-            plan.iterable_family == crate::semantics::ForeachIterableFamily::PublicIterable
-        })
-    {
-        return iteration::lower_foreach(foreach, return_type, context);
-    }
-    if let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) {
-        if foreach.first_binding.is_some() {
+        .map(|plan| plan.iterable_family)
+        .ok_or_else(|| vec![unsupported(foreach.span, "a checked foreach has a plan")])?;
+    match family {
+        Family::PublicIterable => return iteration::lower_foreach(foreach, return_type, context),
+        Family::Region => {
+            context.push_scope();
+            let result = lower_region_foreach_in_scope(foreach, return_type, context);
+            context.pop_scope();
+            return result;
+        }
+        Family::Bytes | Family::PriorityQueue | Family::Other => {
             return Err(vec![unsupported(
                 foreach.span,
-                "checked value-only range foreach retained an impossible first binding",
+                format!("checking rejects a foreach over {}", family.display_name()),
             )]);
         }
-        if let Some(ty) = &foreach.value_binding.ty {
-            if !matches!(
-                context.native_type_ref(ty),
-                Some(mir::Type::Scalar(mir::ScalarType::Integer(_)))
-            ) {
+        Family::IntegerRange => {
+            let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) else {
                 return Err(vec![unsupported(
                     foreach.span,
-                    format!("integer range foreach bindings require an integer type; got `{ty}`"),
+                    "a checked range foreach has a range iterable",
+                )]);
+            };
+            if foreach.first_binding.is_some() {
+                return Err(vec![unsupported(
+                    foreach.span,
+                    "checked value-only range foreach retained an impossible first binding",
                 )]);
             }
+            if let Some(ty) = &foreach.value_binding.ty {
+                if !matches!(
+                    context.native_type_ref(ty),
+                    Some(mir::Type::Scalar(mir::ScalarType::Integer(_)))
+                ) {
+                    return Err(vec![unsupported(
+                        foreach.span,
+                        format!(
+                            "integer range foreach bindings require an integer type; got `{ty}`"
+                        ),
+                    )]);
+                }
+            }
+            context.push_scope();
+            let result =
+                lower_range_foreach_in_scope(foreach, start, end, inclusive, return_type, context);
+            context.pop_scope();
+            return result;
         }
-        context.push_scope();
-        let result =
-            lower_range_foreach_in_scope(foreach, start, end, inclusive, return_type, context);
-        context.pop_scope();
-        return result;
+        Family::List
+        | Family::TypedArray
+        | Family::Dictionary
+        | Family::SortedDictionary
+        | Family::Set
+        | Family::SortedSet
+        | Family::Deque
+        | Family::DictionaryKeysProjection
+        | Family::DictionaryValuesProjection => {}
     }
 
     let (collection_expr, projection) = foreach
@@ -8461,6 +8492,152 @@ fn lower_collection_foreach_in_scope(
                 source_span: foreach.span,
             }),
         ));
+    context.current_block = context.is_reachable(exit_block).then_some(exit_block);
+    Ok(())
+}
+
+/// `foreach` over a byte region or typed array region (Decision 0148
+/// section 8, amendment Iterating Regions of 2026-11-20): elements in
+/// index order, an optional zero-based `int` index, and for a writable
+/// binding over a writable region the element written back before the
+/// next element, as a writable foreach over `T[]` writes back.
+fn lower_region_foreach_in_scope(
+    foreach: &hir::ForeachStmt,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let mir::Type::Region(region_type) = context.expression_type(&foreach.iterable)? else {
+        return Err(vec![unsupported(
+            foreach.iterable.span(),
+            "a checked region foreach walks a present region",
+        )]);
+    };
+    let element = byte_region::element_type(region_type, foreach.iterable.span(), context)?;
+    let writable = foreach.value_binding.writable;
+    let region = byte_region::local(&foreach.iterable, writable, context)?;
+    let index_type = IntegerType::Int64;
+    let index_local = context.declare_temp(true, index_type);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: index_local,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::constant(
+                IntegerValue::from_i128(index_type, 0).expect("zero is a valid int"),
+            ),
+        )),
+    });
+    let first_local = foreach.first_binding.as_ref().map(|binding| {
+        context.declare_user_local(
+            &binding.name,
+            false,
+            mir::Type::Scalar(mir::ScalarType::Integer(index_type)),
+        )
+    });
+    let value_local =
+        context.declare_user_local_owned(&foreach.value_binding.name, writable, element, false);
+
+    let header_block = context.create_block();
+    let body_block = context.create_block();
+    let update_block = context.create_block();
+    let exit_block = context.create_block();
+    context.terminate_current(mir::Terminator::Jump(header_block));
+    context.current_block = Some(header_block);
+    context.terminate_current(mir::Terminator::Branch {
+        condition: mir::BoolExpression::Compare {
+            op: mir::CompareOp::Less,
+            left: Box::new(mir::ValueExpression::Integer(local_integer_expression(
+                index_local,
+                index_type,
+            ))),
+            right: Box::new(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                ty: index_type,
+                operand: mir::Operand::RegionLength(region),
+            })),
+        },
+        then_block: body_block,
+        else_block: exit_block,
+    });
+
+    context.current_block = Some(body_block);
+    let offset = collection_offset_rvalue(index_local);
+    if let Some(target) = first_local {
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: offset.clone(),
+        });
+    }
+    let read = match element {
+        mir::Type::Scalar(scalar) => mir::Rvalue::Value(value_expression_from_operand(
+            scalar,
+            mir::Operand::RegionIndex {
+                region,
+                index: Box::new(offset.clone()),
+                index_span: foreach.span,
+            },
+        )),
+        mir::Type::NullableScalar(scalar) => {
+            mir::Rvalue::NullableScalar(mir::NullableScalarExpression::RegionIndex {
+                ty: scalar,
+                region,
+                index: Box::new(offset.clone()),
+                index_span: foreach.span,
+            })
+        }
+        _ => {
+            return Err(vec![unsupported(
+                foreach.span,
+                "a built region element is a scalar or a nullable pointer",
+            )])
+        }
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: value_local,
+        value: read,
+    });
+
+    context.push_loop_targets(LoopTargets {
+        continue_block: update_block,
+        break_block: exit_block,
+        continue_cleanup_depth: context.local_scopes.len(),
+        break_cleanup_depth: context.local_scopes.len(),
+        continue_finalizer_depth: context.active_finalizers.len(),
+        break_finalizer_depth: context.active_finalizers.len(),
+        continue_sources: Vec::new(),
+    });
+    context.push_scope();
+    let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
+    let body_fallthrough = context.current_block;
+    context.pop_scope();
+    context.pop_loop_targets();
+    body_result?;
+    if let Some(block) = body_fallthrough {
+        context.terminate_block(block, mir::Terminator::Jump(update_block));
+    }
+
+    context.current_block = Some(update_block);
+    if writable {
+        context.push_statement(mir::Statement::AssignRegionIndex {
+            region,
+            index: offset,
+            value: foreach_local_rvalue(value_local, element)?,
+            index_span: foreach.span,
+        });
+    }
+    context.push_statement(mir::Statement::AssignLocal {
+        target: index_local,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::Binary {
+                ty: index_type,
+                op: mir::IntegerBinaryOp::Add,
+                left: Box::new(local_integer_expression(index_local, index_type)),
+                right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
+                    index_type,
+                ))),
+                span: foreach.span,
+                right_span: foreach.span,
+            },
+        )),
+    });
+    context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
 }

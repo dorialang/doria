@@ -1117,6 +1117,41 @@ function fill(writable WritableArrayRegion<int32> $values, int32 $value): void
 ";
 
 #[test]
+fn foreach_walks_typed_array_regions_in_index_order() {
+    // Decision 0148 section 8, amendment Iterating Regions of 2026-11-20:
+    // readonly elements, the `int` index, and writable elements changed in
+    // place through a writable region binding.
+    let source = "function main(): void
+{
+    writable int32[] $numbers = [1, 2, 3, 4, 5];
+    foreach ($numbers->getRegion(0, 3) as int32 $value) {
+        echo $value;
+    }
+    foreach ($numbers->getRegion(2, 3) as int $index => int32 $value) {
+        echo \" \" . $index . \":\" . $value;
+    }
+    {
+        let writable $tail = $numbers->getWritableRegion(1, 3);
+        foreach ($tail as writable int32 $value) {
+            if ($value == 3) {
+                continue;
+            }
+            $value *= 10;
+        }
+    }
+    foreach ($numbers->getRegion(0, 0) as int32 $value) {
+        echo \" empty\";
+    }
+    echo \" \";
+    foreach ($numbers as int32 $value) {
+        echo $value . \",\";
+    }
+}
+";
+    assert_runs_everywhere(source, "123 0:3 1:4 2:5 1,20,3,40,5,");
+}
+
+#[test]
 fn typed_array_regions_view_read_write_and_copy_elements_in_place() {
     // Decision 0148 section 8: views over `T[]` that copy nothing.
     let source = format!(

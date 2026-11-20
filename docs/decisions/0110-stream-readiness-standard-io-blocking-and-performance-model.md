@@ -4,6 +4,12 @@
 > interfaces and nonallocating erased dispatch. This record still owns the later
 > stream capability names, members, and performance appendix.
 
+> **Stage 40 amendment (2026-11-20):** Decision 0148 (Amendment: Iterating
+> Regions) makes `ByteRegion` and `WritableByteRegion` iterable with
+> `foreach`, yielding `uint8` elements in index order, with an optional
+> `int $index =>` binding and in-place `writable` bindings over a writable
+> region. `Bytes` itself still has no `foreach` (Decision 0132).
+
 - **Status:** Accepted
 - **Date:** 2026-08-02
 - **Owners:** Doria language and standard-library design

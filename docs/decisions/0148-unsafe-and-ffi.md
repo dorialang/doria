@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -157,6 +157,17 @@ ruled on three naming cards: "`Pointer<T>` and `WritablePointer<T>`
   carrier is boxed the same way: a handle of a `SharedReference<I>` or
   `WritableSharedReference<I>` to an interface `I` points to a box holding
   its two words, and `reclaim` frees the box.
+
+### Amendment: Iterating Regions (2026-11-20)
+
+Section 8 said what a typed array region offers but not whether `foreach`
+walks one, and Decision 0110 left the same question open for byte regions.
+Checking accepted `foreach ($numbers->getRegion(0, 3) as int $value)` and
+lowering then rejected it, because each derived the iterable families on its
+own. Andrew answered the card on 2026-11-20: "Regions are iterable
+(Recommended)". Section 8 states the rule for `ArrayRegion<T>` and
+`WritableArrayRegion<T>`; it covers Decision 0110's `ByteRegion` and
+`WritableByteRegion` the same way, with `uint8` elements.
 
 ## Context
 
@@ -506,6 +517,15 @@ mirroring Decision 0110's byte regions:
 - `pointer` and `writablePointer` exist when `T` is FFI-safe (section 7).
 - Formation allocates nothing and copies nothing; bounds panic as `T[]`
   indexing does; borrow rules match the byte regions.
+- `foreach` walks every region in index order on every backend: `ByteRegion`
+  and `WritableByteRegion` (Decision 0110) with `uint8` elements, and
+  `ArrayRegion<T>` and `WritableArrayRegion<T>` with `T` elements. A binding
+  is readonly. A writable region bound to a writable place also accepts
+  `as writable T $value`, which changes the element in place, under the same
+  rule as a writable foreach over `T[]` (E0201 otherwise). `int $index =>`
+  gives the zero-based index as for `T[]` (Decision 0132), and both bindings
+  carry their types (Decision 0133). Checking classifies the region once in
+  the foreach plan, and lowering reads that plan (amendment of 2026-11-20).
 - No strided view exists in core. Shapes, ranks and strides belong to the
   `NDArray` storage library of plan Appendix A; a binding passes a stride to C
   as an integer.

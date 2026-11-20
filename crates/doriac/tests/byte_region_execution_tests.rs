@@ -255,6 +255,37 @@ function main(): void {{
 }
 
 #[test]
+fn foreach_walks_byte_regions_in_index_order() {
+    // Decision 0148 Amendment: Iterating Regions (2026-11-20), which covers
+    // Decision 0110's byte regions: `uint8` elements in index order, the
+    // `int` index, and in-place writes through a writable region.
+    executes(
+        r#"
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(4);
+    $bytes[0] = 1;
+    $bytes[1] = 2;
+    $bytes[2] = 3;
+    foreach ($bytes->getRegion(0, 3) as uint8 $byte) {
+        echo $byte;
+    }
+    foreach ($bytes->getRegion(1, 2) as int $index => uint8 $byte) {
+        echo " {$index}:{$byte}";
+    }
+    {
+        let writable $view = $bytes->getWritableRegion(0, 4);
+        foreach ($view as writable uint8 $byte) {
+            $byte += 5;
+        }
+    }
+    echo "\n{$bytes[0]},{$bytes[1]},{$bytes[2]},{$bytes[3]}\n";
+}
+"#,
+        "123 0:2 1:3\n6,7,8,5\n",
+    );
+}
+
+#[test]
 fn readonly_copies_and_writable_reborrows_reuse_the_same_bytes() {
     executes(
         r#"

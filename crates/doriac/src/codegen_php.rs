@@ -3185,7 +3185,9 @@ fn validate_statement(
                     .is_some_and(|ty| {
                         matches!(
                             ty,
-                            ResolvedType::SortedDictionary(_, _) | ResolvedType::Deque(_)
+                            ResolvedType::SortedDictionary(_, _)
+                                | ResolvedType::Deque(_)
+                                | ResolvedType::ByteRegion(_)
                         ) || core_collection::uses_receiver(ty)
                     });
                 if !supported {
@@ -9339,6 +9341,10 @@ fn emit_foreach_body(
         emit_public_foreach(foreach, iterable, output, indent, scopes);
         return;
     }
+    if foreach.iterable_family == crate::semantics::ForeachIterableFamily::Region {
+        emit_region_foreach(foreach, iterable, output, indent, scopes);
+        return;
+    }
     scopes.push();
     let first_name = foreach
         .first_binding
@@ -9383,6 +9389,111 @@ fn emit_foreach_body(
             emit_statement(statement, output, indent, scopes);
         }
     });
+    scopes.pop();
+    writeln(output, indent, "}");
+}
+
+/// `foreach` over a byte region (Decision 0148 section 8, amendment
+/// Iterating Regions of 2026-11-20): elements in index order through the
+/// region's checked `get`, with an optional zero-based index. A writable
+/// binding writes its element back when the iteration ends, however it
+/// ends, as PHP's by-reference walk of a typed array does.
+fn emit_region_foreach(
+    foreach: &ForeachStmt,
+    iterable: &str,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    scopes.push();
+    let region = scopes.fresh_temp("__doria_region");
+    let index = scopes.fresh_temp("__doria_region_index");
+    let first_name = foreach
+        .first_binding
+        .as_ref()
+        .map(|binding| scopes.declare(&binding.name));
+    let value_name = scopes.declare(&foreach.value_binding.name);
+    // Both bindings are direct PHP locals; a closure that captures one
+    // reads it through a cell, as the public foreach does.
+    let mut bound_cells = Vec::new();
+    for (name, binding_span, php_name) in foreach
+        .first_binding
+        .as_ref()
+        .zip(first_name.as_ref())
+        .map(|(binding, php_name)| (binding.name.as_str(), binding.span, php_name.clone()))
+        .into_iter()
+        .chain(std::iter::once((
+            foreach.value_binding.name.as_str(),
+            foreach.value_binding.span,
+            value_name.clone(),
+        )))
+    {
+        if let Some(binding) = scopes.binding_for_declaration(name, binding_span) {
+            if scopes.needs_cell(binding) {
+                scopes.bind_place(binding, PhpBindingPlace::Cell(php_name.clone()));
+                bound_cells.push(php_name);
+            } else {
+                scopes.bind_place(binding, PhpBindingPlace::Direct(php_name));
+            }
+        }
+    }
+    let span = foreach.span;
+    let start = scopes.source_location(span, span.start);
+    let end = scopes.source_location(span, span.end);
+    let callable = scopes.callable_identity();
+    writeln(output, indent, &format!("${region} = {iterable};"));
+    writeln(
+        output,
+        indent,
+        &format!("for (${index} = 0; ${index} < count(${region}); ${index}++)"),
+    );
+    writeln(output, indent, "{");
+    let bind = |name: &str, value: String| {
+        if bound_cells.iter().any(|cell| cell == name) {
+            format!("${name} = new __DoriaCell({value});")
+        } else {
+            format!("${name} = {value};")
+        }
+    };
+    if let Some(first_name) = &first_name {
+        writeln(output, indent + 1, &bind(first_name, format!("${index}")));
+    }
+    writeln(
+        output,
+        indent + 1,
+        &bind(
+            &value_name,
+            format!("${region}->get(${index}, {start}, {end}, {callable})"),
+        ),
+    );
+    let value_read = if bound_cells.contains(&value_name) {
+        format!("${value_name}->value")
+    } else {
+        format!("${value_name}")
+    };
+    let body_indent = if foreach.value_binding.writable {
+        writeln(output, indent + 1, "try");
+        writeln(output, indent + 1, "{");
+        indent + 2
+    } else {
+        indent + 1
+    };
+    emit_owned_scope(output, body_indent, scopes, |output, indent, scopes| {
+        for statement in &foreach.body.statements {
+            emit_statement(statement, output, indent, scopes);
+        }
+    });
+    if foreach.value_binding.writable {
+        writeln(output, indent + 1, "}");
+        writeln(output, indent + 1, "finally");
+        writeln(output, indent + 1, "{");
+        writeln(
+            output,
+            indent + 2,
+            &format!("${region}->set(${index}, {value_read}, {start}, {end}, {callable});"),
+        );
+        writeln(output, indent + 1, "}");
+    }
     scopes.pop();
     writeln(output, indent, "}");
 }

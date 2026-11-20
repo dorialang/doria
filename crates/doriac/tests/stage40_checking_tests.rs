@@ -1526,3 +1526,47 @@ fn a_handle_takes_its_value_and_to_handle_consumes_the_reference() {
         assert!(codes(&source).contains(&"E0470"), "{body}: {:#?}", findings(&source));
     }
 }
+
+#[test]
+fn foreach_over_regions_checks_its_bindings_and_other_sources_are_not_iterable() {
+    // Decision 0148 Amendment: Iterating Regions (2026-11-20). Checking
+    // classifies the iterable once; a source no family classifies is E0810.
+    let accepted = "function main(): void { writable int32[] $numbers = [1, 2]; foreach ($numbers->getRegion(0, 2) as int $index => int32 $value) { echo \"{$index}{$value}\"; } let writable $view = $numbers->getWritableRegion(0, 2); foreach ($view as writable int32 $value) { $value = 3; } }";
+    assert_eq!(
+        codes(accepted),
+        Vec::<&str>::new(),
+        "{:#?}",
+        findings(accepted)
+    );
+    for (body, code, title) in [
+        (
+            "writable int32[] $numbers = [1]; foreach ($numbers->getRegion(0, 1) as writable int32 $value) { $value = 2; }",
+            "E0201",
+            "Writable Foreach Needs A Writable Collection",
+        ),
+        (
+            "writable int32[] $numbers = [1]; let $view = $numbers->getWritableRegion(0, 1); foreach ($view as writable int32 $value) { $value = 2; }",
+            "E0201",
+            "Writable Foreach Needs A Writable Collection",
+        ),
+        (
+            "writable int32[] $numbers = [1]; foreach ($numbers->getRegion(0, 1) as int64 $value) { echo $value; }",
+            "E0403",
+            "Type Mismatch",
+        ),
+        (
+            "let $count = 3; foreach ($count as int $value) { echo $value; }",
+            "E0810",
+            "Foreach Source Is Not Iterable",
+        ),
+    ] {
+        let source = format!("function main(): void {{ {body} }}");
+        let found = findings(&source);
+        assert!(
+            found
+                .iter()
+                .any(|diagnostic| diagnostic.code == code && diagnostic.title == title),
+            "{body}: {found:#?}"
+        );
+    }
+}

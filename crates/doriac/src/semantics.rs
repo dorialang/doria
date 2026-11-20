@@ -98,6 +98,9 @@ pub enum ForeachIterationKind {
     DictionaryKey,
 }
 
+/// A `foreach` over a value no iterable family classifies.
+const FOREACH_SOURCE_NOT_ITERABLE_CODE: &str = "E0810";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeachIterableFamily {
     IntegerRange,
@@ -112,6 +115,10 @@ pub enum ForeachIterableFamily {
     DictionaryValuesProjection,
     PriorityQueue,
     Bytes,
+    /// `ByteRegion`, `WritableByteRegion`, `ArrayRegion<T>` and
+    /// `WritableArrayRegion<T>` (Decision 0148 section 8, amendment
+    /// Iterating Regions of 2026-11-20).
+    Region,
     PublicIterable,
     Other,
 }
@@ -131,6 +138,7 @@ impl ForeachIterableFamily {
             Self::DictionaryValuesProjection => "Dictionary values projection",
             Self::PriorityQueue => "PriorityQueue",
             Self::Bytes => "Bytes",
+            Self::Region => "region",
             Self::PublicIterable => "public Iterable",
             Self::Other => "this value",
         }
@@ -8490,7 +8498,13 @@ impl<'program> Checker<'program> {
                 order: ForeachIterationOrder::ValueOrder,
             };
         }
-        match self.types.kind(iterable_ty).clone() {
+        // A present shared-reference access object walks its payload, as
+        // member access through it does; lowering reaches the same payload.
+        let classified = match self.forwarded_access_payload(iterable_ty) {
+            Some((payload, false)) => payload,
+            _ => iterable_ty,
+        };
+        match self.types.kind(classified).clone() {
             TypeKind::List(value) => ForeachTypePlan {
                 family: ForeachIterableFamily::List,
                 iteration_kind: ForeachIterationKind::SequenceIndex,
@@ -8554,6 +8568,22 @@ impl<'program> Checker<'program> {
                 first_binding_type: None,
                 value_binding_type: value,
                 order: ForeachIterationOrder::ValueOrder,
+            },
+            TypeKind::ByteRegion(_) => ForeachTypePlan {
+                family: ForeachIterableFamily::Region,
+                iteration_kind: ForeachIterationKind::SequenceIndex,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+                value_binding_type: self.types.intern(TypeKind::Integer(IntegerType::UInt8)),
+                order: ForeachIterationOrder::Sequence,
+            },
+            TypeKind::ArrayRegion(_, element) => ForeachTypePlan {
+                family: ForeachIterableFamily::Region,
+                iteration_kind: ForeachIterationKind::SequenceIndex,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+                value_binding_type: element,
+                order: ForeachIterationOrder::Sequence,
             },
             TypeKind::Bytes => ForeachTypePlan {
                 family: ForeachIterableFamily::Bytes,
@@ -10399,6 +10429,34 @@ impl<'program> Checker<'program> {
                         method_context,
                     );
                 }
+                // Checking owns the iterable families (Decision 0132): a
+                // source that none of them classifies is not iterable, so
+                // lowering never meets one.
+                if plan.family == ForeachIterableFamily::Other
+                    && !matches!(
+                        self.types.kind(iterable_ty),
+                        TypeKind::Unknown
+                            | TypeKind::Mixed
+                            | TypeKind::EmptyCollection
+                            | TypeKind::Heterogeneous
+                    )
+                {
+                    let got = self.types.display(iterable_ty);
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            FOREACH_SOURCE_NOT_ITERABLE_CODE,
+                            format!("`foreach` cannot walk a value of type `{got}`"),
+                            foreach.iterable.span(),
+                        )
+                        .with_title("Foreach Source Is Not Iterable")
+                        .with_explanation(
+                            "`foreach` walks integer ranges, `T[]`, the collections, regions and values that implement `Iterable<T>`.",
+                        )
+                        .with_help(
+                            "walk one of those, such as a region of the value's elements, or loop with `for` over an index",
+                        ),
+                    );
+                }
                 if plan.family == ForeachIterableFamily::PublicIterable {
                     self.select_public_iteration(plan.iterable_type, foreach.span);
                     if foreach.value_binding.writable {
@@ -10417,7 +10475,38 @@ impl<'program> Checker<'program> {
                 // mutating collection method. Only these families yield
                 // writable elements; every other source reports its own rule,
                 // and an unresolved source has already been reported.
+                // A readonly region's elements cannot change through it.
                 if foreach.value_binding.writable
+                    && plan.family == ForeachIterableFamily::Region
+                    && matches!(
+                        self.types.kind(plan.iterable_type),
+                        TypeKind::ByteRegion(crate::types::ByteRegionKind::Readonly)
+                            | TypeKind::ArrayRegion(crate::types::ByteRegionKind::Readonly, _)
+                    )
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0201",
+                            "a writable foreach binding needs a writable region",
+                            foreach.iterable.span(),
+                        )
+                        .with_title("Writable Foreach Needs A Writable Collection")
+                        .with_primary_label("This Region Is Readonly")
+                        .with_related(
+                            foreach
+                                .value_binding
+                                .writable_span
+                                .unwrap_or(foreach.value_binding.span),
+                            "Writable Binding Declared Here",
+                        )
+                        .with_explanation(
+                            "A `writable` foreach binding changes each element in place, so the region it walks must be a `WritableByteRegion` or `WritableArrayRegion<T>`.",
+                        )
+                        .with_help(
+                            "walk a writable region from `getWritableRegion(...)` bound to a writable variable, or remove `writable` from the binding to only read the elements",
+                        ),
+                    );
+                } else if foreach.value_binding.writable
                     && dictionary_projection.is_none()
                     && matches!(
                         plan.family,
@@ -10426,6 +10515,7 @@ impl<'program> Checker<'program> {
                             | ForeachIterableFamily::Dictionary
                             | ForeachIterableFamily::SortedDictionary
                             | ForeachIterableFamily::Deque
+                            | ForeachIterableFamily::Region
                     )
                 {
                     self.record_capture_requirement_for_expr(
