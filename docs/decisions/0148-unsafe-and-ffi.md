@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Typed Link Inputs). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -79,6 +79,20 @@ stack slots. Andrew ruled on 2026-11-17: "Runtime trampoline for Cranelift
 Section 6 said how a fixed-length array field is supplied at construction but
 not what assigning the whole field (`$tip->text = $region`) does. Andrew ruled
 on 2026-11-17: "Copy, same rule as construction (Recommended)". Section 6
+states the rule.
+
+### Amendment: Owned Foreign Strings (2026-11-20)
+
+Section 9 said how `CString` and `Utf16String` are made and read but not
+whether they are Copy or Move values. Andrew ruled on 2026-11-20: "Move
+value owning its buffer (Recommended)". Section 9 states the rule.
+
+### Amendment: Typed Link Inputs (2026-11-20)
+
+Sections 18 and 19 said Baton writes resolved link inputs into build-plan
+schema 2 and `doriac` accepts the same inputs through repeatable flags, but
+not the input model, the field shapes or the flags. Andrew ruled on
+2026-11-20: "Typed inputs per logical library (Recommended)". Section 18
 states the rule.
 
 ## Context
@@ -442,6 +456,12 @@ addition, and zero-copy numerical exchange reaches C through a safe value.
   `$cString->pointer: Ptr<CChar>` borrows it.
 - `Utf16String::from` and `Utf16String::tryFrom` produce NUL-terminated UTF-16
   for the Windows `W` APIs, with `$utf16->pointer: Ptr<uint16>`.
+- `CString` and `Utf16String` are Move values that each own one
+  NUL-terminated buffer, released deterministically when their owner ends,
+  with no reference count. A second copy is an explicit `CString::from($text)`;
+  holders pass them readonly or with `take`. Forming `pointer` pins the value
+  as section 7 pins any place, so the buffer stays in place while the
+  pointer is live (amendment of 2026-11-20).
 - `String::fromCString(Ptr<CChar> $text): ?string` (unsafe) copies up to the
   NUL and returns null for invalid UTF-8; `String::fromUtf16(Ptr<uint16> $text):
   ?string` (unsafe) returns null for unpaired surrogates. Both follow
@@ -651,6 +671,41 @@ internal extern "C"
 - Emitted code referencing a logical library with no resolved input is a
   compile-time diagnostic naming the manifest table and the flag.
 - Link inputs of dependency packages reach the final link.
+
+Resolved link inputs are typed per logical library (amendment of
+2026-11-20). In build-plan schema 2 each package carries
+
+```json
+"nativeLibraries": [
+  {
+    "name": "zlib",
+    "link": "dynamic",
+    "inputs": [
+      { "kind": "library", "name": "z" },
+      { "kind": "searchPath", "path": "native/windows/lib" },
+      { "kind": "framework", "name": "AppKit" },
+      { "kind": "file", "path": "native/windows/lib/zlib.lib" }
+    ],
+    "runtimeFiles": ["native/windows/bin/zlib1.dll"]
+  }
+]
+```
+
+with `link` either `"dynamic"` or `"static"`. Baton parses pkg-config
+`--libs` output into these kinds and rejects any other flag with its own
+diagnostic, so `doriac` never receives raw linker arguments. The same plan
+revision adds `unsafePolicy` (`"allow"` or `"deny"`) to each package
+(section 25) and `windowsSubsystem` (`"console"` or `"gui"`) to
+`selectedTarget` (section 21). Link inputs stay attributed to the package
+that declares them through the final link and the receipt.
+
+The direct flags name the logical library: `--link-library zlib=z`,
+`--link-library zlib=static:z`, `--link-search zlib=<dir>`,
+`--link-framework appkit=AppKit`, `--link-file zlib=<path>`,
+`--runtime-file zlib=<path>`, and `--windows-subsystem gui`. The
+diagnostic for a library with no input names the library and both fixes: a
+`[native-libraries.<name>]` entry for this platform, or
+`--link-library <name>=<library>`.
 
 ### 19. `[native-libraries]`
 
@@ -912,6 +967,8 @@ has one precise contract.
   the placement of `Platform`, `OperatingSystem` and `Architecture` in
   `Doria\Std\Ffi` (section 1).
 - Section 21's absent-stream rule applies on every platform.
+- `ForeignCall::lastSystemCode` is 0 before any capturing call on the
+  thread (section 16), as C's `errno` is at program start.
 
 ## Unsettled
 
