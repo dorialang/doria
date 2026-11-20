@@ -5268,6 +5268,9 @@ pub enum IntegerBinaryOp {
 pub enum IntegerExpression {
     /// The bits of a one-word inline value, as `int64`.
     InlineWord(Box<InlineValueExpression>),
+    /// `ForeignCall::lastSystemCode` (Decision 0148 section 16): the code
+    /// the last capturing foreign call stored on this thread, as `int64`.
+    LastSystemCode,
     Use {
         ty: IntegerType,
         operand: Operand,
@@ -5358,6 +5361,7 @@ impl PartialEq for IntegerExpression {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::InlineWord(left), Self::InlineWord(right)) => left == right,
+            (Self::LastSystemCode, Self::LastSystemCode) => true,
             (
                 Self::Use {
                     ty: left_ty,
@@ -5487,7 +5491,9 @@ impl IntegerExpression {
             | Self::Convert { ty, .. }
             | Self::Call { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
-            Self::FloatToInt { .. } | Self::InlineWord(_) => IntegerType::Int64,
+            Self::FloatToInt { .. } | Self::InlineWord(_) | Self::LastSystemCode => {
+                IntegerType::Int64
+            }
             Self::EnumBacking { .. } | Self::CopyRegion { .. } | Self::Terminal { .. } => {
                 IntegerType::Int64
             }
@@ -6308,6 +6314,9 @@ pub enum ForeignFieldAccess {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForeignFunction {
     pub callee: ForeignCallee,
+    /// `#[CaptureSystemCode(source)]` (section 16): the code read
+    /// immediately after the call, before any other code runs.
+    pub system_code: Option<crate::foreign::SystemCodeSource>,
     pub parameters: Vec<Type>,
     /// `None` for `void`.
     pub return_type: Option<Type>,
@@ -8222,7 +8231,7 @@ fn enum_class_temporary_capacity(value: &EnumExpression) -> usize {
 fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
     match value {
         IntegerExpression::InlineWord(value) => inline_class_temporary_capacity(value),
-        IntegerExpression::Use { .. } => 0,
+        IntegerExpression::Use { .. } | IntegerExpression::LastSystemCode => 0,
         IntegerExpression::Unary { operand, .. }
         | IntegerExpression::Convert { value: operand, .. } => {
             integer_class_temporary_capacity(operand)
@@ -9980,6 +9989,7 @@ impl fmt::Display for IntegerExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InlineWord(value) => write!(formatter, "inlineWord({value})"),
+            Self::LastSystemCode => write!(formatter, "last_system_code: int64"),
             IntegerExpression::Use { ty, operand } => match operand {
                 Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: {ty}")
@@ -11022,12 +11032,15 @@ impl fmt::Display for Statement {
                         if let Some(library) = library {
                             write!(formatter, " in {library}")?;
                         }
-                        Ok(())
                     }
                     ForeignCallee::Pointer(pointer) => {
-                        write!(formatter, "foreign_call *local{}({args})", pointer.0)
+                        write!(formatter, "foreign_call *local{}({args})", pointer.0)?;
                     }
                 }
+                if let Some(source) = function.system_code {
+                    write!(formatter, " capturing {source:?}")?;
+                }
+                Ok(())
             }
             Statement::DropInlineValue {
                 local,

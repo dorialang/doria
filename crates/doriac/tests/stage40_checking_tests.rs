@@ -533,11 +533,12 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
             "extern \"C\" { /** @safety Any value. */ #[LinkName(\"printf\")] #[Variadic(fixedParameters: 1)] function printInteger(Ptr<CChar> $format, int32 $value): int32; }",
             "Variadic Foreign Functions Cannot Be Built Yet",
         ),
-        (
-            "extern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::Errno)] function close(int32 $descriptor): int32; }",
-            "System Code Capture Cannot Be Built Yet",
-        ),
-    ] {
+    ]
+    .into_iter()
+    .chain((!cfg!(windows)).then_some((
+        "extern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::WindowsLastError)] function close(int32 $descriptor): int32; }",
+        "Windows Last Error Capture Cannot Be Built Here Yet",
+    ))) {
         let source = format!(
             "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, Library, LinkName, Ptr, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
         );
@@ -1168,4 +1169,18 @@ fn typed_array_regions_have_the_region_members() {
     // A live writable region excludes other access to its source.
     let conflict = codes("function main(): void { writable int32[] $numbers = [1, 2]; writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 2); echo $numbers[0]; $region[0] = 3; }");
     assert!(!conflict.is_empty());
+}
+
+#[test]
+fn the_last_system_code_is_a_readonly_static_int() {
+    // Decision 0148 section 16.
+    let prelude = "use Doria\\Std\\Ffi\\ForeignCall;\n";
+    let read = format!(
+        "{prelude}function main(): void {{ int $code = ForeignCall::lastSystemCode; echo $code; }}"
+    );
+    assert!(codes(&read).is_empty(), "{:#?}", findings(&read));
+    let written = format!("{prelude}function main(): void {{ ForeignCall::lastSystemCode = 1; }}");
+    assert_eq!(codes(&written), ["E0202"], "{:#?}", findings(&written));
+    let unknown = format!("{prelude}function main(): void {{ echo ForeignCall::lastCode; }}");
+    assert_eq!(codes(&unknown), ["E0488"], "{:#?}", findings(&unknown));
 }

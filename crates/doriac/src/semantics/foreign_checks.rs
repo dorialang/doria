@@ -395,6 +395,52 @@ impl<'program> Checker<'program> {
         ty
     }
 
+    /// `ForeignCall::lastSystemCode` (Decision 0148 section 16): a readonly
+    /// static `int` any context reads. Reports another member, and a write
+    /// when `writing`. `None` when `qualifier` is not `ForeignCall`.
+    pub(super) fn foreign_call_member(
+        &mut self,
+        qualifier: &StaticQualifier,
+        member: &str,
+        span: Span,
+        writing: bool,
+    ) -> Option<TypeId> {
+        let ty = self.foreign_call_member_type(qualifier, member)?;
+        if member != crate::compiler_known_ffi::LAST_SYSTEM_CODE {
+            self.diagnostics.push(Diagnostic::new(
+                "E0488",
+                format!("unknown static member `ForeignCall::{member}`; `ForeignCall` has `lastSystemCode`"),
+                span,
+            ));
+        } else if writing {
+            self.diagnostics.push(Diagnostic::new(
+                "E0202",
+                "cannot assign to readonly static property `ForeignCall::lastSystemCode`",
+                span,
+            ));
+        }
+        Some(ty)
+    }
+
+    /// The type of a `ForeignCall` static member, without reporting.
+    pub(super) fn foreign_call_member_type(
+        &mut self,
+        qualifier: &StaticQualifier,
+        member: &str,
+    ) -> Option<TypeId> {
+        let StaticQualifier::Class(name) = qualifier else {
+            return None;
+        };
+        if name != crate::compiler_known_ffi::FOREIGN_CALL {
+            return None;
+        }
+        Some(if member == crate::compiler_known_ffi::LAST_SYSTEM_CODE {
+            self.types.intern(TypeKind::Integer(IntegerType::Int64))
+        } else {
+            self.types.unknown()
+        })
+    }
+
     pub(super) fn check_foreign_abi(&mut self, abi: &str, span: Span) {
         if abi != "C" {
             self.diagnostics.push(

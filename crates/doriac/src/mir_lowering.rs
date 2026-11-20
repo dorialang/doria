@@ -28689,6 +28689,13 @@ fn lower_integer_expression(
             )?,
         }),
         hir::Expr::StaticMember {
+            class_name, member, ..
+        } if class_name == crate::compiler_known_ffi::FOREIGN_CALL
+            && member == crate::compiler_known_ffi::LAST_SYSTEM_CODE =>
+        {
+            Ok(mir::IntegerExpression::LastSystemCode)
+        }
+        hir::Expr::StaticMember {
             class_name,
             member,
             span,

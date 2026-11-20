@@ -32,6 +32,7 @@ mod owned_interface;
 mod platform_io;
 mod process;
 mod string_ops;
+mod system_code;
 pub mod terminal;
 #[cfg(test)]
 mod test_callback;
@@ -175,6 +176,7 @@ pub use byte_region::{
     dr_v2_byte_region_get, dr_v2_byte_region_set, dr_v2_byte_region_subregion, dr_v2_bytes_region,
 };
 pub use bytes::DrBytesV1;
+pub use system_code::{dr_v1_capture_system_code, dr_v1_last_system_code};
 pub use collection::{
     DrCollectionV1, DR_COLLECTION_AGGREGATE_OFFSET, DR_COLLECTION_ALIGN,
     DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET, DR_COLLECTION_HEAD_OFFSET,

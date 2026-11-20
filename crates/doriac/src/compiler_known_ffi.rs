@@ -25,7 +25,12 @@ pub const FOREIGN_CALL: &str = "Doria\\Std\\Ffi\\ForeignCall";
 pub const HANDLE: &str = "Doria\\Std\\Ffi\\Handle";
 pub const C_STRING: &str = "Doria\\Std\\Ffi\\CString";
 pub const UTF16_STRING: &str = "Doria\\Std\\Ffi\\Utf16String";
-pub const PENDING_TYPES: [&str; 5] = [PLATFORM, FOREIGN_CALL, HANDLE, C_STRING, UTF16_STRING];
+pub const PENDING_TYPES: [&str; 4] = [PLATFORM, HANDLE, C_STRING, UTF16_STRING];
+
+/// Members of `Doria\Std\Ffi` that checking models directly: the
+/// `ForeignCall::lastSystemCode` static (section 16).
+pub const MODELED_TYPES: [&str; 1] = [FOREIGN_CALL];
+pub const LAST_SYSTEM_CODE: &str = "lastSystemCode";
 
 /// The declarations in [`SOURCE_TEXT`].
 pub const DECLARED_TYPES: [&str; 8] = [
@@ -86,6 +91,7 @@ class NonBlocking {
 pub fn canonical_types() -> impl Iterator<Item = &'static str> {
     crate::foreign::type_names()
         .chain(DECLARED_TYPES)
+        .chain(MODELED_TYPES)
         .chain(PENDING_TYPES)
 }
 

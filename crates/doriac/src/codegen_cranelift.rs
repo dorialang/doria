@@ -20643,6 +20643,15 @@ fn lower_integer_expression(
         mir::IntegerExpression::InlineWord(value) => {
             lower_inline_expression(builder, value, resources)
         }
+        mir::IntegerExpression::LastSystemCode => runtime_call(
+            builder,
+            crate::native_abi::LAST_SYSTEM_CODE,
+            &[],
+            Some(types::I64),
+            &[],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("the last system code read produced no value")),
         mir::IntegerExpression::Use { ty, operand } => {
             lower_integer_operand(builder, *ty, operand, resources)
         }
@@ -21227,7 +21236,15 @@ fn lower_foreign_call(
             let address = builder.ins().stack_load(pointer, pointer, slot, 0);
             let reference = builder.import_signature(signature);
             let call = builder.ins().call_indirect(reference, address, &values);
-            return finish_foreign_call(builder, call, &physical, target, target_type, resources);
+            return finish_foreign_call(
+                builder,
+                call,
+                &physical,
+                foreign.system_code,
+                target,
+                target_type,
+                resources,
+            );
         }
     };
     let call = match resources.module.get_name(symbol) {
@@ -21262,19 +21279,44 @@ fn lower_foreign_call(
             builder.ins().call(reference, &values)
         }
     };
-    finish_foreign_call(builder, call, &physical, target, target_type, resources)
+    finish_foreign_call(
+        builder,
+        call,
+        &physical,
+        foreign.system_code,
+        target,
+        target_type,
+        resources,
+    )
 }
 
-/// Stores the result of the foreign call `call` into `target` as its
+/// Captures the system code the foreign call `call` left, when its
+/// declaration asks for it (Decision 0148 section 16), before any other
+/// code runs; then stores the call's result into `target` as its
 /// classified return value arrives.
 fn finish_foreign_call(
     builder: &mut FunctionBuilder,
     call: cranelift_codegen::ir::Inst,
     physical: &crate::native_abi::c_abi::PhysicalSignature,
+    system_code: Option<crate::foreign::SystemCodeSource>,
     target: Option<mir::LocalId>,
     target_type: Option<mir::Type>,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
+    if let Some(source) = system_code {
+        let source = builder.ins().iconst(
+            types::I32,
+            i64::from(crate::native_abi::system_code_source(source)),
+        );
+        runtime_call(
+            builder,
+            crate::native_abi::CAPTURE_SYSTEM_CODE,
+            &[types::I32],
+            None,
+            &[source],
+            resources,
+        )?;
+    }
     use crate::c_layout::CScalar;
     use crate::native_abi::c_abi::{self, PhysicalReturn};
     let pointer = resources.module.target_config().pointer_type();

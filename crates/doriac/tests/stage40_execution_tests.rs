@@ -533,6 +533,39 @@ function main(): void
     assert_runs_natively(source, "5 3 2 9 11 13");
 }
 
+#[test]
+fn the_last_system_code_starts_at_zero_everywhere() {
+    assert_runs_everywhere(
+        "use Doria\\Std\\Ffi\\ForeignCall;\nfunction main(): void { echo ForeignCall::lastSystemCode; }",
+        "0",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_capturing_declaration_keeps_its_errno_past_later_code() {
+    // Decision 0148 section 16: `close(-1)` fails with `EBADF`, 9 on Linux
+    // and macOS, and the code survives the allocation that follows.
+    let source = "
+use Doria\\Std\\Ffi\\{CaptureSystemCode, ForeignCall, SystemCodeSource};
+
+extern \"C\"
+{
+    /** @safety Any descriptor. */
+    #[CaptureSystemCode(SystemCodeSource::Errno)]
+    function close(int32 $descriptor): int32;
+}
+
+function main(): void
+{
+    int32 $status = unsafe(close(-1));
+    string $between = \"text \" . $status;
+    echo $between . \" \" . ForeignCall::lastSystemCode;
+}
+";
+    assert_runs_natively(source, "text -1 9");
+}
+
 const AGGREGATES: &str = r#"
 extern "C" struct Color
 {

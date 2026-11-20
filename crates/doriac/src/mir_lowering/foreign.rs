@@ -344,6 +344,7 @@ pub(super) fn lower_extern_body(
             symbol: binding.symbol.clone(),
             library: binding.library.clone(),
         },
+        system_code: binding.system_code,
         parameters: parameter_types.to_vec(),
         return_type: result,
         fixed_parameters: binding.fixed_parameters,
@@ -415,6 +416,7 @@ pub(super) fn function_pointer_call(
     context.push_statement(mir::Statement::ForeignCall {
         function: Box::new(mir::ForeignFunction {
             callee: mir::ForeignCallee::Pointer(callee),
+            system_code: None,
             parameters,
             return_type,
             fixed_parameters: None,

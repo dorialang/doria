@@ -6022,6 +6022,7 @@ fn validate_integer_expression(
             }
             validate_inline_value_expression(program, function, value)
         }
+        mir::IntegerExpression::LastSystemCode => Ok(()),
         mir::IntegerExpression::Use { ty, operand } => {
             validate_integer_operand(program, function, *ty, operand)
         }
@@ -13787,6 +13788,7 @@ fn collect_integer_class_local_accesses<'a>(
         mir::IntegerExpression::InlineWord(value) => {
             collect_inline_class_local_accesses(value, accesses);
         }
+        mir::IntegerExpression::LastSystemCode => {}
         mir::IntegerExpression::Use { operand, .. } => {
             collect_operand_class_local_accesses(operand, accesses);
         }
@@ -21579,6 +21581,7 @@ fn integer_observes_property(
         mir::IntegerExpression::InlineWord(value) => {
             inline_value_observes_property(value, receiver, property)
         }
+        mir::IntegerExpression::LastSystemCode => false,
         mir::IntegerExpression::Use { operand, .. } => {
             operand_observes_property(operand, receiver, property)
         }

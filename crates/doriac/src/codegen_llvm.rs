@@ -22198,6 +22198,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<IntValue<'ctx>, BackendError> {
         match expression {
             mir::IntegerExpression::InlineWord(value) => self.lower_inline_expression(value),
+            mir::IntegerExpression::LastSystemCode => Ok(self
+                .call_runtime(
+                    crate::native_abi::LAST_SYSTEM_CODE,
+                    &[],
+                    Some(self.context.i64_type().into()),
+                    &[],
+                )?
+                .ok_or_else(|| backend_failure("the last system code read produced no value"))?
+                .into_int_value()),
             mir::IntegerExpression::Use { ty, operand } => self.lower_integer_operand(*ty, operand),
             mir::IntegerExpression::Unary {
                 ty,
@@ -22857,6 +22866,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         for (index, attribute) in &attributes {
             call.add_attribute(AttributeLoc::Param(*index), *attribute);
+        }
+        // The system code is read before any other code runs (Decision
+        // 0148 section 16).
+        if let Some(source) = foreign.system_code {
+            self.call_runtime(
+                crate::native_abi::CAPTURE_SYSTEM_CODE,
+                &[self.context.i32_type().into()],
+                None,
+                &[self
+                    .context
+                    .i32_type()
+                    .const_int(
+                        u64::from(crate::native_abi::system_code_source(source)),
+                        false,
+                    )
+                    .into()],
+            )?;
         }
         let Some(target) = target else {
             return Ok(());

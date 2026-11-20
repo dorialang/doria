@@ -171,7 +171,8 @@ const AGGREGATE_MESSAGE: &str =
 
 /// One E0784 diagnostic per extern declaration whose binding no execution
 /// target builds yet, in source order: one in a block with `#[Library]`, a
-/// variadic one, and one that captures a system code.
+/// variadic one, and one that captures `WindowsLastError` for a target
+/// other than Windows.
 pub fn unbuildable_bindings(
     bindings: &std::collections::HashMap<Span, crate::foreign::ForeignBinding>,
 ) -> Vec<Diagnostic> {
@@ -190,11 +191,16 @@ pub fn unbuildable_bindings(
                 "Variadic Foreign Functions Cannot Be Built Yet",
                 format!("the variadic binding of `{symbol}` is part of Doria; this compiler does not build variadic foreign calls yet"),
             );
-        } else if binding.system_code.is_some() {
+        } else if binding.system_code == Some(crate::foreign::SystemCodeSource::WindowsLastError)
+            && crate::c_layout::CTarget::host().operating_system
+                != crate::c_layout::TargetOperatingSystem::Windows
+        {
+            // Section 16 makes this a compile error in emitted code, which
+            // depends on section 17's platform branches.
             finder.report(
                 *span,
-                "System Code Capture Cannot Be Built Yet",
-                format!("capturing the system code `{symbol}` leaves is part of Doria; this compiler does not build it yet"),
+                "Windows Last Error Capture Cannot Be Built Here Yet",
+                format!("capturing `GetLastError` after `{symbol}` on a target other than Windows is part of Doria; this compiler does not yet decide which code a target emits"),
             );
         }
     }

@@ -20120,6 +20120,9 @@ impl<'program> Checker<'program> {
         if self
             .foreign_aggregate_constant(access.qualifier, access.member, access.member_span)
             .is_some()
+            || self
+                .foreign_call_member(access.qualifier, access.member, access.member_span, false)
+                .is_some()
         {
             return;
         }
@@ -20304,6 +20307,14 @@ impl<'program> Checker<'program> {
         access: StaticAccess<'_>,
         method_context: Option<&MethodContext>,
     ) -> Option<AssignmentTarget> {
+        if let Some(ty) =
+            self.foreign_call_member(access.qualifier, access.member, access.member_span, true)
+        {
+            return Some(AssignmentTarget {
+                ty,
+                destination: AssignmentDestination::Type,
+            });
+        }
         let class_name = self.resolve_static_qualifier(access, method_context)?;
         let (_, member) = self.check_resolved_static_member(access, &class_name, method_context)?;
         let StaticMemberInfo::Property(property) = member else {
@@ -24183,6 +24194,9 @@ impl<'program> Checker<'program> {
                 ..
             } => {
                 if let Some(ty) = self.foreign_aggregate_constant_type(qualifier, member) {
+                    return ty;
+                }
+                if let Some(ty) = self.foreign_call_member_type(qualifier, member) {
                     return ty;
                 }
                 let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context)

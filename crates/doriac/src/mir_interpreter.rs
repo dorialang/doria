@@ -7381,6 +7381,14 @@ impl<'a> Interpreter<'a> {
         expression: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            // The interpreter runs every foreign call through the native
+            // companion library (Decision 0148 section 22), so no capturing
+            // call has stored a code here and the slot keeps its initial 0.
+            mir::IntegerExpression::LastSystemCode => {
+                self.push_scalar(mir::ScalarValue::Integer(
+                    IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is an int64"),
+                ))?;
+            }
             mir::IntegerExpression::InlineWord(value) => {
                 let frame = self.current_frame_mut()?;
                 frame

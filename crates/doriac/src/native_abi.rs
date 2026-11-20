@@ -182,6 +182,19 @@ pub const ARRAY_REGION: &str = "dr_v2_array_region";
 pub const ARRAY_REGION_SUBREGION: &str = "dr_v2_array_region_subregion";
 pub const ARRAY_REGION_ELEMENT: &str = "dr_v2_array_region_element";
 pub const ARRAY_REGION_COPY: &str = "dr_v1_array_region_copy";
+/// Decision 0148 section 16: stores the system code a foreign call left,
+/// and reads the stored code.
+pub const CAPTURE_SYSTEM_CODE: &str = "dr_v1_capture_system_code";
+pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
+
+/// The runtime's number for a system code source, which
+/// `CAPTURE_SYSTEM_CODE` takes.
+pub const fn system_code_source(source: crate::foreign::SystemCodeSource) -> u32 {
+    match source {
+        crate::foreign::SystemCodeSource::Errno => 0,
+        crate::foreign::SystemCodeSource::WindowsLastError => 1,
+    }
+}
 /// Decision 0110 child processes: one checked transport for every `Child`
 /// intrinsic (operation tag, child payload, operand words, checked outputs).
 pub const CHECKED_PROCESS: &str = "dr_v1_checked_process";
