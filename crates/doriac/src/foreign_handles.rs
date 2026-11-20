@@ -63,20 +63,23 @@ impl HandleOperation {
     }
 
     /// What the operation does, completing "… needs an unsafe context" in
-    /// E0785. Every handle operation sidesteps ownership, so each needs one
-    /// (plan §3.5).
-    pub const fn unsafe_description(self) -> &'static str {
+    /// E0785, or `None` when it is safe. Handing a value to C keeps every
+    /// guarantee: the value stays alive and unaliased until a `reclaim`
+    /// takes it back. Only `reclaim` and `borrow` trust the handle to hold
+    /// a value of the stated type and family, so only they are unsafe
+    /// (Decision 0148 section 11).
+    pub const fn unsafe_description(self) -> Option<&'static str> {
         match self {
-            Self::Create => "handing a Doria value to C as a handle",
-            Self::Reclaim => "taking a Doria value back from a handle",
-            Self::Borrow => "borrowing a Doria value through a handle",
+            Self::Create => None,
+            Self::Reclaim => Some("taking a Doria value back from a handle"),
+            Self::Borrow => Some("borrowing a Doria value through a handle"),
         }
     }
 
     pub const fn documentation(self, family: HandleFamily) -> &'static str {
         match (self, family) {
-            (Self::Create, HandleFamily::Owned) => "Hands an owned class value to C as a handle, a `WritablePointer<Opaque>` C keeps as user data (Decision 0148 section 11). Needs an unsafe context. The value is not destroyed until `Handle::reclaim` takes it back. A closed class's handle is its object; an open class's handle addresses a small box holding the object and its class, so the value keeps its exact type.",
-            (Self::Create, HandleFamily::Shared(_)) => "Hands this reference's strong claim to C as a handle, a `WritablePointer<Opaque>` (Decision 0148 section 11). Needs an unsafe context. The reference is consumed; the value stays alive until the family's `reclaim` takes the claim back.",
+            (Self::Create, HandleFamily::Owned) => "Hands an owned class value to C as a handle, a `WritablePointer<Opaque>` C keeps as user data (Decision 0148 section 11). Safe: the value is not destroyed until `Handle::reclaim` takes it back. A closed class's handle is its object; an open class's handle addresses a small box holding the object and its class, so the value keeps its exact type.",
+            (Self::Create, HandleFamily::Shared(_)) => "Hands this reference's strong claim to C as a handle, a `WritablePointer<Opaque>` (Decision 0148 section 11). Safe: the reference is consumed; the value stays alive until the family's `reclaim` takes the claim back.",
             (Self::Reclaim, HandleFamily::Owned) => "Takes back the owned class value `Handle::create` handed to C (Decision 0148 section 11); its type comes from the expected type. Needs an unsafe context. Reclaiming a handle twice, or as another type, is undefined behavior.",
             (Self::Reclaim, HandleFamily::Shared(_)) => "Takes back the strong claim `toHandle` handed to C as a reference of this family (Decision 0148 section 11); the payload type comes from the expected type. Needs an unsafe context. Reclaiming a handle twice, or as another type or family, is undefined behavior.",
             (Self::Borrow, HandleFamily::Owned) => "Lends the class value a handle holds, with readonly access, for the enclosing unsafe context, without taking it back (Decision 0148 section 11); its type comes from the expected type. Needs an unsafe context; the value cannot leave it.",

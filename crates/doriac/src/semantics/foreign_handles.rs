@@ -67,7 +67,9 @@ impl<'program> Checker<'program> {
             return true;
         };
         let callee = format!("`{}::{}`", family.companion(), operation.name(family));
-        self.require_unsafe(access.span, operation.unsafe_description());
+        if let Some(description) = operation.unsafe_description() {
+            self.require_unsafe(access.span, description);
+        }
         if args.len() != 1 {
             self.report_argument_count_mismatch(&callee, 1, 1, args.len(), access.span);
             return true;
@@ -231,7 +233,6 @@ impl<'program> Checker<'program> {
             return false;
         };
         self.check_expr(object, scopes, method_context);
-        self.require_unsafe(span, HandleOperation::Create.unsafe_description());
         if !args.is_empty() {
             for argument in args {
                 self.check_expr(&argument.value, scopes, method_context);

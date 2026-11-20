@@ -2222,14 +2222,14 @@ extern "C"
 
 function main(): void
 {
-    WritablePointer<Opaque> $owned = unsafe(Handle::create(new Counter(3)));
+    WritablePointer<Opaque> $owned = Handle::create(new Counter(3));
     unsafe {
         show(Handle::borrow($owned));
         Counter $back = Handle::reclaim($owned);
         echo " back " . $back->count;
     }
     Shape $shape = new Circle();
-    WritablePointer<Opaque> $boxed = unsafe(Handle::create($shape));
+    WritablePointer<Opaque> $boxed = Handle::create($shape);
     unsafe {
         describe(Handle::borrow($boxed));
         Shape $again = Handle::reclaim($boxed);
@@ -2237,7 +2237,7 @@ function main(): void
     }
     SharedReference<Counter> $shared = shared new Counter(7);
     let $second = $shared->share();
-    WritablePointer<Opaque> $claim = unsafe($shared->toHandle());
+    WritablePointer<Opaque> $claim = $shared->toHandle();
     unsafe {
         SharedReference<Counter> $returned = SharedReference::reclaim($claim);
         echo " shared " . $returned->count;

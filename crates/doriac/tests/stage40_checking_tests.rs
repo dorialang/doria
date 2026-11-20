@@ -1460,11 +1460,12 @@ function show(Counter $counter): void
 
 #[test]
 fn handles_hold_class_values_and_take_their_type_from_the_expected_type() {
-    // Decision 0148 section 11: every handle operation needs an unsafe
-    // context (plan §3.5), `Handle` holds class values, and `reclaim` and
-    // `borrow` read their value type from where the result goes.
+    // Decision 0148 section 11: handing a value to C (`Handle::create`,
+    // `toHandle`) is safe and only `reclaim` and `borrow` need an unsafe
+    // context, `Handle` holds class values, and `reclaim` and `borrow` read
+    // their value type from where the result goes.
     let accepted = format!(
-        "{HANDLES}function main(): void {{ unsafe {{ WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); show(Handle::borrow($handle)); Counter $back = Handle::reclaim($handle); SharedReference<Counter> $shared = shared new Counter(2); WritablePointer<Opaque> $claim = $shared->toHandle(); SharedReference<Counter> $again = SharedReference::reclaim($claim); }} }}"
+        "{HANDLES}function main(): void {{ WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); SharedReference<Counter> $shared = shared new Counter(2); WritablePointer<Opaque> $claim = $shared->toHandle(); unsafe {{ show(Handle::borrow($handle)); Counter $back = Handle::reclaim($handle); SharedReference<Counter> $again = SharedReference::reclaim($claim); }} }}"
     );
     assert_eq!(
         codes(&accepted),
@@ -1474,12 +1475,12 @@ fn handles_hold_class_values_and_take_their_type_from_the_expected_type() {
     );
     for (body, code, title) in [
         (
-            "unsafe { let $handle = Handle::create(3); }",
+            "let $handle = Handle::create(3);",
             "E0807",
             "Handle Holds A Class Value",
         ),
         (
-            "unsafe { WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); let $back = Handle::reclaim($handle); }",
+            "WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); unsafe { let $back = Handle::reclaim($handle); }",
             "E0808",
             "Handle Needs A Value Type",
         ),
@@ -1489,14 +1490,19 @@ fn handles_hold_class_values_and_take_their_type_from_the_expected_type() {
             "Unknown Method",
         ),
         (
-            "WritablePointer<Opaque> $handle = Handle::create(new Counter(1));",
+            "WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); Counter $back = Handle::reclaim($handle);",
             "E0785",
             "Unsafe Operation Outside An Unsafe Context",
         ),
         (
-            "WritablePointer<Opaque> $handle = unsafe(Handle::create(new Counter(1))); show(unsafe(Handle::borrow($handle)));",
+            "WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); show(unsafe(Handle::borrow($handle)));",
             "E0809",
             "Borrowed Handle Value Leaves Its Unsafe Context",
+        ),
+        (
+            "WritablePointer<Opaque> $handle = unsafe(Handle::create(new Counter(1)));",
+            "E0797",
+            "Unused Unsafe Context",
         ),
     ] {
         let source = format!("{HANDLES}function main(): void {{ {body} }}");
@@ -1513,8 +1519,8 @@ fn handles_hold_class_values_and_take_their_type_from_the_expected_type() {
 #[test]
 fn a_handle_takes_its_value_and_to_handle_consumes_the_reference() {
     for body in [
-        "let $counter = new Counter(1); WritablePointer<Opaque> $handle = unsafe(Handle::create($counter)); echo $counter->count;",
-        "SharedReference<Counter> $shared = shared new Counter(1); WritablePointer<Opaque> $claim = unsafe($shared->toHandle()); echo $shared->count;",
+        "let $counter = new Counter(1); WritablePointer<Opaque> $handle = Handle::create($counter); echo $counter->count;",
+        "SharedReference<Counter> $shared = shared new Counter(1); WritablePointer<Opaque> $claim = $shared->toHandle(); echo $shared->count;",
     ] {
         let source = format!("{HANDLES}function main(): void {{ {body} }}");
         assert!(codes(&source).contains(&"E0470"), "{body}: {:#?}", findings(&source));
