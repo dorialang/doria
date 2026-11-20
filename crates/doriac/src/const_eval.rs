@@ -1406,7 +1406,7 @@ pub enum ConstType {
     NullableInline(crate::inline_value::InlineValueType),
     /// A nullable type with no constant values of its own, so `null` is its
     /// only constant: the nullable runtime handles and keys, the nullable
-    /// pointers `?Ptr<T>` and `?MutPtr<T>`, and the nullable C function
+    /// pointers `?Pointer<T>` and `?WritablePointer<T>`, and the nullable C function
     /// pointer types (Decision 0148 sections 3 and 12).
     NullOnly(Box<TypeRef>),
 }
@@ -1556,7 +1556,7 @@ impl fmt::Display for ConstType {
 fn has_only_null_constant(ty: &TypeRef) -> bool {
     let pointer = ty.function.is_none()
         && ty.arguments.len() == 1
-        && [crate::foreign::PTR, crate::foreign::MUT_PTR].contains(&ty.name.as_str());
+        && [crate::foreign::POINTER, crate::foreign::WRITABLE_POINTER].contains(&ty.name.as_str());
     let c_function = ty
         .function
         .as_ref()

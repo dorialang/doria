@@ -744,7 +744,7 @@ impl<'a> Resolver<'a> {
             },
             diagnostics: {
                 // A program with unsafe or foreign forms stops here, before an
-                // unimplemented name such as `Doria\Std\Ffi\Ptr` reads as an
+                // unimplemented name such as `Doria\Std\Ffi\Pointer` reads as an
                 // unknown one.
                 let unavailable = crate::unsafe_code::unchecked_forms(self.authored);
                 if unavailable.is_empty() {

@@ -32,9 +32,9 @@ pub enum StringValueType {
     StringIterable,
     /// `Ordering`.
     Ordering,
-    /// `Doria\Std\Ffi\Ptr<CChar>`, a NUL-terminated C string.
+    /// `Doria\Std\Ffi\Pointer<CChar>`, a NUL-terminated C string.
     CStringPointer,
-    /// `Doria\Std\Ffi\Ptr<uint16>`, NUL-terminated UTF-16 text.
+    /// `Doria\Std\Ffi\Pointer<uint16>`, NUL-terminated UTF-16 text.
     Utf16Pointer,
     /// A pending member whose result type is not decided yet.
     Undecided,

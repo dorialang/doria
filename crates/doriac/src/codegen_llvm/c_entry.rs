@@ -407,7 +407,7 @@ fn emit<'ctx>(
                     .into()
             }
             // A pointer, nullable or not, is its address word on both sides;
-            // a null `?Ptr<T>` is address zero.
+            // a null `?Pointer<T>` is address zero.
             mir::Type::Scalar(mir::ScalarType::Inline(_)) | mir::Type::NullableScalar(_) => build(
                 builder.build_ptr_to_int(value.into_pointer_value(), word, "c.entry.address"),
             )?
@@ -478,7 +478,7 @@ fn emit<'ctx>(
             let value =
                 returned.ok_or_else(|| malformed_mir("a C entry's function returns its value"))?;
             let value: BasicValueEnum<'ctx> = match ty {
-                // An absent `?Ptr<T>` is already address zero.
+                // An absent `?Pointer<T>` is already address zero.
                 mir::Type::Scalar(mir::ScalarType::Inline(_)) | mir::Type::NullableScalar(_) => {
                     build(builder.build_int_to_ptr(
                         value.into_int_value(),

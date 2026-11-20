@@ -374,7 +374,7 @@ fn emit(
                         .bitcast(types::I32, MemFlagsData::new(), value),
                 );
             }
-            // A null `?Ptr<T>` is address zero.
+            // A null `?Pointer<T>` is address zero.
             mir::Type::NullableScalar(_) => {
                 let present = builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0);
                 values.push(builder.ins().uextend(pointer, present));
@@ -449,7 +449,7 @@ fn emit(
                 (mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)), _) => builder
                     .ins()
                     .bitcast(types::F32, MemFlagsData::new(), value),
-                // An absent `?Ptr<T>` is address zero.
+                // An absent `?Pointer<T>` is address zero.
                 (mir::Type::NullableScalar(_), _) => {
                     let payload = *results
                         .get(1)

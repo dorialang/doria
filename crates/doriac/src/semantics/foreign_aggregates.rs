@@ -279,7 +279,7 @@ impl<'program> Checker<'program> {
                 span,
             )
             .with_title("Foreign Type Is Not Valid Here")
-            .with_help(format!("write `Ptr<{short}>` or `MutPtr<{short}>`")),
+            .with_help(format!("write `Pointer<{short}>` or `WritablePointer<{short}>`")),
         );
     }
 

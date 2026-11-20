@@ -9709,7 +9709,7 @@ impl Checker<'_> {
         );
     }
 
-    /// `Ptr::to($place)` or `MutPtr::to($place)`: the place is read, or
+    /// `Pointer::to($place)` or `WritablePointer::to($place)`: the place is read, or
     /// written as an assignment target is, then pinned until the innermost enclosing
     /// unsafe context ends (Decision 0148 section 7). Within the context it
     /// cannot be moved or replaced (`breaking_pin`). Forming a pointer
@@ -9731,7 +9731,7 @@ impl Checker<'_> {
         };
         let roots = self.borrow_root_keys(place, scopes);
         // The place itself is used, as an assignment target is: a
-        // `MutPtr::to` place must be writable.
+        // `WritablePointer::to` place must be writable.
         let pins = std::mem::take(&mut self.unsafe_pins);
         self.use_expr(place, scopes, mode);
         self.unsafe_pins = pins;
@@ -9791,7 +9791,7 @@ impl Checker<'_> {
     /// `$region->pointer` or `$region->writablePointer` (Decision 0148
     /// section 7): the region is read, or used with writable access, and the
     /// region and the storage it borrows are pinned until the innermost
-    /// enclosing unsafe context ends, as `Ptr::to` pins its place. The
+    /// enclosing unsafe context ends, as `Pointer::to` pins its place. The
     /// storage, not the region descriptor, is what the pointer addresses, so
     /// the storage must outlive the context.
     fn form_region_pointer(

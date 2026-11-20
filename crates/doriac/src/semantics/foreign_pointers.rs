@@ -3,8 +3,8 @@
 //!
 //! The members and their contracts are the table in
 //! [`crate::pointer_intrinsics`]; this module types them. A conversion whose
-//! target comes from the expected type (`Ptr::cast`, `Ptr::fromAddress`,
-//! `Ptr::toFunction`) reads the type recorded for the call's position.
+//! target comes from the expected type (`Pointer::cast`, `Pointer::fromAddress`,
+//! `Pointer::toFunction`) reads the type recorded for the call's position.
 
 use super::*;
 use crate::foreign::{ForeignType, PointerAccess};
@@ -237,7 +237,7 @@ impl<'program> Checker<'program> {
             });
         } else if pointer_intrinsics::instance_member(other_access, name).is_some() {
             diagnostic = diagnostic.with_help(format!(
-                "`Ptr<T>` gives read access only; `{name}` needs a `MutPtr<T>`"
+                "`Pointer<T>` gives read access only; `{name}` needs a `WritablePointer<T>`"
             ));
         } else {
             let members = pointer_intrinsics::instance_members(receiver.access)
@@ -315,7 +315,7 @@ impl<'program> Checker<'program> {
         Some(self.null_safe_result_type(result, null_safe))
     }
 
-    /// A static call on `Ptr`, `MutPtr`, `Opaque` or a C boundary type.
+    /// A static call on `Pointer`, `WritablePointer`, `Opaque` or a C boundary type.
     /// Returns false for every other class.
     pub(super) fn check_foreign_companion_call(
         &mut self,
@@ -333,7 +333,7 @@ impl<'program> Checker<'program> {
                     access.member_span,
                 )
                 .with_title("Unknown Method")
-                .with_help("`Opaque` names the untyped pointee of `Ptr<Opaque>` and `MutPtr<Opaque>`; it has no members"),
+                .with_help("`Opaque` names the untyped pointee of `Pointer<Opaque>` and `WritablePointer<Opaque>`; it has no members"),
             );
             return true;
         }
@@ -411,13 +411,13 @@ impl<'program> Checker<'program> {
             .with_title("Unknown Method");
             diagnostic = diagnostic.with_help(match (pointer, member_name) {
                 (PointerAccess::Write, "fromAddress") => {
-                    "convert the address with `Ptr::fromAddress`, then give it write access with `MutPtr::cast`".to_string()
+                    "convert the address with `Pointer::fromAddress`, then give it write access with `WritablePointer::cast`".to_string()
                 }
                 (PointerAccess::Write, "toFunction") => {
-                    "convert the address with `Ptr::toFunction`".to_string()
+                    "convert the address with `Pointer::toFunction`".to_string()
                 }
                 (PointerAccess::Write, "from") => {
-                    "form a `MutPtr` with `MutPtr::to` or `MutPtr::cast`; `Ptr::from` drops write access".to_string()
+                    "form a `WritablePointer` with `WritablePointer::to` or `WritablePointer::cast`; `Pointer::from` drops write access".to_string()
                 }
                 _ => format!(
                     "`{companion}` has {}",
@@ -505,7 +505,9 @@ impl<'program> Checker<'program> {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0408",
-                            format!("argument 1 of {callee} expects `MutPtr<T>`, got `{got}`"),
+                            format!(
+                                "argument 1 of {callee} expects `WritablePointer<T>`, got `{got}`"
+                            ),
                             argument.span(),
                         )
                         .with_title("Argument Type Mismatch")
@@ -558,10 +560,10 @@ impl<'program> Checker<'program> {
         .with_title("Pointer Conversion Needs A Target Type");
         diagnostic = diagnostic.with_help(match operation {
             PointerOperation::ToFunction => {
-                "declare the result with its type, as in `extern \"C\" function(int32): int32 $callback = Ptr::toFunction($address);`".to_string()
+                "declare the result with its type, as in `extern \"C\" function(int32): int32 $callback = Pointer::toFunction($address);`".to_string()
             }
             PointerOperation::FromAddress => {
-                "declare the result with its type, as in `?Ptr<uint8> $bytes = Ptr::fromAddress($address);`".to_string()
+                "declare the result with its type, as in `?Pointer<uint8> $bytes = Pointer::fromAddress($address);`".to_string()
             }
             _ => format!(
                 "declare the result with its type, as in `{0}<uint8> $bytes = {0}::cast($pointer);`",
@@ -596,8 +598,8 @@ impl<'program> Checker<'program> {
         fits.then_some(target)
     }
 
-    /// `Ptr::to($place)` and `MutPtr::to($place)`: a local, a foreign struct
-    /// field or a property, of an FFI-safe type. Whether a `MutPtr::to`
+    /// `Pointer::to($place)` and `WritablePointer::to($place)`: a local, a foreign struct
+    /// field or a property, of an FFI-safe type. Whether a `WritablePointer::to`
     /// place is writable is the ownership checker's rule, as for every write.
     fn check_pointer_place(
         &mut self,
@@ -616,7 +618,7 @@ impl<'program> Checker<'program> {
                 )
                 .with_title("Pointer Source Is Not A Place")
                 .with_explanation(
-                    "`Ptr::to` and `MutPtr::to` address a local, a foreign struct field or a property, and keep it in place until the unsafe context ends. A computed value has no lasting storage to address.",
+                    "`Pointer::to` and `WritablePointer::to` address a local, a foreign struct field or a property, and keep it in place until the unsafe context ends. A computed value has no lasting storage to address.",
                 )
                 .with_help("store the value in a local first, then form the pointer to the local"),
             );

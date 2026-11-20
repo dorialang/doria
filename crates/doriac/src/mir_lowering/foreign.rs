@@ -7,7 +7,7 @@
 //! `Statement::Pointer` over a pointer local, so both native backends lower
 //! one checked operation per statement and the interpreter can find every
 //! one before it runs a program. Conversions that keep the address (`cast`,
-//! `Ptr::from`, `toFunction`) are the value itself.
+//! `Pointer::from`, `toFunction`) are the value itself.
 
 use super::*;
 use crate::foreign::{ForeignType, PointerAccess};

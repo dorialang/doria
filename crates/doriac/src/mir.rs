@@ -6450,9 +6450,9 @@ pub enum PointerOperation {
     },
     /// `$pointer->address`, as `uint64`.
     Address { pointer: LocalId },
-    /// `Ptr::fromAddress`: `?Ptr`, absent for address zero.
+    /// `Pointer::fromAddress`: `?Pointer`, absent for address zero.
     FromAddress { address: IntegerExpression },
-    /// `Ptr::to($place)` and `MutPtr::to($place)`: the address of the place
+    /// `Pointer::to($place)` and `WritablePointer::to($place)`: the address of the place
     /// the local names, its own storage or the place it borrows, `offset`
     /// bytes in: zero for the whole local, a field's offset for a field of
     /// a foreign struct or union. Checking pins that place for the

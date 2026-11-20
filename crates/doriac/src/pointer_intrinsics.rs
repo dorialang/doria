@@ -1,7 +1,7 @@
 //! Source contracts for raw pointers and C boundary values (Decision 0148
 //! sections 4, 5 and 7).
 //!
-//! The table names every member of `Ptr<T>`, `MutPtr<T>` and the C boundary
+//! The table names every member of `Pointer<T>`, `WritablePointer<T>` and the C boundary
 //! types, the operation it performs, whether it needs an unsafe context and
 //! whether it needs a pointee with a size. Checking types each member from
 //! its operation; ownership recognizes pointer formation through
@@ -23,18 +23,18 @@ pub enum PointerOperation {
     ByteOffset,
     /// `$pointer->address: uint64`.
     Address,
-    /// `Ptr::cast($pointer)` and `MutPtr::cast($pointer)`: the target comes
+    /// `Pointer::cast($pointer)` and `WritablePointer::cast($pointer)`: the target comes
     /// from the expected type.
     Cast,
-    /// `Ptr::fromAddress(uint64 $address): ?Ptr<T>`, `T` from the expected
+    /// `Pointer::fromAddress(uint64 $address): ?Pointer<T>`, `T` from the expected
     /// type.
     FromAddress,
-    /// `Ptr::toFunction(Ptr<Opaque> $address)`: the C function pointer type of
+    /// `Pointer::toFunction(Pointer<Opaque> $address)`: the C function pointer type of
     /// the expected type.
     ToFunction,
-    /// `Ptr::from(MutPtr<T> $pointer): Ptr<T>`.
+    /// `Pointer::from(WritablePointer<T> $pointer): Pointer<T>`.
     DropWriteAccess,
-    /// `Ptr::to($place)` and `MutPtr::to($place)`: the address of an FFI-safe
+    /// `Pointer::to($place)` and `WritablePointer::to($place)`: the address of an FFI-safe
     /// place, pinned to the end of the innermost enclosing unsafe context.
     AddressOf,
 }
@@ -63,7 +63,7 @@ impl PointerMember {
 
 impl PointerOperation {
     /// Reading, writing and moving by elements use the pointee's size, so
-    /// `Ptr<Opaque>` and a pointer to a foreign struct declared without
+    /// `Pointer<Opaque>` and a pointer to a foreign struct declared without
     /// fields have no such member.
     pub const fn needs_sized_pointee(self) -> bool {
         matches!(self, Self::Read { .. } | Self::Write { .. } | Self::Offset)
@@ -103,7 +103,7 @@ pub fn instance_members(access: PointerAccess) -> Vec<PointerMember> {
         .collect()
 }
 
-/// The instance member `name` of `Ptr<T>` or `MutPtr<T>`.
+/// The instance member `name` of `Pointer<T>` or `WritablePointer<T>`.
 pub fn instance_member(access: PointerAccess, name: &str) -> Option<PointerMember> {
     let member = |name, kind, operation, documentation| {
         Some(PointerMember {
@@ -161,7 +161,7 @@ pub fn instance_member(access: PointerAccess, name: &str) -> Option<PointerMembe
     }
 }
 
-/// The static member `name` of the `Ptr` or `MutPtr` companion.
+/// The static member `name` of the `Pointer` or `WritablePointer` companion.
 pub fn static_member(access: PointerAccess, name: &str) -> Option<PointerMember> {
     let member = |name, operation, documentation| {
         Some(PointerMember {
@@ -180,7 +180,7 @@ pub fn static_member(access: PointerAccess, name: &str) -> Option<PointerMember>
         (_, "to") => member(
             "to",
             PointerOperation::AddressOf,
-            "The address of a local, a foreign struct field or a property of FFI-safe type. `MutPtr::to` needs a writable place. Forming it pins the place until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
+            "The address of a local, a foreign struct field or a property of FFI-safe type. `WritablePointer::to` needs a writable place. Forming it pins the place until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
         ),
         (PointerAccess::Read, "fromAddress") => member(
             "fromAddress",
@@ -203,7 +203,7 @@ pub fn static_member(access: PointerAccess, name: &str) -> Option<PointerMember>
 
 const STATIC_MEMBERS: [&str; 5] = ["cast", "to", "fromAddress", "toFunction", "from"];
 
-/// Every static member of the `Ptr` or `MutPtr` companion.
+/// Every static member of the `Pointer` or `WritablePointer` companion.
 pub fn static_members(access: PointerAccess) -> Vec<PointerMember> {
     STATIC_MEMBERS
         .into_iter()
@@ -245,7 +245,7 @@ impl BoundaryConversion {
     }
 }
 
-/// The companion a static call names, when it is `Ptr`, `MutPtr` or a C
+/// The companion a static call names, when it is `Pointer`, `WritablePointer` or a C
 /// boundary type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForeignCompanion {
@@ -276,7 +276,7 @@ impl ForeignCompanion {
     }
 }
 
-/// `Ptr::to($place)` or `MutPtr::to($place)`: the access the pointer gives.
+/// `Pointer::to($place)` or `WritablePointer::to($place)`: the access the pointer gives.
 pub fn formation(qualifier: &StaticQualifier, method: &str) -> Option<PointerAccess> {
     let StaticQualifier::Class(class) = qualifier else {
         return None;

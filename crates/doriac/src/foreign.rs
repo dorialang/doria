@@ -8,8 +8,8 @@
 use crate::ast::ForeignAggregateKind;
 
 pub const NAMESPACE: &str = "Doria\\Std\\Ffi";
-pub const PTR: &str = "Doria\\Std\\Ffi\\Ptr";
-pub const MUT_PTR: &str = "Doria\\Std\\Ffi\\MutPtr";
+pub const POINTER: &str = "Doria\\Std\\Ffi\\Pointer";
+pub const WRITABLE_POINTER: &str = "Doria\\Std\\Ffi\\WritablePointer";
 pub const OPAQUE: &str = "Doria\\Std\\Ffi\\Opaque";
 
 /// The panic of `CLong::from` and the other boundary types' `from` for a
@@ -21,7 +21,7 @@ pub const BOUNDARY_CONVERSION_PANIC_CODE: &str = "P1701";
 pub const POINTER_ALIGNMENT_PANIC_CODE: &str = "P1702";
 
 /// The panic of `offset` and `byteOffset` when the address leaves the
-/// address space or reaches zero, which no `Ptr<T>` holds (section 4).
+/// address space or reaches zero, which no `Pointer<T>` holds (section 4).
 pub const POINTER_ADDRESS_PANIC_CODE: &str = "P1703";
 
 /// The panic of a construction that supplies a fixed-length array field
@@ -88,7 +88,7 @@ impl ForeignStringEncoding {
     }
 }
 
-/// Read access (`Ptr<T>`) or read and write access (`MutPtr<T>`).
+/// Read access (`Pointer<T>`) or read and write access (`WritablePointer<T>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PointerAccess {
     Read,
@@ -98,22 +98,22 @@ pub enum PointerAccess {
 impl PointerAccess {
     pub const fn source_name(self) -> &'static str {
         match self {
-            Self::Read => PTR,
-            Self::Write => MUT_PTR,
+            Self::Read => POINTER,
+            Self::Write => WRITABLE_POINTER,
         }
     }
 
     pub const fn short_name(self) -> &'static str {
         match self {
-            Self::Read => "Ptr",
-            Self::Write => "MutPtr",
+            Self::Read => "Pointer",
+            Self::Write => "WritablePointer",
         }
     }
 
     pub fn from_source_name(name: &str) -> Option<Self> {
         match name {
-            PTR => Some(Self::Read),
-            MUT_PTR => Some(Self::Write),
+            POINTER => Some(Self::Read),
+            WRITABLE_POINTER => Some(Self::Write),
             _ => None,
         }
     }
@@ -232,13 +232,13 @@ pub struct ForeignAggregateType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ForeignType<T> {
-    /// `Ptr<T>` or `MutPtr<T>`: one machine word, never null. `?Ptr<T>` is the
+    /// `Pointer<T>` or `WritablePointer<T>`: one machine word, never null. `?Pointer<T>` is the
     /// nullable C pointer.
     Pointer {
         access: PointerAccess,
         pointee: T,
     },
-    /// The pointee-only type behind `Ptr<Opaque>`: no values and no size.
+    /// The pointee-only type behind `Pointer<Opaque>`: no values and no size.
     Opaque,
     Boundary(CBoundaryType),
     Function(CFunctionType<T>),
@@ -319,7 +319,7 @@ impl<T> ForeignType<T> {
 /// Every compiler-known type name of `Doria\Std\Ffi` that the type model
 /// carries itself, rather than a declaration in the module source.
 pub fn type_names() -> impl Iterator<Item = &'static str> {
-    [PTR, MUT_PTR, OPAQUE]
+    [POINTER, WRITABLE_POINTER, OPAQUE]
         .into_iter()
         .chain(
             CBoundaryType::ALL

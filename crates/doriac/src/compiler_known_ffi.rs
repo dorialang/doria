@@ -1,6 +1,6 @@
 //! Compiler-owned `Doria\Std\Ffi` declarations (Decision 0148 section 1).
 //!
-//! `Ptr`, `MutPtr`, `Opaque` and the C boundary types are carried by the type
+//! `Pointer`, `WritablePointer`, `Opaque` and the C boundary types are carried by the type
 //! model itself ([`crate::foreign`]). The enums and attribute classes below
 //! are ordinary Doria, so attribute arguments are checked by the typed
 //! attribute machinery of Decision 0125.

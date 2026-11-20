@@ -659,7 +659,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::NullableRegion(_) => pointer_width.checked_mul(3),
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
         mir::Type::ClosureEnvironment(_) => Some(pointer_width),
-        // A null pointer is address zero, so `?Ptr<T>` is stored as its
+        // A null pointer is address zero, so `?Pointer<T>` is stored as its
         // word and the runtime reads zero as absent.
         mir::Type::NullableScalar(scalar)
             if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>

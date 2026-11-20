@@ -14,7 +14,7 @@ const EVERY_FORM: &str = r#"declare(unsafe: "allow");
 
 namespace App\Native;
 
-use Doria\Std\Ffi\{CChar, CSize, CUnsignedLong, MutPtr, Opaque, Ptr};
+use Doria\Std\Ffi\{CChar, CSize, CUnsignedLong, Opaque, Pointer, WritablePointer};
 
 /**
  * Bindings to zlib.
@@ -29,9 +29,9 @@ internal extern "C"
 
     #[LinkName("printf")]
     #[Variadic(fixedParameters: 1)]
-    function printInteger(Ptr<CChar> $format, int32 $value = 0): int32;
+    function printInteger(Pointer<CChar> $format, int32 $value = 0): int32;
 
-    function malloc(CSize $size): ?MutPtr<Opaque>;
+    function malloc(CSize $size): ?WritablePointer<Opaque>;
 }
 
 extern "C" struct ZStream;
@@ -50,14 +50,14 @@ extern "C" union EventStorage
     uint16[128] $tip;
 }
 
-extern "C" function windowProcedure(Ptr<Opaque> $window, uint32 $message): int64
+extern "C" function windowProcedure(Pointer<Opaque> $window, uint32 $message): int64
 {
     return 0;
 }
 
 class Buffer
 {
-    ?extern "C" function(Ptr<Opaque>, uint32): int64 $procedure = null;
+    ?extern "C" function(Pointer<Opaque>, uint32): int64 $procedure = null;
 
     /** @safety The buffer outlives every pointer it hands out. */
     unsafe function address(): uint64
@@ -77,7 +77,7 @@ interface Device
 }
 
 /** @safety The caller owns `$pointer`. */
-unsafe function release(MutPtr<Opaque> $pointer): void
+unsafe function release(WritablePointer<Opaque> $pointer): void
 {
     unsafe {
         free($pointer);
@@ -230,7 +230,7 @@ fn every_stage40_form_parses_without_a_parser_error() {
     };
     assert_eq!(
         procedure.ty.to_string(),
-        "?extern \"C\" function(Ptr<Opaque>, uint32): int64"
+        "?extern \"C\" function(Pointer<Opaque>, uint32): int64"
     );
     let doriac::ast::ClassMember::Method(address) = &class.members[1] else {
         panic!("method");

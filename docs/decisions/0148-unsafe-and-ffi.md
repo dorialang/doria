@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-ABI Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-ABI Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -44,7 +44,7 @@ question's subject and his selection, quoted.
 27. Safety documentation: "Safety section, shown at call sites (Recommended)".
 
 These rulings amend plan D3 for foreign layouts, replace the plan's
-`Ptr<void>` with `Ptr<Opaque>`, move native-library declarations from plan
+`Ptr<void>` with `Pointer<Opaque>`, move native-library declarations from plan
 Appendix A's deferral into Stage 40, and give the interpreter and PHP output
 native execution of unsafe code. The amendments are listed under Invalidated
 Elsewhere.
@@ -113,6 +113,36 @@ library beside the program it builds, for direct `doriac compile`,
 `doriac run`, Baton builds and the companion library. Baton resolves them,
 records them in the receipt and passes them to `doriac` in build-plan schema
 2. Section 19 states the rule.
+
+### Amendment: Readable Names (2026-11-20)
+
+Section 11 did not say what the handle of a class value holds when the class
+is open, so the value's dynamic type can differ from its static type. Andrew
+answered that card on 2026-11-20: "Closed: object pointer... but I want to
+address something else that needs care! Doria should not look like Rust. I
+don't like Rust's mysterious encantations... MutPtr is another Rust like
+spelling... it doesn't not meet the standard of "Readable code"." He then
+ruled on three naming cards: "`Pointer<T>` and `WritablePointer<T>`
+(Recommended)", "create, reclaim, borrow (Recommended)" and
+"`fromPointer($owner, $pointer, $length)` (Recommended)".
+
+- `Ptr<T>` is `Pointer<T>` and `MutPtr<T>` is `WritablePointer<T>` in every
+  form: `?Pointer<T>`, `Pointer<Opaque>`, `Pointer::to`,
+  `WritablePointer::to`, `Pointer::cast`, `WritablePointer::cast`,
+  `Pointer::fromAddress`, `Pointer::from` and `Pointer::toFunction`. The names
+  match `ByteRegion` and `WritableByteRegion` and the regions' `pointer` and
+  `writablePointer` properties.
+- `Handle::create`, `Handle::reclaim` and `Handle::borrow`, with
+  `$reference->toHandle()`, `SharedReference::reclaim` and
+  `SharedReference::borrow` and the same pair on `WritableSharedReference`,
+  replace `intoRaw`, `fromRaw` and `borrowRaw` (section 11).
+- `ByteRegion::fromPointer`, `WritableByteRegion::fromPointer`,
+  `ArrayRegion::fromPointer` and `WritableArrayRegion::fromPointer` replace
+  `fromRaw` (section 10).
+- The earlier spellings are not kept as aliases.
+- A closed class's handle is its object pointer, and an open class's handle
+  points to a heap box holding the object and its descriptor. Section 11
+  states the rule.
 
 ## Context
 
@@ -185,7 +215,7 @@ Its consumers are concrete:
 ### Inconsistencies in the sources, and how this record resolves them
 
 1. Plan §3.5 used `Ptr<void>`, which Decision 0069 (line 27), plan §4.8 and SPEC
-   §7 forbid. Resolved: `Ptr<Opaque>` (ruling 3); plan §3.5 amended.
+   §7 forbid. Resolved: `Pointer<Opaque>` (ruling 3); plan §3.5 amended.
 2. Plan §4.9 placed zero-copy views over `uint8[]`/`Bytes` in the unsafe tier;
    Decision 0110 had already delivered safe byte regions. Resolved: views are
    safe regions and only their pointer accessors need `unsafe` (rulings 7 and
@@ -226,7 +256,7 @@ Its consumers are concrete:
 - FFI must not copy all buffers by default (plan Stage 40 entry).
 - `doriac` never parses `Baton.toml`; packages have no build scripts
   (Decisions 0117, 0118).
-- `Ptr<T>` is not display-convertible (plan §4.6); `resource` stays reserved
+- `Pointer<T>` is not display-convertible (plan §4.6); `resource` stays reserved
   for the PHP bridge (plan §4.8).
 - No implicit conversions (plan D15); checked arithmetic in both profiles (plan
   D4); abort-only panics that never unwind (plan §3.6, Decision 0040).
@@ -242,13 +272,13 @@ Its consumers are concrete:
 
 ### 1. The `Doria\Std\Ffi` module
 
-`Ptr`, `MutPtr`, `Opaque`, the C boundary types, `CString`, `Utf16String`,
-`Handle`, `ForeignCall`, `Platform`, `OperatingSystem`, `Architecture`,
-`SystemCodeSource` and the FFI attributes (`Library`, `LinkName`, `Variadic`,
-`CaptureSystemCode`, `NonBlocking`) are compiler-known members of
-`Doria\Std\Ffi`. A file imports what it uses:
-`use Doria\Std\Ffi\{Ptr, MutPtr, Opaque};`. The keywords `unsafe` and `extern`
-are language-level. `ArrayRegion<T>` and `WritableArrayRegion<T>` are core
+`Pointer`, `WritablePointer`, `Opaque`, the C boundary types, `CString`,
+`Utf16String`, `Handle`, `ForeignCall`, `Platform`, `OperatingSystem`,
+`Architecture`, `SystemCodeSource` and the FFI attributes (`Library`,
+`LinkName`, `Variadic`, `CaptureSystemCode`, `NonBlocking`) are
+compiler-known members of `Doria\Std\Ffi`. A file imports what it uses:
+`use Doria\Std\Ffi\{Opaque, Pointer, WritablePointer};`. The keywords
+`unsafe` and `extern` are language-level. `ArrayRegion<T>` and `WritableArrayRegion<T>` are core
 types beside `T[]` (section 8). `String::fromCString` and `String::fromUtf16`
 are `String` companion members (Decision 0103).
 
@@ -261,7 +291,7 @@ An unsafe context is either a statement block or a parenthesized expression:
 
 ```doria
 unsafe {
-    $status = deflate(MutPtr::to($stream), Z_FINISH);
+    $status = deflate(WritablePointer::to($stream), Z_FINISH);
 }
 let $bound = unsafe(compressBound($sourceLength));
 ```
@@ -286,18 +316,19 @@ the unit sections 7, 22 and 23 build on. Plan §3.5 records the body rule.
 
 ### 3. Pointer types
 
-- `Ptr<T>` (read access) and `MutPtr<T>` (read and write access) are Copy, one
-  machine word, and never null.
-- `?Ptr<T>` and `?MutPtr<T>` are C nullable pointers: one word, null is address
-  zero, narrowed with `is`, `??` and `?->` (Decision 0093).
+- `Pointer<T>` (read access) and `WritablePointer<T>` (read and write access)
+  are Copy, one machine word, and never null.
+- `?Pointer<T>` and `?WritablePointer<T>` are C nullable pointers: one word,
+  null is address zero, narrowed with `is`, `??` and `?->` (Decision 0093).
 - `Opaque` is a compiler-known pointee-only type with no values and no size.
-  `Ptr<Opaque>` and `MutPtr<Opaque>` spell C's `const void *` and `void *`.
+  `Pointer<Opaque>` and `WritablePointer<Opaque>` spell C's `const void *`
+  and `void *`.
 - A bodyless foreign struct declares a named incomplete C type:
-  `extern "C" struct ZStream;` gives `Ptr<ZStream>`.
+  `extern "C" struct ZStream;` gives `Pointer<ZStream>`.
 - `void` remains return-position only (Decision 0069).
 
 Consequence: the checker proves which pointers may be null at compile time, and
-`?Ptr<T>` passes to C unchanged.
+`?Pointer<T>` passes to C unchanged.
 
 ### 4. Pointer operations
 
@@ -309,16 +340,16 @@ Consequence: the checker proves which pointers may be null at compile time, and
 | Unaligned write | `$mutable->writeUnaligned(T $value): void` | unsafe |
 | Element offset | `$pointer->offset(int $count)` scaled by `T`'s size | unsafe |
 | Byte offset | `$pointer->byteOffset(int $bytes)` | unsafe |
-| Cast | `Ptr::cast($pointer)`, `MutPtr::cast($pointer)`, target from the expected type | unsafe |
-| From address | `Ptr::fromAddress(uint64 $address): ?Ptr<T>` | unsafe |
+| Cast | `Pointer::cast($pointer)`, `WritablePointer::cast($pointer)`, target from the expected type | unsafe |
+| From address | `Pointer::fromAddress(uint64 $address): ?Pointer<T>` | unsafe |
 | Address | `$pointer->address: uint64` | safe |
-| Drop write access | `Ptr::from(MutPtr<T> $pointer): Ptr<T>` | safe |
+| Drop write access | `Pointer::from(WritablePointer<T> $pointer): Pointer<T>` | safe |
 | Copy, `==`, `!=`, null narrowing | ordinary | safe |
 
 - `read` and `write` panic with a catalogued code on a misaligned address in
   both profiles; the unaligned forms carry no alignment requirement.
 - Address arithmetic that overflows panics with a catalogued code.
-- `offset`, `read` and `write` on `Ptr<Opaque>` are compile errors.
+- `offset`, `read` and `write` on `Pointer<Opaque>` are compile errors.
 - `T` in a read or write is an FFI-safe type (section 6).
 
 Consequence: every unchecked memory access is a named verb a search finds, and
@@ -406,24 +437,25 @@ extern "C" union EventStorage
 Consequence: plan D3 gains one exception, foreign C layouts declared with
 `extern "C"`. Classes stay heap move types with private payloads.
 
-FFI-safe types are: fixed-width integers and floats, `bool`, `Ptr<T>`,
-`MutPtr<T>` and their nullable forms, the boundary types, C function pointer
-types (section 12), and foreign structs and unions.
+FFI-safe types are: fixed-width integers and floats, `bool`, `Pointer<T>`,
+`WritablePointer<T>` and their nullable forms, the boundary types, C function
+pointer types (section 12), and foreign structs and unions.
 
 ### 7. Pointers into Doria storage
 
 Formation:
 
-- `$region->pointer: Ptr<uint8>` on `ByteRegion` and `WritableByteRegion`;
-  `$writableRegion->writablePointer: MutPtr<uint8>` requires writable access to
-  the region. Typed regions have the same members with `Ptr<T>` and `MutPtr<T>`
-  when `T` is FFI-safe.
+- `$region->pointer: Pointer<uint8>` on `ByteRegion` and `WritableByteRegion`;
+  `$writableRegion->writablePointer: WritablePointer<uint8>` requires writable
+  access to the region. Typed regions have the same members with `Pointer<T>`
+  and `WritablePointer<T>` when `T` is FFI-safe.
 - `$text->byteRegion->pointer` addresses a string's UTF-8 bytes, without a NUL
   terminator.
-- `Ptr::to($place)` and `MutPtr::to($place)` address an FFI-safe Copy place: a
-  local, a foreign struct field, or a property of FFI-safe type. `MutPtr::to`
-  takes a `writable` parameter, so the place must be writable.
-- A class payload has no pointer form; classes reach C only as raw handles
+- `Pointer::to($place)` and `WritablePointer::to($place)` address an FFI-safe
+  Copy place: a local, a foreign struct field, or a property of FFI-safe type.
+  `WritablePointer::to` takes a `writable` parameter, so the place must be
+  writable.
+- A class payload has no pointer form; classes reach C only as handles
   (section 11).
 - An empty region's pointer is a non-null address aligned for `T` that must not
   be dereferenced.
@@ -472,18 +504,19 @@ addition, and zero-copy numerical exchange reaches C through a safe value.
 - `CString::from(string $text): CString` copies the UTF-8 bytes and appends NUL;
   it panics with a catalogued code on an interior NUL.
   `CString::tryFrom(string $text): ?CString` returns null instead.
-  `$cString->pointer: Ptr<CChar>` borrows it.
+  `$cString->pointer: Pointer<CChar>` borrows it.
 - `Utf16String::from` and `Utf16String::tryFrom` produce NUL-terminated UTF-16
-  for the Windows `W` APIs, with `$utf16->pointer: Ptr<uint16>`.
+  for the Windows `W` APIs, with `$utf16->pointer: Pointer<uint16>`.
 - `CString` and `Utf16String` are Move values that each own one
   NUL-terminated buffer, released deterministically when their owner ends,
   with no reference count. A second copy is an explicit `CString::from($text)`;
   holders pass them readonly or with `take`. Forming `pointer` pins the value
   as section 7 pins any place, so the buffer stays in place while the
   pointer is live (amendment of 2026-11-20).
-- `String::fromCString(Ptr<CChar> $text): ?string` (unsafe) copies up to the
-  NUL and returns null for invalid UTF-8; `String::fromUtf16(Ptr<uint16> $text):
-  ?string` (unsafe) returns null for unpaired surrogates. Both follow
+- `String::fromCString(Pointer<CChar> $text): ?string` (unsafe) copies up to
+  the NUL and returns null for invalid UTF-8;
+  `String::fromUtf16(Pointer<uint16> $text): ?string` (unsafe) returns null
+  for unpaired surrogates. Both follow
   `String::fromBytes` (Decision 0103).
 - APIs taking pointer and length use `$text->byteRegion`.
 - An extern signature never converts a `string` implicitly; `string` is not
@@ -494,10 +527,11 @@ and a returned C string's ownership stays with the binding author.
 
 ### 10. Memory a foreign library allocates
 
-- `ByteRegion::fromRaw($owner, Ptr<uint8> $data, int $length)` and
-  `WritableByteRegion::fromRaw(writable $owner, MutPtr<uint8> $data, int $length)`,
-  and the typed `ArrayRegion::fromRaw` / `WritableArrayRegion::fromRaw`, are
-  unsafe constructors whose region borrows `$owner`.
+- `ByteRegion::fromPointer($owner, Pointer<uint8> $pointer, int $length)` and
+  `WritableByteRegion::fromPointer(writable $owner,
+  WritablePointer<uint8> $pointer, int $length)`, and the typed
+  `ArrayRegion::fromPointer` / `WritableArrayRegion::fromPointer`, are unsafe
+  constructors whose region borrows `$owner` (names amended 2026-11-20).
 - The owner is an ordinary class whose `__destruct` calls the library's own
   release function in an unsafe context. A method returning the region follows
   Decision 0089's elision to `$this`.
@@ -505,11 +539,18 @@ and a returned C string's ownership stays with the binding author.
 ```doria
 class DecodedImage
 {
-    function __construct(internal MutPtr<uint8> $pixels, internal int $length) {}
+    function __construct(
+        internal WritablePointer<uint8> $pixels,
+        internal int $length,
+    ) {}
 
     function getPixels(): ByteRegion
     {
-        return unsafe(ByteRegion::fromRaw($this, Ptr::from($this->pixels), $this->length));
+        return unsafe(ByteRegion::fromPointer(
+            $this,
+            Pointer::from($this->pixels),
+            $this->length,
+        ));
     }
 
     function __destruct()
@@ -528,17 +569,25 @@ region works with every region-taking API, including the Decision 0110 streams.
 
 ### 11. Raw handles
 
-- Owned class values: `Handle::intoRaw(take T $value): MutPtr<Opaque>`;
-  `Handle::fromRaw(MutPtr<Opaque> $handle): T` (unsafe) reclaims ownership.
-- `SharedReference<T>`: `$reference->intoRaw(): MutPtr<Opaque>` consumes one
-  strong claim; `SharedReference::fromRaw($handle)` (unsafe) reclaims it.
+- Owned class values: `Handle::create(take T $value): WritablePointer<Opaque>`;
+  `Handle::reclaim(WritablePointer<Opaque> $handle): T` (unsafe) reclaims
+  ownership.
+- `SharedReference<T>`: `$reference->toHandle(): WritablePointer<Opaque>`
+  consumes one strong claim; `SharedReference::reclaim($handle)` (unsafe)
+  reclaims it.
 - `WritableSharedReference<T>`: the same pair, preserving its family and its
   runtime access checks.
 - Borrowing forms lend without reclaiming, for the enclosing unsafe context:
-  `Handle::borrowRaw($handle)` (readonly access to `T`),
-  `SharedReference::borrowRaw($handle)`, `WritableSharedReference::borrowRaw($handle)`.
+  `Handle::borrow($handle)` (readonly access to `T`),
+  `SharedReference::borrow($handle)` and
+  `WritableSharedReference::borrow($handle)`.
 - `T` comes from the expected type. A handle reclaimed or borrowed as the wrong
   type or family is undefined behavior.
+- A closed class's handle is its object pointer; `Handle::create` allocates
+  nothing. An open class's handle points to a heap box holding the object and
+  its class descriptor: `Handle::reclaim` frees the box and returns the value
+  with its exact dynamic type, and `Handle::borrow` reads through the box
+  (amendment of 2026-11-20).
 - Raw handles are not Stage 41 bridge handles, and no conversion exists between
   them.
 
@@ -549,7 +598,7 @@ second writable access panics where an unchecked pointer would alias.
 ### 12. Callbacks and C function pointers
 
 ```doria
-extern "C" function windowProcedure(Ptr<Opaque> $window, uint32 $message,
+extern "C" function windowProcedure(Pointer<Opaque> $window, uint32 $message,
     uint64 $wParam, int64 $lParam): int64
 {
     ...
@@ -560,12 +609,13 @@ extern "C" function windowProcedure(Ptr<Opaque> $window, uint32 $message,
   `extern "C" function` with a body. It has no captures, type parameters or
   `throws`, and its signature is FFI-safe. Its body is an ordinary context.
 - Its name in expression position is a value of the structural type
-  `extern "C" function(Ptr<Opaque>, uint32, uint64, int64): int64`; the nullable
-  form is `?extern "C" function(...)`. These values are Copy and one word.
+  `extern "C" function(Pointer<Opaque>, uint32, uint64, int64): int64`; the
+  nullable form is `?extern "C" function(...)`. These values are Copy and one
+  word.
 - Calling a C function pointer value is unsafe.
-- `Ptr::toFunction(Ptr<Opaque> $address)` (unsafe) converts an address from
-  `dlsym` or `GetProcAddress` to the C function pointer type of the expected
-  type.
+- `Pointer::toFunction(Pointer<Opaque> $address)` (unsafe) converts an address
+  from `dlsym` or `GetProcAddress` to the C function pointer type of the
+  expected type.
 - A checked error must be handled inside the body, including the automatic
   I/O errors of Decision 0123 (`IoError` and `InvalidUtf8Error`, which `echo`
   can raise). A body that can let one escape is a checking error reported at
@@ -605,7 +655,7 @@ extern "C"
 {
     #[LinkName("printf")]
     #[Variadic(fixedParameters: 1)]
-    function printInteger(Ptr<CChar> $format, int32 $value): int32;
+    function printInteger(Pointer<CChar> $format, int32 $value): int32;
 }
 ```
 
@@ -850,9 +900,10 @@ companion in reverse order at region exit. Writable places are written back
 before the host resumes, on every exit status. A value moved into a host
 operation transfers its token.
 
-**Raw handles in hosted mode.** `intoRaw`, `fromRaw` and `borrowRaw` are host
-operations; the handle is a nonzero address-sized token from a host handle
-table. C treats it as opaque, as section 11 requires.
+**Raw handles in hosted mode.** `Handle::create`, `Handle::reclaim`,
+`Handle::borrow`, `toHandle` and the shared references' `reclaim` and
+`borrow` are host operations; the handle is a nonzero address-sized token
+from a host handle table. C treats it as opaque, as section 11 requires.
 
 **Foreign-backed regions on the host.** A region over foreign memory that leaves
 an unsafe context is represented on the host as address and length; its reads,
@@ -1125,8 +1176,8 @@ foreign call in hooks (26); no documentation enforcement, a required
 - SPEC gains the keywords, the `Doria\Std\Ffi` vocabulary, foreign aggregates,
   platform constants, the `declare` grammar, documentation comments and the
   absent-stream rule.
-- Decision 0110's regions gain pointer accessors and owner-bound `fromRaw`;
-  typed array regions join them.
+- Decision 0110's regions gain pointer accessors and owner-bound
+  `fromPointer`; typed array regions join them.
 - Decision 0125's attribute targets grow to extern blocks and declarations.
 - Decision 0121's function types gain the structural C function pointer form.
 - The build plan moves to schema 2 (link inputs, Windows subsystem, package
@@ -1144,7 +1195,7 @@ foreign call in hooks (26); no documentation enforcement, a required
 
 **Amended with this record (2026-11-16):**
 
-- `docs/doria-end-to-end-plan.md`: D3 (foreign layouts), D12 (`Ptr<Opaque>`,
+- `docs/doria-end-to-end-plan.md`: D3 (foreign layouts), D12 (`Pointer<Opaque>`,
   companion), §3.5 (example, body rule, policy, companion), §4.9 (safe regions),
   §8.2 (interpreter and companion), §8.3 (the ABI review: settled and remaining),
   §9.1 (`ArrayRegion<T>` slicing), the Stage 40 entry (companion and

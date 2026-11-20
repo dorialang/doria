@@ -22723,7 +22723,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let moved = build(self.builder.build_int_add(address, bytes, "pointer.offset"))?;
                 // A negative offset must move down and any other up; wrapping
                 // past either end of the address space, or reaching zero,
-                // leaves every address a `Ptr<T>` can hold.
+                // leaves every address a `Pointer<T>` can hold.
                 let compare = |this: &Self, predicate, left, right, name| {
                     build(this.builder.build_int_compare(predicate, left, right, name))
                 };
@@ -22857,7 +22857,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 Some(self.nullable_value(present, payload.into())?.into())
             }
-            // `?Ptr<T>` is its address, null at zero.
+            // `?Pointer<T>` is its address, null at zero.
             mir::PointerOperation::FromAddress { address } => {
                 Some(self.lower_integer_expression(address)?.into())
             }
@@ -23099,7 +23099,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     word,
                     "foreign.result.address",
                 ))?;
-                // A `?Ptr<T>` result is stored as its word.
+                // A `?Pointer<T>` result is stored as its word.
                 address.into()
             }
             _ => returned,
@@ -23110,7 +23110,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     /// A scalar argument of a foreign call, as C receives it: the value as
-    /// it is stored, so a null `?Ptr<T>` is address zero.
+    /// it is stored, so a null `?Pointer<T>` is address zero.
     fn foreign_scalar_argument(
         &mut self,
         args: &[mir::LocalId],

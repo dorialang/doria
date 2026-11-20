@@ -227,18 +227,18 @@ function main(): void {}
     );
 
     let safe = r#"
-use Doria\Std\Ffi\{CChar, CLong, CSize, MutPtr, Opaque, Ptr};
+use Doria\Std\Ffi\{CChar, CLong, CSize, Opaque, Pointer, WritablePointer};
 
 extern "C"
 {
     /** @safety Pointers are valid for the call. */
-    function copy(MutPtr<uint8> $destination, Ptr<uint8> $source, CSize $length): ?MutPtr<Opaque>;
+    function copy(WritablePointer<uint8> $destination, Pointer<uint8> $source, CSize $length): ?WritablePointer<Opaque>;
 
     /** @safety Pointers are valid for the call. */
-    function length(Ptr<CChar> $text): CLong;
+    function length(Pointer<CChar> $text): CLong;
 
     /** @safety Pointers are valid for the call. */
-    function sort(MutPtr<Opaque> $base, CSize $count, extern "C" function(Ptr<Opaque>, Ptr<Opaque>): int32 $compare): void;
+    function sort(WritablePointer<Opaque> $base, CSize $count, extern "C" function(Pointer<Opaque>, Pointer<Opaque>): int32 $compare): void;
 }
 
 function main(): void {}
@@ -246,7 +246,7 @@ function main(): void {}
     assert!(codes(safe).is_empty(), "{:#?}", findings(safe));
 
     let pointee =
-        "use Doria\\Std\\Ffi\\Ptr; function main(): void { ?Ptr<string> $pointer = null; }";
+        "use Doria\\Std\\Ffi\\Pointer; function main(): void { ?Pointer<string> $pointer = null; }";
     only(pointee, "E0786");
 }
 
@@ -302,7 +302,7 @@ fn foreign_signatures_have_no_effects_modes_or_type_parameters() {
 #[test]
 fn foreign_symbols_follow_the_link_name_rules() {
     let printf = only(
-        "use Doria\\Std\\Ffi\\{CChar, Ptr}; extern \"C\" { /** @safety None. */ function printf(Ptr<CChar> $format): int32; } function main(): void {}",
+        "use Doria\\Std\\Ffi\\{CChar, Pointer}; extern \"C\" { /** @safety None. */ function printf(Pointer<CChar> $format): int32; } function main(): void {}",
         "E0791",
     );
     assert!(printf
@@ -333,17 +333,17 @@ function main(): void {}
     only(conflict, "E0790");
 
     let linked = r#"
-use Doria\Std\Ffi\{CChar, LinkName, Opaque, Ptr};
+use Doria\Std\Ffi\{CChar, LinkName, Opaque, Pointer};
 
 extern "C"
 {
     /** @safety Any value. */
     #[LinkName("objc_msgSend")]
-    function sendNoArguments(Ptr<Opaque> $receiver, Ptr<Opaque> $selector): Ptr<Opaque>;
+    function sendNoArguments(Pointer<Opaque> $receiver, Pointer<Opaque> $selector): Pointer<Opaque>;
 
     /** @safety Any value. */
     #[LinkName("objc_msgSend")]
-    function sendText(Ptr<Opaque> $receiver, Ptr<Opaque> $selector, Ptr<CChar> $text): Ptr<Opaque>;
+    function sendText(Pointer<Opaque> $receiver, Pointer<Opaque> $selector, Pointer<CChar> $text): Pointer<Opaque>;
 }
 
 function main(): void {}
@@ -354,14 +354,14 @@ function main(): void {}
 #[test]
 fn variadic_bindings_declare_promoted_types() {
     let promoted = r#"
-use Doria\Std\Ffi\{CChar, LinkName, Ptr, Variadic};
+use Doria\Std\Ffi\{CChar, LinkName, Pointer, Variadic};
 
 extern "C"
 {
     /** @safety `$format` is a NUL-terminated format. */
     #[LinkName("printf")]
     #[Variadic(fixedParameters: 1)]
-    function printSmall(Ptr<CChar> $format, int16 $value, float32 $ratio): int32;
+    function printSmall(Pointer<CChar> $format, int16 $value, float32 $ratio): int32;
 }
 
 function main(): void {}
@@ -378,14 +378,14 @@ function main(): void {}
     assert!(found.iter().all(|diagnostic| diagnostic.fixes.len() == 1));
 
     let range = r#"
-use Doria\Std\Ffi\{CChar, LinkName, Ptr, Variadic};
+use Doria\Std\Ffi\{CChar, LinkName, Pointer, Variadic};
 
 extern "C"
 {
     /** @safety `$format` is a NUL-terminated format. */
     #[LinkName("printf")]
     #[Variadic(fixedParameters: 3)]
-    function printOne(Ptr<CChar> $format, int32 $value): int32;
+    function printOne(Pointer<CChar> $format, int32 $value): int32;
 }
 
 function main(): void {}
@@ -529,7 +529,7 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
         "Windows Last Error Capture Cannot Be Built Here Yet",
     )) {
         let source = format!(
-            "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, LinkName, Ptr, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
+            "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, LinkName, Pointer, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
         );
         assert!(codes(&source).is_empty(), "{title}: {:#?}", findings(&source));
         let diagnostics = doriac::lower_source_to_mir("ffi.doria", source)
@@ -664,7 +664,7 @@ fn foreign_aggregates_have_fields_and_constants_only() {
 #[test]
 fn an_incomplete_struct_is_used_only_through_a_pointer() {
     let pointer = format!(
-        "use Doria\\Std\\Ffi\\MutPtr; {COLOR} extern \"C\" {{ /** @safety Valid streams. */ function finish(MutPtr<Stream> $stream): int32; }} function main(): void {{}}"
+        "use Doria\\Std\\Ffi\\WritablePointer; {COLOR} extern \"C\" {{ /** @safety Valid streams. */ function finish(WritablePointer<Stream> $stream): int32; }} function main(): void {{}}"
     );
     assert!(codes(&pointer).is_empty(), "{:#?}", findings(&pointer));
     let by_value =
@@ -673,13 +673,13 @@ fn an_incomplete_struct_is_used_only_through_a_pointer() {
     assert!(diagnostic
         .helps
         .iter()
-        .any(|help| help.contains("Ptr<Stream>")));
+        .any(|help| help.contains("Pointer<Stream>")));
 }
 
 #[test]
 fn foreign_aggregates_cross_the_c_boundary_by_value_and_by_pointer() {
     let source = format!(
-        "use Doria\\Std\\Ffi\\Ptr; {COLOR} extern \"C\" {{ /** @safety Any color. */ function blend(Color $left, Ptr<Color> $right): Color; }} function main(): void {{}}"
+        "use Doria\\Std\\Ffi\\Pointer; {COLOR} extern \"C\" {{ /** @safety Any color. */ function blend(Color $left, Pointer<Color> $right): Color; }} function main(): void {{}}"
     );
     assert!(codes(&source).is_empty(), "{:#?}", findings(&source));
 }
@@ -746,7 +746,7 @@ fn assigning_a_fixed_length_array_field_copies_a_region_of_its_count() {
 }
 
 const POINTERS: &str = r#"
-use Doria\Std\Ffi\{CChar, CLong, CSize, MutPtr, Opaque, Ptr};
+use Doria\Std\Ffi\{CChar, CLong, CSize, Opaque, Pointer, WritablePointer};
 
 extern "C" struct Point
 {
@@ -759,11 +759,11 @@ extern "C" struct Handle;
 extern "C"
 {
     /** @safety Any size. */
-    function allocate(CSize $size): MutPtr<Opaque>;
+    function allocate(CSize $size): WritablePointer<Opaque>;
     /** @safety A handle from `openHandle`. */
-    function openHandle(): MutPtr<Handle>;
+    function openHandle(): WritablePointer<Handle>;
     /** @safety A valid callback. */
-    function find(Ptr<CChar> $name): Ptr<Opaque>;
+    function find(Pointer<CChar> $name): Pointer<Opaque>;
 }
 "#;
 
@@ -783,16 +783,16 @@ fn pin_program(body: &str) -> String {
 #[test]
 fn pointer_members_have_their_types() {
     for body in [
-        "unsafe { let $pointer = MutPtr::to($value); $pointer->write(7); int32 $read = $pointer->read(); echo $read; }",
-        "unsafe { let $pointer = MutPtr::to($value); $pointer->writeUnaligned(7); int32 $read = $pointer->readUnaligned(); echo $read; }",
-        "unsafe { let $pointer = Ptr::to($value); Ptr<int32> $next = $pointer->offset(1); Ptr<int32> $byte = $pointer->byteOffset(4); echo $next == $byte; }",
-        "unsafe { let $field = MutPtr::to($point->y); $field->write(5); } unsafe { Point $copy = Ptr::to($point)->read(); echo $copy->x; }",
-        "unsafe { let $pointer = MutPtr::to($value); Ptr<uint8> $bytes = Ptr::cast($pointer); MutPtr<uint8> $writable = MutPtr::cast($pointer); echo $bytes->address == $writable->address; }",
-        "unsafe { ?Ptr<int64> $absent = Ptr::fromAddress(0); echo $absent == null; }",
-        "unsafe { let $address = find(Ptr::cast(Ptr::to($value))); extern \"C\" function(int32): int32 $callback = Ptr::toFunction($address); echo $callback(3); }",
-        "unsafe { let $memory = allocate(CSize::from(8)); MutPtr<uint8> $bytes = MutPtr::cast($memory); let $skipped = $memory->byteOffset(4); echo $bytes->address < $skipped->address; }",
-        "let $readonly = Ptr::from(unsafe(MutPtr::to($value))); echo $readonly->address;",
-        "unsafe { let $pointer = MutPtr::to($value); let $same = MutPtr::to($value); echo $pointer == $same; }",
+        "unsafe { let $pointer = WritablePointer::to($value); $pointer->write(7); int32 $read = $pointer->read(); echo $read; }",
+        "unsafe { let $pointer = WritablePointer::to($value); $pointer->writeUnaligned(7); int32 $read = $pointer->readUnaligned(); echo $read; }",
+        "unsafe { let $pointer = Pointer::to($value); Pointer<int32> $next = $pointer->offset(1); Pointer<int32> $byte = $pointer->byteOffset(4); echo $next == $byte; }",
+        "unsafe { let $field = WritablePointer::to($point->y); $field->write(5); } unsafe { Point $copy = Pointer::to($point)->read(); echo $copy->x; }",
+        "unsafe { let $pointer = WritablePointer::to($value); Pointer<uint8> $bytes = Pointer::cast($pointer); WritablePointer<uint8> $writable = WritablePointer::cast($pointer); echo $bytes->address == $writable->address; }",
+        "unsafe { ?Pointer<int64> $absent = Pointer::fromAddress(0); echo $absent == null; }",
+        "unsafe { let $address = find(Pointer::cast(Pointer::to($value))); extern \"C\" function(int32): int32 $callback = Pointer::toFunction($address); echo $callback(3); }",
+        "unsafe { let $memory = allocate(CSize::from(8)); WritablePointer<uint8> $bytes = WritablePointer::cast($memory); let $skipped = $memory->byteOffset(4); echo $bytes->address < $skipped->address; }",
+        "let $readonly = Pointer::from(unsafe(WritablePointer::to($value))); echo $readonly->address;",
+        "unsafe { let $pointer = WritablePointer::to($value); let $same = WritablePointer::to($value); echo $pointer == $same; }",
     ] {
         let source = pointer_program(body);
         assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
@@ -802,25 +802,25 @@ fn pointer_members_have_their_types() {
 #[test]
 fn pointer_operations_need_an_unsafe_context() {
     for (body, operation) in [
-        ("let $pointer = Ptr::to($value);", "forming a pointer"),
+        ("let $pointer = Pointer::to($value);", "forming a pointer"),
         (
-            "let $pointer = unsafe(Ptr::to($value)); echo $pointer->read();",
+            "let $pointer = unsafe(Pointer::to($value)); echo $pointer->read();",
             "reading through a pointer",
         ),
         (
-            "let $pointer = unsafe(MutPtr::to($value)); $pointer->write(1);",
+            "let $pointer = unsafe(WritablePointer::to($value)); $pointer->write(1);",
             "writing through a pointer",
         ),
         (
-            "let $pointer = unsafe(Ptr::to($value)); let $next = $pointer->offset(1);",
+            "let $pointer = unsafe(Pointer::to($value)); let $next = $pointer->offset(1);",
             "offsetting a pointer",
         ),
         (
-            "let $pointer = unsafe(Ptr::to($value)); Ptr<uint8> $bytes = Ptr::cast($pointer);",
+            "let $pointer = unsafe(Pointer::to($value)); Pointer<uint8> $bytes = Pointer::cast($pointer);",
             "converting a pointer",
         ),
         (
-            "?Ptr<int32> $pointer = Ptr::fromAddress(16);",
+            "?Pointer<int32> $pointer = Pointer::fromAddress(16);",
             "converting an address to a pointer",
         ),
     ] {
@@ -831,7 +831,7 @@ fn pointer_operations_need_an_unsafe_context() {
         );
     }
     let safe = pointer_program(
-        "let $pointer = unsafe(MutPtr::to($value)); echo $pointer->address; let $readonly = Ptr::from($pointer); echo $readonly == Ptr::from($pointer);",
+        "let $pointer = unsafe(WritablePointer::to($value)); echo $pointer->address; let $readonly = Pointer::from($pointer); echo $readonly == Pointer::from($pointer);",
     );
     assert!(codes(&safe).is_empty(), "{:#?}", findings(&safe));
 }
@@ -858,23 +858,24 @@ fn reading_writing_and_offsetting_need_a_pointee_with_a_size() {
 #[test]
 fn a_pointer_addresses_a_place_of_an_ffi_safe_type() {
     for body in [
-        "unsafe { let $pointer = Ptr::to(3); }",
-        "unsafe { let $pointer = Ptr::to(Int32::from(3)); }",
+        "unsafe { let $pointer = Pointer::to(3); }",
+        "unsafe { let $pointer = Pointer::to(Int32::from(3)); }",
     ] {
         let diagnostic = only(&pointer_program(body), "E0801");
         assert_eq!(diagnostic.title, "Pointer Source Is Not A Place");
     }
-    let text = pointer_program("let $text = \"zlib\"; unsafe { let $pointer = Ptr::to($text); }");
+    let text =
+        pointer_program("let $text = \"zlib\"; unsafe { let $pointer = Pointer::to($text); }");
     assert!(codes(&text).contains(&"E0786"), "{:#?}", findings(&text));
 }
 
 #[test]
 fn a_conversion_takes_its_target_from_the_expected_type() {
     for body in [
-        "unsafe { let $pointer = MutPtr::to($value); let $bytes = Ptr::cast($pointer); }",
-        "unsafe { let $pointer = MutPtr::to($value); int $number = Ptr::cast($pointer); }",
-        "unsafe { let $address = Ptr::fromAddress(16); }",
-        "unsafe { let $function = Ptr::toFunction(find(Ptr::cast(Ptr::to($value)))); }",
+        "unsafe { let $pointer = WritablePointer::to($value); let $bytes = Pointer::cast($pointer); }",
+        "unsafe { let $pointer = WritablePointer::to($value); int $number = Pointer::cast($pointer); }",
+        "unsafe { let $address = Pointer::fromAddress(16); }",
+        "unsafe { let $function = Pointer::toFunction(find(Pointer::cast(Pointer::to($value)))); }",
     ] {
         let diagnostic = only(&pointer_program(body), "E0802");
         assert_eq!(diagnostic.title, "Pointer Conversion Needs A Target Type");
@@ -884,21 +885,24 @@ fn a_conversion_takes_its_target_from_the_expected_type() {
 #[test]
 fn pointers_have_only_their_own_members() {
     let write = only(
-        &pointer_program("unsafe { let $pointer = Ptr::to($value); $pointer->write(1); }"),
+        &pointer_program("unsafe { let $pointer = Pointer::to($value); $pointer->write(1); }"),
         "E0304",
     );
     assert!(
-        write.helps.iter().any(|help| help.contains("MutPtr<T>")),
+        write
+            .helps
+            .iter()
+            .any(|help| help.contains("WritablePointer<T>")),
         "{write:#?}"
     );
     let property = only(
-        &pointer_program("let $pointer = unsafe(Ptr::to($value)); echo $pointer->adress;"),
+        &pointer_program("let $pointer = unsafe(Pointer::to($value)); echo $pointer->adress;"),
         "E0303",
     );
     assert_eq!(property.title, "Unknown Property");
     let ordering = only(
         &pointer_program(
-            "let $pointer = unsafe(Ptr::to($value)); let $less = $pointer < $pointer;",
+            "let $pointer = unsafe(Pointer::to($value)); let $less = $pointer < $pointer;",
         ),
         "E0441",
     );
@@ -913,13 +917,13 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
     // Decision 0148 section 7, amended 2026-11-16: "Pins stop moves, not
     // field access".
     let conflicting = [
-        "unsafe { let $pointer = Ptr::to($value); $value = 4; }",
-        "unsafe { let $pointer = MutPtr::to($value); $value++; }",
-        "unsafe { let $pointer = Ptr::to($point); $point = new Point(x: 3, y: 4); }",
-        "unsafe { let $field = MutPtr::to($point->y); $point = new Point(x: 3, y: 4); }",
-        "let writable $box = new Box(); unsafe { let $field = Ptr::to($box->count); $box->reset(); }",
-        "let writable $box = new Box(); unsafe { let $field = MutPtr::to($box->count); $box->count = 2; }",
-        "let writable $box = new Box(); unsafe { let $field = Ptr::to($box->count); consume($box); }",
+        "unsafe { let $pointer = Pointer::to($value); $value = 4; }",
+        "unsafe { let $pointer = WritablePointer::to($value); $value++; }",
+        "unsafe { let $pointer = Pointer::to($point); $point = new Point(x: 3, y: 4); }",
+        "unsafe { let $field = WritablePointer::to($point->y); $point = new Point(x: 3, y: 4); }",
+        "let writable $box = new Box(); unsafe { let $field = Pointer::to($box->count); $box->reset(); }",
+        "let writable $box = new Box(); unsafe { let $field = WritablePointer::to($box->count); $box->count = 2; }",
+        "let writable $box = new Box(); unsafe { let $field = Pointer::to($box->count); consume($box); }",
     ];
     for body in conflicting {
         let found = findings(&pin_program(body));
@@ -941,24 +945,24 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
         );
     }
     for body in [
-        "unsafe { let $pointer = MutPtr::to($value); $pointer->write(4); } $value = 5; echo $value;",
-        "unsafe { let $pointer = MutPtr::to($value); let $again = MutPtr::to($value); let $readonly = Ptr::to($value); }",
-        "unsafe { let $pointer = Ptr::to($value); echo $value; }",
-        "unsafe { let $pointer = MutPtr::to($value); echo $value; }",
-        "unsafe { let $pointer = Ptr::to($value); let $writable = MutPtr::to($value); }",
-        "writable int $round = 0; unsafe { while ($round < 2) { $round++; echo $value; let $pointer = MutPtr::to($value); } }",
-        "unsafe { let $pointer = MutPtr::to($point); $point->x = 5; echo $point->y; $pointer->write(new Point(x: 1, y: 1)); echo $point->x; }",
-        "unsafe { let $field = MutPtr::to($point->y); $point->x = 3; echo $point->y; }",
-        "unsafe { let $pointer = Ptr::to($point); show($point); }",
+        "unsafe { let $pointer = WritablePointer::to($value); $pointer->write(4); } $value = 5; echo $value;",
+        "unsafe { let $pointer = WritablePointer::to($value); let $again = WritablePointer::to($value); let $readonly = Pointer::to($value); }",
+        "unsafe { let $pointer = Pointer::to($value); echo $value; }",
+        "unsafe { let $pointer = WritablePointer::to($value); echo $value; }",
+        "unsafe { let $pointer = Pointer::to($value); let $writable = WritablePointer::to($value); }",
+        "writable int $round = 0; unsafe { while ($round < 2) { $round++; echo $value; let $pointer = WritablePointer::to($value); } }",
+        "unsafe { let $pointer = WritablePointer::to($point); $point->x = 5; echo $point->y; $pointer->write(new Point(x: 1, y: 1)); echo $point->x; }",
+        "unsafe { let $field = WritablePointer::to($point->y); $point->x = 3; echo $point->y; }",
+        "unsafe { let $pointer = Pointer::to($point); show($point); }",
         // A `writable` parameter of a Copy type receives its own copy.
-        "unsafe { let $pointer = Ptr::to($point); shift($point); }",
-        "let writable $box = new Box(); unsafe { let $field = MutPtr::to($box->count); $box->other = 2; echo $box->count; }",
+        "unsafe { let $pointer = Pointer::to($point); shift($point); }",
+        "let writable $box = new Box(); unsafe { let $field = WritablePointer::to($box->count); $box->other = 2; echo $box->count; }",
     ] {
         let source = pin_program(body);
         assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
     }
     let capture = pointer_program(
-        "unsafe { let $pointer = Ptr::to($value); let $bump = function(): void with (writable $value) { $value = 1; }; }",
+        "unsafe { let $pointer = Pointer::to($value); let $bump = function(): void with (writable $value) { $value = 1; }; }",
     );
     assert!(
         codes(&capture).contains(&"E0654"),
@@ -967,13 +971,15 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
     );
     let inner = only(
         &pointer_program(
-            "unsafe { { writable int32 $inner = 1; let $pointer = MutPtr::to($inner); } }",
+            "unsafe { { writable int32 $inner = 1; let $pointer = WritablePointer::to($inner); } }",
         ),
         "E0762",
     );
     assert_eq!(inner.title, "Value Cannot Outlive Borrowed Source");
     let readonly = only(
-        &pointer_program("int32 $fixed = 1; unsafe { let $pointer = MutPtr::to($fixed); }"),
+        &pointer_program(
+            "int32 $fixed = 1; unsafe { let $pointer = WritablePointer::to($fixed); }",
+        ),
         "E0479",
     );
     assert!(readonly.message.contains("$fixed"));
@@ -981,7 +987,7 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
 
 fn region_program(body: &str) -> String {
     format!(
-        "use Doria\\Std\\Ffi\\{{MutPtr, Ptr}}; use Doria\\Std\\Io\\{{ByteRegion, WritableByteRegion}}; function consume(take Bytes $bytes): void {{}} function main(): void {{ writable Bytes $buffer = Bytes::allocate(8); {body} }}"
+        "use Doria\\Std\\Ffi\\{{Pointer, WritablePointer}}; use Doria\\Std\\Io\\{{ByteRegion, WritableByteRegion}}; function consume(take Bytes $bytes): void {{}} function main(): void {{ writable Bytes $buffer = Bytes::allocate(8); {body} }}"
     )
 }
 
@@ -991,10 +997,10 @@ fn a_region_pointer_needs_an_unsafe_context_and_pins_the_storage() {
     // `writablePointer` with writable access to a writable one; forming
     // either pins the region's storage until the unsafe context ends.
     for body in [
-        "unsafe { Ptr<uint8> $data = $buffer->getRegion(0, 4)->pointer; echo $data->read(); }",
+        "unsafe { Pointer<uint8> $data = $buffer->getRegion(0, 4)->pointer; echo $data->read(); }",
         "let $region = $buffer->getRegion(2, 4); unsafe { let $data = $region->pointer; let $again = $region->pointer; echo $data == $again; } echo $buffer[0];",
-        "writable WritableByteRegion $region = $buffer->getWritableRegion(0, 4); unsafe { MutPtr<uint8> $data = $region->writablePointer; $data->write(UInt8::from(1)); Ptr<uint8> $read = $region->pointer; echo $read->read(); }",
-        "let $text = \"Doria\"; unsafe { Ptr<uint8> $data = $text->byteRegion->pointer; echo $data->read(); }",
+        "writable WritableByteRegion $region = $buffer->getWritableRegion(0, 4); unsafe { WritablePointer<uint8> $data = $region->writablePointer; $data->write(UInt8::from(1)); Pointer<uint8> $read = $region->pointer; echo $read->read(); }",
+        "let $text = \"Doria\"; unsafe { Pointer<uint8> $data = $text->byteRegion->pointer; echo $data->read(); }",
         "unsafe { let $data = $buffer->getRegion(0, 4)->pointer; echo $buffer[1]; }",
         "unsafe { let $data = $buffer->getRegion(0, 4)->pointer; } consume($buffer);",
     ] {
@@ -1082,7 +1088,7 @@ fn boundary_values_convert_explicitly_and_compare_only_for_equality() {
 
 #[test]
 fn pointer_operations_report_that_they_cannot_be_built_yet() {
-    let source = "use Doria\\Std\\Ffi\\{CLong, Ptr}; function main(): void { writable int32 $value = 1; let $pointer = unsafe(Ptr::to($value)); let $long = CLong::from(2); }";
+    let source = "use Doria\\Std\\Ffi\\{CLong, Pointer}; function main(): void { writable int32 $value = 1; let $pointer = unsafe(Pointer::to($value)); let $long = CLong::from(2); }";
     assert!(codes(source).is_empty(), "{:#?}", findings(source));
     let diagnostics = doriac::compile_source(
         "ffi.doria",
@@ -1105,7 +1111,7 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
     );
     // A pointer to a foreign struct field builds; one to a class property
     // does not yet.
-    let property = "use Doria\\Std\\Ffi\\Ptr; class Box { int32 $count = 0; } function main(): void { let $box = new Box(); let $pointer = unsafe(Ptr::to($box->count)); }";
+    let property = "use Doria\\Std\\Ffi\\Pointer; class Box { int32 $count = 0; } function main(): void { let $box = new Box(); let $pointer = unsafe(Pointer::to($box->count)); }";
     let diagnostics = doriac::compile_source(
         "ffi.doria",
         property.to_string(),
@@ -1127,9 +1133,9 @@ fn typed_array_regions_have_the_region_members() {
         "int32[] $numbers = [1, 2]; ArrayRegion<int32> $region = $numbers->getRegion(0, 2); int32 $first = $region[0]; int $length = $region->length; ArrayRegion<int32> $part = $region->getRegion(1, 1); echo $first; echo $length; echo $part[0];",
         "writable int32[] $numbers = [1, 2]; writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 2); $region[1] = 5; int32[] $other = [3]; int $copied = $region->copyFrom($other->getRegion(0, 1)); echo $copied;",
         "string[] $names = [\"Ada\"]; ArrayRegion<string> $region = $names->getRegion(0, 1); echo $region->length;",
-        "writable int32[] $numbers = [1]; unsafe { Ptr<int32> $data = $numbers->getRegion(0, 1)->pointer; } unsafe { writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 1); MutPtr<int32> $writable = $region->writablePointer; }",
+        "writable int32[] $numbers = [1]; unsafe { Pointer<int32> $data = $numbers->getRegion(0, 1)->pointer; } unsafe { writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 1); WritablePointer<int32> $writable = $region->writablePointer; }",
     ] {
-        let source = format!("use Doria\\Std\\Ffi\\{{MutPtr, Ptr}}; function main(): void {{ {body} }}");
+        let source = format!("use Doria\\Std\\Ffi\\{{Pointer, WritablePointer}}; function main(): void {{ {body} }}");
         assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
     }
     for (body, code) in [
@@ -1142,7 +1148,7 @@ fn typed_array_regions_have_the_region_members() {
         ("writable int32[] $numbers = [1, 2]; writable WritableArrayRegion<int32> $region = $numbers->getWritableRegion(0, 2); $region->copyWithin(0, 1, 1);", ""),
         ("int32[] $numbers = [1]; let $region = $numbers->getRegion(0, 1); let $data = $region->pointer;", "E0785"),
     ] {
-        let found = codes(&format!("use Doria\\Std\\Ffi\\{{MutPtr, Ptr}}; function main(): void {{ {body} }}"));
+        let found = codes(&format!("use Doria\\Std\\Ffi\\{{Pointer, WritablePointer}}; function main(): void {{ {body} }}"));
         assert!(!found.is_empty(), "{body} should not check");
         if !code.is_empty() {
             assert!(found.iter().all(|found| *found == code), "{body}: {found:?}");
@@ -1151,7 +1157,7 @@ fn typed_array_regions_have_the_region_members() {
     // A pointer pins the array, so it cannot be lent as writable in the
     // same unsafe context.
     let pinned = only(
-        "use Doria\\Std\\Ffi\\Ptr; function main(): void { writable int32[] $numbers = [1]; unsafe { Ptr<int32> $data = $numbers->getRegion(0, 1)->pointer; let $region = $numbers->getWritableRegion(0, 1); } }",
+        "use Doria\\Std\\Ffi\\Pointer; function main(): void { writable int32[] $numbers = [1]; unsafe { Pointer<int32> $data = $numbers->getRegion(0, 1)->pointer; let $region = $numbers->getWritableRegion(0, 1); } }",
         "E0477",
     );
     assert_eq!(pinned.title, "Pinned Value Cannot Be Moved Or Replaced");
@@ -1175,21 +1181,21 @@ fn the_last_system_code_is_a_readonly_static_int() {
 }
 
 const FOREIGN_STRINGS: &str = r#"
-use Doria\Std\Ffi\{CChar, CString, Ptr, Utf16String};
+use Doria\Std\Ffi\{CChar, CString, Pointer, Utf16String};
 "#;
 
 #[test]
 fn foreign_string_pointers_and_readers_need_an_unsafe_context() {
     let pointer = format!(
-        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); Ptr<CChar> $text = $name->pointer; }}"
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); Pointer<CChar> $text = $name->pointer; }}"
     );
     assert_eq!(only(&pointer, "E0785").code, "E0785");
     let reader = format!(
-        "{FOREIGN_STRINGS}function read(Ptr<CChar> $text): ?string {{ return String::fromCString($text); }}"
+        "{FOREIGN_STRINGS}function read(Pointer<CChar> $text): ?string {{ return String::fromCString($text); }}"
     );
     assert_eq!(only(&reader, "E0785").code, "E0785");
     let checked = format!(
-        "{FOREIGN_STRINGS}function read(Ptr<uint16> $text): ?string {{ return unsafe(String::fromUtf16($text)); }}"
+        "{FOREIGN_STRINGS}function read(Pointer<uint16> $text): ?string {{ return unsafe(String::fromUtf16($text)); }}"
     );
     assert!(findings(&checked).is_empty(), "{:#?}", findings(&checked));
 }
@@ -1216,20 +1222,20 @@ fn foreign_strings_are_move_values_without_equality() {
 #[test]
 fn a_foreign_string_stays_alive_and_in_place_while_its_pointer_is_used() {
     let temporary = format!(
-        "{FOREIGN_STRINGS}function main(): void {{ unsafe {{ Ptr<CChar> $text = CString::from(\"x\")->pointer; }} }}"
+        "{FOREIGN_STRINGS}function main(): void {{ unsafe {{ Pointer<CChar> $text = CString::from(\"x\")->pointer; }} }}"
     );
     assert_eq!(only(&temporary, "E0762").code, "E0762");
     let inner = format!(
-        "{FOREIGN_STRINGS}function main(): void {{ unsafe {{ {{ let $name = CString::from(\"x\"); Ptr<CChar> $text = $name->pointer; }} }} }}"
+        "{FOREIGN_STRINGS}function main(): void {{ unsafe {{ {{ let $name = CString::from(\"x\"); Pointer<CChar> $text = $name->pointer; }} }} }}"
     );
     assert_eq!(only(&inner, "E0762").code, "E0762");
     let given = format!(
         "{FOREIGN_STRINGS}function keep(take CString $text): void {{}}
-function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Ptr<CChar> $text = $name->pointer; keep($name); }} }}"
+function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Pointer<CChar> $text = $name->pointer; keep($name); }} }}"
     );
     assert_eq!(only(&given, "E0477").code, "E0477");
     let pinned = format!(
-        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Ptr<CChar> $text = $name->pointer; Ptr<CChar> $again = $name->pointer; }} let $later = $name; }}"
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Pointer<CChar> $text = $name->pointer; Pointer<CChar> $again = $name->pointer; }} let $later = $name; }}"
     );
     assert!(findings(&pinned).is_empty(), "{:#?}", findings(&pinned));
 }
@@ -1238,18 +1244,18 @@ function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Ptr<CChar> 
 fn a_c_abi_function_name_is_a_c_function_pointer_value() {
     // Decision 0148 section 12: the name has the structural C function
     // pointer type of the function's signature.
-    let callback = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
-extern \"C\" function visit(Ptr<Opaque> $item, int32 $depth): bool
+    let callback = "use Doria\\Std\\Ffi\\{Opaque, Pointer};
+extern \"C\" function visit(Pointer<Opaque> $item, int32 $depth): bool
 {
     return $depth > 0;
 }
 ";
     let matching = format!(
-        "{callback}function main(): void {{ extern \"C\" function(Ptr<Opaque>, int32): bool $visitor = visit; ?extern \"C\" function(Ptr<Opaque>, int32): bool $maybe = visit; }}"
+        "{callback}function main(): void {{ extern \"C\" function(Pointer<Opaque>, int32): bool $visitor = visit; ?extern \"C\" function(Pointer<Opaque>, int32): bool $maybe = visit; }}"
     );
     assert!(codes(&matching).is_empty(), "{:#?}", findings(&matching));
     let mismatched = format!(
-        "{callback}function main(): void {{ extern \"C\" function(Ptr<Opaque>): bool $visitor = visit; }}"
+        "{callback}function main(): void {{ extern \"C\" function(Pointer<Opaque>): bool $visitor = visit; }}"
     );
     assert!(!codes(&mismatched).is_empty(), "the signatures differ");
     // The native targets build the C entry; the interpreter takes its
@@ -1271,8 +1277,8 @@ fn a_c_abi_function_that_can_let_an_io_error_escape_is_a_checking_error() {
     // Decision 0148 section 12 (amendment of 2026-11-20): no checked error
     // leaves a C-ABI function, the automatic I/O errors of Decision 0123
     // included, and the fix wraps the work in `try`.
-    let source = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
-extern \"C\" function report(Ptr<Opaque> $item): void
+    let source = "use Doria\\Std\\Ffi\\{Opaque, Pointer};
+extern \"C\" function report(Pointer<Opaque> $item): void
 {
     echo \"called\";
 }
@@ -1311,9 +1317,9 @@ function main(): void {}
     // A helper's automatic I/O reaches the C-ABI function that calls it.
     // The fix for a body that returns a value is guidance: each `catch`
     // needs a `return` only the author can choose.
-    let through_helper = "use Doria\\Std\\Ffi\\{Opaque, Ptr};
+    let through_helper = "use Doria\\Std\\Ffi\\{Opaque, Pointer};
 function note(string $text): void { echo $text; }
-extern \"C\" function count(Ptr<Opaque> $item): int32
+extern \"C\" function count(Pointer<Opaque> $item): int32
 {
     note(\"counted\");
     return 1;

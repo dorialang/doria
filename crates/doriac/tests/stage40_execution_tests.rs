@@ -215,13 +215,13 @@ fn assert_interpreter_reports_companion(mir: &doriac::mir::Program) {
     assert!(error.to_string().contains(&companion[0].message), "{error}");
 }
 
-const POINTER: &str = "use Doria\\Std\\Ffi\\{MutPtr, Ptr};\n";
+const POINTER: &str = "use Doria\\Std\\Ffi\\{Pointer, WritablePointer};\n";
 
 #[test]
 fn pointer_addresses_offset_cast_and_compare() {
     let source = format!(
         "{POINTER}
-function step(Ptr<int32> $pointer, int $count): Ptr<int32>
+function step(Pointer<int32> $pointer, int $count): Pointer<int32>
 {{
     return unsafe($pointer->offset($count));
 }}
@@ -229,10 +229,10 @@ function step(Ptr<int32> $pointer, int $count): Ptr<int32>
 function main(): void
 {{
     unsafe {{
-        ?Ptr<int32> $absent = Ptr::fromAddress(0);
+        ?Pointer<int32> $absent = Pointer::fromAddress(0);
         echo $absent == null;
         echo \" \";
-        ?Ptr<int32> $maybe = Ptr::fromAddress(4096);
+        ?Pointer<int32> $maybe = Pointer::fromAddress(4096);
         if ($maybe != null) {{
             let $base = $maybe;
             echo $base->address;
@@ -243,13 +243,13 @@ function main(): void
             echo \" \";
             echo $base->byteOffset(6)->address;
             echo \" \";
-            Ptr<uint8> $bytes = Ptr::cast($base);
+            Pointer<uint8> $bytes = Pointer::cast($base);
             echo $bytes->offset(5)->address;
             echo \" \";
-            MutPtr<int64> $wide = MutPtr::cast($base);
+            WritablePointer<int64> $wide = WritablePointer::cast($base);
             echo $wide->offset(1)->address;
             echo \" \";
-            Ptr<int64> $readonly = Ptr::from($wide);
+            Pointer<int64> $readonly = Pointer::from($wide);
             echo $readonly->address == $base->address;
             echo \" \";
             echo $base == step($base, 0);
@@ -266,8 +266,8 @@ function main(): void
 #[test]
 fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [
-        "?Ptr<int32> $pointer = Ptr::fromAddress(4098); if ($pointer != null) { echo $pointer->read(); }",
-        "?Ptr<float64> $pointer = Ptr::fromAddress(4100); if ($pointer != null) { MutPtr<float64> $mutable = MutPtr::cast($pointer); $mutable->write(1.5); }",
+        "?Pointer<int32> $pointer = Pointer::fromAddress(4098); if ($pointer != null) { echo $pointer->read(); }",
+        "?Pointer<float64> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<float64> $mutable = WritablePointer::cast($pointer); $mutable->write(1.5); }",
     ] {
         let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
         assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
@@ -278,13 +278,13 @@ fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
 fn an_offset_that_leaves_the_address_space_panics_with_p1703() {
     for body in [
         // Below zero.
-        "?Ptr<uint8> $pointer = Ptr::fromAddress(8); if ($pointer != null) { echo $pointer->byteOffset(-16)->address; }",
-        // To zero, which no `Ptr<T>` holds.
-        "?Ptr<int64> $pointer = Ptr::fromAddress(16); if ($pointer != null) { echo $pointer->offset(-2)->address; }",
+        "?Pointer<uint8> $pointer = Pointer::fromAddress(8); if ($pointer != null) { echo $pointer->byteOffset(-16)->address; }",
+        // To zero, which no `Pointer<T>` holds.
+        "?Pointer<int64> $pointer = Pointer::fromAddress(16); if ($pointer != null) { echo $pointer->offset(-2)->address; }",
         // Past the largest address.
-        "?Ptr<uint8> $pointer = Ptr::fromAddress(18446744073709551608); if ($pointer != null) { echo $pointer->byteOffset(8)->address; }",
+        "?Pointer<uint8> $pointer = Pointer::fromAddress(18446744073709551608); if ($pointer != null) { echo $pointer->byteOffset(8)->address; }",
         // The scaled count overflows before the address moves.
-        "?Ptr<int64> $pointer = Ptr::fromAddress(4096); if ($pointer != null) { echo $pointer->offset(2305843009213693952)->address; }",
+        "?Pointer<int64> $pointer = Pointer::fromAddress(4096); if ($pointer != null) { echo $pointer->offset(2305843009213693952)->address; }",
     ] {
         let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
         assert_panics_natively(&source, "P1703", "Pointer Arithmetic Left The Address Space");
@@ -294,7 +294,7 @@ fn an_offset_that_leaves_the_address_space_panics_with_p1703() {
 #[test]
 fn the_interpreter_and_php_output_report_pointer_operations() {
     let source = format!(
-        "{POINTER}function main(): void {{ unsafe {{ ?Ptr<int32> $pointer = Ptr::fromAddress(4096); echo $pointer == null; }} }}"
+        "{POINTER}function main(): void {{ unsafe {{ ?Pointer<int32> $pointer = Pointer::fromAddress(4096); echo $pointer == null; }} }}"
     );
     let debug = doriac::compile_source(
         "stage40.doria",
@@ -324,7 +324,7 @@ function main(): void
 {{
     writable int32 $value = 41;
     unsafe {{
-        let $pointer = MutPtr::to($value);
+        let $pointer = WritablePointer::to($value);
         $pointer->write(7);
         echo $pointer->read();
         echo \" \";
@@ -333,20 +333,20 @@ function main(): void
     echo \" \";
     writable float64 $ratio = 0.0;
     unsafe {{
-        let $place = MutPtr::to($ratio);
+        let $place = WritablePointer::to($ratio);
         $place->writeUnaligned(2.5);
         echo Float::toInt($place->readUnaligned() * 2.0);
     }}
     echo \" \";
     writable bool $flag = false;
     unsafe {{
-        MutPtr::to($flag)->write(true);
+        WritablePointer::to($flag)->write(true);
     }}
     echo $flag;
     echo \" \";
     writable int64 $wide = 0;
     unsafe {{
-        MutPtr<uint8> $low = MutPtr::cast(MutPtr::to($wide));
+        WritablePointer<uint8> $low = WritablePointer::cast(WritablePointer::to($wide));
         $low->write(UInt8::from(255));
         $low->byteOffset(1)->write(UInt8::from(1));
     }}
@@ -363,17 +363,17 @@ function main(): void
     // capture name the caller's place, so a write through a pointer to
     // either is what the caller reads next.
     let parameters = format!(
-        "{POINTER}function bump(writable int32 $count): void {{ unsafe {{ MutPtr::to($count)->write(8); }} echo $count . \" \"; }}
+        "{POINTER}function bump(writable int32 $count): void {{ unsafe {{ WritablePointer::to($count)->write(8); }} echo $count . \" \"; }}
 function main(): void {{
     writable int32 $value = 1;
     bump($value);
     echo $value . \" \";
-    let $set = function(writable int32 $target): void {{ unsafe {{ MutPtr::to($target)->write(5); }} echo $target . \" \"; }};
+    let $set = function(writable int32 $target): void {{ unsafe {{ WritablePointer::to($target)->write(5); }} echo $target . \" \"; }};
     $set($value);
     echo $value . \" \";
     writable int32 $captured = 2;
     writable function writable(): void $raise = function(): void with (writable $captured) {{
-        unsafe {{ MutPtr::to($captured)->write(9); }}
+        unsafe {{ WritablePointer::to($captured)->write(9); }}
         echo $captured . \" \";
         $captured = $captured + 1;
     }};
@@ -386,7 +386,7 @@ function main(): void {{
 }
 
 const C_LIBRARY: &str = r#"
-use Doria\Std\Ffi\{CChar, CLong, CSize, LinkName, MutPtr, Opaque, Ptr};
+use Doria\Std\Ffi\{CChar, CLong, CSize, LinkName, Opaque, Pointer, WritablePointer};
 
 extern "C"
 {
@@ -397,21 +397,21 @@ extern "C"
     function labs(CLong $value): CLong;
 
     /** @safety `$text` points to a NUL-terminated string. */
-    function strlen(Ptr<CChar> $text): CSize;
+    function strlen(Pointer<CChar> $text): CSize;
 
     /** @safety The memory is released once, with `free`. */
-    function malloc(CSize $size): ?MutPtr<Opaque>;
+    function malloc(CSize $size): ?WritablePointer<Opaque>;
 
     /** @safety `$memory` is null, or came from `malloc` and is not used again. */
-    function free(?MutPtr<Opaque> $memory): void;
+    function free(?WritablePointer<Opaque> $memory): void;
 
     /** @safety `$memory` is writable for `$count` bytes. */
     #[LinkName("memset")]
-    function fill(MutPtr<Opaque> $memory, int32 $value, CSize $count): MutPtr<Opaque>;
+    function fill(WritablePointer<Opaque> $memory, int32 $value, CSize $count): WritablePointer<Opaque>;
 
     /** @safety `$memory` is writable for `$count` bytes. */
     #[LinkName("memset")]
-    function clear(MutPtr<Opaque> $memory, int32 $value, CSize $count): void;
+    function clear(WritablePointer<Opaque> $memory, int32 $value, CSize $count): void;
 }
 "#;
 
@@ -426,17 +426,17 @@ function main(): void
         echo \" \";
         echo Int64::from(labs(CLong::from(-123456)));
         echo \" \";
-        ?MutPtr<Opaque> $memory = malloc(CSize::from(16));
+        ?WritablePointer<Opaque> $memory = malloc(CSize::from(16));
         if ($memory != null) {{
             let $block = $memory;
             clear($block, 0, CSize::from(16));
-            MutPtr<uint8> $bytes = MutPtr::cast($block);
+            WritablePointer<uint8> $bytes = WritablePointer::cast($block);
             $bytes->write(UInt8::from(68));
             $bytes->offset(1)->write(UInt8::from(111));
             $bytes->offset(2)->write(UInt8::from(114));
             $bytes->offset(3)->write(UInt8::from(105));
             $bytes->offset(4)->write(UInt8::from(97));
-            Ptr<CChar> $text = Ptr::cast(Ptr::from($bytes));
+            Pointer<CChar> $text = Pointer::cast(Pointer::from($bytes));
             echo UInt64::from(strlen($text));
             echo \" \";
             echo $bytes->offset(4)->read();
@@ -465,10 +465,10 @@ function main(): void
 #[test]
 fn c_function_pointer_values_are_called_through_their_address() {
     // Decision 0148 section 12: addresses from `dlsym`, converted with
-    // `Ptr::toFunction`, called with scalars and a struct result, held
+    // `Pointer::toFunction`, called with scalars and a struct result, held
     // nullable, in a foreign struct field, and passed through a function.
     let source = "
-use Doria\\Std\\Ffi\\{CChar, MutPtr, Opaque, Ptr};
+use Doria\\Std\\Ffi\\{CChar, Opaque, Pointer, WritablePointer};
 
 extern \"C\" struct Quotient
 {
@@ -484,20 +484,20 @@ extern \"C\" struct Table
 extern \"C\"
 {
     /** @safety `$path` is null or a NUL-terminated path. */
-    function dlopen(?Ptr<CChar> $path, int32 $mode): ?MutPtr<Opaque>;
+    function dlopen(?Pointer<CChar> $path, int32 $mode): ?WritablePointer<Opaque>;
 
     /** @safety `$handle` came from `dlopen` and `$name` is NUL-terminated. */
-    function dlsym(MutPtr<Opaque> $handle, Ptr<CChar> $name): ?MutPtr<Opaque>;
+    function dlsym(WritablePointer<Opaque> $handle, Pointer<CChar> $name): ?WritablePointer<Opaque>;
 }
 
-function find(MutPtr<Opaque> $handle, uint8[] $name): Ptr<Opaque>
+function find(WritablePointer<Opaque> $handle, uint8[] $name): Pointer<Opaque>
 {
     unsafe {
-        ?MutPtr<Opaque> $symbol = dlsym($handle, Ptr::cast($name->getRegion(0, $name->length)->pointer));
+        ?WritablePointer<Opaque> $symbol = dlsym($handle, Pointer::cast($name->getRegion(0, $name->length)->pointer));
         if ($symbol == null) {
             panic(\"no symbol\");
         }
-        return Ptr::from($symbol);
+        return Pointer::from($symbol);
     }
 }
 
@@ -509,14 +509,14 @@ function apply(extern \"C\" function(int32): int32 $function, int32 $value): int
 function main(): void
 {
     unsafe {
-        ?MutPtr<Opaque> $program = dlopen(null, 1);
+        ?WritablePointer<Opaque> $program = dlopen(null, 1);
         if ($program == null) {
             panic(\"no program handle\");
         }
         let $handle = $program;
-        extern \"C\" function(int32): int32 $absolute = Ptr::toFunction(find($handle, [97, 98, 115, 0]));
+        extern \"C\" function(int32): int32 $absolute = Pointer::toFunction(find($handle, [97, 98, 115, 0]));
         echo $absolute(-5);
-        extern \"C\" function(int32, int32): Quotient $divide = Ptr::toFunction(find($handle, [100, 105, 118, 0]));
+        extern \"C\" function(int32, int32): Quotient $divide = Pointer::toFunction(find($handle, [100, 105, 118, 0]));
         Quotient $result = $divide(17, 5);
         echo \" \" . $result->quotient . \" \" . $result->remainder;
         ?extern \"C\" function(int32): int32 $maybe = $absolute;
@@ -743,25 +743,25 @@ function main(): void
 {{
     writable Pixel $pixel = new Pixel(x: 1, y: 2, color: new Color(red: 3, green: 4, blue: 5), weight: 0.5, visible: false);
     unsafe {{
-        let $whole = MutPtr::to($pixel);
+        let $whole = WritablePointer::to($pixel);
         Pixel $copy = $whole->read();
         echo $copy->x . \" \" . $copy->color->blue . \" \";
         writable Pixel $changed = $copy;
         $changed->y = 40;
         $whole->write($changed);
         echo $pixel->y . \" \";
-        let $green = MutPtr::to($pixel->color->green);
+        let $green = WritablePointer::to($pixel->color->green);
         $green->write(UInt8::from(77));
         echo $pixel->color->green . \" \";
-        let $color = MutPtr::to($pixel->color);
+        let $color = WritablePointer::to($pixel->color);
         Color $read = $color->read();
         echo $read->green . \" \" . $whole->read()->color->green . \" \";
-        Ptr<Pixel> $base = Ptr::from($whole);
+        Pointer<Pixel> $base = Pointer::from($whole);
         echo $base->offset(1)->address - $base->address;
-        let $y = MutPtr::to($pixel->y);
+        let $y = WritablePointer::to($pixel->y);
         $y->writeUnaligned(9);
         echo \" \" . $y->readUnaligned() . \" \" . $pixel->y . \" \";
-        MutPtr<uint8> $bytes = MutPtr::cast($whole);
+        WritablePointer<uint8> $bytes = WritablePointer::cast($whole);
         echo $bytes->offset(8)->read();
     }}
 }}
@@ -773,8 +773,8 @@ function main(): void
 #[test]
 fn an_aligned_aggregate_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [
-        "?Ptr<Sample> $pointer = Ptr::fromAddress(4100); if ($pointer != null) { Sample $sample = $pointer->read(); echo $sample->tag; }",
-        "?Ptr<Sample> $pointer = Ptr::fromAddress(4100); if ($pointer != null) { MutPtr<Sample> $mutable = MutPtr::cast($pointer); $mutable->write(new Sample(tag: 1, value: 2, extra: 3)); }",
+        "?Pointer<Sample> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { Sample $sample = $pointer->read(); echo $sample->tag; }",
+        "?Pointer<Sample> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<Sample> $mutable = WritablePointer::cast($pointer); $mutable->write(new Sample(tag: 1, value: 2, extra: 3)); }",
     ] {
         let source = format!("{POINTER}{AGGREGATES}function main(): void {{ unsafe {{ {body} }} }}");
         assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
@@ -854,7 +854,7 @@ use Doria\\Std\\Ffi\\{{CSize, LinkName, Opaque}};
 
 extern \"C\" struct Fill
 {{
-    MutPtr<Opaque> $memory;
+    WritablePointer<Opaque> $memory;
     int64 $value;
 }}
 
@@ -867,7 +867,7 @@ extern \"C\"
 {{
     /** @safety `$fill->memory` is writable for `$count` bytes. */
     #[LinkName(\"memset\")]
-    function fill(Fill $fill, CSize $count): MutPtr<Opaque>;
+    function fill(Fill $fill, CSize $count): WritablePointer<Opaque>;
 
     /** @safety Any value. */
     #[LinkName(\"ldexp\")]
@@ -878,7 +878,7 @@ function main(): void
 {{
     writable int64 $target = 0;
     unsafe {{
-        MutPtr<Opaque> $memory = MutPtr::cast(MutPtr::to($target));
+        WritablePointer<Opaque> $memory = WritablePointer::cast(WritablePointer::to($target));
         let $filled = fill(new Fill(memory: $memory, value: 1), CSize::from(3));
         echo $filled == $memory;
     }}
@@ -908,11 +908,11 @@ function main(): void
     writable Tip $tip = new Tip();
     echo Tip::SIZE . \" \" . $tip->length . \" \";
     unsafe {{
-        MutPtr<uint16> $text = MutPtr::cast(MutPtr::to($tip));
+        WritablePointer<uint16> $text = WritablePointer::cast(WritablePointer::to($tip));
         echo $text->read() . \" \" . $text->offset(2)->read() . \" \";
         $text->offset(1)->write(UInt16::from(9));
-        Ptr<int32> $length = Ptr::cast(Ptr::from($text)->byteOffset(8));
-        echo $length->read() . \" \" . Ptr::from($text)->offset(1)->read();
+        Pointer<int32> $length = Pointer::cast(Pointer::from($text)->byteOffset(8));
+        echo $length->read() . \" \" . Pointer::from($text)->offset(1)->read();
     }}
 }}
 "
@@ -932,17 +932,17 @@ fn null_is_the_constant_default_of_nullable_pointers() {
 extern \"C\" struct Link
 {{
     int32 $value;
-    ?Ptr<Link> $next = null;
+    ?Pointer<Link> $next = null;
     ?extern \"C\" function(int32): int32 $visit = null;
 }}
 
 extern \"C\"
 {{
     /** @safety `$text` points to a NUL-terminated string. */
-    function strtol(Ptr<CChar> $text, ?MutPtr<Ptr<CChar>> $end = null, int32 $base = 10): CLong;
+    function strtol(Pointer<CChar> $text, ?WritablePointer<Pointer<CChar>> $end = null, int32 $base = 10): CLong;
 }}
 
-function absent(?Ptr<int64> $pointer = null): bool
+function absent(?Pointer<int64> $pointer = null): bool
 {{
     return $pointer == null;
 }}
@@ -965,16 +965,16 @@ function main(): void
 
 #[test]
 fn a_nullable_pointer_is_one_word_and_null_is_address_zero() {
-    // Decision 0148 section 3: `?Ptr<T>` is one word and null is address
+    // Decision 0148 section 3: `?Pointer<T>` is one word and null is address
     // zero wherever it is stored, so C reads and writes it in place: in a
-    // foreign field, through `MutPtr::to` of a local, through a
-    // `Ptr<?Ptr<T>>`, and as a C result. Doria storage holds the same word.
+    // foreign field, through `WritablePointer::to` of a local, through a
+    // `Pointer<?Pointer<T>>`, and as a C result. Doria storage holds the same word.
     let source = format!(
         "{POINTER}use Doria\\Std\\Ffi\\{{CChar, CLong, CString, CUnsignedLong}};
 
 extern \"C\" struct Stream
 {{
-    ?Ptr<uint8> $nextIn = null;
+    ?Pointer<uint8> $nextIn = null;
     uint32 $availableIn = 0;
     CUnsignedLong $totalIn;
 }}
@@ -982,17 +982,17 @@ extern \"C\" struct Stream
 extern \"C\"
 {{
     /** @safety `$text` is NUL-terminated; `$end` is null or writable. */
-    function strtol(Ptr<CChar> $text, ?MutPtr<?Ptr<CChar>> $end, int32 $base): CLong;
+    function strtol(Pointer<CChar> $text, ?WritablePointer<?Pointer<CChar>> $end, int32 $base): CLong;
     /** @safety `$name` is NUL-terminated. */
-    function getenv(Ptr<CChar> $name): ?Ptr<CChar>;
+    function getenv(Pointer<CChar> $name): ?Pointer<CChar>;
 }}
 
 class Holder
 {{
-    function __construct(writable ?Ptr<uint8> $pointer) {{}}
+    function __construct(writable ?Pointer<uint8> $pointer) {{}}
 }}
 
-function pass(?Ptr<uint8> $pointer): ?Ptr<uint8>
+function pass(?Pointer<uint8> $pointer): ?Pointer<uint8>
 {{
     return $pointer;
 }}
@@ -1003,7 +1003,7 @@ function main(): void
     writable Stream $stream = new Stream(totalIn: CUnsignedLong::from(7));
     unsafe {{
         let $from = $input->getRegion(0, 3)->pointer;
-        Ptr<uint64> $words = Ptr::cast(Ptr::from(MutPtr::to($stream)));
+        Pointer<uint64> $words = Pointer::cast(Pointer::from(WritablePointer::to($stream)));
         echo $words->read() . \" \" . Stream::SIZE . \" \";
         $stream->nextIn = $from;
         $stream->availableIn = 3;
@@ -1012,12 +1012,12 @@ function main(): void
         echo (($stream->nextIn ?? $from)->address == $from->address) . \"\\n\";
 
         let $digits = CString::from(\"42rest\");
-        writable ?Ptr<CChar> $end = null;
-        echo Int64::from(strtol($digits->pointer, MutPtr::to($end), 10)) . \" \";
+        writable ?Pointer<CChar> $end = null;
+        echo Int64::from(strtol($digits->pointer, WritablePointer::to($end), 10)) . \" \";
         echo (($end ?? $digits->pointer)->address - $digits->pointer->address) . \" \";
         echo Int64::from(strtol($digits->pointer, null, 10)) . \" \";
-        writable ?Ptr<CChar> $later = null;
-        let $laterPlace = MutPtr::to($later);
+        writable ?Pointer<CChar> $later = null;
+        let $laterPlace = WritablePointer::to($later);
         if ($later == null) {{
             strtol($digits->pointer, $laterPlace, 10);
             echo (($later ?? $digits->pointer)->address - $digits->pointer->address) . \" \";
@@ -1025,9 +1025,9 @@ function main(): void
         let $name = CString::from(\"DORIA_STAGE40_NO_SUCH_VARIABLE\");
         echo (getenv($name->pointer) == null) . \"\\n\";
 
-        writable ?Ptr<uint8> $slot = null;
-        let $place = MutPtr::to($slot);
-        Ptr<uint64> $raw = Ptr::cast(Ptr::from($place));
+        writable ?Pointer<uint8> $slot = null;
+        let $place = WritablePointer::to($slot);
+        Pointer<uint64> $raw = Pointer::cast(Pointer::from($place));
         echo ($place->read() == null) . \" \";
         $place->write($from);
         echo ($raw->read() == $from->address) . \" \" . ($slot != null) . \" \";
@@ -1038,7 +1038,7 @@ function main(): void
         echo ((pass($holder->pointer) ?? $from)->address == $from->address) . \" \";
         $holder->pointer = null;
         echo (pass($holder->pointer) == null) . \" \";
-        List<?Ptr<uint8>> $list = [null, $from];
+        List<?Pointer<uint8>> $list = [null, $from];
         echo ($list[0] == null) . \" \" . (($list[1] ?? $from)->address == $from->address);
     }}
 }}
@@ -1059,7 +1059,7 @@ use Doria\\Std\\Io\\WritableByteRegion;
 extern \"C\"
 {{
     /** @safety `$memory` is writable for `$count` bytes. */
-    function memset(MutPtr<uint8> $memory, int32 $value, CSize $count): MutPtr<uint8>;
+    function memset(WritablePointer<uint8> $memory, int32 $value, CSize $count): WritablePointer<uint8>;
 }}
 
 function main(): void
@@ -1229,7 +1229,7 @@ function main(): void
 
 #[test]
 fn typed_array_regions_view_pointer_elements() {
-    // Decision 0148 section 8 over `Ptr<T>[]`.
+    // Decision 0148 section 8 over `Pointer<T>[]`.
     let source = format!(
         "{POINTER}
 function main(): void
@@ -1237,14 +1237,14 @@ function main(): void
     int32 $first = 4;
     int32 $second = 5;
     unsafe {{
-        writable Ptr<int32>[] $pointers = [Ptr::to($first), Ptr::to($first)];
+        writable Pointer<int32>[] $pointers = [Pointer::to($first), Pointer::to($first)];
         {{
-            writable WritableArrayRegion<Ptr<int32>> $slots = $pointers->getWritableRegion(0, 2);
-            $slots[1] = Ptr::to($second);
+            writable WritableArrayRegion<Pointer<int32>> $slots = $pointers->getWritableRegion(0, 2);
+            $slots[1] = Pointer::to($second);
         }}
         let $view = $pointers->getRegion(0, 2);
-        Ptr<int32> $one = $view[0];
-        Ptr<int32> $two = $view[1];
+        Pointer<int32> $one = $view[0];
+        Pointer<int32> $two = $view[1];
         echo $one->read() . \" \" . $two->read();
     }}
 }}
@@ -1378,8 +1378,8 @@ function main(): void
     $tip->text[0] = UInt16::from(1);
     echo \" \" . $copy->text[0];
     unsafe {{
-        Ptr<uint16> $text = $tip->text->pointer;
-        Ptr<int32> $length = Ptr::cast($text->byteOffset(8));
+        Pointer<uint16> $text = $tip->text->pointer;
+        Pointer<int32> $length = Pointer::cast($text->byteOffset(8));
         echo \" \" . $text->offset(1)->read() . \" \" . $length->read();
     }}
     let $empty = new Tip();
@@ -1557,7 +1557,7 @@ function main(): void
         echo \" \";
         echo String::fromUtf16($wide->pointer) ?? \"invalid\";
         echo \" \";
-        Ptr<CChar> $invalid = Ptr::cast($bytes->getRegion(0, 2)->pointer);
+        Pointer<CChar> $invalid = Pointer::cast($bytes->getRegion(0, 2)->pointer);
         echo String::fromCString($invalid) ?? \"invalid\";
     }}
 }}
@@ -1582,13 +1582,13 @@ fn php_output_reports_that_it_does_not_build_foreign_strings_yet() {
     );
 }
 
-const SORTING: &str = "use Doria\\Std\\Ffi\\{CSize, MutPtr, Opaque, Ptr};
+const SORTING: &str = "use Doria\\Std\\Ffi\\{CSize, Opaque, Pointer, WritablePointer};
 
-extern \"C\" function compareIntegers(Ptr<Opaque> $left, Ptr<Opaque> $right): int32
+extern \"C\" function compareIntegers(Pointer<Opaque> $left, Pointer<Opaque> $right): int32
 {
     unsafe {
-        Ptr<int32> $first = Ptr::cast($left);
-        Ptr<int32> $second = Ptr::cast($right);
+        Pointer<int32> $first = Pointer::cast($left);
+        Pointer<int32> $second = Pointer::cast($right);
         let $a = $first->read();
         let $b = $second->read();
         if ($a < $b) {
@@ -1604,8 +1604,8 @@ extern \"C\" function compareIntegers(Ptr<Opaque> $left, Ptr<Opaque> $right): in
 extern \"C\"
 {
     /** @safety `$base` holds `$count` elements of `$size` bytes each. */
-    function qsort(MutPtr<Opaque> $base, CSize $count, CSize $size,
-        extern \"C\" function(Ptr<Opaque>, Ptr<Opaque>): int32 $compare): void;
+    function qsort(WritablePointer<Opaque> $base, CSize $count, CSize $size,
+        extern \"C\" function(Pointer<Opaque>, Pointer<Opaque>): int32 $compare): void;
 }
 ";
 
@@ -1620,7 +1620,7 @@ function main(): void
     writable int32[] $values = [5, -3, 9, 1, 7, 1];
     unsafe {{
         writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 6);
-        qsort(MutPtr::cast($region->writablePointer), CSize::from(6), CSize::from(4), compareIntegers);
+        qsort(WritablePointer::cast($region->writablePointer), CSize::from(6), CSize::from(4), compareIntegers);
     }}
     foreach ($values as int32 $value) {{
         echo $value . \" \";
@@ -1636,9 +1636,9 @@ fn a_c_abi_function_that_catches_its_io_errors_runs_as_a_qsort_callback() {
     // Decision 0148 section 12 (amendment of 2026-11-20): a C-ABI function
     // whose `echo` sits inside `try` with a `catch` for its I/O error lets
     // no checked error reach C, so its C entry uses the ordinary call.
-    let source = "use Doria\\Std\\Ffi\\{CSize, MutPtr, Opaque, Ptr};
+    let source = "use Doria\\Std\\Ffi\\{CSize, Opaque, Pointer, WritablePointer};
 
-extern \"C\" function compareLoudly(Ptr<Opaque> $left, Ptr<Opaque> $right): int32
+extern \"C\" function compareLoudly(Pointer<Opaque> $left, Pointer<Opaque> $right): int32
 {
     try {
         echo \".\";
@@ -1646,8 +1646,8 @@ extern \"C\" function compareLoudly(Ptr<Opaque> $left, Ptr<Opaque> $right): int3
         return 0;
     }
     unsafe {
-        Ptr<int32> $first = Ptr::cast($left);
-        Ptr<int32> $second = Ptr::cast($right);
+        Pointer<int32> $first = Pointer::cast($left);
+        Pointer<int32> $second = Pointer::cast($right);
         return $first->read() - $second->read();
     }
 }
@@ -1655,8 +1655,8 @@ extern \"C\" function compareLoudly(Ptr<Opaque> $left, Ptr<Opaque> $right): int3
 extern \"C\"
 {
     /** @safety `$base` holds `$count` elements of `$size` bytes each. */
-    function qsort(MutPtr<Opaque> $base, CSize $count, CSize $size,
-        extern \"C\" function(Ptr<Opaque>, Ptr<Opaque>): int32 $compare): void;
+    function qsort(WritablePointer<Opaque> $base, CSize $count, CSize $size,
+        extern \"C\" function(Pointer<Opaque>, Pointer<Opaque>): int32 $compare): void;
 }
 
 function main(): void
@@ -1664,7 +1664,7 @@ function main(): void
     writable int32[] $values = [3, 1, 2];
     unsafe {
         writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 3);
-        qsort(MutPtr::cast($region->writablePointer), CSize::from(3), CSize::from(4), compareLoudly);
+        qsort(WritablePointer::cast($region->writablePointer), CSize::from(3), CSize::from(4), compareLoudly);
     }
     echo \" \";
     foreach ($values as int32 $value) {
@@ -1698,7 +1698,7 @@ fn variadic_foreign_functions_are_called_per_arity_on_every_native_profile() {
     // `snprintf` directly; Cranelift calls it through the runtime's variadic
     // call trampoline (amendment of 2026-11-17). The second binding passes
     // more values than the argument registers hold.
-    let source = "use Doria\\Std\\Ffi\\{CChar, CSize, CString, LinkName, MutPtr, Ptr, Variadic};
+    let source = "use Doria\\Std\\Ffi\\{CChar, CSize, CString, LinkName, Pointer, Variadic, WritablePointer};
 use Doria\\Std\\Io\\WritableByteRegion;
 
 extern \"C\"
@@ -1706,13 +1706,13 @@ extern \"C\"
     /** @safety `$buffer` holds `$size` bytes and `$format` matches the values. */
     #[LinkName(\"snprintf\")]
     #[Variadic(fixedParameters: 3)]
-    function formatThree(MutPtr<CChar> $buffer, CSize $size, Ptr<CChar> $format,
+    function formatThree(WritablePointer<CChar> $buffer, CSize $size, Pointer<CChar> $format,
         int32 $count, float64 $ratio, int64 $total): int32;
 
     /** @safety `$buffer` holds `$size` bytes and `$format` matches the values. */
     #[LinkName(\"snprintf\")]
     #[Variadic(fixedParameters: 3)]
-    function formatMany(MutPtr<CChar> $buffer, CSize $size, Ptr<CChar> $format,
+    function formatMany(WritablePointer<CChar> $buffer, CSize $size, Pointer<CChar> $format,
         int64 $a, int64 $b, int64 $c, int64 $d, int64 $e, int64 $f,
         float64 $g, float64 $h, float64 $i, float64 $j, float64 $k,
         float64 $l, float64 $m, float64 $n, float64 $o): int32;
@@ -1725,12 +1725,12 @@ function main(): void
     let $many = CString::from(\"%lld %lld %lld %lld %lld %lld %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f\");
     unsafe {
         writable WritableByteRegion $region = $bytes->getWritableRegion(0, 128);
-        MutPtr<CChar> $buffer = MutPtr::cast($region->writablePointer);
+        WritablePointer<CChar> $buffer = WritablePointer::cast($region->writablePointer);
         let $written = formatThree($buffer, CSize::from(128), $three->pointer, 7, 2.5, -9);
-        echo $written . \" \" . (String::fromCString(Ptr::from($buffer)) ?? \"invalid\") . \"\\n\";
+        echo $written . \" \" . (String::fromCString(Pointer::from($buffer)) ?? \"invalid\") . \"\\n\";
         formatMany($buffer, CSize::from(128), $many->pointer, 1, 2, 3, 4, 5, 6,
             0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5);
-        echo String::fromCString(Ptr::from($buffer)) ?? \"invalid\";
+        echo String::fromCString(Pointer::from($buffer)) ?? \"invalid\";
     }
 }
 ";
@@ -1746,7 +1746,7 @@ fn a_c_entry_receives_and_returns_every_c_form() {
     // under the C convention, so each value crosses the boundary twice:
     // integers of every width, `bool`, `float32`, `float64`, pointers
     // present and absent, and a struct in and out by value.
-    let source = "use Doria\\Std\\Ffi\\{CLong, MutPtr, Opaque, Ptr};
+    let source = "use Doria\\Std\\Ffi\\{CLong, Opaque, Pointer, WritablePointer};
 
 extern \"C\" struct Pair
 {
@@ -1762,7 +1762,7 @@ extern \"C\" struct Wide
 }
 
 extern \"C\" function describe(int8 $small, uint16 $medium, bool $flag, float32 $ratio,
-    ?Ptr<Opaque> $address, CLong $count): int64
+    ?Pointer<Opaque> $address, CLong $count): int64
 {
     writable int64 $total = Int64::from($small) + Int64::from($medium) + Int64::from($count);
     if ($flag) {
@@ -1790,7 +1790,7 @@ extern \"C\" function widen(Wide $value, bool $negate): Wide
     return $value;
 }
 
-extern \"C\" function absent(?Ptr<Opaque> $address): ?Ptr<Opaque>
+extern \"C\" function absent(?Pointer<Opaque> $address): ?Pointer<Opaque>
 {
     return $address;
 }
@@ -1798,7 +1798,7 @@ extern \"C\" function absent(?Ptr<Opaque> $address): ?Ptr<Opaque>
 function main(): void
 {
     unsafe {
-        extern \"C\" function(int8, uint16, bool, float32, ?Ptr<Opaque>, CLong): int64 $describe = describe;
+        extern \"C\" function(int8, uint16, bool, float32, ?Pointer<Opaque>, CLong): int64 $describe = describe;
         float32 $ratio = 0.5;
         echo $describe(-5, 60000, true, $ratio, null, CLong::from(7)) . \" \";
         extern \"C\" function(Pair): Pair $swap = swap;
@@ -1810,7 +1810,7 @@ function main(): void
         echo $wide->b;
         echo $wide->c;
         echo \" \";
-        extern \"C\" function(?Ptr<Opaque>): ?Ptr<Opaque> $absent = absent;
+        extern \"C\" function(?Pointer<Opaque>): ?Pointer<Opaque> $absent = absent;
         echo $absent(null) == null;
     }
 }
@@ -1825,7 +1825,7 @@ fn a_panic_in_a_callback_shows_the_foreign_call_in_its_call_path() {
     // frame.
     let source = format!(
         "{SORTING}
-extern \"C\" function refuse(Ptr<Opaque> $left, Ptr<Opaque> $right): int32
+extern \"C\" function refuse(Pointer<Opaque> $left, Pointer<Opaque> $right): int32
 {{
     panic(\"no comparisons\");
 }}
@@ -1834,7 +1834,7 @@ function sort(writable int32[] $values): void
 {{
     unsafe {{
         writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 2);
-        qsort(MutPtr::cast($region->writablePointer), CSize::from(2), CSize::from(4), refuse);
+        qsort(WritablePointer::cast($region->writablePointer), CSize::from(2), CSize::from(4), refuse);
     }}
 }}
 
@@ -1873,9 +1873,9 @@ function main(): void
 fn a_callback_on_another_thread_panics_with_p1706() {
     // Decision 0148 section 13: C may call a C-ABI function only on the
     // thread running Doria code.
-    let source = "use Doria\\Std\\Ffi\\{MutPtr, Opaque, Ptr};
+    let source = "use Doria\\Std\\Ffi\\{Opaque, Pointer, WritablePointer};
 
-extern \"C\" function work(?MutPtr<Opaque> $context): ?MutPtr<Opaque>
+extern \"C\" function work(?WritablePointer<Opaque> $context): ?WritablePointer<Opaque>
 {
     return $context;
 }
@@ -1883,19 +1883,19 @@ extern \"C\" function work(?MutPtr<Opaque> $context): ?MutPtr<Opaque>
 extern \"C\"
 {
     /** @safety `$thread` is writable for one `pthread_t`. */
-    function pthread_create(MutPtr<uint64> $thread, ?Ptr<Opaque> $attributes,
-        extern \"C\" function(?MutPtr<Opaque>): ?MutPtr<Opaque> $start,
-        ?MutPtr<Opaque> $context): int32;
+    function pthread_create(WritablePointer<uint64> $thread, ?Pointer<Opaque> $attributes,
+        extern \"C\" function(?WritablePointer<Opaque>): ?WritablePointer<Opaque> $start,
+        ?WritablePointer<Opaque> $context): int32;
 
     /** @safety `$thread` came from `pthread_create` and was not joined. */
-    function pthread_join(uint64 $thread, ?MutPtr<Opaque> $result): int32;
+    function pthread_join(uint64 $thread, ?WritablePointer<Opaque> $result): int32;
 }
 
 function main(): void
 {
     writable uint64 $thread = 0;
     unsafe {
-        if (pthread_create(MutPtr::to($thread), null, work, null) == 0) {
+        if (pthread_create(WritablePointer::to($thread), null, work, null) == 0) {
             pthread_join($thread, null);
         }
     }

@@ -299,8 +299,8 @@ impl<'program> Checker<'program> {
             if position != TypePosition::Pointee {
                 return Some(self.report_foreign_type_placement(
                     span,
-                    "`Opaque` has no values; it names the untyped pointee of `Ptr<Opaque>` and `MutPtr<Opaque>`",
-                    "write `Ptr<Opaque>` for C's `const void *` or `MutPtr<Opaque>` for `void *`",
+                    "`Opaque` has no values; it names the untyped pointee of `Pointer<Opaque>` and `WritablePointer<Opaque>`",
+                    "write `Pointer<Opaque>` for C's `const void *` or `WritablePointer<Opaque>` for `void *`",
                 ));
             }
             self.resolve_zero_arg_type(ty, span, TypeKind::Foreign(ForeignType::Opaque))
@@ -526,14 +526,14 @@ impl<'program> Checker<'program> {
 
     fn ffi_safe_replacement(&self, ty: TypeId) -> String {
         match self.types.kind(ty) {
-            TypeKind::String => "pass `Ptr<CChar>` from a `CString`, or `$text->byteRegion->pointer` with its length for a pointer-and-length API".to_string(),
-            TypeKind::Bytes | TypeKind::ByteRegion(_) => "pass `$region->pointer` (`Ptr<uint8>`) with `$region->length`".to_string(),
+            TypeKind::String => "pass `Pointer<CChar>` from a `CString`, or `$text->byteRegion->pointer` with its length for a pointer-and-length API".to_string(),
+            TypeKind::Bytes | TypeKind::ByteRegion(_) => "pass `$region->pointer` (`Pointer<uint8>`) with `$region->length`".to_string(),
             TypeKind::TypedArray(element) => format!(
-                "pass a region pointer, `Ptr<{}>`, with its length",
+                "pass a region pointer, `Pointer<{}>`, with its length",
                 self.types.display(*element)
             ),
             TypeKind::Class(_) | TypeKind::Interface(_) | TypeKind::SharedHandle(..) => {
-                "pass a raw handle, `MutPtr<Opaque>` from `Handle::intoRaw`".to_string()
+                "pass a raw handle, `WritablePointer<Opaque>` from `Handle::create`".to_string()
             }
             TypeKind::Function(_) => {
                 "pass a C-ABI function, typed `extern \"C\" function(...)`".to_string()
@@ -543,7 +543,7 @@ impl<'program> Checker<'program> {
                 "only pointers and C function pointers are nullable at the C boundary; pass a sentinel value or a pointer".to_string()
             }
             TypeKind::Foreign(ForeignType::Opaque) => {
-                "write `Ptr<Opaque>` or `MutPtr<Opaque>`".to_string()
+                "write `Pointer<Opaque>` or `WritablePointer<Opaque>`".to_string()
             }
             _ => "use a fixed-width integer or float, `bool`, a pointer, a boundary type or a foreign struct".to_string(),
         }
@@ -814,7 +814,7 @@ impl<'program> Checker<'program> {
                         span,
                     )
                     .with_title("Foreign Parameter Has A Mode")
-                    .with_help("pass a `MutPtr<T>` for a value C writes through")
+                    .with_help("pass a `WritablePointer<T>` for a value C writes through")
                     .with_fix(
                         Span::in_source(span.source, span.start, parameter.type_span.start),
                         "",

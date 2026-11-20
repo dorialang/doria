@@ -21226,7 +21226,7 @@ fn lower_pointer_operation(
             let moved = builder.ins().iadd(address, bytes);
             // A negative offset must move down and any other up; wrapping
             // past either end of the address space, or reaching zero,
-            // leaves every address a `Ptr<T>` can hold.
+            // leaves every address a `Pointer<T>` can hold.
             let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, bytes, 0);
             let wrapped_down = builder
                 .ins()
@@ -21361,7 +21361,7 @@ fn lower_foreign_call(
                 let ty = local_definition(resources.program, resources.function_id, local)?.ty;
                 let slot = local_slot(resources.local_slots, local)?;
                 // A C scalar is passed as the value it is stored as; a null
-                // `?Ptr<T>` is stored as address zero.
+                // `?Pointer<T>` is stored as address zero.
                 let scalar = c_scalar_storage(ty)?;
                 values.push(
                     builder
@@ -21786,7 +21786,7 @@ fn finish_foreign_call(
     } else {
         value
     };
-    // The result is stored as C returned it; a null `?Ptr<T>` is stored as
+    // The result is stored as C returned it; a null `?Pointer<T>` is stored as
     // address zero.
     c_scalar_storage(ty)?;
     let slot = local_slot(resources.local_slots, target)?;

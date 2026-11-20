@@ -1058,7 +1058,7 @@ pub enum NullableScalarForm {
     /// A presence word, then the payload `payload_offset` bytes in.
     Tagged { payload_offset: u32 },
     /// The payload alone, absent as the all-zero payload. A nullable
-    /// pointer (`?Ptr<T>`, `?MutPtr<T>` or `?extern "C" function(...)`) is
+    /// pointer (`?Pointer<T>`, `?WritablePointer<T>` or `?extern "C" function(...)`) is
     /// one word and null is address zero (Decision 0148 section 3), the
     /// form C reads and writes.
     ZeroIsNull,

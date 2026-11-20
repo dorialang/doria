@@ -26,7 +26,7 @@ pub fn unit_type(encoding: ForeignStringEncoding) -> ResolvedType {
     }
 }
 
-/// `Ptr<CChar>` or `Ptr<uint16>`: what `pointer` gives and what
+/// `Pointer<CChar>` or `Pointer<uint16>`: what `pointer` gives and what
 /// `String::fromCString` and `String::fromUtf16` read.
 pub fn unit_pointer(encoding: ForeignStringEncoding) -> ResolvedType {
     ResolvedType::Foreign(Box::new(ForeignType::Pointer {
@@ -126,8 +126,8 @@ pub fn member(encoding: ForeignStringEncoding, name: &str) -> Option<ByteIntrins
                 ForeignStringEncoding::Utf16 => "forming a pointer to a `Utf16String`",
             });
             spec.documentation = match encoding {
-                ForeignStringEncoding::Utf8 => "The address of the first byte of this NUL-terminated buffer (`Ptr<CChar>`), for C functions that read a string. Needs an unsafe context. The value stays in place, and cannot be given away, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
-                ForeignStringEncoding::Utf16 => "The address of the first code unit of this NUL-terminated buffer (`Ptr<uint16>`), for the Windows `W` functions. Needs an unsafe context. The value stays in place, and cannot be given away, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
+                ForeignStringEncoding::Utf8 => "The address of the first byte of this NUL-terminated buffer (`Pointer<CChar>`), for C functions that read a string. Needs an unsafe context. The value stays in place, and cannot be given away, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
+                ForeignStringEncoding::Utf16 => "The address of the first code unit of this NUL-terminated buffer (`Pointer<uint16>`), for the Windows `W` functions. Needs an unsafe context. The value stays in place, and cannot be given away, replaced or released, until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
             };
         }
         _ => return None,

@@ -81,7 +81,7 @@ struct Resolution {
     closure_bodies: Vec<(Block, Span)>,
     entry_facts: BTreeMap<BindingId, Fact>,
     constructor_properties: HashMap<String, BindingId>,
-    /// Each place a `MutPtr::to` addresses, with the unsafe context it is
+    /// Each place a `WritablePointer::to` addresses, with the unsafe context it is
     /// formed in. C can write the place through the pointer during any call
     /// in that context (Decision 0148 section 7), so no fact about it
     /// survives a call there.
@@ -1383,7 +1383,7 @@ fn kill_short_circuit_effects(
     }
 }
 
-/// Forgets every fact about a place a `MutPtr` addresses in the unsafe
+/// Forgets every fact about a place a `WritablePointer` addresses in the unsafe
 /// context the call at `call` runs in.
 fn kill_exposed_places(call: Span, state: &mut State, resolution: &Resolution) {
     for (context, binding) in &resolution.pointer_exposures {
@@ -2426,7 +2426,7 @@ impl Resolver {
         self.scopes.pop();
     }
 
-    /// Records the place a `MutPtr::to` call addresses inside an unsafe
+    /// Records the place a `WritablePointer::to` call addresses inside an unsafe
     /// context.
     fn record_pointer_exposure(
         &mut self,

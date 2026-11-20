@@ -3673,7 +3673,7 @@ enum LifecycleMethod {
 enum TypePosition {
     Return,
     Value,
-    /// The type argument of `Ptr<T>` or `MutPtr<T>`, where `Opaque` and an
+    /// The type argument of `Pointer<T>` or `WritablePointer<T>`, where `Opaque` and an
     /// incomplete foreign struct are allowed.
     Pointee,
     /// A foreign struct or union field, where `T[N]` is allowed.

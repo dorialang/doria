@@ -148,7 +148,7 @@ pub enum InlineValueType {
     StandardOutput(ClassId),
     StandardError(ClassId),
     Terminal(TerminalValue, ClassId),
-    /// A raw pointer, `Ptr<T>`, `MutPtr<T>` or a C function pointer
+    /// A raw pointer, `Pointer<T>`, `WritablePointer<T>` or a C function pointer
     /// (Decision 0148 sections 3 and 12): one address word. Its pointee,
     /// access and C signature are checking facts MIR does not carry.
     Pointer,
@@ -184,7 +184,7 @@ impl InlineValueType {
             Self::StandardOutput(_) => crate::compiler_known_stream::STANDARD_OUTPUT,
             Self::StandardError(_) => crate::compiler_known_stream::STANDARD_ERROR,
             Self::Terminal(value, _) => value.name(),
-            Self::Pointer => crate::foreign::PTR,
+            Self::Pointer => crate::foreign::POINTER,
         }
     }
 
