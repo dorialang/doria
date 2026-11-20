@@ -407,3 +407,26 @@ fn fixed_length_arrays_are_written_only_in_foreign_fields() {
     let diagnostic = parse_error("function main(): void { uint16[4] $values = []; }");
     assert_eq!(diagnostic.code, "P0001");
 }
+
+#[test]
+fn borrow_is_a_member_name_after_double_colon_and_arrow() {
+    // Decision 0148 section 11 spells `Handle::borrow`; `borrow` never
+    // begins syntax after `::`, `->` or `?->`, so it is a member name there
+    // as `use` and `not` are.
+    let source = "function lend(): void
+{
+    echo $lender->borrow() . $lender?->borrow;
+}
+
+function main(): void
+{
+    unsafe {
+        echo Handle::borrow($handle);
+        echo WritableSharedReference::borrow($handle);
+    }
+}
+";
+    let program = doriac::parse_source("borrow.doria", source)
+        .unwrap_or_else(|diagnostics| panic!("borrow parses as a member name: {diagnostics:#?}"));
+    assert_eq!(program.items.len(), 2);
+}

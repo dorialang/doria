@@ -4171,9 +4171,10 @@ impl Proof<'_> {
             mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Mixed(value)) => {
                 self.value(context, site, flow, &mir::Rvalue::Mixed(value.clone()))
             }
-            mir::Rvalue::Region(mir::RegionExpression::Region { source, .. }) => {
-                self.value(context, site, flow, source)
-            }
+            mir::Rvalue::Region(
+                mir::RegionExpression::Region { source, .. }
+                | mir::RegionExpression::Foreign { owner: source, .. },
+            ) => self.value(context, site, flow, source),
             mir::Rvalue::Region(mir::RegionExpression::AssumePresent { value, .. }) => self.value(
                 context,
                 site,

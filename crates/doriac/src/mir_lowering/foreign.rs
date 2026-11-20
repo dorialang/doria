@@ -13,7 +13,7 @@ use super::*;
 use crate::foreign::{ForeignType, PointerAccess};
 use crate::pointer_intrinsics::{self, PointerOperation};
 
-const POINTER: mir::Type = mir::Type::Scalar(mir::ScalarType::Inline(
+pub(super) const POINTER: mir::Type = mir::Type::Scalar(mir::ScalarType::Inline(
     crate::inline_value::InlineValueType::Pointer,
 ));
 
@@ -60,6 +60,23 @@ pub(super) fn expression(
             } else {
                 nullable_present_rvalue(value)
             }))
+        }
+        // `$reference->toHandle()` consumes the reference (section 11).
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } if method == crate::foreign_handles::TO_HANDLE
+            && args.is_empty()
+            && matches!(
+                context.expression_type(object)?,
+                mir::Type::SharedReference(_) | mir::Type::WritableSharedReference(_)
+            ) =>
+        {
+            let ty = context.expression_type(object)?;
+            create_handle(object, ty, *span, expected, context).map(Some)
         }
         hir::Expr::MethodCall {
             object,
@@ -183,6 +200,49 @@ pub(super) fn expression(
             span,
         } if crate::foreign::ForeignStringEncoding::from_source_name(class_name).is_some() => {
             owned_string_construction(method, args, *span, expected, context)
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if crate::foreign_handles::static_operation(class_name, method).is_some() => {
+            let (_, operation) = crate::foreign_handles::static_operation(class_name, method)
+                .expect("the handle operation was matched");
+            let [argument] = argument_values(args)[..] else {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("`{class_name}::{method}` has one argument"),
+                )]);
+            };
+            match operation {
+                crate::foreign_handles::HandleOperation::Create => {
+                    let ty = context.expression_type(argument)?;
+                    create_handle(argument, ty, *span, expected, context).map(Some)
+                }
+                crate::foreign_handles::HandleOperation::Reclaim
+                | crate::foreign_handles::HandleOperation::Borrow => {
+                    let ty = context.expression_type(unparenthesized_place(expr))?;
+                    let reclaim = operation == crate::foreign_handles::HandleOperation::Reclaim;
+                    let handle = materialize_pointer(argument, context)?;
+                    handle_value_type(ty, *span)?;
+                    let target = if reclaim {
+                        context.declare_owned_temp(ty)
+                    } else {
+                        context.declare_borrowed_temp(ty, false)
+                    };
+                    context.push_statement(mir::Statement::Pointer {
+                        target: Some(target),
+                        operation: mir::PointerOperation::FromHandle {
+                            handle,
+                            ty,
+                            reclaim,
+                        },
+                        span: *span,
+                    });
+                    Ok(Some(local_rvalue(target, ty, reclaim)))
+                }
+            }
         }
         hir::Expr::StaticCall {
             class_name,
@@ -387,7 +447,56 @@ pub(super) fn statement(expr: &hir::Expr, context: &mut LoweringContext) -> Diag
 }
 
 /// The pointer `expr` evaluates to, in a local the operation reads.
-fn materialize_pointer(
+/// The handle that holds `value` of type `ty`, whose ownership moves into
+/// it (Decision 0148 section 11).
+fn create_handle(
+    value: &hir::Expr,
+    ty: mir::Type,
+    span: Span,
+    expected: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    handle_value_type(ty, span)?;
+    let value = lower_call_argument(value, ty, mir::FunctionParameterMode::Take, context)?;
+    let target = context.declare_return_temp(POINTER, false);
+    context.push_statement(mir::Statement::Pointer {
+        target: Some(target),
+        operation: mir::PointerOperation::CreateHandle { value },
+        span,
+    });
+    let handle = local_rvalue(target, POINTER, false);
+    Ok(if expected == POINTER {
+        handle
+    } else {
+        present_as_expected(handle, expected)
+    })
+}
+
+/// A handle holds a class value or a shared reference of one word. A
+/// `SharedReference<I>` of an interface `I` is two words, and no target
+/// builds its handle yet.
+fn handle_value_type(ty: mir::Type, span: Span) -> DiagnosticResult<()> {
+    if ty.shared_interface().is_some() {
+        return Err(vec![crate::unsafe_code::unbuilt_form(
+            span,
+            "Handles Of Shared Interface References Cannot Be Built Yet",
+            "a handle of a shared reference to an interface is part of Doria; this compiler builds handles of class values and of shared references to classes, and not of shared references to interfaces yet",
+        )]);
+    }
+    if matches!(
+        ty,
+        mir::Type::Class(_) | mir::Type::SharedReference(_) | mir::Type::WritableSharedReference(_)
+    ) {
+        Ok(())
+    } else {
+        Err(vec![unsupported(
+            span,
+            "a handle holds a class value or a shared reference",
+        )])
+    }
+}
+
+pub(super) fn materialize_pointer(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::LocalId> {

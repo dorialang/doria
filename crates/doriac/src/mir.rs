@@ -4113,6 +4113,17 @@ pub enum RegionExpression {
         left: Box<NullableRegionExpression>,
         right: Box<RegionExpression>,
     },
+    /// A region over foreign memory (Decision 0148 section 10): `length`
+    /// elements at `data`, a pointer local a
+    /// [`PointerOperation::ForeignRange`] checked. The region borrows
+    /// `owner`, the place whose destructor releases the memory, as a
+    /// region borrows its source; reading `owner` has no effect.
+    Foreign {
+        kind: RegionType,
+        owner: Box<Rvalue>,
+        data: LocalId,
+        length: LocalId,
+    },
 }
 
 impl RegionExpression {
@@ -4123,7 +4134,8 @@ impl RegionExpression {
             | Self::Call { kind, .. }
             | Self::AssumePresent { kind, .. }
             | Self::CollectionIndex { kind, .. }
-            | Self::Coalesce { kind, .. } => *kind,
+            | Self::Coalesce { kind, .. }
+            | Self::Foreign { kind, .. } => *kind,
         }
     }
 
@@ -4136,7 +4148,7 @@ impl RegionExpression {
                 Self::Coalesce { left, right, .. } => {
                     left.borrows_descriptor() || right.borrows_descriptor()
                 }
-                Self::Region { .. } | Self::Call { .. } => false,
+                Self::Region { .. } | Self::Call { .. } | Self::Foreign { .. } => false,
             }
     }
 }
@@ -6489,6 +6501,35 @@ pub enum PointerOperation {
     /// address of the C entry of `function`, one of `Program::c_entries`,
     /// as a C function pointer.
     CEntryAddress { function: FunctionId },
+    /// The memory `ByteRegion::fromPointer($owner, $pointer, $length)` and
+    /// its three siblings view (section 10): `pointer` itself, once
+    /// `length` elements of `stride` bytes from it are a range. A pointer
+    /// not a multiple of `align`, the element's C alignment, panics with
+    /// P1702; a negative length or a range past the end of the address
+    /// space panics with P1703. [`RegionExpression::Foreign`] forms the
+    /// region.
+    ForeignRange {
+        pointer: LocalId,
+        length: IntegerExpression,
+        stride: u64,
+        align: u64,
+    },
+    /// `Handle::create(take $value)` and `$reference->toHandle()` (section
+    /// 11): the handle that holds `value`, an owned class value or a shared
+    /// reference whose ownership moves into the handle. A closed class's
+    /// handle is its object, an open class's the box of its object and
+    /// descriptor (`native_abi::HANDLE_BOX_CREATE`), and a shared
+    /// reference's its one word.
+    CreateHandle { value: Rvalue },
+    /// `Handle::reclaim`, the shared references' `reclaim` (`reclaim`), and
+    /// every `borrow`: the value of type `ty` the handle local `handle`
+    /// holds. A reclaimed value is owned again and an open class's box is
+    /// released; a borrowed one is lent, and the handle keeps it.
+    FromHandle {
+        handle: LocalId,
+        ty: Type,
+        reclaim: bool,
+    },
 }
 
 impl PointerOperation {
@@ -6499,12 +6540,17 @@ impl PointerOperation {
             | Self::Write { pointer, .. }
             | Self::Offset { pointer, .. }
             | Self::Address { pointer }
-            | Self::ReadForeignString { pointer, .. } => Some(*pointer),
+            | Self::ReadForeignString { pointer, .. }
+            | Self::ForeignRange { pointer, .. }
+            | Self::FromHandle {
+                handle: pointer, ..
+            } => Some(*pointer),
             Self::FromAddress { .. }
             | Self::AddressOf { .. }
             | Self::RegionData { .. }
             | Self::ForeignStringData { .. }
-            | Self::CEntryAddress { .. } => None,
+            | Self::CEntryAddress { .. }
+            | Self::CreateHandle { .. } => None,
         }
     }
 }
@@ -7530,16 +7576,22 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             ForeignFieldAccess::Write { value, .. } => rvalue_class_temporary_capacity(value),
         },
         Statement::Pointer { operation, .. } => match operation {
-            PointerOperation::Write { value, .. } => rvalue_class_temporary_capacity(value),
+            PointerOperation::Write { value, .. } | PointerOperation::CreateHandle { value } => {
+                rvalue_class_temporary_capacity(value)
+            }
             PointerOperation::Offset { count, .. } => integer_class_temporary_capacity(count),
             PointerOperation::FromAddress { address } => integer_class_temporary_capacity(address),
+            PointerOperation::ForeignRange { length, .. } => {
+                integer_class_temporary_capacity(length)
+            }
             PointerOperation::Read { .. }
             | PointerOperation::Address { .. }
             | PointerOperation::AddressOf { .. }
             | PointerOperation::RegionData { .. }
             | PointerOperation::ForeignStringData { .. }
             | PointerOperation::ReadForeignString { .. }
-            | PointerOperation::CEntryAddress { .. } => 0,
+            | PointerOperation::CEntryAddress { .. }
+            | PointerOperation::FromHandle { .. } => 0,
         },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
@@ -7811,6 +7863,7 @@ fn byte_region_class_temporary_capacity(value: &RegionExpression) -> usize {
                 + rvalue_class_temporary_capacity(length)
         }
         RegionExpression::Local { .. } => 0,
+        RegionExpression::Foreign { owner, .. } => rvalue_class_temporary_capacity(owner),
         RegionExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -9385,6 +9438,16 @@ impl fmt::Display for RegionExpression {
                 length,
                 ..
             } => write!(formatter, "{kind}({source}, {offset}, {length})"),
+            Self::Foreign {
+                kind,
+                owner,
+                data,
+                length,
+            } => write!(
+                formatter,
+                "{kind} foreign({owner}, local{}, local{})",
+                data.0, length.0
+            ),
             Self::Local {
                 local, transfer, ..
             } => write!(
@@ -11052,6 +11115,29 @@ impl fmt::Display for Statement {
                     PointerOperation::CEntryAddress { function } => {
                         write!(formatter, "c_entry_address(function{})", function.0)
                     }
+                    PointerOperation::CreateHandle { value } => {
+                        write!(formatter, "create_handle({value})")
+                    }
+                    PointerOperation::FromHandle {
+                        handle,
+                        ty,
+                        reclaim,
+                    } => write!(
+                        formatter,
+                        "{}_handle<{ty}>(local{})",
+                        if *reclaim { "reclaim" } else { "borrow" },
+                        handle.0
+                    ),
+                    PointerOperation::ForeignRange {
+                        pointer,
+                        length,
+                        stride,
+                        align,
+                    } => write!(
+                        formatter,
+                        "foreign_range(local{}, {length} * {stride} @{align})",
+                        pointer.0
+                    ),
                     PointerOperation::AddressOf { local, offset } => {
                         write!(formatter, "pointer_to(local{} @{offset})", local.0)
                     }

@@ -167,6 +167,10 @@ pub const BYTES_ALLOCATE: &str = "dr_v2_bytes_allocate";
 pub const BYTES_FREE: &str = "dr_v1_bytes_free";
 /// Releases a `CString` or `Utf16String` buffer (Decision 0148 section 9).
 pub const FOREIGN_STRING_FREE: &str = "dr_v1_foreign_string_free";
+/// The box behind an open class value's handle (Decision 0148 section 11):
+/// the object word, then the descriptor word.
+pub const HANDLE_BOX_CREATE: &str = "dr_v1_handle_box_create";
+pub const HANDLE_BOX_FREE: &str = "dr_v1_handle_box_free";
 
 /// The runtime function that builds an owned foreign string from a string:
 /// `(frame, string) -> buffer`, null from a `tryFrom` form for text with NUL.
@@ -722,6 +726,16 @@ pub fn array_region_element(
         return None;
     }
     Some((array.value, array_region_stride(array.value)?))
+}
+
+/// The bytes between elements of `region`: one for a byte region, the
+/// element stride for a typed array region; `None` for an element type no
+/// target builds.
+pub fn region_stride(program: &mir::Program, region: mir::RegionType) -> Option<u8> {
+    match region.array {
+        None => Some(1),
+        Some(_) => array_region_element(program, region).map(|(_, stride)| stride),
+    }
 }
 
 pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {

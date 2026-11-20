@@ -113,6 +113,115 @@ pub fn members(receiver: &ResolvedType, kind: ByteMemberKind) -> Vec<ByteIntrins
     .collect()
 }
 
+/// The static member of the four region companions (Decision 0148 section
+/// 10): `ByteRegion::fromPointer($owner, $pointer, $length)`,
+/// `WritableByteRegion::fromPointer(writable $owner, ...)` and the typed
+/// `ArrayRegion::fromPointer` and `WritableArrayRegion::fromPointer`.
+pub const FROM_POINTER: &str = "fromPointer";
+
+/// The parameters of [`FROM_POINTER`], in declaration order. The region
+/// borrows the first, `owner`.
+pub const FROM_POINTER_PARAMETERS: [&str; 3] = ["owner", "pointer", "length"];
+
+/// A region companion a static call names: the region's access and
+/// whether it is a typed array region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionCompanion {
+    pub kind: ByteRegionKind,
+    pub typed: bool,
+}
+
+impl RegionCompanion {
+    /// The companion a canonical class name names, if it is one of the four
+    /// region types.
+    pub fn from_class_name(name: &str) -> Option<Self> {
+        ByteRegionKind::from_source_name(name)
+            .map(|kind| Self { kind, typed: false })
+            .or_else(|| {
+                ByteRegionKind::from_array_source_name(name).map(|kind| Self { kind, typed: true })
+            })
+    }
+
+    /// The companion and member of a `fromPointer` call, from its qualifier.
+    pub fn from_pointer_call(
+        qualifier: &crate::ast::StaticQualifier,
+        method: &str,
+    ) -> Option<Self> {
+        match qualifier {
+            crate::ast::StaticQualifier::Class(name) if method == FROM_POINTER => {
+                Self::from_class_name(name)
+            }
+            _ => None,
+        }
+    }
+
+    /// The name source spells, without its namespace.
+    pub fn short_name(self) -> &'static str {
+        if self.typed {
+            self.kind.array_source_name()
+        } else {
+            self.kind
+                .source_name()
+                .rsplit('\\')
+                .next()
+                .expect("a region name has a last segment")
+        }
+    }
+
+    /// The pointer access `fromPointer` takes: write access for a writable
+    /// region, which C fills through.
+    pub const fn pointer_access(self) -> crate::foreign::PointerAccess {
+        if self.kind.is_writable() {
+            crate::foreign::PointerAccess::Write
+        } else {
+            crate::foreign::PointerAccess::Read
+        }
+    }
+
+    /// The region type over elements of `element`; a byte region ignores it.
+    pub fn region_type(self, element: ResolvedType) -> ResolvedType {
+        if self.typed {
+            ResolvedType::ArrayRegion(self.kind, Box::new(element))
+        } else {
+            ResolvedType::ByteRegion(self.kind)
+        }
+    }
+
+    pub const fn documentation(self) -> &'static str {
+        match (self.typed, self.kind.is_writable()) {
+            (false, false) => "Views `length` bytes of memory a foreign library owns, starting at `pointer`, as a readonly region (Decision 0148 section 10). Needs an unsafe context. The region borrows `owner`, the Doria value whose destructor releases the memory, so it cannot outlive it; a method returning the region borrows `$this`. A negative length, or a range past the end of the address space, panics with P1703. The memory is not copied, and Doria never releases it.",
+            (false, true) => "Views `length` bytes of memory a foreign library owns, starting at `pointer`, as a writable region (Decision 0148 section 10). Needs an unsafe context and writable access to `owner`, the Doria value whose destructor releases the memory; the region borrows it, so it cannot outlive it. A negative length, or a range past the end of the address space, panics with P1703. The memory is not copied, and Doria never releases it.",
+            (true, false) => "Views `length` elements of type `T` of memory a foreign library owns, starting at `pointer`, as a readonly region (Decision 0148 section 10); `T` is the pointer's pointee. Needs an unsafe context. The region borrows `owner`, the Doria value whose destructor releases the memory, so it cannot outlive it. A pointer not aligned for `T` panics with P1702; a negative length, or a range past the end of the address space, panics with P1703. The memory is not copied, and Doria never releases it.",
+            (true, true) => "Views `length` elements of type `T` of memory a foreign library owns, starting at `pointer`, as a writable region (Decision 0148 section 10); `T` is the pointer's pointee. Needs an unsafe context and writable access to `owner`, the Doria value whose destructor releases the memory; the region borrows it, so it cannot outlive it. A pointer not aligned for `T` panics with P1702; a negative length, or a range past the end of the address space, panics with P1703. The memory is not copied, and Doria never releases it.",
+        }
+    }
+}
+
+/// The source-order argument of a `fromPointer` call bound to parameter
+/// `parameter` under named-argument binding (Decision 0098), with its index.
+pub fn from_pointer_argument(
+    args: &[crate::ast::Argument],
+    parameter: usize,
+) -> Option<(usize, &crate::ast::Argument)> {
+    let index = from_pointer_binding(
+        &args
+            .iter()
+            .map(|argument| argument.name.as_ref().map(|name| name.text.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .param_to_arg
+    .get(parameter)
+    .copied()
+    .flatten()?;
+    Some((index, args.get(index)?))
+}
+
+/// The binding of `fromPointer`'s arguments, by their names in source
+/// order, onto [`FROM_POINTER_PARAMETERS`].
+pub fn from_pointer_binding(names: &[Option<&str>]) -> crate::arg_binding::BoundArguments {
+    crate::arg_binding::bind_arguments(&FROM_POINTER_PARAMETERS, &[false; 3], names)
+}
+
 /// A string's UTF-8 bytes as a readonly region (Stage 36a decision log entry
 /// 49). Decision 0103 keeps the string instance surface to properties for
 /// data, measurements and views; this is the borrowed byte view, beside

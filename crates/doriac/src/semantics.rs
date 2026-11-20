@@ -13,6 +13,7 @@ mod enum_specialization_tests;
 pub(crate) mod executable_effects;
 mod foreign_aggregates;
 mod foreign_checks;
+mod foreign_handles;
 mod foreign_pointers;
 mod instantiation;
 mod interface_witnesses;
@@ -7982,6 +7983,32 @@ impl<'program> Checker<'program> {
         if let Some(borrow) = self.authored_call_return_borrow(call) {
             return borrow;
         }
+        // A region over foreign memory borrows its owner argument
+        // (Decision 0148 section 10).
+        if let Expr::StaticCall {
+            qualifier,
+            method,
+            args,
+            ..
+        } = call
+        {
+            if let Some(region) =
+                crate::byte_intrinsics::RegionCompanion::from_pointer_call(qualifier, method)
+            {
+                return crate::byte_intrinsics::from_pointer_argument(args, 0).map_or(
+                    ReturnBorrowLookup::Resolved(None),
+                    |(argument_index, _)| ReturnBorrowLookup::ResolvedArgument {
+                        borrow: ReturnBorrow {
+                            source: BorrowSource::Parameter(0),
+                            kind: ReturnBorrowKind::Retained,
+                            writable: region.kind.is_writable(),
+                            lifetime: RetainedLifetime::LastUse,
+                        },
+                        argument_index,
+                    },
+                );
+            }
+        }
         if let Expr::MethodCall { object, method, .. } = call {
             let receiver_type = self
                 .expression_types
@@ -12156,6 +12183,9 @@ impl<'program> Checker<'program> {
         let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context) else {
             return;
         };
+        if self.record_foreign_companion_argument_types(&class_name, method, args) {
+            return;
+        }
         let params = self
             .classes
             .get(&class_name)
@@ -13561,6 +13591,17 @@ impl<'program> Checker<'program> {
                 ) {
                     return;
                 }
+                if self.check_handle_method_call(
+                    object,
+                    method,
+                    args,
+                    *null_safe,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 if !self.check_string_instance_method_call(
                     object,
                     method,
@@ -13756,6 +13797,7 @@ impl<'program> Checker<'program> {
                 self.enter_unsafe_context(*keyword_span);
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr);
                 self.leave_unsafe_context();
+                self.reject_escaping_handle_borrow(expr);
             }
             Expr::Unary { op, expr, span } => {
                 if *op == UnaryOp::Negate {
@@ -23997,6 +24039,9 @@ impl<'program> Checker<'program> {
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if let Some(result) = self.pointer_method_type(object_ty, method, *null_safe) {
+                    return result;
+                }
+                if let Some(result) = self.handle_method_type(object_ty, method, *null_safe) {
                     return result;
                 }
                 if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {

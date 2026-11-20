@@ -6532,6 +6532,18 @@ fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// The types a handle holds (Decision 0148 section 11): class values and
+/// the shared references whose carrier is one word.
+fn handle_value_type(ty: mir::Type) -> bool {
+    ty.shared_interface().is_none()
+        && matches!(
+            ty,
+            mir::Type::Class(_)
+                | mir::Type::SharedReference(_)
+                | mir::Type::WritableSharedReference(_)
+        )
+}
+
 /// A pointer operation reads a pointer local and assigns a result of its
 /// own type (Decision 0148 section 4).
 fn validate_pointer_operation(
@@ -6626,6 +6638,44 @@ fn validate_pointer_operation(
             Some(pointer)
         }
         mir::PointerOperation::ReadForeignString { .. } => Some(mir::Type::NullableString),
+        mir::PointerOperation::CreateHandle { value } => {
+            if !handle_value_type(value.ty()) {
+                return Err(malformed_mir(
+                    "a handle holds a class value or a one-word shared reference",
+                ));
+            }
+            if value.borrows_move_value() {
+                return Err(malformed_mir("a handle takes the ownership of its value"));
+            }
+            validate_rvalue(program, function, value)?;
+            Some(pointer)
+        }
+        mir::PointerOperation::FromHandle { ty, .. } => {
+            if !handle_value_type(*ty) {
+                return Err(malformed_mir(
+                    "a handle gives back a class value or a one-word shared reference",
+                ));
+            }
+            Some(*ty)
+        }
+        mir::PointerOperation::ForeignRange {
+            length,
+            stride,
+            align,
+            ..
+        } => {
+            if length.ty() != IntegerType::Int64
+                || *stride == 0
+                || *stride > i64::MAX as u64
+                || !align.is_power_of_two()
+            {
+                return Err(malformed_mir(
+                    "a foreign range has an int64 length, a nonzero stride and a power-of-two alignment",
+                ));
+            }
+            validate_integer_expression(program, function, length)?;
+            Some(pointer)
+        }
         mir::PointerOperation::CEntryAddress { function } => {
             if !program.c_entries.contains(function) {
                 return Err(malformed_mir(
@@ -14678,11 +14728,13 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 accesses.resource_read(pointer);
             }
             match operation {
-                mir::PointerOperation::Write { value, .. } => {
+                mir::PointerOperation::Write { value, .. }
+                | mir::PointerOperation::CreateHandle { value } => {
                     collect_rvalue_class_local_accesses(value, &mut accesses)
                 }
                 mir::PointerOperation::Offset { count: value, .. }
-                | mir::PointerOperation::FromAddress { address: value } => {
+                | mir::PointerOperation::FromAddress { address: value }
+                | mir::PointerOperation::ForeignRange { length: value, .. } => {
                     collect_integer_class_local_accesses(value, &mut accesses)
                 }
                 mir::PointerOperation::AddressOf { local, .. }
@@ -14693,7 +14745,8 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 mir::PointerOperation::Read { .. }
                 | mir::PointerOperation::Address { .. }
                 | mir::PointerOperation::ReadForeignString { .. }
-                | mir::PointerOperation::CEntryAddress { .. } => {}
+                | mir::PointerOperation::CEntryAddress { .. }
+                | mir::PointerOperation::FromHandle { .. } => {}
             }
         }
         mir::Statement::CompletePendingRequest {
@@ -20649,11 +20702,13 @@ fn statement_observes_property(
             }
         },
         mir::Statement::Pointer { operation, .. } => match operation {
-            mir::PointerOperation::Write { value, .. } => {
+            mir::PointerOperation::Write { value, .. }
+            | mir::PointerOperation::CreateHandle { value } => {
                 rvalue_observes_property(value, receiver, property)
             }
             mir::PointerOperation::Offset { count: value, .. }
-            | mir::PointerOperation::FromAddress { address: value } => {
+            | mir::PointerOperation::FromAddress { address: value }
+            | mir::PointerOperation::ForeignRange { length: value, .. } => {
                 integer_observes_property(value, receiver, property)
             }
             mir::PointerOperation::Read { .. }
@@ -20662,7 +20717,8 @@ fn statement_observes_property(
             | mir::PointerOperation::RegionData { .. }
             | mir::PointerOperation::ForeignStringData { .. }
             | mir::PointerOperation::ReadForeignString { .. }
-            | mir::PointerOperation::CEntryAddress { .. } => false,
+            | mir::PointerOperation::CEntryAddress { .. }
+            | mir::PointerOperation::FromHandle { .. } => false,
         },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,

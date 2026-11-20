@@ -3091,6 +3091,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     *positional,
                 )?
                 .into_struct_value()),
+            // A region over foreign memory is the range its pointer
+            // operation checked; the owner is a loan only checking and
+            // validation read. Both locals are one word.
+            mir::RegionExpression::Foreign { data, length, .. } => {
+                let data = self.pointer_local(*data)?;
+                let data = build(
+                    self.builder
+                        .build_int_to_ptr(data, pointer, "foreign.region"),
+                )?;
+                let length = self.pointer_local(*length)?;
+                self.byte_region_value(data, length)
+            }
             mir::RegionExpression::Region {
                 source,
                 offset,
@@ -22807,6 +22819,120 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     ))?
                     .into(),
                 )
+            }
+            // A closed class's handle is its object and a shared
+            // reference's its word; an open class's is a runtime box of its
+            // two words (Decision 0148 section 11).
+            mir::PointerOperation::CreateHandle { value } => {
+                let ty = value.ty();
+                let lowered = self.lower_rvalue(value)?;
+                let address = match ty {
+                    mir::Type::Class(class) => match self.class_parts(lowered, class)? {
+                        (object, Some(descriptor)) => {
+                            self.set_active_panic_site(span)?;
+                            let pointer_type = self.context.ptr_type(AddressSpace::default());
+                            self.call_runtime(
+                                crate::native_abi::HANDLE_BOX_CREATE,
+                                &[
+                                    pointer_type.into(),
+                                    pointer_type.into(),
+                                    pointer_type.into(),
+                                ],
+                                Some(pointer_type.into()),
+                                &[self.current_frame.into(), object.into(), descriptor.into()],
+                            )?
+                            .ok_or_else(|| backend_failure("a handle box produced no address"))?
+                            .into_pointer_value()
+                        }
+                        (object, None) => object,
+                    },
+                    _ => lowered.into_pointer_value(),
+                };
+                Some(build(self.builder.build_ptr_to_int(address, word, "handle"))?.into())
+            }
+            mir::PointerOperation::FromHandle {
+                handle,
+                ty,
+                reclaim,
+            } => {
+                let pointer_type = self.context.ptr_type(AddressSpace::default());
+                let address = self.pointer_local(*handle)?;
+                let address = build(self.builder.build_int_to_ptr(
+                    address,
+                    pointer_type,
+                    "handle",
+                ))?;
+                Some(match ty {
+                    mir::Type::Class(class) if class_uses_open_carrier(self.program, *class) => {
+                        let object = build(self.builder.build_load(
+                            pointer_type,
+                            address,
+                            "handle.object",
+                        ))?
+                        .into_pointer_value();
+                        let descriptor_address = self.byte_offset(
+                            address,
+                            self.target_data.get_pointer_byte_size(None),
+                            "handle.descriptor",
+                        )?;
+                        let descriptor = build(self.builder.build_load(
+                            pointer_type,
+                            descriptor_address,
+                            "handle.descriptor",
+                        ))?
+                        .into_pointer_value();
+                        if *reclaim {
+                            self.call_runtime(
+                                crate::native_abi::HANDLE_BOX_FREE,
+                                &[pointer_type.into()],
+                                None,
+                                &[address.into()],
+                            )?;
+                        }
+                        self.open_class_value(object, descriptor)?.into()
+                    }
+                    _ => address.into(),
+                })
+            }
+            mir::PointerOperation::ForeignRange {
+                pointer,
+                length,
+                stride,
+                align,
+            } => {
+                let length = self.lower_integer_expression(length)?;
+                let address = self.pointer_local(*pointer)?;
+                self.checked_pointer_memory(address, *align, true, span)?;
+                // The range is `length` elements from the address: a
+                // negative length, or an end past the address space, is no
+                // range.
+                let (bytes, scaled_overflow) = self.checked_arithmetic_parts(
+                    IntegerType::Int64,
+                    mir::IntegerBinaryOp::Multiply,
+                    length,
+                    word.const_int(*stride, false),
+                )?;
+                let negative = build(self.builder.build_int_compare(
+                    IntPredicate::SLT,
+                    length,
+                    word.const_zero(),
+                    "region.length.negative",
+                ))?;
+                let end = build(self.builder.build_int_add(address, bytes, "region.end"))?;
+                let wrapped = build(self.builder.build_int_compare(
+                    IntPredicate::ULT,
+                    end,
+                    address,
+                    "region.end.wrapped",
+                ))?;
+                let leaves = build(self.builder.build_or(
+                    scaled_overflow,
+                    negative,
+                    "region.leaves",
+                ))?;
+                let leaves = build(self.builder.build_or(leaves, wrapped, "region.leaves"))?;
+                self.lower_panic_if_code(leaves, crate::foreign::POINTER_ADDRESS_PANIC_CODE, span)?;
+                Some(address.into())
             }
             mir::PointerOperation::RegionData { region, align } => {
                 let (data, _) =

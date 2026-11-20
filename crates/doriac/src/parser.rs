@@ -4851,10 +4851,10 @@ impl Parser {
             },
         });
         let token = self.advance().clone();
-        let (member, member_sigil_span) = match token.kind {
-            TokenKind::Identifier(name) | TokenKind::Reserved(name) => (name, None),
-            TokenKind::Variable(name) => (
-                name,
+        let (member, member_sigil_span) = match (&token.kind, Self::member_name(&token.kind)) {
+            (_, Some(name)) => (name, None),
+            (TokenKind::Variable(name), None) => (
+                name.clone(),
                 Some(self.span(token.span.start, token.span.start + 1)),
             ),
             _ => {
@@ -5975,14 +5975,27 @@ impl Parser {
     /// begin its own syntax, so it remains a valid member name.
     fn expect_member_name(&mut self, message: &str) -> Option<String> {
         let token = self.advance().clone();
-        match token.kind {
-            TokenKind::Identifier(name) | TokenKind::Reserved(name) => Some(name),
-            TokenKind::Use => Some("use".to_string()),
-            TokenKind::Not => Some("not".to_string()),
-            _ => {
+        match Self::member_name(&token.kind) {
+            Some(name) => Some(name),
+            None => {
                 self.error(message, token.span);
                 None
             }
+        }
+    }
+
+    /// The member name `kind` spells after `->`, `?->` or `::`, if it can be
+    /// one: an identifier, a reserved future keyword, or a keyword that never
+    /// begins syntax there: `use`, `not`, and `borrow`, which Decision 0148
+    /// section 11 spells as `Handle::borrow`. A method declaration takes a
+    /// reserved future keyword only (`expect_callable_name` otherwise).
+    fn member_name(kind: &TokenKind) -> Option<String> {
+        match kind {
+            TokenKind::Identifier(name) | TokenKind::Reserved(name) => Some(name.clone()),
+            TokenKind::Use | TokenKind::Not | TokenKind::Borrow => {
+                Some(token_name(kind).to_string())
+            }
+            _ => None,
         }
     }
 

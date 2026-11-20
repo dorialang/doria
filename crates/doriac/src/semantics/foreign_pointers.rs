@@ -7,6 +7,7 @@
 //! `Pointer::toFunction`) reads the type recorded for the call's position.
 
 use super::*;
+use crate::byte_intrinsics::RegionCompanion;
 use crate::foreign::{ForeignType, PointerAccess};
 use crate::pointer_intrinsics::{
     self, BoundaryConversion, ForeignCompanion, PointerMember, PointerMemberKind, PointerOperation,
@@ -15,6 +16,7 @@ use crate::pointer_intrinsics::{
 pub(super) const UNSIZED_POINTEE_CODE: &str = "E0800";
 pub(super) const POINTER_PLACE_CODE: &str = "E0801";
 pub(super) const POINTER_TARGET_CODE: &str = "E0802";
+pub(super) const REGION_OWNER_CODE: &str = "E0806";
 
 #[derive(Debug, Clone, Copy)]
 struct PointerReceiver {
@@ -337,6 +339,13 @@ impl<'program> Checker<'program> {
             );
             return true;
         }
+        if self.check_handle_static_call(class_name, access, args, scopes, method_context) {
+            return true;
+        }
+        if let Some(region) = RegionCompanion::from_class_name(class_name) {
+            self.check_region_from_pointer(region, access, args, scopes, method_context);
+            return true;
+        }
         let Some(companion) = ForeignCompanion::from_class_name(class_name) else {
             return false;
         };
@@ -352,6 +361,134 @@ impl<'program> Checker<'program> {
             }
         }
         true
+    }
+
+    /// `ByteRegion::fromPointer($owner, $pointer, $length)` and its three
+    /// siblings (section 10): an unsafe constructor whose region borrows
+    /// `$owner`, a place, as `getRegion` borrows its receiver.
+    fn check_region_from_pointer(
+        &mut self,
+        region: RegionCompanion,
+        access: StaticAccess<'_>,
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let companion = region.short_name();
+        if access.member != crate::byte_intrinsics::FROM_POINTER {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0304",
+                    format!("unknown method `{companion}::{}`", access.member),
+                    access.member_span,
+                )
+                .with_title("Unknown Method")
+                .with_help(format!(
+                    "`{companion}::fromPointer($owner, $pointer, $length)` views memory a foreign library owns; a region over Doria storage comes from `getRegion` or `getWritableRegion`"
+                )),
+            );
+            return;
+        }
+        let callee = format!("`{companion}::fromPointer`");
+        self.require_unsafe(access.span, "forming a region over foreign memory");
+        if args.len() != crate::byte_intrinsics::FROM_POINTER_PARAMETERS.len() {
+            self.report_argument_count_mismatch(&callee, 3, 3, args.len(), access.span);
+            return;
+        }
+        let owner = crate::byte_intrinsics::from_pointer_argument(args, 0);
+        let owner_ty = match owner {
+            Some((_, owner)) => self.infer_expr_type(&owner.value, scopes, method_context),
+            None => self.types.unknown(),
+        };
+        let pointer_ty = self.region_pointer_parameter(region, args, scopes, method_context);
+        let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+        let [owner_name, pointer_name, length_name] =
+            crate::byte_intrinsics::FROM_POINTER_PARAMETERS;
+        let mut owner_parameter = self.pointer_parameter(owner_name, owner_ty);
+        owner_parameter.writable = region.kind.is_writable();
+        let parameters = [
+            owner_parameter,
+            self.pointer_parameter(pointer_name, pointer_ty),
+            self.pointer_parameter(length_name, int),
+        ];
+        self.check_call_arguments(
+            &callee,
+            &parameters,
+            args,
+            access.span,
+            scopes,
+            method_context,
+        );
+        if let Some((_, owner)) = owner {
+            if !matches!(ungroup_place(&owner.value), Expr::This { .. })
+                && !self.is_pointer_place(&owner.value, method_context)
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        REGION_OWNER_CODE,
+                        format!("the region from {callee} borrows its owner, and this is a value with no place"),
+                        owner.value.span(),
+                    )
+                    .with_title("Region Owner Is Not A Place")
+                    .with_explanation(
+                        "A region over foreign memory borrows its owner, the Doria value whose destructor releases the memory, so the region cannot outlive it. The owner is a local, `$this` or a property; a computed value would be destroyed while the region still views its memory.",
+                    )
+                    .with_help("store the owner in a local first, then pass the local"),
+                );
+            }
+        }
+    }
+
+    /// The pointer `fromPointer` on `region` takes: `Pointer<uint8>` or
+    /// `WritablePointer<uint8>` for a byte region, and for a typed region
+    /// the pointer the call passes, whose pointee is the element type and
+    /// must be FFI-safe.
+    fn region_pointer_parameter(
+        &mut self,
+        region: RegionCompanion,
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let access = region.pointer_access();
+        if !region.typed {
+            let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+            return self.types.intern(TypeKind::Foreign(ForeignType::Pointer {
+                access,
+                pointee: byte,
+            }));
+        }
+        let Some((_, argument)) = crate::byte_intrinsics::from_pointer_argument(args, 1) else {
+            return self.types.unknown();
+        };
+        let argument_ty = self.infer_expr_type(&argument.value, scopes, method_context);
+        let Some(receiver) = self.pointer_receiver(argument_ty) else {
+            if !matches!(self.types.kind(argument_ty), TypeKind::Unknown) {
+                let got = self.types.display(argument_ty);
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0408",
+                        format!(
+                            "argument `pointer` of `{}::fromPointer` expects `{}<T>`, got `{got}`",
+                            region.short_name(),
+                            access.short_name()
+                        ),
+                        argument.value.span(),
+                    )
+                    .with_title("Argument Type Mismatch"),
+                );
+            }
+            return argument_ty;
+        };
+        self.require_ffi_safe(
+            receiver.pointee,
+            argument.value.span(),
+            "an array region element",
+        );
+        self.types.intern(TypeKind::Foreign(ForeignType::Pointer {
+            access,
+            pointee: receiver.pointee,
+        }))
     }
 
     /// `CString::from($text)`, `CString::tryFrom($text)` and the
@@ -683,6 +820,25 @@ impl<'program> Checker<'program> {
     ) -> Option<TypeId> {
         if class_name == crate::foreign::OPAQUE {
             return Some(self.types.unknown());
+        }
+        if let Some(result) = self.handle_static_call_type(class_name, method, span) {
+            return Some(result);
+        }
+        if let Some(region) = RegionCompanion::from_class_name(class_name) {
+            if method != crate::byte_intrinsics::FROM_POINTER {
+                return Some(self.types.unknown());
+            }
+            let element = match crate::byte_intrinsics::from_pointer_argument(args, 1) {
+                Some((_, argument)) if region.typed => {
+                    let pointer = self.infer_expr_type(&argument.value, scopes, method_context);
+                    match self.pointer_receiver(pointer) {
+                        Some(receiver) => self.types.resolved(receiver.pointee),
+                        None => return Some(self.types.unknown()),
+                    }
+                }
+                _ => ResolvedType::Integer(IntegerType::UInt8),
+            };
+            return Some(self.types.intern_resolved(&region.region_type(element)));
         }
         let companion = ForeignCompanion::from_class_name(class_name)?;
         let argument = args.first().map(|argument| &argument.value);

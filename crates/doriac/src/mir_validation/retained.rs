@@ -1052,7 +1052,12 @@ fn region_sources(
     match value {
         E::CollectionIndex { collection, .. } => Ok(loans[collection.0].clone()),
         E::Local { local, .. } => Ok(loans[local.0].clone()),
-        E::Region { kind, source, .. } => borrowed_sources(
+        E::Region { kind, source, .. }
+        | E::Foreign {
+            kind,
+            owner: source,
+            ..
+        } => borrowed_sources(
             program,
             source,
             kind.is_writable(),

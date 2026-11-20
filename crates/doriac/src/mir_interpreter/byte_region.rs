@@ -178,6 +178,14 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::Rvalue(*offset));
                     frame.tasks.push(EvaluationTask::Rvalue(*source));
                 }
+                // Its range comes from a pointer operation, which the
+                // interpreter runs through the native companion library
+                // (Decision 0148 sections 22 and 23).
+                mir::RegionExpression::Foreign { .. } => {
+                    return Err(InterpreterError::new(
+                        "a region over foreign memory runs through the native companion library",
+                    ));
+                }
                 mir::RegionExpression::Call {
                     kind,
                     function,

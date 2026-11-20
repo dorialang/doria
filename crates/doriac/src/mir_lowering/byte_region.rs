@@ -157,6 +157,16 @@ pub(super) fn expression(
             )?;
             form(kind, source, args, *span, context)
         }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if method == crate::byte_intrinsics::FROM_POINTER
+            && crate::byte_intrinsics::RegionCompanion::from_class_name(class_name).is_some() =>
+        {
+            from_pointer(kind, args, *span, context)
+        }
         _ => {
             let (signature, args) = call(expr, context)?;
             Ok(mir::RegionExpression::Call {
@@ -521,6 +531,68 @@ fn form(
         offset: Box::new(offset),
         length: Box::new(length),
         span,
+    })
+}
+
+/// `ByteRegion::fromPointer($owner, $pointer, $length)` and its siblings
+/// (Decision 0148 section 10): a pointer operation checks the range, and
+/// the region over it borrows the owner, a checked place, exactly as a
+/// region borrows its source.
+fn from_pointer(
+    kind: mir::RegionType,
+    args: &[hir::Argument],
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<mir::RegionExpression> {
+    let names = args
+        .iter()
+        .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+        .collect::<Vec<_>>();
+    let bound = crate::byte_intrinsics::from_pointer_binding(&names);
+    let [Some(owner), Some(pointer), Some(length)] = bound.param_to_arg[..] else {
+        return Err(vec![unsupported(
+            span,
+            "a region over foreign memory has checked owner, pointer and length arguments",
+        )]);
+    };
+    let owner_value = &args[owner].value;
+    let owner = lower_call_argument(
+        owner_value,
+        context.expression_type(owner_value)?,
+        if kind.is_writable() {
+            mir::FunctionParameterMode::Writable
+        } else {
+            mir::FunctionParameterMode::Readonly
+        },
+        context,
+    )?;
+    // An element's alignment is its stride: every element a region over
+    // foreign memory views is FFI-safe and stored at its own width.
+    let stride = built_element(kind, span, context)?.map_or(1, |(_, stride)| u64::from(stride));
+    let pointer = super::foreign::materialize_pointer(&args[pointer].value, context)?;
+    let int = IntegerType::Int64;
+    let length = lower_integer_expression(&args[length].value, context)?;
+    let length_local = context.declare_temp(false, int);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: length_local,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(length)),
+    });
+    let data = context.declare_return_temp(super::foreign::POINTER, false);
+    context.push_statement(mir::Statement::Pointer {
+        target: Some(data),
+        operation: mir::PointerOperation::ForeignRange {
+            pointer,
+            length: mir::IntegerExpression::use_operand(int, mir::Operand::Local(length_local)),
+            stride,
+            align: stride,
+        },
+        span,
+    });
+    Ok(mir::RegionExpression::Foreign {
+        kind,
+        owner: Box::new(owner),
+        data,
+        length: length_local,
     })
 }
 

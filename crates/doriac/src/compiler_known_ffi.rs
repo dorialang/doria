@@ -27,11 +27,12 @@ pub const HANDLE: &str = "Doria\\Std\\Ffi\\Handle";
 /// ([`crate::foreign::ForeignStringEncoding`]).
 pub const C_STRING: &str = "Doria\\Std\\Ffi\\CString";
 pub const UTF16_STRING: &str = "Doria\\Std\\Ffi\\Utf16String";
-pub const PENDING_TYPES: [&str; 2] = [PLATFORM, HANDLE];
+pub const PENDING_TYPES: [&str; 1] = [PLATFORM];
 
 /// Members of `Doria\Std\Ffi` that checking models directly: the
-/// `ForeignCall::lastSystemCode` static (section 16).
-pub const MODELED_TYPES: [&str; 1] = [FOREIGN_CALL];
+/// `ForeignCall::lastSystemCode` static (section 16) and the `Handle`
+/// companion (section 11, [`crate::foreign_handles`]).
+pub const MODELED_TYPES: [&str; 2] = [FOREIGN_CALL, HANDLE];
 pub const LAST_SYSTEM_CODE: &str = "lastSystemCode";
 
 /// The declarations in [`SOURCE_TEXT`].

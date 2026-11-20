@@ -9275,6 +9275,23 @@ fn lower_byte_region_expression(
         mir::RegionExpression::Local {
             local, transfer, ..
         } => lower_byte_region_local(builder, *local, *transfer, resources),
+        // A region over foreign memory is the range its pointer operation
+        // checked; the owner is a loan only checking and validation read.
+        mir::RegionExpression::Foreign { data, length, .. } => {
+            let mut word = |local: mir::LocalId| {
+                load_lowered_from_stack(
+                    builder,
+                    resources.program,
+                    local_definition(resources.program, resources.function_id, local)?.ty,
+                    local_slot(resources.local_slots, local)?,
+                    pointer,
+                )
+                .single()
+            };
+            let data = word(*data)?;
+            let length = word(*length)?;
+            Ok(LoweredValue::ByteRegion { data, length })
+        }
         mir::RegionExpression::Call {
             function,
             args,
@@ -21329,6 +21346,84 @@ fn lower_pointer_operation(
             .ok_or_else(|| backend_failure("a foreign string read produced no result"))?;
             let present = presence_word(builder, payload, pointer);
             Some(LoweredValue::Nullable { present, payload })
+        }
+        // A closed class's handle is its object and a shared reference's
+        // its word; an open class's is a runtime box of its two words
+        // (Decision 0148 section 11).
+        mir::PointerOperation::CreateHandle { value } => Some(LoweredValue::Single(
+            match lower_rvalue(builder, value, resources)? {
+                LoweredValue::OpenClass { object, descriptor } => {
+                    set_active_panic_site(builder, span, resources);
+                    runtime_call(
+                        builder,
+                        crate::native_abi::HANDLE_BOX_CREATE,
+                        &[pointer, pointer, pointer],
+                        Some(pointer),
+                        &[resources.current_frame, object, descriptor],
+                        resources,
+                    )?
+                    .ok_or_else(|| backend_failure("a handle box produced no address"))?
+                }
+                value => value.single()?,
+            },
+        )),
+        mir::PointerOperation::FromHandle {
+            handle,
+            ty,
+            reclaim,
+        } => {
+            let address = address_of(builder, *handle, resources)?;
+            Some(match ty {
+                mir::Type::Class(class) if class_uses_open_carrier(resources.program, *class) => {
+                    let object = builder
+                        .ins()
+                        .load(pointer, MemFlagsData::trusted(), address, 0);
+                    let descriptor = builder.ins().load(
+                        pointer,
+                        MemFlagsData::trusted(),
+                        address,
+                        pointer.bytes() as i32,
+                    );
+                    if *reclaim {
+                        runtime_call(
+                            builder,
+                            crate::native_abi::HANDLE_BOX_FREE,
+                            &[pointer],
+                            None,
+                            &[address],
+                            resources,
+                        )?;
+                    }
+                    LoweredValue::OpenClass { object, descriptor }
+                }
+                _ => LoweredValue::Single(address),
+            })
+        }
+        mir::PointerOperation::ForeignRange {
+            pointer: local,
+            length,
+            stride,
+            align,
+        } => {
+            let address = address_of(builder, *local, resources)?;
+            let length = lower_integer_expression(builder, length, resources)?;
+            lower_pointer_alignment_check(builder, address, *align, span, resources)?;
+            // The range is `length` elements from the address: a negative
+            // length, or an end past the address space, is no range.
+            let scale = builder.ins().iconst(types::I64, *stride as i64);
+            let (bytes, scaled_overflow) = builder.ins().smul_overflow(length, scale);
+            let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, length, 0);
+            let (_, wrapped) = builder.ins().uadd_overflow(address, bytes);
+            let leaves = builder.ins().bor(scaled_overflow, negative);
+            let leaves = builder.ins().bor(leaves, wrapped);
+            lower_panic_if_code(
+                builder,
+                leaves,
+                crate::foreign::POINTER_ADDRESS_PANIC_CODE,
+                span,
+                resources,
+            )?;
+            Some(LoweredValue::Single(address))
         }
         mir::PointerOperation::FromAddress { address } => {
             let address = lower_integer_expression(builder, address, resources)?;

@@ -48,6 +48,7 @@ pub mod diagnostic_entries;
 pub mod diagnostics;
 pub mod enums;
 pub mod foreign;
+pub mod foreign_handles;
 pub mod foreign_strings;
 pub mod format_string;
 pub mod hir;

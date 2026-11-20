@@ -1975,3 +1975,321 @@ function main(): void
 ";
     assert_panics_natively(source, "P1706", "C Called Doria From Another Thread");
 }
+
+/// A C allocator for the foreign-memory programs (Decision 0148 section
+/// 10): `malloc` and `free` from the platform C runtime.
+const C_ALLOCATOR: &str = "use Doria\\Std\\Ffi\\{CSize, Opaque, Pointer, WritablePointer};
+use Doria\\Std\\Io\\{ByteRegion, IoError};
+
+extern \"C\"
+{
+    /** @safety The memory is released with `free`. */
+    function malloc(CSize $size): ?WritablePointer<Opaque>;
+
+    /** @safety `$memory` came from `malloc` and is released once. */
+    function free(WritablePointer<Opaque> $memory): void;
+}
+
+function allocate(int $bytes): WritablePointer<Opaque>
+{
+    unsafe {
+        ?WritablePointer<Opaque> $memory = malloc(CSize::from($bytes));
+        if ($memory != null) {
+            return $memory;
+        }
+    }
+    panic(\"out of memory\");
+}
+";
+
+#[test]
+fn an_owner_class_exposes_memory_a_c_allocator_owns_as_a_region() {
+    // Decision 0148 section 10's DecodedImage: the owner's destructor gives
+    // the memory back to the library, and the region its method returns
+    // borrows `$this` (Decision 0089), so safe code reads it after every
+    // unsafe context has ended.
+    let source = format!(
+        "{C_ALLOCATOR}
+class DecodedImage
+{{
+    function __construct(
+        internal WritablePointer<uint8> $pixels,
+        internal int $length,
+    ) {{}}
+
+    function getPixels(): ByteRegion
+    {{
+        return unsafe(ByteRegion::fromPointer(
+            $this,
+            Pointer::from($this->pixels),
+            $this->length,
+        ));
+    }}
+
+    function __destruct()
+    {{
+        try {{
+            echo \" released\";
+        }} catch (IoError $error) {{
+        }}
+        unsafe {{ free(WritablePointer::cast($this->pixels)); }}
+    }}
+}}
+
+function decode(int $length): DecodedImage
+{{
+    unsafe {{
+        WritablePointer<uint8> $pixels = WritablePointer::cast(allocate($length));
+        for (writable int $index = 0; $index < $length; $index++) {{
+            $pixels->offset($index)->write(UInt8::from($index * 3));
+        }}
+        return new DecodedImage($pixels, $length);
+    }}
+}}
+
+function total(ByteRegion $bytes): int
+{{
+    writable int $sum = 0;
+    for (writable int $index = 0; $index < $bytes->length; $index++) {{
+        $sum += Int::from($bytes[$index]);
+    }}
+    return $sum;
+}}
+
+function main(): void
+{{
+    {{
+        let $image = decode(5);
+        let $pixels = $image->getPixels();
+        echo $pixels->length . \" \" . $pixels[4] . \" \" . total($pixels->getRegion(1, 3));
+    }}
+    echo \" done\";
+}}
+"
+    );
+    assert_runs_natively(&source, "5 12 18 released done");
+}
+
+#[test]
+fn typed_regions_over_foreign_memory_read_and_write_its_elements() {
+    // `ArrayRegion::fromPointer` takes its element type from the pointer;
+    // the writable form needs writable access to its owner.
+    let source = format!(
+        "{C_ALLOCATOR}
+class Samples
+{{
+    function __construct(internal WritablePointer<int32> $values, internal int $count) {{}}
+
+    writable function getWritableValues(): WritableArrayRegion<int32>
+    {{
+        return unsafe(WritableArrayRegion::fromPointer($this, $this->values, $this->count));
+    }}
+
+    function getValues(): ArrayRegion<int32>
+    {{
+        return unsafe(ArrayRegion::fromPointer($this, Pointer::from($this->values), $this->count));
+    }}
+
+    function __destruct()
+    {{
+        unsafe {{ free(WritablePointer::cast($this->values)); }}
+    }}
+}}
+
+function main(): void
+{{
+    let writable $samples = unsafe(new Samples(WritablePointer::cast(allocate(16)), 4));
+    {{
+        let writable $values = $samples->getWritableValues();
+        for (writable int $index = 0; $index < $values->length; $index++) {{
+            $values[$index] = Int32::from($index * 10 - 5);
+        }}
+    }}
+    let $values = $samples->getValues();
+    for (writable int $index = 0; $index < $values->length; $index++) {{
+        echo $values[$index] . \" \";
+    }}
+    echo $values->getRegion(2, 2)[1];
+}}
+"
+    );
+    assert_runs_natively(&source, "-5 5 15 25 25");
+}
+
+#[test]
+fn a_region_over_foreign_memory_needs_an_aligned_pointer_and_a_range() {
+    // An `int32` region at an odd address panics with P1702 before safe
+    // code reads it; a negative length is no range (P1703).
+    let misaligned = format!(
+        "{C_ALLOCATOR}
+function main(): void
+{{
+    let $memory = allocate(16);
+    unsafe {{
+        Pointer<int32> $values = Pointer::cast(Pointer::from($memory)->byteOffset(1));
+        let $region = ArrayRegion::fromPointer($memory, $values, 2);
+        echo $region->length;
+    }}
+}}
+"
+    );
+    assert_panics_natively(&misaligned, "P1702", "Pointer Access Is Misaligned");
+    let negative = format!(
+        "{C_ALLOCATOR}
+function main(): void
+{{
+    let $memory = allocate(16);
+    int $length = -1;
+    unsafe {{
+        Pointer<uint8> $bytes = Pointer::cast(Pointer::from($memory));
+        let $region = ByteRegion::fromPointer($memory, $bytes, $length);
+        echo $region->length;
+    }}
+}}
+"
+    );
+    assert_panics_natively(
+        &negative,
+        "P1703",
+        "Pointer Arithmetic Left The Address Space",
+    );
+}
+
+#[test]
+fn handles_carry_owned_and_shared_values_through_c_and_back() {
+    // Decision 0148 section 11: a closed class's handle is its object, an
+    // open class's a box that keeps its exact type, and a shared
+    // reference's its strong claim. `bsearch` keeps the handle of a
+    // `WritableSharedReference` as its key and passes it back to the
+    // comparison callback, which borrows it with its runtime access checks.
+    let source = r#"
+use Doria\Std\Ffi\{CSize, Handle, Opaque, Pointer, WritablePointer};
+
+class Counter
+{
+    function __construct(writable int $count) {}
+
+    function __destruct()
+    {
+        try {
+            echo " dropped " . $this->count;
+        } catch (Doria\Std\Io\IoError $error) {
+        }
+    }
+}
+
+open class Shape
+{
+    open function describe(): string { return "shape"; }
+}
+
+class Circle extends Shape
+{
+    override function describe(): string { return "circle"; }
+}
+
+function show(Counter $counter): void
+{
+    echo $counter->count;
+}
+
+function describe(Shape $shape): void
+{
+    echo " " . $shape->describe();
+}
+
+function bump(WritableSharedReference<Counter> $counter): void
+{
+    let writable $access = $counter->acquireWritableAccess();
+    $access->count++;
+}
+
+extern "C" function compareKey(Pointer<Opaque> $key, Pointer<Opaque> $element): int32
+{
+    unsafe {
+        bump(WritableSharedReference::borrow(WritablePointer::cast($key)));
+        Pointer<int32> $value = Pointer::cast($element);
+        return 5 - $value->read();
+    }
+}
+
+extern "C"
+{
+    /** @safety `$base` holds `$count` sorted elements of `$size` bytes. */
+    function bsearch(Pointer<Opaque> $key, Pointer<Opaque> $base, CSize $count, CSize $size,
+        extern "C" function(Pointer<Opaque>, Pointer<Opaque>): int32 $compare): ?Pointer<Opaque>;
+}
+
+function main(): void
+{
+    WritablePointer<Opaque> $owned = unsafe(Handle::create(new Counter(3)));
+    unsafe {
+        show(Handle::borrow($owned));
+        Counter $back = Handle::reclaim($owned);
+        echo " back " . $back->count;
+    }
+    Shape $shape = new Circle();
+    WritablePointer<Opaque> $boxed = unsafe(Handle::create($shape));
+    unsafe {
+        describe(Handle::borrow($boxed));
+        Shape $again = Handle::reclaim($boxed);
+        describe($again);
+    }
+    SharedReference<Counter> $shared = shared new Counter(7);
+    let $second = $shared->share();
+    WritablePointer<Opaque> $claim = unsafe($shared->toHandle());
+    unsafe {
+        SharedReference<Counter> $returned = SharedReference::reclaim($claim);
+        echo " shared " . $returned->count;
+    }
+    echo " second " . $second->count;
+    let $writable = new WritableSharedReference(new Counter(0));
+    let $key = $writable->share();
+    int32[] $values = [1, 3, 5, 7];
+    unsafe {
+        WritablePointer<Opaque> $context = $key->toHandle();
+        let $region = $values->getRegion(0, 4);
+        ?Pointer<Opaque> $found = bsearch(Pointer::from($context), Pointer::cast($region->pointer), CSize::from(4), CSize::from(4), compareKey);
+        echo " found " . ($found != null);
+        WritableSharedReference<Counter> $mine = WritableSharedReference::reclaim($context);
+    }
+    echo " compared " . ($writable->acquireReadonlyAccess()->count > 0);
+}
+"#;
+    assert_runs_natively(
+        source,
+        "3 back 3 dropped 3 circle circle shared 7 second 7 found true compared true dropped 1 dropped 7",
+    );
+}
+
+#[test]
+fn handles_of_shared_interface_references_report_that_they_cannot_be_built_yet() {
+    let source = "use Doria\\Std\\Ffi\\{Opaque, WritablePointer};
+
+interface Named
+{
+    function name(): string;
+}
+
+class Person implements Named
+{
+    function name(): string { return \"Ada\"; }
+}
+
+function main(): void
+{
+    SharedReference<Named> $named = shared new Person();
+    WritablePointer<Opaque> $handle = unsafe($named->toHandle());
+}
+";
+    let diagnostics = doriac::lower_source_to_mir("stage40.doria", source.to_string())
+        .expect_err("handles of shared interface references are not built yet");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title
+                    == "Handles Of Shared Interface References Cannot Be Built Yet"),
+        "{diagnostics:#?}"
+    );
+}

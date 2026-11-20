@@ -1338,3 +1338,185 @@ function main(): void {}
     );
     assert!(codes(&caught).is_empty(), "{:#?}", findings(&caught));
 }
+
+const FOREIGN_MEMORY: &str = "use Doria\\Std\\Ffi\\{Pointer, WritablePointer};
+use Doria\\Std\\Io\\{ByteRegion, WritableByteRegion};
+
+class Image
+{
+    function __construct(WritablePointer<uint8> $pixels, int $length) {}
+
+    function getPixels(): ByteRegion
+    {
+        return unsafe(ByteRegion::fromPointer($this, Pointer::from($this->pixels), $this->length));
+    }
+}
+
+function image(): Image
+{
+    writable uint8 $byte = 0;
+    return unsafe(new Image(WritablePointer::to($byte), 1));
+}
+";
+
+#[test]
+fn a_region_over_foreign_memory_borrows_a_place_owner_in_an_unsafe_context() {
+    // Decision 0148 section 10: the constructors are unsafe, and the region
+    // borrows `$owner`; a method returning it borrows `$this`.
+    assert_eq!(
+        codes(&format!(
+            "{FOREIGN_MEMORY}function main(): void {{ let $image = image(); echo $image->getPixels()[0]; }}"
+        )),
+        Vec::<&str>::new()
+    );
+    let outside = only(
+        &format!(
+            "{FOREIGN_MEMORY}function main(): void {{ let $image = image(); let $region = ByteRegion::fromPointer($image, Pointer::from($image->pixels), 1); }}"
+        ),
+        "E0785",
+    );
+    assert!(
+        outside
+            .message
+            .contains("forming a region over foreign memory"),
+        "{outside:#?}"
+    );
+    let temporary = findings(&format!(
+        "{FOREIGN_MEMORY}function main(): void {{ let $image = image(); unsafe {{ let $region = ByteRegion::fromPointer(image(), Pointer::from($image->pixels), 1); }} }}"
+    ));
+    let owner = temporary
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0806")
+        .unwrap_or_else(|| panic!("{temporary:#?}"));
+    assert_eq!(owner.title, "Region Owner Is Not A Place");
+}
+
+#[test]
+fn a_region_over_foreign_memory_takes_the_pointer_its_access_and_element_need() {
+    for (call, code) in [
+        // A byte region views `uint8`.
+        ("ByteRegion::fromPointer($image, $values, 1)", "E0408"),
+        // A writable region takes a writable pointer.
+        (
+            "WritableByteRegion::fromPointer($image, Pointer::from($image->pixels), 1)",
+            "E0408",
+        ),
+        // A typed region takes its element from a pointer.
+        ("ArrayRegion::fromPointer($image, 3, 1)", "E0408"),
+        ("ByteRegion::fromBytes($image)", "E0304"),
+    ] {
+        let source = format!(
+            "{FOREIGN_MEMORY}function main(): void {{ let writable $image = image(); unsafe {{ Pointer<int32> $values = Pointer::cast(Pointer::from($image->pixels)); let $region = {call}; }} }}"
+        );
+        assert!(
+            codes(&source).contains(&code),
+            "{call}: {:#?}",
+            findings(&source)
+        );
+    }
+    let typed = format!(
+        "{FOREIGN_MEMORY}function main(): void {{ let $image = image(); unsafe {{ Pointer<int32> $values = Pointer::cast(Pointer::from($image->pixels)); ArrayRegion<int32> $region = ArrayRegion::fromPointer($image, $values, 1); echo $region[0]; }} }}"
+    );
+    assert_eq!(codes(&typed), Vec::<&str>::new());
+}
+
+#[test]
+fn a_region_over_foreign_memory_cannot_outlive_its_owner() {
+    // The region borrows its owner as `getRegion` borrows its receiver.
+    let returned = format!(
+        "{FOREIGN_MEMORY}function leak(): ByteRegion {{ let $image = image(); return unsafe(ByteRegion::fromPointer($image, Pointer::from($image->pixels), 1)); }} function main(): void {{ echo leak()[0]; }}"
+    );
+    assert!(
+        codes(&returned).contains(&"E0762"),
+        "{:#?}",
+        findings(&returned)
+    );
+    let moved = format!(
+        "{FOREIGN_MEMORY}function main(): void {{ let $image = image(); let $pixels = $image->getPixels(); let $other = $image; echo $pixels[0]; }}"
+    );
+    assert!(codes(&moved).contains(&"E0763"), "{:#?}", findings(&moved));
+    let readonly = format!(
+        "{FOREIGN_MEMORY}function main(): void {{ let $image = image(); unsafe {{ let writable $region = WritableByteRegion::fromPointer($image, $image->pixels, 1); $region[0] = 1; }} }}"
+    );
+    assert!(
+        codes(&readonly).contains(&"E0204"),
+        "{:#?}",
+        findings(&readonly)
+    );
+}
+
+const HANDLES: &str = "use Doria\\Std\\Ffi\\{Handle, Opaque, WritablePointer};
+
+class Counter
+{
+    function __construct(writable int $count) {}
+}
+
+function show(Counter $counter): void
+{
+    echo $counter->count;
+}
+";
+
+#[test]
+fn handles_hold_class_values_and_take_their_type_from_the_expected_type() {
+    // Decision 0148 section 11: every handle operation needs an unsafe
+    // context (plan §3.5), `Handle` holds class values, and `reclaim` and
+    // `borrow` read their value type from where the result goes.
+    let accepted = format!(
+        "{HANDLES}function main(): void {{ unsafe {{ WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); show(Handle::borrow($handle)); Counter $back = Handle::reclaim($handle); SharedReference<Counter> $shared = shared new Counter(2); WritablePointer<Opaque> $claim = $shared->toHandle(); SharedReference<Counter> $again = SharedReference::reclaim($claim); }} }}"
+    );
+    assert_eq!(
+        codes(&accepted),
+        Vec::<&str>::new(),
+        "{:#?}",
+        findings(&accepted)
+    );
+    for (body, code, title) in [
+        (
+            "unsafe { let $handle = Handle::create(3); }",
+            "E0807",
+            "Handle Holds A Class Value",
+        ),
+        (
+            "unsafe { WritablePointer<Opaque> $handle = Handle::create(new Counter(1)); let $back = Handle::reclaim($handle); }",
+            "E0808",
+            "Handle Needs A Value Type",
+        ),
+        (
+            "unsafe { Handle::release(); }",
+            "E0304",
+            "Unknown Method",
+        ),
+        (
+            "WritablePointer<Opaque> $handle = Handle::create(new Counter(1));",
+            "E0785",
+            "Unsafe Operation Outside An Unsafe Context",
+        ),
+        (
+            "WritablePointer<Opaque> $handle = unsafe(Handle::create(new Counter(1))); show(unsafe(Handle::borrow($handle)));",
+            "E0809",
+            "Borrowed Handle Value Leaves Its Unsafe Context",
+        ),
+    ] {
+        let source = format!("{HANDLES}function main(): void {{ {body} }}");
+        let found = findings(&source);
+        assert!(
+            found
+                .iter()
+                .any(|diagnostic| diagnostic.code == code && diagnostic.title == title),
+            "{body}: {found:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_handle_takes_its_value_and_to_handle_consumes_the_reference() {
+    for body in [
+        "let $counter = new Counter(1); WritablePointer<Opaque> $handle = unsafe(Handle::create($counter)); echo $counter->count;",
+        "SharedReference<Counter> $shared = shared new Counter(1); WritablePointer<Opaque> $claim = unsafe($shared->toHandle()); echo $shared->count;",
+    ] {
+        let source = format!("{HANDLES}function main(): void {{ {body} }}");
+        assert!(codes(&source).contains(&"E0470"), "{body}: {:#?}", findings(&source));
+    }
+}

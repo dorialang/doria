@@ -20,6 +20,7 @@ mod deadline;
 mod device_io;
 mod entry_args;
 mod file_io;
+mod foreign_handle;
 mod foreign_string;
 #[cfg(feature = "hosted-shared-runtime")]
 mod identity;

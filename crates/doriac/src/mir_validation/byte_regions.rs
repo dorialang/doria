@@ -93,6 +93,40 @@ pub(super) fn validate_expression(
             }
             Ok(())
         }
+        // A region over foreign memory borrows its owner, a place of any
+        // type, with the region's access (Decision 0148 section 10).
+        E::Foreign {
+            kind,
+            owner,
+            data,
+            length,
+        } => {
+            validate_rvalue(program, function, owner)?;
+            if owner.ty().has_move_ownership() && !owner.borrows_move_value() {
+                return Err(malformed_mir(
+                    "a region over foreign memory must borrow its owner",
+                ));
+            }
+            if kind.is_writable() {
+                require_writable(program, function, owner)?;
+            }
+            if local_in(function, *data)?.ty
+                != mir::Type::Scalar(mir::ScalarType::Inline(
+                    crate::inline_value::InlineValueType::Pointer,
+                ))
+                || local_in(function, *length)?.ty != INT
+            {
+                return Err(malformed_mir(
+                    "a region over foreign memory has a pointer and an int length",
+                ));
+            }
+            if crate::native_abi::region_stride(program, *kind).is_none() {
+                return Err(malformed_mir(
+                    "a region over foreign memory views elements the targets build",
+                ));
+            }
+            Ok(())
+        }
         E::Local {
             kind,
             local,
@@ -416,6 +450,17 @@ pub(super) fn collect_expression<'a>(
             collect_rvalue_class_local_accesses(length, accesses);
             accesses.retained_acquisition(source, kind.is_writable());
         }
+        E::Foreign {
+            kind,
+            owner,
+            data,
+            length,
+        } => {
+            collect_rvalue_class_local_accesses(owner, accesses);
+            accesses.resource_read(*data);
+            accesses.resource_read(*length);
+            accesses.retained_acquisition(owner, kind.is_writable());
+        }
         E::Local {
             local, transfer, ..
         } => {
@@ -497,9 +542,12 @@ pub(super) fn value_parents(
             mir::RegionExpression::CollectionIndex { collection, .. } => {
                 Ok(parents[collection.0].clone())
             }
-            mir::RegionExpression::Region { kind, source, .. } => {
-                reborrow_parents(program, function, source, kind.is_writable(), parents)
-            }
+            mir::RegionExpression::Region { kind, source, .. }
+            | mir::RegionExpression::Foreign {
+                kind,
+                owner: source,
+                ..
+            } => reborrow_parents(program, function, source, kind.is_writable(), parents),
             mir::RegionExpression::Local { local, .. } => Ok(parents[local.0].clone()),
             mir::RegionExpression::Call {
                 function: callee,
@@ -633,7 +681,8 @@ pub(super) fn escaping(
             mir::RegionExpression::Local {
                 local, transfer, ..
             } => Ok(if *transfer { Vec::new() } else { vec![*local] }),
-            mir::RegionExpression::Region { source, .. } => {
+            mir::RegionExpression::Region { source, .. }
+            | mir::RegionExpression::Foreign { owner: source, .. } => {
                 escaping_class_local_borrows(program, source)
             }
             mir::RegionExpression::Call {
@@ -765,7 +814,14 @@ pub(super) fn inferred_borrow(
         return return_contract(function);
     }
     match value {
-        mir::Rvalue::Region(mir::RegionExpression::Region { kind, source, .. }) => Ok(
+        mir::Rvalue::Region(
+            mir::RegionExpression::Region { kind, source, .. }
+            | mir::RegionExpression::Foreign {
+                kind,
+                owner: source,
+                ..
+            },
+        ) => Ok(
             infer_rvalue_return_borrow(program, function, source)?.map(|borrow| {
                 mir::ReturnBorrow {
                     kind: mir::ReturnBorrowKind::Retained,
