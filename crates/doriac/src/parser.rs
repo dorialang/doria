@@ -52,18 +52,13 @@ pub struct Parser {
     /// The token kinds a trial's parse paths tested right after the trial
     /// token, once they had consumed it.
     trial_followers: std::cell::RefCell<Vec<TokenKind>>,
-    /// How many `parse_expression` calls enclose the token being parsed.
-    expression_depth: usize,
-    /// True when the next `parse_expression` parses an argument or a
-    /// collection literal element, where a comparison reading of
-    /// `callee<A, B>(...)` forms one element per comma.
-    list_element: bool,
-    /// The plain-name call candidates `callee<A, B>(` found since the
-    /// innermost `parse_expression` began, with that call's depth.
-    call_candidates: Vec<(usize, usize)>,
-    /// The reading forced on a candidate while its other reading is parsed,
-    /// keyed by the index of its `<` token.
-    forced_call_readings: HashMap<usize, CallReading>,
+    /// Every `callee<A, B>(` whose type arguments are all plain names, with
+    /// the reading this parse gave it (Decision 0105, Amendment: Type
+    /// Arguments At The Call).
+    call_candidates: Vec<CallCandidate>,
+    /// The readings name resolution chose, keyed by the span of each
+    /// candidate's `<`; a candidate without one reads as type arguments.
+    call_readings: HashMap<Span, CallReading>,
 }
 
 /// What a token trial found: whether a parse path took the token, and which
@@ -95,6 +90,7 @@ struct ParserCheckpoint {
     qualified_names_len: usize,
     attributes_len: usize,
     diagnostics_len: usize,
+    call_candidates_len: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -135,11 +131,15 @@ impl Parser {
             declaring_namespace: false,
             token_trial: None,
             trial_followers: std::cell::RefCell::new(Vec::new()),
-            expression_depth: 0,
-            list_element: false,
             call_candidates: Vec::new(),
-            forced_call_readings: HashMap::new(),
+            call_readings: HashMap::new(),
         }
+    }
+
+    /// Reads each plain-name call candidate as name resolution chose.
+    pub fn with_call_readings(mut self, readings: HashMap<Span, CallReading>) -> Self {
+        self.call_readings = readings;
+        self
     }
 
     /// Whether the parser accepts the token at `index`: some parse path,
@@ -253,9 +253,18 @@ impl Parser {
         Span::in_source(self.source_id, start, end)
     }
 
-    pub fn parse_program(mut self) -> DiagnosticResult<Program> {
+    pub fn parse_program(self) -> DiagnosticResult<Program> {
+        self.parse_program_with_candidates().0
+    }
+
+    /// The program, with the call candidates the parse met even when it
+    /// failed.
+    pub fn parse_program_with_candidates(
+        mut self,
+    ) -> (DiagnosticResult<Program>, Vec<CallCandidate>) {
         let (directives, namespace, imports, includes, items) = self.parse_source_items();
-        if self.diagnostics.is_empty() {
+        let candidates = self.call_candidates.clone();
+        let program = if self.diagnostics.is_empty() {
             Ok(Program {
                 directives,
                 namespace,
@@ -263,11 +272,13 @@ impl Parser {
                 includes,
                 qualified_names: self.qualified_names,
                 attributes: self.attributes,
+                call_candidates: self.call_candidates,
                 items,
             })
         } else {
             Err(self.diagnostics)
-        }
+        };
+        (program, candidates)
     }
 
     #[allow(clippy::type_complexity)]
@@ -378,6 +389,7 @@ impl Parser {
             qualified_names_len: self.qualified_names.len(),
             attributes_len: self.attributes.len(),
             diagnostics_len: self.diagnostics.len(),
+            call_candidates_len: self.call_candidates.len(),
         }
     }
 
@@ -405,6 +417,8 @@ impl Parser {
             .truncate(checkpoint.qualified_names_len);
         self.attributes.truncate(checkpoint.attributes_len);
         self.diagnostics.truncate(checkpoint.diagnostics_len);
+        self.call_candidates
+            .truncate(checkpoint.call_candidates_len);
     }
 
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
@@ -4184,117 +4198,7 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Option<Expr> {
-        let list_element = std::mem::take(&mut self.list_element);
-        self.expression_depth += 1;
-        let depth = self.expression_depth;
-        let expression = self.parse_expression_readings(list_element, depth);
-        self.expression_depth -= 1;
-        expression
-    }
-
-    /// An argument or collection literal element.
-    fn parse_list_element(&mut self) -> Option<Expr> {
-        self.list_element = true;
-        self.parse_expression()
-    }
-
-    /// Parses one expression and, when it contains `callee<A, B>(...)` with
-    /// only plain names between `<` and `>` at this depth, both of its
-    /// readings (Decision 0105, Amendment: Type Arguments At The Call). The
-    /// source reads as stated type arguments and, because `<` and `>` share
-    /// one precedence, as comparisons. When both readings parse to the same
-    /// token, the result is one [`TypeArgumentsOrComparison`] node that
-    /// name resolution classifies; otherwise the reading that parses is the
-    /// result, and when neither parses the comparison reading reports its
-    /// diagnostics, as before type arguments at a call existed.
-    fn parse_expression_readings(&mut self, list_element: bool, depth: usize) -> Option<Expr> {
-        let start = self.checkpoint();
-        let candidates_before = self.call_candidates.len();
-        let probe = self.parse_ternary();
-        let found = self.call_candidates[candidates_before..]
-            .iter()
-            .filter(|(_, at)| *at == depth)
-            .map(|(open, _)| *open)
-            .collect::<Vec<_>>();
-        self.call_candidates.truncate(candidates_before);
-        let Some(&open) = found.first() else {
-            return probe;
-        };
-        let end = self.current;
-        let parsed_cleanly = |parser: &Self, expression: &Option<Expr>| {
-            expression.is_some()
-                && parser.current == end
-                && parser.diagnostics.len() == start.diagnostics_len
-        };
-        let open_span = self.tokens[open].span;
-        let names = self.candidate_names(open);
-
-        // With one candidate here, the probe is the type-argument reading.
-        // With more, that reading decides the later ones in turn.
-        let (call, call_parses) = if found.len() == 1 {
-            let parses = parsed_cleanly(self, &probe);
-            (probe, parses)
-        } else {
-            self.restore_checkpoint(start);
-            self.forced_call_readings
-                .insert(open, CallReading::TypeArguments);
-            let call = self.parse_expression_readings(list_element, depth);
-            let parses = parsed_cleanly(self, &call);
-            (call, parses)
-        };
-
-        self.restore_checkpoint(start);
-        self.forced_call_readings
-            .insert(open, CallReading::Comparison);
-        let mut comparison = Vec::new();
-        let mut comparison_parses = true;
-        loop {
-            match self.parse_expression_readings(false, depth) {
-                Some(element) => comparison.push(element),
-                None => {
-                    comparison_parses = false;
-                    break;
-                }
-            }
-            if !list_element || self.current >= end || !self.check(&TokenKind::Comma) {
-                break;
-            }
-            self.advance();
-        }
-        let comparison_parses = comparison_parses
-            && self.current == end
-            && self.diagnostics.len() == start.diagnostics_len;
-
-        let result = match (call, call_parses, comparison_parses) {
-            (Some(call), true, true) => {
-                let span = call.span();
-                Some(Expr::TypeArgumentsOrComparison(Box::new(
-                    TypeArgumentsOrComparison {
-                        names,
-                        open_span,
-                        call,
-                        comparison,
-                        span,
-                    },
-                )))
-            }
-            (_, true, false) => {
-                self.restore_checkpoint(start);
-                self.forced_call_readings
-                    .insert(open, CallReading::TypeArguments);
-                self.parse_expression_readings(list_element, depth)
-            }
-            _ => {
-                // The comparison reading alone: its first element here, and
-                // the enclosing list parses any others, as it always has.
-                self.restore_checkpoint(start);
-                self.forced_call_readings
-                    .insert(open, CallReading::Comparison);
-                self.parse_expression_readings(false, depth)
-            }
-        };
-        self.forced_call_readings.remove(&open);
-        result
+        self.parse_ternary()
     }
 
     /// The names between a candidate's `<` and `>`.
@@ -4339,10 +4243,6 @@ impl Parser {
             return None;
         }
         let open = self.current;
-        let forced = self.forced_call_readings.get(&open).copied();
-        if forced == Some(CallReading::Comparison) {
-            return None;
-        }
         let checkpoint = self.checkpoint();
         // A list that does not parse leaves completion as it found it.
         let completion = self.completion.clone();
@@ -4367,8 +4267,25 @@ impl Parser {
             return None;
         }
         let span = open_span.merge(self.previous().span);
-        if forced.is_none() && arguments.iter().all(TypeRef::is_plain_name) {
-            self.call_candidates.push((open, self.expression_depth));
+        if arguments.iter().all(TypeRef::is_plain_name) {
+            // The same tokens also read as comparisons. Name resolution
+            // chooses; until it has, a candidate reads as type arguments,
+            // which every argument list parses as.
+            let read_as = self
+                .call_readings
+                .get(&open_span)
+                .copied()
+                .unwrap_or(CallReading::TypeArguments);
+            self.call_candidates.push(CallCandidate {
+                open_span,
+                names: self.candidate_names(open),
+                read_as,
+            });
+            if read_as == CallReading::Comparison {
+                self.restore_checkpoint(checkpoint);
+                self.completion = completion;
+                return None;
+            }
         }
         Some(CallTypeArguments { arguments, span })
     }
@@ -5270,9 +5187,6 @@ impl Parser {
     fn contains_bare_identifier(expr: &Expr) -> bool {
         match expr {
             Expr::Identifier { name, .. } => !name.contains('\\'),
-            Expr::TypeArgumentsOrComparison(node) => {
-                node.comparison.iter().any(Self::contains_bare_identifier)
-            }
             Expr::InterpolatedString { parts, .. } => parts.iter().any(|part| match part {
                 InterpolatedStringPart::Text { .. } => false,
                 InterpolatedStringPart::Expr(expr) => Self::contains_bare_identifier(expr),
@@ -5407,14 +5321,8 @@ impl Parser {
     fn parse_array(&mut self, start: usize) -> Option<Expr> {
         let mut elements = Vec::new();
         if !self.check(&TokenKind::RightBracket) {
-            let first = self.parse_list_element()?;
+            let first = self.parse_expression()?;
             if self.match_kind(&TokenKind::Semicolon) {
-                // A repeat literal has one value, so a comparison reading
-                // that forms several elements is not a reading here.
-                let first = match first {
-                    Expr::TypeArgumentsOrComparison(node) if node.comparison.len() > 1 => node.call,
-                    first => first,
-                };
                 let count = self.parse_expression()?;
                 let end = self
                     .expect(
@@ -5434,10 +5342,10 @@ impl Parser {
             loop {
                 let first = match first.take() {
                     Some(first) => first,
-                    None => self.parse_list_element()?,
+                    None => self.parse_expression()?,
                 };
                 if self.match_kind(&TokenKind::FatArrow) {
-                    let value = self.parse_list_element()?;
+                    let value = self.parse_expression()?;
                     elements.push(ArrayElement {
                         key: Some(first),
                         value,
@@ -5487,7 +5395,7 @@ impl Parser {
                         unreachable!("named-argument lookahead guarantees an identifier");
                     };
                     self.advance();
-                    let value = self.parse_list_element()?;
+                    let value = self.parse_expression()?;
                     let span = name_token.span.merge(value.span());
                     last_named_span = Some(name_token.span);
                     args.push(Argument {
@@ -5499,7 +5407,7 @@ impl Parser {
                         span,
                     });
                 } else {
-                    let value = self.parse_list_element()?;
+                    let value = self.parse_expression()?;
                     let span = value.span();
                     if let Some(named_span) = last_named_span {
                         self.diagnostics.push(

@@ -1226,6 +1226,33 @@ function main(): void
 }
 
 #[test]
+fn pointer_conversions_take_a_stated_target() {
+    // `Pointer::cast<T>` and `Pointer::fromAddress<T>` state the pointee, so
+    // a read needs no typed local.
+    let source = r#"
+use Doria\Std\Ffi\{Opaque, Pointer};
+
+/** @safety `$pointer` addresses an `int32`. */
+unsafe function readThrough(Pointer<Opaque> $pointer): int32
+{
+    return unsafe(Pointer::cast<int32>($pointer)->read());
+}
+
+function main(): void
+{
+    writable int32 $value = 41;
+    unsafe {
+        let $opaque = Pointer::cast<Opaque>(Pointer::to($value));
+        echo readThrough($opaque);
+        let $again = Pointer::fromAddress<int32>($opaque->address) ?? Pointer::cast<int32>($opaque);
+        echo " " . $again->read();
+    }
+}
+"#;
+    assert_runs_natively(source, "41 41");
+}
+
+#[test]
 fn typed_array_regions_view_read_write_and_copy_elements_in_place() {
     // Decision 0148 section 8: views over `T[]` that copy nothing.
     let source = format!(

@@ -182,12 +182,12 @@ pub fn analyze_source_for_ide_with_source_context(
 ) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
     let source = SourceFile::new(path, text);
     let context = source_context.compilation.clone();
-    let mut authored = parse_source_file(&source)?;
+    let authored = parse_source_file(&source)?;
+    // Tooling reads the authored tree as name resolution reads it.
+    let authored = read_call_candidates(&source, authored, &context, None)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
-    // Tooling reads the authored tree as name resolution read it.
-    names::apply_call_readings(&mut authored, &resolution.call_readings, None);
     resolution.resolved.program = augment_compiler_known(
         &resolution.resolved.program,
         &resolution.resolved.facts,
@@ -973,12 +973,12 @@ fn prepare_source(
 pub(crate) fn prepare_parsed_source(
     source: &SourceFile,
     context: CompilationContext,
-    mut authored: Program,
+    authored: Program,
 ) -> DiagnosticResult<PreparedSource> {
+    let authored = read_call_candidates(source, authored, &context, None)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let resolution = names::resolve_program_for_ide(&authored, &context);
-    names::apply_call_readings(&mut authored, &resolution.call_readings, None);
     let mut warnings = diagnostics::separate_errors(resolution.diagnostics)?;
     let mut resolved = resolution.resolved;
     resolved.program = augment_compiler_known(
@@ -1009,11 +1009,60 @@ pub(crate) fn prepare_parsed_source(
     })
 }
 
+/// Parses `source`, reading each `callee<A, B>(...)` whose type arguments
+/// are all plain names as type arguments. When that leaves the source
+/// unparsed, it is read again with those calls as comparisons, the meaning
+/// they had before type arguments at a call existed (Decision 0105,
+/// Amendment: Type Arguments At The Call); [`read_call_candidates`] then
+/// applies name resolution's choice.
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {
+    let (parsed, candidates) =
+        parse_source_file_with_call_readings(source, std::collections::HashMap::new())?;
+    match parsed {
+        Ok(program) => Ok(program),
+        Err(diagnostics) if candidates.is_empty() => Err(diagnostics),
+        Err(diagnostics) => {
+            let comparisons = candidates
+                .iter()
+                .map(|candidate| (candidate.open_span, ast::CallReading::Comparison))
+                .collect();
+            parse_source_file_with_call_readings(source, comparisons)?
+                .0
+                .map_err(|_| diagnostics)
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_source_file_with_call_readings(
+    source: &SourceFile,
+    readings: std::collections::HashMap<source::Span, ast::CallReading>,
+) -> DiagnosticResult<(DiagnosticResult<Program>, Vec<ast::CallCandidate>)> {
     let (tokens, comments) = lexer::Lexer::new(source).lex_with_comments();
-    parser::Parser::new(tokens?)
+    Ok(parser::Parser::new(tokens?)
         .with_documentation(parser::documentation_comments(source, &comments))
-        .parse_program()
+        .with_call_readings(readings)
+        .parse_program_with_candidates())
+}
+
+/// `program` with each call candidate read as name resolution reads it: the
+/// same tree when it already does, and otherwise `source` parsed again with
+/// those readings. Two parses at most, whatever the candidates' nesting.
+pub(crate) fn read_call_candidates(
+    source: &SourceFile,
+    program: Program,
+    context: &CompilationContext,
+    environment: Option<&names::NameResolutionEnvironment>,
+) -> DiagnosticResult<Program> {
+    let readings = names::call_readings(&program, context, environment);
+    if program
+        .call_candidates
+        .iter()
+        .all(|candidate| readings.get(&candidate.open_span) == Some(&candidate.read_as))
+    {
+        return Ok(program);
+    }
+    parse_source_file_with_call_readings(source, readings)?.0
 }
 
 pub fn render_diagnostics(

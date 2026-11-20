@@ -1096,9 +1096,6 @@ fn kill_mutated_call_arguments(
         kill_exposed_places(expr.span(), state, resolution);
     }
     match expr {
-        crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-            unreachable!("name resolution classifies type arguments at a call")
-        }
         Expr::PropertyAccess { object, .. }
         | Expr::Grouped { expr: object, .. }
         | Expr::Unsafe { expr: object, .. }
@@ -1470,9 +1467,6 @@ fn expression_fact(
 ) -> Option<Fact> {
     let value = ungroup(value);
     match value {
-        crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-            unreachable!("name resolution classifies type arguments at a call")
-        }
         Expr::Null { .. } => Some(Fact::Null),
         Expr::String { .. }
         | Expr::InterpolatedString { .. }
@@ -1743,9 +1737,6 @@ fn collect_expr(
     }
 
     match expr {
-        crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-            unreachable!("name resolution classifies type arguments at a call")
-        }
         Expr::PropertyAccess { object, span, .. } => {
             if let Some(binding) = resolution.property_uses.get(span) {
                 if let Some(fact) = state.facts.get(binding) {
@@ -2656,9 +2647,6 @@ impl Resolver {
             return;
         }
         match expr {
-            crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-                unreachable!("name resolution classifies type arguments at a call")
-            }
             Expr::PropertyAccess {
                 object,
                 property,

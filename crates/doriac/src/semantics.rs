@@ -13447,9 +13447,6 @@ impl<'program> Checker<'program> {
             return;
         }
         match expr {
-            crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-                unreachable!("name resolution classifies type arguments at a call")
-            }
             Expr::Closure(closure) => {
                 self.check_closure_expression(closure, scopes, method_context);
             }
@@ -23957,9 +23954,6 @@ impl<'program> Checker<'program> {
             return self.types.intern(TypeKind::Void);
         }
         match expr {
-            crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-                unreachable!("name resolution classifies type arguments at a call")
-            }
             Expr::Closure(closure) => self
                 .closure_types
                 .get(&closure.span)

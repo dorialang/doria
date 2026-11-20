@@ -23,6 +23,12 @@ pub struct Program {
     /// target without duplicating the authored application for promoted
     /// constructor parameters.
     pub attributes: Vec<AttributeAttachment>,
+    /// Every `callee<A, B>(...)` whose type arguments are all plain or
+    /// namespaced names, which also reads as comparisons (Decision 0105,
+    /// Amendment: Type Arguments At The Call), with the reading this tree
+    /// gives it. Name resolution chooses each reading once; a tree whose
+    /// readings differ from that choice is parsed again with it.
+    pub call_candidates: Vec<CallCandidate>,
     pub items: Vec<Item>,
 }
 
@@ -1307,11 +1313,6 @@ pub enum Expr {
         span: Span,
     },
     When(Box<WhenExpression>),
-    /// `callee<A, B>(...)` whose type arguments are all plain or namespaced
-    /// names, which also reads as comparisons (Decision 0105, Amendment:
-    /// Type Arguments At The Call). Name resolution chooses the reading
-    /// once; no later stage sees this node.
-    TypeArgumentsOrComparison(Box<TypeArgumentsOrComparison>),
     Closure(Box<ClosureExpression>),
     /// `unsafe(<expression>)`: exactly that expression is an unsafe context,
     /// and the form yields its value (Decision 0148 section 2).
@@ -1415,21 +1416,14 @@ pub struct CallTypeArguments {
     pub span: Span,
 }
 
-/// The two readings of `callee<A, B>(...)` when every type argument is a
-/// plain or namespaced name. `call` is the expression read with the type
-/// arguments; `comparison` is the same source read with `<` and `>` as
-/// comparisons, as the elements it forms: one, or in an argument list or
-/// collection literal one per comma between the names
-/// (`show($a->size < B, C > ($d))`).
+/// One `callee<A, B>(...)` whose type arguments are all plain or namespaced
+/// names: identified by its `<`, with the names and the reading the tree
+/// that holds it gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeArgumentsOrComparison {
-    /// The names between `<` and `>`, in source spelling.
-    pub names: Vec<CandidateTypeName>,
-    /// The `<` that opens the list; it identifies the candidate.
+pub struct CallCandidate {
     pub open_span: Span,
-    pub call: Expr,
-    pub comparison: Vec<Expr>,
-    pub span: Span,
+    pub names: Vec<CandidateTypeName>,
+    pub read_as: CallReading,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1438,7 +1432,7 @@ pub struct CandidateTypeName {
     pub span: Span,
 }
 
-/// How name resolution reads a [`TypeArgumentsOrComparison`].
+/// How a [`CallCandidate`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallReading {
     TypeArguments,
@@ -1513,7 +1507,6 @@ impl Expr {
             | Expr::Match { span, .. }
             | Expr::Unsafe { span, .. } => *span,
             Expr::When(when) => when.span,
-            Expr::TypeArgumentsOrComparison(node) => node.span,
             Expr::Closure(closure) => closure.span,
         }
     }

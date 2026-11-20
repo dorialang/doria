@@ -178,7 +178,12 @@ two cards on 2026-11-20: "Type argument at the call (Recommended)", then
 "Explicit type arguments for every generic call (Recommended)", recorded as
 Decision 0105's Amendment: Type Arguments At The Call. Each handle operation
 declares one type parameter `T`; `reclaim` and `borrow` read a stated `T`
-first and the expected type second. Section 11 states the rule.
+first and the expected type second. Section 11 states the rule. The pointer
+conversions of section 4 follow the same ruling: `Pointer::cast`,
+`WritablePointer::cast` and `Pointer::fromAddress` declare the pointee as one
+type parameter (`Pointer::cast<int32>($pointer)`), `Pointer::toFunction`
+declares the C function pointer type, and each reads a stated argument before
+the expected type.
 
 ## Context
 
@@ -376,7 +381,7 @@ Consequence: the checker proves which pointers may be null at compile time, and
 | Unaligned write | `$writablePointer->writeUnaligned(T $value): void` | unsafe |
 | Element offset | `$pointer->offset(int $count)` scaled by `T`'s size | unsafe |
 | Byte offset | `$pointer->byteOffset(int $bytes)` | unsafe |
-| Cast | `Pointer::cast($pointer)`, `WritablePointer::cast($pointer)`, target from the expected type | unsafe |
+| Cast | `Pointer::cast<T>($pointer)`, `WritablePointer::cast<T>($pointer)`, `T` stated or from the expected type | unsafe |
 | From address | `Pointer::fromAddress(uint64 $address): ?Pointer<T>` | unsafe |
 | Address | `$pointer->address: uint64` | safe |
 | Drop write access | `Pointer::from(WritablePointer<T> $pointer): Pointer<T>` | safe |

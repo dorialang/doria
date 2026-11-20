@@ -665,8 +665,36 @@ impl<'program> Checker<'program> {
         }
     }
 
-    /// The target of a conversion that takes it from the expected type, or
-    /// E0802 when the position supplies none of the right kind.
+    /// The target a call states for a conversion, which declares one type
+    /// parameter (Decision 0105, Amendment: Type Arguments At The Call): the
+    /// pointee for `cast` and `fromAddress`, as in `Pointer::cast<int32>`,
+    /// and the C function pointer type itself for `toFunction`.
+    fn stated_conversion_target(
+        &mut self,
+        operation: PointerOperation,
+        pointer: PointerAccess,
+        span: Span,
+    ) -> Option<TypeId> {
+        let member = match operation {
+            PointerOperation::Cast => "cast",
+            PointerOperation::FromAddress => "fromAddress",
+            PointerOperation::ToFunction => "toFunction",
+            _ => return None,
+        };
+        let callee = format!("`{}::{member}`", pointer.short_name());
+        let stated = self.stated_type_argument_types(&callee, 1, span)?[0];
+        Some(match operation {
+            PointerOperation::ToFunction => stated,
+            _ => self.types.intern(TypeKind::Foreign(ForeignType::Pointer {
+                access: pointer,
+                pointee: stated,
+            })),
+        })
+    }
+
+    /// The target of a conversion, from a type argument stated at the call
+    /// or else the expected type, or E0802 when neither is of the right
+    /// kind.
     fn expected_pointer_target(
         &mut self,
         operation: PointerOperation,
@@ -681,15 +709,18 @@ impl<'program> Checker<'program> {
             PointerOperation::ToFunction => "a C function pointer type".to_string(),
             _ => format!("a `{}<T>` type", pointer.short_name()),
         };
+        let found = self
+            .stated_conversion_target(operation, pointer, span)
+            .or_else(|| self.contextual_expression_types.get(&span).copied());
         let mut diagnostic = Diagnostic::new(
             POINTER_TARGET_CODE,
-            match self.contextual_expression_types.get(&span).copied() {
-                Some(expected) => format!(
-                    "{callee} takes its target from the expected type, and `{}` is not {wanted}",
-                    self.types.display(expected)
+            match found {
+                Some(found) => format!(
+                    "{callee} takes its target from its type argument or the expected type, and `{}` is not {wanted}",
+                    self.types.display(found)
                 ),
                 None => format!(
-                    "{callee} takes its target from the expected type, and nothing here states one"
+                    "{callee} takes its target from its type argument or the expected type, and nothing here states one"
                 ),
             },
             span,
@@ -697,13 +728,13 @@ impl<'program> Checker<'program> {
         .with_title("Pointer Conversion Needs A Target Type");
         diagnostic = diagnostic.with_help(match operation {
             PointerOperation::ToFunction => {
-                "declare the result with its type, as in `extern \"C\" function(int32): int32 $callback = Pointer::toFunction($address);`".to_string()
+                "state the target at the call or declare the result with its type, as in `extern \"C\" function(int32): int32 $callback = Pointer::toFunction($address);`".to_string()
             }
             PointerOperation::FromAddress => {
-                "declare the result with its type, as in `?Pointer<uint8> $bytes = Pointer::fromAddress($address);`".to_string()
+                "state the pointee at the call, as in `Pointer::fromAddress<uint8>($address)`, or declare the result with its type".to_string()
             }
             _ => format!(
-                "declare the result with its type, as in `{0}<uint8> $bytes = {0}::cast($pointer);`",
+                "state the pointee at the call, as in `{0}::cast<uint8>($pointer)`, or declare the result with its type",
                 pointer.short_name()
             ),
         });
@@ -714,12 +745,13 @@ impl<'program> Checker<'program> {
     /// The non-null target type the expected type at `span` names for
     /// `operation`, without reporting.
     fn conversion_target(
-        &self,
+        &mut self,
         operation: PointerOperation,
         pointer: PointerAccess,
         span: Span,
     ) -> Option<TypeId> {
-        let expected = self.contextual_expression_types.get(&span).copied()?;
+        let stated = self.stated_conversion_target(operation, pointer, span);
+        let expected = stated.or_else(|| self.contextual_expression_types.get(&span).copied())?;
         let target = match self.types.kind(expected) {
             TypeKind::Nullable(inner) => *inner,
             _ => expected,

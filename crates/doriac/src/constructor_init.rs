@@ -806,9 +806,6 @@ fn inspect_expr(
     analysis: &mut Analysis,
 ) {
     match expression {
-        crate::ast::Expr::TypeArgumentsOrComparison(_) => {
-            unreachable!("name resolution classifies type arguments at a call")
-        }
         Expr::This { span } => {
             report_incomplete_this(class, properties, state, *span, &mut analysis.diagnostics)
         }

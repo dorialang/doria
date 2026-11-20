@@ -640,6 +640,7 @@ fn empty_program() -> Program {
         includes: Vec::new(),
         qualified_names: Vec::new(),
         attributes: Vec::new(),
+        call_candidates: Vec::new(),
         items: Vec::new(),
     }
 }
@@ -765,20 +766,21 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             complete: graph.completeness == GraphCompleteness::Complete,
             includes_resolved: true,
         };
-        let resolution = crate::names::resolve_program_in_graph_for_ide(
-            &source.authored,
-            &context,
-            &environment,
-        );
         // Name resolution reads each `callee<A, B>(...)` once; every later
         // pass, elaboration included, starts from the authored tree read
         // that way (Decision 0105, Amendment: Type Arguments At The Call).
-        let mut classified = source.authored.clone();
-        crate::names::apply_call_readings(
-            &mut classified,
-            &resolution.call_readings,
-            Some(&mut diagnostics),
-        );
+        let classified = crate::read_call_candidates(
+            &source.source,
+            source.authored.clone(),
+            &context,
+            Some(&environment),
+        )
+        .unwrap_or_else(|source_diagnostics| {
+            diagnostics.extend(source_diagnostics);
+            source.authored.clone()
+        });
+        let resolution =
+            crate::names::resolve_program_in_graph_for_ide(&classified, &context, &environment);
         classified_sources.insert(identity.clone(), classified);
         let resolved = resolution.resolved;
         append_program(&mut preliminary_combined, &resolved.program);

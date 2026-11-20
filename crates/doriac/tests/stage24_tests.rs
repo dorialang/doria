@@ -774,13 +774,14 @@ function main(): void {{ let $missing = none(); }}"
 
 #[test]
 fn tooling_reads_the_authored_tree_as_name_resolution_read_it() {
-    // Decision 0105, Amendment: Type Arguments At The Call: the parser keeps
-    // both readings of `callee<A>(...)`, name resolution chooses one, and the
-    // authored program tooling receives holds only that reading.
+    // Decision 0105, Amendment: Type Arguments At The Call: the parser
+    // records each plain-name candidate, name resolution reads it once, and
+    // the authored program tooling receives is parsed with that reading.
     let source = format!(
         "{STATED_GENERICS}
 const int LIMIT = 3;
-function main(): void {{ echo none<int>() ?? 1; echo pick<int, bool>(1, 2<LIMIT>(false)); }}"
+const int MAX = 2;
+function main(): void {{ let $factory = pick<Factory, Factory>(new Factory(), new Factory()); echo MAX<LIMIT>(false); }}"
     );
     let (program, analysis) =
         doriac::analyze_source_for_ide("tooling-readings.doria", source).expect("source parses");
@@ -792,7 +793,42 @@ function main(): void {{ echo none<int>() ?? 1; echo pick<int, bool>(1, 2<LIMIT>
         "{:#?}",
         analysis.diagnostics
     );
-    let tree = format!("{program:?}");
-    assert!(!tree.contains("TypeArgumentsOrComparison"), "{tree}");
-    assert!(tree.contains("type_arguments: Some"), "{tree}");
+    assert_eq!(
+        program
+            .call_candidates
+            .iter()
+            .map(|candidate| candidate.read_as)
+            .collect::<Vec<_>>(),
+        [
+            doriac::ast::CallReading::TypeArguments,
+            doriac::ast::CallReading::Comparison
+        ]
+    );
+}
+
+#[test]
+fn deeply_nested_candidates_parse_in_linear_time() {
+    // Each candidate is read once, so nesting costs at most two parses of the
+    // source; reading both forms at every level would never finish here.
+    const DEPTH: usize = 40;
+    let calls = format!(
+        "{}new Factory(){}",
+        "pick<Factory, Factory>(new Factory(), ".repeat(DEPTH),
+        ")".repeat(DEPTH)
+    );
+    let comparisons = format!("{}false{}", "MAX<LIMIT>(".repeat(DEPTH), ")".repeat(DEPTH));
+    let source = format!(
+        "{STATED_GENERICS}
+const int LIMIT = 3;
+const int MAX = 2;
+function main(): void {{ let $factory = {calls}; echo {comparisons}; }}"
+    );
+    let started = std::time::Instant::now();
+    doriac::check_source("nested-candidates.doria", &source)
+        .unwrap_or_else(|findings| panic!("{findings:#?}"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
 }

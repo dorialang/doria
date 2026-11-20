@@ -179,9 +179,6 @@ pub fn expr(expression: &Expr, visitor: &mut dyn FnMut(&Expr)) {
             expr(start, visitor);
             expr(end, visitor);
         }
-        Expr::TypeArgumentsOrComparison(_) => {
-            unreachable!("name resolution classifies type arguments at a call before any visit")
-        }
         Expr::Match {
             scrutinee, arms, ..
         } => {

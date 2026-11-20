@@ -216,15 +216,19 @@ cases; a second explicit-argument syntax is surface without payoff."
 - When every argument is a plain or namespaced name, the same tokens also
   read as comparisons, because `<` and `>` share one precedence and associate
   left: `$counter->value<LIMIT>($flag)` is `($counter->value < LIMIT) >
-  ($flag)`. The parser keeps both readings in one syntax-neutral node, and in
-  an argument list or collection literal the comparison reading forms one
-  element per comma between the names.
-- Name resolution classifies that node once: the type argument reading when
-  every name resolves to a type and none to a value, and otherwise the
-  comparison reading, as before this amendment. A name that resolves only to
-  a type cannot be a comparison operand, so the rule needs no knowledge of
-  the callee; a non-generic callee then reports E0811. Checking, lowering,
-  tooling and metadata read the classified tree and never decide again.
+  ($flag)`. The parser records each such call as one syntax-neutral
+  candidate: the span of its `<`, its names, and the reading the tree gives
+  it, type arguments until name resolution has read it. A source that does
+  not parse that way is read with its candidates as comparisons.
+- Name resolution reads each candidate once: type arguments when every name
+  resolves to a type and none to a value, and comparisons otherwise, as before
+  this amendment. A name that resolves only to a type cannot be a comparison
+  operand, so the rule needs no knowledge of the callee; a non-generic callee
+  then reports E0811. A tree whose readings differ from that choice is parsed
+  again with it, so the source is parsed at most twice whatever the
+  candidates' nesting, and a comparison reading in an argument list or
+  collection literal forms one element per comma as it always did. Checking,
+  lowering, tooling and metadata receive that tree and never decide again.
 
 These programs keep their comparison meaning, each with a test, where
 `LIMIT`, `MAX`, `B` and `C` are constants and `$flag` is a `bool`:
