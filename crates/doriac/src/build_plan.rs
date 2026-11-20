@@ -4,9 +4,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::{Diagnostic, DiagnosticKind, DiagnosticResult, DiagnosticSource};
+pub use crate::native_link::{NativeLibrary, WindowsSubsystem};
 use crate::source::Span;
 
-pub const BUILD_PLAN_SCHEMA_VERSION: u32 = 1;
+/// The newest build-plan schema; every version in
+/// [`SUPPORTED_BUILD_PLAN_SCHEMA_VERSIONS`] is accepted.
+pub const BUILD_PLAN_SCHEMA_VERSION: u32 = 2;
+
+/// Schema 2 adds each package's `nativeLibraries` and `unsafePolicy` and the
+/// selected target's `windowsSubsystem` (Decision 0148 section 18, amended
+/// 2026-11-20). Schema 1 plans keep their meaning.
+pub const SUPPORTED_BUILD_PLAN_SCHEMA_VERSIONS: [u32; 2] = [1, 2];
+const SUPPORTED: &str = "`1` or `2`";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -27,6 +36,10 @@ pub struct SelectedTarget {
     pub kind: TargetKind,
     pub entry_source: Option<String>,
     pub active_scopes: Vec<SourceScope>,
+    /// Schema 2: `"console"` or `"gui"` for a binary target, absent for a
+    /// library (Decision 0148 section 21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_subsystem: Option<WindowsSubsystem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -47,6 +60,22 @@ pub struct Package {
     pub sources: Vec<Source>,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+    /// Schema 2: the resolved link inputs of each logical library the
+    /// package's sources name with `#[Library]` (Decision 0148 section 18).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_libraries: Vec<NativeLibrary>,
+    /// Schema 2: the package's unsafe policy (Decision 0148 section 25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsafe_policy: Option<UnsafePolicy>,
+}
+
+/// Whether a package's sources may contain unsafe code (Decision 0148
+/// section 25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnsafePolicy {
+    Allow,
+    Deny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,12 +191,13 @@ pub fn parse_build_plan(
         .get("schemaVersion")
         .and_then(serde_json::Value::as_u64)
     {
-        if version != u64::from(BUILD_PLAN_SCHEMA_VERSION) {
+        if !SUPPORTED_BUILD_PLAN_SCHEMA_VERSIONS
+            .iter()
+            .any(|supported| u64::from(*supported) == version)
+        {
             return Err(vec![compiler_input_diagnostic(
                 "E0676",
-                format!(
-                    "unknown build-plan schema version `{version}`; expected `{BUILD_PLAN_SCHEMA_VERSION}`"
-                ),
+                format!("unknown build-plan schema version `{version}`; expected {SUPPORTED}"),
                 Span::default(),
             )
             .with_title("Build Plan Schema Version Is Unsupported")
@@ -185,7 +215,10 @@ pub fn encode_build_plan(plan: &BuildPlan) -> DiagnosticResult<String> {
     serde_json::to_string_pretty(plan).map_err(|error| {
         vec![compiler_input_diagnostic(
             "E0676",
-            format!("could not encode build-plan schema 1: {error}"),
+            format!(
+                "could not encode build-plan schema {}: {error}",
+                plan.schema_version
+            ),
             Span::default(),
         )
         .with_title("Build Plan Could Not Be Encoded")]
@@ -214,12 +247,12 @@ pub fn parse_build_plan_document(
 
 pub fn validate_build_plan(plan: &BuildPlan) -> DiagnosticResult<()> {
     let mut diagnostics = Vec::new();
-    if plan.schema_version != BUILD_PLAN_SCHEMA_VERSION {
+    if !SUPPORTED_BUILD_PLAN_SCHEMA_VERSIONS.contains(&plan.schema_version) {
         diagnostics.push(
             compiler_input_diagnostic(
                 "E0676",
                 format!(
-                    "unknown build-plan schema version `{}`; expected `{BUILD_PLAN_SCHEMA_VERSION}`",
+                    "unknown build-plan schema version `{}`; expected {SUPPORTED}",
                     plan.schema_version
                 ),
                 Span::default(),
@@ -278,6 +311,23 @@ pub fn validate_build_plan(plan: &BuildPlan) -> DiagnosticResult<()> {
         )),
         (CompilerTarget::Debug | CompilerTarget::Php, Some(_)) => diagnostics.push(input(
             "compiler.nativeProfile must be null unless compiler.target is `native`",
+        )),
+        _ => {}
+    }
+    let schema_2 = plan.schema_version >= 2;
+    match (
+        schema_2,
+        plan.selected_target.kind,
+        plan.selected_target.windows_subsystem,
+    ) {
+        (false, _, Some(_)) => diagnostics.push(input(
+            "selectedTarget.windowsSubsystem requires build-plan schema 2",
+        )),
+        (true, TargetKind::Binary, None) => diagnostics.push(input(
+            "a binary selected target requires a windowsSubsystem in build-plan schema 2",
+        )),
+        (true, TargetKind::Library, Some(_)) => diagnostics.push(input(
+            "a library selected target must not declare a windowsSubsystem",
         )),
         _ => {}
     }
@@ -402,6 +452,7 @@ pub fn validate_build_plan(plan: &BuildPlan) -> DiagnosticResult<()> {
                 )));
             }
         }
+        validate_native_facts(package, schema_2, &mut diagnostics);
         let mut dependencies = BTreeSet::new();
         let mut dependency_packages = BTreeSet::new();
         for dependency in &package.dependencies {
@@ -427,9 +478,7 @@ pub fn validate_build_plan(plan: &BuildPlan) -> DiagnosticResult<()> {
         )));
     }
     if plan.selected_target.package != plan.root_package {
-        diagnostics.push(input(
-            "schema-1 selected target package must equal rootPackage",
-        ));
+        diagnostics.push(input("the selected target package must equal rootPackage"));
     }
     let Some(target_package) = packages.get(plan.selected_target.package.as_str()) else {
         diagnostics.push(input(format!(
@@ -477,6 +526,58 @@ pub fn validate_build_plan(plan: &BuildPlan) -> DiagnosticResult<()> {
     }
 }
 
+/// The schema-2 package fields: `unsafePolicy` and `nativeLibraries`.
+fn validate_native_facts(package: &Package, schema_2: bool, diagnostics: &mut Vec<Diagnostic>) {
+    let identity = &package.identity;
+    match (schema_2, package.unsafe_policy) {
+        (false, Some(_)) => diagnostics.push(input(format!(
+            "package `{identity}` declares unsafePolicy, which requires build-plan schema 2"
+        ))),
+        (true, None) => diagnostics.push(input(format!(
+            "package `{identity}` requires an unsafePolicy in build-plan schema 2"
+        ))),
+        _ => {}
+    }
+    if !schema_2 && !package.native_libraries.is_empty() {
+        diagnostics.push(input(format!(
+            "package `{identity}` declares nativeLibraries, which requires build-plan schema 2"
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for library in &package.native_libraries {
+        if !names.insert(library.name.as_str()) {
+            diagnostics.push(input(format!(
+                "package `{identity}` declares native library `{}` more than once",
+                library.name
+            )));
+        }
+        for problem in library.problems() {
+            diagnostics.push(input(format!("package `{identity}`: {problem}")));
+        }
+        let paths = library
+            .inputs
+            .iter()
+            .filter_map(|input| match input {
+                crate::native_link::LinkInput::SearchPath { path }
+                | crate::native_link::LinkInput::File { path } => Some(path),
+                _ => None,
+            })
+            .chain(&library.runtime_files);
+        for path in paths {
+            // A path pkg-config resolved is absolute machine-local input,
+            // as an absolute package root is; a project path stays inside
+            // its package.
+            if !path.is_absolute() {
+                validate_relative_plan_path(
+                    &path.to_string_lossy(),
+                    &format!("native library `{}`", library.name),
+                    diagnostics,
+                );
+            }
+        }
+    }
+}
+
 fn build_plan_json_diagnostic(
     path: &str,
     text: &str,
@@ -495,7 +596,7 @@ fn build_plan_json_diagnostic(
     .with_title("Build Plan Is Invalid")
     .with_primary_label("Build Plan JSON Is Invalid")
     .with_primary_source(DiagnosticSource::Path(path.to_string()))
-    .with_explanation("Build-plan schema 1 uses strict camelCase JSON fields.")]
+    .with_explanation("Build plans use strict camelCase JSON fields.")]
 }
 
 fn validate_relative_plan_path(value: &str, subject: &str, diagnostics: &mut Vec<Diagnostic>) {

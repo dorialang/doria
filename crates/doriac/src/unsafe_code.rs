@@ -170,22 +170,17 @@ const AGGREGATE_MESSAGE: &str =
     "foreign structs and unions are part of Doria; the interpreter does not run them yet";
 
 /// One E0784 diagnostic per extern declaration whose binding no execution
-/// target builds yet, in source order: one in a block with `#[Library]`, a
-/// variadic one, and one that captures `WindowsLastError` for a target
-/// other than Windows.
+/// target builds yet, in source order: a variadic one, and one that
+/// captures `WindowsLastError` for a target other than Windows. A binding
+/// in a `#[Library]` block builds; the native link checks its library has
+/// link inputs ([`crate::native_link`]).
 pub fn unbuildable_bindings(
     bindings: &std::collections::HashMap<Span, crate::foreign::ForeignBinding>,
 ) -> Vec<Diagnostic> {
     let mut finder = Finder::new(Gate::Execution);
     for (span, binding) in bindings {
         let symbol = &binding.symbol;
-        if let Some(library) = &binding.library {
-            finder.report(
-                *span,
-                "Native Libraries Cannot Be Linked Yet",
-                format!("`{symbol}` binds the native library `{library}`, which is part of Doria; this compiler does not link native libraries yet"),
-            );
-        } else if binding.fixed_parameters.is_some() {
+        if binding.fixed_parameters.is_some() {
             finder.report(
                 *span,
                 "Variadic Foreign Functions Cannot Be Built Yet",

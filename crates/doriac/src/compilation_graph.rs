@@ -189,6 +189,34 @@ fn load_compilation_graph_inner(
             source_map: Box::default(),
         }
     })?;
+    // Section 25's package policy is enforced with the `declare` grammar
+    // it shares; until then a "deny" package is never silently allowed.
+    let unenforced = document
+        .plan
+        .packages
+        .iter()
+        .filter(|package| package.unsafe_policy == Some(crate::build_plan::UnsafePolicy::Deny))
+        .map(|package| {
+            crate::build_plan::compiler_input_diagnostic(
+                crate::unsafe_code::NOT_AVAILABLE_CODE,
+                format!(
+                    "the unsafe policy \"deny\" of package `{}` is part of Doria; this compiler does not enforce unsafe policies yet",
+                    package.identity
+                ),
+                Span::default(),
+            )
+            .with_title("Package Unsafe Policies Are Not Available Yet")
+            .with_primary_source(crate::diagnostics::DiagnosticSource::Path(
+                document.path.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if !unenforced.is_empty() {
+        return Err(GraphLoadFailure {
+            diagnostics: unenforced,
+            source_map: Box::default(),
+        });
+    }
     let active_scopes = document
         .plan
         .selected_target
@@ -562,6 +590,38 @@ fn stable_source_ids<'a>(
         result.insert(identity.clone(), SourceId(candidate));
     }
     result
+}
+
+/// The link facts of a graph (Decision 0148 section 18): each package's
+/// native libraries, their paths resolved against its canonical root, and
+/// the selected target's Windows subsystem. A source finds the libraries
+/// of the package that owns it.
+pub fn native_linking(graph: &CompilationGraph) -> crate::native_link::NativeLinking {
+    let source_packages = graph
+        .sources
+        .values()
+        .filter_map(|source| match &source.package {
+            PackageIdentity::Named(package) => Some((source.id, package.clone())),
+            _ => None,
+        })
+        .collect();
+    crate::native_link::NativeLinking::for_packages(
+        graph.build_plan.packages.iter().filter_map(|package| {
+            graph.packages.get(&package.identity).map(|node| {
+                (
+                    package.identity.as_str(),
+                    node.canonical_root.as_path(),
+                    package.native_libraries.as_slice(),
+                )
+            })
+        }),
+        source_packages,
+        graph
+            .build_plan
+            .selected_target
+            .windows_subsystem
+            .unwrap_or_default(),
+    )
 }
 
 pub fn compilation_context(source: &GraphSource) -> CompilationContext {

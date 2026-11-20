@@ -63,6 +63,7 @@ pub mod names;
 mod narrowing;
 pub mod native_abi;
 pub mod native_closure_abi;
+pub mod native_link;
 pub mod native_process;
 mod native_shared;
 pub mod numeric;
@@ -740,7 +741,10 @@ pub(crate) fn compilation_graph_options(
             unreachable!("validated native plan has a profile")
         }
     };
-    Ok(options)
+    Ok(CompileOptions {
+        linking: compilation_graph::native_linking(graph),
+        ..options
+    })
 }
 
 pub fn compile_build_plan_file(

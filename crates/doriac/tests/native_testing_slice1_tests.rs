@@ -33,6 +33,7 @@ fn document(scope: SourceScope, generated_for: Option<GeneratedFor>) -> BuildPla
                     SourceScope::Development,
                     SourceScope::Generated,
                 ],
+                windows_subsystem: None,
             },
             packages: vec![Package {
                 identity: PACKAGE.to_string(),
@@ -55,6 +56,8 @@ fn document(scope: SourceScope, generated_for: Option<GeneratedFor>) -> BuildPla
                     generated_for,
                 }],
                 dependencies: Vec::new(),
+                native_libraries: Vec::new(),
+                unsafe_policy: None,
             }],
             compiler: CompilerOptions {
                 target: CompilerTarget::Debug,
@@ -101,6 +104,7 @@ fn dispatcher_graph(
                     SourceScope::Development,
                     SourceScope::Generated,
                 ],
+                windows_subsystem: None,
             },
             packages: vec![Package {
                 identity: PACKAGE.to_string(),
@@ -136,6 +140,8 @@ fn dispatcher_graph(
                     },
                 ],
                 dependencies: Vec::new(),
+                native_libraries: Vec::new(),
+                unsafe_policy: None,
             }],
             compiler: CompilerOptions {
                 target,
@@ -248,7 +254,10 @@ fn temporary_artifacts_are_reserved_independently_across_threads() {
 }
 
 fn run_emitted(output: doriac::backend::BackendOutput) -> std::process::Output {
-    let doriac::backend::BackendOutput::Executable { bytes, extension } = output else {
+    let doriac::backend::BackendOutput::Executable {
+        bytes, extension, ..
+    } = output
+    else {
         panic!("native backend must emit an executable");
     };
     let path = temporary_path(&extension);
@@ -277,7 +286,10 @@ fn run_emitted(output: doriac::backend::BackendOutput) -> std::process::Output {
 fn run_emitted_with_assertion_outcome(
     output: doriac::backend::BackendOutput,
 ) -> (std::process::Output, Vec<u8>) {
-    let doriac::backend::BackendOutput::Executable { bytes, extension } = output else {
+    let doriac::backend::BackendOutput::Executable {
+        bytes, extension, ..
+    } = output
+    else {
         panic!("native backend must emit an executable");
     };
     let path = temporary_path(&extension);

@@ -29,6 +29,9 @@ pub enum BackendOutput {
     Executable {
         extension: String,
         bytes: Vec<u8>,
+        /// The runtime files of the native libraries it links, published
+        /// beside it (Decision 0148 section 19).
+        runtime_files: Vec<PathBuf>,
     },
     Artifact {
         path: PathBuf,
@@ -53,7 +56,14 @@ pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), Back
             write_output(out_path, contents.as_bytes())
         }
         BackendOutput::Binary { bytes, .. } => write_output(out_path, &bytes),
-        BackendOutput::Executable { bytes, .. } => {
+        BackendOutput::Executable {
+            bytes,
+            runtime_files,
+            ..
+        } => {
+            for file in &runtime_files {
+                publish_runtime_file(file, directory)?;
+            }
             write_output(out_path, &bytes)?;
             #[cfg(unix)]
             {
@@ -86,6 +96,30 @@ pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), Back
 /// observe a partly written output. As with an in-place write, a symlinked
 /// destination replaces the file it points to, and an existing file's
 /// permissions carry over.
+/// Copies a native library's runtime file into the executable's directory,
+/// where the executable loads it.
+fn publish_runtime_file(file: &Path, directory: &Path) -> Result<(), BackendError> {
+    let name = file.file_name().ok_or_else(|| {
+        BackendError::new(format!(
+            "runtime file `{}` has no file name",
+            file.display()
+        ))
+    })?;
+    let destination = directory.join(name);
+    if std::fs::canonicalize(file).ok() == std::fs::canonicalize(&destination).ok()
+        && destination.exists()
+    {
+        return Ok(());
+    }
+    let bytes = std::fs::read(file).map_err(|error| {
+        BackendError::new(format!(
+            "failed to read runtime file `{}`: {error}",
+            file.display()
+        ))
+    })?;
+    write_output(&destination, &bytes)
+}
+
 fn write_output(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let destination = match std::fs::symlink_metadata(path) {
@@ -190,24 +224,28 @@ impl NativeProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileOptions {
     pub target: BackendTarget,
     pub native_profile: NativeProfile,
+    /// The link inputs of the native libraries the program names
+    /// (Decision 0148 section 18).
+    pub linking: crate::native_link::NativeLinking,
 }
 
 impl CompileOptions {
-    pub const fn new(target: BackendTarget) -> Self {
+    pub fn new(target: BackendTarget) -> Self {
         Self {
             target,
             native_profile: NativeProfile::Fast,
+            linking: crate::native_link::NativeLinking::default(),
         }
     }
 
-    pub const fn native(native_profile: NativeProfile) -> Self {
+    pub fn native(native_profile: NativeProfile) -> Self {
         Self {
-            target: BackendTarget::Native,
             native_profile,
+            ..Self::new(BackendTarget::Native)
         }
     }
 }
@@ -280,18 +318,25 @@ impl Backend for NativeBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        emit_native(program, NativeProfile::Fast)
+        emit_native(
+            program,
+            NativeProfile::Fast,
+            &crate::native_link::NativeLinking::default(),
+        )
     }
 }
 
 fn emit_native(
     program: &hir::Program,
     native_profile: NativeProfile,
+    linking: &crate::native_link::NativeLinking,
 ) -> Result<BackendOutput, BackendError> {
     let mir = lower_validated_mir(program)?;
+    let executable = codegen_native::generate_linked_executable(&mir, native_profile, linking)?;
     Ok(BackendOutput::Executable {
         extension: native_executable_extension().to_string(),
-        bytes: codegen_native::generate_executable(&mir, native_profile)?,
+        bytes: executable.bytes,
+        runtime_files: executable.runtime_files,
     })
 }
 
@@ -344,7 +389,7 @@ pub fn emit_with_options(
     }
 
     match options.target {
-        BackendTarget::Native => emit_native(program, options.native_profile),
+        BackendTarget::Native => emit_native(program, options.native_profile, &options.linking),
         BackendTarget::Php => PhpBackend.emit(program),
         BackendTarget::Debug => DebugBackend.emit(program),
         BackendTarget::Wasm => Err(format!(

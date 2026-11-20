@@ -445,9 +445,21 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
     let mut release = false;
     let mut out = None::<String>;
     let mut performance_report = None::<String>;
+    let mut linking = doriac::native_link::NativeLinking::default();
+    let mut link_flags = false;
+    let working_directory = env::current_dir()
+        .map_err(|error| format!("cannot read the working directory: {error}"))?;
     let mut index = if plan_path.is_some() { 2 } else { 1 };
     while index < args.len() {
         match args[index].as_str() {
+            flag if doriac::native_link::LINK_FLAGS.contains(&flag) => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                linking.apply_flag(flag, value, &working_directory)?;
+                link_flags = true;
+                index += 2;
+            }
             "--target" => {
                 let target_value = args
                     .get(index + 1)
@@ -504,6 +516,12 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
             "--target and --release cannot override compiler settings from a build plan".into(),
         );
     }
+    if plan_path.is_some() && link_flags {
+        return Err(
+            "link flags cannot override the native libraries of a build plan; Baton writes them from `[native-libraries]`".into(),
+        );
+    }
+    linking.finish_flags()?;
 
     let source_load_started = Instant::now();
     if let Some(plan_path) = plan_path {
@@ -603,6 +621,7 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         } else {
             NativeProfile::Fast
         },
+        linking,
     };
     let (output, mut report, warnings) = if performance_report.is_some() {
         let command = utf8_cli_arguments(&invocation)?;
@@ -1381,14 +1400,25 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let mut release = false;
+    let mut linking = doriac::native_link::NativeLinking::default();
+    let working_directory = env::current_dir()
+        .map_err(|error| format!("cannot read the working directory: {error}"))?;
     // Everything after `--` belongs to the program, not to `doriac`, so a
     // program argument can safely look like a compiler option (decision 0099).
-    for option in &compiler_args[1..] {
+    let mut options = compiler_args[1..].iter();
+    while let Some(option) = options.next() {
         match option.as_str() {
             "--release" => release = true,
+            flag if doriac::native_link::LINK_FLAGS.contains(&flag) => {
+                let value = options
+                    .next()
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                linking.apply_flag(flag, value, &working_directory)?;
+            }
             option => return Err(format!("unknown run option `{option}`").into()),
         }
     }
+    linking.finish_flags()?;
 
     let (path, text) = read_source(input)?;
     let profile = if release {
@@ -1399,7 +1429,10 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
     let (output, warnings) = doriac::compile_source_with_warnings(
         path.clone(),
         text.clone(),
-        CompileOptions::native(profile),
+        CompileOptions {
+            linking,
+            ..CompileOptions::native(profile)
+        },
     )
     .map_err(|diagnostics| {
         CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
@@ -1438,10 +1471,17 @@ fn execute_native_output(
     output: BackendOutput,
     program_args: &[OsString],
 ) -> Result<(ExitStatus, Option<Vec<u8>>), CliError> {
-    let temp_path = temp_run_executable_path(input);
+    // The executable gets a directory of its own, where the runtime files
+    // of its native libraries are published beside it.
+    let temp_directory = temp_run_directory(input);
+    fs::create_dir_all(&temp_directory)
+        .map_err(|error| format!("failed to create temp run directory: {error}"))?;
+    let temp_path = temp_directory.join(temp_run_executable_name(input));
     let outcome_path = temp_path.with_extension("doria-outcome");
-    write_backend_output(&temp_path, output)
-        .map_err(|error| format!("failed to write temp native executable: {}", error.message))?;
+    if let Err(error) = write_backend_output(&temp_path, output) {
+        let _ = fs::remove_dir_all(&temp_directory);
+        return Err(format!("failed to write temp native executable: {}", error.message).into());
+    }
     let status = doriac::native_process::spawn(
         Command::new(&temp_path)
             .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
@@ -1458,8 +1498,7 @@ fn execute_native_output(
         )
     });
     let runtime_payload = fs::read(&outcome_path).ok();
-    let _ = fs::remove_file(&outcome_path);
-    let _ = fs::remove_file(&temp_path);
+    let _ = fs::remove_dir_all(&temp_directory);
     Ok((status?, runtime_payload))
 }
 
@@ -2074,21 +2113,29 @@ impl<'a> RuntimeOutcomeDecoder<'a> {
     }
 }
 
-fn temp_run_executable_path(input: &str) -> PathBuf {
-    let stem = Path::new(input)
+fn temp_run_stem(input: &str) -> &str {
+    Path::new(input)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
-        .unwrap_or("doriac-run");
+        .unwrap_or("doriac-run")
+}
+
+fn temp_run_directory(input: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let extension = if cfg!(windows) { ".exe" } else { "" };
     env::temp_dir().join(format!(
-        "doriac-run-{stem}-{}-{nanos}{extension}",
+        "doriac-run-{}-{}-{nanos}",
+        temp_run_stem(input),
         std::process::id()
     ))
+}
+
+fn temp_run_executable_name(input: &str) -> String {
+    let extension = if cfg!(windows) { ".exe" } else { "" };
+    format!("{}{extension}", temp_run_stem(input))
 }
 
 fn exit_code_from_status(status: ExitStatus) -> Result<ExitCode, String> {
@@ -2129,7 +2176,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [--schema-version 1|2|3] [diagnostic options]\n    doriac metadata --build-plan <plan.json> [--schema-version 1|2|3] [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n    doriac explain <code> [--format human|json]\n    doriac explain --all [--format human|json]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [--schema-version 1|2|3] [diagnostic options]\n    doriac metadata --build-plan <plan.json> [--schema-version 1|2|3] [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [link options] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [link options] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n    doriac explain <code> [--format human|json]\n    doriac explain --all [--format human|json]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nLINK OPTIONS (repeatable; a build plan carries these in nativeLibraries):\n    --link-library <library>=[static:]<name>    link a library by name\n    --link-search <library>=<directory>         search a directory for libraries\n    --link-framework <library>=<framework>      link a macOS framework\n    --link-file <library>=<path>                link a library file by path\n    --runtime-file <library>=<path>             place a file the program loads beside it\n    --windows-subsystem console|gui             Windows subsystem; default: console\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

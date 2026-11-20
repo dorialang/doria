@@ -13,6 +13,7 @@ use std::os::windows::process::CommandExt;
 use std::process::Output;
 
 use crate::backend::{BackendError, NativeProfile};
+use crate::native_link::{LinkPlan, NativeLinking, WindowsSubsystem};
 use crate::{codegen_cranelift, mir, runtime_artifact};
 
 #[derive(Debug, Clone)]
@@ -30,10 +31,31 @@ pub struct NativePerformance {
     pub optimization: crate::mir_validation::OptimizationMetrics,
 }
 
+/// A linked executable and the runtime files its foreign libraries load,
+/// which are placed beside it (Decision 0148 section 19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedExecutable {
+    pub bytes: Vec<u8>,
+    pub runtime_files: Vec<PathBuf>,
+}
+
+/// The executable of a program that links no native library.
 pub fn generate_executable(
     program: &mir::Program,
     profile: NativeProfile,
 ) -> Result<Vec<u8>, BackendError> {
+    generate_linked_executable(program, profile, &NativeLinking::default())
+        .map(|executable| executable.bytes)
+}
+
+/// The executable of `program`, linking the native libraries its foreign
+/// calls name from `linking` (Decision 0148 section 18).
+pub fn generate_linked_executable(
+    program: &mir::Program,
+    profile: NativeProfile,
+    linking: &NativeLinking,
+) -> Result<LinkedExecutable, BackendError> {
+    let plan = link_plan(program, linking)?;
     let object_bytes = match profile {
         NativeProfile::Fast => codegen_cranelift::lower_mir_to_object(program)?,
         NativeProfile::Release => lower_release_object(program)?,
@@ -41,16 +63,30 @@ pub fn generate_executable(
     let hosting = runtime_artifact::RuntimeHosting::for_program(program);
     let runtime = runtime_artifact::locate(profile, hosting)?;
     let runtime_path = runtime.path;
-    link_object(&object_bytes, &runtime_path, hosting)
+    let (bytes, _, _) = link_object_with_metadata(&object_bytes, &runtime_path, hosting, &plan)?;
+    Ok(LinkedExecutable {
+        bytes,
+        runtime_files: plan.runtime_files,
+    })
+}
+
+/// The link plan of `program` for the host target, which native code
+/// generation targets.
+fn link_plan(program: &mir::Program, linking: &NativeLinking) -> Result<LinkPlan, BackendError> {
+    linking
+        .resolve(program, crate::c_layout::CTarget::host())
+        .map_err(BackendError::from_diagnostics)
 }
 
 pub(crate) fn generate_executable_with_performance(
     program: &mir::Program,
     profile: NativeProfile,
-) -> Result<(Vec<u8>, NativePerformance), BackendError> {
+    linking: &NativeLinking,
+) -> Result<(LinkedExecutable, NativePerformance), BackendError> {
     let started = Instant::now();
     crate::mir_validation::validate_program(program)?;
     let mir_validation = started.elapsed();
+    let plan = link_plan(program, linking)?;
 
     let started = Instant::now();
     let mut optimization = crate::mir_validation::OptimizationMetrics::default();
@@ -80,11 +116,14 @@ pub(crate) fn generate_executable_with_performance(
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
-    let (executable, linker, link_command) =
-        link_object_with_metadata(&object_bytes, &runtime_path, hosting)?;
+    let (bytes, linker, link_command) =
+        link_object_with_metadata(&object_bytes, &runtime_path, hosting, &plan)?;
     let linking = started.elapsed();
     Ok((
-        executable,
+        LinkedExecutable {
+            bytes,
+            runtime_files: plan.runtime_files,
+        },
         NativePerformance {
             mir_validation,
             code_generation,
@@ -131,18 +170,11 @@ fn lower_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError
     ))
 }
 
-fn link_object(
-    object_bytes: &[u8],
-    runtime_path: &Path,
-    hosting: runtime_artifact::RuntimeHosting,
-) -> Result<Vec<u8>, BackendError> {
-    link_object_with_metadata(object_bytes, runtime_path, hosting).map(|(bytes, _, _)| bytes)
-}
-
 fn link_object_with_metadata(
     object_bytes: &[u8],
     runtime_path: &Path,
     hosting: runtime_artifact::RuntimeHosting,
+    plan: &LinkPlan,
 ) -> Result<(Vec<u8>, String, Vec<String>), BackendError> {
     let temp_stem = unique_temp_stem();
     let object_path = temp_stem.with_extension(object_extension());
@@ -152,7 +184,7 @@ fn link_object_with_metadata(
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
 
     let (linker, arguments) =
-        match invoke_linker(&object_path, runtime_path, &executable_path, hosting) {
+        match invoke_linker(&object_path, runtime_path, &executable_path, hosting, plan) {
             Ok(metadata) => metadata,
             Err(error) => {
                 cleanup_temp_artifacts(&object_path, &executable_path);
@@ -181,6 +213,7 @@ fn invoke_linker(
     runtime_path: &Path,
     executable_path: &Path,
     hosting: runtime_artifact::RuntimeHosting,
+    plan: &LinkPlan,
 ) -> Result<(String, Vec<String>), BackendError> {
     // Cranelift emits a host object from MIR, then the host toolchain links it.
     // Doria does not generate C source or use C semantics as an oracle.
@@ -197,6 +230,7 @@ fn invoke_linker(
             runtime: runtime_path,
             executable: executable_path,
             hosting,
+            foreign: plan,
         },
     );
     let mut command = Command::new(&linker);
@@ -482,13 +516,15 @@ fn default_linker(msvc_host: bool) -> &'static str {
 }
 
 /// What one executable link combines: the generated object, the selected
-/// runtime archive and the C runtime it is hosted by, and the output.
+/// runtime archive and the C runtime it is hosted by, the foreign link
+/// inputs, and the output.
 #[derive(Debug, Clone, Copy)]
 struct LinkInputs<'a> {
     object: &'a Path,
     runtime: &'a Path,
     executable: &'a Path,
     hosting: runtime_artifact::RuntimeHosting,
+    foreign: &'a LinkPlan,
 }
 
 fn linker_arguments(
@@ -503,7 +539,12 @@ fn linker_arguments(
         runtime: runtime_path,
         executable: executable_path,
         hosting,
+        foreign,
     } = inputs;
+    let subsystem = match foreign.windows_subsystem {
+        WindowsSubsystem::Console => "/SUBSYSTEM:CONSOLE",
+        WindowsSubsystem::Gui => "/SUBSYSTEM:WINDOWS",
+    };
     let msvc_driver =
         windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker));
     if msvc_driver && hosting == runtime_artifact::RuntimeHosting::CrtHosted {
@@ -514,21 +555,33 @@ fn linker_arguments(
         // `libcmt.lib` names), so clean machines need no redistributable,
         // and the startup code and vcruntime statically. The runtime archive
         // is the CRT-hosted one, which defines none of the CRT's symbols.
-        return vec![
+        let mut arguments = vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),
             runtime_path.as_os_str().to_os_string(),
             OsString::from(format!("/Fe:{}", executable_path.display())),
             OsString::from("/link"),
-            OsString::from("/SUBSYSTEM:CONSOLE"),
-            OsString::from("libcmt.lib"),
-            OsString::from("libvcruntime.lib"),
-            OsString::from("ucrt.lib"),
-            OsString::from("/NODEFAULTLIB:libucrt.lib"),
-            OsString::from("kernel32.lib"),
-            OsString::from("shell32.lib"),
-            OsString::from("bcrypt.lib"),
+            OsString::from(subsystem),
         ];
+        // The GUI subsystem's default entry is `WinMainCRTStartup`, which
+        // calls `WinMain`; Doria's entry is `main` on either subsystem.
+        if foreign.windows_subsystem == WindowsSubsystem::Gui {
+            arguments.push(OsString::from("/ENTRY:mainCRTStartup"));
+        }
+        arguments.extend(
+            [
+                "libcmt.lib",
+                "libvcruntime.lib",
+                "ucrt.lib",
+                "/NODEFAULTLIB:libucrt.lib",
+                "kernel32.lib",
+                "shell32.lib",
+                "bcrypt.lib",
+            ]
+            .map(OsString::from),
+        );
+        arguments.extend(foreign.msvc_arguments());
+        return arguments;
     }
     if msvc_driver {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
@@ -545,7 +598,7 @@ fn linker_arguments(
             OsString::from(format!("/Fe:{}", executable_path.display())),
             OsString::from("/link"),
             OsString::from("/ENTRY:main"),
-            OsString::from("/SUBSYSTEM:CONSOLE"),
+            OsString::from(subsystem),
             OsString::from("kernel32.lib"),
             // `doria_rt.lib` is a staticlib, so it carries archived objects
             // without the crate metadata that records a `#[link]` dependency.
@@ -562,6 +615,7 @@ fn linker_arguments(
         OsString::from("-o"),
         executable_path.as_os_str().to_os_string(),
     ];
+    arguments.extend(foreign.driver_arguments(crate::c_layout::CTarget::host()));
     if windows {
         arguments.push(OsString::from("-lshell32"));
         arguments.push(OsString::from("-lbcrypt"));
@@ -595,6 +649,7 @@ mod tests {
                 runtime: Path::new("doria_rt.lib"),
                 executable: Path::new("main.exe"),
                 hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
             },
         );
 
@@ -627,6 +682,7 @@ mod tests {
                 runtime: Path::new("doria_rt.lib"),
                 executable: Path::new("main.exe"),
                 hosting: runtime_artifact::RuntimeHosting::CrtHosted,
+                foreign: &LinkPlan::default(),
             },
         );
 
@@ -651,6 +707,57 @@ mod tests {
     }
 
     #[test]
+    fn windows_foreign_libraries_and_the_gui_subsystem_follow_the_c_runtime() {
+        let foreign = LinkPlan {
+            items: vec![
+                crate::native_link::LinkItem::SearchPath(PathBuf::from("native")),
+                crate::native_link::LinkItem::Library {
+                    name: "zlib".to_string(),
+                    mode: crate::native_link::LinkMode::Dynamic,
+                },
+            ],
+            runtime_files: Vec::new(),
+            windows_subsystem: WindowsSubsystem::Gui,
+        };
+        let args = linker_arguments(
+            "cl.exe",
+            false,
+            true,
+            true,
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::CrtHosted,
+                foreign: &foreign,
+            },
+        );
+
+        assert_eq!(
+            args,
+            [
+                "/nologo",
+                "main.obj",
+                "doria_rt.lib",
+                "/Fe:main.exe",
+                "/link",
+                "/SUBSYSTEM:WINDOWS",
+                "/ENTRY:mainCRTStartup",
+                "libcmt.lib",
+                "libvcruntime.lib",
+                "ucrt.lib",
+                "/NODEFAULTLIB:libucrt.lib",
+                "kernel32.lib",
+                "shell32.lib",
+                "bcrypt.lib",
+                "/LIBPATH:native",
+                "zlib.lib",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
     fn windows_clang_cl_uses_msvc_compiler_driver_arguments() {
         let args = linker_arguments(
             "clang-cl.exe",
@@ -662,6 +769,7 @@ mod tests {
                 runtime: Path::new("doria_rt.lib"),
                 executable: Path::new("main.exe"),
                 hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
             },
         );
 
@@ -694,6 +802,7 @@ mod tests {
                 runtime: Path::new("doria_rt.lib"),
                 executable: Path::new("main.exe"),
                 hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
             },
         );
 
@@ -722,6 +831,7 @@ mod tests {
                 runtime: Path::new("libdoria_rt.a"),
                 executable: Path::new("main.exe"),
                 hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
             },
         );
 

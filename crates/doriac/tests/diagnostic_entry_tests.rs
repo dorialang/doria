@@ -17,7 +17,8 @@ const CHECKED_CODES_WITHOUT_A_PROGRAM: &[&str] = &[
     // Only ever reported after another error at the same place.
     "E0454", "E0473", "E0633", "E0634", "E0696",
     // Reported when a program is compiled, not when it is checked.
-    "E0505", // Raised only through compiler interfaces that no command reaches.
+    "E0505", "E0804", "E0805",
+    // Raised only through compiler interfaces that no command reaches.
     "E0673", "E0674", "E0699",
     // Reported for a project's build plan or several of its files.
     "E0676", "E0677", "E0678", "E0679", "E0680", "E0682", "E0683", "E0684", "E0685",
@@ -51,6 +52,7 @@ fn development_source_diagnostics(source: &str) -> Vec<doriac::diagnostics::Diag
                     SourceScope::Development,
                     SourceScope::Generated,
                 ],
+                windows_subsystem: None,
             },
             packages: vec![Package {
                 identity: PACKAGE.to_string(),
@@ -69,6 +71,8 @@ fn development_source_diagnostics(source: &str) -> Vec<doriac::diagnostics::Diag
                     generated_for: None,
                 }],
                 dependencies: Vec::new(),
+                native_libraries: Vec::new(),
+                unsafe_policy: None,
             }],
             compiler: CompilerOptions {
                 target: CompilerTarget::Debug,
@@ -158,13 +162,14 @@ fn check_entry(entry: &doria_diagnostic_catalogue::explanations::DiagnosticEntry
         // library, which this compiler does not build yet; such an example
         // runs as a native program, whose report carries the same title.
         if !doriac::unsafe_code::companion_operations(&program).is_empty() {
-            let run = native_execution::execute_native(
-                &program,
-                doriac::backend::NativeProfile::Fast,
-            );
+            let run =
+                native_execution::execute_native(&program, doriac::backend::NativeProfile::Fast);
             let stderr = String::from_utf8_lossy(&run.stderr);
             assert_eq!(run.status.code(), Some(101), "{code}: {stderr}");
-            assert!(stderr.contains(code), "{code}: its example ends with {stderr}");
+            assert!(
+                stderr.contains(code),
+                "{code}: its example ends with {stderr}"
+            );
             assert!(
                 stderr.contains(entry.title) == entry.title_is_fixed,
                 "{code}: the entry's `Title:` line does not match the report: {stderr}"

@@ -323,6 +323,8 @@ mod tests {
             namespace_mappings: Vec::new(),
             sources: Vec::new(),
             dependencies: Vec::new(),
+            native_libraries: Vec::new(),
+            unsafe_policy: None,
         }
     }
 

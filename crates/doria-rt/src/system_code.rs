@@ -52,6 +52,19 @@ unsafe fn errno() -> i32 {
     }
 }
 
+/// `GetLastError` on Windows. Checking rejects a `WindowsLastError` capture
+/// emitted for another target, so elsewhere no call reaches it.
+fn windows_last_error() -> i64 {
+    #[cfg(windows)]
+    {
+        i64::from(unsafe { crate::win32::GetLastError() })
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 /// Reads the code `source` names and stores it as the last system code.
 ///
 /// # Safety
@@ -62,8 +75,7 @@ unsafe fn errno() -> i32 {
 pub unsafe extern "C" fn dr_v1_capture_system_code(source: u32) {
     let code = match source {
         SOURCE_ERRNO => i64::from(errno()),
-        #[cfg(windows)]
-        SOURCE_WINDOWS_LAST_ERROR => i64::from(crate::win32::GetLastError()),
+        SOURCE_WINDOWS_LAST_ERROR => windows_last_error(),
         _ => 0,
     };
     LAST_SYSTEM_CODE.store(code, Ordering::Relaxed);

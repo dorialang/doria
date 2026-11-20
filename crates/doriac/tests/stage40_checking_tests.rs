@@ -526,10 +526,6 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
 
     for (declaration, title) in [
         (
-            "#[Library(\"zlib\")] extern \"C\" { /** @safety Any value. */ function zlibVersion(): Ptr<CChar>; }",
-            "Native Libraries Cannot Be Linked Yet",
-        ),
-        (
             "extern \"C\" { /** @safety Any value. */ #[LinkName(\"printf\")] #[Variadic(fixedParameters: 1)] function printInteger(Ptr<CChar> $format, int32 $value): int32; }",
             "Variadic Foreign Functions Cannot Be Built Yet",
         ),
@@ -540,7 +536,7 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
         "Windows Last Error Capture Cannot Be Built Here Yet",
     ))) {
         let source = format!(
-            "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, Library, LinkName, Ptr, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
+            "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, LinkName, Ptr, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
         );
         assert!(codes(&source).is_empty(), "{title}: {:#?}", findings(&source));
         let diagnostics = doriac::lower_source_to_mir("ffi.doria", source)

@@ -1843,6 +1843,7 @@ mod tests {
             crate::backend::BackendOutput::Executable {
                 extension: String::new(),
                 bytes: b"new executable".to_vec(),
+                runtime_files: Vec::new(),
             },
         )
         .unwrap();
@@ -1869,6 +1870,7 @@ mod tests {
             crate::backend::BackendOutput::Executable {
                 extension: String::new(),
                 bytes: b"new executable".to_vec(),
+                runtime_files: Vec::new(),
             },
         )
         .unwrap();

@@ -134,6 +134,7 @@ fn development_plan() -> BuildPlanDocument {
                     SourceScope::Development,
                     SourceScope::Generated,
                 ],
+                windows_subsystem: None,
             },
             packages: vec![Package {
                 identity: package.to_string(),
@@ -182,6 +183,8 @@ fn development_plan() -> BuildPlanDocument {
                     },
                 ],
                 dependencies: Vec::new(),
+                native_libraries: Vec::new(),
+                unsafe_policy: None,
             }],
             compiler: CompilerOptions {
                 target: CompilerTarget::Native,

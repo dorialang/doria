@@ -59,6 +59,8 @@ fn package(identity: &str, sources: Vec<Source>, dependencies: Vec<Dependency>) 
         }],
         sources,
         dependencies,
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     }
 }
 
@@ -77,6 +79,7 @@ fn plan(packages: Vec<Package>, entry: &str) -> BuildPlanDocument {
                 kind: TargetKind::Binary,
                 entry_source: Some(entry.to_string()),
                 active_scopes: vec![SourceScope::Main],
+                windows_subsystem: None,
             },
             packages,
             compiler: CompilerOptions {
@@ -629,6 +632,8 @@ fn multi_source_graph_preserves_writable_nullable_property_receivers() {
             ),
         ],
         dependencies: Vec::new(),
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     };
     let document = plan(vec![application], entry);
     let mut provider = InMemorySourceProvider::new();
