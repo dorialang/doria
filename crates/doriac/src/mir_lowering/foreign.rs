@@ -1,4 +1,4 @@
-//! Raw pointer operations and extern declaration bodies (Decision 0148
+//! Pointer operations and extern declaration bodies (Decision 0148
 //! sections 4, 14 and 15).
 //!
 //! A pointer is the one-word inline value `InlineValueType::Pointer`; its
@@ -39,7 +39,7 @@ pub(super) fn expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
     match unparenthesized_place(expr) {
-        // The name of a C-ABI Doria function is the address of its C entry
+        // The name of a C-callable Doria function is the address of its C entry
         // (section 12).
         hir::Expr::Identifier { name, span }
             if context
@@ -339,7 +339,7 @@ fn materialize_foreign_string(
     Ok(local)
 }
 
-/// `$mutable->write($value)` and `writeUnaligned` as a statement; `false`
+/// `$writablePointer->write($value)` and `writeUnaligned` as a statement; `false`
 /// when `expr` is not one.
 pub(super) fn statement(expr: &hir::Expr, context: &mut LoweringContext) -> DiagnosticResult<bool> {
     let hir::Expr::MethodCall {

@@ -1,12 +1,12 @@
 //! C entries into Doria and the Call Path through foreign frames (Decision
 //! 0148 section 13).
 //!
-//! A program with C-ABI Doria functions records the thread that runs its
+//! A program with C-callable Doria functions records the thread that runs its
 //! Doria code when it starts (`dr_v1_record_doria_thread`). Each outbound
 //! foreign call stores the calling Doria frame in `dr_v1_foreign_call_frame`
 //! for the length of the call, restoring the previous value afterwards, so
 //! a nested call inside a callback leaves its enclosing call's record in
-//! place. The C entry of a C-ABI function calls `dr_v1_enter_c_function`,
+//! place. The C entry of a C-callable function calls `dr_v1_enter_c_function`,
 //! which panics with P1706 on any other thread and otherwise links a
 //! `[foreign call]` frame to the recorded caller, so the Call Path stays
 //! continuous through C. An entry with no outbound call in progress starts
@@ -58,13 +58,13 @@ fn current_thread() -> usize {
 }
 
 /// Records the calling thread as the thread running Doria code. The process
-/// entry of a program with C-ABI functions calls it before any Doria code.
+/// entry of a program with C-callable functions calls it before any Doria code.
 #[no_mangle]
 pub extern "C" fn dr_v1_record_doria_thread() {
     DORIA_THREAD.store(current_thread(), Ordering::Relaxed);
 }
 
-/// Enters a C-ABI Doria function from C. Panics with P1706, reported at
+/// Enters a C-callable Doria function from C. Panics with P1706, reported at
 /// `entry`, when the calling thread is not the thread running Doria code.
 /// Otherwise returns the parent frame of the function's own frame: `marker`,
 /// filled as the `[foreign call]` frame of the outbound call in progress, or

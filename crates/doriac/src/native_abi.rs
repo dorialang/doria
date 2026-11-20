@@ -215,7 +215,7 @@ pub const CAPTURE_SYSTEM_CODE: &str = "dr_v1_capture_system_code";
 pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
 /// Decision 0148 section 13: the runtime's record of the Doria frame of the
 /// outbound foreign call in progress, which generated code stores before
-/// and after every foreign call; the entry of a C-ABI function, which checks
+/// and after every foreign call; the entry of a C-callable function, which checks
 /// the thread and links the function's frame to that record; and the
 /// recording of the thread running Doria code at process entry.
 pub const FOREIGN_CALL_FRAME: &str = "dr_v1_foreign_call_frame";
@@ -768,7 +768,7 @@ pub fn function_symbol(function: &mir::Function) -> String {
     format!("__doria_fn_{}_{}", function.id.0, sanitized)
 }
 
-/// The C size, equal to its alignment, of a scalar a raw pointer reads and
+/// The C size, equal to its alignment, of a scalar a pointer reads and
 /// writes (Decision 0148 section 4); `None` for a scalar without a C layout.
 /// The size and alignment of a value a pointer reads or writes (Decision
 /// 0148 section 4): a scalar with a C layout, whose alignment is its size,

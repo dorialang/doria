@@ -213,7 +213,7 @@ fn every_stage40_form_parses_without_a_parser_error() {
             Item::Function(function) if function.linkage.is_c_abi() => Some(function),
             _ => None,
         })
-        .expect("C-ABI function");
+        .expect("C-callable function");
     assert_eq!(callback.name, "windowProcedure");
     assert!(matches!(callback.body, FunctionBody::Block(_)));
 

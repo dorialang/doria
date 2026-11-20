@@ -1,9 +1,9 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-ABI Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
-- **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
+- **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
 
 ## Approval And Boundary
 
@@ -87,9 +87,9 @@ Section 9 said how `CString` and `Utf16String` are made and read but not
 whether they are Copy or Move values. Andrew ruled on 2026-11-20: "Move
 value owning its buffer (Recommended)". Section 9 states the rule.
 
-### Amendment: Checked Errors In C-ABI Functions (2026-11-20)
+### Amendment: Checked Errors In C-Callable Functions (2026-11-20)
 
-Section 12 said a checked error must be handled inside a C-ABI function's
+Section 12 said a checked error must be handled inside a C-callable function's
 body but not whether that includes Decision 0123's automatic I/O errors,
 which need no declaration elsewhere. Andrew ruled on 2026-11-20: "Checking
 error: catch it inside the body (Recommended)". Section 12 states the rule.
@@ -139,6 +139,17 @@ ruled on three naming cards: "`Pointer<T>` and `WritablePointer<T>`
 - `ByteRegion::fromPointer`, `WritableByteRegion::fromPointer`,
   `ArrayRegion::fromPointer` and `WritableArrayRegion::fromPointer` replace
   `fromRaw` (section 10).
+- The same day Andrew ruled on three more cards: "`Architecture::X64` and
+  `Architecture::Arm64` (Recommended)", "Keep `Errno`, whitelisted in the
+  charter (Recommended)" and ""C-callable function" (Recommended)".
+  `Architecture::X8664` is `Architecture::X64` and `Architecture::Aarch64`
+  is `Architecture::Arm64` (section 17). `SystemCodeSource::Errno` stays,
+  and `errno` joins the naming charter's industry-universal lexemes beside
+  `printf` (plan §9.1). A Doria function declared `extern "C" function`
+  with a body is a C-callable function in prose and diagnostics, which
+  called it a C-ABI function.
+- The section 4 examples write `$writablePointer->write(...)`, and prose
+  says handles and pointers where it said raw handles and raw pointers.
 - The earlier spellings are not kept as aliases.
 - A closed class's handle is its object pointer, and an open class's handle
   points to a heap box holding the object and its descriptor. Section 11
@@ -336,8 +347,8 @@ Consequence: the checker proves which pointers may be null at compile time, and
 | --- | --- | --- |
 | Aligned read | `$pointer->read(): T` | unsafe |
 | Unaligned read | `$pointer->readUnaligned(): T` | unsafe |
-| Aligned write | `$mutable->write(T $value): void` | unsafe |
-| Unaligned write | `$mutable->writeUnaligned(T $value): void` | unsafe |
+| Aligned write | `$writablePointer->write(T $value): void` | unsafe |
+| Unaligned write | `$writablePointer->writeUnaligned(T $value): void` | unsafe |
 | Element offset | `$pointer->offset(int $count)` scaled by `T`'s size | unsafe |
 | Byte offset | `$pointer->byteOffset(int $bytes)` | unsafe |
 | Cast | `Pointer::cast($pointer)`, `WritablePointer::cast($pointer)`, target from the expected type | unsafe |
@@ -567,7 +578,7 @@ class DecodedImage
 Consequence: every release protocol is stated by its owner class, and the
 region works with every region-taking API, including the Decision 0110 streams.
 
-### 11. Raw handles
+### 11. Handles
 
 - Owned class values: `Handle::create(take T $value): WritablePointer<Opaque>`;
   `Handle::reclaim(WritablePointer<Opaque> $handle): T` (unsafe) reclaims
@@ -588,7 +599,7 @@ region works with every region-taking API, including the Decision 0110 streams.
   its class descriptor: `Handle::reclaim` frees the box and returns the value
   with its exact dynamic type, and `Handle::borrow` reads through the box
   (amendment of 2026-11-20).
-- Raw handles are not Stage 41 bridge handles, and no conversion exists between
+- Handles are not Stage 41 bridge handles, and no conversion exists between
   them.
 
 Consequence: a callback re-entered while it runs (Win32 `SendMessage` inside a
@@ -605,7 +616,7 @@ extern "C" function windowProcedure(Pointer<Opaque> $window, uint32 $message,
 }
 ```
 
-- A C-ABI Doria function is a namespace-level free function declared
+- A C-callable Doria function is a namespace-level free function declared
   `extern "C" function` with a body. It has no captures, type parameters or
   `throws`, and its signature is FFI-safe. Its body is an ordinary context.
 - Its name in expression position is a value of the structural type
@@ -621,7 +632,7 @@ extern "C" function windowProcedure(Pointer<Opaque> $window, uint32 $message,
   can raise). A body that can let one escape is a checking error reported at
   the function, whose fix wraps the work in `try` with a `catch` for each
   error (amendment of 2026-11-20). A panic aborts.
-- Stage 40 exports no symbol for a C-ABI function; C reaches it only through its
+- Stage 40 exports no symbol for a C-callable function; C reaches it only through its
   address. Stage 41 reuses the same C entry machinery for exports.
 - Closures do not convert to C function pointers. State travels through a
   context pointer and section 11's handles.
@@ -715,7 +726,7 @@ if (Platform::operatingSystem == OperatingSystem::Windows) {
 ```
 
 - `Platform::operatingSystem` (`OperatingSystem::Linux`, `MacOs`, `Windows`) and
-  `Platform::architecture` (`Architecture::X8664`, `Aarch64`) are compile-time
+  `Platform::architecture` (`Architecture::X64`, `Arm64`) are compile-time
   constants of the compilation target.
 - Every branch is parsed and type-checked on every host. A branch whose
   condition is constant false for the target is neither emitted nor linked.
@@ -874,7 +885,7 @@ checked error.
 | `Bytes`, `T[]` of Copy edge kinds, byte and array regions over host storage | Readonly: copied into a native buffer for the region. Writable: copied in, and copied back at every region exit |
 | Regions over foreign memory (section 10) | Address and length, no copy |
 | `CString`, `Utf16String` | Content re-materialized natively per region |
-| Raw handles | Host handle tokens, by value |
+| Handles | Host handle tokens, by value |
 | Every other value (class instances, interfaces, other collections, closures, `mixed`, shared references, nullable move values) | Stays on the host; the companion holds an opaque host token |
 
 The borrow rules of section 7 make the copies unobservable: a pinned place
@@ -888,9 +899,9 @@ a static property access, and a Doria I/O or runtime intrinsic each run on the
 host through a reverse edge: `host->call(host, operationId, arguments, results)`,
 returning the same status set. Arguments and results cross by the table above.
 
-**Callbacks.** The companion contains the C entry for each C-ABI Doria function.
+**Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
-reverse edge; the body runs on the host. C-ABI signatures are FFI-safe, so every
+reverse edge; the body runs on the host. C-callable signatures are FFI-safe, so every
 argument crosses by value.
 
 **Ownership and destruction.** Host-owned values are created, moved and
@@ -900,7 +911,7 @@ companion in reverse order at region exit. Writable places are written back
 before the host resumes, on every exit status. A value moved into a host
 operation transfers its token.
 
-**Raw handles in hosted mode.** `Handle::create`, `Handle::reclaim`,
+**Handles in hosted mode.** `Handle::create`, `Handle::reclaim`,
 `Handle::borrow`, `toHandle` and the shared references' `reclaim` and
 `borrow` are host operations; the handle is a nonzero address-sized token
 from a host handle table. C treats it as opaque, as section 11 requires.
@@ -984,13 +995,13 @@ behavior inside a region is defined by the native code it calls.
   key; a key appears at most once; an unknown key or value is a compile error.
 - `declare(unsafe: "deny");` or `declare(unsafe: "allow");` sets the file
   policy; the default is `"allow"`. Under `"deny"` the file may contain no unsafe
-  context, `unsafe function`, extern block, foreign aggregate or C-ABI function.
+  context, `unsafe function`, extern block, foreign aggregate or C-callable function.
   Calling a safe wrapper defined elsewhere stays allowed.
 - `unsafe = "deny"` in a package's `Baton.toml` applies `"deny"` to every source
   of that package; a file directive may not relax it. The policy travels to
   `doriac` in the build plan per package. Dependencies keep their own policy.
 - `baton audit unsafe` lists every unsafe context, `unsafe function`, extern
-  declaration, foreign aggregate and C-ABI function across the dependency tree
+  declaration, foreign aggregate and C-callable function across the dependency tree
   with package, file and line. `doriac` produces that inventory as compiler
   metadata; Baton does not parse Doria.
 
@@ -1012,7 +1023,7 @@ is part of the declaration's unchecked contract.
   sites.
 - The diagnostics, each with a catalogue entry (Decision 0145): unsafe operation
   outside an unsafe context; non-FFI-safe type in an extern signature or foreign
-  aggregate, naming the type to use; `throws` on a C-ABI function; conflicting
+  aggregate, naming the type to use; `throws` on a C-callable function; conflicting
   declarations of one symbol; a logical library with no link input; a missing
   Safety section (warning); `declare(unsafe: "deny")` and package policy
   violations; an unused unsafe context (warning); a missing or mismatched
@@ -1081,8 +1092,8 @@ has one precise contract.
    library.
 4. **Platform-dependent layout.** The `z_stream` fixture passes with 32-bit
    `uLong` on Windows and 64-bit `uLong` elsewhere from one source.
-5. **Callbacks.** zlib's `zalloc` / `zfree` are C-ABI Doria functions reaching a
-   Doria allocation counter through `opaque` and a raw handle; every allocation
+5. **Callbacks.** zlib's `zalloc` / `zfree` are C-callable Doria functions reaching a
+   Doria allocation counter through `opaque` and a handle; every allocation
    is released once, including under the interpreter and PHP output through
    reverse edges.
 6. **Foreign-owned memory.** An RAII owner exposes a foreign-backed region,
@@ -1133,7 +1144,7 @@ has one precise contract.
   `objc_msgSend` bindings.
 - Generating declarations from C headers.
 - Foreign data symbols.
-- Exported symbols for C-ABI functions, and a public native library format; the
+- Exported symbols for C-callable functions, and a public native library format; the
   companion's shared-library kind is internal and Stage 41 builds on it.
 - A standard dynamic-loading API.
 - Inline assembly, volatile access and atomics.
@@ -1189,7 +1200,7 @@ foreign call in hooks (26); no documentation enforcement, a required
 - The parity manifest's fixtures require zlib on every test host.
 - `--target php` and `--target debug` need the native toolchain for programs
   with unsafe code.
-- Raw pointers are neither `Sendable` nor `Shareable` until Stage 39 decides.
+- Pointers are neither `Sendable` nor `Shareable` until Stage 39 decides.
 
 ## Invalidated Elsewhere
 

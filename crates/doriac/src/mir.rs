@@ -101,7 +101,7 @@ pub struct Program {
     pub closure_descriptors: Vec<ClosureDescriptor>,
     pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
     pub foreign_aggregates: Vec<ForeignAggregateDefinition>,
-    /// The C-ABI Doria functions (Decision 0148 section 12). Each has a C
+    /// The C-callable Doria functions (Decision 0148 section 12). Each has a C
     /// entry under the target's C convention, which checks the calling
     /// thread, links the Call Path to the outbound foreign call in
     /// progress (section 13) and calls the function as Doria code does.
@@ -6295,7 +6295,7 @@ pub enum Statement {
         function_type: FunctionTypeId,
         nullable: bool,
     },
-    /// One raw pointer operation (Decision 0148 section 4), assigning its
+    /// One pointer operation (Decision 0148 section 4), assigning its
     /// result, if it has one, to `target`. `span` is the operation's
     /// source, where a misaligned access (P1702) or an address that
     /// leaves the address space (P1703) panics.
@@ -6485,7 +6485,7 @@ pub enum PointerOperation {
         pointer: LocalId,
         encoding: crate::foreign::ForeignStringEncoding,
     },
-    /// The name of a C-ABI Doria function as a value (section 12): the
+    /// The name of a C-callable Doria function as a value (section 12): the
     /// address of the C entry of `function`, one of `Program::c_entries`,
     /// as a C function pointer.
     CEntryAddress { function: FunctionId },

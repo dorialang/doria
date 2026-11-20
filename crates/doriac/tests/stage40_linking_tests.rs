@@ -143,7 +143,7 @@ fn a_library_without_link_inputs_names_the_manifest_entry_and_the_flag() {
 fn target(operating_system: TargetOperatingSystem) -> CTarget {
     CTarget {
         operating_system,
-        architecture: TargetArchitecture::X8664,
+        architecture: TargetArchitecture::X64,
     }
 }
 

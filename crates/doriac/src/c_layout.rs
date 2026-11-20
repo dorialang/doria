@@ -23,8 +23,8 @@ pub enum TargetOperatingSystem {
 /// The architectures of the tier-1 targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetArchitecture {
-    X8664,
-    Aarch64,
+    X64,
+    Arm64,
 }
 
 /// The C calling convention `extern "C"` means on a target (section 14).
@@ -59,9 +59,9 @@ impl CTarget {
             TargetOperatingSystem::Linux
         };
         let architecture = if cfg!(target_arch = "aarch64") {
-            TargetArchitecture::Aarch64
+            TargetArchitecture::Arm64
         } else {
-            TargetArchitecture::X8664
+            TargetArchitecture::X64
         };
         Self {
             operating_system,
@@ -72,11 +72,11 @@ impl CTarget {
     pub const fn calling_convention(self) -> CCallingConvention {
         match (self.operating_system, self.architecture) {
             (TargetOperatingSystem::Windows, _) => CCallingConvention::Windows64,
-            (_, TargetArchitecture::X8664) => CCallingConvention::SystemV,
-            (TargetOperatingSystem::MacOs, TargetArchitecture::Aarch64) => {
+            (_, TargetArchitecture::X64) => CCallingConvention::SystemV,
+            (TargetOperatingSystem::MacOs, TargetArchitecture::Arm64) => {
                 CCallingConvention::AppleArm64
             }
-            (TargetOperatingSystem::Linux, TargetArchitecture::Aarch64) => {
+            (TargetOperatingSystem::Linux, TargetArchitecture::Arm64) => {
                 CCallingConvention::Aapcs64
             }
         }
@@ -97,7 +97,7 @@ impl CTarget {
         let windows = matches!(self.operating_system, TargetOperatingSystem::Windows);
         let linux_aarch64 = matches!(
             (self.operating_system, self.architecture),
-            (TargetOperatingSystem::Linux, TargetArchitecture::Aarch64)
+            (TargetOperatingSystem::Linux, TargetArchitecture::Arm64)
         );
         match boundary {
             CBoundaryType::Char => CScalar::Integer {
@@ -334,11 +334,11 @@ mod tests {
         }
     }
 
-    const LINUX_X86: CTarget = target(TargetOperatingSystem::Linux, TargetArchitecture::X8664);
-    const LINUX_ARM: CTarget = target(TargetOperatingSystem::Linux, TargetArchitecture::Aarch64);
-    const MAC_ARM: CTarget = target(TargetOperatingSystem::MacOs, TargetArchitecture::Aarch64);
-    const MAC_X86: CTarget = target(TargetOperatingSystem::MacOs, TargetArchitecture::X8664);
-    const WINDOWS: CTarget = target(TargetOperatingSystem::Windows, TargetArchitecture::X8664);
+    const LINUX_X86: CTarget = target(TargetOperatingSystem::Linux, TargetArchitecture::X64);
+    const LINUX_ARM: CTarget = target(TargetOperatingSystem::Linux, TargetArchitecture::Arm64);
+    const MAC_ARM: CTarget = target(TargetOperatingSystem::MacOs, TargetArchitecture::Arm64);
+    const MAC_X86: CTarget = target(TargetOperatingSystem::MacOs, TargetArchitecture::X64);
+    const WINDOWS: CTarget = target(TargetOperatingSystem::Windows, TargetArchitecture::X64);
 
     fn int(bytes: u8, signed: bool) -> CType {
         CType::Scalar(CScalar::Integer { bytes, signed })

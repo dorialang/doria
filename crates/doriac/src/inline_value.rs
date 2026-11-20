@@ -148,7 +148,7 @@ pub enum InlineValueType {
     StandardOutput(ClassId),
     StandardError(ClassId),
     Terminal(TerminalValue, ClassId),
-    /// A raw pointer, `Pointer<T>`, `WritablePointer<T>` or a C function pointer
+    /// A pointer, `Pointer<T>`, `WritablePointer<T>` or a C function pointer
     /// (Decision 0148 sections 3 and 12): one address word. Its pointee,
     /// access and C signature are checking facts MIR does not carry.
     Pointer,

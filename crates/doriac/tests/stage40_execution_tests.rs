@@ -267,7 +267,7 @@ function main(): void
 fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [
         "?Pointer<int32> $pointer = Pointer::fromAddress(4098); if ($pointer != null) { echo $pointer->read(); }",
-        "?Pointer<float64> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<float64> $mutable = WritablePointer::cast($pointer); $mutable->write(1.5); }",
+        "?Pointer<float64> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<float64> $writablePointer = WritablePointer::cast($pointer); $writablePointer->write(1.5); }",
     ] {
         let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
         assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
@@ -774,7 +774,7 @@ function main(): void
 fn an_aligned_aggregate_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [
         "?Pointer<Sample> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { Sample $sample = $pointer->read(); echo $sample->tag; }",
-        "?Pointer<Sample> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<Sample> $mutable = WritablePointer::cast($pointer); $mutable->write(new Sample(tag: 1, value: 2, extra: 3)); }",
+        "?Pointer<Sample> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<Sample> $writablePointer = WritablePointer::cast($pointer); $writablePointer->write(new Sample(tag: 1, value: 2, extra: 3)); }",
     ] {
         let source = format!("{POINTER}{AGGREGATES}function main(): void {{ unsafe {{ {body} }} }}");
         assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
@@ -1682,7 +1682,7 @@ extern \"C\"
 
 #[test]
 fn c_calls_a_c_abi_function_through_its_name_as_a_value() {
-    // Decision 0148 section 12: the name of a C-ABI function is the
+    // Decision 0148 section 12: the name of a C-callable function is the
     // address of its C entry, which C calls under the C convention.
     let source = format!(
         "{SORTING}
@@ -1704,7 +1704,7 @@ function main(): void
 
 #[test]
 fn a_c_abi_function_that_catches_its_io_errors_runs_as_a_qsort_callback() {
-    // Decision 0148 section 12 (amendment of 2026-11-20): a C-ABI function
+    // Decision 0148 section 12 (amendment of 2026-11-20): a C-callable function
     // whose `echo` sits inside `try` with a `catch` for its I/O error lets
     // no checked error reach C, so its C entry uses the ordinary call.
     let source = "use Doria\\Std\\Ffi\\{CSize, Opaque, Pointer, WritablePointer};
@@ -1942,7 +1942,7 @@ function main(): void
 #[cfg(unix)]
 #[test]
 fn a_callback_on_another_thread_panics_with_p1706() {
-    // Decision 0148 section 13: C may call a C-ABI function only on the
+    // Decision 0148 section 13: C may call a C-callable function only on the
     // thread running Doria code.
     let source = "use Doria\\Std\\Ffi\\{Opaque, Pointer, WritablePointer};
 

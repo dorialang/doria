@@ -334,10 +334,10 @@ pub struct SemanticInfo {
     /// The binding of each extern declaration, keyed by its declaration span
     /// (Decision 0148 sections 14 to 18).
     pub foreign_bindings: HashMap<Span, crate::foreign::ForeignBinding>,
-    /// The canonical names of the C-ABI Doria functions (Decision 0148
+    /// The canonical names of the C-callable Doria functions (Decision 0148
     /// section 12).
     pub c_abi_functions: HashSet<String>,
-    /// Each name of a C-ABI function used as a value, the address of its C
+    /// Each name of a C-callable function used as a value, the address of its C
     /// entry, by span, with the function's canonical name (section 12).
     pub c_abi_function_values: HashMap<Span, String>,
     /// Every foreign struct and union by canonical name (Decision 0148
@@ -9385,7 +9385,7 @@ impl<'program> Checker<'program> {
         declared: &[TypeId],
         observed: &CheckedEffectSet,
     ) {
-        // Authored reach: a destructor or a C-ABI function must catch whatever
+        // Authored reach: a destructor or a C-callable function must catch whatever
         // its own body may raise, not only what the closures and members it
         // currently reaches happen to raise. Neither lets any checked Error
         // escape, automatic I/O included (Decision 0148 section 12, amendment
@@ -13799,7 +13799,7 @@ impl<'program> Checker<'program> {
             Expr::When(_) => self.check_when_expression(expr, scopes, method_context),
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
-                // A C-ABI function's name is the address of its C entry
+                // A C-callable function's name is the address of its C entry
                 // (Decision 0148 section 12).
                 if self.foreign.c_abi_functions.contains(name) {
                     self.foreign

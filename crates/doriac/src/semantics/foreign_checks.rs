@@ -48,9 +48,9 @@ pub(super) struct ForeignState {
     unsafe_callables: HashSet<Span>,
     /// The binding of each extern declaration, by declaration span.
     pub(super) bindings: HashMap<Span, ForeignBinding>,
-    /// The canonical names of the C-ABI Doria functions (section 12).
+    /// The canonical names of the C-callable Doria functions (section 12).
     pub(super) c_abi_functions: HashSet<String>,
-    /// Each name of a C-ABI function used as a value, by its span, with the
+    /// Each name of a C-callable function used as a value, by its span, with the
     /// function's canonical name (section 12).
     pub(super) c_abi_function_values: HashMap<Span, String>,
 }
@@ -533,10 +533,10 @@ impl<'program> Checker<'program> {
                 self.types.display(*element)
             ),
             TypeKind::Class(_) | TypeKind::Interface(_) | TypeKind::SharedHandle(..) => {
-                "pass a raw handle, `WritablePointer<Opaque>` from `Handle::create`".to_string()
+                "pass a handle, `WritablePointer<Opaque>` from `Handle::create`".to_string()
             }
             TypeKind::Function(_) => {
-                "pass a C-ABI function, typed `extern \"C\" function(...)`".to_string()
+                "pass a C-callable function, typed `extern \"C\" function(...)`".to_string()
             }
             TypeKind::Enum(_) => "pass the enum's backing integer".to_string(),
             TypeKind::Nullable(_) => {
@@ -549,7 +549,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    /// Extern declarations and C-ABI functions: their signatures, symbols
+    /// Extern declarations and C-callable functions: their signatures, symbols
     /// and Safety sections. Runs after attributes are bound.
     pub(super) fn check_foreign_declarations(&mut self) {
         let program = self.program;
@@ -621,15 +621,15 @@ impl<'program> Checker<'program> {
                 }
                 FunctionLinkage::CAbi { abi, .. } => {
                     self.check_foreign_abi(&abi.value, abi.span);
-                    self.check_foreign_signature(function, "a C-ABI function");
+                    self.check_foreign_signature(function, "a C-callable function");
                     if let Some(span) = function.unsafe_span {
                         self.diagnostics.push(
                             Diagnostic::new(
                                 FOREIGN_SIGNATURE_CODE,
-                                "a C-ABI function is called by C through its address; Doria code does not call it, so it takes no `unsafe` modifier",
+                                "a C-callable function is called by C through its address; Doria code does not call it, so it takes no `unsafe` modifier",
                                 span,
                             )
-                            .with_title("C-ABI Function Cannot Be Unsafe"),
+                            .with_title("C-Callable Function Cannot Be Unsafe"),
                         );
                     }
                 }
@@ -775,7 +775,7 @@ impl<'program> Checker<'program> {
         );
     }
 
-    /// Shape rules shared by extern declarations and C-ABI functions.
+    /// Shape rules shared by extern declarations and C-callable functions.
     fn check_foreign_signature(&mut self, function: &FunctionDecl, what: &str) {
         if let Some(parameters) = &function.syntax.type_parameters {
             self.diagnostics.push(
@@ -832,7 +832,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    /// E0631 for a C-ABI function whose body can let the checked errors
+    /// E0631 for a C-callable function whose body can let the checked errors
     /// `uncovered` escape, automatic I/O errors included (Decision 0148
     /// section 12, amendment of 2026-11-20). C receives only the return
     /// value, so the fix wraps the body in `try` with one `catch` per error.
@@ -860,7 +860,7 @@ impl<'program> Checker<'program> {
             format!("checked errors {listed} can leave `extern \"C\" function {short}`"),
             function.span,
         )
-        .with_title("C-ABI Functions Must Handle Every Checked Error")
+        .with_title("C-Callable Functions Must Handle Every Checked Error")
         .with_explanation(
             "C calls this function and receives only its return value, so no checked error may leave the body, including the I/O errors of `echo` and other built-in operations.",
         )

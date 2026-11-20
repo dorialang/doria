@@ -1,5 +1,5 @@
 //! Stage 40 checking (Decision 0148): unsafe contexts, foreign declarations,
-//! C-ABI functions, C function pointer types and their diagnostics.
+//! C-callable functions, C function pointer types and their diagnostics.
 
 use doriac::diagnostics::{Diagnostic, DiagnosticSeverity, FixApplicability};
 
@@ -1275,7 +1275,7 @@ extern \"C\" function visit(Pointer<Opaque> $item, int32 $depth): bool
 #[test]
 fn a_c_abi_function_that_can_let_an_io_error_escape_is_a_checking_error() {
     // Decision 0148 section 12 (amendment of 2026-11-20): no checked error
-    // leaves a C-ABI function, the automatic I/O errors of Decision 0123
+    // leaves a C-callable function, the automatic I/O errors of Decision 0123
     // included, and the fix wraps the work in `try`.
     let source = "use Doria\\Std\\Ffi\\{Opaque, Pointer};
 extern \"C\" function report(Pointer<Opaque> $item): void
@@ -1287,7 +1287,7 @@ function main(): void {}
     let diagnostic = only(source, "E0631");
     assert_eq!(
         diagnostic.title,
-        "C-ABI Functions Must Handle Every Checked Error"
+        "C-Callable Functions Must Handle Every Checked Error"
     );
     assert!(
         diagnostic
@@ -1314,7 +1314,7 @@ function main(): void {}
     );
     assert!(codes(&fixed).is_empty(), "{:#?}", findings(&fixed));
 
-    // A helper's automatic I/O reaches the C-ABI function that calls it.
+    // A helper's automatic I/O reaches the C-callable function that calls it.
     // The fix for a body that returns a value is guidance: each `catch`
     // needs a `return` only the author can choose.
     let through_helper = "use Doria\\Std\\Ffi\\{Opaque, Pointer};

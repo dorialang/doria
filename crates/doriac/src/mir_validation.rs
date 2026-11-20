@@ -1375,7 +1375,7 @@ fn validate_class(
                 crate::compiler_known_term::SOURCE_ID
             }
             crate::inline_value::InlineValueType::Pointer => {
-                return Err(malformed_mir("a raw pointer is not a class"));
+                return Err(malformed_mir("a pointer is not a class"));
             }
         };
         if class.source_span.source != source
@@ -6629,7 +6629,7 @@ fn validate_pointer_operation(
         mir::PointerOperation::CEntryAddress { function } => {
             if !program.c_entries.contains(function) {
                 return Err(malformed_mir(
-                    "a C entry address names a C-ABI function of the program",
+                    "a C entry address names a C-callable function of the program",
                 ));
             }
             Some(pointer)

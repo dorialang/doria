@@ -22633,7 +22633,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
-    /// One raw pointer operation (Decision 0148 section 4). Memory is
+    /// One pointer operation (Decision 0148 section 4). Memory is
     /// accessed with the pointee's size; an aligned access tests the
     /// address first and then states the alignment it proved.
     fn lower_pointer_operation(

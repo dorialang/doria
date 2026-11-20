@@ -1,4 +1,4 @@
-//! Source contracts for raw pointers and C boundary values (Decision 0148
+//! Source contracts for pointers and C boundary values (Decision 0148
 //! sections 4, 5 and 7).
 //!
 //! The table names every member of `Pointer<T>`, `WritablePointer<T>` and the C boundary
@@ -15,7 +15,7 @@ use crate::foreign::{CBoundaryType, PointerAccess};
 pub enum PointerOperation {
     /// `$pointer->read(): T` (aligned) and `readUnaligned(): T`.
     Read { aligned: bool },
-    /// `$mutable->write(T $value): void` (aligned) and `writeUnaligned`.
+    /// `$writablePointer->write(T $value): void` (aligned) and `writeUnaligned`.
     Write { aligned: bool },
     /// `$pointer->offset(int $count)`, scaled by the pointee's size.
     Offset,

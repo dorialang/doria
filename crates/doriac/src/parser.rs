@@ -1981,7 +1981,7 @@ impl Parser {
                     )
                     .with_title("Extern Declaration Has A Body")
                     .with_help(
-                        "end the declaration with `;`, or write a C-ABI Doria function as `extern \"C\" function` outside the block",
+                        "end the declaration with `;`, or write a C-callable Doria function as `extern \"C\" function` outside the block",
                     ),
                 );
                 let _ = self.parse_callable_body();

@@ -2583,7 +2583,7 @@ fn lower_program_impl(
         foreign_aggregates,
         ..
     } = collection_registry;
-    // Each C-ABI Doria function has a C entry (Decision 0148 sections 12
+    // Each C-callable Doria function has a C entry (Decision 0148 sections 12
     // and 13), in function order. Checking has proved that no checked error
     // leaves its body (E0631), so it uses the ordinary call, which MIR
     // validation confirms.

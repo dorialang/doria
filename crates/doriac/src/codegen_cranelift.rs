@@ -21096,7 +21096,7 @@ fn lower_integer_binary(
     }
 }
 
-/// One raw pointer operation (Decision 0148 section 4). Memory is accessed
+/// One pointer operation (Decision 0148 section 4). Memory is accessed
 /// with the pointee's size; an aligned access tests the address first.
 fn lower_pointer_operation(
     builder: &mut FunctionBuilder,

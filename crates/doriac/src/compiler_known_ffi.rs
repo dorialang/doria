@@ -61,8 +61,8 @@ enum OperatingSystem {
     case Windows;
 }
 enum Architecture {
-    case X8664;
-    case Aarch64;
+    case X64;
+    case Arm64;
 }
 enum SystemCodeSource {
     case Errno;

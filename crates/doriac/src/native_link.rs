@@ -661,7 +661,7 @@ mod tests {
     fn target(operating_system: TargetOperatingSystem) -> CTarget {
         CTarget {
             operating_system,
-            architecture: crate::c_layout::TargetArchitecture::X8664,
+            architecture: crate::c_layout::TargetArchitecture::X64,
         }
     }
 

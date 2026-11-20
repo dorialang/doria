@@ -1,6 +1,6 @@
 //! Grammar for unsafe code and the foreign function interface (Decision
 //! 0148): `declare` directives, documentation comments, `unsafe` contexts and
-//! functions, `extern "C"` blocks, C-ABI functions, foreign structs and
+//! functions, `extern "C"` blocks, C-callable functions, foreign structs and
 //! unions, and C function pointer types.
 
 use super::{FunctionModifiers, Parser};
@@ -247,7 +247,7 @@ impl Parser {
     }
 
     /// Everything after `extern` at namespace level: a block of foreign
-    /// declarations, a C-ABI function, or a foreign struct or union.
+    /// declarations, a C-callable function, or a foreign struct or union.
     pub(super) fn parse_extern_items(
         &mut self,
         access: MemberAccess,
@@ -316,7 +316,7 @@ impl Parser {
         self.diagnostics.push(
             Diagnostic::new(
                 "P0001",
-                "`extern \"C\"` is followed by `{` and declarations, by `function` and a C-ABI function, or by `struct` or `union`",
+                "`extern \"C\"` is followed by `{` and declarations, by `function` and a C-callable function, or by `struct` or `union`",
                 self.peek().span,
             )
             .with_title("Extern Declaration Is Incomplete"),

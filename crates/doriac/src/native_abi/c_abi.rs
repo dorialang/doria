@@ -835,19 +835,19 @@ mod tests {
 
     const LINUX_X86: CTarget = CTarget {
         operating_system: TargetOperatingSystem::Linux,
-        architecture: TargetArchitecture::X8664,
+        architecture: TargetArchitecture::X64,
     };
     const LINUX_ARM: CTarget = CTarget {
         operating_system: TargetOperatingSystem::Linux,
-        architecture: TargetArchitecture::Aarch64,
+        architecture: TargetArchitecture::Arm64,
     };
     const MAC_ARM: CTarget = CTarget {
         operating_system: TargetOperatingSystem::MacOs,
-        architecture: TargetArchitecture::Aarch64,
+        architecture: TargetArchitecture::Arm64,
     };
     const WINDOWS: CTarget = CTarget {
         operating_system: TargetOperatingSystem::Windows,
-        architecture: TargetArchitecture::X8664,
+        architecture: TargetArchitecture::X64,
     };
 
     const INT32: CType = CType::Scalar(CScalar::Integer {

@@ -1,4 +1,4 @@
-//! C entries of C-ABI Doria functions (Decision 0148 sections 12 and 13).
+//! C entries of C-callable Doria functions (Decision 0148 sections 12 and 13).
 //!
 //! Each C entry has the function's C signature under the target's C
 //! convention, the inverse of an outbound foreign call: it receives every
@@ -112,7 +112,7 @@ pub(super) fn c_signature(module: &ObjectModule, physical: &PhysicalSignature) -
     signature
 }
 
-/// Declares the C entry of every C-ABI function of `program`.
+/// Declares the C entry of every C-callable function of `program`.
 pub(super) fn declare(
     module: &mut ObjectModule,
     program: &mir::Program,
