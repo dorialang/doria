@@ -165,6 +165,33 @@ pub const APPEND_FILE: &str = "dr_v2_append_file";
 pub const BYTES_COPY: &str = "dr_v1_bytes_copy";
 pub const BYTES_ALLOCATE: &str = "dr_v2_bytes_allocate";
 pub const BYTES_FREE: &str = "dr_v1_bytes_free";
+/// Releases a `CString` or `Utf16String` buffer (Decision 0148 section 9).
+pub const FOREIGN_STRING_FREE: &str = "dr_v1_foreign_string_free";
+
+/// The runtime function that builds an owned foreign string from a string:
+/// `(frame, string) -> buffer`, null from a `tryFrom` form for text with NUL.
+pub const fn foreign_string_constructor(
+    encoding: crate::foreign::ForeignStringEncoding,
+    fallible: bool,
+) -> &'static str {
+    match (encoding, fallible) {
+        (crate::foreign::ForeignStringEncoding::Utf8, false) => "dr_v2_c_string_from",
+        (crate::foreign::ForeignStringEncoding::Utf8, true) => "dr_v2_c_string_try_from",
+        (crate::foreign::ForeignStringEncoding::Utf16, false) => "dr_v2_utf16_string_from",
+        (crate::foreign::ForeignStringEncoding::Utf16, true) => "dr_v2_utf16_string_try_from",
+    }
+}
+
+/// The runtime function behind `String::fromCString` or
+/// `String::fromUtf16`: `(frame, pointer) -> ?string`.
+pub const fn foreign_string_reader(
+    encoding: crate::foreign::ForeignStringEncoding,
+) -> &'static str {
+    match encoding {
+        crate::foreign::ForeignStringEncoding::Utf8 => "dr_v2_string_from_c_string",
+        crate::foreign::ForeignStringEncoding::Utf16 => "dr_v2_string_from_utf16",
+    }
+}
 pub const BYTES_LENGTH: &str = "dr_v1_bytes_length";
 pub const BYTES_DATA: &str = "dr_v1_bytes_data";
 pub const BYTES_GET: &str = "dr_v2_bytes_get";
@@ -303,6 +330,9 @@ pub const fn assertion_collection_kind(kind: mir::CollectionKind) -> i64 {
         mir::CollectionKind::SortedSet => 6,
         mir::CollectionKind::PriorityQueue => 7,
         mir::CollectionKind::Deque => 8,
+        // Checking gives owned foreign strings no assertion presentation,
+        // and validation rejects one.
+        mir::CollectionKind::ForeignString(_) => 9,
     }
 }
 

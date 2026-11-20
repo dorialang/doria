@@ -23,9 +23,11 @@ pub const NON_BLOCKING: &str = "Doria\\Std\\Ffi\\NonBlocking";
 pub const PLATFORM: &str = "Doria\\Std\\Ffi\\Platform";
 pub const FOREIGN_CALL: &str = "Doria\\Std\\Ffi\\ForeignCall";
 pub const HANDLE: &str = "Doria\\Std\\Ffi\\Handle";
+/// The owned foreign strings, which the type model carries
+/// ([`crate::foreign::ForeignStringEncoding`]).
 pub const C_STRING: &str = "Doria\\Std\\Ffi\\CString";
 pub const UTF16_STRING: &str = "Doria\\Std\\Ffi\\Utf16String";
-pub const PENDING_TYPES: [&str; 4] = [PLATFORM, HANDLE, C_STRING, UTF16_STRING];
+pub const PENDING_TYPES: [&str; 2] = [PLATFORM, HANDLE];
 
 /// Members of `Doria\Std\Ffi` that checking models directly: the
 /// `ForeignCall::lastSystemCode` static (section 16).

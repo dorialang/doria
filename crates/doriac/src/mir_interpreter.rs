@@ -965,6 +965,12 @@ enum EvaluationTask {
     WriteFile,
     AppendFile,
     ReadFileBytes(mir::CollectionTypeId, Span),
+    /// `CString::from` (`span`, panicking on NUL) or `tryFrom` (`None`,
+    /// absent on NUL) over the string on the value stack.
+    ForeignString {
+        collection: mir::CollectionTypeId,
+        span: Option<Span>,
+    },
     AllocateBytes(mir::CollectionTypeId, Span),
     WriteFileBytes {
         contents: mir::LocalId,
@@ -6648,6 +6654,61 @@ impl<'a> Interpreter<'a> {
                         collection, entries,
                     )));
             }
+            EvaluationTask::ForeignString { collection, span } => {
+                let text = self.pop_string()?;
+                let definition = self
+                    .program
+                    .collection_types
+                    .get(collection.0)
+                    .ok_or_else(|| InterpreterError::new("foreign string type does not exist"))?;
+                let mir::CollectionKind::ForeignString(encoding) = definition.kind else {
+                    return Err(InterpreterError::new(
+                        "MIR foreign string construction builds another collection",
+                    ));
+                };
+                let value = if text.as_bytes().contains(&0) {
+                    match span {
+                        Some(span) => {
+                            return self.runtime_panic_step_at(
+                                crate::foreign::INTERIOR_NUL_PANIC_CODE,
+                                span,
+                            )
+                        }
+                        None => None,
+                    }
+                } else {
+                    let unit = |ty: IntegerType, value: u128| {
+                        (
+                            None,
+                            LocalValue::Scalar(mir::ScalarValue::Integer(
+                                IntegerValue::from_u128(ty, value)
+                                    .expect("a code unit fits its width"),
+                            )),
+                        )
+                    };
+                    let entries = match encoding {
+                        crate::foreign::ForeignStringEncoding::Utf8 => text
+                            .as_bytes()
+                            .iter()
+                            .map(|byte| unit(IntegerType::UInt8, u128::from(*byte)))
+                            .collect(),
+                        crate::foreign::ForeignStringEncoding::Utf16 => text
+                            .encode_utf16()
+                            .map(|code| unit(IntegerType::UInt16, u128::from(code)))
+                            .collect(),
+                    };
+                    Some(CollectionValue::new(collection, entries))
+                };
+                let value = match span {
+                    Some(_) => value.ok_or_else(|| {
+                        InterpreterError::new("a panicking foreign string construction is present")
+                    })?,
+                    None => CollectionValue::nullable(collection, value),
+                };
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(value));
+            }
             EvaluationTask::ReadFileBytes(collection, path_span) => {
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
@@ -11613,6 +11674,18 @@ impl<'a> Interpreter<'a> {
                     .push(EvaluationTask::ReadFileBytes(collection, path_span));
                 frame.tasks.push(EvaluationTask::String(*path));
             }
+            mir::CollectionExpression::ForeignString {
+                collection,
+                text,
+                span,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ForeignString {
+                    collection,
+                    span: Some(span),
+                });
+                frame.tasks.push(EvaluationTask::String(*text));
+            }
             mir::CollectionExpression::ReadStdinBytes { collection } => {
                 let remaining = self.stdin[self.stdin_cursor..].to_vec();
                 self.stdin_cursor = self.stdin.len();
@@ -11651,6 +11724,14 @@ impl<'a> Interpreter<'a> {
                     .push(EvaluationValue::Collection(CollectionValue::nullable(
                         collection, None,
                     )));
+            }
+            mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ForeignString {
+                    collection,
+                    span: None,
+                });
+                frame.tasks.push(EvaluationTask::String(*text));
             }
             mir::NullableCollectionExpression::Collection(value) => {
                 let frame = self.current_frame_mut()?;

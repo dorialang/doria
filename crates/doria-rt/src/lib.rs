@@ -19,6 +19,7 @@ mod deadline;
 mod device_io;
 mod entry_args;
 mod file_io;
+mod foreign_string;
 #[cfg(feature = "hosted-shared-runtime")]
 mod identity;
 #[cfg(test)]
@@ -176,7 +177,6 @@ pub use byte_region::{
     dr_v2_byte_region_get, dr_v2_byte_region_set, dr_v2_byte_region_subregion, dr_v2_bytes_region,
 };
 pub use bytes::DrBytesV1;
-pub use system_code::{dr_v1_capture_system_code, dr_v1_last_system_code};
 pub use collection::{
     DrCollectionV1, DR_COLLECTION_AGGREGATE_OFFSET, DR_COLLECTION_ALIGN,
     DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET, DR_COLLECTION_HEAD_OFFSET,
@@ -189,6 +189,7 @@ pub use collection::{
 pub use deadline::{dr_v1_deadline_from_now, DrDeadlineV1};
 pub use mixed::DrMixedV1;
 pub use monotonic_clock::dr_v1_monotonic_clock;
+pub use system_code::{dr_v1_capture_system_code, dr_v1_last_system_code};
 pub use transfer_group::adapter::DrAdapterContextV1;
 pub use transfer_group::source::ResolveSourceCallback;
 pub use wait_budget::{dr_v1_wait_budget_init_deadline, DrWaitBudgetV1};

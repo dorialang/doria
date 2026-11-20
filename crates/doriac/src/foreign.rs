@@ -28,6 +28,66 @@ pub const POINTER_ADDRESS_PANIC_CODE: &str = "P1703";
 /// `T[N]` from a region whose length is not `N` (section 6).
 pub const ARRAY_FIELD_LENGTH_PANIC_CODE: &str = "P1704";
 
+/// The panic of `CString::from` and `Utf16String::from` for text that
+/// contains NUL, which would end the C string early (section 9).
+pub const INTERIOR_NUL_PANIC_CODE: &str = "P1705";
+
+/// The text encoding of an owned foreign string (section 9): `CString`
+/// holds UTF-8 bytes and `Utf16String` UTF-16 code units, each in one
+/// NUL-terminated buffer the value owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ForeignStringEncoding {
+    Utf8,
+    Utf16,
+}
+
+impl ForeignStringEncoding {
+    pub const ALL: [Self; 2] = [Self::Utf8, Self::Utf16];
+
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Utf8 => crate::compiler_known_ffi::C_STRING,
+            Self::Utf16 => crate::compiler_known_ffi::UTF16_STRING,
+        }
+    }
+
+    pub const fn short_name(self) -> &'static str {
+        match self {
+            Self::Utf8 => "CString",
+            Self::Utf16 => "Utf16String",
+        }
+    }
+
+    pub fn from_source_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|encoding| encoding.source_name() == name)
+    }
+
+    /// The bytes of one code unit: 1 for UTF-8, 2 for UTF-16.
+    pub const fn unit_bytes(self) -> u64 {
+        match self {
+            Self::Utf8 => 1,
+            Self::Utf16 => 2,
+        }
+    }
+
+    /// The `String` companion member that reads a NUL-terminated string of
+    /// this encoding from C: `String::fromCString` or `String::fromUtf16`.
+    pub const fn string_reader(self) -> &'static str {
+        match self {
+            Self::Utf8 => "fromCString",
+            Self::Utf16 => "fromUtf16",
+        }
+    }
+
+    pub fn from_string_reader(member: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|encoding| encoding.string_reader() == member)
+    }
+}
+
 /// Read access (`Ptr<T>`) or read and write access (`MutPtr<T>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PointerAccess {
@@ -188,6 +248,9 @@ pub enum ForeignType<T> {
         element: T,
         length: u64,
     },
+    /// `CString` or `Utf16String`: a Move value owning one NUL-terminated
+    /// buffer, released when its owner ends (section 9, amended 2026-11-20).
+    OwnedString(ForeignStringEncoding),
 }
 
 impl<T> ForeignType<T> {
@@ -208,6 +271,7 @@ impl<T> ForeignType<T> {
                 element: map(element),
                 length: *length,
             },
+            Self::OwnedString(encoding) => ForeignType::OwnedString(*encoding),
         }
     }
 
@@ -231,6 +295,7 @@ impl<T> ForeignType<T> {
             ),
             Self::Aggregate(aggregate) => aggregate.name.clone(),
             Self::FixedArray { element, length } => format!("{}[{length}]", show(element)),
+            Self::OwnedString(encoding) => encoding.short_name().to_string(),
         }
     }
 
@@ -244,7 +309,9 @@ impl<T> ForeignType<T> {
                 .chain(std::iter::once(&function.return_type))
                 .collect(),
             Self::FixedArray { element, .. } => vec![element],
-            Self::Opaque | Self::Boundary(_) | Self::Aggregate(_) => Vec::new(),
+            Self::Opaque | Self::Boundary(_) | Self::Aggregate(_) | Self::OwnedString(_) => {
+                Vec::new()
+            }
         }
     }
 }
@@ -252,11 +319,18 @@ impl<T> ForeignType<T> {
 /// Every compiler-known type name of `Doria\Std\Ffi` that the type model
 /// carries itself, rather than a declaration in the module source.
 pub fn type_names() -> impl Iterator<Item = &'static str> {
-    [PTR, MUT_PTR, OPAQUE].into_iter().chain(
-        CBoundaryType::ALL
-            .into_iter()
-            .map(CBoundaryType::source_name),
-    )
+    [PTR, MUT_PTR, OPAQUE]
+        .into_iter()
+        .chain(
+            CBoundaryType::ALL
+                .into_iter()
+                .map(CBoundaryType::source_name),
+        )
+        .chain(
+            ForeignStringEncoding::ALL
+                .into_iter()
+                .map(ForeignStringEncoding::source_name),
+        )
 }
 
 pub fn is_type_name(name: &str) -> bool {
@@ -276,7 +350,9 @@ pub fn is_ffi_safe(ty: &crate::types::ResolvedType) -> bool {
             | ForeignType::Boundary(_)
             | ForeignType::Function(_)
             | ForeignType::Aggregate(_) => true,
-            ForeignType::Opaque | ForeignType::FixedArray { .. } => false,
+            ForeignType::Opaque | ForeignType::FixedArray { .. } | ForeignType::OwnedString(_) => {
+                false
+            }
         },
         ResolvedType::Nullable(inner) => matches!(
             inner.as_ref(),

@@ -347,8 +347,49 @@ impl<'program> Checker<'program> {
             ForeignCompanion::Boundary(boundary) => {
                 self.check_boundary_conversion(boundary, access, args, scopes, method_context)
             }
+            ForeignCompanion::OwnedString(encoding) => {
+                self.check_owned_string_construction(encoding, access, args, scopes, method_context)
+            }
         }
         true
+    }
+
+    /// `CString::from($text)`, `CString::tryFrom($text)` and the
+    /// `Utf16String` pair (section 9).
+    fn check_owned_string_construction(
+        &mut self,
+        encoding: crate::foreign::ForeignStringEncoding,
+        access: StaticAccess<'_>,
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let companion = encoding.short_name();
+        let Some(member) = crate::foreign_strings::member(encoding, access.member)
+            .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::StaticMethod)
+        else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0304",
+                    format!("unknown method `{companion}::{}`", access.member),
+                    access.member_span,
+                )
+                .with_title("Unknown Method")
+                .with_help(format!(
+                    "`{companion}::from(...)` and `{companion}::tryFrom(...)` are available; `pointer` gives C the address of the buffer"
+                )),
+            );
+            return;
+        };
+        let parameters = member.parameter_info(&mut self.types);
+        self.check_call_arguments(
+            &format!("{companion}::{}", member.name),
+            &parameters,
+            args,
+            access.span,
+            scopes,
+            method_context,
+        );
     }
 
     fn check_pointer_static_call(
@@ -644,6 +685,14 @@ impl<'program> Checker<'program> {
         let companion = ForeignCompanion::from_class_name(class_name)?;
         let argument = args.first().map(|argument| &argument.value);
         let result = match companion {
+            ForeignCompanion::OwnedString(encoding) => {
+                match crate::foreign_strings::member(encoding, method).filter(|member| {
+                    member.kind == crate::byte_intrinsics::ByteMemberKind::StaticMethod
+                }) {
+                    Some(member) => self.types.intern_resolved(&member.return_type),
+                    None => self.types.unknown(),
+                }
+            }
             ForeignCompanion::Boundary(boundary) => {
                 let value = self
                     .types

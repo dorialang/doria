@@ -41,6 +41,9 @@ pub(crate) enum CollectionFamily {
     PriorityQueue,
     Deque,
     Bytes,
+    /// `CString` and `Utf16String`: one owned buffer, tracked as `Bytes` is
+    /// (Decision 0148 section 9).
+    ForeignString,
 }
 
 impl CollectionFamily {
@@ -55,6 +58,11 @@ impl CollectionFamily {
             ResolvedType::PriorityQueue(_) => Some(Self::PriorityQueue),
             ResolvedType::Deque(_) => Some(Self::Deque),
             ResolvedType::Bytes => Some(Self::Bytes),
+            ResolvedType::Foreign(foreign)
+                if matches!(**foreign, crate::foreign::ForeignType::OwnedString(_)) =>
+            {
+                Some(Self::ForeignString)
+            }
             ResolvedType::Nullable(inner) | ResolvedType::SharedHandle(_, inner) => {
                 Self::from_resolved(inner)
             }
@@ -287,6 +295,11 @@ fn resolve_type_ref(
                 name if crate::foreign::CBoundaryType::from_source_name(name).is_some() => {
                     ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Boundary(
                         crate::foreign::CBoundaryType::from_source_name(name)?,
+                    )))
+                }
+                name if crate::foreign::ForeignStringEncoding::from_source_name(name).is_some() => {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::OwnedString(
+                        crate::foreign::ForeignStringEncoding::from_source_name(name)?,
                     )))
                 }
                 _ => ResolvedType::Class(ClassType::new(plain.name, Vec::new())),

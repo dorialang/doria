@@ -2760,8 +2760,29 @@ fn foreign_mir_type(
         ForeignType::Pointer { .. } | ForeignType::Function(_) => Some(mir::Type::Scalar(
             mir::ScalarType::Inline(crate::inline_value::InlineValueType::Pointer),
         )),
+        ForeignType::OwnedString(encoding) => registry
+            .ids
+            .get(&foreign_string_key(*encoding))
+            .copied()
+            .map(mir::Type::Collection),
         ForeignType::Opaque | ForeignType::FixedArray { .. } => None,
     }
+}
+
+/// The collection registry key of an owned foreign string: its kind and its
+/// code unit.
+fn foreign_string_key(
+    encoding: crate::foreign::ForeignStringEncoding,
+) -> (mir::CollectionKind, Option<mir::Type>, mir::Type) {
+    let unit = match encoding {
+        crate::foreign::ForeignStringEncoding::Utf8 => IntegerType::UInt8,
+        crate::foreign::ForeignStringEncoding::Utf16 => IntegerType::UInt16,
+    };
+    (
+        mir::CollectionKind::ForeignString(encoding),
+        None,
+        mir::Type::Scalar(mir::ScalarType::Integer(unit)),
+    )
 }
 
 fn intern_resolved_collection_types(
@@ -2789,7 +2810,13 @@ fn intern_resolved_collection_types(
             })
         }
         ResolvedType::Mixed => mir::Type::Mixed,
-        ResolvedType::Foreign(foreign) => foreign_mir_type(foreign, collections)?,
+        ResolvedType::Foreign(foreign) => {
+            if let crate::foreign::ForeignType::OwnedString(encoding) = foreign.as_ref() {
+                let (kind, key, unit) = foreign_string_key(*encoding);
+                collections.intern(kind, key, unit);
+            }
+            foreign_mir_type(foreign, collections)?
+        }
         ResolvedType::Error => mir::Type::ERROR,
         ResolvedType::Function(function) => {
             if let Some(id) = collections.function_ids.get(function.as_ref()) {
@@ -14684,16 +14711,19 @@ fn string_intrinsic_signature(
             T::NullableInt => Ok(nullable_int),
             T::NullableString => Ok(mir::Type::NullableString),
             T::StringList => strings().ok_or_else(|| missing("List<string>")),
-            T::ByteRegion | T::StringIterable | T::Ordering | T::Undecided => {
-                Err(vec![Diagnostic::new(
-                    "I1301",
-                    format!(
-                        "String `{}` is not lowered as a String intrinsic call",
-                        string_intrinsic_name(kind)
-                    ),
-                    span,
-                )])
-            }
+            T::ByteRegion
+            | T::StringIterable
+            | T::Ordering
+            | T::Undecided
+            | T::CStringPointer
+            | T::Utf16Pointer => Err(vec![Diagnostic::new(
+                "I1301",
+                format!(
+                    "String `{}` is not lowered as a String intrinsic call",
+                    string_intrinsic_name(kind)
+                ),
+                span,
+            )]),
         }
     };
 

@@ -32,6 +32,10 @@ pub enum StringValueType {
     StringIterable,
     /// `Ordering`.
     Ordering,
+    /// `Doria\Std\Ffi\Ptr<CChar>`, a NUL-terminated C string.
+    CStringPointer,
+    /// `Doria\Std\Ffi\Ptr<uint16>`, NUL-terminated UTF-16 text.
+    Utf16Pointer,
     /// A pending member whose result type is not decided yet.
     Undecided,
 }
@@ -55,6 +59,12 @@ impl StringValueType {
                 "Iterable",
                 vec![ResolvedType::String],
             )),
+            Self::CStringPointer => {
+                crate::foreign_strings::unit_pointer(crate::foreign::ForeignStringEncoding::Utf8)
+            }
+            Self::Utf16Pointer => {
+                crate::foreign_strings::unit_pointer(crate::foreign::ForeignStringEncoding::Utf16)
+            }
             Self::Ordering | Self::Undecided => return None,
         })
     }
@@ -121,6 +131,10 @@ pub struct StringMember {
     pub parameters: &'static [StringParameter],
     pub result: StringValueType,
     pub availability: StringAvailability,
+    /// What the member does when it needs an unsafe context, completing
+    /// "… needs an unsafe context"; `None` for a safe member. Only the
+    /// readers of C text need one (Decision 0148 section 9).
+    pub unsafe_operation: Option<&'static str>,
     pub documentation: &'static str,
 }
 
@@ -216,6 +230,7 @@ const fn property_entry(
         parameters: &[],
         result,
         availability: StringAvailability::Executable,
+        unsafe_operation: None,
         documentation,
     }
 }
@@ -232,6 +247,7 @@ const fn companion_entry(
         parameters,
         result,
         availability: StringAvailability::Executable,
+        unsafe_operation: None,
         documentation,
     }
 }
@@ -244,6 +260,25 @@ const fn pending(
     StringMember {
         availability: StringAvailability::Pending { reason, help },
         ..member
+    }
+}
+
+/// A companion that reads foreign text through a pointer (Decision 0148
+/// section 9): unsafe, and `null` for text that is not valid Unicode.
+const fn foreign_reader(
+    name: &'static str,
+    parameters: &'static [StringParameter],
+    documentation: &'static str,
+    operation: &'static str,
+) -> StringMember {
+    StringMember {
+        unsafe_operation: Some(operation),
+        ..companion_entry(
+            name,
+            parameters,
+            StringValueType::NullableString,
+            documentation,
+        )
     }
 }
 
@@ -485,6 +520,18 @@ pub const STRING_MEMBERS: &[StringMember] = &[
         &[required("bytes", T::Bytes)],
         T::NullableString,
         "Copies valid UTF-8 bytes into a string and returns null for invalid UTF-8.",
+    ),
+    foreign_reader(
+        "fromCString",
+        &[required("text", T::CStringPointer)],
+        "Copies a NUL-terminated C string up to its NUL into a string and returns null for invalid UTF-8. Needs an unsafe context: the pointer must address readable memory up to a NUL.",
+        "reading a C string",
+    ),
+    foreign_reader(
+        "fromUtf16",
+        &[required("text", T::Utf16Pointer)],
+        "Copies NUL-terminated UTF-16 text up to its NUL into a string and returns null for an unpaired surrogate. Needs an unsafe context: the pointer must address readable, aligned memory up to a NUL code unit.",
+        "reading UTF-16 text",
     ),
     pending(
         companion_entry(

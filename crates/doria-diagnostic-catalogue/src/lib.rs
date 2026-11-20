@@ -60,7 +60,7 @@ pub const DIAGNOSTIC_CODES: &[&str] = &[
     "P1111", "P1201", "P1202", "P1203", "P1204", "P1205", "P1206", "P1301", "P1302", "P1303",
     "P1304", "P1305", "P1310", "P1311", "P1312", "P1313", "P1320", "P1321", "P1322", "P1401",
     "P1402", "P1403", "P1404", "P1405", "P1406", "P1407", "P1410", "P1501", "P1502", "P1503",
-    "P1504", "P1505", "P1601", "P1701", "P1702", "P1703", "P1704", "R1000", "R1001",
+    "P1504", "P1505", "P1601", "P1701", "P1702", "P1703", "P1704", "P1705", "R1000", "R1001",
 ];
 
 /// Codes that once identified a diagnostic and that no compiler raises any
@@ -1070,6 +1070,15 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         domain: "ffi",
         primary_label: "Region Of Another Length Here",
         explanation: "A fixed-length array field is copied from a region with exactly as many elements as the field holds.",
+        process_status: 101,
+        fact_names: &[],
+    },
+    RuntimeCatalogueEntry {
+        code: "P1705",
+        title: "Text For C Contains NUL",
+        domain: "ffi",
+        primary_label: "Text With NUL Converted Here",
+        explanation: "A C string ends at its first NUL, so text that contains NUL cannot become a `CString` or `Utf16String`.",
         process_status: 101,
         fact_names: &[],
     },

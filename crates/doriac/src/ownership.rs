@@ -9821,6 +9821,40 @@ impl Checker<'_> {
             return;
         };
         let context_depth = context.depth;
+        // A `CString` or `Utf16String` is its own storage (Decision 0148
+        // section 9): the value, not a loan, must outlive the context.
+        let owned_string = self
+            .resolved_type(region)
+            .and_then(crate::foreign_strings::encoding_of);
+        if let Some(encoding) = owned_string {
+            let short = encoding.short_name();
+            let destroyed = match pointer_place_root(region) {
+                None => Some(format!(
+                    "this `{short}` is a temporary value, destroyed at the end of its statement, before the unsafe context that pins it ends"
+                )),
+                Some(name) => scopes
+                    .get(name)
+                    .filter(|binding| binding.scope_depth > context_depth)
+                    .map(|_| {
+                        format!(
+                            "`${name}` is destroyed at the end of its block, before the unsafe context that pins it ends"
+                        )
+                    }),
+            };
+            if let Some(message) = destroyed {
+                self.diagnostics.push(
+                    Diagnostic::new("E0762", message, region.span())
+                        .with_title("Value Cannot Outlive Borrowed Source")
+                        .with_explanation(format!(
+                            "A pointer to a `{short}` is valid until the innermost enclosing unsafe context ends, and the `{short}` stays in place and alive for that long."
+                        ))
+                        .with_help(format!(
+                            "keep the `{short}` in a local declared before the unsafe context, or in the unsafe context itself"
+                        )),
+                );
+                return;
+            }
+        }
         if let Some(loan) = loans.iter().find(|loan| loan.source_depth > context_depth) {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -10043,6 +10077,9 @@ impl Checker<'_> {
                         if (class_name == "Set" && method == "from")
                             || (class_name == "Bytes"
                                 && matches!(method.as_str(), "fromArray" | "allocate"))
+                            || (crate::foreign::ForeignStringEncoding::from_source_name(class_name)
+                                .is_some()
+                                && matches!(method.as_str(), "from" | "tryFrom"))
                 ) {
                     return true;
                 }
@@ -11311,6 +11348,9 @@ pub(crate) fn resolved_type_is_move_type(
         crate::types::ResolvedType::ByteRegion(kind)
         | crate::types::ResolvedType::ArrayRegion(kind, _) => kind.is_writable(),
         crate::types::ResolvedType::Class(class) => class.inline_copy_type().is_none(),
+        crate::types::ResolvedType::Foreign(foreign) => {
+            matches!(**foreign, crate::foreign::ForeignType::OwnedString(_))
+        }
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
         | crate::types::ResolvedType::Error
@@ -11383,6 +11423,17 @@ fn resolved_collection_info(
 ) -> Option<CollectionInfo> {
     use crate::types::ResolvedType;
     let (family, value) = match ty {
+        ResolvedType::Foreign(foreign)
+            if matches!(**foreign, crate::foreign::ForeignType::OwnedString(_)) =>
+        {
+            return Some(CollectionInfo {
+                family: CollectionFamily::ForeignString,
+                value_move: false,
+                value_mixed: false,
+                value_class: None,
+                value_collection: None,
+            });
+        }
         ResolvedType::Bytes => {
             return Some(CollectionInfo {
                 family: CollectionFamily::Bytes,
@@ -11435,6 +11486,14 @@ fn type_ref_collection_info(
 ) -> Option<CollectionInfo> {
     if ty.name == "Bytes" && ty.arguments.is_empty() {
         return Some(bytes_collection_info());
+    }
+    if crate::foreign::ForeignStringEncoding::from_source_name(&ty.name).is_some()
+        && ty.arguments.is_empty()
+    {
+        return Some(CollectionInfo {
+            family: CollectionFamily::ForeignString,
+            ..bytes_collection_info()
+        });
     }
     let (family, value) = match ty.name.as_str() {
         "[]" if ty.type_argument_count() == 1 => {
@@ -11528,6 +11587,7 @@ fn type_ref_is_move_type_with_nominals(
         || crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
         || type_ref_class_name(ty, classes, receiver_class).is_some()
         || move_nominal_names.contains(&ty.name)
+        || crate::foreign::ForeignStringEncoding::from_source_name(&ty.name).is_some()
         || matches!(
             ty.name.as_str(),
             "mixed"

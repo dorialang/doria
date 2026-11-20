@@ -419,40 +419,20 @@ impl Finder {
 
     /// One expression, without its children: the visitors above reach those.
     fn expression_node(&mut self, expression: &Expr) {
-        match expression {
-            Expr::StaticCall {
-                qualifier: StaticQualifier::Class(class),
-                method,
-                member_span,
-                ..
-            } if self.gate == Gate::Checking
-                && class == "String"
-                && matches!(method.as_str(), "fromCString" | "fromUtf16") =>
-            {
-                self.report(
-                    *member_span,
-                    "Foreign String Conversions Are Not Available Yet",
-                    format!(
-                        "`String::{method}` is part of Doria; this compiler does not implement it yet"
-                    ),
-                )
+        if let Expr::Closure(closure) = expression {
+            for parameter in &closure.parameters {
+                self.misplaced_aggregate(
+                    &parameter.ty,
+                    parameter.span,
+                    Some("a closure parameter"),
+                );
             }
-            Expr::Closure(closure) => {
-                for parameter in &closure.parameters {
-                    self.misplaced_aggregate(
-                        &parameter.ty,
-                        parameter.span,
-                        Some("a closure parameter"),
-                    );
-                }
-                if let Some(result) = &closure.return_type {
-                    self.misplaced_aggregate(&result.ty, closure.span, Some("a closure result"));
-                }
-                if let ClosureBody::Block(body) = &closure.body {
-                    self.block(body);
-                }
+            if let Some(result) = &closure.return_type {
+                self.misplaced_aggregate(&result.ty, closure.span, Some("a closure result"));
             }
-            _ => {}
+            if let ClosureBody::Block(body) = &closure.body {
+                self.block(body);
+            }
         }
     }
 

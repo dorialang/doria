@@ -86,7 +86,7 @@ pub fn type_documentation(ty: &ResolvedType) -> Option<&'static str> {
         ResolvedType::ArrayRegion(ByteRegionKind::Writable, _) => Some(
             "Exclusive borrowed view of elements of a `T[]` (Move), carried inline without owning storage or retaining a runtime reference count. `length` counts elements; indexing reads `T`. Indexed writes and `getWritableRegion` require writable access. `getRegion` creates a readonly reborrow. `copyFrom` copies another region's elements into this one. When `T` is FFI-safe, `pointer` and, with writable access, `writablePointer` give the address of its first element in an unsafe context. The source's complete place remains exclusively borrowed.",
         ),
-        _ => None,
+        ty => crate::foreign_strings::encoding_of(ty).map(crate::foreign_strings::type_documentation),
     }
 }
 
@@ -104,6 +104,8 @@ pub fn members(receiver: &ResolvedType, kind: ByteMemberKind) -> Vec<ByteIntrins
         "pointer",
         "writablePointer",
         "[]",
+        "from",
+        "tryFrom",
     ]
     .into_iter()
     .filter_map(|name| member(receiver, name))
@@ -157,6 +159,12 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
             (kind.is_writable(), element.as_ref().clone(), true)
         }
         ResolvedType::String => return string_member(name),
+        ResolvedType::Foreign(_) => {
+            return crate::foreign_strings::member(
+                crate::foreign_strings::encoding_of(receiver)?,
+                name,
+            )
+        }
         _ => return None,
     };
     let region = |kind: ByteRegionKind| {

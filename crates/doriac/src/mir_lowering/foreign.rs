@@ -106,6 +106,19 @@ pub(super) fn expression(
             span,
             ..
         } => {
+            if property == "pointer"
+                && crate::foreign_strings::encoding_of(&context.resolved_expression_type(object)?)
+                    .is_some()
+            {
+                let string = materialize_foreign_string(object, context)?;
+                let target = context.declare_return_temp(POINTER, false);
+                context.push_statement(mir::Statement::Pointer {
+                    target: Some(target),
+                    operation: mir::PointerOperation::ForeignStringData { string },
+                    span: *span,
+                });
+                return Ok(Some(local_rvalue(target, POINTER, false)));
+            }
             if let (true, mir::Type::Region(region_type)) = (
                 matches!(property.as_str(), "pointer" | "writablePointer"),
                 context.expression_type(object)?,
@@ -140,6 +153,41 @@ pub(super) fn expression(
                 span: *span,
             });
             Ok(Some(local_rvalue(target, address, false)))
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if crate::foreign::ForeignStringEncoding::from_source_name(class_name).is_some() => {
+            owned_string_construction(method, args, *span, expected, context)
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if class_name == "String"
+            && crate::foreign::ForeignStringEncoding::from_string_reader(method).is_some() =>
+        {
+            let encoding = crate::foreign::ForeignStringEncoding::from_string_reader(method)
+                .expect("the reader was matched");
+            let [argument] = argument_values(args)[..] else {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("`String::{method}` has one argument"),
+                )]);
+            };
+            let pointer = materialize_pointer(argument, context)?;
+            let target = context.declare_return_temp(mir::Type::NullableString, false);
+            context.push_statement(mir::Statement::Pointer {
+                target: Some(target),
+                operation: mir::PointerOperation::ReadForeignString { pointer, encoding },
+                span: *span,
+            });
+            // As for a call's string result, the string's own cleanup
+            // transport releases the temporary.
+            Ok(Some(local_rvalue(target, mir::Type::NullableString, false)))
         }
         hir::Expr::StaticCall {
             class_name,
@@ -215,6 +263,58 @@ pub(super) fn expression(
         }
         _ => Ok(None),
     }
+}
+
+/// `CString::from($text)`, `CString::tryFrom($text)` and the `Utf16String`
+/// pair (section 9): a new owned buffer, absent from `tryFrom` for text
+/// with NUL.
+fn owned_string_construction(
+    method: &str,
+    args: &[hir::Argument],
+    span: Span,
+    expected: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::Rvalue>> {
+    let construction = crate::foreign_strings::OwnedStringConstruction::from_name(method);
+    let [argument] = argument_values(args)[..] else {
+        return Err(vec![unsupported(
+            span,
+            format!("`{method}` has one argument"),
+        )]);
+    };
+    let text = Box::new(lower_string_expression(argument, context)?);
+    match (construction, expected) {
+        (
+            Some(crate::foreign_strings::OwnedStringConstruction::From),
+            mir::Type::Collection(collection),
+        ) => Ok(Some(mir::Rvalue::Collection(
+            mir::CollectionExpression::ForeignString {
+                collection,
+                text,
+                span,
+            },
+        ))),
+        (
+            Some(crate::foreign_strings::OwnedStringConstruction::TryFrom),
+            mir::Type::NullableCollection(collection),
+        ) => Ok(Some(mir::Rvalue::NullableCollection(
+            mir::NullableCollectionExpression::TryForeignString { collection, text },
+        ))),
+        _ => Err(vec![unsupported(
+            span,
+            format!("`{method}` does not produce the expected foreign string type"),
+        )]),
+    }
+}
+
+/// The local holding the `CString` or `Utf16String` that `expr` names,
+/// borrowed for its `pointer`.
+fn materialize_foreign_string(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::LocalId> {
+    let (local, _) = lower_collection_local(expr, context)?;
+    Ok(local)
 }
 
 /// `$mutable->write($value)` and `writeUnaligned` as a statement; `false`

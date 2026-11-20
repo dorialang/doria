@@ -254,6 +254,18 @@ impl<'program> Checker<'program> {
         let pointer = PointerAccess::from_source_name(&ty.name);
         let boundary = CBoundaryType::from_source_name(&ty.name);
         let opaque = ty.name == crate::foreign::OPAQUE;
+        if let Some(encoding) = crate::foreign::ForeignStringEncoding::from_source_name(&ty.name) {
+            let base = self.resolve_zero_arg_type(
+                ty,
+                span,
+                TypeKind::Foreign(ForeignType::OwnedString(encoding)),
+            );
+            return Some(if ty.nullable {
+                self.types.intern(TypeKind::Nullable(base))
+            } else {
+                base
+            });
+        }
         if pointer.is_none() && boundary.is_none() && !opaque {
             return None;
         }

@@ -1180,3 +1180,63 @@ fn the_last_system_code_is_a_readonly_static_int() {
     let unknown = format!("{prelude}function main(): void {{ echo ForeignCall::lastCode; }}");
     assert_eq!(codes(&unknown), ["E0488"], "{:#?}", findings(&unknown));
 }
+
+const FOREIGN_STRINGS: &str = r#"
+use Doria\Std\Ffi\{CChar, CString, Ptr, Utf16String};
+"#;
+
+#[test]
+fn foreign_string_pointers_and_readers_need_an_unsafe_context() {
+    let pointer = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); Ptr<CChar> $text = $name->pointer; }}"
+    );
+    assert_eq!(only(&pointer, "E0785").code, "E0785");
+    let reader = format!(
+        "{FOREIGN_STRINGS}function read(Ptr<CChar> $text): ?string {{ return String::fromCString($text); }}"
+    );
+    assert_eq!(only(&reader, "E0785").code, "E0785");
+    let checked = format!(
+        "{FOREIGN_STRINGS}function read(Ptr<uint16> $text): ?string {{ return unsafe(String::fromUtf16($text)); }}"
+    );
+    assert!(findings(&checked).is_empty(), "{:#?}", findings(&checked));
+}
+
+#[test]
+fn foreign_strings_are_move_values_without_equality() {
+    let moved = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); let $other = $name; let $again = $name; }}"
+    );
+    assert_eq!(codes(&moved), ["E0470"], "{:#?}", findings(&moved));
+    let compared = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); let $other = CString::from(\"x\"); echo $name == $other; }}"
+    );
+    assert!(!codes(&compared).is_empty(), "a CString has no `==`");
+    let unknown = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::fromBytes(\"x\"); }}"
+    );
+    assert_eq!(codes(&unknown), ["E0304"], "{:#?}", findings(&unknown));
+    let argument =
+        format!("{FOREIGN_STRINGS}function main(): void {{ let $name = Utf16String::from(1); }}");
+    assert!(!codes(&argument).is_empty(), "the text is a string");
+}
+
+#[test]
+fn a_foreign_string_stays_alive_and_in_place_while_its_pointer_is_used() {
+    let temporary = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ unsafe {{ Ptr<CChar> $text = CString::from(\"x\")->pointer; }} }}"
+    );
+    assert_eq!(only(&temporary, "E0762").code, "E0762");
+    let inner = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ unsafe {{ {{ let $name = CString::from(\"x\"); Ptr<CChar> $text = $name->pointer; }} }} }}"
+    );
+    assert_eq!(only(&inner, "E0762").code, "E0762");
+    let given = format!(
+        "{FOREIGN_STRINGS}function keep(take CString $text): void {{}}
+function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Ptr<CChar> $text = $name->pointer; keep($name); }} }}"
+    );
+    assert_eq!(only(&given, "E0477").code, "E0477");
+    let pinned = format!(
+        "{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); unsafe {{ Ptr<CChar> $text = $name->pointer; Ptr<CChar> $again = $name->pointer; }} let $later = $name; }}"
+    );
+    assert!(findings(&pinned).is_empty(), "{:#?}", findings(&pinned));
+}

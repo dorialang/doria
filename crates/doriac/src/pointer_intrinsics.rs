@@ -251,6 +251,8 @@ impl BoundaryConversion {
 pub enum ForeignCompanion {
     Pointer(PointerAccess),
     Boundary(CBoundaryType),
+    /// `CString` or `Utf16String` ([`crate::foreign_strings`]).
+    OwnedString(crate::foreign::ForeignStringEncoding),
 }
 
 impl ForeignCompanion {
@@ -259,12 +261,17 @@ impl ForeignCompanion {
         PointerAccess::from_source_name(class)
             .map(Self::Pointer)
             .or_else(|| CBoundaryType::from_source_name(class).map(Self::Boundary))
+            .or_else(|| {
+                crate::foreign::ForeignStringEncoding::from_source_name(class)
+                    .map(Self::OwnedString)
+            })
     }
 
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Pointer(access) => access.short_name(),
             Self::Boundary(boundary) => boundary.short_name(),
+            Self::OwnedString(encoding) => encoding.short_name(),
         }
     }
 }

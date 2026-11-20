@@ -13934,6 +13934,11 @@ fn lower_collection_expression(
             release_string(builder, path, resources)?;
             Ok(result)
         }
+        mir::CollectionExpression::ForeignString {
+            collection,
+            text,
+            span,
+        } => lower_foreign_string_construction(builder, *collection, text, *span, false, resources),
         mir::CollectionExpression::ReadStdinBytes { .. } => runtime_call(
             builder,
             READ_STDIN_BYTES,
@@ -13954,6 +13959,43 @@ fn lower_collection_expression(
     }
 }
 
+/// `CString::from`, `Utf16String::from` and their `tryFrom` forms
+/// (Decision 0148 section 9): the runtime copies the text into a new
+/// NUL-terminated buffer, the value. `from` panics at `span` for text with
+/// NUL; `tryFrom` (`fallible`) gives null instead.
+fn lower_foreign_string_construction(
+    builder: &mut FunctionBuilder,
+    collection: mir::CollectionTypeId,
+    text: &mir::StringExpression,
+    span: crate::source::Span,
+    fallible: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let mir::CollectionKind::ForeignString(encoding) =
+        collection_definition(resources.program, collection)?.kind
+    else {
+        return Err(malformed_mir(
+            "a foreign string construction builds a CString or Utf16String",
+        ));
+    };
+    let text = lower_string_expression(builder, text, resources)?;
+    if !fallible {
+        set_active_panic_site(builder, span, resources);
+    }
+    let result = runtime_call(
+        builder,
+        crate::native_abi::foreign_string_constructor(encoding, fallible),
+        &[pointer, pointer],
+        Some(pointer),
+        &[resources.current_frame, text],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("a foreign string construction produced no result"))?;
+    release_string(builder, text, resources)?;
+    Ok(result)
+}
+
 fn lower_nullable_collection_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::NullableCollectionExpression,
@@ -13962,6 +14004,16 @@ fn lower_nullable_collection_expression(
     let pointer = resources.module.target_config().pointer_type();
     match expression {
         mir::NullableCollectionExpression::Null(_) => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableCollectionExpression::TryForeignString { collection, text } => {
+            lower_foreign_string_construction(
+                builder,
+                *collection,
+                text,
+                crate::source::Span::default(),
+                true,
+                resources,
+            )
+        }
         mir::NullableCollectionExpression::Collection(value) => {
             lower_collection_expression(builder, value, resources)
         }
@@ -16073,15 +16125,19 @@ fn lower_finish_collection_value(
     let done = builder.create_block();
     builder.ins().brif(present, drop_block, &[], done, &[]);
     builder.switch_to_block(drop_block);
-    if definition.kind == mir::CollectionKind::Bytes {
+    if let mir::CollectionKind::Bytes | mir::CollectionKind::ForeignString(_) = definition.kind {
         if action != CollectionStorageAction::Free {
             return Err(malformed_mir(
-                "Bytes cannot be cleared as a named collection",
+                "Bytes and foreign strings cannot be cleared as a named collection",
             ));
         }
         let _ = runtime_call(
             builder,
-            BYTES_FREE,
+            if definition.kind == mir::CollectionKind::Bytes {
+                BYTES_FREE
+            } else {
+                crate::native_abi::FOREIGN_STRING_FREE
+            },
             &[pointer],
             None,
             &[collection],
@@ -21058,6 +21114,28 @@ fn lower_pointer_operation(
             Some(LoweredValue::Single(
                 builder.ins().select(empty, aligned, data),
             ))
+        }
+        // An owned foreign string is the address of its buffer.
+        mir::PointerOperation::ForeignStringData { string } => Some(LoweredValue::Single(
+            lower_collection_pointer(builder, *string, resources)?,
+        )),
+        mir::PointerOperation::ReadForeignString {
+            pointer: local,
+            encoding,
+        } => {
+            let address = address_of(builder, *local, resources)?;
+            set_active_panic_site(builder, span, resources);
+            let payload = runtime_call(
+                builder,
+                crate::native_abi::foreign_string_reader(*encoding),
+                &[pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, address],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("a foreign string read produced no result"))?;
+            let present = presence_word(builder, payload, pointer);
+            Some(LoweredValue::Nullable { present, payload })
         }
         mir::PointerOperation::FromAddress { address } => {
             let address = lower_integer_expression(builder, address, resources)?;

@@ -13784,6 +13784,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.release_string(path)?;
                 Ok(result)
             }
+            mir::CollectionExpression::ForeignString {
+                collection,
+                text,
+                span,
+            } => self.lower_foreign_string_construction(*collection, text, Some(*span)),
             mir::CollectionExpression::ReadStdinBytes { .. } => Ok(self
                 .call_runtime(
                     READ_STDIN_BYTES,
@@ -13817,6 +13822,40 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(value)
     }
 
+    /// `CString::from` (`span`, panicking there for text with NUL) or a
+    /// `tryFrom` form (`None`, null for text with NUL), as Cranelift lowers
+    /// them (Decision 0148 section 9).
+    fn lower_foreign_string_construction(
+        &mut self,
+        collection: mir::CollectionTypeId,
+        text: &mir::StringExpression,
+        span: Option<crate::source::Span>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let mir::CollectionKind::ForeignString(encoding) =
+            self.collection_definition(collection)?.kind
+        else {
+            return Err(malformed_mir(
+                "a foreign string construction builds a CString or Utf16String",
+            ));
+        };
+        let text = self.lower_string_expression(text)?;
+        if let Some(span) = span {
+            self.set_active_panic_site(span)?;
+        }
+        let result = self
+            .call_runtime(
+                crate::native_abi::foreign_string_constructor(encoding, span.is_none()),
+                &[pointer.into(), pointer.into()],
+                Some(pointer.into()),
+                &[self.current_frame.into(), text.into()],
+            )?
+            .ok_or_else(|| backend_failure("a foreign string construction produced no result"))?
+            .into_pointer_value();
+        self.release_string(text)?;
+        Ok(result)
+    }
+
     fn lower_nullable_collection_expression_inner(
         &mut self,
         expression: &mir::NullableCollectionExpression,
@@ -13824,6 +13863,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
             mir::NullableCollectionExpression::Null(_) => Ok(pointer.const_null()),
+            mir::NullableCollectionExpression::TryForeignString { collection, text } => {
+                self.lower_foreign_string_construction(*collection, text, None)
+            }
             mir::NullableCollectionExpression::Collection(value) => {
                 self.lower_collection_expression(value)
             }
@@ -16432,13 +16474,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .build_conditional_branch(present, drop_block, done),
         )?;
         self.builder.position_at_end(drop_block);
-        if definition.kind == mir::CollectionKind::Bytes {
+        if let mir::CollectionKind::Bytes | mir::CollectionKind::ForeignString(_) = definition.kind
+        {
             if action != CollectionStorageAction::Free {
                 return Err(malformed_mir(
-                    "Bytes cannot be cleared as a named collection",
+                    "Bytes and foreign strings cannot be cleared as a named collection",
                 ));
             }
-            let _ = self.call_runtime(BYTES_FREE, &[pointer.into()], None, &[collection.into()])?;
+            let free = if definition.kind == mir::CollectionKind::Bytes {
+                BYTES_FREE
+            } else {
+                crate::native_abi::FOREIGN_STRING_FREE
+            };
+            let _ = self.call_runtime(free, &[pointer.into()], None, &[collection.into()])?;
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
             return Ok(());
@@ -22620,6 +22668,46 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     data,
                     "region.pointer",
                 ))?)
+            }
+            // An owned foreign string is the address of its buffer.
+            mir::PointerOperation::ForeignStringData { string } => {
+                let buffer = self.collection_pointer(*string)?;
+                Some(
+                    build(
+                        self.builder
+                            .build_ptr_to_int(buffer, word, "foreign.string.pointer"),
+                    )?
+                    .into(),
+                )
+            }
+            mir::PointerOperation::ReadForeignString { pointer, encoding } => {
+                let pointer_type = self.context.ptr_type(AddressSpace::default());
+                let address = self.pointer_local(*pointer)?;
+                let address = build(self.builder.build_int_to_ptr(
+                    address,
+                    pointer_type,
+                    "foreign.string.text",
+                ))?;
+                self.set_active_panic_site(span)?;
+                let payload = self
+                    .call_runtime(
+                        crate::native_abi::foreign_string_reader(*encoding),
+                        &[pointer_type.into(), pointer_type.into()],
+                        Some(pointer_type.into()),
+                        &[self.current_frame.into(), address.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("a foreign string read produced no result"))?
+                    .into_pointer_value();
+                let present = build(
+                    self.builder
+                        .build_is_not_null(payload, "foreign.string.present"),
+                )?;
+                let present = build(self.builder.build_int_z_extend(
+                    present,
+                    self.context.ptr_sized_int_type(self.target_data, None),
+                    "foreign.string.present.word",
+                ))?;
+                Some(self.nullable_value(present, payload.into())?.into())
             }
             mir::PointerOperation::FromAddress { address } => {
                 let address = self.lower_integer_expression(address)?;

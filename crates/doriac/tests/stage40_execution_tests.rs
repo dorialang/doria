@@ -1352,3 +1352,103 @@ function main(): void
         "Array Region Length Does Not Match The Field",
     );
 }
+
+const FOREIGN_STRINGS: &str = "use Doria\\Std\\Ffi\\{CString, Utf16String};\n";
+
+#[test]
+fn foreign_strings_are_built_moved_and_released_everywhere() {
+    let source = format!(
+        "{FOREIGN_STRINGS}
+function keep(take CString $text): CString
+{{
+    return $text;
+}}
+
+function main(): void
+{{
+    let $name = CString::from(\"héllo\");
+    let $kept = keep($name);
+    let $wide = Utf16String::from(text: \"A😀\");
+    let $empty = CString::from(\"\");
+    let $zeros = Bytes::allocate(3);
+    let $withNul = String::fromBytes($zeros) ?? \"\";
+    ?CString $missing = CString::tryFrom($withNul);
+    ?Utf16String $present = Utf16String::tryFrom(\"ok\");
+    if ($missing == null) {{
+        echo \"absent \";
+    }}
+    if ($present != null) {{
+        echo \"present\";
+    }}
+}}
+"
+    );
+    assert_runs_everywhere(&source, "absent present");
+}
+
+#[test]
+fn text_with_nul_panics_with_p1705() {
+    for construction in ["CString::from", "Utf16String::from"] {
+        let source = format!(
+            "{FOREIGN_STRINGS}
+function main(): void
+{{
+    echo \"before \";
+    let $zeros = Bytes::allocate(3);
+    let $withNul = String::fromBytes($zeros) ?? \"\";
+    let $text = {construction}($withNul);
+    echo \"after\";
+}}
+"
+        );
+        assert_panics_everywhere(&source, "before ", "P1705");
+    }
+}
+
+#[test]
+fn foreign_strings_give_c_their_buffers_and_read_text_back() {
+    let source = format!(
+        "{C_LIBRARY}
+use Doria\\Std\\Ffi\\{{CString, Utf16String}};
+
+function main(): void
+{{
+    let $name = CString::from(\"héllo\");
+    let $wide = Utf16String::from(\"A😀\");
+    let writable $bytes = Bytes::allocate(2);
+    $bytes[0] = UInt8::from(255);
+    unsafe {{
+        echo UInt64::from(strlen($name->pointer));
+        echo \" \";
+        echo String::fromCString($name->pointer) ?? \"invalid\";
+        echo \" \";
+        echo $wide->pointer->offset(1)->read();
+        echo \" \";
+        echo $wide->pointer->offset(3)->read();
+        echo \" \";
+        echo String::fromUtf16($wide->pointer) ?? \"invalid\";
+        echo \" \";
+        Ptr<CChar> $invalid = Ptr::cast($bytes->getRegion(0, 2)->pointer);
+        echo String::fromCString($invalid) ?? \"invalid\";
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "6 héllo 55357 0 A😀 invalid");
+}
+
+#[test]
+fn php_output_reports_that_it_does_not_build_foreign_strings_yet() {
+    let source =
+        format!("{FOREIGN_STRINGS}function main(): void {{ let $name = CString::from(\"x\"); }}");
+    let diagnostics =
+        doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+            .expect_err("PHP output does not build foreign strings yet");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0784"
+                && diagnostic.title == "Foreign Strings Cannot Be Built For PHP Output Yet"),
+        "{diagnostics:#?}"
+    );
+}

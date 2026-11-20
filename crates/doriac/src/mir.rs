@@ -347,6 +347,11 @@ impl Eq for Program {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CollectionKind {
     Bytes,
+    /// `CString` or `Utf16String` (Decision 0148 section 9): one runtime
+    /// buffer of NUL-terminated code units, the value being the buffer's
+    /// address. It has no elements a program reads or iterates; its value
+    /// type is the code unit, `uint8` or `uint16`.
+    ForeignString(crate::foreign::ForeignStringEncoding),
     TypedArray,
     List,
     Dictionary,
@@ -374,7 +379,10 @@ impl CollectionKind {
     }
 
     pub const fn supports_foreach(self) -> bool {
-        !matches!(self, Self::Bytes | Self::PriorityQueue)
+        !matches!(
+            self,
+            Self::Bytes | Self::ForeignString(_) | Self::PriorityQueue
+        )
     }
 
     pub const fn supports_writable_element_iteration(self) -> bool {
@@ -4274,6 +4282,14 @@ pub enum CollectionExpression {
     ReadStdinBytes {
         collection: CollectionTypeId,
     },
+    /// `CString::from($text)` and `Utf16String::from($text)` (Decision
+    /// 0148 section 9): a new NUL-terminated buffer of the text's code
+    /// units. Text that contains NUL panics with P1705 at `span`.
+    ForeignString {
+        collection: CollectionTypeId,
+        text: Box<StringExpression>,
+        span: Span,
+    },
     StringIntrinsic(Box<StringIntrinsicCall>),
     Call {
         collection: CollectionTypeId,
@@ -4287,6 +4303,13 @@ pub enum CollectionExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableCollectionExpression {
     Null(CollectionTypeId),
+    /// `CString::tryFrom($text)` and `Utf16String::tryFrom($text)`: as
+    /// [`CollectionExpression::ForeignString`], absent for text that
+    /// contains NUL.
+    TryForeignString {
+        collection: CollectionTypeId,
+        text: Box<StringExpression>,
+    },
     Collection(CollectionExpression),
     Local {
         collection: CollectionTypeId,
@@ -4332,6 +4355,7 @@ impl NullableCollectionExpression {
     pub const fn collection(&self) -> CollectionTypeId {
         match self {
             Self::Null(collection)
+            | Self::TryForeignString { collection, .. }
             | Self::Local { collection, .. }
             | Self::Index { collection, .. }
             | Self::CollectionGet { collection, .. }
@@ -4369,7 +4393,8 @@ impl NullableCollectionExpression {
                 collection,
                 transfer: true,
                 ..
-            } => Some(*collection),
+            }
+            | Self::TryForeignString { collection, .. } => Some(*collection),
             Self::CollectionGet {
                 collection, access, ..
             } if access.removes_element() => Some(*collection),
@@ -4433,6 +4458,7 @@ impl CollectionExpression {
             | Self::BytesAllocate { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
+            | Self::ForeignString { collection, .. }
             | Self::Call { collection, .. } => *collection,
             Self::StringIntrinsic(call) => match call.result {
                 Type::Collection(collection) => collection,
@@ -4463,6 +4489,7 @@ impl CollectionExpression {
             | Self::BytesAllocate { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
+            | Self::ForeignString { collection, .. }
             | Self::Call {
                 collection,
                 return_borrow:
@@ -6432,6 +6459,17 @@ pub enum PointerOperation {
     /// address aligned for the element, which must not be dereferenced.
     /// Checking pins the region's storage for the enclosing unsafe context.
     RegionData { region: LocalId, align: u64 },
+    /// `$text->pointer` on a `CString` or `Utf16String` local (section 9):
+    /// the address of its buffer's first code unit. Checking pins the value
+    /// for the enclosing unsafe context.
+    ForeignStringData { string: LocalId },
+    /// `String::fromCString` and `String::fromUtf16`: the `?string` the
+    /// NUL-terminated text at `pointer` holds, absent when it is not valid
+    /// Unicode.
+    ReadForeignString {
+        pointer: LocalId,
+        encoding: crate::foreign::ForeignStringEncoding,
+    },
 }
 
 impl PointerOperation {
@@ -6441,8 +6479,12 @@ impl PointerOperation {
             Self::Read { pointer, .. }
             | Self::Write { pointer, .. }
             | Self::Offset { pointer, .. }
-            | Self::Address { pointer } => Some(*pointer),
-            Self::FromAddress { .. } | Self::AddressOf { .. } | Self::RegionData { .. } => None,
+            | Self::Address { pointer }
+            | Self::ReadForeignString { pointer, .. } => Some(*pointer),
+            Self::FromAddress { .. }
+            | Self::AddressOf { .. }
+            | Self::RegionData { .. }
+            | Self::ForeignStringData { .. } => None,
         }
     }
 }
@@ -7474,7 +7516,9 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             PointerOperation::Read { .. }
             | PointerOperation::Address { .. }
             | PointerOperation::AddressOf { .. }
-            | PointerOperation::RegionData { .. } => 0,
+            | PointerOperation::RegionData { .. }
+            | PointerOperation::ForeignStringData { .. }
+            | PointerOperation::ReadForeignString { .. } => 0,
         },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
@@ -7873,6 +7917,9 @@ fn nullable_collection_class_temporary_capacity(value: &NullableCollectionExpres
             nullable_collection_class_temporary_capacity(left)
                 + nullable_collection_class_temporary_capacity(right)
         }
+        NullableCollectionExpression::TryForeignString { text, .. } => {
+            string_class_temporary_capacity(text)
+        }
         NullableCollectionExpression::Null(_)
         | NullableCollectionExpression::Local { .. }
         | NullableCollectionExpression::Property { .. } => 0,
@@ -8187,7 +8234,8 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
             CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
             CollectionExpression::Property { .. }
             | CollectionExpression::SharedAccessPayload { .. } => 0,
-            CollectionExpression::ReadFileBytes { path, .. } => {
+            CollectionExpression::ReadFileBytes { path, .. }
+            | CollectionExpression::ForeignString { text: path, .. } => {
                 string_class_temporary_capacity(path)
             }
         }
@@ -9485,6 +9533,13 @@ impl fmt::Display for CollectionExpression {
             }
             Self::ReadFileBytes { path, .. } => write!(formatter, "read_file_bytes({path})"),
             Self::ReadStdinBytes { .. } => formatter.write_str("read_stdin_bytes()"),
+            Self::ForeignString {
+                collection, text, ..
+            } => write!(
+                formatter,
+                "foreign_string collection#{}({text})",
+                collection.0
+            ),
             Self::StringIntrinsic(call) => write!(formatter, "{call}"),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
         }
@@ -10977,6 +11032,15 @@ impl fmt::Display for Statement {
                             region.0
                         )
                     }
+                    PointerOperation::ForeignStringData { string } => {
+                        write!(formatter, "foreign_string_pointer(local{})", string.0)
+                    }
+                    PointerOperation::ReadForeignString { pointer, encoding } => write!(
+                        formatter,
+                        "read_foreign_string<{}>(local{})",
+                        encoding.short_name(),
+                        pointer.0
+                    ),
                 }
             }
             Statement::ForeignField {

@@ -6563,6 +6563,22 @@ fn validate_pointer_operation(
             }
             Some(pointer)
         }
+        mir::PointerOperation::ForeignStringData { string } => {
+            let foreign_string = match local_in(function, *string)?.ty {
+                mir::Type::Collection(collection) => matches!(
+                    collection_in(program, collection)?.kind,
+                    mir::CollectionKind::ForeignString(_)
+                ),
+                _ => false,
+            };
+            if !foreign_string {
+                return Err(malformed_mir(
+                    "a foreign string pointer reads a present CString or Utf16String local",
+                ));
+            }
+            Some(pointer)
+        }
+        mir::PointerOperation::ReadForeignString { .. } => Some(mir::Type::NullableString),
         mir::PointerOperation::FromAddress { address } => {
             if address.ty() != IntegerType::UInt64 {
                 return Err(malformed_mir("a pointer is formed from a uint64 address"));
@@ -9554,6 +9570,9 @@ fn validate_collection_expression(
             }
             Ok(())
         }
+        mir::CollectionExpression::ForeignString { text, .. } => {
+            validate_foreign_string_construction(program, function, definition, text)
+        }
         mir::CollectionExpression::StringIntrinsic(call) => validate_string_intrinsic(
             program,
             function,
@@ -9583,6 +9602,33 @@ fn validate_collection_expression(
     }
 }
 
+/// `CString::from`, `Utf16String::from` and their `tryFrom` forms build an
+/// owned foreign string from a string (Decision 0148 section 9).
+fn validate_foreign_string_construction(
+    program: &mir::Program,
+    function: &mir::Function,
+    definition: &mir::CollectionType,
+    text: &mir::StringExpression,
+) -> Result<(), BackendError> {
+    let mir::CollectionKind::ForeignString(encoding) = definition.kind else {
+        return Err(malformed_mir(
+            "a foreign string construction builds a CString or Utf16String",
+        ));
+    };
+    let unit = match encoding {
+        crate::foreign::ForeignStringEncoding::Utf8 => IntegerType::UInt8,
+        crate::foreign::ForeignStringEncoding::Utf16 => IntegerType::UInt16,
+    };
+    if definition.key.is_some()
+        || definition.value != mir::Type::Scalar(mir::ScalarType::Integer(unit))
+    {
+        return Err(malformed_mir(
+            "a foreign string's collection type holds its code units",
+        ));
+    }
+    validate_string_expression(program, function, text)
+}
+
 fn validate_nullable_collection_expression(
     program: &mir::Program,
     function: &mir::Function,
@@ -9605,6 +9651,10 @@ fn validate_nullable_collection_expression(
             *access,
         ),
         mir::NullableCollectionExpression::Null(_) => Ok(()),
+        mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+            let definition = collection_in(program, collection)?;
+            validate_foreign_string_construction(program, function, definition, text)
+        }
         mir::NullableCollectionExpression::Collection(value) => {
             if value.collection() != collection {
                 return Err(malformed_mir(
@@ -9820,6 +9870,11 @@ fn validate_string_intrinsic(
                 ));
             };
             let definition = collection_in(program, collection)?;
+            if matches!(definition.kind, mir::CollectionKind::ForeignString(_)) {
+                return Err(malformed_mir(
+                    "an owned foreign string has no assertion presentation",
+                ));
+            }
             let expected = [string, int, int, string, string, int, string, string];
             for (index, (argument, expected)) in call.args[1..].iter().zip(expected).enumerate() {
                 if argument.ty() != expected {
@@ -10101,7 +10156,7 @@ fn require_writable_nullable_collection(
     use mir::NullableCollectionExpression as E;
     let writable = match value {
         E::CollectionGet { .. } => false,
-        E::Null(_) => true,
+        E::Null(_) | E::TryForeignString { .. } => true,
         E::Collection(value) => {
             return validate_collection_borrow_writability(program, function, value, true);
         }
@@ -11477,6 +11532,7 @@ fn infer_collection_expression_return_borrow(
         | mir::CollectionExpression::BytesAllocate { .. }
         | mir::CollectionExpression::ReadFileBytes { .. }
         | mir::CollectionExpression::ReadStdinBytes { .. }
+        | mir::CollectionExpression::ForeignString { .. }
         | mir::CollectionExpression::StringIntrinsic(_)
         | mir::CollectionExpression::Call {
             return_borrow: None,
@@ -11493,6 +11549,7 @@ fn infer_nullable_collection_return_borrow(
     use mir::NullableCollectionExpression as E;
     match expression {
         E::CollectionGet { access, .. } if access.removes_element() => Ok(None),
+        E::TryForeignString { .. } => Ok(None),
         E::CollectionGet { source, .. } => Ok(infer_local_return_borrow(
             program, function, *source,
         )?
@@ -13288,7 +13345,8 @@ fn collect_collection_class_local_accesses<'a>(
         mir::CollectionExpression::Property {
             object, property, ..
         } => accesses.borrow_property(*object, *property),
-        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+        mir::CollectionExpression::ReadFileBytes { path, .. }
+        | mir::CollectionExpression::ForeignString { text: path, .. } => {
             collect_string_class_local_accesses(path, accesses)
         }
         mir::CollectionExpression::Call {
@@ -13396,6 +13454,9 @@ fn collect_nullable_collection_class_local_accesses<'a>(
             if *transfer {
                 accesses.resource_transfer(*local);
             }
+        }
+        mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+            collect_string_class_local_accesses(text, accesses)
         }
         mir::NullableCollectionExpression::Null(_) => {}
     }
@@ -14565,10 +14626,13 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                     collect_integer_class_local_accesses(value, &mut accesses)
                 }
                 mir::PointerOperation::AddressOf { local, .. }
-                | mir::PointerOperation::RegionData { region: local, .. } => {
+                | mir::PointerOperation::RegionData { region: local, .. }
+                | mir::PointerOperation::ForeignStringData { string: local } => {
                     accesses.resource_read(*local)
                 }
-                mir::PointerOperation::Read { .. } | mir::PointerOperation::Address { .. } => {}
+                mir::PointerOperation::Read { .. }
+                | mir::PointerOperation::Address { .. }
+                | mir::PointerOperation::ReadForeignString { .. } => {}
             }
         }
         mir::Statement::CompletePendingRequest {
@@ -18809,6 +18873,7 @@ fn nullable_collection_expression_presence(
         mir::NullableCollectionExpression::Property { .. }
         | mir::NullableCollectionExpression::Index { .. }
         | mir::NullableCollectionExpression::CollectionGet { .. }
+        | mir::NullableCollectionExpression::TryForeignString { .. }
         | mir::NullableCollectionExpression::Call { .. } => None,
         mir::NullableCollectionExpression::Coalesce { left, right, .. } => coalesced_presence(
             nullable_collection_expression_presence(left, present),
@@ -20532,7 +20597,9 @@ fn statement_observes_property(
             mir::PointerOperation::Read { .. }
             | mir::PointerOperation::Address { .. }
             | mir::PointerOperation::AddressOf { .. }
-            | mir::PointerOperation::RegionData { .. } => false,
+            | mir::PointerOperation::RegionData { .. }
+            | mir::PointerOperation::ForeignStringData { .. }
+            | mir::PointerOperation::ReadForeignString { .. } => false,
         },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,
@@ -21379,7 +21446,8 @@ fn collection_observes_property(
             property: observed,
             ..
         } => *object == receiver && *observed == property,
-        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+        mir::CollectionExpression::ReadFileBytes { path, .. }
+        | mir::CollectionExpression::ForeignString { text: path, .. } => {
             string_observes_property(path, receiver, property)
         }
         mir::CollectionExpression::Call { args, .. } => args
@@ -21423,6 +21491,9 @@ fn nullable_collection_observes_property(
         mir::NullableCollectionExpression::Coalesce { left, right, .. } => {
             nullable_collection_observes_property(left, receiver, property)
                 || nullable_collection_observes_property(right, receiver, property)
+        }
+        mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+            string_observes_property(text, receiver, property)
         }
         mir::NullableCollectionExpression::Null(_)
         | mir::NullableCollectionExpression::Local { .. } => false,

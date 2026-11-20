@@ -4131,6 +4131,10 @@ fn foreign_value(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
         crate::foreign::ForeignType::Pointer { .. } | crate::foreign::ForeignType::Function(_) => {
             ("Pointers Cannot Be Built For PHP Output Yet", "pointers")
         }
+        crate::foreign::ForeignType::OwnedString(_) => (
+            "Foreign Strings Cannot Be Built For PHP Output Yet",
+            "`CString` and `Utf16String` values",
+        ),
         _ => (
             "Foreign Values Cannot Be Built For PHP Output Yet",
             "foreign structs and unions",

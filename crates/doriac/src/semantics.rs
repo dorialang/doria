@@ -3348,9 +3348,17 @@ fn semantic_type_capabilities(
             needs_drop: false,
             equality: false,
         },
-        // Every foreign value is a Copy value with no cleanup. Pointers,
-        // boundary values and C function pointers compare with `==`;
-        // foreign aggregates do not (Decision 0148 sections 4, 5 and 6).
+        // `CString` and `Utf16String` are Move values that own their
+        // buffer and have no `==` (Decision 0148 section 9).
+        TypeKind::Foreign(crate::foreign::ForeignType::OwnedString(_)) => EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: false,
+        },
+        // Every other foreign value is a Copy value with no cleanup.
+        // Pointers, boundary values and C function pointers compare with
+        // `==`; foreign aggregates do not (Decision 0148 sections 4, 5 and 6).
         TypeKind::Foreign(foreign) => EnumCapabilities {
             equality: !matches!(
                 foreign,
@@ -3446,6 +3454,8 @@ fn semantic_layout_shape(
                 }
             }
         }),
+        // An owned foreign string is the address of its buffer.
+        TypeKind::Foreign(crate::foreign::ForeignType::OwnedString(_)) => Some(scalar(POINTER)),
         // Foreign values have the target C layout (Decision 0148 sections 5
         // and 6); `Opaque` has none.
         TypeKind::Foreign(_) => {
@@ -3467,9 +3477,11 @@ fn semantic_layout_shape(
                 TypeKind::Foreign(
                     crate::foreign::ForeignType::Pointer { .. }
                         | crate::foreign::ForeignType::Function(_)
+                        | crate::foreign::ForeignType::OwnedString(_)
                 )
             ) {
-                // Null is address zero (Decision 0148 section 3).
+                // Null is address zero (Decision 0148 section 3); an absent
+                // owned string has no buffer.
                 return Some(scalar(POINTER));
             }
             if matches!(
@@ -17085,6 +17097,26 @@ impl<'program> Checker<'program> {
             );
             return;
         }
+        // Foreign structs, unions and owned foreign strings have no `==`
+        // (Decision 0148 sections 6 and 9); pointers and boundary values do.
+        if let Some(foreign) = [left_ty, right_ty].into_iter().find(|ty| {
+            matches!(self.types.kind(*ty), TypeKind::Foreign(_))
+                && !semantic_type_capabilities(&self.types, *ty, &HashMap::new()).equality
+        }) {
+            let display = self.types.display(foreign);
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0420",
+                    format!("`{display}` values cannot be compared for equality"),
+                    span,
+                )
+                .with_title("Foreign Value Has No Equality")
+                .with_help(
+                    "compare the fields of a foreign struct, or the strings a `CString` or `Utf16String` was made from",
+                ),
+            );
+            return;
+        }
         if self.constrained_equality_operands(left_ty, right_ty) {
             return;
         }
@@ -19522,6 +19554,11 @@ impl<'program> Checker<'program> {
             }
             self.diagnostics.push(diagnostic);
             return;
+        }
+        if let Some(operation) =
+            crate::string_surface::companion(method).and_then(|member| member.unsafe_operation)
+        {
+            self.require_unsafe(span, operation);
         }
         let Some((params, _)) = self.string_companion_signature(method) else {
             self.diagnostics.push(
