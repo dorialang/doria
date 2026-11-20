@@ -6271,8 +6271,15 @@ pub enum Statement {
 pub enum ForeignFieldAccess {
     /// Copies the field into `target`.
     Read { target: LocalId },
-    /// Stores `value` into the field.
-    Write { value: Rvalue },
+    /// Stores `value` into the field. For a fixed-length array field `T[N]`
+    /// (Decision 0148 section 6, amended 2026-11-17), `copied_elements` is
+    /// `Some(N)` and `value` is a readonly typed array region whose `N`
+    /// elements are copied, as `ForeignFieldValue::copied_elements` at
+    /// construction; another length panics with P1704.
+    Write {
+        value: Rvalue,
+        copied_elements: Option<u64>,
+    },
     /// A fixed-length array field `T[N]` as a typed array region of its
     /// `length` elements (section 6), assigned to `target`. The region
     /// borrows the aggregate; checking keeps the aggregate in place.
@@ -7421,7 +7428,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::ForeignCall { .. } => 0,
         Statement::ForeignField { access, .. } => match access {
             ForeignFieldAccess::Read { .. } | ForeignFieldAccess::Region { .. } => 0,
-            ForeignFieldAccess::Write { value } => rvalue_class_temporary_capacity(value),
+            ForeignFieldAccess::Write { value, .. } => rvalue_class_temporary_capacity(value),
         },
         Statement::Pointer { operation, .. } => match operation {
             PointerOperation::Write { value, .. } => rvalue_class_temporary_capacity(value),
@@ -10945,9 +10952,20 @@ impl fmt::Display for Statement {
                     "local{} = foreign_field(local{}, @{offset})",
                     target.0, aggregate.0
                 ),
-                ForeignFieldAccess::Write { value } => write!(
+                ForeignFieldAccess::Write {
+                    value,
+                    copied_elements: None,
+                } => write!(
                     formatter,
                     "foreign_field(local{}, @{offset}) = {value}",
+                    aggregate.0
+                ),
+                ForeignFieldAccess::Write {
+                    value,
+                    copied_elements: Some(length),
+                } => write!(
+                    formatter,
+                    "foreign_field(local{}, @{offset}) = copy_elements({value}, {length})",
                     aggregate.0
                 ),
                 ForeignFieldAccess::Region { target, length } => write!(

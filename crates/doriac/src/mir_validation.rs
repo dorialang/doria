@@ -14518,7 +14518,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             aggregate, access, ..
         } => {
             accesses.resource_read(*aggregate);
-            if let mir::ForeignFieldAccess::Write { value } = access {
+            if let mir::ForeignFieldAccess::Write { value, .. } = access {
                 collect_rvalue_class_local_accesses(value, &mut accesses);
             }
         }
@@ -20487,7 +20487,7 @@ fn statement_observes_property(
         mir::Statement::SetDiagnosticSite { .. } | mir::Statement::ForeignCall { .. } => false,
         mir::Statement::ForeignField { access, .. } => match access {
             mir::ForeignFieldAccess::Read { .. } | mir::ForeignFieldAccess::Region { .. } => false,
-            mir::ForeignFieldAccess::Write { value } => {
+            mir::ForeignFieldAccess::Write { value, .. } => {
                 rvalue_observes_property(value, receiver, property)
             }
         },

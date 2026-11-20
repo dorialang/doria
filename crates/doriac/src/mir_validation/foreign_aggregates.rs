@@ -96,6 +96,30 @@ fn validate_array_field(
     Ok(())
 }
 
+/// A value stored into the field at `offset`, by a construction or a
+/// write: of the field's type, or for a fixed-length array field of
+/// `copied_elements` elements a readonly region whose elements are copied
+/// (section 6).
+fn validate_stored_field(
+    program: &mir::Program,
+    aggregate: mir::ForeignAggregateType,
+    offset: u64,
+    value: &mir::Rvalue,
+    copied_elements: Option<u64>,
+) -> Result<(), BackendError> {
+    match copied_elements {
+        Some(length) => {
+            if value.ty().is_writable_region() {
+                return Err(malformed_mir(
+                    "a fixed-length array field is copied from a readonly region",
+                ));
+            }
+            validate_array_field(program, aggregate, offset, value.ty(), length)
+        }
+        None => validate_field(program, aggregate, offset, value.ty()),
+    }
+}
+
 pub(super) fn validate_field_access(
     program: &mir::Program,
     function: &mir::Function,
@@ -113,13 +137,16 @@ pub(super) fn validate_field_access(
             let target = local_in(function, *target)?;
             validate_field(program, aggregate_type, offset, target.ty)
         }
-        mir::ForeignFieldAccess::Write { value } => {
+        mir::ForeignFieldAccess::Write {
+            value,
+            copied_elements,
+        } => {
             if !local_in(function, aggregate)?.writable {
                 return Err(malformed_mir(
                     "a foreign field write names a readonly local",
                 ));
             }
-            validate_field(program, aggregate_type, offset, value.ty())?;
+            validate_stored_field(program, aggregate_type, offset, value, *copied_elements)?;
             validate_rvalue(program, function, value)
         }
         mir::ForeignFieldAccess::Region { target, length } => {
@@ -150,17 +177,13 @@ pub(super) fn validate_expression(
                 ));
             }
             for field in fields {
-                match field.copied_elements {
-                    Some(length) => {
-                        if field.value.ty().is_writable_region() {
-                            return Err(malformed_mir(
-                                "a fixed-length array field is copied from a readonly region",
-                            ));
-                        }
-                        validate_array_field(program, ty, field.offset, field.value.ty(), length)?
-                    }
-                    None => validate_field(program, ty, field.offset, field.value.ty())?,
-                }
+                validate_stored_field(
+                    program,
+                    ty,
+                    field.offset,
+                    &field.value,
+                    field.copied_elements,
+                )?;
                 validate_rvalue(program, function, &field.value)?;
             }
             Ok(())

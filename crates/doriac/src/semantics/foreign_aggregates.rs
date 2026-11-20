@@ -376,26 +376,14 @@ impl<'program> Checker<'program> {
                             .is_some_and(|by_position| by_position.name == field.name),
                     });
                 if let Some((_, argument)) = supplied {
-                    if let Some(known) =
-                        self.known_region_length(&argument.value, scopes, method_context)
-                    {
-                        if known != length {
-                            self.diagnostics.push(
-                                Diagnostic::new(
-                                    "E0803",
-                                    format!(
-                                        "the field `${}` holds {length} elements, and this region has {known}",
-                                        field.name
-                                    ),
-                                    argument.value.span(),
-                                )
-                                .with_title("Array Region Length Does Not Match The Field")
-                                .with_help(format!(
-                                    "supply a region of {length} elements, or omit the field, which is zero-filled, and copy into it with `copyFrom`"
-                                )),
-                            );
-                            return true;
-                        }
+                    if !self.check_fixed_array_supply(
+                        &field.name,
+                        length,
+                        &argument.value,
+                        scopes,
+                        method_context,
+                    ) {
+                        return true;
                     }
                 }
             }
@@ -415,6 +403,68 @@ impl<'program> Checker<'program> {
             method_context,
         );
         true
+    }
+
+    /// A region supplied for the fixed-length array field `$name` of
+    /// `length` elements, at construction or by assignment (section 6,
+    /// amended 2026-11-16 and 2026-11-17): a length checking can see that
+    /// differs is E0803, any other mismatch panics (P1704). Returns false
+    /// when it reported.
+    fn check_fixed_array_supply(
+        &mut self,
+        name: &str,
+        length: u64,
+        value: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let Some(known) = self.known_region_length(value, scopes, method_context) else {
+            return true;
+        };
+        if known == length {
+            return true;
+        }
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0803",
+                format!("the field `${name}` holds {length} elements, and this region has {known}"),
+                value.span(),
+            )
+            .with_title("Array Region Length Does Not Match The Field")
+            .with_help(format!(
+                "supply a region of {length} elements, or copy fewer elements into the field's region with `copyFrom`"
+            )),
+        );
+        false
+    }
+
+    /// `$value->field = $region` for a fixed-length array field: the
+    /// region's length against the field's count, as at construction.
+    /// Returns false when it reported.
+    pub(super) fn check_fixed_array_field_assignment(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let Expr::PropertyAccess {
+            object, property, ..
+        } = target
+        else {
+            return true;
+        };
+        let object_ty = self.infer_expr_type(object, scopes, method_context);
+        let Some((_, info)) = self.aggregate_of(object_ty) else {
+            return true;
+        };
+        let Some(TypeKind::Foreign(ForeignType::FixedArray { length, .. })) = info
+            .field(property)
+            .map(|field| self.types.kind(field.ty).clone())
+        else {
+            return true;
+        };
+        self.check_fixed_array_supply(property, length, value, scopes, method_context)
     }
 
     /// The element count of a region expression when checking can see it:
@@ -496,34 +546,28 @@ impl<'program> Checker<'program> {
     /// The field type of a write target, or `None` when `object_ty` is not a
     /// foreign aggregate. Writing a union member is safe. Whether the place
     /// is writable is the ownership checker's rule, as for every place.
+    ///
+    /// A whole fixed-length array field `T[N]` is assigned from a readonly
+    /// region of exactly `N` elements, copied as at construction (section
+    /// 6, amended 2026-11-17).
     pub(super) fn check_foreign_field_write(
         &mut self,
         object_ty: TypeId,
         property: &str,
         member_span: Span,
-        span: Span,
     ) -> Option<Option<TypeId>> {
         let (name, info) = self.aggregate_of(object_ty)?;
         let Some(field) = info.field(property).cloned() else {
             self.report_unknown_foreign_field(&name, &info, property, member_span);
             return Some(None);
         };
-        if matches!(
-            self.types.kind(field.ty),
-            TypeKind::Foreign(ForeignType::FixedArray { .. })
-        ) {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    crate::unsafe_code::NOT_AVAILABLE_CODE,
-                    "assigning a whole fixed-length array field is not available in this compiler",
-                    span,
-                )
-                .with_title("Fixed-Length Array Fields Cannot Be Assigned Yet")
-                .with_help(format!(
-                    "write through the field's region instead: `$value->{property}[0] = $element;` or `$value->{property}->copyFrom($source);`"
-                )),
-            );
-            return Some(None);
+        if let TypeKind::Foreign(ForeignType::FixedArray { element, .. }) =
+            self.types.kind(field.ty).clone()
+        {
+            return Some(Some(self.types.intern(TypeKind::ArrayRegion(
+                crate::types::ByteRegionKind::Readonly,
+                element,
+            ))));
         }
         Some(Some(field.ty))
     }

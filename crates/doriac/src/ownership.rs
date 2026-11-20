@@ -4947,7 +4947,10 @@ impl Checker<'_> {
                         .is_some_and(|property| property.move_type || property.mixed);
                     let retained_value = self.prepare_retained_value(&assignment.value, scopes);
                     let mut valid_function_storage = true;
-                    if let Some(value) = retained_value.as_ref() {
+                    if let Some(value) = retained_value
+                        .as_ref()
+                        .filter(|_| !self.stores_into_foreign_field(&assignment.target))
+                    {
                         let stores_on_receiver = matches!(
                             ungroup_expr(&assignment.target),
                             Expr::PropertyAccess { object, .. }
@@ -10313,6 +10316,19 @@ impl Checker<'_> {
                 .is_some_and(|collection| collection.value_mixed),
             _ => false,
         }
+    }
+
+    /// Whether `target` is a field of a foreign struct or union (Decision
+    /// 0148 section 6). A foreign aggregate is an inline Copy value that
+    /// carries no source, so a construction of one retains nothing of its
+    /// arguments; a field store is the same copy into its storage, a
+    /// fixed-length array field copying the elements of a region (amended
+    /// 2026-11-17), and keeps no loan of the stored value either.
+    fn stores_into_foreign_field(&self, target: &Expr) -> bool {
+        let Expr::PropertyAccess { object, .. } = ungroup_expr(target) else {
+            return false;
+        };
+        self.resolved_type(object).is_some_and(is_foreign_aggregate)
     }
 
     fn assignment_property_info<'a>(

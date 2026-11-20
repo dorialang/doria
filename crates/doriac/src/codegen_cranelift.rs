@@ -4028,8 +4028,8 @@ fn lower_statement(
             aggregate,
             offset,
             access,
-            ..
-        } => lower_foreign_field(builder, *aggregate, *offset, access, resources)?,
+            span,
+        } => lower_foreign_field(builder, *aggregate, *offset, access, *span, resources)?,
         mir::Statement::DropFunction { local, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
@@ -10462,48 +10462,15 @@ fn lower_foreign_aggregate_expression(
             for field in fields {
                 let value = lower_rvalue(builder, &field.value, resources)?;
                 let field_address = builder.ins().iadd_imm_u(address, field.offset as i64);
-                match field.copied_elements {
-                    // A fixed-length array field copies a region of exactly
-                    // its element count (section 6, amended 2026-11-16).
-                    Some(count) => {
-                        let mir::Type::Region(region) = field.value.ty() else {
-                            return Err(malformed_mir("a copied field is supplied from a region"));
-                        };
-                        let (_, stride) =
-                            crate::native_abi::array_region_element(resources.program, region)
-                                .ok_or_else(|| {
-                                    malformed_mir("a copied field views built elements")
-                                })?;
-                        let (data, length) = value.byte_region()?;
-                        let mismatch =
-                            builder
-                                .ins()
-                                .icmp_imm_u(IntCC::NotEqual, length, count as i64);
-                        lower_panic_if_code(
-                            builder,
-                            mismatch,
-                            crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
-                            *span,
-                            resources,
-                        )?;
-                        let stride = builder.ins().iconst(pointer, i64::from(stride));
-                        runtime_call(
-                            builder,
-                            crate::native_abi::ARRAY_REGION_COPY,
-                            &[pointer, pointer, pointer, pointer, pointer],
-                            Some(pointer),
-                            &[field_address, length, data, length, stride],
-                            resources,
-                        )?;
-                    }
-                    None => store_foreign_field(
-                        builder,
-                        field.value.ty(),
-                        field_address,
-                        value,
-                        resources,
-                    )?,
-                }
+                store_field_value(
+                    builder,
+                    field_address,
+                    &field.value,
+                    value,
+                    field.copied_elements,
+                    *span,
+                    resources,
+                )?;
             }
             Ok(address)
         }
@@ -10520,6 +10487,51 @@ fn lower_foreign_aggregate_expression(
             .ok_or_else(|| malformed_mir("a foreign aggregate call returned void"))?
             .single(),
     }
+}
+
+/// Stores a construction's or a write's field value at its address. A
+/// fixed-length array field copies a region of exactly its element count
+/// (section 6, amended 2026-11-16 and 2026-11-17), and another length
+/// panics with P1704 at `span`.
+fn store_field_value(
+    builder: &mut FunctionBuilder,
+    field_address: Value,
+    source: &mir::Rvalue,
+    value: LoweredValue,
+    copied_elements: Option<u64>,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let Some(count) = copied_elements else {
+        return store_foreign_field(builder, source.ty(), field_address, value, resources);
+    };
+    let pointer = resources.module.target_config().pointer_type();
+    let mir::Type::Region(region) = source.ty() else {
+        return Err(malformed_mir("a copied field is supplied from a region"));
+    };
+    let (_, stride) = crate::native_abi::array_region_element(resources.program, region)
+        .ok_or_else(|| malformed_mir("a copied field views built elements"))?;
+    let (data, length) = value.byte_region()?;
+    let mismatch = builder
+        .ins()
+        .icmp_imm_u(IntCC::NotEqual, length, count as i64);
+    lower_panic_if_code(
+        builder,
+        mismatch,
+        crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
+        span,
+        resources,
+    )?;
+    let stride = builder.ins().iconst(pointer, i64::from(stride));
+    runtime_call(
+        builder,
+        crate::native_abi::ARRAY_REGION_COPY,
+        &[pointer, pointer, pointer, pointer, pointer],
+        Some(pointer),
+        &[field_address, length, data, length, stride],
+        resources,
+    )?;
+    Ok(())
 }
 
 /// Stores a field value at its address inside a foreign struct or union.
@@ -10542,6 +10554,7 @@ fn lower_foreign_field(
     aggregate: mir::LocalId,
     offset: u64,
     access: &mir::ForeignFieldAccess,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -10556,9 +10569,20 @@ fn lower_foreign_field(
             let target_slot = local_slot(resources.local_slots, *target)?;
             store_lowered_to_stack(builder, resources.program, ty, target_slot, value, pointer)
         }
-        mir::ForeignFieldAccess::Write { value } => {
+        mir::ForeignFieldAccess::Write {
+            value,
+            copied_elements,
+        } => {
             let lowered = lower_rvalue(builder, value, resources)?;
-            store_foreign_field(builder, value.ty(), address, lowered, resources)
+            store_field_value(
+                builder,
+                address,
+                value,
+                lowered,
+                *copied_elements,
+                span,
+                resources,
+            )
         }
         mir::ForeignFieldAccess::Region { target, length } => {
             let ty = local_definition(resources.program, resources.function_id, *target)?.ty;

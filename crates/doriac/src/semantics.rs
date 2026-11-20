@@ -11164,6 +11164,14 @@ impl<'program> Checker<'program> {
                 );
                 let target_ty = target.ty;
                 let destination = target.destination.clone();
+                if !self.check_fixed_array_field_assignment(
+                    Self::ungroup_expr(&assignment.target),
+                    &assignment.value,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 let assignment_ok = self.check_expr_assignable(
                     target.ty,
                     &assignment.value,
@@ -18354,7 +18362,7 @@ impl<'program> Checker<'program> {
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if let Some(field) =
-                    self.check_foreign_field_write(object_ty, property, *member_span, *span)
+                    self.check_foreign_field_write(object_ty, property, *member_span)
                 {
                     return field.map(|ty| AssignmentTarget {
                         ty,

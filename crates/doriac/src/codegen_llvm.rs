@@ -5234,8 +5234,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 aggregate,
                 offset,
                 access,
-                ..
-            } => self.lower_foreign_field(*aggregate, *offset, access)?,
+                span,
+            } => self.lower_foreign_field(*aggregate, *offset, access, *span)?,
             mir::Statement::DropFunction { local, .. } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let carrier = build(self.builder.build_load(
@@ -11207,48 +11207,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         malformed_mir("a foreign field offset exceeds its aggregate")
                     })?;
                     let field_address = self.byte_offset(address, offset, "foreign.field")?;
-                    let Some(count) = field.copied_elements else {
-                        self.store_value_at_address(field_address, value, field.value.ty())?;
-                        continue;
-                    };
-                    // A fixed-length array field copies a region of exactly
-                    // its element count (section 6, amended 2026-11-16).
-                    let mir::Type::Region(region) = field.value.ty() else {
-                        return Err(malformed_mir("a copied field is supplied from a region"));
-                    };
-                    let (_, stride) = crate::native_abi::array_region_element(self.program, region)
-                        .ok_or_else(|| malformed_mir("a copied field views built elements"))?;
-                    let (data, length) = self.byte_region_parts(value.into_struct_value())?;
-                    let word = self.context.ptr_sized_int_type(self.target_data, None);
-                    let mismatch = build(self.builder.build_int_compare(
-                        IntPredicate::NE,
-                        length,
-                        word.const_int(count, false),
-                        "foreign.field.copy.mismatch",
-                    ))?;
-                    self.lower_panic_if_code(
-                        mismatch,
-                        crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
+                    self.store_field_value(
+                        field_address,
+                        &field.value,
+                        value,
+                        field.copied_elements,
                         *span,
-                    )?;
-                    let pointer = self.context.ptr_type(AddressSpace::default());
-                    self.call_runtime(
-                        crate::native_abi::ARRAY_REGION_COPY,
-                        &[
-                            pointer.into(),
-                            word.into(),
-                            pointer.into(),
-                            word.into(),
-                            word.into(),
-                        ],
-                        Some(word.into()),
-                        &[
-                            field_address.into(),
-                            length.into(),
-                            data.into(),
-                            length.into(),
-                            word.const_int(u64::from(stride), false).into(),
-                        ],
                     )?;
                 }
                 Ok(address)
@@ -11283,6 +11247,61 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(slot)
     }
 
+    /// Stores a construction's or a write's field value at its address. A
+    /// fixed-length array field copies a region of exactly its element
+    /// count (section 6, amended 2026-11-16 and 2026-11-17), and another
+    /// length panics with P1704 at `span`.
+    fn store_field_value(
+        &mut self,
+        field_address: PointerValue<'ctx>,
+        source: &mir::Rvalue,
+        value: BasicValueEnum<'ctx>,
+        copied_elements: Option<u64>,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let Some(count) = copied_elements else {
+            return self.store_value_at_address(field_address, value, source.ty());
+        };
+        let mir::Type::Region(region) = source.ty() else {
+            return Err(malformed_mir("a copied field is supplied from a region"));
+        };
+        let (_, stride) = crate::native_abi::array_region_element(self.program, region)
+            .ok_or_else(|| malformed_mir("a copied field views built elements"))?;
+        let (data, length) = self.byte_region_parts(value.into_struct_value())?;
+        let word = self.context.ptr_sized_int_type(self.target_data, None);
+        let mismatch = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            length,
+            word.const_int(count, false),
+            "foreign.field.copy.mismatch",
+        ))?;
+        self.lower_panic_if_code(
+            mismatch,
+            crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
+            span,
+        )?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        self.call_runtime(
+            crate::native_abi::ARRAY_REGION_COPY,
+            &[
+                pointer.into(),
+                word.into(),
+                pointer.into(),
+                word.into(),
+                word.into(),
+            ],
+            Some(word.into()),
+            &[
+                field_address.into(),
+                length.into(),
+                data.into(),
+                length.into(),
+                word.const_int(u64::from(stride), false).into(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// One field read or write of the foreign struct or union in
     /// `aggregate`'s slot, `offset` bytes from its start.
     fn lower_foreign_field(
@@ -11290,6 +11309,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         aggregate: mir::LocalId,
         offset: u64,
         access: &mir::ForeignFieldAccess,
+        span: crate::source::Span,
     ) -> Result<(), BackendError> {
         let base = local_slot(&self.local_slots, aggregate)?;
         let offset = u32::try_from(offset)
@@ -11328,9 +11348,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 build(self.builder.build_store(target_slot, value))?;
                 Ok(())
             }
-            mir::ForeignFieldAccess::Write { value } => {
+            mir::ForeignFieldAccess::Write {
+                value,
+                copied_elements,
+            } => {
                 let lowered = self.lower_rvalue(value)?;
-                self.store_value_at_address(address, lowered, value.ty())
+                self.store_field_value(address, value, lowered, *copied_elements, span)
             }
             mir::ForeignFieldAccess::Region { target, length } => {
                 let ty = local_in(self.function, *target)?.ty;

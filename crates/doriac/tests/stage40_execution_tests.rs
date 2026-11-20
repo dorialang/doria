@@ -1059,3 +1059,68 @@ function main(): void
         "Array Region Length Does Not Match The Field",
     );
 }
+
+#[test]
+fn assigning_a_fixed_length_array_field_copies_the_region() {
+    // Decision 0148 section 6, amended 2026-11-17.
+    let source = "
+extern \"C\" struct Tip
+{
+    uint16[3] $text;
+    uint16[3] $other;
+}
+
+extern \"C\" struct Outer
+{
+    int8 $tag;
+    Tip $tip;
+}
+
+// A writable Copy parameter is the callee's own copy.
+function replaced(writable Tip $tip, ArrayRegion<uint16> $source): Tip
+{
+    $tip->text = $source;
+    return $tip;
+}
+
+function main(): void
+{
+    writable uint16[] $letters = [72, 105, 33, 46];
+    writable Tip $tip = new Tip();
+    $tip->text = $letters->getRegion(1, 3);
+    $letters[1] = UInt16::from(0);
+    echo $tip->text[0] . \" \" . $tip->text[2];
+    $tip->other = $tip->text->getRegion(0, 3);
+    $tip->text[0] = UInt16::from(1);
+    echo \" \" . $tip->other[0];
+    $tip = replaced($tip, $letters->getRegion(0, 3));
+    echo \" \" . $tip->text[0] . \" \" . $tip->text[1];
+    $tip->text = $tip->text->getRegion(0, 3);
+    echo \" \" . $tip->text[0];
+    writable Outer $outer = new Outer(tag: 1, tip: new Tip());
+    $outer->tip->other = $tip->other->getRegion(0, 3);
+    echo \" \" . $outer->tip->other[2] . \" \" . $outer->tip->text[2];
+}
+";
+    assert_runs_natively(source, "105 46 105 72 0 72 46 0");
+    let mismatch = "
+extern \"C\" struct Tip
+{
+    uint16[3] $text;
+}
+
+function main(): void
+{
+    uint16[] $letters = [72, 105];
+    writable Tip $tip = new Tip();
+    echo \"a\";
+    $tip->text = $letters->getRegion(0, $letters->length);
+    echo $tip->text[0];
+}
+";
+    assert_panics_natively(
+        mismatch,
+        "P1704",
+        "Array Region Length Does Not Match The Field",
+    );
+}

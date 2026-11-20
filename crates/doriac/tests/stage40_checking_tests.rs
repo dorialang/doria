@@ -719,12 +719,40 @@ fn fixed_length_array_fields_read_and_are_supplied_as_regions() {
         "{declaration} function main(): void {{ let $tip = new Tip(length: 0); $tip->text[0] = UInt16::from(1); }}"
     ));
     assert!(!readonly.is_empty());
-    let assigned = findings(&format!("{declaration} function main(): void {{ uint16[] $letters = [1, 2, 3]; writable Tip $tip = new Tip(length: 0); $tip->text = $letters->getRegion(0, 3); }}"));
-    assert!(
-        assigned.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Fixed-Length Array Fields Cannot Be Assigned Yet"),
-        "{assigned:#?}"
+}
+
+#[test]
+fn assigning_a_fixed_length_array_field_copies_a_region_of_its_count() {
+    // Decision 0148 section 6, amended 2026-11-17.
+    let declaration =
+        "extern \"C\" struct Tip { uint16[3] $text; uint16[3] $other; int32 $length; }";
+    for body in [
+        "uint16[] $letters = [1, 2, 3]; writable Tip $tip = new Tip(length: 0); $tip->text = $letters->getRegion(0, 3);",
+        "uint16[] $letters = [1, 2, 3, 4]; let $count = 3; writable Tip $tip = new Tip(length: 0); $tip->text = $letters->getRegion(1, $count);",
+        "writable Tip $tip = new Tip(length: 0); $tip->text = $tip->other->getRegion(0, 3);",
+        "let $source = new Tip(length: 0); writable Tip $tip = new Tip(length: 0); ($tip->text) = $source->other;",
+    ] {
+        let source = format!("{declaration} function main(): void {{ {body} }}");
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let known = only(
+        &format!("{declaration} function main(): void {{ uint16[] $letters = [1, 2, 3, 4]; writable Tip $tip = new Tip(length: 0); $tip->text = $letters->getRegion(0, 4); }}"),
+        "E0803",
     );
+    assert_eq!(known.title, "Array Region Length Does Not Match The Field");
+    // The field of a readonly place is not assigned.
+    assert!(!codes(&format!("{declaration} function main(): void {{ uint16[] $letters = [1, 2, 3]; let $tip = new Tip(length: 0); $tip->text = $letters->getRegion(0, 3); }}")).is_empty());
+    // A writable region, including a field of a writable place, is not a
+    // readonly one, and a field is not a number.
+    for body in [
+        "writable uint16[] $letters = [1, 2, 3]; writable Tip $tip = new Tip(length: 0); $tip->text = $letters->getWritableRegion(0, 3);",
+        "writable Tip $tip = new Tip(length: 0); $tip->text = $tip->other;",
+        "writable Tip $tip = new Tip(length: 0); $tip->text += 1;",
+        "uint16[] $letters = [1, 2, 3]; writable Tip $tip = new Tip(length: 0); $tip->text = $letters;",
+    ] {
+        let source = format!("{declaration} function main(): void {{ {body} }}");
+        assert!(!codes(&source).is_empty(), "{body}");
+    }
 }
 
 const POINTERS: &str = r#"

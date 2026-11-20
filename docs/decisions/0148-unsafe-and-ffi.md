@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and section 14 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -73,6 +73,13 @@ set `%al` to the count of vector registers a System V x86_64 variadic call
 uses, and it cannot place Apple arm64 variadic arguments in their 8-byte
 stack slots. Andrew ruled on 2026-11-17: "Runtime trampoline for Cranelift
 (Recommended)". Section 14 states the rule.
+
+### Amendment: Assigning A Fixed-Length Array Field (2026-11-17)
+
+Section 6 said how a fixed-length array field is supplied at construction but
+not what assigning the whole field (`$tip->text = $region`) does. Andrew ruled
+on 2026-11-17: "Copy, same rule as construction (Recommended)". Section 6
+states the rule.
 
 ## Context
 
@@ -341,7 +348,9 @@ extern "C" union EventStorage
   supplied one is copied from an `ArrayRegion<T>` whose length must equal the
   field's count: a length known at compile time that differs is a compile
   error, and any other mismatch panics with a catalogued code (amendment of
-  2026-11-16).
+  2026-11-16). Assigning the whole field of a writable place,
+  `$tip->text = $region`, copies from a readonly region under the same rule
+  (amendment of 2026-11-17).
 - A union is built either with `new EventStorage()`, every byte zero, or with
   exactly one named member, `new EventStorage(key: $key)`, which writes that
   member and leaves every other byte zero (amendment of 2026-11-16).

@@ -366,11 +366,16 @@ pub(super) fn lower_extern_body(
 struct FieldPlace {
     aggregate: mir::LocalId,
     offset: u64,
-    /// The field's type; for a fixed-length array field, the typed array
-    /// region checking gives a read of it.
-    ty: mir::Type,
-    /// `Some(N)` for a fixed-length array field `T[N]`.
-    array_length: Option<u64>,
+    field: FieldKind,
+}
+
+/// What a foreign field holds.
+enum FieldKind {
+    /// A scalar, pointer or nested aggregate of this MIR type.
+    Value(mir::Type),
+    /// A fixed-length array field `element[length]`, read as a typed array
+    /// region and written by copying one (section 6).
+    Array { element: ResolvedType, length: u64 },
 }
 
 /// The checked facts of the foreign struct or union `ty` is, or `None` for
@@ -451,27 +456,22 @@ fn field_place(
     };
     let field_type = field.ty.clone();
     let field_offset = layout.fields[index].offset;
-    // A fixed-length array field reads as the region checking typed: its
-    // access follows the containing place (section 6).
-    let array_length = match &field_type {
-        ResolvedType::Foreign(foreign) => match foreign.as_ref() {
-            ForeignType::FixedArray { length, .. } => Some(*length),
-            _ => None,
+    let field = match fixed_array(&field_type) {
+        Some((element, length)) => FieldKind::Array {
+            element: element.clone(),
+            length,
         },
-        _ => None,
-    };
-    let ty = match array_length {
-        Some(_) => context.expression_type(expr)?,
-        None => context
-            .mir_resolved_type(&field_type)
-            .ok_or_else(|| vec![unsupported(*span, "a foreign field type has no MIR type")])?,
+        None => FieldKind::Value(
+            context
+                .mir_resolved_type(&field_type)
+                .ok_or_else(|| vec![unsupported(*span, "a foreign field type has no MIR type")])?,
+        ),
     };
     if let Some(outer) = field_place(object, context)? {
         return Ok(Some(FieldPlace {
             aggregate: outer.aggregate,
             offset: outer.offset + field_offset,
-            ty,
-            array_length,
+            field,
         }));
     }
     let aggregate = match unparenthesized_place(object) {
@@ -500,9 +500,19 @@ fn field_place(
     Ok(Some(FieldPlace {
         aggregate,
         offset: field_offset,
-        ty,
-        array_length,
+        field,
     }))
+}
+
+/// The element type and count of a fixed-length array field type.
+fn fixed_array(ty: &ResolvedType) -> Option<(&ResolvedType, u64)> {
+    let ResolvedType::Foreign(foreign) = ty else {
+        return None;
+    };
+    match foreign.as_ref() {
+        ForeignType::FixedArray { element, length } => Some((element, *length)),
+        _ => None,
+    }
 }
 
 /// The value of a foreign struct or union field read, converted to
@@ -515,22 +525,32 @@ pub(super) fn field_read(
     let Some(place) = field_place(expr, context)? else {
         return Ok(None);
     };
-    let target = context.declare_return_temp(place.ty, false);
-    let access = match (place.array_length, place.ty) {
-        (Some(length), mir::Type::Region(region)) => {
+    let (ty, target, access) = match place.field {
+        FieldKind::Value(ty) => {
+            let target = context.declare_return_temp(ty, false);
+            (ty, target, mir::ForeignFieldAccess::Read { target })
+        }
+        // A fixed-length array field reads as the region checking typed:
+        // its access follows the containing place (section 6).
+        FieldKind::Array { length, .. } => {
+            let ty = context.expression_type(expr)?;
+            let mir::Type::Region(region) = ty else {
+                return Err(vec![unsupported(
+                    expr.span(),
+                    "a fixed-length array field reads as a region",
+                )]);
+            };
             byte_region::built_element(region, expr.span(), context)?;
+            let target = context.declare_return_temp(ty, false);
             // A writable field region is the writable place its elements
             // are written through.
             context.locals[target.0].writable = region.is_writable();
-            mir::ForeignFieldAccess::Region { target, length }
+            (
+                ty,
+                target,
+                mir::ForeignFieldAccess::Region { target, length },
+            )
         }
-        (Some(_), _) => {
-            return Err(vec![unsupported(
-                expr.span(),
-                "a fixed-length array field reads as a region",
-            )])
-        }
-        (None, _) => mir::ForeignFieldAccess::Read { target },
     };
     context.push_statement(mir::Statement::ForeignField {
         aggregate: place.aggregate,
@@ -538,13 +558,15 @@ pub(super) fn field_read(
         access,
         span: expr.span(),
     });
-    convert_call_result(target, place.ty, expected, false, expr.span(), context).map(Some)
+    convert_call_result(target, ty, expected, false, expr.span(), context).map(Some)
 }
 
 /// `$aggregate->field = $value`, a compound assignment to a field, and
 /// `$aggregate->field++`; `false` when `target` is not a field of a foreign
 /// struct or union. A compound form reads the field before it evaluates
-/// the right-hand side, as every read-modify-write place does.
+/// the right-hand side, as every read-modify-write place does. A whole
+/// fixed-length array field is copied from a readonly region of its count
+/// (section 6, amended 2026-11-17).
 pub(super) fn field_write(
     target: &hir::Expr,
     update: FieldUpdate<'_>,
@@ -553,16 +575,34 @@ pub(super) fn field_write(
     let Some(place) = field_place(target, context)? else {
         return Ok(false);
     };
-    let value = match update {
-        FieldUpdate::Assign(value) => lower_rvalue_as_expected(value, place.ty, context)?,
-        FieldUpdate::Compound { .. } | FieldUpdate::Increment { .. } => {
-            let mir::Type::Scalar(scalar) = place.ty else {
+    let write = match (place.field, update) {
+        (FieldKind::Array { element, length }, FieldUpdate::Assign(value)) => {
+            let region = copied_region(&element, value.span(), context)?;
+            mir::ForeignFieldValue {
+                offset: place.offset,
+                value: lower_rvalue_as_expected(value, region, context)?,
+                copied_elements: Some(length),
+            }
+        }
+        (FieldKind::Array { .. }, _) => {
+            return Err(vec![unsupported(
+                target.span(),
+                "checking admitted a read-modify-write of a fixed-length array field",
+            )])
+        }
+        (FieldKind::Value(ty), FieldUpdate::Assign(value)) => mir::ForeignFieldValue {
+            offset: place.offset,
+            value: lower_rvalue_as_expected(value, ty, context)?,
+            copied_elements: None,
+        },
+        (FieldKind::Value(ty), update) => {
+            let mir::Type::Scalar(scalar) = ty else {
                 return Err(vec![unsupported(
                     target.span(),
                     "a read-modify-write of a foreign field needs a scalar field",
                 )]);
             };
-            let current = context.declare_return_temp(place.ty, false);
+            let current = context.declare_return_temp(ty, false);
             context.push_statement(mir::Statement::ForeignField {
                 aggregate: place.aggregate,
                 offset: place.offset,
@@ -570,7 +610,7 @@ pub(super) fn field_write(
                 span: target.span(),
             });
             let operand = mir::Operand::Local(current);
-            mir::Rvalue::Value(match update {
+            let value = mir::Rvalue::Value(match update {
                 FieldUpdate::Compound { op, value, span } => {
                     lower_compound_value(operand, scalar, op, value, span, context)?
                 }
@@ -578,13 +618,21 @@ pub(super) fn field_write(
                     lower_increment_value(operand, scalar, op, span)?
                 }
                 FieldUpdate::Assign(_) => unreachable!("handled above"),
-            })
+            });
+            mir::ForeignFieldValue {
+                offset: place.offset,
+                value,
+                copied_elements: None,
+            }
         }
     };
     context.push_statement(mir::Statement::ForeignField {
         aggregate: place.aggregate,
-        offset: place.offset,
-        access: mir::ForeignFieldAccess::Write { value },
+        offset: write.offset,
+        access: mir::ForeignFieldAccess::Write {
+            value: write.value,
+            copied_elements: write.copied_elements,
+        },
         span: target.span(),
     });
     Ok(true)
@@ -741,14 +789,16 @@ fn construct(
         supplied[index] = true;
         // A fixed-length array field is copied from a readonly region of
         // its element count (section 6, amended 2026-11-16).
-        let (field_type, copied_elements) =
-            match supplied_region(&facts.fields[index], argument, context)? {
-                Some((region, length)) => (region, Some(length)),
-                None => (
-                    mir_field_type(&facts.fields[index], argument.span, context)?,
-                    None,
-                ),
-            };
+        let (field_type, copied_elements) = match fixed_array(&facts.fields[index].ty) {
+            Some((element, length)) => (
+                copied_region(element, argument.span, context)?,
+                Some(length),
+            ),
+            None => (
+                mir_field_type(&facts.fields[index], argument.span, context)?,
+                None,
+            ),
+        };
         let value = lower_rvalue_as_expected(&argument.value, field_type, context)?;
         fields.push(mir::ForeignFieldValue {
             offset: layout.fields[index].offset,
@@ -777,31 +827,25 @@ fn construct(
     Ok(mir::ForeignAggregateExpression::Construct { ty, fields, span })
 }
 
-/// The readonly region type and element count of a fixed-length array
-/// field `T[N]` supplied at construction; `None` for another field.
-fn supplied_region(
-    field: &crate::foreign::ForeignFieldFacts,
-    argument: &hir::Argument,
+/// The readonly region type `ArrayRegion<element>` a fixed-length array
+/// field is copied from, at construction or by assignment (section 6).
+fn copied_region(
+    element: &ResolvedType,
+    span: Span,
     context: &LoweringContext,
-) -> DiagnosticResult<Option<(mir::Type, u64)>> {
-    let ResolvedType::Foreign(foreign) = &field.ty else {
-        return Ok(None);
-    };
-    let ForeignType::FixedArray { element, length } = foreign.as_ref() else {
-        return Ok(None);
-    };
+) -> DiagnosticResult<mir::Type> {
     let region = ResolvedType::ArrayRegion(
         crate::types::ByteRegionKind::Readonly,
         Box::new(element.clone()),
     );
     let Some(mir::Type::Region(region)) = context.mir_resolved_type(&region) else {
         return Err(vec![unsupported(
-            argument.span,
+            span,
             "a fixed-length array field's region type has no MIR type",
         )]);
     };
-    byte_region::built_element(region, argument.span, context)?;
-    Ok(Some((mir::Type::Region(region), *length)))
+    byte_region::built_element(region, span, context)?;
+    Ok(mir::Type::Region(region))
 }
 
 fn mir_field_type(
