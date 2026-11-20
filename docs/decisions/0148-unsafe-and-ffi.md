@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Typed Link Inputs). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, raw pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -93,7 +93,19 @@ Sections 18 and 19 said Baton writes resolved link inputs into build-plan
 schema 2 and `doriac` accepts the same inputs through repeatable flags, but
 not the input model, the field shapes or the flags. Andrew ruled on
 2026-11-20: "Typed inputs per logical library (Recommended)". Section 18
-states the rule.
+states the rule. `docs/build-plan-schema.md` (Baton Requirements) lists what
+Baton implements for it.
+
+### Amendment: Runtime Files Placed By The Compiler (2026-11-20)
+
+Section 19 said Baton copies `runtime-files` beside the built executable or
+companion, while section 18 lets `doriac compile` and `doriac run` link without
+Baton. Andrew ruled on 2026-11-20: "doriac places them for every build
+(Recommended)". `doriac` places the runtime files of every linked native
+library beside the program it builds, for direct `doriac compile`,
+`doriac run`, Baton builds and the companion library. Baton resolves them,
+records them in the receipt and passes them to `doriac` in build-plan schema
+2. Section 19 states the rule.
 
 ## Context
 
@@ -723,9 +735,11 @@ macos = { framework = "AppKit" }
 - Kinds: `pkg-config`, `system` (link by name through the default search),
   `library` with project-relative `search-paths`, and `framework` (macOS).
 - `link` is `"static"` or `"dynamic"`.
-- Baton copies `runtime-files` beside the built executable or companion and
-  gives project-local Unix libraries an rpath relative to the loading artifact.
-  `doriac run` and `baton run` make the same files reachable.
+- `doriac` places `runtime-files` beside the built executable or companion on
+  every build route and gives project-local Unix libraries an rpath relative to
+  the loading artifact. Baton passes the files in the build plan and records
+  them in the receipt; `doriac run` and `baton run` rely on that placement
+  (amendment of 2026-11-20).
 - Paths follow Decision 0118's containment rules. Resolved facts, including
   pkg-config output, are recorded in the build receipt.
 - A platform without an entry has no such library, which is valid until emitted
@@ -868,7 +882,7 @@ share one runtime state.
   `doria-companion-v1/<hash>/` under the same root as the embedded runtime
   cache, and loads it with the platform loader, searching the companion's
   directory first for its dependent libraries.
-- `runtime-files` (section 19) are placed beside the companion.
+- `doriac` places `runtime-files` (section 19) beside the companion.
 
 **Caching.** The cache key hashes compiler identity, runtime digest, the
 validated MIR of every region and host operation signature, resolved link
@@ -1155,7 +1169,9 @@ foreign call in hooks (26); no documentation enforcement, a required
   `docs/targets.md` (`windows-subsystem`), `docs/build-plan.md` (schema 2),
   `docs/dependencies.md` (transitive link inputs), `docs/toolchain.md`
   (pkg-config and native toolchain needs for `php` and `debug` builds), receipts
-  (companion and link facts), run-time file deployment, and `baton audit unsafe`.
+  (companion, link facts and runtime files, which `doriac` places), and
+  `baton audit unsafe`. `docs/build-plan-schema.md` (Baton Requirements) lists
+  the Baton side of sections 18 to 21 and 25.
 - **Benchmarks (`dorialang/benchmarks`).** Call-overhead, zero-copy and
   companion region-entry cases.
 - **Draft records owned by another session, not edited.** The geometry-math

@@ -244,3 +244,40 @@ processors, package installation, and incremental project inventory without
 changing compiler build-plan schema 1. Compiler build-plan schema 2 comes from
 Stage 40: Baton resolves `[native-libraries]`, `unsafe` and
 `windows-subsystem` from `Baton.toml` into it.
+
+## Baton Requirements
+
+Baton implements its side of Decision 0148 sections 18 to 21 and 25 as
+follows. `doriac` already accepts every field below.
+
+1. Emit schema 2 (`schemaVersion: 2`). Every package carries `unsafePolicy`:
+   `"deny"` when its `Baton.toml` sets `unsafe = "deny"`, otherwise
+   `"allow"`. A binary `selectedTarget` carries `windowsSubsystem` from the
+   target's `windows-subsystem`, `"console"` by default; a library target
+   omits it.
+2. Write `nativeLibraries` per package for the selected platform only, each
+   entry `{name, link, inputs, runtimeFiles}`. `system = "z"` becomes a
+   `library` input; `library` with `search-paths` becomes `searchPath` inputs
+   followed by a `library` input; `framework` becomes a `framework` input
+   (macOS). A library with no entry for the platform writes no entry. Paths
+   are package-relative without `..` unless absolute. Each entry has at least
+   one `library`, `framework` or `file` input, and names match
+   `[A-Za-z0-9_][A-Za-z0-9_+.-]*`.
+3. Run `pkg-config --libs <name>` for a `pkg-config` entry and map each token:
+   `-L<dir>` or `-L <dir>` to `searchPath`, `-l<name>` to `library`,
+   `-framework <name>` to `framework`, and an absolute path ending in `.a`,
+   `.so` (with or without a version suffix), `.dylib`, `.tbd` or `.lib` to
+   `file`. Any other token is rejected with a Baton diagnostic naming the
+   token and the logical library.
+4. Keep each package's `nativeLibraries` on its own package entry. `doriac`
+   links every referenced library across the graph and attributes each input
+   to its package.
+5. Record in the receipt, per package and logical library, the resolved
+   inputs, link mode, runtime files, and the raw pkg-config output and
+   version where pkg-config ran. `doriac` places runtime files beside the
+   built program, so Baton records them and does not copy them.
+6. `baton run` relies on `doriac` having placed the runtime files.
+7. Document `[native-libraries]` and `unsafe` in `project-manifest.md`,
+   `windows-subsystem` in `targets.md`, schema 2 in `build-plan.md`,
+   transitive link inputs in `dependencies.md`, and pkg-config in
+   `toolchain.md`.
