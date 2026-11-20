@@ -53,7 +53,7 @@ pub(super) fn physical(
     ))
 }
 
-fn clif_scalar(scalar: CScalar, pointer: ClifType) -> ClifType {
+pub(super) fn clif_scalar(scalar: CScalar, pointer: ClifType) -> ClifType {
     match scalar {
         CScalar::Integer { bytes: 1, .. } | CScalar::Bool => types::I8,
         CScalar::Integer { bytes: 2, .. } => types::I16,

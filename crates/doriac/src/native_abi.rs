@@ -221,6 +221,22 @@ pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
 pub const FOREIGN_CALL_FRAME: &str = "dr_v1_foreign_call_frame";
 pub const ENTER_C_FUNCTION: &str = "dr_v1_enter_c_function";
 pub const RECORD_DORIA_THREAD: &str = "dr_v1_record_doria_thread";
+/// Decision 0148 section 14 (amendment of 2026-11-17): the trampoline
+/// through which the fast profile calls a variadic C function, and the
+/// byte offsets of the runtime's `DrVariadicCallV1` it reads and writes:
+/// eight integer and eight float argument register images, the indirect
+/// result register, the System V vector register count, the stack area's
+/// size and address, and two integer and four float result registers.
+pub const VARIADIC_CALL: &str = "dr_v1_variadic_call";
+pub const VARIADIC_CALL_INTEGER: i32 = 0;
+pub const VARIADIC_CALL_FLOAT: i32 = 64;
+pub const VARIADIC_CALL_INDIRECT_RESULT: i32 = 128;
+pub const VARIADIC_CALL_VECTOR_REGISTERS: i32 = 136;
+pub const VARIADIC_CALL_STACK_BYTES: i32 = 144;
+pub const VARIADIC_CALL_STACK: i32 = 152;
+pub const VARIADIC_CALL_RETURN_INTEGER: i32 = 160;
+pub const VARIADIC_CALL_RETURN_FLOAT: i32 = 176;
+pub const VARIADIC_CALL_SIZE: u32 = 208;
 
 /// The runtime's number for a system code source, which
 /// `CAPTURE_SYSTEM_CODE` takes.

@@ -44,6 +44,7 @@ mod transfer_group;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_readiness;
 mod utf8_stream;
+mod variadic_call;
 mod wait_budget;
 #[cfg(any(windows, test))]
 mod win32;
@@ -193,6 +194,8 @@ pub use monotonic_clock::dr_v1_monotonic_clock;
 pub use system_code::{dr_v1_capture_system_code, dr_v1_last_system_code};
 pub use transfer_group::adapter::DrAdapterContextV1;
 pub use transfer_group::source::ResolveSourceCallback;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub use variadic_call::dr_v1_variadic_call;
 pub use wait_budget::{dr_v1_wait_budget_init_deadline, DrWaitBudgetV1};
 
 /// # Safety

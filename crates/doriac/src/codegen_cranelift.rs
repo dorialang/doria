@@ -21319,9 +21319,10 @@ fn lower_foreign_call(
             let address = builder.ins().stack_load(pointer, pointer, slot, 0);
             let reference = builder.import_signature(signature);
             let call = builder.ins().call_indirect(reference, address, &values);
+            let results = builder.inst_results(call).to_vec();
             return finish_foreign_call(
                 builder,
-                call,
+                &results,
                 &physical,
                 foreign.system_code,
                 outbound,
@@ -21331,6 +21332,22 @@ fn lower_foreign_call(
             );
         }
     };
+    // The fast profile calls a variadic function through the runtime
+    // trampoline (section 14, amendment of 2026-11-17).
+    if physical.fixed_parameters.is_some() {
+        let results =
+            lower_variadic_call(builder, symbol, &signature, &physical, &values, resources)?;
+        return finish_foreign_call(
+            builder,
+            &results,
+            &physical,
+            foreign.system_code,
+            outbound,
+            target,
+            target_type,
+            resources,
+        );
+    }
     let call = match resources.module.get_name(symbol) {
         Some(cranelift_module::FuncOrDataId::Func(id))
             if resources
@@ -21363,9 +21380,10 @@ fn lower_foreign_call(
             builder.ins().call(reference, &values)
         }
     };
+    let results = builder.inst_results(call).to_vec();
     finish_foreign_call(
         builder,
-        call,
+        &results,
         &physical,
         foreign.system_code,
         outbound,
@@ -21373,6 +21391,190 @@ fn lower_foreign_call(
         target_type,
         resources,
     )
+}
+
+/// Calls the variadic C function `symbol` through the runtime's variadic
+/// call trampoline (Decision 0148 section 14, amendment of 2026-11-17).
+/// `values` are the physical parameters of the call in order; each is
+/// stored where the shared layout (`c_abi::variadic_call_layout`) places
+/// it. Returns the result registers `physical`'s return reads, in order.
+fn lower_variadic_call(
+    builder: &mut FunctionBuilder,
+    symbol: &str,
+    signature: &cranelift_codegen::ir::Signature,
+    physical: &crate::native_abi::c_abi::PhysicalSignature,
+    values: &[Value],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Vec<Value>, BackendError> {
+    use crate::c_layout::CScalar;
+    use crate::native_abi::c_abi::{
+        self, PartType, PhysicalParameter, PhysicalReturn, VariadicSlot,
+    };
+    use crate::native_abi::{
+        VARIADIC_CALL, VARIADIC_CALL_FLOAT, VARIADIC_CALL_INDIRECT_RESULT, VARIADIC_CALL_INTEGER,
+        VARIADIC_CALL_RETURN_FLOAT, VARIADIC_CALL_RETURN_INTEGER, VARIADIC_CALL_SIZE,
+        VARIADIC_CALL_STACK, VARIADIC_CALL_STACK_BYTES, VARIADIC_CALL_VECTOR_REGISTERS,
+    };
+    let pointer = resources.module.target_config().pointer_type();
+    let flags = MemFlagsData::trusted();
+    let layout = c_abi::variadic_call_layout(crate::c_layout::CTarget::host(), physical);
+    if layout.placements.len() != values.len() {
+        return Err(malformed_mir("a variadic call places every value"));
+    }
+    let call = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        VARIADIC_CALL_SIZE,
+        3,
+    ));
+    let call = builder.ins().stack_addr(pointer, call, 0);
+    let stack_bytes = u32::try_from(layout.stack_bytes)
+        .map_err(|_| malformed_mir("a variadic call's stack area fits a stack slot"))?;
+    let stack = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        stack_bytes.max(16),
+        4,
+    ));
+    let stack = builder.ins().stack_addr(pointer, stack, 0);
+    // One argument register's 64-bit image of `value`: an integer widened
+    // by its signedness, a float's bits.
+    let word = |builder: &mut FunctionBuilder, value: Value, signed: bool| match builder
+        .func
+        .dfg
+        .value_type(value)
+    {
+        types::I64 => value,
+        types::F64 => builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), value),
+        types::F32 => {
+            let bits = builder
+                .ins()
+                .bitcast(types::I32, MemFlagsData::new(), value);
+            builder.ins().uextend(types::I64, bits)
+        }
+        _ if signed => builder.ins().sextend(types::I64, value),
+        _ => builder.ins().uextend(types::I64, value),
+    };
+    for ((parameter, slots), value) in physical
+        .parameters
+        .iter()
+        .zip(&layout.placements)
+        .zip(values.iter().copied())
+    {
+        let signed = matches!(
+            parameter,
+            PhysicalParameter::Scalar {
+                scalar: CScalar::Integer { signed: true, .. },
+                ..
+            }
+        );
+        for slot in slots {
+            match *slot {
+                VariadicSlot::Integer(index) => {
+                    let image = word(builder, value, signed);
+                    let offset = VARIADIC_CALL_INTEGER + 8 * index as i32;
+                    builder.ins().store(flags, image, call, offset);
+                }
+                VariadicSlot::Float(index) => {
+                    let offset = VARIADIC_CALL_FLOAT + 8 * index as i32;
+                    builder.ins().store(flags, value, call, offset);
+                }
+                VariadicSlot::IndirectResult => {
+                    builder
+                        .ins()
+                        .store(flags, value, call, VARIADIC_CALL_INDIRECT_RESULT);
+                }
+                // A System V memory-class aggregate copies its image, which
+                // is whole 8-byte words long.
+                VariadicSlot::Stack { offset, size }
+                    if matches!(parameter, PhysicalParameter::StackImage { .. }) =>
+                {
+                    for chunk in (0..size).step_by(8) {
+                        let part = builder.ins().load(types::I64, flags, value, chunk as i32);
+                        builder
+                            .ins()
+                            .store(flags, part, stack, (offset + chunk) as i32);
+                    }
+                }
+                VariadicSlot::Stack { offset, size: 8 } => {
+                    let image = word(builder, value, signed);
+                    builder.ins().store(flags, image, stack, offset as i32);
+                }
+                // A fixed Apple arm64 stack argument at its natural size.
+                VariadicSlot::Stack { offset, .. } => {
+                    builder.ins().store(flags, value, stack, offset as i32);
+                }
+            }
+        }
+    }
+    let vector_registers = builder
+        .ins()
+        .iconst(types::I64, layout.vector_registers as i64);
+    builder.ins().store(
+        flags,
+        vector_registers,
+        call,
+        VARIADIC_CALL_VECTOR_REGISTERS,
+    );
+    let stack_size = builder.ins().iconst(types::I64, i64::from(stack_bytes));
+    builder
+        .ins()
+        .store(flags, stack_size, call, VARIADIC_CALL_STACK_BYTES);
+    builder.ins().store(flags, stack, call, VARIADIC_CALL_STACK);
+    let function = match resources.module.get_name(symbol) {
+        Some(cranelift_module::FuncOrDataId::Func(id)) => id,
+        Some(cranelift_module::FuncOrDataId::Data(_)) => {
+            return Err(malformed_mir(format!(
+                "the foreign symbol {symbol} names data of this object"
+            )))
+        }
+        None => resources
+            .module
+            .declare_function(symbol, Linkage::Import, signature)
+            .map_err(|error| backend_failure(error.to_string()))?,
+    };
+    let function = resources
+        .module
+        .declare_func_in_func(function, builder.func);
+    let function = builder.ins().func_addr(pointer, function);
+    runtime_call(
+        builder,
+        VARIADIC_CALL,
+        &[pointer, pointer],
+        None,
+        &[function, call],
+        resources,
+    )?;
+    // Integer parts take the integer result registers in order and float
+    // parts the float ones, as every convention returns them.
+    let mut integers = 0;
+    let mut floats = 0;
+    let mut read = |builder: &mut FunctionBuilder, ty: ClifType, float: bool| {
+        let offset = if float {
+            floats += 1;
+            VARIADIC_CALL_RETURN_FLOAT + 8 * (floats - 1)
+        } else {
+            integers += 1;
+            VARIADIC_CALL_RETURN_INTEGER + 8 * (integers - 1)
+        };
+        builder.ins().load(ty, flags, call, offset)
+    };
+    Ok(match &physical.return_value {
+        PhysicalReturn::Void | PhysicalReturn::Indirect => Vec::new(),
+        PhysicalReturn::Scalar(scalar) => vec![read(
+            builder,
+            c_entry::clif_scalar(*scalar, pointer),
+            scalar.is_float(),
+        )],
+        PhysicalReturn::Parts(parts) => parts
+            .iter()
+            .map(|(_, ty)| match ty {
+                PartType::Integer64 => read(builder, types::I64, false),
+                PartType::Float32 => read(builder, types::F32, true),
+                PartType::Float64 => read(builder, types::F64, true),
+            })
+            .collect(),
+    })
 }
 
 /// The runtime's record of the outbound foreign call in progress, and the
@@ -21391,7 +21593,7 @@ struct OutboundRecord {
 #[allow(clippy::too_many_arguments)]
 fn finish_foreign_call(
     builder: &mut FunctionBuilder,
-    call: cranelift_codegen::ir::Inst,
+    results: &[Value],
     physical: &crate::native_abi::c_abi::PhysicalSignature,
     system_code: Option<crate::foreign::SystemCodeSource>,
     outbound: OutboundRecord,
@@ -21438,8 +21640,7 @@ fn finish_foreign_call(
                 3,
             ));
             let image = builder.ins().stack_addr(pointer, image, 0);
-            let results = builder.inst_results(call).to_vec();
-            for ((offset, _), value) in parts.iter().zip(results) {
+            for ((offset, _), value) in parts.iter().zip(results.iter().copied()) {
                 builder
                     .ins()
                     .store(MemFlagsData::trusted(), value, image, *offset as i32);
@@ -21460,7 +21661,9 @@ fn finish_foreign_call(
         PhysicalReturn::Indirect => return Ok(()),
         PhysicalReturn::Void => return Err(malformed_mir("a void foreign call assigns no result")),
     };
-    let value = builder.inst_results(call)[0];
+    let value = *results
+        .first()
+        .ok_or_else(|| malformed_mir("a foreign call with a result produced none"))?;
     let value = match (scalar, ty) {
         // C `_Bool` is 0 or 1; any other byte still reads as `true`.
         (CScalar::Bool, _) => {

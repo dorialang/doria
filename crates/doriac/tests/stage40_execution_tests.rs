@@ -1564,6 +1564,54 @@ function main(): void
 }
 
 #[test]
+fn variadic_foreign_functions_are_called_per_arity_on_every_native_profile() {
+    // Decision 0148 section 14: one binding per used arity. LLVM calls
+    // `snprintf` directly; Cranelift calls it through the runtime's variadic
+    // call trampoline (amendment of 2026-11-17). The second binding passes
+    // more values than the argument registers hold.
+    let source = "use Doria\\Std\\Ffi\\{CChar, CSize, CString, LinkName, MutPtr, Ptr, Variadic};
+use Doria\\Std\\Io\\WritableByteRegion;
+
+extern \"C\"
+{
+    /** @safety `$buffer` holds `$size` bytes and `$format` matches the values. */
+    #[LinkName(\"snprintf\")]
+    #[Variadic(fixedParameters: 3)]
+    function formatThree(MutPtr<CChar> $buffer, CSize $size, Ptr<CChar> $format,
+        int32 $count, float64 $ratio, int64 $total): int32;
+
+    /** @safety `$buffer` holds `$size` bytes and `$format` matches the values. */
+    #[LinkName(\"snprintf\")]
+    #[Variadic(fixedParameters: 3)]
+    function formatMany(MutPtr<CChar> $buffer, CSize $size, Ptr<CChar> $format,
+        int64 $a, int64 $b, int64 $c, int64 $d, int64 $e, int64 $f,
+        float64 $g, float64 $h, float64 $i, float64 $j, float64 $k,
+        float64 $l, float64 $m, float64 $n, float64 $o): int32;
+}
+
+function main(): void
+{
+    let writable $bytes = Bytes::allocate(128);
+    let $three = CString::from(\"%d %.2f %lld\");
+    let $many = CString::from(\"%lld %lld %lld %lld %lld %lld %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f\");
+    unsafe {
+        writable WritableByteRegion $region = $bytes->getWritableRegion(0, 128);
+        MutPtr<CChar> $buffer = MutPtr::cast($region->writablePointer);
+        let $written = formatThree($buffer, CSize::from(128), $three->pointer, 7, 2.5, -9);
+        echo $written . \" \" . (String::fromCString(Ptr::from($buffer)) ?? \"invalid\") . \"\\n\";
+        formatMany($buffer, CSize::from(128), $many->pointer, 1, 2, 3, 4, 5, 6,
+            0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5);
+        echo String::fromCString(Ptr::from($buffer)) ?? \"invalid\";
+    }
+}
+";
+    assert_runs_natively(
+        source,
+        "9 7 2.50 -9\n1 2 3 4 5 6 0.5 1.5 2.5 3.5 4.5 5.5 6.5 7.5 8.5",
+    );
+}
+
+#[test]
 fn a_c_entry_receives_and_returns_every_c_form() {
     // A C function pointer value holding a C entry's address calls it
     // under the C convention, so each value crosses the boundary twice:

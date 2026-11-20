@@ -524,17 +524,10 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
         "{diagnostics:#?}"
     );
 
-    for (declaration, title) in [
-        (
-            "extern \"C\" { /** @safety Any value. */ #[LinkName(\"printf\")] #[Variadic(fixedParameters: 1)] function printInteger(Ptr<CChar> $format, int32 $value): int32; }",
-            "Variadic Foreign Functions Cannot Be Built Yet",
-        ),
-    ]
-    .into_iter()
-    .chain((!cfg!(windows)).then_some((
+    for (declaration, title) in (!cfg!(windows)).then_some((
         "extern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::WindowsLastError)] function close(int32 $descriptor): int32; }",
         "Windows Last Error Capture Cannot Be Built Here Yet",
-    ))) {
+    )) {
         let source = format!(
             "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, LinkName, Ptr, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
         );

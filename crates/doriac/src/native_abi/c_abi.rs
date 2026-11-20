@@ -77,6 +77,8 @@ pub enum ReturnPassing {
 pub struct SignatureClassification {
     pub parameters: Vec<ArgumentPassing>,
     pub return_value: ReturnPassing,
+    /// The count of fixed parameters of a variadic binding (section 14).
+    pub fixed_parameters: Option<usize>,
 }
 
 /// How a narrow integer or `bool` argument or result is widened.
@@ -136,6 +138,7 @@ pub fn classify(
     SignatureClassification {
         parameters,
         return_value,
+        fixed_parameters,
     }
 }
 
@@ -480,6 +483,10 @@ pub enum PhysicalReturn {
 pub struct PhysicalSignature {
     pub parameters: Vec<PhysicalParameter>,
     pub return_value: PhysicalReturn,
+    /// For a variadic call, the count of leading `parameters` that come
+    /// from the fixed arguments (and the result address); the rest are the
+    /// variadic arguments.
+    pub fixed_parameters: Option<usize>,
 }
 
 /// The bytes a backend reserves for an argument's or result's memory image
@@ -517,7 +524,17 @@ pub fn physical_signature(
     // Registers a backend has filled, by class, which only AArch64 padding
     // reads; the result address travels in `x8` there.
     let mut used = RegisterUse::default();
+    let mut fixed_parameters = None;
     for (argument, passing) in classification.parameters.iter().enumerate() {
+        // Apple arm64 places every variadic argument on the stack, so no
+        // register needs padding before one.
+        let apple_variadic = classification
+            .fixed_parameters
+            .is_some_and(|fixed| argument >= fixed)
+            && target.calling_convention() == CCallingConvention::AppleArm64;
+        if classification.fixed_parameters == Some(argument) {
+            fixed_parameters = Some(parameters.len());
+        }
         match passing {
             ArgumentPassing::Scalar(scalar) => used.push(
                 &mut parameters,
@@ -575,7 +592,7 @@ pub fn physical_signature(
                 },
             ),
             ArgumentPassing::IndirectCopy { on_stack } => {
-                if *on_stack {
+                if *on_stack && !apple_variadic {
                     used.pad(&mut parameters, PartClass::Integer);
                 }
                 used.push(&mut parameters, PhysicalParameter::CopyAddress { argument });
@@ -594,6 +611,9 @@ pub fn physical_signature(
         ReturnPassing::Indirect => PhysicalReturn::Indirect,
     };
     PhysicalSignature {
+        fixed_parameters: classification
+            .fixed_parameters
+            .map(|_| fixed_parameters.unwrap_or(parameters.len())),
         parameters,
         return_value,
     }
@@ -640,6 +660,168 @@ impl RegisterUse {
         while *self.count(class) < AARCH64_ARGUMENT_REGISTERS {
             self.push(parameters, PhysicalParameter::Padding(class));
         }
+    }
+}
+
+// The variadic call trampoline -----------------------------------------------
+
+/// Where the runtime's variadic call trampoline (`dr_v1_variadic_call`,
+/// Decision 0148 section 14, amendment of 2026-11-17) places one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VariadicSlot {
+    /// The argument register of index `n` among the general-purpose ones:
+    /// `rdi rsi rdx rcx r8 r9` on System V, `rcx rdx r8 r9` on Windows x64,
+    /// `x0`-`x7` on AArch64.
+    Integer(usize),
+    /// The floating-point argument register of index `n`: `xmm0`-`xmm7` or
+    /// `v0`-`v7`. A `float32` travels in its low four bytes.
+    Float(usize),
+    /// The AArch64 indirect result register `x8`.
+    IndirectResult,
+    /// `size` bytes at `offset` in the stack argument area.
+    Stack { offset: u64, size: u64 },
+}
+
+/// Where every value of a variadic call goes. The compiler fills the
+/// trampoline's register images and stack area from it; the trampoline
+/// only loads them, so the convention's rules live here alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VariadicCallLayout {
+    /// The slots of each [`PhysicalSignature`] parameter, in order: one,
+    /// two for a Windows x64 variadic float (a float register and the
+    /// integer register of the same position), none for padding.
+    pub placements: Vec<Vec<VariadicSlot>>,
+    /// The stack argument area, a multiple of 16 bytes, including Windows
+    /// x64's 32-byte shadow area.
+    pub stack_bytes: u64,
+    /// The count of vector registers used, which System V passes in `%al`
+    /// to a variadic callee; 0 elsewhere.
+    pub vector_registers: u64,
+}
+
+/// The trampoline layout of a classified variadic call. Fixed arguments
+/// travel as in any call; the variadic ones follow the convention's rules
+/// for them: System V counts the vector registers in `%al`, Windows x64
+/// duplicates a float in the integer register of its position, Apple arm64
+/// places each in its own 8-byte stack slot, and AAPCS64 treats them as
+/// fixed.
+pub fn variadic_call_layout(target: CTarget, physical: &PhysicalSignature) -> VariadicCallLayout {
+    let convention = target.calling_convention();
+    let fixed = physical
+        .fixed_parameters
+        .unwrap_or(physical.parameters.len());
+    let mut integers = 0;
+    let mut floats = 0;
+    let mut stack = 0;
+    let mut placements = Vec::with_capacity(physical.parameters.len());
+    // The next slot of `size` bytes aligned to `align` in the stack area.
+    let stack_slot = |stack: &mut u64, size: u64, align: u64| {
+        let offset = stack.div_ceil(align) * align;
+        *stack = offset + size;
+        VariadicSlot::Stack { offset, size }
+    };
+    for (index, parameter) in physical.parameters.iter().enumerate() {
+        let variadic = index >= fixed;
+        // Whether the value travels in an integer register, a float
+        // register, or neither.
+        let class = match parameter {
+            PhysicalParameter::Scalar { scalar, .. } if scalar.is_float() => Some(PartClass::Float),
+            PhysicalParameter::Part {
+                ty: PartType::Float32 | PartType::Float64,
+                ..
+            } => Some(PartClass::Float),
+            PhysicalParameter::Padding(class) => Some(*class),
+            PhysicalParameter::StackImage { .. } => None,
+            _ => Some(PartClass::Integer),
+        };
+        // The natural size of a value that reaches the stack.
+        let natural = match parameter {
+            PhysicalParameter::Scalar { scalar, .. } => scalar.size(),
+            _ => 8,
+        };
+        let slots = match convention {
+            CCallingConvention::SystemV => match (parameter, class) {
+                (PhysicalParameter::StackImage { size, .. }, _) => {
+                    vec![stack_slot(&mut stack, *size, 8)]
+                }
+                (_, Some(PartClass::Float)) if floats < SYSTEM_V_FLOAT_REGISTERS => {
+                    floats += 1;
+                    vec![VariadicSlot::Float(floats - 1)]
+                }
+                (_, Some(PartClass::Integer)) if integers < SYSTEM_V_INTEGER_REGISTERS => {
+                    integers += 1;
+                    vec![VariadicSlot::Integer(integers - 1)]
+                }
+                _ => vec![stack_slot(&mut stack, 8, 8)],
+            },
+            CCallingConvention::Windows64 => {
+                // Each value takes the next of four positions, whatever
+                // its class; later values take 8-byte stack slots after
+                // the shadow area.
+                let position = integers;
+                integers += 1;
+                if position >= 4 {
+                    vec![stack_slot(&mut stack, 8, 8)]
+                } else if class == Some(PartClass::Float) {
+                    let mut slots = vec![VariadicSlot::Float(position)];
+                    if variadic {
+                        slots.push(VariadicSlot::Integer(position));
+                    }
+                    slots
+                } else {
+                    vec![VariadicSlot::Integer(position)]
+                }
+            }
+            CCallingConvention::Aapcs64 | CCallingConvention::AppleArm64 => {
+                let apple = convention == CCallingConvention::AppleArm64;
+                match (parameter, class) {
+                    (PhysicalParameter::ResultAddress, _) => vec![VariadicSlot::IndirectResult],
+                    _ if variadic && apple => vec![stack_slot(&mut stack, 8, 8)],
+                    (PhysicalParameter::Padding(_), Some(PartClass::Float)) => {
+                        floats = (floats + 1).min(AARCH64_REGISTERS);
+                        Vec::new()
+                    }
+                    (PhysicalParameter::Padding(_), _) => {
+                        integers = (integers + 1).min(AARCH64_REGISTERS);
+                        Vec::new()
+                    }
+                    (_, Some(PartClass::Float)) if floats < AARCH64_REGISTERS => {
+                        floats += 1;
+                        vec![VariadicSlot::Float(floats - 1)]
+                    }
+                    (_, Some(PartClass::Integer)) if integers < AARCH64_REGISTERS => {
+                        integers += 1;
+                        vec![VariadicSlot::Integer(integers - 1)]
+                    }
+                    // Apple arm64 packs fixed stack arguments at their
+                    // natural size; AAPCS64 gives each an 8-byte slot.
+                    _ if apple => vec![stack_slot(&mut stack, natural, natural)],
+                    _ => vec![stack_slot(&mut stack, natural.max(8), 8)],
+                }
+            }
+        };
+        placements.push(slots);
+    }
+    let vector_registers = match convention {
+        CCallingConvention::SystemV => floats as u64,
+        _ => 0,
+    };
+    let shadow = match convention {
+        CCallingConvention::Windows64 => 32,
+        _ => 0,
+    };
+    // Windows x64 stack slots follow the shadow area.
+    if shadow > 0 {
+        for slot in placements.iter_mut().flatten() {
+            if let VariadicSlot::Stack { offset, .. } = slot {
+                *offset += shadow;
+            }
+        }
+    }
+    VariadicCallLayout {
+        placements,
+        stack_bytes: (stack + shadow).div_ceil(16) * 16,
+        vector_registers,
     }
 }
 
@@ -1027,5 +1209,95 @@ mod tests {
             PhysicalReturn::Parts(vec![(0, PartType::Integer64), (8, PartType::Float64)])
         );
         assert_eq!(padded_image_size(12), 16);
+    }
+
+    fn variadic_layout(target: CTarget, parameters: &[CType], fixed: usize) -> VariadicCallLayout {
+        let classification = classify(target, parameters, None, Some(fixed));
+        let physical = physical_signature(target, parameters, &classification);
+        assert_eq!(physical.fixed_parameters, Some(fixed));
+        variadic_call_layout(target, &physical)
+    }
+
+    #[test]
+    fn a_variadic_call_places_each_argument_by_its_convention() {
+        use VariadicSlot::{Float, Integer, Stack};
+        // printf(const char *format, ...) with an int and a double.
+        let printf = [CType::Scalar(CScalar::Pointer), INT32, FLOAT64];
+        let system_v = variadic_layout(LINUX_X86, &printf, 1);
+        assert_eq!(
+            system_v.placements,
+            [vec![Integer(0)], vec![Integer(1)], vec![Float(0)]]
+        );
+        assert_eq!((system_v.stack_bytes, system_v.vector_registers), (0, 1));
+        // Windows x64 duplicates a variadic double in the integer register
+        // of its position and keeps the 32-byte shadow area.
+        let windows = variadic_layout(WINDOWS, &printf, 1);
+        assert_eq!(
+            windows.placements,
+            [
+                vec![Integer(0)],
+                vec![Integer(1)],
+                vec![Float(2), Integer(2)]
+            ]
+        );
+        assert_eq!((windows.stack_bytes, windows.vector_registers), (32, 0));
+        // Apple arm64 gives each variadic argument its own 8-byte slot.
+        let apple = variadic_layout(MAC_ARM, &printf, 1);
+        assert_eq!(
+            apple.placements,
+            [
+                vec![Integer(0)],
+                vec![Stack { offset: 0, size: 8 }],
+                vec![Stack { offset: 8, size: 8 }]
+            ]
+        );
+        assert_eq!(apple.stack_bytes, 16);
+        // AAPCS64 passes variadic arguments as fixed ones.
+        let linux_arm = variadic_layout(LINUX_ARM, &printf, 1);
+        assert_eq!(
+            linux_arm.placements,
+            [vec![Integer(0)], vec![Integer(1)], vec![Float(0)]]
+        );
+        assert_eq!(linux_arm.stack_bytes, 0);
+    }
+
+    #[test]
+    fn variadic_arguments_past_the_registers_take_stack_slots() {
+        use VariadicSlot::{Integer, Stack};
+        let integers = [INT64; 8];
+        let system_v = variadic_layout(LINUX_X86, &integers, 1);
+        assert_eq!(system_v.placements[5], [Integer(5)]);
+        assert_eq!(system_v.placements[6], [Stack { offset: 0, size: 8 }]);
+        assert_eq!(system_v.placements[7], [Stack { offset: 8, size: 8 }]);
+        assert_eq!(system_v.stack_bytes, 16);
+        let windows = variadic_layout(WINDOWS, &integers[..5], 1);
+        assert_eq!(windows.placements[3], [Integer(3)]);
+        assert_eq!(
+            windows.placements[4],
+            [Stack {
+                offset: 32,
+                size: 8
+            }]
+        );
+        assert_eq!(windows.stack_bytes, 48);
+        // A struct after the fixed arguments on Apple arm64 fills whole
+        // 8-byte slots, and one over 16 bytes travels as the address of a
+        // copy in a slot, with no register padding before it.
+        let pair = record(vec![INT64, INT32]);
+        let wide = record(vec![INT64, INT64, INT64]);
+        let apple = variadic_layout(MAC_ARM, &[INT32, pair, wide], 1);
+        assert_eq!(
+            apple.placements,
+            [
+                vec![Integer(0)],
+                vec![Stack { offset: 0, size: 8 }],
+                vec![Stack { offset: 8, size: 8 }],
+                vec![Stack {
+                    offset: 16,
+                    size: 8
+                }]
+            ]
+        );
+        assert_eq!(apple.stack_bytes, 32);
     }
 }

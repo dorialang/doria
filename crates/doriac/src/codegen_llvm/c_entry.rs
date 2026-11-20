@@ -121,17 +121,21 @@ pub(super) fn c_function_type<'ctx>(
             PhysicalParameter::CopyAddress { .. } => pointer.into(),
         });
     }
+    // A variadic function (Decision 0148 section 14) declares its fixed
+    // parameters; LLVM places the variadic ones as the convention requires.
+    let variadic = physical.fixed_parameters.is_some();
     let parameter_types = parameter_types
         .into_iter()
+        .take(physical.fixed_parameters.unwrap_or(usize::MAX))
         .map(BasicMetadataTypeEnum::from)
         .collect::<Vec<_>>();
     // The bits above a narrow result are not relied on.
     let function_type = match &physical.return_value {
         PhysicalReturn::Scalar(scalar) => {
-            scalar_type(context, *scalar).fn_type(&parameter_types, false)
+            scalar_type(context, *scalar).fn_type(&parameter_types, variadic)
         }
         PhysicalReturn::Parts(parts) if parts.len() == 1 => {
-            part_type(context, parts[0].1).fn_type(&parameter_types, false)
+            part_type(context, parts[0].1).fn_type(&parameter_types, variadic)
         }
         PhysicalReturn::Parts(parts) => context
             .struct_type(
@@ -141,9 +145,9 @@ pub(super) fn c_function_type<'ctx>(
                     .collect::<Vec<_>>(),
                 false,
             )
-            .fn_type(&parameter_types, false),
+            .fn_type(&parameter_types, variadic),
         PhysicalReturn::Void | PhysicalReturn::Indirect => {
-            context.void_type().fn_type(&parameter_types, false)
+            context.void_type().fn_type(&parameter_types, variadic)
         }
     };
     (function_type, attributes)

@@ -22815,8 +22815,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             function_type,
                             Some(Linkage::External),
                         );
+                        // A variadic argument's attributes belong to the call.
                         for (index, attribute) in &attributes {
-                            function.add_attribute(AttributeLoc::Param(*index), *attribute);
+                            if *index < function_type.count_param_types() {
+                                function.add_attribute(AttributeLoc::Param(*index), *attribute);
+                            }
                         }
                         function
                     }
