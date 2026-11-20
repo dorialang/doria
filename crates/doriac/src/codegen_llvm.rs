@@ -22820,32 +22820,30 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into(),
                 )
             }
-            // A closed class's handle is its object and a shared
-            // reference's its word; an open class's is a runtime box of its
-            // two words (Decision 0148 section 11).
+            // A one-word value is its own handle; a two-word carrier is a
+            // runtime box of its two words (`mir::Program::handle_carrier`,
+            // Decision 0148 section 11).
             mir::PointerOperation::CreateHandle { value } => {
-                let ty = value.ty();
+                let carrier = self.program.handle_carrier(value.ty());
                 let lowered = self.lower_rvalue(value)?;
-                let address = match ty {
-                    mir::Type::Class(class) => match self.class_parts(lowered, class)? {
-                        (object, Some(descriptor)) => {
-                            self.set_active_panic_site(span)?;
-                            let pointer_type = self.context.ptr_type(AddressSpace::default());
-                            self.call_runtime(
-                                crate::native_abi::HANDLE_BOX_CREATE,
-                                &[
-                                    pointer_type.into(),
-                                    pointer_type.into(),
-                                    pointer_type.into(),
-                                ],
-                                Some(pointer_type.into()),
-                                &[self.current_frame.into(), object.into(), descriptor.into()],
-                            )?
-                            .ok_or_else(|| backend_failure("a handle box produced no address"))?
-                            .into_pointer_value()
-                        }
-                        (object, None) => object,
-                    },
+                let address = match carrier {
+                    Some(mir::HandleCarrier::Boxed) => {
+                        let (first, second) = self.open_class_parts(lowered)?;
+                        self.set_active_panic_site(span)?;
+                        let pointer_type = self.context.ptr_type(AddressSpace::default());
+                        self.call_runtime(
+                            crate::native_abi::HANDLE_BOX_CREATE,
+                            &[
+                                pointer_type.into(),
+                                pointer_type.into(),
+                                pointer_type.into(),
+                            ],
+                            Some(pointer_type.into()),
+                            &[self.current_frame.into(), first.into(), second.into()],
+                        )?
+                        .ok_or_else(|| backend_failure("a handle box produced no address"))?
+                        .into_pointer_value()
+                    }
                     _ => lowered.into_pointer_value(),
                 };
                 Some(build(self.builder.build_ptr_to_int(address, word, "handle"))?.into())
@@ -22862,23 +22860,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     pointer_type,
                     "handle",
                 ))?;
-                Some(match ty {
-                    mir::Type::Class(class) if class_uses_open_carrier(self.program, *class) => {
-                        let object = build(self.builder.build_load(
+                Some(match self.program.handle_carrier(*ty) {
+                    Some(mir::HandleCarrier::Boxed) => {
+                        let first = build(self.builder.build_load(
                             pointer_type,
                             address,
-                            "handle.object",
+                            "handle.first",
                         ))?
                         .into_pointer_value();
-                        let descriptor_address = self.byte_offset(
+                        let second_address = self.byte_offset(
                             address,
                             self.target_data.get_pointer_byte_size(None),
-                            "handle.descriptor",
+                            "handle.second",
                         )?;
-                        let descriptor = build(self.builder.build_load(
+                        let second = build(self.builder.build_load(
                             pointer_type,
-                            descriptor_address,
-                            "handle.descriptor",
+                            second_address,
+                            "handle.second",
                         ))?
                         .into_pointer_value();
                         if *reclaim {
@@ -22889,7 +22887,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 &[address.into()],
                             )?;
                         }
-                        self.open_class_value(object, descriptor)?.into()
+                        // Both two-word carriers share one LLVM shape
+                        // (`open_class_carrier_type`).
+                        self.open_class_value(first, second)?.into()
                     }
                     _ => address.into(),
                 })

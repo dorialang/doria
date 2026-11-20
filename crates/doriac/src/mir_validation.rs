@@ -6534,15 +6534,6 @@ fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
 
 /// The types a handle holds (Decision 0148 section 11): class values and
 /// the shared references whose carrier is one word.
-fn handle_value_type(ty: mir::Type) -> bool {
-    ty.shared_interface().is_none()
-        && matches!(
-            ty,
-            mir::Type::Class(_)
-                | mir::Type::SharedReference(_)
-                | mir::Type::WritableSharedReference(_)
-        )
-}
 
 /// A pointer operation reads a pointer local and assigns a result of its
 /// own type (Decision 0148 section 4).
@@ -6639,9 +6630,9 @@ fn validate_pointer_operation(
         }
         mir::PointerOperation::ReadForeignString { .. } => Some(mir::Type::NullableString),
         mir::PointerOperation::CreateHandle { value } => {
-            if !handle_value_type(value.ty()) {
+            if program.handle_carrier(value.ty()).is_none() {
                 return Err(malformed_mir(
-                    "a handle holds a class value or a one-word shared reference",
+                    "a handle holds a class value or a shared reference",
                 ));
             }
             if value.borrows_move_value() {
@@ -6651,9 +6642,9 @@ fn validate_pointer_operation(
             Some(pointer)
         }
         mir::PointerOperation::FromHandle { ty, .. } => {
-            if !handle_value_type(*ty) {
+            if program.handle_carrier(*ty).is_none() {
                 return Err(malformed_mir(
-                    "a handle gives back a class value or a one-word shared reference",
+                    "a handle gives back a class value or a shared reference",
                 ));
             }
             Some(*ty)

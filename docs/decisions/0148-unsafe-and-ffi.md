@@ -153,7 +153,10 @@ ruled on three naming cards: "`Pointer<T>` and `WritablePointer<T>`
 - The earlier spellings are not kept as aliases.
 - A closed class's handle is its object pointer, and an open class's handle
   points to a heap box holding the object and its descriptor. Section 11
-  states the rule.
+  states the rule. As a consequence of the same ruling, every two-word
+  carrier is boxed the same way: a handle of a `SharedReference<I>` or
+  `WritableSharedReference<I>` to an interface `I` points to a box holding
+  its two words, and `reclaim` frees the box.
 
 ## Context
 
@@ -598,7 +601,10 @@ region works with every region-taking API, including the Decision 0110 streams.
   nothing. An open class's handle points to a heap box holding the object and
   its class descriptor: `Handle::reclaim` frees the box and returns the value
   with its exact dynamic type, and `Handle::borrow` reads through the box
-  (amendment of 2026-11-20).
+  (amendment of 2026-11-20). The same rule covers every two-word carrier: a
+  shared reference to a class is one word and is its own handle, and a
+  shared reference to an interface is boxed, with the family's `reclaim`
+  freeing the box.
 - Handles are not Stage 41 bridge handles, and no conversion exists between
   them.
 

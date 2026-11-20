@@ -865,6 +865,35 @@ impl LoweredValue {
         }
     }
 
+    /// The two words of a two-word carrier: an open class value's object
+    /// and descriptor, or a shared interface reference's two words, in the
+    /// order they are stored.
+    fn two_words(self) -> Result<(Value, Value), BackendError> {
+        match self {
+            Self::OpenClass { object, descriptor } => Ok((object, descriptor)),
+            Self::Nullable { present, payload } => Ok((present, payload)),
+            Self::Single(_) | Self::ByteRegion { .. } | Self::NullableByteRegion { .. } => {
+                Err(malformed_mir("expected a two-word backend value"))
+            }
+        }
+    }
+
+    /// The value of type `ty` made of two stored words, the inverse of
+    /// [`Self::two_words`].
+    fn from_two_words(ty: mir::Type, first: Value, second: Value) -> Self {
+        if ty.shared_interface().is_some() {
+            Self::Nullable {
+                present: first,
+                payload: second,
+            }
+        } else {
+            Self::OpenClass {
+                object: first,
+                descriptor: second,
+            }
+        }
+    }
+
     fn single(self) -> Result<Value, BackendError> {
         match self {
             Self::Single(value) => Ok(value),
@@ -21347,38 +21376,41 @@ fn lower_pointer_operation(
             let present = presence_word(builder, payload, pointer);
             Some(LoweredValue::Nullable { present, payload })
         }
-        // A closed class's handle is its object and a shared reference's
-        // its word; an open class's is a runtime box of its two words
-        // (Decision 0148 section 11).
-        mir::PointerOperation::CreateHandle { value } => Some(LoweredValue::Single(
-            match lower_rvalue(builder, value, resources)? {
-                LoweredValue::OpenClass { object, descriptor } => {
+        // A one-word value is its own handle; a two-word carrier is a
+        // runtime box of its two words (`mir::Program::handle_carrier`,
+        // Decision 0148 section 11).
+        mir::PointerOperation::CreateHandle { value } => {
+            let carrier = resources.program.handle_carrier(value.ty());
+            let lowered = lower_rvalue(builder, value, resources)?;
+            Some(LoweredValue::Single(match carrier {
+                Some(mir::HandleCarrier::Boxed) => {
+                    let (first, second) = lowered.two_words()?;
                     set_active_panic_site(builder, span, resources);
                     runtime_call(
                         builder,
                         crate::native_abi::HANDLE_BOX_CREATE,
                         &[pointer, pointer, pointer],
                         Some(pointer),
-                        &[resources.current_frame, object, descriptor],
+                        &[resources.current_frame, first, second],
                         resources,
                     )?
                     .ok_or_else(|| backend_failure("a handle box produced no address"))?
                 }
-                value => value.single()?,
-            },
-        )),
+                _ => lowered.single()?,
+            }))
+        }
         mir::PointerOperation::FromHandle {
             handle,
             ty,
             reclaim,
         } => {
             let address = address_of(builder, *handle, resources)?;
-            Some(match ty {
-                mir::Type::Class(class) if class_uses_open_carrier(resources.program, *class) => {
-                    let object = builder
+            Some(match resources.program.handle_carrier(*ty) {
+                Some(mir::HandleCarrier::Boxed) => {
+                    let first = builder
                         .ins()
                         .load(pointer, MemFlagsData::trusted(), address, 0);
-                    let descriptor = builder.ins().load(
+                    let second = builder.ins().load(
                         pointer,
                         MemFlagsData::trusted(),
                         address,
@@ -21394,7 +21426,7 @@ fn lower_pointer_operation(
                             resources,
                         )?;
                     }
-                    LoweredValue::OpenClass { object, descriptor }
+                    LoweredValue::from_two_words(*ty, first, second)
                 }
                 _ => LoweredValue::Single(address),
             })

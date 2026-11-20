@@ -472,21 +472,10 @@ fn create_handle(
     })
 }
 
-/// A handle holds a class value or a shared reference of one word. A
-/// `SharedReference<I>` of an interface `I` is two words, and no target
-/// builds its handle yet.
+/// A handle holds a class value or a shared reference
+/// ([`mir::Type::is_handle_value`]).
 fn handle_value_type(ty: mir::Type, span: Span) -> DiagnosticResult<()> {
-    if ty.shared_interface().is_some() {
-        return Err(vec![crate::unsafe_code::unbuilt_form(
-            span,
-            "Handles Of Shared Interface References Cannot Be Built Yet",
-            "a handle of a shared reference to an interface is part of Doria; this compiler builds handles of class values and of shared references to classes, and not of shared references to interfaces yet",
-        )]);
-    }
-    if matches!(
-        ty,
-        mir::Type::Class(_) | mir::Type::SharedReference(_) | mir::Type::WritableSharedReference(_)
-    ) {
+    if ty.is_handle_value() {
         Ok(())
     } else {
         Err(vec![unsupported(

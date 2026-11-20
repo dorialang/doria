@@ -2263,8 +2263,11 @@ function main(): void
 }
 
 #[test]
-fn handles_of_shared_interface_references_report_that_they_cannot_be_built_yet() {
-    let source = "use Doria\\Std\\Ffi\\{Opaque, WritablePointer};
+fn handles_box_shared_references_to_interfaces() {
+    // Decision 0148 section 11 (amendment of 2026-11-20): a shared
+    // reference to an interface is a two-word carrier, so its handle boxes
+    // both words, `borrow` reads through the box and `reclaim` frees it.
+    let source = r#"use Doria\Std\Ffi\{Opaque, WritablePointer};
 
 interface Named
 {
@@ -2273,23 +2276,50 @@ interface Named
 
 class Person implements Named
 {
-    function name(): string { return \"Ada\"; }
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct()
+    {
+        try {
+            echo " dropped " . $this->text;
+        } catch (Doria\Std\Io\IoError $error) {
+        }
+    }
+}
+
+function show(SharedReference<Named> $named): void
+{
+    echo " " . $named->name();
+}
+
+function showWritable(WritableSharedReference<Named> $named): void
+{
+    echo " " . $named->acquireReadonlyAccess()->name();
 }
 
 function main(): void
 {
-    SharedReference<Named> $named = shared new Person();
-    WritablePointer<Opaque> $handle = unsafe($named->toHandle());
+    SharedReference<Named> $named = shared new Person("Ada");
+    let $second = $named->share();
+    WritablePointer<Opaque> $handle = $named->toHandle();
+    unsafe {
+        show(SharedReference::borrow($handle));
+        SharedReference<Named> $back = SharedReference::reclaim($handle);
+        show($back);
+    }
+    show($second);
+    let $writable = new WritableSharedReference<Named>(new Person("Grace"));
+    WritablePointer<Opaque> $claim = $writable->toHandle();
+    unsafe {
+        showWritable(WritableSharedReference::borrow($claim));
+        WritableSharedReference<Named> $mine = WritableSharedReference::reclaim($claim);
+        showWritable($mine);
+    }
+    echo " end";
 }
-";
-    let diagnostics = doriac::lower_source_to_mir("stage40.doria", source.to_string())
-        .expect_err("handles of shared interface references are not built yet");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title
-                    == "Handles Of Shared Interface References Cannot Be Built Yet"),
-        "{diagnostics:#?}"
+"#;
+    assert_runs_natively(
+        source,
+        " Ada Ada Ada Grace Grace dropped Grace end dropped Ada",
     );
 }

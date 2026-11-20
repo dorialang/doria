@@ -1,43 +1,46 @@
-//! The box behind the handle of an open class value (Decision 0148 section
+//! The box behind the handle of a two-word carrier (Decision 0148 section
 //! 11, amendment Readable Names of 2026-11-20).
 //!
-//! A closed class's handle is its object pointer. An open class value is
-//! two words, the object and its class descriptor, because its dynamic
-//! class may be a descendant of its static one; its handle is the address of
-//! one runtime allocation holding both, so `Handle::reclaim` returns the
-//! value with its exact dynamic type. The allocator is the runtime's private
-//! one (Decision 0044); C only keeps and passes back the address.
+//! A one-word value is its own handle. A two-word carrier, an open class
+//! value (its object and class descriptor, because its dynamic class may be
+//! a descendant of its static one) or a shared reference to an interface
+//! (its two words), cannot fit in the one word C keeps, so its handle is the
+//! address of one runtime allocation holding both words; `Handle::reclaim`
+//! and the shared families' `reclaim` read them back, so the value keeps its
+//! exact dynamic type, and free the box. The allocator is the runtime's
+//! private one (Decision 0044); C only keeps and passes back the address.
 
 use crate::{allocate, deallocate, panic_catalogued, DrStackFrameV2};
 
 const ALLOCATION_FAILED: &[u8] = b"P1601";
 
-/// The two words of an open class value, in the order generated code loads
-/// them: the object at offset zero and the descriptor one word after it.
+/// The two words of a two-word carrier, in the order generated code stores
+/// and loads them: the first at offset zero and the second one word after
+/// it (an open class value's object, then its descriptor).
 #[repr(C)]
 pub struct DrHandleBoxV1 {
-    pub object: *mut u8,
-    pub descriptor: *const u8,
+    pub first: *mut u8,
+    pub second: *const u8,
 }
 
-/// Boxes an open class value for `Handle::create`, which hands its
-/// ownership to the box. Allocation failure panics with P1601.
+/// Boxes a two-word carrier for `Handle::create` or `toHandle`, which hand
+/// its ownership to the box. Allocation failure panics with P1601.
 ///
 /// # Safety
 ///
-/// `frame` is the caller's frame; `object` and `descriptor` are the two
-/// words of a live, owned open class value.
+/// `frame` is the caller's frame; `first` and `second` are the two words of
+/// a live, owned open class value or shared interface reference.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_handle_box_create(
     frame: *const DrStackFrameV2,
-    object: *mut u8,
-    descriptor: *const u8,
+    first: *mut u8,
+    second: *const u8,
 ) -> *mut DrHandleBoxV1 {
     let handle = allocate(core::mem::size_of::<DrHandleBoxV1>()).cast::<DrHandleBoxV1>();
     if handle.is_null() {
         panic_catalogued(frame, ALLOCATION_FAILED);
     }
-    handle.write(DrHandleBoxV1 { object, descriptor });
+    handle.write(DrHandleBoxV1 { first, second });
     handle
 }
 
@@ -57,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_box_holds_the_object_then_the_descriptor() {
+    fn a_box_holds_the_first_word_then_the_second() {
         let mut object = 7_u8;
         let descriptor = 9_u8;
         unsafe {

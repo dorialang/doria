@@ -200,7 +200,40 @@ impl SelectedTarget {
     }
 }
 
+/// How a handle holds its value (Decision 0148 section 11, amendment
+/// Readable Names of 2026-11-20). A one-word value is its own handle. A
+/// two-word carrier, an open class value (object and class descriptor) or
+/// a shared reference to an interface (control block and interface view),
+/// is boxed: the handle addresses one runtime allocation holding both words
+/// (`native_abi::HANDLE_BOX_CREATE`), and `reclaim` frees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleCarrier {
+    Word,
+    Boxed,
+}
+
 impl Program {
+    /// How a handle holds a value of `ty`, or `None` when no handle holds
+    /// one: handles hold class values and the strong claims of
+    /// `SharedReference<T>` and `WritableSharedReference<T>`.
+    pub fn handle_carrier(&self, ty: Type) -> Option<HandleCarrier> {
+        if !ty.is_handle_value() {
+            return None;
+        }
+        let two_words = match ty {
+            Type::Class(class) => self
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open),
+            _ => ty.shared_interface().is_some(),
+        };
+        Some(if two_words {
+            HandleCarrier::Boxed
+        } else {
+            HandleCarrier::Word
+        })
+    }
+
     /// Whether the executable links foreign code: any foreign call,
     /// including one of the platform C runtime or of a C function pointer
     /// (Decision 0148 section 20).
@@ -1561,6 +1594,16 @@ impl Type {
             | Self::NullableWritableSharedReferenceAccess(payload) => Some(payload),
             _ => None,
         }
+    }
+
+    /// Whether a handle holds a value of this type: a class value or the
+    /// strong claim of a `SharedReference<T>` or `WritableSharedReference<T>`
+    /// (Decision 0148 section 11). [`Program::handle_carrier`] says how.
+    pub const fn is_handle_value(self) -> bool {
+        matches!(
+            self,
+            Self::Class(_) | Self::SharedReference(_) | Self::WritableSharedReference(_)
+        )
     }
 
     pub const fn shared_interface(self) -> Option<InterfaceTypeId> {
@@ -6516,14 +6559,13 @@ pub enum PointerOperation {
     },
     /// `Handle::create(take $value)` and `$reference->toHandle()` (section
     /// 11): the handle that holds `value`, an owned class value or a shared
-    /// reference whose ownership moves into the handle. A closed class's
-    /// handle is its object, an open class's the box of its object and
-    /// descriptor (`native_abi::HANDLE_BOX_CREATE`), and a shared
-    /// reference's its one word.
+    /// reference whose ownership moves into the handle. A one-word value
+    /// is its own handle and a two-word carrier is boxed
+    /// ([`Program::handle_carrier`]).
     CreateHandle { value: Rvalue },
     /// `Handle::reclaim`, the shared references' `reclaim` (`reclaim`), and
     /// every `borrow`: the value of type `ty` the handle local `handle`
-    /// holds. A reclaimed value is owned again and an open class's box is
+    /// holds. A reclaimed value is owned again and a boxed carrier's box is
     /// released; a borrowed one is lent, and the handle keeps it.
     FromHandle {
         handle: LocalId,
