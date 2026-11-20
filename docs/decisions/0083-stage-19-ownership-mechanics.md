@@ -97,3 +97,39 @@ Decision 0131 narrows the Move-value `take` requirement to actual property
 promotion. Constructor-only and inherited-property override parameters follow
 ordinary readonly, writable, and `take` parameter ownership rules and never
 become property owners merely because they occur in `__construct`.
+
+## Amendment, 2026-11-20: Writable Promoted Owners
+
+Andrew ruled on a card, "Allow `take writable` on promoted parameters
+(Recommended)". A promoted constructor parameter may combine the two
+modifiers, in either order:
+
+```doria
+class Game
+{
+    function __construct(internal take writable List<Scene> $scenes) {}
+
+    writable function update(): void
+    {
+        foreach ($this->scenes as writable Scene $scene) {
+            $scene->update();
+        }
+    }
+}
+```
+
+On a promoted parameter `take` moves the argument into the new property and
+`writable` makes that property writable, the meaning `writable` already has
+on a promoted Copy property such as `writable int $count`. Before this
+amendment a promoted move-type property was always readonly, and a writable
+owned property had to be declared in the class body and assigned in the
+constructor.
+
+- E0467 still rejects `take` with `writable` on every other parameter, where
+  `writable` means a writable borrow of the caller's value.
+- E0468's fix for a promoted `writable` move parameter inserts `take` and
+  keeps `writable`. It used to replace `writable` with `take`, which silently
+  made the property readonly.
+- A `writable` foreach binding needs a writable collection (E0201), the same
+  rule as a mutating collection method. Checking used to accept a readonly
+  source and leave the backend to reject it.

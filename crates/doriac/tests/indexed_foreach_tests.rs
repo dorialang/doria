@@ -1,4 +1,11 @@
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/native_execution.rs"]
+mod native_execution;
+
 use doriac::ast::{Item as AstItem, Stmt as AstStmt};
+use doriac::backend::NativeProfile;
 use doriac::diagnostics::{Diagnostic, DiagnosticSeverity, FixApplicability};
 use doriac::hir::{Item as HirItem, Stmt as HirStmt};
 use doriac::mir::{self, ControlFlowPlan, ForeachIterationKind, Statement};
@@ -657,4 +664,216 @@ function main(): void
             "accepted invalid source: {invalid}"
         );
     }
+}
+
+#[test]
+fn writable_bindings_write_through_property_local_and_nested_collections() {
+    let source = r#"
+class Counter
+{
+    function __construct(writable int $value) {}
+    writable function increment(): void { $this->value++; }
+}
+
+class Shelf
+{
+    writable List<Counter> $counters = [];
+}
+
+class Holder
+{
+    internal writable List<Counter> $counters = [];
+    internal writable List<int> $totals = [1, 2];
+    writable List<List<Counter>> $rows = [];
+    writable Shelf $shelf = new Shelf();
+
+    writable function add(take Counter $counter): void { $this->counters->add($counter); }
+
+    writable function update(): void
+    {
+        foreach ($this->counters as writable Counter $counter) { $counter->increment(); }
+        foreach ($this->totals as writable int $total) { $total = $total * 10; }
+        foreach ($this->rows[0] as writable Counter $counter) { $counter->increment(); }
+        foreach ($this->shelf->counters as writable Counter $counter) { $counter->increment(); }
+    }
+
+    function show(): void
+    {
+        foreach ($this->counters as Counter $counter) { echo "{$counter->value} "; }
+        foreach ($this->totals as int $total) { echo "{$total} "; }
+        foreach ($this->rows[0] as Counter $counter) { echo "{$counter->value} "; }
+        foreach ($this->shelf->counters as Counter $counter) { echo "{$counter->value} "; }
+    }
+}
+
+function main(): void
+{
+    let writable $holder = new Holder();
+    $holder->add(new Counter(1));
+    $holder->add(new Counter(5));
+    $holder->rows->add([new Counter(20)]);
+    $holder->shelf->counters->add(new Counter(30));
+    $holder->update();
+    $holder->show();
+    writable List<Counter> $local = [new Counter(7)];
+    foreach ($local as writable Counter $counter) { $counter->increment(); }
+    foreach ($local as Counter $counter) { echo "{$counter->value}\n"; }
+}
+"#;
+    let expected = "2 6 10 20 21 31 8\n";
+    let mir = doriac::lower_source_to_mir("indexed-foreach.doria", source)
+        .unwrap_or_else(|diagnostics| panic!("writable foreach should lower: {diagnostics:#?}"));
+    let output = doriac::mir_interpreter::interpret(&mir).expect("writable foreach should run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert_eq!(output.exit_status, 0);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, expected);
+    }
+    assert_php_keeps_writable_iteration_native(source);
+}
+
+#[test]
+fn writable_bindings_write_through_a_promoted_owned_property() {
+    let source = r#"
+class Scene
+{
+    function __construct(writable int $frames) {}
+    writable function update(): void { $this->frames++; }
+}
+
+class Game
+{
+    function __construct(internal take writable List<Scene> $scenes) {}
+
+    writable function update(): void
+    {
+        foreach ($this->scenes as writable Scene $scene) { $scene->update(); }
+    }
+
+    function show(): void
+    {
+        foreach ($this->scenes as Scene $scene) { echo "{$scene->frames}\n"; }
+    }
+}
+
+function main(): void
+{
+    let writable $game = new Game([new Scene(1), new Scene(4)]);
+    $game->update();
+    $game->show();
+}
+"#;
+    let expected = "2\n5\n";
+    let mir = doriac::lower_source_to_mir("indexed-foreach.doria", source)
+        .unwrap_or_else(|diagnostics| panic!("writable foreach should lower: {diagnostics:#?}"));
+    let output = doriac::mir_interpreter::interpret(&mir).expect("writable foreach should run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    for &profile in NativeProfile::AVAILABLE {
+        native_execution::assert_native_execution(&mir, profile, expected);
+    }
+    assert_php_keeps_writable_iteration_native(source);
+}
+
+/// PHP output cannot hand out a writable borrow of a collection element, so it
+/// reports B2301 for this valid program and names the native targets.
+fn assert_php_keeps_writable_iteration_native(source: &str) {
+    let errors = doriac::compile_source_to_php("indexed-foreach.doria", source)
+        .expect_err("PHP output cannot preserve writable element iteration");
+    assert!(
+        errors.iter().any(|diagnostic| diagnostic.code == "B2301"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn writable_bindings_need_a_writable_collection() {
+    let common = r#"
+class Scene
+{
+    function __construct(writable int $frames) {}
+    writable function update(): void { $this->frames++; }
+}
+"#;
+    for (case, body) in [
+        (
+            "promoted take property",
+            r#"
+class Game
+{
+    function __construct(internal take List<Scene> $scenes) {}
+    writable function update(): void { foreach ($this->scenes as writable Scene $scene) { $scene->update(); } }
+}
+function main(): void {}
+"#,
+        ),
+        (
+            "readonly method",
+            r#"
+class Game
+{
+    internal writable List<Scene> $scenes = [];
+    function update(): void { foreach ($this->scenes as writable Scene $scene) { $scene->update(); } }
+}
+function main(): void {}
+"#,
+        ),
+        (
+            "readonly local",
+            r#"
+function main(): void
+{
+    List<Scene> $scenes = [new Scene(1)];
+    foreach ($scenes as writable Scene $scene) { $scene->update(); }
+}
+"#,
+        ),
+        (
+            "readonly parameter",
+            r#"
+function walk(List<Scene> $scenes): void { foreach ($scenes as writable Scene $scene) { $scene->update(); } }
+function main(): void {}
+"#,
+        ),
+        (
+            "take parameter",
+            r#"
+function walk(take List<Scene> $scenes): void { foreach ($scenes as writable Scene $scene) { $scene->update(); } }
+function main(): void {}
+"#,
+        ),
+    ] {
+        let source = format!("{common}{body}");
+        let found = errors(&source);
+        let diagnostic = found
+            .iter()
+            .find(|diagnostic| diagnostic.code == "E0201")
+            .unwrap_or_else(|| panic!("{case}: {found:#?}"));
+        assert_eq!(
+            diagnostic.title, "Writable Foreach Needs A Writable Collection",
+            "{case}"
+        );
+        let iterable = if source.contains("($this->scenes") {
+            "$this->scenes"
+        } else {
+            "$scenes"
+        };
+        let start = source.find(&format!("({iterable} as writable")).unwrap() + 1;
+        assert_eq!(
+            (diagnostic.span.start, diagnostic.span.end),
+            (start, start + iterable.len()),
+            "{case}"
+        );
+        assert_eq!(found.len(), 1, "{case}: {found:#?}");
+    }
+
+    // An unresolved source is reported once, with no second error at the loop.
+    let undeclared = errors(&format!(
+        "{common}function main(): void {{ foreach ($scenes as writable Scene $scene) {{ $scene->update(); }} }}"
+    ));
+    assert!(
+        undeclared
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0201"),
+        "{undeclared:#?}"
+    );
 }

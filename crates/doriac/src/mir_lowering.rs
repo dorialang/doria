@@ -7946,7 +7946,14 @@ fn lower_foreach_statement(
         })
         .unwrap_or((&foreach.iterable, CollectionForeachProjection::Main));
     context.push_scope();
-    materialize_nested_collection_places(collection_expr, false, context)?;
+    // A writable binding borrows each element writably, so the collection it
+    // walks is a writable place, exactly as for an indexed write. Checking
+    // already proved the source may be written.
+    let writable = foreach.value_binding.writable;
+    materialize_nested_collection_places(collection_expr, writable, context)?;
+    if writable {
+        materialize_collection_place(collection_expr, true, context)?;
+    }
     let (collection, collection_type) = match lower_collection_local(collection_expr, context) {
         Ok(place) => place,
         Err(_) => {
@@ -7962,7 +7969,7 @@ fn lower_foreach_statement(
             let value =
                 lower_collection_expression(collection_expr, collection_type, !borrowed, context)?;
             let local = if borrowed {
-                context.declare_borrowed_temp(mir::Type::Collection(collection_type), false)
+                context.declare_borrowed_temp(mir::Type::Collection(collection_type), writable)
             } else {
                 context.declare_owned_temp(mir::Type::Collection(collection_type))
             };
