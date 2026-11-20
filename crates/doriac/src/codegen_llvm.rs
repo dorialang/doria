@@ -18746,6 +18746,29 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.forward_evaluated_borrow_home(present.into(), result.into());
                 Ok(result)
             }
+            mir::NullableScalarExpression::RegionIndex {
+                region,
+                index,
+                index_span,
+                ..
+            } => {
+                // A nullable pointer element is its word, absent at zero.
+                let index = self.lower_rvalue(index)?;
+                let (element, address) = self
+                    .typed_region_element(*region, index, *index_span)?
+                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+                if element != mir::Type::NullableScalar(ty) {
+                    return Err(malformed_mir(
+                        "a region element read has the element's type",
+                    ));
+                }
+                let word = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, self.program, element),
+                    address,
+                    "array-region.nullable-element",
+                ))?;
+                self.nullable_scalar_pair(ty, word)
+            }
             mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let local = local_in(self.function, *collection)?;

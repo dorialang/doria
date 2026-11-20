@@ -495,8 +495,9 @@ impl Interpreter<'_> {
             }
             Task::Index { region, span } | Task::Set { region, span } => {
                 let write = matches!(task, Task::Set { .. });
+                // An element is a scalar or a nullable pointer.
                 let replacement = if write {
-                    Some(self.pop_scalar()?)
+                    Some(self.pop_local_value()?)
                 } else {
                     None
                 };
@@ -522,12 +523,22 @@ impl Interpreter<'_> {
                 let (entries, _) = self.collection_element_storage(base)?;
                 let position = base.index + index as usize;
                 if let Some(value) = replacement {
-                    if !region.kind.is_writable() || mir::Type::Scalar(value.ty()) != base.ty {
+                    if !region.kind.is_writable()
+                        || !matches!(
+                            (&value, base.ty),
+                            (LocalValue::Scalar(scalar), mir::Type::Scalar(ty))
+                                if scalar.ty() == ty
+                        ) && !matches!(
+                            (&value, base.ty),
+                            (LocalValue::NullableScalar { ty, .. }, mir::Type::NullableScalar(expected))
+                                if *ty == expected
+                        )
+                    {
                         return Err(InterpreterError::new(
                             "MIR region write has an invalid capability or element type",
                         ));
                     }
-                    entries.borrow_mut()[position].1 = LocalValue::Scalar(value);
+                    entries.borrow_mut()[position].1 = value;
                 } else {
                     let value = entries.borrow()[position].1.clone();
                     self.push_local_value(value)?;

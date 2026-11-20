@@ -1277,6 +1277,77 @@ function main(): void
 }
 
 #[test]
+fn typed_array_regions_view_nullable_pointer_elements() {
+    // Decision 0148 sections 3 and 8: a `?Pointer<T>` element is one word,
+    // null at address zero, so C reads the region as `T **`.
+    let source = format!(
+        "{POINTER}
+function main(): void
+{{
+    int32 $first = 4;
+    int32 $second = 5;
+    unsafe {{
+        writable (?Pointer<int32>)[] $slots = [Pointer::to($first), null, null];
+        {{
+            writable WritableArrayRegion<?Pointer<int32>> $region = $slots->getWritableRegion(0, 3);
+            $region[1] = Pointer::to($second);
+            $region[0] = null;
+            echo ($region[0] == null) . \" \" . (($region[1] ?? Pointer::to($first))->read()) . \" \";
+        }}
+        let $view = $slots->getRegion(0, 3);
+        Pointer<uint64> $words = Pointer::cast($view->pointer);
+        echo $words->read() . \" \" . ($words->offset(1)->read() == Pointer::to($second)->address) . \" \";
+        echo $words->offset(2)->read() . \" \";
+        Pointer<?Pointer<int32>> $secondSlot = $view->pointer->offset(1);
+        echo (($secondSlot->read() ?? Pointer::to($first))->read()) . \" \" . ($view[2] == null);
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "true 5 0 true 0 5 true");
+    // A fixed-length array field of nullable pointers (section 6) is a
+    // region of words, zero-filled when omitted.
+    let fields = format!(
+        "{POINTER}
+extern \"C\" struct Table
+{{
+    (?Pointer<int32>)[2] $entries;
+    int32 $count = 2;
+}}
+
+function main(): void
+{{
+    int32 $first = 4;
+    int32 $second = 5;
+    unsafe {{
+        writable Table $table = new Table();
+        echo Table::SIZE . \" \" . ($table->entries[0] == null) . \" \" . ($table->entries[1] == null) . \" \";
+        $table->entries[1] = Pointer::to($second);
+        echo (($table->entries[1] ?? Pointer::to($first))->read()) . \" \";
+        (?Pointer<int32>)[] $copied = [Pointer::to($first), null];
+        writable Table $other = new Table(entries: $copied->getRegion(0, 2));
+        echo (($other->entries[0] ?? Pointer::to($second))->read()) . \" \" . ($other->entries[1] == null);
+    }}
+}}
+"
+    );
+    assert_runs_natively(&fields, "24 true true 5 4 true");
+    // Without pointer formation the interpreter reads and writes them too.
+    assert_runs_everywhere(
+        "use Doria\\Std\\Ffi\\Pointer;
+function main(): void
+{
+    writable (?Pointer<int32>)[] $slots = [null, null];
+    writable WritableArrayRegion<?Pointer<int32>> $region = $slots->getWritableRegion(0, 2);
+    $region[1] = null;
+    echo ($region[0] == null) . \" \" . ($region[1] == null);
+}
+",
+        "true true",
+    );
+}
+
+#[test]
 fn array_region_bounds_panic_as_typed_arrays_do() {
     assert_panics_everywhere(
         "function main(): void { int32[] $numbers = [1, 2, 3]; echo \"a\"; let $region = $numbers->getRegion(2, 2); echo $region->length; }",

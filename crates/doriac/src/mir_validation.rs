@@ -14535,6 +14535,11 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(value, accesses);
             accesses.contents_access(*collection, false);
         }
+        mir::NullableScalarExpression::RegionIndex { region, index, .. } => {
+            accesses.resource_read(*region);
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.contents_access(*region, false);
+        }
         mir::NullableScalarExpression::StringIntrinsic(call) => {
             collect_rvalue_args_class_local_accesses(&call.args, accesses)
         }
@@ -19008,6 +19013,7 @@ fn nullable_scalar_expression_presence(
         | mir::NullableScalarExpression::NullSafeProperty { .. }
         | mir::NullableScalarExpression::NullSafeCall { .. }
         | mir::NullableScalarExpression::DictionaryGet { .. }
+        | mir::NullableScalarExpression::RegionIndex { .. }
         | mir::NullableScalarExpression::CollectionIndexOf { .. }
         | mir::NullableScalarExpression::Parse { .. }
         | mir::NullableScalarExpression::TryConvert { .. }
@@ -22072,6 +22078,9 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::CollectionIndexOf { value, .. } => {
             rvalue_observes_property(value, receiver, property)
         }
+        mir::NullableScalarExpression::RegionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
         mir::NullableScalarExpression::Parse { value, .. } => {
             string_observes_property(value, receiver, property)
         }
@@ -24483,6 +24492,15 @@ fn validate_nullable_scalar_expression(
             mir::Type::Scalar(ty),
             *access,
         ),
+        mir::NullableScalarExpression::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(
+                program,
+                function,
+                *region,
+                index,
+                mir::Type::NullableScalar(ty),
+            )
+        }
         mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
             let local = local_in(function, *collection)?;
             let mir::Type::Collection(collection_type) = local.ty else {

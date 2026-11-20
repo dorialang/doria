@@ -11835,13 +11835,12 @@ fn lower_assignment(
     } = target
     {
         if let mir::Type::Region(region_type) = context.expression_type(collection)? {
-            let element = byte_region::element_scalar(region_type, *span, context)?;
+            let element = byte_region::element_type(region_type, *span, context)?;
             let region = byte_region::local(collection, true, context)?;
             let index_type = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
             let index = lower_rvalue_as_expected(index, index_type, context)?;
             let (index, index_type) = core_value::materialize_value(index, context);
-            let value =
-                lower_rvalue_as_expected(&assignment.value, mir::Type::Scalar(element), context)?;
+            let value = lower_rvalue_as_expected(&assignment.value, element, context)?;
             context.push_statement(mir::Statement::AssignRegionIndex {
                 region,
                 index: local_rvalue(index, index_type, false),
@@ -12938,6 +12937,16 @@ fn lower_nullable_scalar_expression(
         hir::Expr::Index {
             collection, index, ..
         } => {
+            if let mir::Type::Region(region_type) = context.expression_type(collection)? {
+                return byte_region::nullable_element_read(
+                    expr,
+                    collection,
+                    index,
+                    region_type,
+                    expected,
+                    context,
+                );
+            }
             let (collection, key) = lower_collection_index_operand(
                 collection,
                 index,

@@ -541,6 +541,50 @@ pub(super) fn element_scalar(
     }
 }
 
+/// The type of the elements of `region`: `uint8` for a byte region, and
+/// the built element type of a typed array region (E0784 otherwise),
+/// which is a scalar or a nullable pointer.
+pub(super) fn element_type(
+    region: mir::RegionType,
+    span: Span,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<mir::Type> {
+    Ok(match built_element(region, span, context)? {
+        None => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+        Some((element, _)) => element,
+    })
+}
+
+/// `$region[$index]` read as `?expected`, for a typed array region whose
+/// elements are nullable pointers (Decision 0148 sections 3 and 8).
+pub(super) fn nullable_element_read(
+    expr: &hir::Expr,
+    region: &hir::Expr,
+    index: &hir::Expr,
+    region_type: mir::RegionType,
+    expected: mir::ScalarType,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if element_type(region_type, expr.span(), context)? != mir::Type::NullableScalar(expected) {
+        return Err(vec![unsupported(
+            expr.span(),
+            "a region element read has the element's type",
+        )]);
+    }
+    let region = local(region, false, context)?;
+    let index = lower_rvalue_as_expected(
+        index,
+        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        context,
+    )?;
+    Ok(mir::NullableScalarExpression::RegionIndex {
+        ty: expected,
+        region,
+        index: Box::new(index),
+        index_span: expr.span(),
+    })
+}
+
 /// The element type and stride of a typed array region the execution
 /// targets build, or E0784 at `span` for an element type none builds yet.
 /// `None` for a byte region.

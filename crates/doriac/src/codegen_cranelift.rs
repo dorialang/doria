@@ -4313,17 +4313,21 @@ fn lower_statement(
             index_span,
         } => {
             let index = lower_rvalue(builder, index, resources)?.single()?;
-            let value = lower_rvalue(builder, value, resources)?.single()?;
-            if let Some((_, address)) =
+            let value = lower_rvalue(builder, value, resources)?;
+            if let Some((element, address)) =
                 typed_region_element(builder, *region, index, *index_span, resources)?
             {
-                builder.ins().store(
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    value,
+                let pointer = resources.module.target_config().pointer_type();
+                store_lowered_to_address(
+                    builder,
+                    resources.program,
+                    element,
                     address,
-                    0,
-                );
+                    value,
+                    pointer,
+                )?;
             } else {
+                let value = value.single()?;
                 let (data, length) =
                     lower_byte_region_local(builder, *region, false, resources)?.byte_region()?;
                 set_active_panic_site(builder, *index_span, resources);
@@ -9102,17 +9106,39 @@ fn lower_typed_region_read(
     scalar: mir::ScalarType,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
+    lower_typed_region_element_value(
+        builder,
+        region,
+        index,
+        index_span,
+        mir::Type::Scalar(scalar),
+        resources,
+    )?
+    .single()
+}
+
+/// Element `index` of the typed array region `region`, read as
+/// `expected`: a scalar, or a nullable pointer, which loads from its word
+/// as absent at address zero.
+fn lower_typed_region_element_value(
+    builder: &mut FunctionBuilder,
+    region: mir::LocalId,
+    index: &mir::Rvalue,
+    index_span: crate::source::Span,
+    expected: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
     let index = lower_rvalue(builder, index, resources)?.single()?;
     let (element, address) = typed_region_element(builder, region, index, index_span, resources)?
         .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
-    if element != mir::Type::Scalar(scalar) {
+    if element != expected {
         return Err(malformed_mir(
             "a region element read has the element's type",
         ));
     }
     let pointer = resources.module.target_config().pointer_type();
     let value = load_lowered_from_address(builder, resources.program, element, address, pointer);
-    normalize_foreign_bool(builder, element, value)?.single()
+    normalize_foreign_bool(builder, element, value)
 }
 
 fn lower_byte_region_expression(
@@ -20338,6 +20364,19 @@ fn lower_nullable_scalar_expression(
             )?;
             Ok(LoweredValue::Nullable { present, payload })
         }
+        mir::NullableScalarExpression::RegionIndex {
+            region,
+            index,
+            index_span,
+            ..
+        } => lower_typed_region_element_value(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::Type::NullableScalar(ty),
+            resources,
+        ),
         mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
             let local = local_definition(resources.program, resources.function_id, *collection)?;
             let mir::Type::Collection(collection_type) = local.ty else {

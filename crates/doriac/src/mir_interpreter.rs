@@ -8437,6 +8437,21 @@ impl<'a> Interpreter<'a> {
                 frame.tasks.push(EvaluationTask::SetPanicSite(index_span));
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
+            mir::NullableScalarExpression::RegionIndex {
+                region,
+                index,
+                index_span,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::ByteRegion(byte_region::Task::Index {
+                        region,
+                        span: index_span,
+                    }));
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
             mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
                 let ownership = value.mixed_ownership();
                 let frame = self.current_frame_mut()?;
