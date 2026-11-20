@@ -1049,6 +1049,57 @@ pub const fn memory_value_layout(ty: mir::Type) -> Option<NativeLayout> {
     }
 }
 
+/// How a nullable scalar `?T` is laid out wherever it is stored: a local's
+/// slot, a property, an element, a closure capture, a static, or memory C
+/// reads and writes. Every native layout, load and store of `?T` follows
+/// this one rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullableScalarForm {
+    /// A presence word, then the payload `payload_offset` bytes in.
+    Tagged { payload_offset: u32 },
+    /// The payload alone, absent as the all-zero payload. A nullable
+    /// pointer (`?Ptr<T>`, `?MutPtr<T>` or `?extern "C" function(...)`) is
+    /// one word and null is address zero (Decision 0148 section 3), the
+    /// form C reads and writes.
+    ZeroIsNull,
+}
+
+impl NullableScalarForm {
+    /// The byte offset of the payload within the stored `?T`.
+    pub const fn payload_offset(self) -> u32 {
+        match self {
+            Self::Tagged { payload_offset } => payload_offset,
+            Self::ZeroIsNull => 0,
+        }
+    }
+}
+
+/// Whether `?T` takes [`NullableScalarForm::ZeroIsNull`], independently of
+/// the target's pointer width.
+pub const fn nullable_scalar_is_zero_is_null(scalar: mir::ScalarType) -> bool {
+    matches!(
+        scalar,
+        mir::ScalarType::Inline(crate::inline_value::InlineValueType::Pointer)
+    )
+}
+
+pub const fn nullable_scalar_form(
+    scalar: mir::ScalarType,
+    pointer_size: u32,
+) -> NullableScalarForm {
+    if nullable_scalar_is_zero_is_null(scalar) {
+        return NullableScalarForm::ZeroIsNull;
+    }
+    let payload = type_layout(mir::Type::Scalar(scalar), pointer_size);
+    NullableScalarForm::Tagged {
+        payload_offset: if payload.align > pointer_size {
+            payload.align
+        } else {
+            pointer_size
+        },
+    }
+}
+
 pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
     if ty.shared_interface().is_some() {
         return NativeLayout {
@@ -1071,18 +1122,13 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
             size: ty.storage_bytes(),
             align: ty.storage_bytes(),
         },
-        mir::Type::NullableScalar(scalar) => {
-            let payload = type_layout(mir::Type::Scalar(scalar), pointer_size);
-            let align = if payload.align > pointer_size {
-                payload.align
-            } else {
-                pointer_size
-            };
-            NativeLayout {
-                size: align * 2,
-                align,
-            }
-        }
+        mir::Type::NullableScalar(scalar) => match nullable_scalar_form(scalar, pointer_size) {
+            NullableScalarForm::ZeroIsNull => type_layout(mir::Type::Scalar(scalar), pointer_size),
+            NullableScalarForm::Tagged { payload_offset } => NativeLayout {
+                size: payload_offset * 2,
+                align: payload_offset,
+            },
+        },
         mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)

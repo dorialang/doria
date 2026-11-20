@@ -1245,10 +1245,14 @@ fn define_static_data(
         match &property.initializer {
             mir::StaticValue::Scalar(value) => {
                 let scalar = scalar_data_bytes(*value);
-                if matches!(property.ty, mir::Type::NullableScalar(_)) {
+                if let mir::Type::NullableScalar(stored) = property.ty {
+                    let form =
+                        native_closure_abi::nullable_scalar_form(stored, pointer_bytes as u32);
                     let mut bytes = Vec::with_capacity(layout.size as usize);
-                    append_target_word(&mut bytes, 1, pointer_bytes);
-                    bytes.resize(layout.align as usize, 0);
+                    if form != native_closure_abi::NullableScalarForm::ZeroIsNull {
+                        append_target_word(&mut bytes, 1, pointer_bytes);
+                    }
+                    bytes.resize(form.payload_offset() as usize, 0);
                     bytes.extend_from_slice(&scalar);
                     bytes.resize(layout.size as usize, 0);
                     description.define(bytes.into_boxed_slice());
@@ -2460,6 +2464,17 @@ fn bind_parameters(
             continue;
         }
         let first = value_from_doria_abi(builder, first, ty);
+        if let mir::Type::NullableScalar(_) = ty {
+            let payload = params.next().ok_or_else(|| {
+                malformed_mir("nullable function parameter is missing its ABI payload")
+            })?;
+            let value = LoweredValue::Nullable {
+                present: first,
+                payload: nullable_payload_from_doria_abi(builder, payload, ty),
+            };
+            store_lowered_to_stack(builder, program, ty, slot, value, pointer_type)?;
+            continue;
+        }
         if matches!(ty, mir::Type::Region(_) | mir::Type::NullableRegion(_)) {
             let mut words = vec![first];
             let count = if matches!(ty, mir::Type::NullableRegion(_)) {
@@ -2514,8 +2529,7 @@ fn bind_parameters(
         if ty.shared_interface().is_some()
             || matches!(
                 ty,
-                mir::Type::NullableScalar(_)
-                    | mir::Type::NullableString
+                mir::Type::NullableString
                     | mir::Type::Interface(_)
                     | mir::Type::NullableInterface(_)
                     | mir::Type::Function(_)
@@ -3101,15 +3115,11 @@ fn initialize_payload_static_value(
         (mir::StaticValue::Scalar(value), mir::Type::NullableScalar(expected))
             if value.ty() == expected =>
         {
-            let present = builder.ins().iconst(pointer, 1);
-            builder.ins().store(flags, present, address, 0);
-            let value = cranelift_scalar_constant(builder, *value);
-            builder.ins().store(
-                flags,
-                value,
-                address,
-                native_closure_abi::type_layout(ty, pointer.bytes()).align as i32,
-            );
+            let value = LoweredValue::Nullable {
+                present: builder.ins().iconst(pointer, 1),
+                payload: cranelift_scalar_constant(builder, *value),
+            };
+            store_nullable_scalar(builder, expected, address, value, flags, pointer)?;
         }
         (mir::StaticValue::String(value), mir::Type::String | mir::Type::NullableString) => {
             let mut bytes = Vec::with_capacity(pointer.bytes() as usize * 2 + value.len());
@@ -5636,15 +5646,16 @@ fn load_lowered_from_stack(
                 .ins()
                 .stack_load(pointer, pointer, slot, (pointer.bytes() * 2) as i32),
         },
-        mir::Type::NullableScalar(scalar) => LoweredValue::Nullable {
-            present: builder.ins().stack_load(pointer, pointer, slot, 0),
-            payload: builder.ins().stack_load(
+        mir::Type::NullableScalar(scalar) => {
+            let address = builder.ins().stack_addr(pointer, slot, 0);
+            load_nullable_scalar(
+                builder,
+                scalar,
+                address,
+                cranelift_codegen::ir::MachMemFlags::trusted().into(),
                 pointer,
-                clif_scalar_type(scalar),
-                slot,
-                native_closure_abi::type_layout(ty, pointer.bytes()).align as i32,
-            ),
-        },
+            )
+        }
         mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
@@ -5760,8 +5771,18 @@ fn store_lowered_to_stack(
                 pointer,
             );
         }
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
+        mir::Type::NullableScalar(scalar) => {
+            let address = builder.ins().stack_addr(pointer, slot, 0);
+            store_nullable_scalar(
+                builder,
+                scalar,
+                address,
+                value,
+                cranelift_codegen::ir::MachMemFlags::trusted().into(),
+                pointer,
+            )?;
+        }
+        mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
         | mir::Type::Function(_)
@@ -5825,15 +5846,9 @@ fn load_lowered_from_address(
                 .ins()
                 .load(pointer, flags, address, (pointer.bytes() * 2) as i32),
         },
-        mir::Type::NullableScalar(scalar) => LoweredValue::Nullable {
-            present: builder.ins().load(pointer, flags, address, 0),
-            payload: builder.ins().load(
-                clif_scalar_type(scalar),
-                flags,
-                address,
-                native_closure_abi::type_layout(ty, pointer.bytes()).align as i32,
-            ),
-        },
+        mir::Type::NullableScalar(scalar) => {
+            load_nullable_scalar(builder, scalar, address, flags.into(), pointer)
+        }
         mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
@@ -5941,8 +5956,10 @@ fn store_lowered_to_address(
             AggregateAccess::Storage,
             pointer,
         ),
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
+        mir::Type::NullableScalar(scalar) => {
+            store_nullable_scalar(builder, scalar, address, value, flags.into(), pointer)?;
+        }
+        mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
         | mir::Type::Function(_)
@@ -5969,6 +5986,66 @@ fn store_lowered_to_address(
         }
         _ => {
             builder.ins().store(flags, value.single()?, address, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Reads a stored `?T` in its `NullableScalarForm` into the presence and
+/// payload pair a `?T` is while code works with it.
+fn load_nullable_scalar(
+    builder: &mut FunctionBuilder,
+    scalar: mir::ScalarType,
+    address: Value,
+    flags: MemFlagsData,
+    pointer: ClifType,
+) -> LoweredValue {
+    match native_closure_abi::nullable_scalar_form(scalar, pointer.bytes()) {
+        native_closure_abi::NullableScalarForm::ZeroIsNull => {
+            let payload = builder
+                .ins()
+                .load(clif_scalar_type(scalar), flags, address, 0);
+            LoweredValue::Nullable {
+                present: presence_word(builder, payload, pointer),
+                payload,
+            }
+        }
+        native_closure_abi::NullableScalarForm::Tagged { payload_offset } => {
+            LoweredValue::Nullable {
+                present: builder.ins().load(pointer, flags, address, 0),
+                payload: builder.ins().load(
+                    clif_scalar_type(scalar),
+                    flags,
+                    address,
+                    payload_offset as i32,
+                ),
+            }
+        }
+    }
+}
+
+/// Stores the presence and payload pair of a `?T` in its
+/// `NullableScalarForm`; an absent nullable pointer stores address zero.
+fn store_nullable_scalar(
+    builder: &mut FunctionBuilder,
+    scalar: mir::ScalarType,
+    address: Value,
+    value: LoweredValue,
+    flags: MemFlagsData,
+    pointer: ClifType,
+) -> Result<(), BackendError> {
+    let (present, payload) = value.nullable()?;
+    match native_closure_abi::nullable_scalar_form(scalar, pointer.bytes()) {
+        native_closure_abi::NullableScalarForm::ZeroIsNull => {
+            let null = builder.ins().iconst(clif_scalar_type(scalar), 0);
+            let word = builder.ins().select(present, payload, null);
+            builder.ins().store(flags, word, address, 0);
+        }
+        native_closure_abi::NullableScalarForm::Tagged { payload_offset } => {
+            builder.ins().store(flags, present, address, 0);
+            builder
+                .ins()
+                .store(flags, payload, address, payload_offset as i32);
         }
     }
     Ok(())
@@ -10251,9 +10328,15 @@ fn operand_borrow_home(
         mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => {
             let mut home = closure_source_home(builder, *local, resources)?;
             if matches!(operand, mir::Operand::NullablePayload(_)) {
-                home.address = builder
-                    .ins()
-                    .iadd_imm_u(home.address, i64::from(pointer.bytes()));
+                let offset =
+                    match local_definition(resources.program, resources.function_id, *local)?.ty {
+                        mir::Type::NullableScalar(scalar) => {
+                            native_closure_abi::nullable_scalar_form(scalar, pointer.bytes())
+                                .payload_offset()
+                        }
+                        _ => pointer.bytes(),
+                    };
+                home.address = builder.ins().iadd_imm_u(home.address, i64::from(offset));
             }
             Ok(borrow_home_descriptor(builder, home, pointer))
         }
@@ -12625,7 +12708,11 @@ fn lower_drop_value_at_address(
             let done = builder.create_block();
             builder.ins().brif(present, some, &[], done, &[]);
             builder.switch_to_block(some);
-            let offset = native_closure_abi::type_layout(ty, pointer.bytes()).align;
+            let offset = native_closure_abi::nullable_scalar_form(
+                mir::ScalarType::Inline(inline),
+                pointer.bytes(),
+            )
+            .payload_offset();
             let value = builder
                 .ins()
                 .load(types::I64, flags, address, offset as i32);
@@ -18412,11 +18499,9 @@ fn retain_inline_value_at(
         let done = builder.create_block();
         builder.ins().brif(present, some, &[], done, &[]);
         builder.switch_to_block(some);
-        let offset = native_closure_abi::type_layout(
-            mir::Type::NullableScalar(mir::ScalarType::Inline(ty)),
-            pointer.bytes(),
-        )
-        .align;
+        let offset =
+            native_closure_abi::nullable_scalar_form(mir::ScalarType::Inline(ty), pointer.bytes())
+                .payload_offset();
         let payload = builder.ins().iadd_imm_u(address, i64::from(offset));
         retain_inline_value_at(builder, payload, ty, false, resources)?;
         builder.ins().jump(done, &[]);
@@ -20994,10 +21079,19 @@ fn lower_pointer_operation(
         )
         .single()
     };
+    // A pointee is a scalar with a C layout, or a nullable pointer stored
+    // as its word.
     let accessed = |ty: mir::Type| match ty {
         mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar)
             .map(|size| (scalar, size))
             .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout")),
+        mir::Type::NullableScalar(scalar)
+            if native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            crate::native_abi::pointee_scalar_size(scalar)
+                .map(|size| (scalar, size))
+                .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout"))
+        }
         _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
     };
     let result = match operation {
@@ -21070,30 +21164,54 @@ fn lower_pointer_operation(
             if *aligned {
                 lower_pointer_alignment_check(builder, address, size, span, resources)?;
             }
-            let value =
-                builder
-                    .ins()
-                    .load(clif_scalar_type(scalar), MemFlagsData::new(), address, 0);
-            // C `_Bool` is 0 or 1; any other byte still reads as `true`.
-            let value = if scalar == mir::ScalarType::Bool {
-                builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
+            if let mir::Type::NullableScalar(_) = ty {
+                Some(load_nullable_scalar(
+                    builder,
+                    scalar,
+                    address,
+                    MemFlagsData::new(),
+                    pointer,
+                ))
             } else {
-                value
-            };
-            Some(LoweredValue::Single(value))
+                let value =
+                    builder
+                        .ins()
+                        .load(clif_scalar_type(scalar), MemFlagsData::new(), address, 0);
+                // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+                let value = if scalar == mir::ScalarType::Bool {
+                    builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
+                } else {
+                    value
+                };
+                Some(LoweredValue::Single(value))
+            }
         }
         mir::PointerOperation::Write {
             pointer: local,
             value,
             aligned,
         } => {
-            let (_, size) = accessed(value.ty())?;
-            let value = lower_rvalue(builder, value, resources)?.single()?;
+            let (scalar, size) = accessed(value.ty())?;
+            let nullable = matches!(value.ty(), mir::Type::NullableScalar(_));
+            let value = lower_rvalue(builder, value, resources)?;
             let address = address_of(builder, *local, resources)?;
             if *aligned {
                 lower_pointer_alignment_check(builder, address, size, span, resources)?;
             }
-            builder.ins().store(MemFlagsData::new(), value, address, 0);
+            if nullable {
+                store_nullable_scalar(
+                    builder,
+                    scalar,
+                    address,
+                    value,
+                    MemFlagsData::new(),
+                    pointer,
+                )?;
+            } else {
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), value.single()?, address, 0);
+            }
             None
         }
         mir::PointerOperation::Offset {
@@ -21242,15 +21360,13 @@ fn lower_foreign_call(
                 let local = foreign_argument_local(args, *argument)?;
                 let ty = local_definition(resources.program, resources.function_id, local)?.ty;
                 let slot = local_slot(resources.local_slots, local)?;
+                // A C scalar is passed as the value it is stored as; a null
+                // `?Ptr<T>` is stored as address zero.
+                let scalar = c_scalar_storage(ty)?;
                 values.push(
-                    match load_lowered_from_stack(builder, resources.program, ty, slot, pointer) {
-                        // A null `?Ptr<T>` is address zero.
-                        LoweredValue::Nullable { present, payload } => {
-                            let null = builder.ins().iconst(pointer, 0);
-                            builder.ins().select(present, payload, null)
-                        }
-                        value => value.single()?,
-                    },
+                    builder
+                        .ins()
+                        .stack_load(pointer, clif_scalar_type(scalar), slot, 0),
                 );
             }
             PhysicalParameter::Part {
@@ -21664,22 +21780,35 @@ fn finish_foreign_call(
     let value = *results
         .first()
         .ok_or_else(|| malformed_mir("a foreign call with a result produced none"))?;
-    let value = match (scalar, ty) {
-        // C `_Bool` is 0 or 1; any other byte still reads as `true`.
-        (CScalar::Bool, _) => {
-            LoweredValue::Single(builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0))
-        }
-        (CScalar::Pointer, mir::Type::NullableScalar(_)) => {
-            let present = builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0);
-            LoweredValue::Nullable {
-                present: builder.ins().uextend(pointer, present),
-                payload: value,
-            }
-        }
-        _ => LoweredValue::Single(value),
+    // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+    let value = if scalar == CScalar::Bool {
+        builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
+    } else {
+        value
     };
+    // The result is stored as C returned it; a null `?Ptr<T>` is stored as
+    // address zero.
+    c_scalar_storage(ty)?;
     let slot = local_slot(resources.local_slots, target)?;
-    store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)
+    builder.ins().stack_store(pointer, value, slot, 0);
+    Ok(())
+}
+
+/// The scalar a C scalar argument or result of type `ty` is stored as. A
+/// nullable C scalar is a nullable pointer, stored as its word
+/// (`NullableScalarForm::ZeroIsNull`), so the stored form is the C form.
+fn c_scalar_storage(ty: mir::Type) -> Result<mir::ScalarType, BackendError> {
+    match ty {
+        mir::Type::Scalar(scalar) => Ok(scalar),
+        mir::Type::NullableScalar(scalar)
+            if native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            Ok(scalar)
+        }
+        _ => Err(malformed_mir(
+            "a foreign call passes C scalars stored in their C form",
+        )),
+    }
 }
 
 fn foreign_argument_local(

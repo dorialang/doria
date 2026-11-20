@@ -659,6 +659,13 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::NullableRegion(_) => pointer_width.checked_mul(3),
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
         mir::Type::ClosureEnvironment(_) => Some(pointer_width),
+        // A null pointer is address zero, so `?Ptr<T>` is stored as its
+        // word and the runtime reads zero as absent.
+        mir::Type::NullableScalar(scalar)
+            if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            Some(pointer_width)
+        }
         mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
             let payload_width = ty.storage_bytes() as u8;
             Some(if payload_width > pointer_width {
@@ -765,6 +772,15 @@ pub(crate) const fn pointee_layout(ty: crate::mir::Type) -> Option<(u64, u64)> {
             Some(size) => Some((size, size)),
             None => None,
         },
+        // A nullable pointer is stored as its word.
+        crate::mir::Type::NullableScalar(scalar)
+            if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            match pointee_scalar_size(scalar) {
+                Some(size) => Some((size, size)),
+                None => None,
+            }
+        }
         crate::mir::Type::ForeignAggregate(aggregate) => {
             Some((aggregate.size as u64, aggregate.align as u64))
         }

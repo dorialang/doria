@@ -406,38 +406,12 @@ fn emit<'ctx>(
                 build(builder.build_int_z_extend(set, context.i8_type(), "c.entry.bool.byte"))?
                     .into()
             }
-            mir::Type::Scalar(mir::ScalarType::Inline(_)) => build(builder.build_ptr_to_int(
-                value.into_pointer_value(),
-                word,
-                "c.entry.address",
-            ))?
+            // A pointer, nullable or not, is its address word on both sides;
+            // a null `?Ptr<T>` is address zero.
+            mir::Type::Scalar(mir::ScalarType::Inline(_)) | mir::Type::NullableScalar(_) => build(
+                builder.build_ptr_to_int(value.into_pointer_value(), word, "c.entry.address"),
+            )?
             .into(),
-            // A null `?Ptr<T>` is address zero.
-            mir::Type::NullableScalar(_) => {
-                let address = build(builder.build_ptr_to_int(
-                    value.into_pointer_value(),
-                    word,
-                    "c.entry.address",
-                ))?;
-                let present = build(builder.build_int_compare(
-                    IntPredicate::NE,
-                    address,
-                    word.const_zero(),
-                    "c.entry.present",
-                ))?;
-                let present =
-                    build(builder.build_int_z_extend(present, usize_type, "c.entry.present.word"))?;
-                let nullable = context.struct_type(&[usize_type.into(), word.into()], false);
-                let carrier = build(builder.build_insert_value(
-                    nullable.get_undef(),
-                    present,
-                    0,
-                    "c.entry.nullable",
-                ))?;
-                build(builder.build_insert_value(carrier, address, 1, "c.entry.nullable"))?
-                    .into_struct_value()
-                    .into()
-            }
             _ => value,
         };
         values.push(value.into());
@@ -504,37 +478,12 @@ fn emit<'ctx>(
             let value =
                 returned.ok_or_else(|| malformed_mir("a C entry's function returns its value"))?;
             let value: BasicValueEnum<'ctx> = match ty {
-                mir::Type::Scalar(mir::ScalarType::Inline(_)) => build(builder.build_int_to_ptr(
-                    value.into_int_value(),
-                    pointer,
-                    "c.entry.result.address",
-                ))?
-                .into(),
-                // An absent `?Ptr<T>` is address zero.
-                mir::Type::NullableScalar(_) => {
-                    let carrier = value.into_struct_value();
-                    let present =
-                        build(builder.build_extract_value(carrier, 0, "c.entry.result.present"))?
-                            .into_int_value();
-                    let payload =
-                        build(builder.build_extract_value(carrier, 1, "c.entry.result.payload"))?
-                            .into_int_value();
-                    let present = build(builder.build_int_compare(
-                        IntPredicate::NE,
-                        present,
-                        present.get_type().const_zero(),
-                        "c.entry.result.present",
-                    ))?;
-                    let address = build(builder.build_select(
-                        present,
-                        payload,
-                        word.const_zero(),
-                        "c.entry.result.address",
-                    ))?;
+                // An absent `?Ptr<T>` is already address zero.
+                mir::Type::Scalar(mir::ScalarType::Inline(_)) | mir::Type::NullableScalar(_) => {
                     build(builder.build_int_to_ptr(
-                        address.into_int_value(),
+                        value.into_int_value(),
                         pointer,
-                        "c.entry.result.pointer",
+                        "c.entry.result.address",
                     ))?
                     .into()
                 }

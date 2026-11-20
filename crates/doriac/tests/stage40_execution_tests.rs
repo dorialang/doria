@@ -964,6 +964,93 @@ function main(): void
 }
 
 #[test]
+fn a_nullable_pointer_is_one_word_and_null_is_address_zero() {
+    // Decision 0148 section 3: `?Ptr<T>` is one word and null is address
+    // zero wherever it is stored, so C reads and writes it in place: in a
+    // foreign field, through `MutPtr::to` of a local, through a
+    // `Ptr<?Ptr<T>>`, and as a C result. Doria storage holds the same word.
+    let source = format!(
+        "{POINTER}use Doria\\Std\\Ffi\\{{CChar, CLong, CString, CUnsignedLong}};
+
+extern \"C\" struct Stream
+{{
+    ?Ptr<uint8> $nextIn = null;
+    uint32 $availableIn = 0;
+    CUnsignedLong $totalIn;
+}}
+
+extern \"C\"
+{{
+    /** @safety `$text` is NUL-terminated; `$end` is null or writable. */
+    function strtol(Ptr<CChar> $text, ?MutPtr<?Ptr<CChar>> $end, int32 $base): CLong;
+    /** @safety `$name` is NUL-terminated. */
+    function getenv(Ptr<CChar> $name): ?Ptr<CChar>;
+}}
+
+class Holder
+{{
+    function __construct(writable ?Ptr<uint8> $pointer) {{}}
+}}
+
+function pass(?Ptr<uint8> $pointer): ?Ptr<uint8>
+{{
+    return $pointer;
+}}
+
+function main(): void
+{{
+    let $input = \"abc\"->bytes;
+    writable Stream $stream = new Stream(totalIn: CUnsignedLong::from(7));
+    unsafe {{
+        let $from = $input->getRegion(0, 3)->pointer;
+        Ptr<uint64> $words = Ptr::cast(Ptr::from(MutPtr::to($stream)));
+        echo $words->read() . \" \" . Stream::SIZE . \" \";
+        $stream->nextIn = $from;
+        $stream->availableIn = 3;
+        echo ($words->read() == $from->address) . \" \" . $words->offset(1)->read() . \" \";
+        echo $words->offset(2)->read() . \" \";
+        echo (($stream->nextIn ?? $from)->address == $from->address) . \"\\n\";
+
+        let $digits = CString::from(\"42rest\");
+        writable ?Ptr<CChar> $end = null;
+        echo Int64::from(strtol($digits->pointer, MutPtr::to($end), 10)) . \" \";
+        echo (($end ?? $digits->pointer)->address - $digits->pointer->address) . \" \";
+        echo Int64::from(strtol($digits->pointer, null, 10)) . \" \";
+        writable ?Ptr<CChar> $later = null;
+        let $laterPlace = MutPtr::to($later);
+        if ($later == null) {{
+            strtol($digits->pointer, $laterPlace, 10);
+            echo (($later ?? $digits->pointer)->address - $digits->pointer->address) . \" \";
+        }}
+        let $name = CString::from(\"DORIA_STAGE40_NO_SUCH_VARIABLE\");
+        echo (getenv($name->pointer) == null) . \"\\n\";
+
+        writable ?Ptr<uint8> $slot = null;
+        let $place = MutPtr::to($slot);
+        Ptr<uint64> $raw = Ptr::cast(Ptr::from($place));
+        echo ($place->read() == null) . \" \";
+        $place->write($from);
+        echo ($raw->read() == $from->address) . \" \" . ($slot != null) . \" \";
+        $place->write(null);
+        echo $raw->read() . \" \" . ($slot == null) . \"\\n\";
+
+        writable Holder $holder = new Holder($from);
+        echo ((pass($holder->pointer) ?? $from)->address == $from->address) . \" \";
+        $holder->pointer = null;
+        echo (pass($holder->pointer) == null) . \" \";
+        List<?Ptr<uint8>> $list = [null, $from];
+        echo ($list[0] == null) . \" \" . (($list[1] ?? $from)->address == $from->address);
+    }}
+}}
+"
+    );
+    assert_runs_natively(
+        &source,
+        "0 24 true 3 7 true\n42 2 42 2 true\ntrue true true 0 true\ntrue true true true",
+    );
+}
+
+#[test]
 fn a_region_pointer_gives_c_the_storage_itself() {
     let source = format!(
         "{POINTER}use Doria\\Std\\Ffi\\CSize;

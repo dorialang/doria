@@ -1722,10 +1722,7 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
         mir::Type::Scalar(mir::ScalarType::Bool) => FieldType::Bool,
         mir::Type::Scalar(mir::ScalarType::Enum(_)) => FieldType::Integer(IntegerType::UInt32),
-        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => FieldType::Aggregate {
-            size: ty.storage_bytes(),
-            align: ty.storage_bytes(),
-        },
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => FieldType::inline(ty, false),
         mir::Type::String => FieldType::String,
         mir::Type::Mixed => FieldType::Mixed,
         mir::Type::NullableScalar(mir::ScalarType::Integer(integer)) => {
@@ -1736,10 +1733,7 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::NullableScalar(mir::ScalarType::Enum(_)) => {
             FieldType::NullableInteger(IntegerType::UInt32)
         }
-        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => FieldType::Aggregate {
-            size: ty.storage_bytes() * 2,
-            align: ty.storage_bytes(),
-        },
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => FieldType::inline(ty, true),
         mir::Type::NullableString => FieldType::NullableString,
         mir::Type::NullableMixed => FieldType::NullableMixed,
         mir::Type::Interface(_) => FieldType::Error,

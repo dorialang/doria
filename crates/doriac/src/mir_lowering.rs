@@ -3738,10 +3738,7 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
-        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => Some(FieldType::Aggregate {
-            size: ty.storage_bytes(),
-            align: ty.storage_bytes(),
-        }),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => Some(FieldType::inline(ty, false)),
         mir::Type::Scalar(mir::ScalarType::Enum(_)) => {
             Some(FieldType::Integer(IntegerType::UInt32))
         }
@@ -3753,10 +3750,7 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         }
         mir::Type::NullableScalar(mir::ScalarType::Float(ty)) => Some(FieldType::NullableFloat(ty)),
         mir::Type::NullableScalar(mir::ScalarType::Bool) => Some(FieldType::NullableBool),
-        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => Some(FieldType::Aggregate {
-            size: ty.storage_bytes() * 2,
-            align: ty.storage_bytes(),
-        }),
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => Some(FieldType::inline(ty, true)),
         mir::Type::NullableScalar(mir::ScalarType::Enum(_)) => {
             Some(FieldType::NullableInteger(IntegerType::UInt32))
         }
@@ -16347,6 +16341,16 @@ fn lower_match_constant_to_blocks(
     Ok(())
 }
 
+/// `value` as a value of `expected`: present when `expected` is the
+/// nullable form of its type, and unchanged otherwise.
+fn present_as_expected(value: mir::Rvalue, expected: mir::Type) -> mir::Rvalue {
+    if non_null_match_type(expected) == (value.ty(), true) {
+        nullable_present_rvalue(value)
+    } else {
+        value
+    }
+}
+
 fn non_null_match_type(ty: mir::Type) -> (mir::Type, bool) {
     let payload = crate::native_abi::nullable_payload_type(ty);
     (payload.unwrap_or(ty), payload.is_some())
@@ -20649,11 +20653,13 @@ fn materialize_checked_rvalue(
     if let Some(value) = core_collection::expression(expr, expected, consume_result, context)? {
         return Ok(Some(value));
     }
+    // A pointer operation or a foreign field read yields its own type; a
+    // nullable expected type receives it present.
     if let Some(value) = foreign::expression(expr, expected, context)? {
-        return Ok(Some(value));
+        return Ok(Some(present_as_expected(value, expected)));
     }
     if let Some(value) = foreign::field_read(expr, expected, context)? {
-        return Ok(Some(value));
+        return Ok(Some(present_as_expected(value, expected)));
     }
     if matches!(
         expr,

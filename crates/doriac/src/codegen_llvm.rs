@@ -600,7 +600,10 @@ fn declare_statics<'ctx>(
         let global = match &property.initializer {
             mir::StaticValue::Scalar(value) => {
                 let initializer = scalar_constant(context, *value);
-                let initializer = if matches!(property.ty, mir::Type::NullableScalar(_)) {
+                // A nullable pointer's initializer is its word.
+                let initializer = if matches!(property.ty, mir::Type::NullableScalar(scalar)
+                    if !native_closure_abi::nullable_scalar_is_zero_is_null(scalar))
+                {
                     let ty =
                         llvm_type(context, target_data, program, property.ty).into_struct_type();
                     ty.const_named_struct(&[usize_type.const_int(1, false).into(), initializer])
@@ -2100,14 +2103,20 @@ fn initialize_payload_static_value_llvm<'ctx>(
         (mir::StaticValue::Scalar(value), mir::Type::NullableScalar(expected))
             if value.ty() == expected =>
         {
-            let word = context.ptr_sized_int_type(target_data, None);
-            build(builder.build_store(address, word.const_int(1, false)))?;
+            let form = native_closure_abi::nullable_scalar_form(
+                expected,
+                target_data.get_pointer_byte_size(None),
+            );
+            if form != native_closure_abi::NullableScalarForm::ZeroIsNull {
+                let word = context.ptr_sized_int_type(target_data, None);
+                build(builder.build_store(address, word.const_int(1, false)))?;
+            }
             let payload = llvm_byte_offset(
                 context,
                 target_data,
                 builder,
                 address,
-                native_closure_abi::type_layout(ty, target_data.get_pointer_byte_size(None)).align,
+                form.payload_offset(),
                 "static.nullable.payload",
             )?;
             build(builder.build_store(payload, scalar_constant(context, *value)))?;
@@ -2836,6 +2845,73 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .build_extract_value(value, 1, "nullable.payload"),
         )?;
         Ok((present, payload))
+    }
+
+    /// The presence and payload pair code works with for a `?T` value as it
+    /// is stored and passed (`llvm_type`). A nullable pointer is its word,
+    /// present when nonzero; any other `?T` is the pair itself.
+    fn nullable_scalar_pair(
+        &self,
+        scalar: mir::ScalarType,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        if !native_closure_abi::nullable_scalar_is_zero_is_null(scalar) {
+            return Ok(value.into_struct_value());
+        }
+        let word = value.into_int_value();
+        let present = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            word,
+            word.get_type().const_zero(),
+            "nullable-pointer.present",
+        ))?;
+        let present = build(self.builder.build_int_z_extend(
+            present,
+            self.context.ptr_sized_int_type(self.target_data, None),
+            "nullable-pointer.present-word",
+        ))?;
+        self.nullable_value(present, word.into())
+    }
+
+    /// The stored and passed form of a `?T` presence and payload pair; an
+    /// absent nullable pointer is address zero.
+    fn nullable_scalar_stored(
+        &self,
+        scalar: mir::ScalarType,
+        pair: StructValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        if !native_closure_abi::nullable_scalar_is_zero_is_null(scalar) {
+            return Ok(pair.into());
+        }
+        let (present, payload) = self.nullable_parts(pair)?;
+        let payload = payload.into_int_value();
+        let present = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            present,
+            present.get_type().const_zero(),
+            "nullable-pointer.is-present",
+        ))?;
+        Ok(build(self.builder.build_select(
+            present,
+            payload,
+            payload.get_type().const_zero(),
+            "nullable-pointer.word",
+        ))?)
+    }
+
+    /// A stored or returned value of type `ty` with a `?T` in pair form, so
+    /// that a null-safe access can tell a nullable result from its payload.
+    fn nullable_scalar_result(
+        &self,
+        ty: mir::Type,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        match ty {
+            mir::Type::NullableScalar(scalar) => {
+                Ok(self.nullable_scalar_pair(scalar, value)?.into())
+            }
+            _ => Ok(value),
+        }
     }
 
     fn byte_region_value(
@@ -3922,7 +3998,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .context
                     .ptr_sized_int_type(self.target_data, None)
                     .const_int(1, false);
-                return Ok(self.nullable_value(present, value)?.into());
+                let pair = self.nullable_value(present, value)?;
+                return self.nullable_scalar_stored(target, pair);
             }
             (mir::Type::String, mir::Type::NullableString) => {
                 let present = self
@@ -3944,7 +4021,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 return Ok(payload);
             }
             (mir::Type::NullableScalar(source), mir::Type::Scalar(target)) if source == target => {
-                let (present, payload) = self.nullable_parts(value.into_struct_value())?;
+                let (present, payload) =
+                    self.nullable_parts(self.nullable_scalar_pair(source, value)?)?;
                 self.require_present_borrow(present)?;
                 return Ok(payload);
             }
@@ -4729,13 +4807,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         local: mir::LocalId,
     ) -> Result<BorrowHome<'ctx>, BackendError> {
         let home = self.closure_source_home(local)?;
-        let ty = llvm_type(
-            self.context,
-            self.target_data,
-            self.program,
-            local_in(self.function, local)?.ty,
-        )
-        .into_struct_type();
+        let local_ty = local_in(self.function, local)?.ty;
+        if matches!(local_ty, mir::Type::NullableScalar(scalar)
+            if native_closure_abi::nullable_scalar_is_zero_is_null(scalar))
+        {
+            // A nullable pointer's payload is its whole word.
+            return Ok(BorrowHome {
+                address: home.address,
+                source_type: self.borrow_home_type_key(mir::Type::String),
+            });
+        }
+        let ty =
+            llvm_type(self.context, self.target_data, self.program, local_ty).into_struct_type();
         Ok(BorrowHome {
             address: build(self.builder.build_struct_gep(
                 ty,
@@ -10659,14 +10742,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let left = build(
                     self.builder
                         .build_load(llvm_ty, left, "payload.left.nullable"),
-                )?
-                .into_struct_value();
+                )?;
+                let left = self.nullable_scalar_pair(scalar, left)?;
                 let right = build(self.builder.build_load(
                     llvm_ty,
                     right,
                     "payload.right.nullable",
-                ))?
-                .into_struct_value();
+                ))?;
+                let right = self.nullable_scalar_pair(scalar, right)?;
                 let (left_present, left_value) = self.nullable_parts(left)?;
                 let (right_present, right_value) = self.nullable_parts(right)?;
                 let presence_equal = build(self.builder.build_int_compare(
@@ -11184,7 +11267,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::Value(value) => self.lower_value_expression(value),
             mir::Rvalue::String(value) => Ok(self.lower_string_expression(value)?.into()),
             mir::Rvalue::NullableScalar(value) => {
-                Ok(self.lower_nullable_scalar_expression(value)?.into())
+                let pair = self.lower_nullable_scalar_expression(value)?;
+                self.nullable_scalar_stored(value.ty(), pair)
             }
             mir::Rvalue::NullableString(value) => {
                 Ok(self.lower_nullable_string_expression(value)?.into())
@@ -12292,7 +12376,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ));
         }
         if matches!(ty, mir::Type::NullableScalar(_) | mir::Type::NullableString) {
-            let (present, payload) = self.nullable_parts(value.into_struct_value())?;
+            let pair = match ty {
+                mir::Type::NullableScalar(scalar) => self.nullable_scalar_pair(scalar, value)?,
+                _ => value.into_struct_value(),
+            };
+            let (present, payload) = self.nullable_parts(pair)?;
             let present = build(self.builder.build_int_truncate(
                 present,
                 self.context.i8_type(),
@@ -14442,8 +14530,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             "aggregate.collection.optional.value",
         ))?;
         if matches!(result_ty, mir::Type::NullableScalar(_)) {
-            let payload = if matches!(definition.value, mir::Type::NullableScalar(_)) {
-                self.nullable_parts(value.into_struct_value())?.1
+            let payload = if let mir::Type::NullableScalar(scalar) = definition.value {
+                self.nullable_parts(self.nullable_scalar_pair(scalar, value)?)?
+                    .1
             } else {
                 value
             };
@@ -14458,7 +14547,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.context.ptr_sized_int_type(self.target_data, None),
                 "aggregate.collection.present",
             ))?;
-            return Ok(self.nullable_value(present, payload)?.into());
+            let mir::Type::NullableScalar(scalar) = result_ty else {
+                unreachable!("matched above");
+            };
+            let pair = self.nullable_value(present, payload)?;
+            return self.nullable_scalar_stored(scalar, pair);
         }
         if matches!(definition.value, mir::Type::Region(_)) {
             let found = build(self.builder.build_load(
@@ -14545,7 +14638,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 key,
                 access,
             )?;
-            return self.nullable_parts(value.into_struct_value());
+            return self.nullable_parts(self.nullable_scalar_pair(scalar, value)?);
         }
         let key_type = definition
             .access_key_type(access)
@@ -14568,7 +14661,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 definition.value,
                 mir::Type::NullableScalar(_) | mir::Type::NullableString
             ) {
-                let (present, payload) = self.nullable_parts(value.into_struct_value())?;
+                let pair = match definition.value {
+                    mir::Type::NullableScalar(scalar) => {
+                        self.nullable_scalar_pair(scalar, value)?
+                    }
+                    _ => value.into_struct_value(),
+                };
+                let (present, payload) = self.nullable_parts(pair)?;
                 self.forward_evaluated_borrow_home(value, present.into());
                 return Ok((present, payload));
             }
@@ -18500,7 +18599,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.nullable_value(self.present_word(true), payload)
             }
             mir::NullableScalarExpression::Local { local, .. } => {
-                Ok(build(self.builder.build_load(
+                let value = build(self.builder.build_load(
                     llvm_type(
                         self.context,
                         self.target_data,
@@ -18509,24 +18608,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     ),
                     local_slot(&self.local_slots, *local)?,
                     "nullable-scalar.local",
-                ))?
-                .into_struct_value())
+                ))?;
+                self.nullable_scalar_pair(ty, value)
             }
             mir::NullableScalarExpression::Property {
                 object, property, ..
-            } => Ok(build(self.builder.build_load(
-                llvm_type(
-                    self.context,
-                    self.target_data,
-                    self.program,
-                    mir::Type::NullableScalar(ty),
-                ),
-                self.lower_property_address(*object, *property)?,
-                "nullable-scalar.property",
-            ))?
-            .into_struct_value()),
+            } => {
+                let value = build(self.builder.build_load(
+                    llvm_type(
+                        self.context,
+                        self.target_data,
+                        self.program,
+                        mir::Type::NullableScalar(ty),
+                    ),
+                    self.lower_property_address(*object, *property)?,
+                    "nullable-scalar.property",
+                ))?;
+                self.nullable_scalar_pair(ty, value)
+            }
             mir::NullableScalarExpression::Static { id, .. } => {
-                Ok(build(self.builder.build_load(
+                let value = build(self.builder.build_load(
                     llvm_type(
                         self.context,
                         self.target_data,
@@ -18535,18 +18636,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     ),
                     self.static_address(*id)?,
                     "nullable-scalar.static",
-                ))?
-                .into_struct_value())
+                ))?;
+                self.nullable_scalar_pair(ty, value)
             }
             mir::NullableScalarExpression::Call {
                 function,
                 args,
                 span,
                 ..
-            } => Ok(self
-                .lower_call_at(*function, args, true, *span)?
-                .ok_or_else(|| malformed_mir("nullable-scalar call produced no result"))?
-                .into_struct_value()),
+            } => {
+                let value = self
+                    .lower_call_at(*function, args, true, *span)?
+                    .ok_or_else(|| malformed_mir("nullable-scalar call produced no result"))?;
+                self.nullable_scalar_pair(ty, value)
+            }
             mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
                 let value = self.lower_nullable_scalar_expression(value)?;
                 self.lower_nullable_value_map(
@@ -18573,7 +18676,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     owned_receiver,
                     |lowerer| {
                         let property = property_definition(lowerer.program, *property)?;
-                        build(lowerer.builder.build_load(
+                        let value = build(lowerer.builder.build_load(
                             llvm_type(
                                 lowerer.context,
                                 lowerer.target_data,
@@ -18582,7 +18685,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             ),
                             lowerer.lower_property_address_from_value(object, property.id)?,
                             "null-safe.scalar.property",
-                        ))
+                        ))?;
+                        lowerer.nullable_scalar_result(property.ty, value)
                     },
                 )
             }
@@ -18604,11 +18708,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     object.class(),
                     owned_receiver,
                     |lowerer| {
-                        lowerer
+                        let value = lowerer
                             .lower_method_call(receiver, *function, args, true, *span)?
                             .ok_or_else(|| {
                                 malformed_mir("null-safe scalar call produced no result")
-                            })
+                            })?;
+                        match lowerer.program.functions[function.0].return_type {
+                            mir::ReturnType::Value(ty) => lowerer.nullable_scalar_result(ty, value),
+                            _ => Ok(value),
+                        }
                     },
                 )
             }
@@ -22512,10 +22620,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         span: crate::source::Span,
     ) -> Result<(), BackendError> {
         let word = self.context.i64_type();
+        // A pointee is a scalar with a C layout, or a nullable pointer, which
+        // is stored and passed as its word.
         let accessed = |ty: mir::Type| match ty {
             mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar)
                 .map(|size| (scalar, size))
                 .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout")),
+            mir::Type::NullableScalar(scalar)
+                if native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+            {
+                crate::native_abi::pointee_scalar_size(scalar)
+                    .map(|size| (scalar, size))
+                    .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout"))
+            }
             _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
         };
         let result: Option<BasicValueEnum<'ctx>> = match operation {
@@ -22740,20 +22857,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 Some(self.nullable_value(present, payload.into())?.into())
             }
+            // `?Ptr<T>` is its address, null at zero.
             mir::PointerOperation::FromAddress { address } => {
-                let address = self.lower_integer_expression(address)?;
-                let present = build(self.builder.build_int_compare(
-                    IntPredicate::NE,
-                    address,
-                    word.const_zero(),
-                    "pointer.present",
-                ))?;
-                let present = build(self.builder.build_int_z_extend(
-                    present,
-                    self.context.ptr_sized_int_type(self.target_data, None),
-                    "pointer.present.word",
-                ))?;
-                Some(self.nullable_value(present, address.into())?.into())
+                Some(self.lower_integer_expression(address)?.into())
             }
         };
         if let (Some(target), Some(value)) = (target, result) {
@@ -22993,22 +23099,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     word,
                     "foreign.result.address",
                 ))?;
-                if matches!(ty, mir::Type::NullableScalar(_)) {
-                    let present = build(self.builder.build_int_compare(
-                        IntPredicate::NE,
-                        address,
-                        word.const_zero(),
-                        "foreign.result.present",
-                    ))?;
-                    let present = build(self.builder.build_int_z_extend(
-                        present,
-                        self.context.ptr_sized_int_type(self.target_data, None),
-                        "foreign.result.present.word",
-                    ))?;
-                    self.nullable_value(present, address.into())?.into()
-                } else {
-                    address.into()
-                }
+                // A `?Ptr<T>` result is stored as its word.
+                address.into()
             }
             _ => returned,
         };
@@ -23017,8 +23109,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
-    /// A scalar argument of a foreign call, as C receives it: a null
-    /// `?Ptr<T>` is address zero.
+    /// A scalar argument of a foreign call, as C receives it: the value as
+    /// it is stored, so a null `?Ptr<T>` is address zero.
     fn foreign_scalar_argument(
         &mut self,
         args: &[mir::LocalId],
@@ -23027,7 +23119,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         use crate::c_layout::CScalar;
         let pointer = self.context.ptr_type(AddressSpace::default());
-        let word = self.context.i64_type();
         let local = *args
             .get(argument)
             .ok_or_else(|| malformed_mir("a foreign call passes every argument"))?;
@@ -23038,29 +23129,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             slot,
             "foreign.argument",
         ))?;
-        Ok(match (ty, scalar) {
-            (mir::Type::NullableScalar(_), CScalar::Pointer) => {
-                let (present, payload) = self.nullable_parts(loaded.into_struct_value())?;
-                let present = build(self.builder.build_int_compare(
-                    IntPredicate::NE,
-                    present,
-                    present.get_type().const_zero(),
-                    "foreign.argument.present",
-                ))?;
-                let address = build(self.builder.build_select(
-                    present,
-                    payload.into_int_value(),
-                    word.const_zero(),
-                    "foreign.argument.address",
-                ))?
-                .into_int_value();
-                build(
-                    self.builder
-                        .build_int_to_ptr(address, pointer, "foreign.argument.pointer"),
-                )?
-                .into()
-            }
-            (_, CScalar::Pointer) => build(self.builder.build_int_to_ptr(
+        Ok(match scalar {
+            CScalar::Pointer => build(self.builder.build_int_to_ptr(
                 loaded.into_int_value(),
                 pointer,
                 "foreign.argument.pointer",
@@ -25965,9 +26035,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     llvm_type(self.context, self.target_data, self.program, nullable),
                     local_slot(&self.local_slots, *local)?,
                     "inline.nullable.local",
-                ))?
-                .into_struct_value();
-                Ok(self.nullable_parts(value)?.1.into_int_value())
+                ))?;
+                let pair = self.nullable_scalar_pair(mir::ScalarType::Inline(ty), value)?;
+                Ok(self.nullable_parts(pair)?.1.into_int_value())
             }
             mir::Operand::Static(id) => {
                 if static_definition(self.program, *id)?.ty != expected {
@@ -26727,6 +26797,13 @@ fn llvm_type<'ctx>(
             byte_region_type(context, target_data).into(),
         )
         .into(),
+        // A nullable pointer is stored and passed as its word
+        // (`native_closure_abi::NullableScalarForm::ZeroIsNull`).
+        mir::Type::NullableScalar(ty)
+            if native_closure_abi::nullable_scalar_is_zero_is_null(ty) =>
+        {
+            scalar_type(context, ty)
+        }
         mir::Type::NullableScalar(ty) => {
             nullable_type(context, target_data, scalar_type(context, ty)).into()
         }
