@@ -2273,13 +2273,16 @@ pub(super) fn validate(
 }
 
 /// The local that owns the storage of a foreign struct or union place: the
-/// local itself, or the class value whose property holds the aggregate. A
+/// local itself, the class value whose property holds the aggregate, the
+/// collection whose element it is, or the region viewing the element. A
 /// static property's storage belongs to no local.
 fn aggregate_owner(place: mir::ForeignAggregatePlace) -> Option<mir::LocalId> {
     match place {
         mir::ForeignAggregatePlace::Local(local)
         | mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => Some(local),
         mir::ForeignAggregatePlace::Property { object, .. } => Some(object),
+        mir::ForeignAggregatePlace::CollectionElement { collection, .. } => Some(collection),
+        mir::ForeignAggregatePlace::RegionElement { region, .. } => Some(region),
         mir::ForeignAggregatePlace::Static(_) => None,
     }
 }

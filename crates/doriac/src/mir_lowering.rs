@@ -8655,10 +8655,18 @@ fn lower_region_foreach_in_scope(
                 index_span: foreach.span,
             })
         }
+        mir::Type::ForeignAggregate(ty) => {
+            mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::RegionIndex {
+                ty,
+                region,
+                index: Box::new(offset.clone()),
+                index_span: foreach.span,
+            })
+        }
         _ => {
             return Err(vec![unsupported(
                 foreach.span,
-                "a built region element is a scalar or a nullable pointer",
+                "a built region element is a scalar, a nullable pointer or a foreign aggregate",
             )])
         }
     };
@@ -8748,6 +8756,8 @@ fn element_write_back(
         | mir::Type::NullableInterface(_)
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::Function(_)
         | mir::Type::NullableFunction(_) => {
             let write_back = ElementWriteBack {
@@ -8776,11 +8786,6 @@ fn element_write_back(
         | mir::Type::NullableCollection(_) => Ok(None),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
-        }
-        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
-            unreachable!(
-                "the execution gate keeps foreign aggregates out of collections and regions"
-            )
         }
         mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
@@ -9092,9 +9097,26 @@ fn collection_value_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
-            unreachable!("the execution gate keeps foreign aggregates out of collections")
-        }
+        mir::Type::ForeignAggregate(ty) => Ok(mir::Rvalue::ForeignAggregate(
+            mir::ForeignAggregateExpression::CollectionIndex {
+                ty,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional,
+                remove: false,
+            },
+        )),
+        mir::Type::NullableForeignAggregate(ty) => Ok(mir::Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::CollectionIndex {
+                ty,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional,
+                remove: false,
+            },
+        )),
         mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
@@ -9167,6 +9189,9 @@ fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<
                 transfer: false,
             },
         )),
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
+            Ok(local_rvalue(local, ty, false))
+        }
         _ => Err(vec![unsupported(
             Span::new(0, 0),
             "this foreach binding cannot be written back in Stage 23 Slice 3",
@@ -24152,9 +24177,26 @@ fn collection_remove_at_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
-            unreachable!("the execution gate keeps foreign aggregates out of collections")
-        }
+        mir::Type::ForeignAggregate(ty) => Ok(mir::Rvalue::ForeignAggregate(
+            mir::ForeignAggregateExpression::CollectionIndex {
+                ty,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional: false,
+                remove: true,
+            },
+        )),
+        mir::Type::NullableForeignAggregate(ty) => Ok(mir::Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::CollectionIndex {
+                ty,
+                collection,
+                index: Box::new(index),
+                index_span,
+                positional: false,
+                remove: true,
+            },
+        )),
         mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
             Span::new(0, 0),
@@ -25463,8 +25505,17 @@ fn nullable_collection_access_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
-            unreachable!("the execution gate keeps foreign aggregates out of collections")
+        mir::Type::ForeignAggregate(ty) | mir::Type::NullableForeignAggregate(ty) => {
+            Ok(mir::Rvalue::NullableForeignAggregate(
+                mir::NullableForeignAggregateExpression::CollectionGet {
+                    ty,
+                    collection,
+                    key,
+                    access,
+                    stored_nullable: matches!(value_type, mir::Type::NullableForeignAggregate(_)),
+                    index_span,
+                },
+            ))
         }
         mir::Type::Collection(payload) | mir::Type::NullableCollection(payload) => Ok(
             mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::CollectionGet {

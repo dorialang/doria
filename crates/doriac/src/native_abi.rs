@@ -691,9 +691,11 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
 /// copied bit for bit that the typed array stores at their own width
 /// (Decision 0148 section 8). These are the integers (with the C boundary
 /// types), floats, `bool`, unit and backed enum tags, pointers and nullable
-/// pointers, and the inline values with no cleanup. `None` for an element type no target
-/// builds a region over yet.
-pub fn array_region_stride(element: mir::Type) -> Option<u8> {
+/// pointers, the inline values with no cleanup, and foreign structs and
+/// unions, whose C size is a multiple of their alignment, as a C array
+/// lays them out (section 6). `None` for an element type no target builds
+/// a region over yet. The collection runtime takes the same stride.
+pub fn array_region_stride(element: mir::Type) -> Option<usize> {
     match element {
         // A scalar's stride is its width; pointer width does not enter it.
         mir::Type::Scalar(
@@ -701,18 +703,29 @@ pub fn array_region_stride(element: mir::Type) -> Option<u8> {
             | mir::ScalarType::Float(_)
             | mir::ScalarType::Bool
             | mir::ScalarType::Enum(_),
-        ) => collection_value_width(element, 8),
+        ) => collection_value_width(element, 8).map(usize::from),
         mir::Type::Scalar(mir::ScalarType::Inline(ty)) if !ty.requires_owned_cleanup() => {
-            collection_value_width(element, 8)
+            collection_value_width(element, 8).map(usize::from)
         }
         // `?Pointer<T>` is one word, null at zero (section 3), so C reads
         // an array of nullable pointers as `T **`.
         mir::Type::NullableScalar(scalar)
             if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
         {
-            collection_value_width(element, 8)
+            collection_value_width(element, 8).map(usize::from)
         }
+        mir::Type::ForeignAggregate(ty) => usize::try_from(ty.size).ok(),
         _ => None,
+    }
+}
+
+/// The alignment of a typed array region's elements of type `element`:
+/// a scalar's is its width, and a foreign struct's or union's is its C
+/// alignment. `None` where [`array_region_stride`] is `None`.
+pub fn array_region_alignment(element: mir::Type) -> Option<usize> {
+    match element {
+        mir::Type::ForeignAggregate(ty) => usize::try_from(ty.align).ok(),
+        _ => array_region_stride(element),
     }
 }
 
@@ -721,7 +734,7 @@ pub fn array_region_stride(element: mir::Type) -> Option<u8> {
 pub fn array_region_element(
     program: &mir::Program,
     region: mir::RegionType,
-) -> Option<(mir::Type, u8)> {
+) -> Option<(mir::Type, usize)> {
     let array = program.collection_types.get(region.array?.0)?;
     if array.kind != mir::CollectionKind::TypedArray {
         return None;
@@ -732,7 +745,7 @@ pub fn array_region_element(
 /// The bytes between elements of `region`: one for a byte region, the
 /// element stride for a typed array region; `None` for an element type no
 /// target builds.
-pub fn region_stride(program: &mir::Program, region: mir::RegionType) -> Option<u8> {
+pub fn region_stride(program: &mir::Program, region: mir::RegionType) -> Option<usize> {
     match region.array {
         None => Some(1),
         Some(_) => array_region_element(program, region).map(|(_, stride)| stride),

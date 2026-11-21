@@ -2800,6 +2800,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    /// Zeroes a value that lives in memory by its bytes.
+    fn zero_memory_value(
+        &self,
+        destination: PointerValue<'ctx>,
+        layout: native_closure_abi::NativeLayout,
+    ) -> Result<(), BackendError> {
+        let size = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(layout.size), false);
+        build(self.builder.build_memset(
+            destination,
+            layout.align,
+            self.context.i8_type().const_zero(),
+            size,
+        ))?;
+        Ok(())
+    }
+
     fn zero_payload_bytes(
         &self,
         destination: PointerValue<'ctx>,
@@ -2817,6 +2836,73 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             size,
         ))?;
         Ok(())
+    }
+
+    /// Entry-block storage for one collection element stored as `storage`,
+    /// or for its nullable form when `nullable_form`.
+    fn entry_inline_alloca(
+        &self,
+        storage: mir::InlineElementStorage,
+        nullable_form: bool,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let size = if nullable_form {
+            storage.nullable_size
+        } else {
+            storage.size
+        };
+        let slot = self.entry_alloca(self.context.i8_type().array_type(size), name)?;
+        slot.as_instruction_value()
+            .ok_or_else(|| backend_failure("inline element alloca has no instruction"))?
+            .set_alignment(storage.align)
+            .map_err(|error| {
+                backend_failure(format!("failed to align inline element slot: {error}"))
+            })?;
+        Ok(slot)
+    }
+
+    /// Copies one collection element stored as `storage` by its bytes.
+    fn copy_inline_element(
+        &self,
+        destination: PointerValue<'ctx>,
+        source: PointerValue<'ctx>,
+        storage: mir::InlineElementStorage,
+    ) -> Result<(), BackendError> {
+        self.copy_memory_value(
+            destination,
+            source,
+            native_closure_abi::NativeLayout {
+                size: storage.size,
+                align: storage.align,
+            },
+        )
+    }
+
+    /// Drops the collection element at `address` stored as `storage`: a
+    /// payload enum runs its drop glue, and a foreign struct or union has
+    /// none.
+    fn drop_inline_element_at(
+        &mut self,
+        address: PointerValue<'ctx>,
+        storage: mir::InlineElementStorage,
+    ) -> Result<(), BackendError> {
+        match storage.payload_enum {
+            Some(ty) => self.drop_payload_enum_at(address, ty, storage.nullable),
+            None => Ok(()),
+        }
+    }
+
+    /// Retains the managed fields of the copied collection element at
+    /// `address` stored as `storage`; a foreign struct or union has none.
+    fn retain_inline_element_at(
+        &mut self,
+        address: PointerValue<'ctx>,
+        storage: mir::InlineElementStorage,
+    ) -> Result<(), BackendError> {
+        match storage.payload_enum {
+            Some(ty) => self.retain_payload_enum_at(address, ty, storage.nullable),
+            None => Ok(()),
+        }
     }
 
     fn byte_offset(
@@ -3069,7 +3155,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     data.into(),
                     length.into(),
                     index.into(),
-                    word.const_int(u64::from(stride), false).into(),
+                    word.const_int(stride as u64, false).into(),
                 ],
             )?
             .ok_or_else(|| backend_failure("an array region element produced no address"))?
@@ -3178,7 +3264,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 source_length.into(),
                                 offset.into(),
                                 length.into(),
-                                word.const_int(u64::from(stride), false).into(),
+                                word.const_int(stride as u64, false).into(),
                             ],
                         )?
                     } else if typed_stride.is_some() {
@@ -5710,10 +5796,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => {
                 let index = self.lower_rvalue(index)?;
                 let value = self.lower_rvalue(value)?;
-                if let Some((_, address)) =
+                if let Some((element, address)) =
                     self.typed_region_element(*region, index, *index_span)?
                 {
-                    build(self.builder.build_store(address, value))?;
+                    // A foreign struct or union element is copied from the
+                    // storage its value lives in.
+                    if let Some(layout) = native_closure_abi::memory_value_layout(element) {
+                        self.copy_memory_value(address, value.into_pointer_value(), layout)?;
+                    } else {
+                        build(self.builder.build_store(address, value))?;
+                    }
                 } else {
                     let region = self.lower_byte_region_local(*region, false)?;
                     let (data, length) = self.byte_region_parts(region)?;
@@ -9748,13 +9840,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 stored_nullable,
                 mode,
                 ..
-            } => self.lower_nullable_payload_enum_collection_get(
+            } => self.lower_nullable_inline_collection_get(
                 *index_span,
-                ty,
+                stored_inline_element(mir::Type::PayloadEnum(ty), *stored_nullable)?,
                 *collection,
                 key,
                 *access,
-                *stored_nullable,
                 *mode,
             ),
             mir::NullablePayloadEnumExpression::Coalesce {
@@ -9826,22 +9917,35 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn lower_nullable_payload_enum_collection_get(
+    /// An element of the collection `collection` that may be absent, as
+    /// the address of its value in the nullable inline layout: `get`, `pop`
+    /// and the Deque and Dictionary accessors `access` names. `storage` is
+    /// how the collection stores its elements. A payload enum element is
+    /// borrowed or copied as `mode` says; a foreign struct or union is
+    /// always copied (`Copy`), and has no managed fields to retain.
+    fn lower_nullable_inline_collection_get(
         &mut self,
         index_span: crate::source::Span,
-        ty: mir::PayloadEnumType,
+        storage: mir::InlineElementStorage,
         collection: mir::LocalId,
         key: &mir::Rvalue,
         access: mir::NullableCollectionAccess,
-        stored_nullable: bool,
         mode: mir::PayloadEnumUseMode,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        let stored_nullable = storage.nullable;
+        let value_layout = native_closure_abi::NativeLayout {
+            size: storage.value_size,
+            align: storage.align,
+        };
+        let nullable_layout = native_closure_abi::NativeLayout {
+            size: storage.nullable_size,
+            align: storage.align,
+        };
         let pointer = self.context.ptr_type(AddressSpace::default());
         let local = local_in(self.function, collection)?;
         let mir::Type::Collection(collection_type) = local.ty else {
             return Err(malformed_mir(
-                "payload enum nullable access uses a non-collection local",
+                "an inline element nullable access uses a non-collection local",
             ));
         };
         let definition = self.collection_definition(collection_type)?.clone();
@@ -9852,11 +9956,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let key_value = self.lower_rvalue(key)?;
         self.set_active_panic_site(index_span)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
-        if matches!(mode, mir::PayloadEnumUseMode::Borrow) && !access.removes_element() {
+        if storage.payload_enum.is_some()
+            && matches!(mode, mir::PayloadEnumUseMode::Borrow)
+            && !access.removes_element()
+        {
             let address =
                 self.collection_borrow_slot(collection, key_word, key_type, access, false)?;
-            let result = self.entry_payload_alloca(ty, true, "aggregate.nullable.borrow")?;
-            self.zero_payload_bytes(result, ty, true)?;
+            let result = self.entry_inline_alloca(storage, true, "aggregate.nullable.borrow")?;
+            self.zero_memory_value(result, nullable_layout)?;
             let function = current_function(&self.builder)?;
             let present_block = self
                 .context
@@ -9874,7 +9981,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             self.builder.position_at_end(present_block);
             if stored_nullable {
-                self.copy_payload_bytes(result, address, ty, true)?;
+                self.copy_memory_value(result, address, nullable_layout)?;
             } else {
                 build(
                     self.builder
@@ -9882,10 +9989,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
                 let destination = self.byte_offset(
                     result,
-                    ty.nullable_payload_offset,
+                    storage.nullable_payload_offset,
                     "aggregate.borrow.payload",
                 )?;
-                self.copy_payload_bytes(destination, address, ty, false)?;
+                self.copy_memory_value(destination, address, value_layout)?;
             }
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
@@ -9901,8 +10008,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             return Ok(result);
         }
-        let raw = self.entry_payload_alloca(ty, stored_nullable, "aggregate.nullable.raw")?;
-        self.zero_payload_bytes(raw, ty, stored_nullable)?;
+        let raw = self.entry_inline_alloca(storage, false, "aggregate.nullable.raw")?;
+        self.zero_memory_value(
+            raw,
+            native_closure_abi::NativeLayout {
+                size: storage.size,
+                align: storage.align,
+            },
+        )?;
         let found = self.entry_alloca(self.context.i8_type(), "aggregate.nullable.found")?;
         let removed_key = self.entry_alloca(self.context.i64_type(), "aggregate.removed.key")?;
         let byte = self.context.i8_type();
@@ -9951,10 +10064,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
             }
         }
-        let result = self.entry_payload_alloca(ty, true, "aggregate.nullable.result")?;
-        self.zero_payload_bytes(result, ty, true)?;
+        let result = self.entry_inline_alloca(storage, true, "aggregate.nullable.result")?;
+        self.zero_memory_value(result, nullable_layout)?;
         if stored_nullable {
-            self.copy_payload_bytes(result, raw, ty, true)?;
+            self.copy_memory_value(result, raw, nullable_layout)?;
         } else {
             let present = build(self.builder.build_load(
                 self.context.i8_type(),
@@ -9964,14 +10077,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             build(self.builder.build_store(result, present))?;
             let destination = self.byte_offset(
                 result,
-                ty.nullable_payload_offset,
+                storage.nullable_payload_offset,
                 "aggregate.nullable.payload",
             )?;
-            self.copy_payload_bytes(destination, raw, ty, false)?;
+            self.copy_memory_value(destination, raw, value_layout)?;
         }
         let mutating = access.removes_element();
         if !mutating && matches!(mode, mir::PayloadEnumUseMode::Copy) {
-            self.retain_payload_enum_at(result, ty, true)?;
+            self.retain_inline_element_at(result, storage.with_nullable(true))?;
         }
         Ok(result)
     }
@@ -11440,7 +11553,134 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let slot = local_slot(&self.local_slots, *local)?;
                 self.byte_offset(slot, ty.nullable_payload_offset, "foreign.payload")
             }
+            mir::ForeignAggregateExpression::CollectionIndex {
+                ty,
+                collection,
+                index,
+                index_span,
+                positional,
+                remove,
+            } => self.lower_inline_collection_element_copy(
+                *collection,
+                index,
+                *index_span,
+                *positional,
+                *remove,
+                mir::Type::ForeignAggregate(*ty),
+            ),
+            // The element is copied out at once, so a later change to the
+            // viewed storage cannot reach the value.
+            mir::ForeignAggregateExpression::RegionIndex {
+                ty,
+                region,
+                index,
+                index_span,
+            } => {
+                let index = self.lower_rvalue(index)?;
+                let (_, address) = self
+                    .typed_region_element(*region, index, *index_span)?
+                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+                let destination = self.entry_foreign_aggregate_alloca(*ty, "foreign.element")?;
+                self.copy_memory_value(
+                    destination,
+                    address,
+                    native_closure_abi::NativeLayout {
+                        size: ty.size,
+                        align: ty.align,
+                    },
+                )?;
+                Ok(destination)
+            }
         }
+    }
+
+    /// The collection local `collection`, and the position or key `index`
+    /// names in it as a collection word with its type: the key of a
+    /// Dictionary family unless `positional`, otherwise an `int` position.
+    fn collection_element_key(
+        &mut self,
+        collection: mir::LocalId,
+        index: BasicValueEnum<'ctx>,
+        positional: bool,
+        index_span: crate::source::Span,
+    ) -> Result<(PointerValue<'ctx>, mir::Type, IntValue<'ctx>), BackendError> {
+        let mir::Type::Collection(collection_type) = local_in(self.function, collection)?.ty else {
+            return Err(malformed_mir(
+                "an inline collection element names a non-collection local",
+            ));
+        };
+        let key = self.collection_definition(collection_type)?.key;
+        let collection = self.collection_pointer(collection)?;
+        self.set_active_panic_site(index_span)?;
+        let index_type = match (positional, key) {
+            (false, Some(key)) => key,
+            _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        };
+        let index_word = self.value_to_collection_word(index, index_type)?;
+        Ok((collection, index_type, index_word))
+    }
+
+    /// The address of a copy of the element of type `stored` that the
+    /// collection local `collection` holds inline at `index`, removing it
+    /// from the collection when `remove`. A missing element panics as
+    /// indexing does.
+    fn lower_inline_collection_element_copy(
+        &mut self,
+        collection: mir::LocalId,
+        index: &mir::Rvalue,
+        index_span: crate::source::Span,
+        positional: bool,
+        remove: bool,
+        stored: mir::Type,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let storage = mir::InlineElementStorage::of(stored)
+            .ok_or_else(|| malformed_mir("an inline collection element has inline storage"))?;
+        let index_value = self.lower_rvalue(index)?;
+        let (collection, index_type, index_word) =
+            self.collection_element_key(collection, index_value, positional, index_span)?;
+        let destination = self.entry_inline_alloca(storage, false, "inline.collection.element")?;
+        if remove {
+            let pointer = self.context.ptr_type(AddressSpace::default());
+            let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+            let index = if usize_type.get_bit_width() == 64 {
+                index_word
+            } else {
+                build(self.builder.build_int_truncate(
+                    index_word,
+                    usize_type,
+                    "inline.collection.remove.index",
+                ))?
+            };
+            let _ = self.call_runtime(
+                COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    usize_type.into(),
+                    pointer.into(),
+                ],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection.into(),
+                    index.into(),
+                    destination.into(),
+                ],
+            )?;
+            return Ok(destination);
+        }
+        let address = self.collection_borrow_slot(
+            collection,
+            index_word,
+            index_type,
+            mir::NullableCollectionAccess::Index,
+            positional,
+        )?;
+        if index_type == mir::Type::String {
+            self.release_string(index_value.into_pointer_value())?;
+        }
+        self.copy_inline_element(destination, address, storage)?;
+        Ok(destination)
     }
 
     /// The address of a `?Name` value in the nullable inline layout of its
@@ -11493,6 +11733,36 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call_at(*function, args, true, *span)?
                 .ok_or_else(|| malformed_mir("a nullable foreign aggregate call returned void"))?
                 .into_pointer_value()),
+            mir::NullableForeignAggregateExpression::CollectionIndex {
+                collection,
+                index,
+                index_span,
+                positional,
+                remove,
+                ..
+            } => self.lower_inline_collection_element_copy(
+                *collection,
+                index,
+                *index_span,
+                *positional,
+                *remove,
+                mir::Type::NullableForeignAggregate(ty),
+            ),
+            mir::NullableForeignAggregateExpression::CollectionGet {
+                collection,
+                key,
+                access,
+                stored_nullable,
+                index_span,
+                ..
+            } => self.lower_nullable_inline_collection_get(
+                *index_span,
+                stored_inline_element(mir::Type::ForeignAggregate(ty), *stored_nullable)?,
+                *collection,
+                key,
+                *access,
+                mir::PayloadEnumUseMode::Copy,
+            ),
         }
     }
 
@@ -11595,7 +11865,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 length.into(),
                 data.into(),
                 length.into(),
-                word.const_int(u64::from(stride), false).into(),
+                word.const_int(stride as u64, false).into(),
             ],
         )?;
         Ok(())
@@ -11628,6 +11898,44 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.lower_property_address(object, property)?
             }
             mir::ForeignAggregatePlace::Static(id) => self.static_address(id)?,
+            // The element's slot in the collection's storage, which a field
+            // write changes in place.
+            mir::ForeignAggregatePlace::CollectionElement {
+                collection,
+                index,
+                positional,
+                index_span,
+            } => {
+                let index_type = local_in(self.function, index)?.ty;
+                let index = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, self.program, index_type),
+                    local_slot(&self.local_slots, index)?,
+                    "foreign.element.index",
+                ))?;
+                let (collection, index_type, index_word) =
+                    self.collection_element_key(collection, index, positional, index_span)?;
+                self.collection_borrow_slot(
+                    collection,
+                    index_word,
+                    index_type,
+                    mir::NullableCollectionAccess::Index,
+                    positional,
+                )?
+            }
+            mir::ForeignAggregatePlace::RegionElement {
+                region,
+                index,
+                index_span,
+            } => {
+                let index = build(self.builder.build_load(
+                    self.context.i64_type(),
+                    local_slot(&self.local_slots, index)?,
+                    "foreign.region.index",
+                ))?;
+                self.typed_region_element(region, index, index_span)?
+                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?
+                    .1
+            }
         };
         let offset = u32::try_from(offset)
             .map_err(|_| malformed_mir("a foreign field offset exceeds its aggregate"))?;
@@ -13003,12 +13311,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ))
     }
 
-    fn lower_payload_enum_collection_literal(
+    fn lower_inline_collection_literal(
         &mut self,
         definition: &mir::CollectionType,
         entries: &[mir::CollectionEntry],
-        ty: mir::PayloadEnumType,
-        nullable: bool,
+        storage: mir::InlineElementStorage,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -13034,10 +13341,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     byte.const_int(u64::from(definition.key.is_some()), false)
                         .into(),
                     byte.const_int(u64::from(fixed), false).into(),
-                    usize_type
-                        .const_int(u64::from(ty.storage_size(nullable)), false)
-                        .into(),
-                    usize_type.const_int(u64::from(ty.align), false).into(),
+                    usize_type.const_int(u64::from(storage.size), false).into(),
+                    usize_type.const_int(u64::from(storage.align), false).into(),
                     byte.const_int(
                         u64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
                         false,
@@ -13061,7 +13366,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let source = self.lower_rvalue(&entry.value)?.into_pointer_value();
             let destination = if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
                 let key = self.lower_rvalue(key)?;
-                self.lower_aggregate_dictionary_write_slot(result, key, key_type, ty, nullable)?
+                self.lower_aggregate_dictionary_write_slot(result, key, key_type, storage)?
             } else if fixed {
                 self.call_runtime(
                     COLLECTION_AGGREGATE_VALUE_AT,
@@ -13097,7 +13402,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| backend_failure("aggregate insertion produced no slot"))?
                 .into_pointer_value()
             };
-            self.copy_payload_bytes(destination, source, ty, nullable)?;
+            self.copy_inline_element(destination, source, storage)?;
         }
         if stage26_collection_kind(definition.kind).is_some() {
             let _ = self.call_runtime(
@@ -13289,8 +13594,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: PointerValue<'ctx>,
         key: BasicValueEnum<'ctx>,
         key_type: mir::Type,
-        value_type: mir::PayloadEnumType,
-        nullable_value: bool,
+        storage: mir::InlineElementStorage,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let byte = self.context.i8_type();
@@ -13336,7 +13640,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ))?;
         build(self.builder.build_conditional_branch(has_old, drop, done))?;
         self.builder.position_at_end(drop);
-        self.drop_payload_enum_at(destination, value_type, nullable_value)?;
+        self.drop_inline_element_at(destination, storage)?;
         self.drop_stored_value(key, key_type)?;
         build(self.builder.build_unconditional_branch(done))?;
         self.builder.position_at_end(done);
@@ -13503,13 +13807,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     }
                     return self.lower_core_collection_new(&definition, usize_type.const_zero());
                 }
-                if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
-                    return self.lower_payload_enum_collection_literal(
-                        &definition,
-                        entries,
-                        ty,
-                        nullable,
-                    );
+                if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
+                    return self.lower_inline_collection_literal(&definition, entries, storage);
                 }
                 if type_uses_aggregate_collection_storage(self.program, definition.value) {
                     return self.lower_aggregate_collection_literal(&definition, entries);
@@ -13867,30 +14166,29 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let fixed = self.context.i8_type().const_int(u64::from(fixed), false);
                 let aggregate =
                     type_uses_aggregate_collection_storage(self.program, definition.value)
-                        || Self::payload_enum_storage(definition.value).is_some();
+                        || mir::InlineElementStorage::of(definition.value).is_some();
                 let nullable = matches!(definition.value, mir::Type::NullableScalar(_));
                 if aggregate || nullable {
-                    let (address, size, alignment) = if let Some((ty, nullable)) =
-                        Self::payload_enum_storage(definition.value)
-                    {
-                        (
-                            self.entry_payload_alloca(ty, nullable, "collection.fill.seed")?,
-                            u64::from(ty.storage_size(nullable)),
-                            u64::from(ty.align),
-                        )
-                    } else {
-                        let carrier = llvm_type(
-                            self.context,
-                            self.target_data,
-                            self.program,
-                            definition.value,
-                        );
-                        (
-                            self.entry_alloca(carrier, "collection.fill.seed")?,
-                            self.target_data.get_store_size(&carrier),
-                            u64::from(self.target_data.get_abi_alignment(&carrier)),
-                        )
-                    };
+                    let (address, size, alignment) =
+                        if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
+                            (
+                                self.entry_inline_alloca(storage, false, "collection.fill.seed")?,
+                                u64::from(storage.size),
+                                u64::from(storage.align),
+                            )
+                        } else {
+                            let carrier = llvm_type(
+                                self.context,
+                                self.target_data,
+                                self.program,
+                                definition.value,
+                            );
+                            (
+                                self.entry_alloca(carrier, "collection.fill.seed")?,
+                                self.target_data.get_store_size(&carrier),
+                                u64::from(self.target_data.get_abi_alignment(&carrier)),
+                            )
+                        };
                     self.store_value_at_address(address, value, definition.value)?;
                     let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
                     let byte = self.context.i8_type();
@@ -15077,10 +15375,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.store_value_at_address(destination, value, definition.value)?;
             return Ok(());
         }
-        if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
+        if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
             if op == mir::CollectionMutationOp::Remove {
                 return Err(malformed_mir(
-                    "payload enum remove-by-value requires generated enum equality",
+                    "inline element remove-by-value requires generated equality",
                 ));
             }
             let source = self.lower_rvalue(value)?.into_pointer_value();
@@ -15119,7 +15417,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| backend_failure("aggregate insertion produced no slot"))?
                 .into_pointer_value()
             };
-            self.copy_payload_bytes(destination, source, ty, nullable)?;
+            self.copy_inline_element(destination, source, storage)?;
             return Ok(());
         }
         if nullable_payload_type(definition.value).is_some()
@@ -15684,7 +15982,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.store_value_at_address(destination, replacement, definition.value)?;
             return Ok(());
         }
-        if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
+        if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
             let replacement = self.lower_rvalue(value)?.into_pointer_value();
             self.set_active_panic_site(index_span)?;
             let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
@@ -15692,8 +15990,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     collection_value,
                     index,
                     key_type,
-                    ty,
-                    nullable,
+                    storage,
                 )?
             } else {
                 let index = self.value_to_collection_word(
@@ -15724,10 +16021,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?
                     .ok_or_else(|| backend_failure("aggregate collection write produced no slot"))?
                     .into_pointer_value();
-                self.drop_payload_enum_at(destination, ty, nullable)?;
+                self.drop_inline_element_at(destination, storage)?;
                 destination
             };
-            self.copy_payload_bytes(destination, replacement, ty, nullable)?;
+            self.copy_inline_element(destination, replacement, storage)?;
             return Ok(());
         }
         if let Some(payload_ty) = nullable_payload_type(definition.value) {
@@ -16051,8 +16348,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         definition: &mir::CollectionType,
     ) -> Result<(), BackendError> {
         let value_claim = definition.value.managed_inline_carrier();
-        let payload_claim = Self::payload_enum_storage(definition.value)
-            .filter(|(ty, _)| ty.capabilities.needs_drop);
+        // Only a payload enum element has managed fields; a foreign struct
+        // or union element is bytes.
+        let payload_claim = mir::InlineElementStorage::of(definition.value).and_then(|storage| {
+            storage
+                .payload_enum
+                .filter(|ty| ty.capabilities.needs_drop)
+                .map(|ty| (ty, storage.nullable))
+        });
         let key_claim = definition.key.and_then(mir::Type::managed_inline_carrier);
         if key_claim.is_some_and(|(_, nullable)| nullable) {
             return Err(malformed_mir(
@@ -16209,13 +16512,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.retain_copied_collection_claims(result, &target_definition)?;
             return Ok(result);
         }
-        if let Some((ty, nullable)) = Self::payload_enum_storage(target_definition.value) {
-            return self.lower_payload_enum_collection_from(
-                &target_definition,
-                source_value,
-                ty,
-                nullable,
-            );
+        if let Some(storage) = mir::InlineElementStorage::of(target_definition.value) {
+            return self.lower_inline_collection_from(&target_definition, source_value, storage);
         }
         if let Some(kind) = stage26_collection_kind(target_definition.kind) {
             if transfer {
@@ -16432,12 +16730,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(result)
     }
 
-    fn lower_payload_enum_collection_from(
+    fn lower_inline_collection_from(
         &mut self,
         target: &mir::CollectionType,
         source: PointerValue<'ctx>,
-        ty: mir::PayloadEnumType,
-        nullable: bool,
+        storage: mir::InlineElementStorage,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -16474,10 +16771,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     byte.const_int(u64::from(target.key.is_some()), false)
                         .into(),
                     byte.const_zero().into(),
-                    usize_type
-                        .const_int(u64::from(ty.storage_size(nullable)), false)
-                        .into(),
-                    usize_type.const_int(u64::from(ty.align), false).into(),
+                    usize_type.const_int(u64::from(storage.size), false).into(),
+                    usize_type.const_int(u64::from(storage.align), false).into(),
                     byte.const_int(u64::from(kind), false).into(),
                     byte.const_int(
                         u64::from(
@@ -16576,7 +16871,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } else {
                 key_word.into()
             };
-            self.lower_aggregate_dictionary_write_slot(result, key, key_ty, ty, nullable)?
+            self.lower_aggregate_dictionary_write_slot(result, key, key_ty, storage)?
         } else {
             self.call_runtime(
                 COLLECTION_AGGREGATE_PUSH_SLOT,
@@ -16587,8 +16882,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
             .into_pointer_value()
         };
-        self.copy_payload_bytes(destination, source_slot, ty, nullable)?;
-        self.retain_payload_enum_at(destination, ty, nullable)?;
+        self.copy_inline_element(destination, source_slot, storage)?;
+        self.retain_inline_element_at(destination, storage)?;
         let next = build(self.builder.build_int_add(
             index,
             usize_type.const_int(1, false),
@@ -16786,6 +17081,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     | mir::Type::NullableScalar(_)
                     | mir::Type::Region(_)
                     | mir::Type::NullableRegion(_)
+                    | mir::Type::ForeignAggregate(_)
+                    | mir::Type::NullableForeignAggregate(_)
             );
         let scalar_keys = definition.key.is_none_or(|key| {
             matches!(key, mir::Type::Scalar(_)) && !native_closure_abi::needs_drop(key)
@@ -16985,7 +17282,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| backend_failure("aggregate collection value read produced no slot"))?
                 .into_pointer_value();
             self.drop_value_at_address(value, definition.value)?;
-        } else if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
+        } else if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
             let index = if usize_type.get_bit_width() == 64 {
                 current
             } else {
@@ -17019,7 +17316,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?
                 .ok_or_else(|| backend_failure("aggregate collection value read produced no slot"))?
                 .into_pointer_value();
-            self.drop_payload_enum_at(value, ty, nullable)?;
+            self.drop_inline_element_at(value, storage)?;
         } else {
             let value_word = self
                 .call_runtime(
@@ -22675,7 +22972,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             destination_length.into(),
                             source_data.into(),
                             source_length.into(),
-                            word.const_int(u64::from(stride), false).into(),
+                            word.const_int(stride as u64, false).into(),
                         ],
                     )?,
                     None => self.call_runtime(
@@ -27201,6 +27498,17 @@ fn class_uses_open_carrier(program: &mir::Program, class: crate::class_layout::C
         .classes
         .get(class.0)
         .is_some_and(|definition| definition.is_open)
+}
+
+/// The inline storage of the collection elements of type `value`, stored
+/// as `?value` when `stored_nullable`.
+fn stored_inline_element(
+    value: mir::Type,
+    stored_nullable: bool,
+) -> Result<mir::InlineElementStorage, BackendError> {
+    mir::InlineElementStorage::of(value)
+        .map(|storage| storage.with_nullable(stored_nullable))
+        .ok_or_else(|| malformed_mir("an inline collection element has inline storage"))
 }
 
 fn type_uses_aggregate_collection_storage(program: &mir::Program, ty: mir::Type) -> bool {

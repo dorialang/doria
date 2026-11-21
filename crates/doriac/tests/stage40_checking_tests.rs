@@ -2070,3 +2070,40 @@ fn foreign_aggregate_statics_are_constants_written_through_writable_statics() {
     assert!(!found.is_empty(), "a missing field is reported");
     assert!(!found.contains(&"E0485"), "{:#?}", findings(&missing));
 }
+
+#[test]
+fn foreign_aggregate_elements_have_no_equality_hashing_or_ordering() {
+    // A foreign struct or union is a collection element and a typed array
+    // region element (Decision 0148 sections 6 and 8), and has no `==`,
+    // hash or order, so it is no key, set element or priority, and no
+    // collection searches for one.
+    let declaration = "extern \"C\" struct Color { uint8 $red; }";
+    let color = "new Color(red: 1)";
+    let built = format!(
+        "{declaration} function main(): void {{ writable List<Color> $colors = [{color}]; writable Dictionary<string, ?Color> $named = []; writable Deque<Color> $queue = Deque::from([{color}]); writable Color[] $array = [{color}]; let $region = $array->getRegion(0, 1); echo $colors[0]->red . \" \" . $region[0]->red; }}"
+    );
+    assert!(codes(&built).is_empty(), "{:#?}", findings(&built));
+    for (body, code) in [
+        ("writable Set<Color> $set = [];", "E0523"),
+        ("writable Dictionary<Color, int> $keyed = [];", "E0523"),
+        (
+            "writable PriorityQueue<Color> $queue = PriorityQueue::from([]);",
+            "E0523",
+        ),
+        (
+            "writable List<Color> $colors = []; echo $colors->contains(new Color(red: 1));",
+            "E0524",
+        ),
+        (
+            "writable List<Color> $colors = []; $colors->remove(new Color(red: 1));",
+            "E0524",
+        ),
+    ] {
+        let source = format!("{declaration} function main(): void {{ {body} }}");
+        assert!(
+            codes(&source).contains(&code),
+            "{body}: {:#?}",
+            findings(&source)
+        );
+    }
+}

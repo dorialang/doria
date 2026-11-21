@@ -844,8 +844,14 @@ function main(): void
 #[test]
 fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
     for (body, position) in [
-        ("function keep(Color[] $colors): void {}", "a type argument"),
-        ("function keep(?Color[] $colors): void {}", "a type argument"),
+        (
+            "class Box<T> { function __construct(take T $value) {} } function keep(Box<Color> $box): void {}",
+            "a type argument",
+        ),
+        (
+            "class Box<T> { function __construct(take T $value) {} } function keep(Box<?Color> $box): void {}",
+            "a type argument",
+        ),
         ("function main(): void { let $show = function(Color $color): void {}; }", "a closure parameter"),
         ("function main(): void { let $show = function(?Color $color): void {}; }", "a closure parameter"),
         (
@@ -883,6 +889,185 @@ fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
                 && diagnostic.title == "Foreign Aggregates Cannot Be Built Here Yet"),
         "{diagnostics:#?}"
     );
+}
+
+/// A collection stores foreign structs and unions inline in its element
+/// slots (Decision 0148 sections 6 and 8): `List`, `T[]`, the Dictionary
+/// families and `Deque`, each also of `?Name`, with indexing, insertion,
+/// removal, nullable access and copies between collections.
+#[test]
+fn foreign_aggregates_are_collection_elements() {
+    let source = format!(
+        "{AGGREGATES}
+function main(): void
+{{
+    writable List<Color> $colors = [];
+    $colors->add(new Color(red: 1, green: 2, blue: 3));
+    $colors->add(new Color(red: 4, green: 5, blue: 6));
+    $colors->insertAt(0, new Color(red: 7, green: 8, blue: 9));
+    echo $colors->count . \" \" . $colors[0]->red . \" \" . $colors[2]->blue . \" \";
+    $colors[2] = new Color(red: 10, green: 11, blue: 12, alpha: 13);
+    echo $colors[2]->alpha . \" \";
+    let $removed = $colors->removeAt(0);
+    echo $removed->red . \" \" . $colors->count . \" \";
+    echo ($colors->get(5) ?? new Color(red: 99, green: 0, blue: 0))->red . \" \";
+    echo ($colors->get(0) ?? new Color(red: 0, green: 0, blue: 0))->green . \" \";
+    writable Deque<Color> $copy = Deque::from($colors);
+    $colors[0] = new Color(red: 77, green: 0, blue: 0);
+    echo ($copy->popFront() ?? new Color(red: 0, green: 0, blue: 0))->red . \" \" . $colors[0]->red . \" \";
+    Sample[] $samples = [new Sample(tag: 1, value: -5, extra: 9), new Sample(tag: 2, value: 1234567890123, extra: 10)];
+    echo $samples[0]->value . \" \" . $samples[1]->value . \" \" . $samples[1]->extra . \" \";
+    writable Dictionary<string, Word> $words = [];
+    $words[\"a\"] = new Word(whole: 258);
+    $words[\"b\"] = new Word(color: new Color(red: 1, green: 1, blue: 1, alpha: 1));
+    unsafe {{
+        echo $words[\"a\"]->whole . \" \" . $words[\"b\"]->whole . \" \";
+    }}
+    echo $words->count . \" \" . ($words->get(\"c\") == null) . \" \";
+    let $gone = $words->remove(\"a\");
+    unsafe {{
+        echo ($gone ?? new Word())->whole . \" \" . $words->count . \" \";
+    }}
+    writable List<?Color> $maybe = [null, new Color(red: 3, green: 3, blue: 3)];
+    $maybe->add(null);
+    echo ($maybe[0] == null) . \" \" . ($maybe[1] ?? new Color(red: 0, green: 0, blue: 0))->red . \" \" . $maybe->count . \" \";
+    echo ($maybe->removeAt(2) == null) . \" \" . ($maybe->get(1) == null) . \" \";
+    writable Deque<Color> $queue = Deque::from([new Color(red: 22, green: 0, blue: 0)]);
+    $queue->pushBack(new Color(red: 21, green: 0, blue: 0));
+    $queue->pushFront(new Color(red: 20, green: 0, blue: 0));
+    echo ($queue->popFront() ?? new Color(red: 0, green: 0, blue: 0))->red . \" \";
+    echo ($queue->popBack() ?? new Color(red: 0, green: 0, blue: 0))->red . \" \" . $queue->count;
+}}
+"
+    );
+    // Every tier-1 target is little-endian: 258 with its low byte 2 is
+    // 0x0102, and four 1 bytes are 0x01010101.
+    assert_runs_natively(
+        &source,
+        "3 7 6 13 7 2 99 2 1 77 -5 1234567890123 10 258 16843009 2 true 258 1 true 3 3 true false 20 21 1",
+    );
+}
+
+/// A field of a collection or region element is a place in the element's
+/// storage: a field write, a nested field write, read-modify-write, a
+/// fixed-length array field's region and a writable foreach binding each
+/// change the element in place (Decision 0148 sections 6 and 8).
+#[test]
+fn fields_of_aggregate_elements_change_in_place() {
+    let source = format!(
+        "{AGGREGATES}
+extern \"C\" struct Tip
+{{
+    int32 $x;
+    Color $color;
+    uint16[4] $text;
+}}
+
+class Palette
+{{
+    function __construct(
+        take writable List<Color> $colors,
+    ) {{}}
+
+    writable function brighten(): void
+    {{
+        $this->colors[0]->red += 1;
+    }}
+}}
+
+function sum(List<Color> $colors): int
+{{
+    writable int $total = 0;
+    foreach ($colors as Color $color) {{
+        $total += Int64::from($color->red);
+    }}
+    return $total;
+}}
+
+function main(): void
+{{
+    writable Tip[] $tips = [new Tip(x: 1, color: new Color(red: 1, green: 1, blue: 1))];
+    $tips[0]->color->blue = 9;
+    $tips[0]->x++;
+    writable WritableArrayRegion<uint16> $text = $tips[0]->text;
+    $text[2] = 44;
+    echo $tips[0]->color->blue . \" \" . $tips[0]->x . \" \" . $tips[0]->text[2] . \" \";
+    foreach ($tips as writable Tip $tip) {{
+        $tip->x = $tip->x * 10;
+    }}
+    echo $tips[0]->x . \" \";
+    writable List<Color> $colors = [new Color(red: 1, green: 2, blue: 3)];
+    $colors[0]->green = 50;
+    foreach ($colors as writable Color $color) {{
+        $color->blue = $color->blue + 100;
+    }}
+    echo $colors[0]->green . \" \" . $colors[0]->blue . \" \";
+    writable Palette $palette = new Palette([new Color(red: 5, green: 0, blue: 0), new Color(red: 6, green: 0, blue: 0)]);
+    $palette->brighten();
+    echo $palette->colors[0]->red . \" \" . sum($palette->colors) . \" \";
+    writable SortedDictionary<int, Color> $sorted = SortedDictionary::from([]);
+    $sorted[3] = new Color(red: 3, green: 0, blue: 0);
+    $sorted[1] = new Color(red: 1, green: 0, blue: 0);
+    $sorted[3]->blue = 33;
+    foreach ($sorted as int $key => writable Color $color) {{
+        $color->green = UInt8::from($key);
+    }}
+    foreach ($sorted as int $key => Color $color) {{
+        echo $key . \"=\" . $color->red . \"/\" . $color->green . \"/\" . $color->blue . \" \";
+    }}
+    writable Dictionary<string, Word> $words = [];
+    $words[\"a\"] = new Word(whole: 258);
+    $words[\"a\"]->low = 7;
+    unsafe {{
+        echo $words[\"a\"]->whole;
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "9 2 44 20 50 103 6 12 1=1/1/0 3=3/3/33 263");
+}
+
+/// A typed array region over foreign structs (Decision 0148 section 8)
+/// views the array's elements at their C stride: element reads and writes,
+/// field writes, `foreach` and a writable binding reach the array, and C
+/// reads the elements through the region's pointer.
+#[test]
+fn typed_regions_view_aggregate_elements_and_c_reads_them() {
+    let source = format!(
+        "{POINTER}use Doria\\Std\\Ffi\\{{CSize, Opaque}};
+{AGGREGATES}
+extern \"C\"
+{{
+    /** @safety Both ranges hold `$count` bytes and do not overlap. */
+    function memcpy(WritablePointer<Opaque> $destination, Pointer<Opaque> $source, CSize $count): WritablePointer<Opaque>;
+}}
+
+function main(): void
+{{
+    writable Sample[] $samples = [new Sample(tag: 1, value: 10, extra: 100), new Sample(tag: 2, value: 20, extra: 200), new Sample(tag: 3, value: 30, extra: 300)];
+    let $region = $samples->getRegion(1, 2);
+    echo $region->length . \" \" . $region[0]->value . \" \" . $region[1]->extra . \" \";
+    foreach ($region as Sample $sample) {{
+        echo $sample->tag . \" \";
+    }}
+    writable WritableArrayRegion<Sample> $writable = $samples->getWritableRegion(0, 3);
+    $writable[2]->value = 333;
+    $writable[0] = new Sample(tag: 9, value: 90, extra: 900);
+    foreach ($writable as writable Sample $sample) {{
+        $sample->extra = $sample->extra + 1;
+    }}
+    echo $samples[0]->tag . \" \" . $samples[2]->value . \" \" . $samples[1]->extra . \" \";
+    writable Sample $target = new Sample(tag: 0, value: 0, extra: 0);
+    unsafe {{
+        let $source = $samples->getRegion(0, 3);
+        memcpy(WritablePointer::cast<Opaque>(WritablePointer::to($target)), Pointer::cast<Opaque>($source->pointer->offset(2)), CSize::from(Sample::SIZE));
+        echo $target->tag . \" \" . $target->value . \" \" . $target->extra . \" \";
+        echo ($source->pointer->offset(1)->address - $source->pointer->address) . \" \" . Sample::SIZE;
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "2 20 300 2 3 9 333 201 3 333 301 24 24");
 }
 
 #[test]

@@ -1291,6 +1291,8 @@ fn collection_type_is_copy(ty: mir::Type) -> bool {
             | mir::Type::String
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_)
     ) || matches!(
         ty,
         mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
@@ -13055,6 +13057,24 @@ fn collect_rvalue_class_local_accesses_of_nullable_aggregate<'a>(
                 collect_rvalue_class_local_accesses(arg, accesses);
             }
         }
+        mir::NullableForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+            ..
+        } => {
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.collection_access(*collection, *remove);
+        }
+        mir::NullableForeignAggregateExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            ..
+        } => {
+            collect_rvalue_class_local_accesses(key, accesses);
+            accesses.collection_access(*collection, access.removes_element());
+        }
     }
 }
 
@@ -13070,7 +13090,9 @@ fn nullable_foreign_aggregate_is_present(
         mir::NullableForeignAggregateExpression::Null(_)
         | mir::NullableForeignAggregateExpression::Property { .. }
         | mir::NullableForeignAggregateExpression::Static { .. }
-        | mir::NullableForeignAggregateExpression::Call { .. } => false,
+        | mir::NullableForeignAggregateExpression::Call { .. }
+        | mir::NullableForeignAggregateExpression::CollectionIndex { .. }
+        | mir::NullableForeignAggregateExpression::CollectionGet { .. } => false,
     }
 }
 
@@ -13098,6 +13120,20 @@ fn collect_foreign_aggregate_class_local_accesses<'a>(
             for arg in args {
                 collect_rvalue_class_local_accesses(arg, accesses);
             }
+        }
+        mir::ForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+            ..
+        } => {
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.collection_access(*collection, *remove);
+        }
+        mir::ForeignAggregateExpression::RegionIndex { region, index, .. } => {
+            accesses.resource_read(*region);
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.contents_access(*region, false);
         }
     }
 }
@@ -14838,6 +14874,20 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                     accesses.borrow_property(*object, *property)
                 }
                 mir::ForeignAggregatePlace::Static(_) => {}
+                mir::ForeignAggregatePlace::CollectionElement {
+                    collection, index, ..
+                } => {
+                    accesses.resource_read(*index);
+                    accesses.collection_access(*collection, false);
+                }
+                mir::ForeignAggregatePlace::RegionElement { region, index, .. } => {
+                    accesses.resource_read(*region);
+                    accesses.resource_read(*index);
+                    accesses.contents_access(
+                        *region,
+                        matches!(access, mir::ForeignFieldAccess::Write { .. }),
+                    );
+                }
             }
             if let mir::ForeignFieldAccess::Write { value, .. } = access {
                 collect_rvalue_class_local_accesses(value, &mut accesses);
@@ -16969,7 +17019,23 @@ fn rvalue_reads_collection_value_at(
                 },
             mode: mir::PayloadEnumUseMode::Borrow,
             ..
-        }) => matches_index(*collection, index, *positional, *remove),
+        })
+        | mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        })
+        | mir::Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            },
+        ) => matches_index(*collection, index, *positional, *remove),
         mir::Rvalue::NullableScalar(mir::NullableScalarExpression::DictionaryGet {
             collection,
             key,
@@ -16997,7 +17063,15 @@ fn rvalue_reads_collection_value_at(
             key,
             access,
             ..
-        }) => matches_nullable(*collection, key, *access),
+        })
+        | mir::Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::CollectionGet {
+                collection,
+                key,
+                access,
+                ..
+            },
+        ) => matches_nullable(*collection, key, *access),
         _ => false,
     }
 }
@@ -21173,6 +21247,10 @@ fn rvalue_observes_property(
                 property: observed,
                 ..
             } => *object == receiver && *observed == property,
+            mir::NullableForeignAggregateExpression::CollectionIndex { index: key, .. }
+            | mir::NullableForeignAggregateExpression::CollectionGet { key, .. } => {
+                rvalue_observes_property(key, receiver, property)
+            }
             mir::NullableForeignAggregateExpression::Null(_)
             | mir::NullableForeignAggregateExpression::Local { .. }
             | mir::NullableForeignAggregateExpression::Static { .. } => false,
@@ -21197,6 +21275,10 @@ fn foreign_aggregate_observes_property(
             property: observed,
             ..
         } => *object == receiver && *observed == property,
+        mir::ForeignAggregateExpression::CollectionIndex { index, .. }
+        | mir::ForeignAggregateExpression::RegionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
         mir::ForeignAggregateExpression::Local { .. }
         | mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { .. }
         | mir::ForeignAggregateExpression::Static { .. } => false,

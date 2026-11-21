@@ -153,10 +153,15 @@ pub(super) fn expression(
                 matches!(property.as_str(), "pointer" | "writablePointer"),
                 context.expression_type(object)?,
             ) {
-                // An element's alignment is its stride: the typed array
-                // stores each element at its own width.
-                let align = byte_region::built_element(region_type, *span, context)?
-                    .map_or(1, |(_, stride)| u64::from(stride));
+                // The typed array stores a scalar at its own width and a
+                // foreign struct or union at its C size, each aligned as C
+                // aligns it.
+                let align = byte_region::built_element(region_type, *span, context)?.map_or(
+                    1,
+                    |(element, stride)| {
+                        crate::native_abi::array_region_alignment(element).unwrap_or(stride) as u64
+                    },
+                );
                 let region = byte_region::local(object, false, context)?;
                 let target = context.declare_return_temp(POINTER, false);
                 context.push_statement(mir::Statement::Pointer {
@@ -299,7 +304,7 @@ pub(super) fn expression(
                         hir::Expr::Variable { name, span: place } => {
                             (context.lookup_local(name, *place)?, 0)
                         }
-                        place => match field_place(place, context)? {
+                        place => match field_place(place, false, context)? {
                             Some(FieldPlace {
                                 aggregate: mir::ForeignAggregatePlace::Local(local),
                                 offset,
@@ -880,6 +885,7 @@ fn aggregate_type(
 /// reach.
 fn field_place(
     expr: &hir::Expr,
+    writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<FieldPlace>> {
     let hir::Expr::PropertyAccess {
@@ -929,7 +935,7 @@ fn field_place(
                 .ok_or_else(|| vec![unsupported(*span, "a foreign field type has no MIR type")])?,
         ),
     };
-    if let Some(outer) = field_place(object, context)? {
+    if let Some(outer) = field_place(object, writable, context)? {
         return Ok(Some(FieldPlace {
             aggregate: outer.aggregate,
             offset: outer.offset + field_offset,
@@ -974,6 +980,16 @@ fn field_place(
         } if context.constant_value(object).is_none() => mir::ForeignAggregatePlace::Static(
             static_aggregate(class_name, member, *span, aggregate_type, context)?,
         ),
+        hir::Expr::Index {
+            collection, index, ..
+        } => element_place(
+            collection,
+            index,
+            aggregate_type,
+            object.span(),
+            writable,
+            context,
+        )?,
         _ => {
             let value = lower_rvalue_as_expected(
                 object,
@@ -994,6 +1010,119 @@ fn field_place(
         offset: field_offset,
         field,
     }))
+}
+
+/// Element `index` of the collection or typed array region `collection`,
+/// which holds foreign structs or unions of type `ty`, as a place in the
+/// element's storage. The position or key is evaluated once into a local.
+/// `writable` gives the collection or region writable access, which a
+/// write through the element needs.
+fn element_place(
+    collection: &hir::Expr,
+    index: &hir::Expr,
+    ty: mir::ForeignAggregateType,
+    index_span: Span,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::ForeignAggregatePlace> {
+    let element = mir::Type::ForeignAggregate(ty);
+    let position = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+    if let mir::Type::Region(region) = context.expression_type(collection)? {
+        if super::byte_region::element_type(region, index_span, context)? != element {
+            return Err(vec![unsupported(
+                index_span,
+                "a region element field access names a region of another element type",
+            )]);
+        }
+        let region = super::byte_region::local(collection, writable, context)?;
+        let index = lower_rvalue_as_expected(index, position, context)?;
+        let (index, _) = core_value::materialize_value(index, context);
+        return Ok(mir::ForeignAggregatePlace::RegionElement {
+            region,
+            index,
+            index_span,
+        });
+    }
+    let Some((collection, collection_type)) =
+        lower_collection_receiver(collection, writable, context)?
+    else {
+        return Err(vec![unsupported(
+            index_span,
+            "a field access names an element of a value that is not a collection",
+        )]);
+    };
+    let info = context.collection_type(collection_type).clone();
+    if info.value != element {
+        return Err(vec![unsupported(
+            index_span,
+            "a collection element field access names a collection of another element type",
+        )]);
+    }
+    let index = lower_rvalue_as_expected(index, info.key.unwrap_or(position), context)?;
+    let (index, _) = core_value::materialize_value(index, context);
+    Ok(mir::ForeignAggregatePlace::CollectionElement {
+        collection,
+        index,
+        positional: false,
+        index_span,
+    })
+}
+
+/// `$values[$index]` and `$values->removeAt($index)` of a collection or
+/// typed array region whose elements are `element`, a foreign struct or
+/// union or its `?Name` form, as a copy of the element; `None` for another
+/// expression.
+fn element_rvalue(
+    expr: &hir::Expr,
+    element: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != element {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt of another element type reached foreign aggregate lowering",
+            )]);
+        }
+        return collection_remove_at_rvalue(collection, index, element, expr.span()).map(Some);
+    }
+    let hir::Expr::Index {
+        collection, index, ..
+    } = unparenthesized_place(expr)
+    else {
+        return Ok(None);
+    };
+    let index_span = expr.span();
+    if let mir::Type::Region(region) = context.expression_type(collection)? {
+        let mir::Type::ForeignAggregate(ty) = element else {
+            return Err(vec![unsupported(
+                index_span,
+                "a region of `?Name` elements reached foreign aggregate lowering",
+            )]);
+        };
+        if super::byte_region::element_type(region, index_span, context)? != element {
+            return Err(vec![unsupported(
+                index_span,
+                "a region element read names a region of another element type",
+            )]);
+        }
+        let region = super::byte_region::local(collection, false, context)?;
+        let index = lower_rvalue_as_expected(
+            index,
+            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+            context,
+        )?;
+        return Ok(Some(mir::Rvalue::ForeignAggregate(
+            mir::ForeignAggregateExpression::RegionIndex {
+                ty,
+                region,
+                index: Box::new(index),
+                index_span,
+            },
+        )));
+    }
+    let (collection, index) = lower_collection_index_operand(collection, index, element, context)?;
+    collection_value_rvalue(collection, index.clone(), index, element, false, index_span).map(Some)
 }
 
 /// Whether `expr` reads a stored class property in place: a property
@@ -1035,7 +1164,13 @@ pub(super) fn field_read(
     if let Some(value) = null_safe_field_read(expr, expected, context)? {
         return Ok(Some(value));
     }
-    let Some(place) = field_place(expr, context)? else {
+    // A writable region of a fixed-length array field needs writable
+    // access to the place that holds the aggregate.
+    let writable = matches!(
+        expected,
+        mir::Type::Region(region) if region.access == crate::types::ByteRegionKind::Writable
+    );
+    let Some(place) = field_place(expr, writable, context)? else {
         return Ok(None);
     };
     let (ty, target, access) = match place.field {
@@ -1230,7 +1365,7 @@ pub(super) fn field_write(
     update: FieldUpdate<'_>,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<bool> {
-    let Some(place) = field_place(target, context)? else {
+    let Some(place) = field_place(target, true, context)? else {
         return Ok(false);
     };
     let write = match (place.field, update) {
@@ -1333,6 +1468,29 @@ pub(super) fn aggregate_expression(
         };
         return Ok(value);
     }
+    // `??`, `when` and `match` merge their branches through the shared
+    // branching lowering, as every other value family's does.
+    if is_branching_expr(unparenthesized_place(expr)) {
+        let value = lower_branching_rvalue(
+            unparenthesized_place(expr),
+            mir::Type::ForeignAggregate(ty),
+            false,
+            context,
+        )?;
+        let mir::Rvalue::ForeignAggregate(value) = value else {
+            return Err(vec![unsupported(
+                expr.span(),
+                "a branching foreign struct or union value merged to another type",
+            )]);
+        };
+        return Ok(value);
+    }
+    if let Some(element) = element_rvalue(expr, mir::Type::ForeignAggregate(ty), context)? {
+        let mir::Rvalue::ForeignAggregate(element) = element else {
+            unreachable!("an element of `Name` values is a foreign aggregate value");
+        };
+        return Ok(element);
+    }
     match unparenthesized_place(expr) {
         hir::Expr::New {
             class_type,
@@ -1410,6 +1568,18 @@ fn aggregate_call(
             let signature = context.lookup_function(name, *span)?;
             let args = lower_call_args(name, args, signature.clone(), *span, context)?;
             (signature, args, *span)
+        }
+        // A collection's members are its own operations, which the shared
+        // collection paths lower; they are no Doria method.
+        hir::Expr::MethodCall { object, .. }
+            if matches!(
+                context.expression_type(object)?,
+                mir::Type::Collection(_)
+                    | mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Collection(_))
+                    | mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Collection(_))
+            ) =>
+        {
+            return Ok(None)
         }
         hir::Expr::MethodCall {
             object,
@@ -1507,6 +1677,12 @@ pub(super) fn nullable_aggregate_expression(
     if context.expression_type(expr)? == mir::Type::ForeignAggregate(ty) {
         return present(aggregate_expression(expr, ty, context)?);
     }
+    if let Some(element) = element_rvalue(expr, nullable, context)? {
+        let mir::Rvalue::NullableForeignAggregate(element) = element else {
+            unreachable!("an element of `?Name` values is a nullable foreign aggregate value");
+        };
+        return Ok(element);
+    }
     if let Some((function, args, span)) =
         aggregate_call(unparenthesized_place(expr), nullable, context)?
     {
@@ -1517,8 +1693,13 @@ pub(super) fn nullable_aggregate_expression(
             span,
         });
     }
-    let value = if is_branching_expr(expr) {
-        Some(lower_branching_rvalue(expr, nullable, false, context)?)
+    let value = if is_branching_expr(unparenthesized_place(expr)) {
+        Some(lower_branching_rvalue(
+            unparenthesized_place(expr),
+            nullable,
+            false,
+            context,
+        )?)
     } else {
         materialize_checked_rvalue(expr, nullable, false, context)?
     };

@@ -1645,6 +1645,74 @@ impl PayloadEnumType {
     }
 }
 
+/// How a collection stores an element held inline by value: a payload enum
+/// or a foreign struct or union, each also as `?T` in the shared nullable
+/// inline layout. The collection runtime copies `size` bytes per element
+/// at a stride rounded to `align`. An access that may find no element
+/// builds the value's nullable form from `value_size`, `nullable_size` and
+/// `nullable_payload_offset`. Only a payload enum's elements have drop
+/// glue; a foreign aggregate is bytes (Decision 0148 section 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineElementStorage {
+    pub size: u32,
+    pub align: u32,
+    pub nullable: bool,
+    pub value_size: u32,
+    pub nullable_size: u32,
+    pub nullable_payload_offset: u32,
+    /// The element's payload enum, when it is one.
+    pub payload_enum: Option<PayloadEnumType>,
+}
+
+impl InlineElementStorage {
+    /// The inline storage of elements of type `ty`, or `None` when the
+    /// collection stores them another way.
+    pub const fn of(ty: Type) -> Option<Self> {
+        let (value_size, align, nullable_size, nullable_payload_offset, nullable, payload_enum) =
+            match ty {
+                Type::PayloadEnum(payload) | Type::NullablePayloadEnum(payload) => (
+                    payload.size,
+                    payload.align,
+                    payload.nullable_size,
+                    payload.nullable_payload_offset,
+                    matches!(ty, Type::NullablePayloadEnum(_)),
+                    Some(payload),
+                ),
+                Type::ForeignAggregate(aggregate) | Type::NullableForeignAggregate(aggregate) => (
+                    aggregate.size,
+                    aggregate.align,
+                    aggregate.nullable_size,
+                    aggregate.nullable_payload_offset,
+                    matches!(ty, Type::NullableForeignAggregate(_)),
+                    None,
+                ),
+                _ => return None,
+            };
+        Some(Self {
+            size: if nullable { nullable_size } else { value_size },
+            align,
+            nullable,
+            value_size,
+            nullable_size,
+            nullable_payload_offset,
+            payload_enum,
+        })
+    }
+
+    /// The stored element with `nullable` stored nullability.
+    pub const fn with_nullable(self, nullable: bool) -> Self {
+        Self {
+            size: if nullable {
+                self.nullable_size
+            } else {
+                self.value_size
+            },
+            nullable,
+            ..self
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SharedPayload {
     Class(ClassId),
@@ -2182,6 +2250,27 @@ pub enum ForeignAggregateExpression {
         ty: ForeignAggregateType,
         local: LocalId,
     },
+    /// A copy of the element of the collection `collection` at `index`: a
+    /// position of a `List<Name>` or `Name[]` when `positional`, otherwise
+    /// a key of a Dictionary family. With `remove` the element leaves the
+    /// collection (`removeAt`) and the copy is its value. A missing element
+    /// panics as indexing does.
+    CollectionIndex {
+        ty: ForeignAggregateType,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+        positional: bool,
+        remove: bool,
+    },
+    /// A copy of element `index` of the typed array region `region`
+    /// (Decision 0148 section 8), bounds-checked as `Name[]` indexing is.
+    RegionIndex {
+        ty: ForeignAggregateType,
+        region: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+    },
 }
 
 impl ForeignAggregateExpression {
@@ -2192,7 +2281,9 @@ impl ForeignAggregateExpression {
             | Self::Property { ty, .. }
             | Self::Static { ty, .. }
             | Self::Call { ty, .. }
-            | Self::NullableLocalAssumeNonNull { ty, .. } => *ty,
+            | Self::NullableLocalAssumeNonNull { ty, .. }
+            | Self::CollectionIndex { ty, .. }
+            | Self::RegionIndex { ty, .. } => *ty,
         }
     }
 }
@@ -2223,6 +2314,29 @@ pub enum NullableForeignAggregateExpression {
         args: Vec<Rvalue>,
         span: Span,
     },
+    /// A copy of the element of the collection of `?Name` values
+    /// `collection` at `index`, as
+    /// `ForeignAggregateExpression::CollectionIndex` reads one.
+    CollectionIndex {
+        ty: ForeignAggregateType,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+        positional: bool,
+        remove: bool,
+    },
+    /// An element that may be absent: `get`, `pop` and the Deque and
+    /// Dictionary accessors `access` names, with `key` the position or key
+    /// it reads. `stored_nullable` says whether the collection stores
+    /// `?Name`, so a present element may itself be `null`.
+    CollectionGet {
+        ty: ForeignAggregateType,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored_nullable: bool,
+        index_span: Span,
+    },
 }
 
 impl NullableForeignAggregateExpression {
@@ -2232,7 +2346,9 @@ impl NullableForeignAggregateExpression {
             | Self::Local { ty, .. }
             | Self::Property { ty, .. }
             | Self::Static { ty, .. }
-            | Self::Call { ty, .. } => *ty,
+            | Self::Call { ty, .. }
+            | Self::CollectionIndex { ty, .. }
+            | Self::CollectionGet { ty, .. } => *ty,
             Self::Present(value) => value.ty(),
         }
     }
@@ -2253,6 +2369,22 @@ pub enum ForeignAggregatePlace {
         property: PropertyId,
     },
     Static(StaticId),
+    /// The element of the collection `collection` at the position or key
+    /// `index` holds, in its slot, as
+    /// `ForeignAggregateExpression::CollectionIndex` finds it.
+    CollectionElement {
+        collection: LocalId,
+        index: LocalId,
+        positional: bool,
+        index_span: Span,
+    },
+    /// Element `index` of the typed array region `region`, in the viewed
+    /// storage.
+    RegionElement {
+        region: LocalId,
+        index: LocalId,
+        index_span: Span,
+    },
 }
 
 impl fmt::Display for ForeignAggregateExpression {
@@ -2290,7 +2422,29 @@ impl fmt::Display for ForeignAggregateExpression {
             Self::NullableLocalAssumeNonNull { local, .. } => {
                 write!(formatter, "copy assume_non_null(local{})", local.0)
             }
+            Self::CollectionIndex {
+                collection,
+                index,
+                remove,
+                ..
+            } => write_collection_index(formatter, *collection, index, *remove),
+            Self::RegionIndex { region, index, .. } => {
+                write!(formatter, "copy local{}[{index}]", region.0)
+            }
         }
+    }
+}
+
+fn write_collection_index(
+    formatter: &mut fmt::Formatter<'_>,
+    collection: LocalId,
+    index: &Rvalue,
+    remove: bool,
+) -> fmt::Result {
+    if remove {
+        write!(formatter, "remove local{}[{index}]", collection.0)
+    } else {
+        write!(formatter, "copy local{}[{index}]", collection.0)
     }
 }
 
@@ -2316,6 +2470,18 @@ impl fmt::Display for NullableForeignAggregateExpression {
                     .join(", ");
                 write!(formatter, "call fn{}({args})", function.0)
             }
+            Self::CollectionIndex {
+                collection,
+                index,
+                remove,
+                ..
+            } => write_collection_index(formatter, *collection, index, *remove),
+            Self::CollectionGet {
+                collection,
+                key,
+                access,
+                ..
+            } => write!(formatter, "{access:?} local{}[{key}]", collection.0),
         }
     }
 }
@@ -2331,6 +2497,12 @@ impl fmt::Display for ForeignAggregatePlace {
                 write!(formatter, "local{}->property{}", object.0, property.index)
             }
             Self::Static(id) => write!(formatter, "static{}", id.0),
+            Self::CollectionElement {
+                collection, index, ..
+            } => write!(formatter, "local{}[local{}]", collection.0, index.0),
+            Self::RegionElement { region, index, .. } => {
+                write!(formatter, "local{}[local{}]", region.0, index.0)
+            }
         }
     }
 }
@@ -8203,6 +8375,10 @@ fn foreign_aggregate_class_temporary_capacity(value: &ForeignAggregateExpression
         ForeignAggregateExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        ForeignAggregateExpression::CollectionIndex { index, .. }
+        | ForeignAggregateExpression::RegionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
         ForeignAggregateExpression::Local { .. }
         | ForeignAggregateExpression::Property { .. }
         | ForeignAggregateExpression::Static { .. }
@@ -8219,6 +8395,10 @@ fn nullable_foreign_aggregate_class_temporary_capacity(
         }
         NullableForeignAggregateExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableForeignAggregateExpression::CollectionIndex { index: key, .. }
+        | NullableForeignAggregateExpression::CollectionGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
         }
         NullableForeignAggregateExpression::Null(_)
         | NullableForeignAggregateExpression::Local { .. }

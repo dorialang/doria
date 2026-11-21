@@ -566,9 +566,16 @@ fn from_pointer(
         },
         context,
     )?;
-    // An element's alignment is its stride: every element a region over
-    // foreign memory views is FFI-safe and stored at its own width.
-    let stride = built_element(kind, span, context)?.map_or(1, |(_, stride)| u64::from(stride));
+    // Every element a region over foreign memory views is FFI-safe: a
+    // scalar is stored at its own width and aligned to it, and a foreign
+    // struct or union at its C size and alignment.
+    let (stride, align) = match built_element(kind, span, context)? {
+        None => (1, 1),
+        Some((element, stride)) => (
+            stride as u64,
+            crate::native_abi::array_region_alignment(element).unwrap_or(stride) as u64,
+        ),
+    };
     let pointer = super::foreign::materialize_pointer(&args[pointer].value, context)?;
     let int = IntegerType::Int64;
     let length = lower_integer_expression(&args[length].value, context)?;
@@ -584,7 +591,7 @@ fn from_pointer(
             pointer,
             length: mir::IntegerExpression::use_operand(int, mir::Operand::Local(length_local)),
             stride,
-            align: stride,
+            align,
         },
         span,
     });
@@ -664,7 +671,7 @@ pub(super) fn built_element(
     region: mir::RegionType,
     span: Span,
     context: &LoweringContext<'_>,
-) -> DiagnosticResult<Option<(mir::Type, u8)>> {
+) -> DiagnosticResult<Option<(mir::Type, usize)>> {
     let Some(array) = region.array else {
         return Ok(None);
     };

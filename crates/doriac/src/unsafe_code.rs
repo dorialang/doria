@@ -166,6 +166,23 @@ fn holds_foreign_aggregate(
                     })
                 })
         }
+        // A collection stores its elements inline, and a typed array region
+        // views a typed array's elements.
+        crate::mir::Type::Collection(collection)
+        | crate::mir::Type::NullableCollection(collection) => program
+            .collection_types
+            .get(collection.0)
+            .is_some_and(|definition| {
+                holds_foreign_aggregate(program, definition.value, visited)
+                    || definition
+                        .key
+                        .is_some_and(|key| holds_foreign_aggregate(program, key, visited))
+            }),
+        crate::mir::Type::Region(region) | crate::mir::Type::NullableRegion(region) => {
+            region.array.is_some_and(|array| {
+                holds_foreign_aggregate(program, crate::mir::Type::Collection(array), visited)
+            })
+        }
         _ => false,
     }
 }
@@ -270,9 +287,9 @@ impl Finder {
     /// Reports a foreign struct or union `ty` holds where no execution
     /// target builds one yet: anywhere in a closure's signature or
     /// captures (`anywhere`), otherwise as a type argument other than a
-    /// pointer's pointee, or in a function type. Locals, parameters,
-    /// results, properties, constants, enum payloads and pointees build,
-    /// each also as `?Name`.
+    /// pointer's pointee or a collection or region element, or in a
+    /// function type. Locals, parameters, results, properties, constants,
+    /// enum payloads, pointees and elements build, each also as `?Name`.
     fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
         if self.aggregates.is_empty() {
             return;
@@ -282,8 +299,9 @@ impl Finder {
             None => aggregate_outside_value_position(ty, &self.aggregates, true),
         };
         if misplaced {
-            let position = anywhere
-                .unwrap_or("a type argument other than a pointer's pointee, or a function type");
+            let position = anywhere.unwrap_or(
+                "a type argument other than a pointer's pointee or an element, or a function type",
+            );
             let (title, message) = misplaced_aggregate_text(position);
             self.report(span, title, message);
         }
@@ -476,7 +494,8 @@ fn mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
 }
 
 /// Whether `ty` holds a foreign struct or union other than by value, or
-/// as `?Name`, in a value position or as a pointer's pointee.
+/// as `?Name`, in a value position, as a pointer's pointee, or as an
+/// element a collection or typed array region holds.
 fn aggregate_outside_value_position(
     ty: &TypeRef,
     aggregates: &HashSet<String>,
@@ -485,13 +504,34 @@ fn aggregate_outside_value_position(
     if aggregates.contains(&ty.name) && !value_position {
         return true;
     }
-    let pointer = crate::foreign::PointerAccess::from_source_name(&ty.name).is_some();
+    let by_value = holds_arguments_by_value(&ty.name);
     ty.arguments.iter().any(|argument| match argument {
         TypeArgumentRef::Type(inner) => {
-            aggregate_outside_value_position(inner, aggregates, pointer)
+            aggregate_outside_value_position(inner, aggregates, by_value)
         }
         TypeArgumentRef::Value(_) => false,
     }) || doria_function_mentions_aggregate(ty, aggregates)
+}
+
+/// Whether the type named `name` holds a foreign struct or union type
+/// argument where it builds one: a pointer's pointee (section 3), an
+/// element of `T[]` or a collection, which stores it inline in its element
+/// slot, or the element a typed array region views (section 8). Checking
+/// decides which collection keys and elements need conformances a foreign
+/// aggregate lacks.
+fn holds_arguments_by_value(name: &str) -> bool {
+    crate::foreign::PointerAccess::from_source_name(name).is_some()
+        || crate::types::ByteRegionKind::from_array_source_name(name).is_some()
+        || matches!(
+            name,
+            "[]" | "List"
+                | "Dictionary"
+                | "SortedDictionary"
+                | "Set"
+                | "SortedSet"
+                | "PriorityQueue"
+                | "Deque"
+        )
 }
 
 /// Whether `ty` is a Doria function type whose signature names a foreign

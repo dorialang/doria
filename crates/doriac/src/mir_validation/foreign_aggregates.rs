@@ -162,6 +162,34 @@ fn place_facts(
             let property = static_in(program, id)?;
             (property.ty, property.writable)
         }
+        // An element is written through a writable collection, which
+        // checking proves of the collection's place.
+        mir::ForeignAggregatePlace::CollectionElement {
+            collection,
+            index,
+            positional,
+            ..
+        } => {
+            let local = local_in(function, collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "a foreign field access names an element of a local without a collection",
+                ));
+            };
+            let definition = collection_in(program, collection_type)?;
+            let index = index_rvalue(function, index)?;
+            validate_collection_element_access(
+                program, function, local, definition, &index, false, positional,
+            )?;
+            (definition.value, local.writable)
+        }
+        // An element is written through a writable region.
+        mir::ForeignAggregatePlace::RegionElement { region, index, .. } => {
+            let index = index_rvalue(function, index)?;
+            let writable = local_in(function, region)?.ty.is_writable_region();
+            byte_regions::validate_index(program, function, region, &index, writable)?;
+            (byte_regions::element(program, function, region)?, writable)
+        }
     };
     let mir::Type::ForeignAggregate(aggregate) = ty else {
         return Err(malformed_mir(
@@ -169,6 +197,18 @@ fn place_facts(
         ));
     };
     Ok((aggregate, writable))
+}
+
+/// The position or key an element place reads from the local `index`.
+fn index_rvalue(
+    function: &mir::Function,
+    index: mir::LocalId,
+) -> Result<mir::Rvalue, BackendError> {
+    Ok(crate::mir::value_factory::local_rvalue(
+        index,
+        local_in(function, index)?.ty,
+        false,
+    ))
 }
 
 pub(super) fn validate_field_access(
@@ -302,7 +342,60 @@ pub(super) fn validate_expression(
             }
             Ok(())
         }
+        mir::ForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        } => validate_collection_element(
+            program,
+            function,
+            *collection,
+            index,
+            mir::Type::ForeignAggregate(ty),
+            *positional,
+            *remove,
+        ),
+        mir::ForeignAggregateExpression::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(
+                program,
+                function,
+                *region,
+                index,
+                mir::Type::ForeignAggregate(ty),
+            )
+        }
     }
+}
+
+/// An element of type `element` (`Name` or `?Name`) of the collection
+/// local `collection` at the position or key `index`, removed from a
+/// writable List when `remove`.
+fn validate_collection_element(
+    program: &mir::Program,
+    function: &mir::Function,
+    collection: mir::LocalId,
+    index: &mir::Rvalue,
+    element: mir::Type,
+    positional: bool,
+    remove: bool,
+) -> Result<(), BackendError> {
+    let local = local_in(function, collection)?;
+    let mir::Type::Collection(collection_type) = local.ty else {
+        return Err(malformed_mir(
+            "a foreign aggregate element names a local that holds no collection",
+        ));
+    };
+    let definition = collection_in(program, collection_type)?;
+    if definition.value != element {
+        return Err(malformed_mir(
+            "a foreign aggregate element names a collection of another element type",
+        ));
+    }
+    validate_collection_element_access(
+        program, function, local, definition, index, remove, positional,
+    )
 }
 
 fn validate_call(
@@ -355,5 +448,52 @@ pub(super) fn validate_nullable_expression(
             args,
             ..
         } => validate_call(program, function, *callee, args, nullable),
+        mir::NullableForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        } => validate_collection_element(
+            program,
+            function,
+            *collection,
+            index,
+            nullable,
+            *positional,
+            *remove,
+        ),
+        mir::NullableForeignAggregateExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            stored_nullable,
+            ..
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "a `?Name` collection access names a local that holds no collection",
+                ));
+            };
+            let stored = if *stored_nullable {
+                nullable
+            } else {
+                mir::Type::ForeignAggregate(ty)
+            };
+            if collection_in(program, collection_type)?.value != stored {
+                return Err(malformed_mir(
+                    "a `?Name` collection access has incorrect stored nullability",
+                ));
+            }
+            validate_dictionary_get(
+                program,
+                function,
+                *collection,
+                key,
+                mir::Type::ForeignAggregate(ty),
+                *access,
+            )
+        }
     }
 }
