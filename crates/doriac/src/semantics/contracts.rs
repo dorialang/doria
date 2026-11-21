@@ -937,6 +937,21 @@ impl Checker<'_> {
         self.core_iteration_element(ty, "Iterable")
     }
 
+    /// Whether `ty` is a class whose conformances checking already rejected
+    /// (E0752), so no contract of it, `Iterable` included, can be read.
+    /// Callers report nothing further about it: the conformance diagnostic
+    /// is the finding.
+    pub(super) fn conformances_rejected(&mut self, ty: TypeId) -> bool {
+        match self.types.kind(ty).clone() {
+            TypeKind::Class(class) => {
+                !self
+                    .class_interface_closure(&class, &mut HashSet::new())
+                    .valid
+            }
+            _ => false,
+        }
+    }
+
     fn core_iteration_element(&mut self, ty: TypeId, contract: &str) -> Option<TypeId> {
         if !self.is_core_interface(contract) {
             return None;

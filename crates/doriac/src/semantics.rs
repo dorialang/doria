@@ -10481,6 +10481,8 @@ impl<'program> Checker<'program> {
                 // Checking owns the iterable families (Decision 0132): a
                 // source that none of them classifies is not iterable, so
                 // lowering never meets one.
+                // A source whose type is already in error has its finding;
+                // reporting it again here would be a cascade.
                 if plan.family == ForeachIterableFamily::Other
                     && !matches!(
                         self.types.kind(iterable_ty),
@@ -10489,6 +10491,7 @@ impl<'program> Checker<'program> {
                             | TypeKind::EmptyCollection
                             | TypeKind::Heterogeneous
                     )
+                    && !self.conformances_rejected(iterable_ty)
                 {
                     let got = self.types.display(iterable_ty);
                     self.diagnostics.push(
