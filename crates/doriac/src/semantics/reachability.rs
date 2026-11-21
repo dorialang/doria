@@ -259,7 +259,7 @@ impl Reachability {
                     {
                         if let Some((parent, _)) = class_members.get_key_value(parent.name.as_str())
                         {
-                            pending.push(Owner::Implementations(*parent));
+                            pending.push(Owner::Implementations(parent));
                         }
                     }
                 }
@@ -280,7 +280,7 @@ impl Reachability {
                     {
                         if let Some((parent, _)) = class_members.get_key_value(parent.name.as_str())
                         {
-                            pending.push(Owner::Class(*parent));
+                            pending.push(Owner::Class(parent));
                         }
                     }
                 }
@@ -289,12 +289,12 @@ impl Reachability {
                 pending.push(match target {
                     ReachTarget::Callable(declaration) => Owner::Callable(*declaration),
                     ReachTarget::Class(name) => match class_members.get_key_value(name.as_str()) {
-                        Some((name, _)) => Owner::Class(*name),
+                        Some((name, _)) => Owner::Class(name),
                         None => continue,
                     },
                     ReachTarget::NamedType(name) => {
                         match class_members.get_key_value(name.as_str()) {
-                            Some((name, _)) => Owner::Implementations(*name),
+                            Some((name, _)) => Owner::Implementations(name),
                             None => continue,
                         }
                     }
