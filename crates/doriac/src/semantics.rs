@@ -21916,9 +21916,22 @@ impl<'program> Checker<'program> {
                 Some(ReceiverAccess::ConstructionRoot) => ObjectPathAccess::ConstructionRoot,
                 _ => ObjectPathAccess::Readonly,
             },
+            // A field of a foreign struct or union is part of the value,
+            // writable exactly when the containing place is (Decision 0148
+            // section 6), through `?->` as well; every other null-safe
+            // access is readonly.
             Expr::PropertyAccess {
-                null_safe: true, ..
-            } => ObjectPathAccess::Readonly,
+                object,
+                null_safe: true,
+                ..
+            } => {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if self.aggregate_of(object_ty).is_some() {
+                    self.object_path_access(object, scopes, method_context)
+                } else {
+                    ObjectPathAccess::Readonly
+                }
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {

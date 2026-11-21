@@ -5751,6 +5751,9 @@ fn lower_expression_statement(
         lower_discarded_rvalue(value, context);
         return Ok(());
     }
+    if byte_region::null_safe_statement(expr, context)? {
+        return Ok(());
+    }
     if foreign::statement(expr, context)? {
         return Ok(());
     }
@@ -13232,11 +13235,6 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
-    if expected == mir::ScalarType::Integer(IntegerType::Int64) {
-        if let Some(value) = byte_region::nullable_length(expr, context)? {
-            return Ok(value);
-        }
-    }
     if let Some(mir::Rvalue::NullableScalar(value)) =
         materialize_checked_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
     {
@@ -21308,6 +21306,10 @@ fn materialize_checked_rvalue(
     // boxes the value by its checked type in `lower_mixed_expression`, so
     // these paths do not produce a value for it.
     if !matches!(expected, mir::Type::Mixed | mir::Type::NullableMixed) {
+        if let Some(value) = byte_region::null_safe_member(expr, expected, consume_result, context)?
+        {
+            return Ok(Some(value));
+        }
         if let Some(value) = foreign::expression(expr, expected, context)? {
             return Ok(Some(present_as_expected(value, expected)));
         }

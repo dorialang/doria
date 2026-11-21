@@ -203,22 +203,8 @@ pub(super) fn expression(
                 matches!(property.as_str(), "pointer" | "writablePointer"),
                 context.expression_type(object)?,
             ) {
-                // The typed array stores a scalar at its own width and a
-                // foreign struct or union at its C size, each aligned as C
-                // aligns it.
-                let align = byte_region::built_element(region_type, *span, context)?.map_or(
-                    1,
-                    |(element, stride)| {
-                        crate::native_abi::array_region_alignment(element).unwrap_or(stride) as u64
-                    },
-                );
                 let region = byte_region::local(object, false, context)?;
-                let target = context.declare_return_temp(POINTER, false);
-                context.push_statement(mir::Statement::Pointer {
-                    target: Some(target),
-                    operation: mir::PointerOperation::RegionData { region, align },
-                    span: *span,
-                });
+                let target = byte_region::pointer(region, region_type, *span, context)?;
                 return Ok(Some(local_rvalue(target, POINTER, false)));
             }
             let Some((access, pointee)) = pointer_type(object, context) else {

@@ -277,56 +277,6 @@ pub(super) fn nullable_expression(
                 remove: false,
             })
         }
-        hir::Expr::MethodCall {
-            object,
-            method,
-            args,
-            span,
-            null_safe: true,
-        } if matches!(method.as_str(), "getRegion" | "getWritableRegion")
-            && matches!(
-                context.expression_type(object)?,
-                mir::Type::NullableRegion(_) | mir::Type::NullableCollection(_)
-            ) =>
-        {
-            let source_type = context.expression_type(object)?;
-            let present_type = non_null_match_type(source_type).0;
-            let source = lower_rvalue_as_borrowed(object, source_type, context)?;
-            let selection = context.coalesce_selection(object);
-            let writable = context
-                .semantic_info
-                .writable_object_paths
-                .contains(&object.span());
-            let result = materialize_null_safe_call(
-                source,
-                selection,
-                writable,
-                None,
-                *span,
-                Some((mir::Type::NullableRegion(kind), transfer)),
-                |source, context| {
-                    let source = narrowed_match_local_rvalue(
-                        source,
-                        source_type,
-                        present_type,
-                        None,
-                        false,
-                        *span,
-                        context,
-                    )?;
-                    let value = mir::Rvalue::Region(form(kind, source, args, *span, context)?);
-                    let (local, ty) = core_value::materialize_value(value, context);
-                    Ok(Some((local, ty, kind.is_writable())))
-                },
-                context,
-            )?
-            .expect("null-safe region operation has a value");
-            let mir::Rvalue::NullableRegion(value) = local_rvalue(result.0, result.1, result.2)
-            else {
-                unreachable!()
-            };
-            Ok(value)
-        }
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
@@ -402,31 +352,43 @@ pub(super) fn copy_from(
         mir::Type::Region(region) if method == "copyFrom" && region.is_writable() => region,
         _ => return Ok(None),
     };
-    built_element(destination_type, *span, context)?;
-    let writable = mir::Type::Region(destination_type);
-    let [source] = argument_values(args)[..] else {
-        return Err(vec![unsupported(
-            *span,
-            "copyFrom expects one source region",
-        )]);
-    };
     let destination = lower_call_argument(
         object,
-        writable,
+        mir::Type::Region(destination_type),
         mir::FunctionParameterMode::Writable,
         context,
     )?;
+    copy_region(destination, destination_type, args, *span, context).map(Some)
+}
+
+/// The copy into the writable region `destination` of `destination_type`
+/// from the one readonly source region in `args`, which views the same
+/// elements.
+fn copy_region(
+    destination: mir::Rvalue,
+    destination_type: mir::RegionType,
+    args: &[hir::Argument],
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<mir::IntegerExpression> {
+    built_element(destination_type, span, context)?;
+    let [source] = argument_values(args)[..] else {
+        return Err(vec![unsupported(
+            span,
+            "copyFrom expects one source region",
+        )]);
+    };
     let source = lower_call_argument(
         source,
         mir::Type::Region(destination_type.with_access(mir::ByteRegionKind::Readonly)),
         mir::FunctionParameterMode::Readonly,
         context,
     )?;
-    Ok(Some(mir::IntegerExpression::CopyRegion {
+    Ok(mir::IntegerExpression::CopyRegion {
         destination: Box::new(destination),
         source: Box::new(source),
-        span: *span,
-    }))
+        span,
+    })
 }
 
 /// `WritableByteRegion::copyWithin(offset, length, destination)`: one
@@ -456,6 +418,17 @@ pub(super) fn copy_within(
         return Ok(false);
     }
     let region = local(object, true, context)?;
+    copy_within_on(region, args, *span, context)?;
+    Ok(true)
+}
+
+/// `copyWithin` on the writable byte region in `region`.
+fn copy_within_on(
+    region: mir::LocalId,
+    args: &[hir::Argument],
+    span: Span,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<()> {
     let names = args
         .iter()
         .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
@@ -470,7 +443,7 @@ pub(super) fn copy_within(
     for (position, argument) in args.iter().enumerate() {
         let Some(parameter) = bound.arg_to_param[position] else {
             return Err(vec![unsupported(
-                *span,
+                span,
                 "copyWithin argument has no checked parameter",
             )]);
         };
@@ -480,7 +453,7 @@ pub(super) fn copy_within(
     }
     let [Some(offset), Some(length), Some(destination)] = operands else {
         return Err(vec![unsupported(
-            *span,
+            span,
             "copyWithin requires offset, length and destination arguments",
         )]);
     };
@@ -489,9 +462,9 @@ pub(super) fn copy_within(
         offset,
         length,
         destination,
-        span: *span,
+        span,
     });
-    Ok(true)
+    Ok(())
 }
 
 fn form(
@@ -687,60 +660,241 @@ pub(super) fn built_element(
     }
 }
 
-pub(super) fn nullable_length(
-    expr: &hir::Expr,
+/// The address of the first element of the region in `region`, of
+/// `region_type`, for C (Decision 0148 section 7). A typed array stores a
+/// scalar at its own width and a foreign struct or union at its C size,
+/// each aligned as C aligns it.
+pub(super) fn pointer(
+    region: mir::LocalId,
+    region_type: mir::RegionType,
+    span: Span,
     context: &mut LoweringContext<'_>,
-) -> DiagnosticResult<Option<mir::NullableScalarExpression>> {
-    let hir::Expr::PropertyAccess {
-        object,
-        property,
-        null_safe: true,
+) -> DiagnosticResult<mir::LocalId> {
+    let align = built_element(region_type, span, context)?.map_or(1, |(element, stride)| {
+        crate::native_abi::array_region_alignment(element).unwrap_or(stride) as u64
+    });
+    let target = context.declare_return_temp(super::foreign::POINTER, false);
+    context.push_statement(mir::Statement::Pointer {
+        target: Some(target),
+        operation: mir::PointerOperation::RegionData { region, align },
         span,
-        ..
-    } = unparenthesized_place(expr)
+    });
+    Ok(target)
+}
+
+/// A region member that `?->` reaches on a nullable region, or the region
+/// formation of a nullable `Bytes` or `T[]`.
+#[derive(Clone, Copy)]
+enum NullSafeOperation {
+    Length,
+    Form(mir::RegionType),
+    CopyFrom,
+    CopyWithin,
+    Pointer,
+}
+
+/// The receiver and parts of a [`null_safe_operation`].
+struct NullSafeMember<'e> {
+    object: &'e hir::Expr,
+    operation: NullSafeOperation,
+    args: &'e [hir::Argument],
+    span: Span,
+}
+
+/// `?->` on `?ByteRegion`, `?WritableByteRegion`, `?ArrayRegion<T>` or
+/// `?WritableArrayRegion<T>` (`length`, `pointer`, `writablePointer`,
+/// `getRegion`, `getWritableRegion`, `copyFrom` and `copyWithin`), and
+/// `?->getRegion` and `?->getWritableRegion` on `?Bytes` or `?T[]`
+/// (Decision 0110; Decision 0148 sections 7 and 8): its receiver and parts,
+/// or `None` when `expr` is not one.
+fn null_safe_operation<'e>(
+    expr: &'e hir::Expr,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<Option<NullSafeMember<'e>>> {
+    let (object, name, args, span, method) = match unparenthesized_place(expr) {
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: true,
+        } => (
+            object.as_ref(),
+            method.as_str(),
+            args.as_slice(),
+            *span,
+            true,
+        ),
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            take: false,
+            span,
+            ..
+        } => (object.as_ref(), property.as_str(), &[][..], *span, false),
+        _ => return Ok(None),
+    };
+    let region = match context.expression_type(object)? {
+        mir::Type::NullableRegion(_) => true,
+        mir::Type::NullableCollection(_) => false,
+        _ => return Ok(None),
+    };
+    let operation = match (name, method) {
+        ("getRegion" | "getWritableRegion", true) => match context.expression_type(expr)? {
+            mir::Type::NullableRegion(kind) => NullSafeOperation::Form(kind),
+            _ => return Ok(None),
+        },
+        ("length", false) if region => NullSafeOperation::Length,
+        ("copyFrom", true) if region => NullSafeOperation::CopyFrom,
+        ("copyWithin", true) if region => NullSafeOperation::CopyWithin,
+        ("pointer" | "writablePointer", false) if region => NullSafeOperation::Pointer,
+        _ => return Ok(None),
+    };
+    Ok(Some(NullSafeMember {
+        object,
+        operation,
+        args,
+        span,
+    }))
+}
+
+/// The value of a [`null_safe_operation`] as `expected`: the member's
+/// value when the receiver is present and null otherwise, through the
+/// null-safe call path class members use. `None` when `expr` is not one.
+pub(super) fn null_safe_member(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    consume_result: bool,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<Option<mir::Rvalue>> {
+    let Some(NullSafeMember {
+        object,
+        operation,
+        args,
+        span,
+    }) = null_safe_operation(expr, context)?
     else {
         return Ok(None);
     };
-    let mir::Type::NullableRegion(kind) = context.expression_type(object)? else {
-        return Ok(None);
+    let result = context.expression_type(expr)?;
+    let (local, ty, transfer) = null_safe_call(
+        object,
+        operation,
+        args,
+        span,
+        Some((result, consume_result)),
+        context,
+    )?
+    .expect("a null-safe region member has a value");
+    convert_call_result(local, ty, expected, transfer, span, context).map(Some)
+}
+
+/// A [`null_safe_operation`] whose value a statement discards; `false`
+/// when `expr` is not one.
+pub(super) fn null_safe_statement(
+    expr: &hir::Expr,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<bool> {
+    let Some(NullSafeMember {
+        object,
+        operation,
+        args,
+        span,
+    }) = null_safe_operation(expr, context)?
+    else {
+        return Ok(false);
     };
-    if property != "length" {
-        return Ok(None);
-    }
-    let ty = mir::ScalarType::Integer(IntegerType::Int64);
-    let source = mir::Rvalue::NullableRegion(nullable_expression(object, kind, false, context)?);
+    null_safe_call(object, operation, args, span, None, context)?;
+    Ok(true)
+}
+
+/// `operation` on the nullable receiver `object`, evaluated once: it runs
+/// on the present region or collection, and `result`, if any, is null when
+/// the receiver is null.
+fn null_safe_call(
+    object: &hir::Expr,
+    operation: NullSafeOperation,
+    args: &[hir::Argument],
+    span: Span,
+    result: Option<(mir::Type, bool)>,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    let source_type = context.expression_type(object)?;
+    let present_type = non_null_match_type(source_type).0;
+    let source = lower_rvalue_as_borrowed(object, source_type, context)?;
     let selection = context.coalesce_selection(object);
-    let result = materialize_null_safe_call(
+    let writable = context
+        .semantic_info
+        .writable_object_paths
+        .contains(&object.span());
+    let value_wanted = result.is_some();
+    materialize_null_safe_call(
         source,
         selection,
-        false,
+        writable,
         None,
-        *span,
-        Some((mir::Type::NullableScalar(ty), false)),
+        span,
+        result,
         |source, context| {
-            let present = mir::Rvalue::Region(mir::RegionExpression::AssumePresent {
-                kind,
-                value: Box::new(mir::NullableRegionExpression::Local {
-                    kind,
-                    local: source,
-                    transfer: false,
-                }),
-            });
-            let (source, _) = core_value::materialize_value(present, context);
-            let value = mir::Rvalue::Value(value_expression_from_operand(
-                ty,
-                mir::Operand::RegionLength(source),
-            ));
+            let present = narrowed_match_local_rvalue(
+                source,
+                source_type,
+                present_type,
+                None,
+                false,
+                span,
+                context,
+            )?;
+            let region_local = |present, writable, context: &mut LoweringContext<'_>| {
+                let (local, _) = core_value::materialize_value(present, context);
+                context.locals[local.0].writable = writable;
+                local
+            };
+            let int = mir::ScalarType::Integer(IntegerType::Int64);
+            let value = match (operation, present_type) {
+                (NullSafeOperation::Form(kind), _) => {
+                    let value = mir::Rvalue::Region(form(kind, present, args, span, context)?);
+                    let (local, ty) = core_value::materialize_value(value, context);
+                    return Ok(Some((local, ty, kind.is_writable())));
+                }
+                (NullSafeOperation::Length, _) => {
+                    let region = region_local(present, false, context);
+                    mir::Rvalue::Value(value_expression_from_operand(
+                        int,
+                        mir::Operand::RegionLength(region),
+                    ))
+                }
+                (NullSafeOperation::CopyFrom, mir::Type::Region(region_type)) => {
+                    let copy = copy_region(present, region_type, args, span, context)?;
+                    mir::Rvalue::Value(mir::ValueExpression::Integer(copy))
+                }
+                (NullSafeOperation::CopyWithin, _) => {
+                    let region = region_local(present, true, context);
+                    copy_within_on(region, args, span, context)?;
+                    return Ok(None);
+                }
+                (NullSafeOperation::Pointer, mir::Type::Region(region_type)) => {
+                    let region = region_local(present, false, context);
+                    let target = pointer(region, region_type, span, context)?;
+                    local_rvalue(target, super::foreign::POINTER, false)
+                }
+                _ => {
+                    return Err(vec![unsupported(
+                        span,
+                        "a null-safe region member has a present region receiver",
+                    )])
+                }
+            };
+            if !value_wanted {
+                lower_discarded_rvalue(value, context);
+                return Ok(None);
+            }
             let (local, ty) = core_value::materialize_value(value, context);
             Ok(Some((local, ty, false)))
         },
         context,
-    )?
-    .expect("nullable region length has a value");
-    Ok(Some(mir::NullableScalarExpression::Local {
-        ty,
-        local: result.0,
-    }))
+    )
 }
 
 fn call(

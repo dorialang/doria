@@ -1234,6 +1234,29 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
     }
 }
 
+/// A null-safe field of a foreign struct or union in a writable place is a
+/// writable region receiver, as the same field without `?->` is (Decision
+/// 0148 section 6); a null-safe access is still never a write target.
+#[test]
+fn null_safe_fields_of_writable_places_are_writable_receivers() {
+    let declarations = "extern \"C\" struct Tip { int32 $id; uint16[3] $text; } class Holder { writable ?Tip $tip = null; } function find(): ?Tip { return new Tip(id: 1); }";
+    for body in [
+        "let writable $holder = new Holder(); uint16[] $source = [1, 2, 3]; echo $holder->tip?->text?->copyFrom($source->getRegion(0, 3)) ?? -1;",
+        "writable ?Tip $tip = find(); uint16[] $source = [1, 2, 3]; echo $tip?->text?->copyFrom($source->getRegion(0, 3)) ?? -1;",
+    ] {
+        let source = format!("{declarations} function main(): void {{ {body} }}");
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let readonly = format!("{declarations} function main(): void {{ ?Tip $tip = find(); uint16[] $source = [1, 2, 3]; echo $tip?->text?->copyFrom($source->getRegion(0, 3)) ?? -1; }}");
+    // A readonly place gives a readonly `ArrayRegion<T>`, which has no
+    // `copyFrom`, with `?->` exactly as without it.
+    let plain = format!("{declarations} function main(): void {{ Tip $tip = new Tip(id: 1); uint16[] $source = [1, 2, 3]; echo $tip->text->copyFrom($source->getRegion(0, 3)); }}");
+    assert_eq!(codes(&plain), ["E0521"], "{:#?}", findings(&plain));
+    assert_eq!(codes(&readonly), ["E0521"], "{:#?}", findings(&readonly));
+    let target = format!("{declarations} function main(): void {{ let writable $holder = new Holder(); $holder->tip?->id = 5; }}");
+    assert_eq!(codes(&target), ["E0511"], "{:#?}", findings(&target));
+}
+
 #[test]
 fn typed_array_regions_have_the_region_members() {
     for body in [

@@ -1046,14 +1046,69 @@ function main(): void
     }}
     {{
         writable ?WritableArrayRegion<uint16> $view = $tips[1]?->text;
-        echo ($view == null) . \"\n\";
+        echo ($view == null) . \" \";
     }}
+    uint16[] $other = [4, 5, 6];
+    echo ($holder->tip?->text?->copyFrom($other->getRegion(0, 3)) ?? -1) . \" \";
+    echo ($holder->none?->text?->copyFrom($other->getRegion(0, 3)) ?? -1) . \" \";
+    echo first($holder->tip) . \"\n\";
     echo first($holder->tip) . \" \" . first($holder->none) . \" \" . first(Holder::kept) . \" \";
     echo first($tips[0]) . \" \" . first($tips[1]);
 }}
 "
     );
-    assert_runs_natively(&source, "3 true 3 3 true\n1:7,9 - 2:7,9 3:7,9 -");
+    assert_runs_natively(&source, "3 true 3 3 true 3 -1 1:4,6\n1:4,6 - 2:7,9 3:7,9 -");
+}
+
+/// `?->` on a nullable region runs each region member only when the region
+/// is present, as a value and as a statement (Decision 0110; Decision 0148
+/// sections 7 and 8): `getWritableRegion` of a `?Bytes`, `copyFrom`,
+/// `copyWithin`, `length`, `getRegion` and `pointer`.
+#[test]
+fn null_safe_region_members_run_only_on_present_regions() {
+    let source = "
+use Doria\\Std\\Io\\WritableByteRegion;
+
+function find(bool $present): ?Bytes
+{
+    if ($present) {
+        return Bytes::allocate(4);
+    }
+    return null;
+}
+
+function main(): void
+{
+    uint8[] $raw = [1, 2, 3];
+    Bytes $other = Bytes::fromArray($raw);
+    writable ?Bytes $bytes = find(true);
+    writable ?Bytes $none = find(false);
+    {
+        writable ?WritableByteRegion $view = $bytes?->getWritableRegion(0, 4);
+        $view?->copyFrom($other->getRegion(0, 3));
+        $view?->copyWithin(0, 2, 2);
+        echo ($view?->length ?? -1) . \" \" . ($view?->getRegion(1, 2)?->length ?? -1) . \" \";
+        echo ($view?->copyFrom($other->getRegion(2, 1)) ?? -1) . \" \";
+        unsafe {
+            echo ($view?->pointer?->read() ?? 0) . \" \";
+        }
+    }
+    {
+        writable ?WritableByteRegion $nothing = $none?->getWritableRegion(0, 4);
+        $nothing?->copyFrom($other->getRegion(0, 3));
+        $nothing?->copyWithin(0, 1, 1);
+        echo ($nothing?->length ?? -1) . \" \";
+        echo ($nothing?->copyFrom($other->getRegion(0, 3)) ?? -1) . \" \";
+        unsafe {
+            echo ($nothing?->pointer?->read() ?? 0) . \" \";
+        }
+    }
+    if ($bytes != null) {
+        echo $bytes[0] . \",\" . $bytes[1] . \",\" . $bytes[2] . \",\" . $bytes[3];
+    }
+}
+";
+    assert_runs_natively(source, "4 2 1 3 -1 -1 0 3,2,1,2");
 }
 
 #[test]
