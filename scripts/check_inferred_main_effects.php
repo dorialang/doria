@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/repository_paths.php';
+
 /**
  * @return list<string>
  */
@@ -127,7 +129,7 @@ function check_inferred_main_effects(string $root): array
             continue;
         }
         $path = str_replace('\\', '/', $file->getPathname());
-        if (str_contains($path, '/target/') || str_contains($path, '/.git/')) {
+        if (is_skipped_path($path)) {
             continue;
         }
         $contents = file_get_contents($file->getPathname());

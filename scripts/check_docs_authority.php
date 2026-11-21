@@ -42,6 +42,7 @@ require_once __DIR__ . '/check_stage30d_closure_execution.php';
 require_once __DIR__ . '/check_stage30e_native_closure_execution.php';
 require_once __DIR__ . '/check_stage30g_list_algorithms.php';
 require_once __DIR__ . '/check_stage30h_closure_completion.php';
+require_once __DIR__ . '/repository_paths.php';
 require_once __DIR__ . '/check_inferred_main_effects.php';
 require_once __DIR__ . '/check_constructor_owned_property_writes.php';
 require_once __DIR__ . '/check_stage31_slice1_namespaces.php';
@@ -93,21 +94,6 @@ function normalize_path(string $path): string
 function relative_path(string $root, string $path): string
 {
     return ltrim(substr(normalize_path($path), strlen(normalize_path($root))), '/');
-}
-
-function is_skipped_path(string $path): bool
-{
-    // `.claude/worktrees/` holds transient checkouts of this same repository, so
-    // every document in it is a duplicate of one already checked at the root.
-    // Without this the guard reports each finding once per live worktree, and a
-    // document fixed at the root keeps failing until every worktree is removed.
-    foreach (['.git/', 'target/', 'node_modules/', '.claude/worktrees/'] as $skip) {
-        if (str_contains($path, $skip)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 function is_historical_path(string $path): bool
