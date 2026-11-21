@@ -427,14 +427,27 @@ pub(crate) unsafe fn write_stdout_at_process_end(bytes: &[u8]) {
 /// the bytes, reading it reports end of input, it is never interactive, and
 /// no file the program opens later takes its place. Every route to the
 /// stream then behaves by the same rule, so none checks for absence itself.
-/// Process entry calls this before any Doria code runs.
-pub(crate) unsafe fn provide_absent_streams() {
-    #[cfg(unix)]
-    for stream in [
+/// Only a stream absent when the process started is given one: a stream
+/// the program or its host closes later stays closed, and its operations
+/// report that it is closed. Native process entry runs this before any Doria
+/// code with every stream in `absent_at_start`, since nothing has closed one
+/// yet; a host that loads the shared runtime later passes the streams it
+/// found absent when it started (bit 0 standard input, 1 output, 2 error).
+/// Every standard stream, for native process entry.
+pub(crate) const EVERY_STANDARD_STREAM: u32 = 0b111;
+
+pub(crate) unsafe fn provide_absent_streams(absent_at_start: u32) {
+    let streams = [
         StandardStream::Stdin,
         StandardStream::Stdout,
         StandardStream::Stderr,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(bit, _)| absent_at_start & (1 << bit) != 0)
+    .map(|(_, stream)| stream);
+    #[cfg(unix)]
+    for stream in streams {
         let descriptor = descriptor(stream);
         if libc::fcntl(descriptor, libc::F_GETFD) != -1
             || crate::platform_io::last_system_code() != i64::from(libc::EBADF)
@@ -450,11 +463,7 @@ pub(crate) unsafe fn provide_absent_streams() {
         }
     }
     #[cfg(windows)]
-    for stream in [
-        StandardStream::Stdin,
-        StandardStream::Stdout,
-        StandardStream::Stderr,
-    ] {
+    for stream in streams {
         if valid_handle(stream).is_some() {
             continue;
         }

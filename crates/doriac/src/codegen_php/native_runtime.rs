@@ -345,7 +345,7 @@ int64_t dr_v1_host_terminal_operate(uint32_t operation, int64_t first, int64_t s
 int64_t dr_v1_terminal_await_event(uint32_t generation, uint8_t wait_kind, uint64_t wait_low,
     int64_t wait_high, DrCancellationV1 *cancellation);
 void dr_v1_terminal_process_ending(void);
-void dr_v1_provide_absent_streams(void);
+void dr_v1_provide_absent_streams(uint32_t absent_at_start);
 DORIA_NATIVE_ABI, $path);
         } catch (Throwable) {
             // Configuration failures are backend diagnostics, never Doria IoError.
@@ -370,8 +370,10 @@ DORIA_NATIVE_ABI, $path);
             self::fail("layout");
         }
         // The runtime shares this process's standard streams (Decision 0148
-        // section 21).
-        $runtime->dr_v1_provide_absent_streams();
+        // section 21): only those absent when the script started get the
+        // null device; one closed since then stays closed.
+        global $__doria_absent_streams;
+        $runtime->dr_v1_provide_absent_streams($__doria_absent_streams);
         return self::$runtime = $runtime;
     }
 }

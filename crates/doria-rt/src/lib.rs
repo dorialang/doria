@@ -1998,16 +1998,19 @@ pub unsafe extern "C" fn dr_v3_writable_shared_payload_descriptor(
     (*control).payload_descriptor
 }
 
-/// Gives each absent standard stream the null device (Decision 0148 section
-/// 21) for a host that loads the shared runtime, as PHP output does. Native
-/// process entry does the same before any Doria code runs.
+/// Gives the null device to each standard stream in `absent_at_start`
+/// (Decision 0148 section 21: bit 0 standard input, 1 output, 2 error) that
+/// is still absent, for a host that loads the shared runtime after it
+/// started, as PHP output does. A stream the host found present at start
+/// and that has closed since stays closed. Native process entry gives every
+/// stream absent at entry the null device before any Doria code runs.
 ///
 /// # Safety
 ///
 /// Call it before the host uses its standard streams from another thread.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_provide_absent_streams() {
-    device_io::provide_absent_streams();
+pub unsafe extern "C" fn dr_v1_provide_absent_streams(absent_at_start: u32) {
+    device_io::provide_absent_streams(absent_at_start);
 }
 
 /// Invokes a generated Doria integer entry function and maps its result to a process status.
@@ -2026,7 +2029,7 @@ pub unsafe extern "C" fn dr_v2_main_int(
     source_span_start: usize,
     source_span_end: usize,
 ) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     finish_main(process_status(
         entry(ptr::null()),
         source_path,
@@ -2103,7 +2106,7 @@ pub unsafe extern "C" fn dr_v2_main_int_args(
     source_span_start: usize,
     source_span_end: usize,
 ) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     let args = entry_args::build(argc, argv);
     let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     // Validate before cleanup: an invalid status is an abort-only panic path.
@@ -2133,7 +2136,7 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
     argv: *const *const u8,
     args_type: usize,
 ) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     let args = entry_args::build(argc, argv);
     let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     entry(ptr::null(), home.as_ptr(), args);
@@ -2149,7 +2152,7 @@ pub unsafe extern "C" fn dr_v2_main_void_args(
 /// for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v2_main_void(entry: DrMainVoidV2) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     entry(ptr::null());
     finish_main(0)
 }
@@ -2168,7 +2171,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
     source_span_start: usize,
     source_span_end: usize,
 ) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     let mut value = 0_i64;
     let mut error = empty_error_carrier();
     finish_main(match entry(ptr::null(), &mut value, &mut error) {
@@ -2192,7 +2195,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int(
 /// `entry` must implement the compiler's checked-entry ABI.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v3_main_checked_void(entry: DrMainCheckedVoidV3) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     let mut error = empty_error_carrier();
     finish_main(match entry(ptr::null(), &mut error) {
         0 => 0,
@@ -2218,7 +2221,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_int_args(
     source_span_start: usize,
     source_span_end: usize,
 ) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     let args = entry_args::build(argc, argv);
     let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     let mut value = 0_i64;
@@ -2251,7 +2254,7 @@ pub unsafe extern "C" fn dr_v3_main_checked_void_args(
     argv: *const *const u8,
     args_type: usize,
 ) -> i32 {
-    device_io::provide_absent_streams();
+    device_io::provide_absent_streams(device_io::EVERY_STANDARD_STREAM);
     let args = entry_args::build(argc, argv);
     let home = [&args as *const *mut DrCollectionV1 as usize, args_type];
     let mut error = empty_error_carrier();
