@@ -365,6 +365,10 @@ pub struct SemanticInfo {
     /// Each name of a C-callable function used as a value, the address of its C
     /// entry, by span, with the function's canonical name (section 12).
     pub c_abi_function_values: HashMap<Span, String>,
+    /// Each unsafe context outside every other one, by the span MIR lowering
+    /// sees: the region the native companion library runs (sections 22 and
+    /// 23).
+    pub unsafe_contexts: HashMap<Span, crate::foreign::UnsafeContextFact>,
     /// Every foreign struct and union by canonical name (Decision 0148
     /// section 6).
     pub foreign_aggregates: HashMap<String, crate::foreign::ForeignAggregateFacts>,
@@ -1627,6 +1631,7 @@ fn finish_checked_analysis(
             foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
             c_abi_functions: std::mem::take(&mut checker.foreign.c_abi_functions),
             c_abi_function_values: std::mem::take(&mut checker.foreign.c_abi_function_values),
+            unsafe_contexts: std::mem::take(&mut checker.foreign.unsafe_contexts),
             foreign_aggregates,
             retained_callables,
             specialized_ownership,
@@ -3795,6 +3800,12 @@ enum DisplayConversionKind {
 }
 
 impl<'program> Checker<'program> {
+    /// Whether checking added an error after the first `before` findings.
+    /// A warning or note never makes a construct invalid (Decision 0108).
+    fn errors_since(&self, before: usize) -> bool {
+        crate::diagnostics::has_errors(&self.diagnostics[before..])
+    }
+
     fn terminal_assertion_spans(&self) -> HashSet<Span> {
         self.assertions
             .iter()
@@ -4342,7 +4353,7 @@ impl<'program> Checker<'program> {
                         name: param.name.clone(),
                     },
                 );
-                if self.diagnostics.len() != diagnostics_before_default {
+                if self.errors_since(diagnostics_before_default) {
                     return None;
                 }
                 match crate::const_eval::evaluate_attribute_value(
@@ -4398,7 +4409,7 @@ impl<'program> Checker<'program> {
                 default_value,
             });
         }
-        if self.diagnostics.len() != diagnostics_before {
+        if self.errors_since(diagnostics_before) {
             return;
         }
         let (source, package) = self.attribute_context(class_decl.span);
@@ -4514,7 +4525,7 @@ impl<'program> Checker<'program> {
                 .with_title("Missing Required Argument"),
             );
         }
-        if self.diagnostics.len() != diagnostics_before {
+        if self.errors_since(diagnostics_before) {
             return None;
         }
 
@@ -4534,7 +4545,7 @@ impl<'program> Checker<'program> {
                     name: parameter.declaration.name.clone(),
                 },
             );
-            if self.diagnostics.len() != diagnostics_before_argument {
+            if self.errors_since(diagnostics_before_argument) {
                 continue;
             }
             match crate::const_eval::evaluate_attribute_value(
@@ -4566,7 +4577,7 @@ impl<'program> Checker<'program> {
                 Err(diagnostics) => self.diagnostics.extend(diagnostics),
             }
         }
-        if self.diagnostics.len() != diagnostics_before {
+        if self.errors_since(diagnostics_before) {
             return None;
         }
 
@@ -10174,7 +10185,11 @@ impl<'program> Checker<'program> {
                 let mut nested_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
-                self.enter_unsafe_context(unsafe_block.keyword_span);
+                self.enter_unsafe_context(
+                    unsafe_block.keyword_span,
+                    unsafe_block.block.span,
+                    crate::foreign::UnsafeContextForm::Block,
+                );
                 self.check_block(
                     &unsafe_block.block,
                     scopes,
@@ -10224,7 +10239,7 @@ impl<'program> Checker<'program> {
                         expr.span(),
                     ));
                 }
-                if self.diagnostics.len() == diagnostics_before {
+                if !self.errors_since(diagnostics_before) {
                     self.record_compiler_known_effects(
                         crate::builtins::ECHO_CHECKED_ERROR_TYPES,
                         *span,
@@ -11355,7 +11370,7 @@ impl<'program> Checker<'program> {
             // A grouped declaration is atomic. Its initializer is checked in
             // the previous scope, and no name from the group is introduced if
             // any part of the declaration is invalid.
-            if self.diagnostics.len() != diagnostics_before {
+            if self.errors_since(diagnostics_before) {
                 return;
             }
         }
@@ -12900,7 +12915,7 @@ impl<'program> Checker<'program> {
             }
             _ => unreachable!("fail is not a terminal matcher method"),
         }
-        if self.diagnostics.len() != diagnostics_before_domain {
+        if self.errors_since(diagnostics_before_domain) {
             return true;
         }
 
@@ -14021,9 +14036,15 @@ impl<'program> Checker<'program> {
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
             }
             Expr::Unsafe {
-                keyword_span, expr, ..
+                keyword_span,
+                expr,
+                span,
             } => {
-                self.enter_unsafe_context(*keyword_span);
+                self.enter_unsafe_context(
+                    *keyword_span,
+                    *span,
+                    crate::foreign::UnsafeContextForm::Expression,
+                );
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr);
                 self.leave_unsafe_context();
                 self.reject_escaping_handle_borrow(expr);
@@ -19221,7 +19242,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             self.record_named_call_effects(
                 callable_contracts::EffectDependency::Exact(function_info.declaration),
                 function_info.checked_effects,
@@ -19396,7 +19417,7 @@ impl<'program> Checker<'program> {
             }
             Builtin::ReadStdinBytes | Builtin::Panic => {}
         }
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             self.record_compiler_known_effects(builtin.required_error_types(), span);
             self.record_compiler_known_effects(builtin.ambient_error_types(), span);
         }
@@ -19738,7 +19759,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             let target = self
                 .call_targets
                 .get(&span)
@@ -20399,7 +20420,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             let target = self
                 .call_targets
                 .get(&access.span)
@@ -21110,7 +21131,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             let owner = self.types.intern(TypeKind::Class(class_type.clone()));
             let ResolvedType::Class(owner) = self.types.resolved(owner) else {
                 unreachable!("interned constructor class type must resolve as a class");

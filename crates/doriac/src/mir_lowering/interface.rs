@@ -870,6 +870,7 @@ fn build_collection_entry(
             terminator,
         }],
         entry_block: mir::BlockId(0),
+        unsafe_regions: Vec::new(),
     })
 }
 
@@ -1106,6 +1107,7 @@ fn build_entry(
         locals,
         blocks,
         entry_block: mir::BlockId(0),
+        unsafe_regions: Vec::new(),
     })
 }
 

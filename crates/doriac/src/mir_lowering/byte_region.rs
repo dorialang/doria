@@ -41,6 +41,9 @@ pub(super) fn expression(
         });
     }
     match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => expression(expr, kind, transfer, context),
         hir::Expr::Index {
             collection, index, ..
@@ -258,6 +261,9 @@ pub(super) fn nullable_expression(
     }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableRegionExpression::Null { kind }),
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => nullable_expression(expr, kind, transfer, context),
         hir::Expr::Index {
             collection, index, ..

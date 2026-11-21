@@ -6,6 +6,7 @@
 //! for the shared-ownership family.
 
 use crate::ast::ForeignAggregateKind;
+use crate::source::Span;
 
 pub const NAMESPACE: &str = "Doria\\Std\\Ffi";
 pub const POINTER: &str = "Doria\\Std\\Ffi\\Pointer";
@@ -212,6 +213,29 @@ pub struct ForeignBinding {
     pub fixed_parameters: Option<usize>,
     /// `#[CaptureSystemCode(source)]`.
     pub system_code: Option<SystemCodeSource>,
+}
+
+/// How an unsafe context is written (section 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UnsafeContextForm {
+    /// `unsafe { }`.
+    Block,
+    /// `unsafe(<expression>)`.
+    Expression,
+}
+
+/// An unsafe context written outside every other one. Each is a region,
+/// which the native companion library runs as one function for the
+/// interpreter and PHP output (sections 22 and 23). An unsafe context inside
+/// another belongs to the outer region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnsafeContextFact {
+    /// The `unsafe` keyword.
+    pub keyword: Span,
+    /// The span MIR lowering sees: the block of `unsafe { }`, or the whole
+    /// `unsafe(<expression>)`.
+    pub span: Span,
+    pub form: UnsafeContextForm,
 }
 
 /// A C function pointer type, `extern "C" function(T...): R` (section 12).

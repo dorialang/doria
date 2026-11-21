@@ -237,6 +237,9 @@ pub(super) fn lower_expression_with_ownership(
         });
     }
     let operand = match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            return Err(unsafe_region::bypassed(*span));
+        }
         hir::Expr::Grouped { expr, .. } => {
             return lower_expression_with_ownership(expr, ty, owned, context)
         }

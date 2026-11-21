@@ -4274,6 +4274,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -4416,6 +4417,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5326,6 +5328,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
                 ))),
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         });
     }
@@ -5437,6 +5440,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5503,6 +5507,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5580,6 +5585,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5640,6 +5646,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5690,6 +5697,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5783,6 +5791,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -5821,6 +5830,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5915,6 +5925,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -5940,6 +5951,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -5965,6 +5977,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6037,6 +6050,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -6062,6 +6076,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             terminator: Terminator::Unreachable,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6151,6 +6166,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6255,6 +6271,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6416,6 +6433,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6602,6 +6620,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6683,6 +6702,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7009,6 +7029,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             },
         ],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7393,6 +7414,7 @@ fn shared_validator_rejects_whole_receiver_uses_but_not_disjoint_fields_in_prope
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let Statement::AssignProperty { value, .. } = &mut program.functions[0].blocks[0].statements[0]
@@ -7771,6 +7793,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&parameter)
@@ -7801,6 +7824,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
             terminator: Terminator::Unreachable,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&returned)
@@ -7837,6 +7861,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     doriac::mir_validation::validate_program(&valid)
@@ -7906,6 +7931,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7954,6 +7980,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7994,6 +8021,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8069,6 +8097,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -8100,6 +8129,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8162,6 +8192,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8284,6 +8315,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&returned)
@@ -8417,6 +8449,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8536,6 +8569,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
             )),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8627,6 +8661,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
             )),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&acquire)
@@ -8751,6 +8786,7 @@ fn valid_void_program() -> Program {
                 terminator: Terminator::ReturnVoid,
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),
@@ -8878,6 +8914,7 @@ fn class_new_program() -> Program {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program
@@ -8950,6 +8987,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -8975,6 +9013,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     (program, child)

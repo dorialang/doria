@@ -11,6 +11,7 @@ use super::*;
 use crate::attributes::{AttributeTarget, AttributeValueKind};
 use crate::foreign::{
     CBoundaryType, CFunctionType, ForeignBinding, ForeignType, PointerAccess, SystemCodeSource,
+    UnsafeContextFact, UnsafeContextForm,
 };
 
 pub(super) const UNSAFE_OPERATION_CODE: &str = "E0785";
@@ -53,6 +54,9 @@ pub(super) struct ForeignState {
     /// Each name of a C-callable function used as a value, by its span, with the
     /// function's canonical name (section 12).
     pub(super) c_abi_function_values: HashMap<Span, String>,
+    /// Each unsafe context outside every other one, by the span MIR
+    /// lowering sees (sections 22 and 23).
+    pub(super) unsafe_contexts: HashMap<Span, UnsafeContextFact>,
     /// Each pointer or region pointee written as a type parameter, by the
     /// site that writes it (section 3, amendment of 2026-11-21).
     generic_pointee_sites: HashSet<(Span, TypeId)>,
@@ -64,8 +68,23 @@ pub(super) struct ForeignState {
 }
 
 impl<'program> Checker<'program> {
-    pub(super) fn enter_unsafe_context(&mut self, keyword: Span) {
+    pub(super) fn enter_unsafe_context(
+        &mut self,
+        keyword: Span,
+        span: Span,
+        form: UnsafeContextForm,
+    ) {
         let redundant = matches!(self.foreign.contexts.last(), Some(Some(_)));
+        if !redundant {
+            self.foreign.unsafe_contexts.insert(
+                span,
+                UnsafeContextFact {
+                    keyword,
+                    span,
+                    form,
+                },
+            );
+        }
         self.foreign.contexts.push(Some(UnsafeContext {
             keyword,
             redundant,

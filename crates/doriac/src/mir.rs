@@ -1111,6 +1111,9 @@ pub struct Function {
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
+    /// The function's unsafe regions in source order (Decision 0148
+    /// sections 22 and 23).
+    pub unsafe_regions: Vec<UnsafeRegion>,
 }
 
 impl PartialEq for Function {
@@ -1133,6 +1136,7 @@ impl PartialEq for Function {
             && self.locals == other.locals
             && self.blocks == other.blocks
             && self.entry_block == other.entry_block
+            && self.unsafe_regions == other.unsafe_regions
     }
 }
 
@@ -8176,6 +8180,123 @@ pub enum Terminator {
     },
 }
 
+impl Terminator {
+    /// The blocks control can reach next, in a fixed order. A terminator
+    /// that returns, propagates an Error, panics or is unreachable has none.
+    pub fn targets(&self) -> Vec<BlockId> {
+        match self {
+            Self::Jump(target) => vec![*target],
+            Self::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![*then_block, *else_block],
+            Self::CheckedCall {
+                success, failure, ..
+            }
+            | Self::CheckedIndirectCall {
+                success, failure, ..
+            }
+            | Self::CheckedConstruct {
+                success, failure, ..
+            }
+            | Self::CheckedIo {
+                success, failure, ..
+            }
+            | Self::CheckedDeadlineFromNow {
+                success, failure, ..
+            }
+            | Self::CheckedCancellationRequest {
+                success, failure, ..
+            } => vec![*success, *failure],
+            Self::IndirectCall { continuation, .. } => vec![*continuation],
+            Self::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(catch_all.iter().copied())
+                .chain(std::iter::once(*fallback))
+                .collect(),
+            Self::Return(_)
+            | Self::ReturnVoid
+            | Self::Panic { .. }
+            | Self::Unreachable
+            | Self::PropagateError { .. } => Vec::new(),
+        }
+    }
+}
+
+/// One unsafe context written outside every other one, in one lowered
+/// function (Decision 0148 sections 22 and 23). Cranelift and LLVM compile
+/// its blocks inline. For the interpreter and PHP output the native
+/// companion library runs them as one function, and the host resumes at
+/// `continuation` or at the exit the region took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsafeRegion {
+    /// SHA-256 over package identity, source identity, span and type
+    /// arguments, in lowercase hexadecimal. Every lowering of one
+    /// specialization yields the same region and the same identity.
+    pub id: String,
+    pub form: crate::foreign::UnsafeContextForm,
+    /// The `unsafe` keyword.
+    pub keyword: Span,
+    /// The block of `unsafe { }`, or the whole `unsafe(<expression>)`.
+    pub span: Span,
+    /// The region's first block. Its blocks are every block from `entry` up
+    /// to, not including, `continuation`.
+    pub entry: BlockId,
+    /// Where control continues when the region falls through (status 0).
+    pub continuation: BlockId,
+    /// The local holding an expression region's value: written inside the
+    /// region and read after it.
+    pub result: Option<LocalId>,
+    /// Every edge that leaves the region other than fallthrough, in the
+    /// order lowering produced them. A break or continue target index is
+    /// the position of its exit here.
+    pub exits: Vec<UnsafeRegionExit>,
+}
+
+impl UnsafeRegion {
+    pub fn contains(&self, block: BlockId) -> bool {
+        self.entry.0 <= block.0 && block.0 < self.continuation.0
+    }
+}
+
+/// One edge out of an unsafe region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsafeRegionExit {
+    /// The region block whose terminator leaves.
+    pub source: BlockId,
+    pub kind: UnsafeRegionExitKind,
+    /// The block outside the region the edge reaches: a loop target, a
+    /// finalizer entry or a catch. `None` when the source block's
+    /// terminator returns or propagates the Error out of the function.
+    pub target: Option<BlockId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeRegionExitKind {
+    Return,
+    Break,
+    Continue,
+    CheckedError { error: LocalId },
+}
+
+impl UnsafeRegionExitKind {
+    /// The status a region entry returns for this exit; 0 is fallthrough.
+    pub const fn status(self) -> i32 {
+        match self {
+            Self::Return => 1,
+            Self::Break => 2,
+            Self::Continue => 3,
+            Self::CheckedError { .. } => 4,
+        }
+    }
+}
 pub(crate) fn class_temporary_capacity(function: &Function) -> usize {
     function
         .blocks

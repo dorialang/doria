@@ -570,6 +570,7 @@ fn rejects_mixed_width_float_binary_operands() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -638,6 +639,7 @@ fn void_program() -> Program {
                 terminator: Terminator::ReturnVoid,
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),

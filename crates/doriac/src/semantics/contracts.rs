@@ -1523,7 +1523,7 @@ impl Checker<'_> {
                 ));
             }
             self.type_parameter_scopes.pop();
-            let valid = self.diagnostics.len() == before;
+            let valid = !self.errors_since(before);
             self.interface_definitions.insert(
                 declaration.name.clone(),
                 InterfaceDefinition {
@@ -2797,7 +2797,7 @@ impl Checker<'_> {
                 name_span: declaration.name_span,
                 type_parameters: declaration.type_params,
                 uses: edges,
-                valid: self.diagnostics.len() == before,
+                valid: !self.errors_since(before),
             });
         }
         let mut completed = HashSet::new();
@@ -2843,8 +2843,7 @@ impl Checker<'_> {
                             declaration.declaration == edge.declaration && declaration.valid
                         })
                     });
-                    let valid =
-                        namespace_valid && self.diagnostics.len() == before && valid_dependencies;
+                    let valid = namespace_valid && !self.errors_since(before) && valid_dependencies;
                     self.contracts.compositions.push(CompositionFacts {
                         class: class.name.clone(),
                         span: composition.span,
@@ -2896,7 +2895,7 @@ impl Checker<'_> {
         }
         self.contract_type_depth -= 1;
         self.type_parameter_scopes.pop();
-        if self.diagnostics.len() != before {
+        if self.errors_since(before) {
             if let Some(facts) = self
                 .contracts
                 .traits
@@ -3011,7 +3010,7 @@ impl Checker<'_> {
                 }
             }
         }
-        self.diagnostics.len() == before
+        !self.errors_since(before)
     }
 
     fn check_trait_expression(&mut self, expression: &Expr) {

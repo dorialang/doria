@@ -17783,7 +17783,7 @@ fn validate_finalizer_plan(
     let entry_predecessors = function
         .blocks
         .iter()
-        .filter(|block| terminator_targets(&block.terminator).contains(&plan.entry))
+        .filter(|block| block.terminator.targets().contains(&plan.entry))
         .map(|block| block.id)
         .collect::<HashSet<_>>();
     if entry_predecessors != planned_sources {
@@ -18160,7 +18160,7 @@ fn cfg_reaches(
             return Ok(true);
         }
         if visited.insert(block) {
-            pending.extend(terminator_targets(&block_in(function, block)?.terminator));
+            pending.extend(block_in(function, block)?.terminator.targets());
         }
     }
     Ok(false)
@@ -18391,9 +18391,7 @@ fn validate_result_path(
         if block_id == activation || !outside.insert(block_id) {
             continue;
         }
-        search.extend(terminator_targets(
-            &block_in(function, block_id)?.terminator,
-        ));
+        search.extend(block_in(function, block_id)?.terminator.targets());
     }
     let mut pending = VecDeque::from([(arm, 0_u8, false, FinalizerSelections::new())]);
     let mut visited = HashSet::new();
@@ -20842,58 +20840,12 @@ fn constructor_property_assignment_count(
         .count())
 }
 
-fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
-    match terminator {
-        mir::Terminator::Jump(target) => vec![*target],
-        mir::Terminator::Branch {
-            then_block,
-            else_block,
-            ..
-        } => vec![*then_block, *else_block],
-        mir::Terminator::CheckedCall {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedIndirectCall {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedConstruct {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedIo {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedDeadlineFromNow {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedCancellationRequest {
-            success, failure, ..
-        } => vec![*success, *failure],
-        mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
-        mir::Terminator::ErrorSwitch {
-            cases,
-            catch_all,
-            fallback,
-            ..
-        } => cases
-            .iter()
-            .map(|(_, target)| *target)
-            .chain(catch_all.iter().copied())
-            .chain(std::iter::once(*fallback))
-            .collect(),
-        mir::Terminator::Return(_)
-        | mir::Terminator::ReturnVoid
-        | mir::Terminator::Panic { .. }
-        | mir::Terminator::Unreachable
-        | mir::Terminator::PropagateError { .. } => Vec::new(),
-    }
-}
-
 fn analysis_terminator_targets(
     terminator: &mir::Terminator,
     fold_constant_branches: bool,
 ) -> Vec<mir::BlockId> {
     if !fold_constant_branches {
-        return terminator_targets(terminator);
+        return terminator.targets();
     }
     match terminator {
         mir::Terminator::Branch {
@@ -20905,7 +20857,7 @@ fn analysis_terminator_targets(
             Some(false) => vec![*else_block],
             None => vec![*then_block, *else_block],
         },
-        _ => terminator_targets(terminator),
+        _ => terminator.targets(),
     }
 }
 

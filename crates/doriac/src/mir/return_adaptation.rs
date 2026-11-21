@@ -332,6 +332,7 @@ pub(crate) fn build_virtual_return_adapter(
         locals,
         blocks,
         entry_block: mir::BlockId(0),
+        unsafe_regions: Vec::new(),
     })
 }
 

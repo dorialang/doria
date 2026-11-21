@@ -606,7 +606,7 @@ pub(super) fn validate_fill(
     let mut region = HashSet::from([plan.body, plan.append, duplication.call, core.success]);
     region.extend(duplication.absent);
     for block in &function.blocks {
-        for target in terminator_targets(&block.terminator) {
+        for target in block.terminator.targets() {
             if (target == plan.header && block.id != plan.setup && block.id != plan.append)
                 || (target == plan.body && block.id != plan.header)
                 || (target == plan.exit && block.id != plan.header)

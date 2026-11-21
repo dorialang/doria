@@ -4087,3 +4087,205 @@ function main(): void
     );
     assert_runs_natively(&source, "77 77 88 3\n");
 }
+
+const REGION_EDGES: &str = r#"
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function check(int32 $value): int32 throws Failure
+{
+    if ($value > 2) {
+        throw new Failure("too large");
+    }
+    return $value;
+}
+
+function walk(int32 $limit): int32
+{
+    writable int32 $step = 0;
+    while ($step < 10) {
+        $step += 1;
+        unsafe {
+            if ($step == 2) {
+                continue;
+            }
+            if ($step == $limit) {
+                break;
+            }
+            if ($step == 7) {
+                return abs(-70);
+            }
+            echo abs($step);
+            echo " ";
+        }
+    }
+    return $step;
+}
+
+function guarded(int32 $value): int32 throws Failure
+{
+    unsafe {
+        echo abs($value);
+        echo " ";
+        echo check($value);
+    }
+    return unsafe(abs($value));
+}
+
+function measure<T>(T $value, int32 $count): int32
+{
+    return unsafe(abs($count));
+}
+
+function main(): void
+{
+    echo walk(4);
+    echo "\n";
+    echo walk(9);
+    echo "\n";
+    try {
+        echo guarded(1);
+    } catch (Failure) {
+        echo "caught";
+    }
+    echo "\n";
+    try {
+        echo guarded(5);
+    } catch (Failure) {
+        echo "caught";
+    }
+    echo "\n";
+    echo measure(1, -2);
+    echo measure("a", -3);
+    echo "\n";
+    unsafe {
+        echo unsafe(abs(-1));
+    }
+}
+"#;
+
+fn function_named<'mir>(
+    mir: &'mir doriac::mir::Program,
+    name: &str,
+) -> &'mir doriac::mir::Function {
+    mir.functions
+        .iter()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("`{name}` is emitted"))
+}
+
+/// Each region's blocks run from its entry up to its continuation, the
+/// host reaches it through its entry alone, and every exit other than
+/// fallthrough leaves it.
+fn assert_region_shape(function: &doriac::mir::Function, region: &doriac::mir::UnsafeRegion) {
+    use doriac::mir::Terminator;
+    assert!(region.entry.0 < region.continuation.0, "{region:#?}");
+    assert_eq!(region.id.len(), 64);
+    assert!(region.id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    for block in &function.blocks {
+        let inside = region.contains(block.id);
+        for target in block.terminator.targets() {
+            if !inside && region.contains(target) {
+                assert_eq!(
+                    target, region.entry,
+                    "only the entry is reached from outside"
+                );
+            }
+        }
+    }
+    assert!(function
+        .blocks
+        .iter()
+        .any(|block| !region.contains(block.id)
+            && block.terminator == Terminator::Jump(region.entry)));
+    for exit in &region.exits {
+        assert!(region.contains(exit.source));
+        if let Some(target) = exit.target {
+            assert!(!region.contains(target) && target != region.continuation);
+        }
+    }
+}
+
+/// Decision 0148 sections 22 and 23: every unsafe context outside another
+/// is a region of its function's MIR, with its fallthrough and each
+/// `return`, `break`, `continue` and checked-error edge out of it, and the
+/// program still runs the same inline on every native profile.
+#[test]
+fn unsafe_contexts_lower_to_regions_with_their_exits() {
+    use doriac::foreign::UnsafeContextForm;
+    use doriac::mir::UnsafeRegionExitKind;
+    let source = format!("{C_LIBRARY}{REGION_EDGES}");
+    let mir = program(&source);
+
+    let walk = function_named(&mir, "walk");
+    let [region] = walk.unsafe_regions.as_slice() else {
+        panic!("{:#?}", walk.unsafe_regions);
+    };
+    assert_region_shape(walk, region);
+    assert_eq!(region.form, UnsafeContextForm::Block);
+    assert_eq!(region.result, None);
+    let kinds = region
+        .exits
+        .iter()
+        .map(|exit| exit.kind)
+        .collect::<Vec<_>>();
+    for kind in [
+        UnsafeRegionExitKind::Continue,
+        UnsafeRegionExitKind::Break,
+        UnsafeRegionExitKind::Return,
+    ] {
+        assert!(kinds.contains(&kind), "{kinds:?}");
+    }
+    assert!(region
+        .exits
+        .iter()
+        .filter(|exit| exit.kind != UnsafeRegionExitKind::Return)
+        .all(|exit| exit.target.is_some()));
+    // `echo` can fail with an I/O Error, which leaves the region too.
+    assert!(kinds
+        .iter()
+        .any(|kind| matches!(kind, UnsafeRegionExitKind::CheckedError { .. })));
+
+    let guarded = function_named(&mir, "guarded");
+    let [block, expression] = guarded.unsafe_regions.as_slice() else {
+        panic!("{:#?}", guarded.unsafe_regions);
+    };
+    assert_region_shape(guarded, block);
+    assert_region_shape(guarded, expression);
+    assert_eq!(block.form, UnsafeContextForm::Block);
+    assert!(block.exits.iter().any(|exit| matches!(
+        exit.kind,
+        UnsafeRegionExitKind::CheckedError { .. }
+    ) && exit.kind.status() == 4));
+    assert_eq!(expression.form, UnsafeContextForm::Expression);
+    let result = expression
+        .result
+        .expect("an expression region has a result");
+    assert!(result.0 < guarded.locals.len());
+    assert!(expression.exits.is_empty(), "{:#?}", expression.exits);
+    assert_ne!(block.id, expression.id);
+
+    // The inner `unsafe(...)` adds nothing to the block around it.
+    let main = function_named(&mir, "main");
+    assert_eq!(main.unsafe_regions.len(), 1, "{:#?}", main.unsafe_regions);
+
+    // One region per specialization: its identity covers the type arguments.
+    let measures = mir
+        .functions
+        .iter()
+        .filter(|function| function.name.starts_with("measure"))
+        .flat_map(|function| {
+            function
+                .unsafe_regions
+                .iter()
+                .map(|region| region.id.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(measures.len(), 2, "{measures:?}");
+
+    assert_runs_natively(&source, "1 3 4\n1 3 4 5 6 70\n1 11\n5 caught\n23\n1");
+}

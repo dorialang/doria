@@ -33,6 +33,7 @@ mod inline_value;
 mod interface;
 mod iteration;
 mod property_hooks;
+mod unsafe_region;
 
 #[derive(Default)]
 struct ClassIds {
@@ -4222,7 +4223,7 @@ fn lower_function(
     if !signature.checked_effects.is_empty() {
         context.pop_error_target();
     }
-    let (locals, mut blocks) = context.finish(metrics);
+    let (locals, mut blocks, unsafe_regions) = context.finish(metrics)?;
     let retained = inputs.semantic_info.retained_callables.get(&function.span);
     let source_parameter = |source: crate::symbols::BorrowSource| match source {
         crate::symbols::BorrowSource::Receiver => params[0],
@@ -4393,6 +4394,7 @@ fn lower_function(
         locals,
         blocks,
         entry_block: mir::BlockId(0),
+        unsafe_regions,
     })
 }
 
@@ -4714,7 +4716,7 @@ fn lower_closure_function(
     if definition.has_checked_transport() {
         context.pop_error_target();
     }
-    let (locals, mut blocks) = context.finish(metrics);
+    let (locals, mut blocks, unsafe_regions) = context.finish(metrics)?;
     let selector_captures = inputs
         .semantic_info
         .closures
@@ -4773,6 +4775,7 @@ fn lower_closure_function(
         locals,
         blocks,
         entry_block: mir::BlockId(0),
+        unsafe_regions,
     })
 }
 
@@ -5454,10 +5457,14 @@ fn lower_statement_sequence(
 
         match statement {
             hir::Stmt::Block(block) => {
-                context.push_scope();
-                let result = lower_statement_sequence(&block.statements, return_type, context);
-                context.pop_scope();
-                result?;
+                if let Some(fact) = context.unsafe_region_fact(block.span) {
+                    unsafe_region::block(fact, block, return_type, context)?;
+                } else {
+                    context.push_scope();
+                    let result = lower_statement_sequence(&block.statements, return_type, context);
+                    context.pop_scope();
+                    result?;
+                }
             }
             hir::Stmt::Echo { expr, span } => {
                 lower_with_statement_temporaries_at(context, *span, |context| {
@@ -5738,6 +5745,9 @@ fn lower_expression_statement(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(()) = unsafe_region::statement(expr, span, context)? {
+        return Ok(());
+    }
     if context
         .semantic_info
         .property_accessor_calls
@@ -9617,6 +9627,13 @@ struct LoweringContext<'semantic> {
     loop_targets: Vec<LoopTargets>,
     when_targets: Vec<WhenTarget>,
     finalizer_regions: Vec<FinalizerRegionBuilder>,
+    /// The function's unsafe regions in source order (Decision 0148
+    /// sections 22 and 23), and the one being lowered.
+    unsafe_regions: Vec<unsafe_region::UnsafeRegionBuilder>,
+    active_unsafe_region: Option<usize>,
+    /// How each block that ends in a structured route leaves, recorded while
+    /// a region is active.
+    unsafe_exit_routes: HashMap<mir::BlockId, mir::UnsafeRegionExitKind>,
     active_finalizers: Vec<mir::FinalizerRegionId>,
     lexical_finalizers: Vec<mir::FinalizerRegionId>,
     executing_finalizers: Vec<ExecutingFinalizer>,
@@ -9788,6 +9805,9 @@ impl<'semantic> LoweringContext<'semantic> {
             loop_targets: Vec::new(),
             when_targets: Vec::new(),
             finalizer_regions: Vec::new(),
+            unsafe_regions: Vec::new(),
+            active_unsafe_region: None,
+            unsafe_exit_routes: HashMap::new(),
             active_finalizers: Vec::new(),
             lexical_finalizers: Vec::new(),
             executing_finalizers: Vec::new(),
@@ -9799,7 +9819,11 @@ impl<'semantic> LoweringContext<'semantic> {
     fn finish(
         self,
         metrics: Option<&mut StructuralMetrics>,
-    ) -> (Vec<mir::Local>, Vec<mir::BasicBlock>) {
+    ) -> DiagnosticResult<(
+        Vec<mir::Local>,
+        Vec<mir::BasicBlock>,
+        Vec<mir::UnsafeRegion>,
+    )> {
         let mut metrics = metrics;
         if let Some(metrics) = metrics.as_deref_mut() {
             let mut depths = Vec::with_capacity(self.finalizer_regions.len());
@@ -9870,8 +9894,10 @@ impl<'semantic> LoweringContext<'semantic> {
                     terminator: block.terminator.unwrap_or(mir::Terminator::Unreachable),
                 }
             })
-            .collect();
-        (self.locals, blocks)
+            .collect::<Vec<_>>();
+        let regions =
+            unsafe_region::finish(self.unsafe_regions, &self.unsafe_exit_routes, &blocks)?;
+        Ok((self.locals, blocks, regions))
     }
 
     fn create_block(&mut self) -> mir::BlockId {
@@ -9903,7 +9929,7 @@ impl<'semantic> LoweringContext<'semantic> {
 
     fn terminate_block(&mut self, block: mir::BlockId, terminator: mir::Terminator) {
         if self.is_reachable(block) {
-            for target in terminator_targets(&terminator) {
+            for target in terminator.targets() {
                 self.reachable_blocks[target.0] = true;
             }
         }
@@ -10190,6 +10216,7 @@ impl<'semantic> LoweringContext<'semantic> {
             self.finalizer_regions[region_id.0]
                 .exits
                 .push(FinalizerExitBuilder { route, source });
+            self.note_unsafe_route(&route.exit);
             self.terminate_current(mir::Terminator::Jump(entry));
             return;
         }
@@ -10206,6 +10233,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Terminator::Return(value.rvalue())
             }
         };
+        self.note_unsafe_route(&route.exit);
         self.terminate_current(terminator);
     }
 
@@ -11662,52 +11690,6 @@ fn finish_finalizer_region_block(
     Ok(())
 }
 
-fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
-    match terminator {
-        mir::Terminator::Jump(target) => vec![*target],
-        mir::Terminator::Branch {
-            then_block,
-            else_block,
-            ..
-        } => vec![*then_block, *else_block],
-        mir::Terminator::CheckedCall {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedIndirectCall {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedConstruct {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedIo {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedDeadlineFromNow {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedCancellationRequest {
-            success, failure, ..
-        } => vec![*success, *failure],
-        mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
-        mir::Terminator::ErrorSwitch {
-            cases,
-            catch_all,
-            fallback,
-            ..
-        } => cases
-            .iter()
-            .map(|(_, block)| *block)
-            .chain(catch_all.iter().copied())
-            .chain(std::iter::once(*fallback))
-            .collect(),
-        mir::Terminator::Return(_)
-        | mir::Terminator::ReturnVoid
-        | mir::Terminator::Panic { .. }
-        | mir::Terminator::PropagateError { .. }
-        | mir::Terminator::Unreachable => Vec::new(),
-    }
-}
-
 fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> DiagnosticResult<()> {
     materialize_nested_collection_places(&decl.initializer, false, context)?;
     let ty = match &decl.ty {
@@ -12634,6 +12616,9 @@ fn lower_string_expression(
                 )])
             }
         }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => lower_string_expression(expr, context),
         hir::Expr::PropertyAccess {
             object, property, ..
@@ -12892,6 +12877,9 @@ fn lower_nullable_string_expression(
     }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableStringExpression::Null),
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => lower_nullable_string_expression(expr, context),
         hir::Expr::Binary {
             left,
@@ -13352,6 +13340,9 @@ fn lower_nullable_scalar_expression(
     }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableScalarExpression::Null(expected)),
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_scalar_expression(expr, expected, context)
         }
@@ -13759,6 +13750,9 @@ fn lower_nullable_class_expression(
     }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableClassExpression::Null(expected)),
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_class_expression(expr, expected, transfer, context)
         }
@@ -14557,6 +14551,11 @@ fn append_string_concat_parts(
     parts: &mut Vec<mir::StringExpression>,
 ) -> DiagnosticResult<()> {
     match expr {
+        // An unsafe region is one part, evaluated inside its own blocks.
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            parts.push(lower_display_string_argument(expr, context)?);
+            Ok(())
+        }
         hir::Expr::Grouped { expr, .. } => append_string_concat_parts(expr, context, parts),
         hir::Expr::Binary {
             left,
@@ -17689,6 +17688,9 @@ fn lower_condition(
                 )]),
             }
         }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => lower_condition(expr, context),
         hir::Expr::PropertyAccess {
             object, property, ..
@@ -18999,6 +19001,9 @@ fn lower_enum_expression(
     }
 
     match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => lower_enum_expression(expr, enum_id, context),
         hir::Expr::Binary {
             left,
@@ -19550,6 +19555,9 @@ fn lower_interface_expression(
                 vtable,
             })
         }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_interface_expression(expr, interface, transfer, context)
         }
@@ -19824,6 +19832,9 @@ fn lower_nullable_interface_expression(
                     return_borrow: signature.return_borrow,
                     span: *span,
                 })
+            }
+            hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+                Err(unsafe_region::bypassed(*span))
             }
             hir::Expr::Grouped { expr, .. } => {
                 lower_nullable_interface_expression(expr, interface, transfer, context)
@@ -20122,6 +20133,9 @@ fn lower_function_expression(
                 transfer,
             })
         }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_function_expression(expr, function_type, transfer, context)
         }
@@ -20351,6 +20365,9 @@ fn lower_nullable_function_expression(
                 local,
                 transfer,
             })
+        }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
         }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_function_expression(expr, function_type, transfer, context)
@@ -21286,6 +21303,9 @@ fn materialize_checked_rvalue(
     consume_result: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if let Some(value) = unsafe_region::value(expr, expected, consume_result, context)? {
+        return Ok(Some(value));
+    }
     if matches!(
         unparenthesized_place(expr),
         hir::Expr::PropertyAccess { take: true, .. }
@@ -22313,6 +22333,11 @@ fn lower_payload_enum_expression(
         };
         return Ok(value);
     }
+    if let hir::Expr::Grouped { span, .. } = expr {
+        if context.unsafe_region_fact(*span).is_some() {
+            return Err(unsafe_region::bypassed(*span));
+        }
+    }
     if let hir::Expr::Grouped { expr, .. } = expr {
         return lower_payload_enum_expression(expr, ty, transfer, context);
     }
@@ -22617,6 +22642,11 @@ fn lower_nullable_payload_enum_expression(
     }
     if context.expression_is_null(expr) {
         return Ok(mir::NullablePayloadEnumExpression::Null(ty));
+    }
+    if let hir::Expr::Grouped { span, .. } = expr {
+        if context.unsafe_region_fact(*span).is_some() {
+            return Err(unsafe_region::bypassed(*span));
+        }
     }
     if let hir::Expr::Grouped { expr, .. } = expr {
         return lower_nullable_payload_enum_expression(expr, ty, transfer, context);
@@ -23213,6 +23243,9 @@ fn lower_nullable_mixed_expression(
         };
     }
     match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => lower_nullable_mixed_expression(expr, transfer, context),
         hir::Expr::Index {
             collection,
@@ -23368,6 +23401,9 @@ fn lower_collection_expression(
         });
     }
     match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_collection_expression(expr, expected, transfer, context)
         }
@@ -23818,6 +23854,9 @@ fn lower_nullable_collection_expression(
     }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableCollectionExpression::Null(expected)),
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_collection_expression(expr, expected, transfer, context)
         }
@@ -24370,7 +24409,10 @@ fn materialize_nested_collection_places(
 ) -> DiagnosticResult<()> {
     // Lazy operands are materialized only in the branch that consumes them.
     // The shared collection-place resolver also covers their nested results.
-    if is_branching_expr(expr) {
+    // An unsafe region walks its own expression inside its blocks.
+    if is_branching_expr(expr)
+        || matches!(expr, hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some())
+    {
         return Ok(());
     }
     match expr {
@@ -25926,6 +25968,9 @@ fn lower_class_expression(
         });
     }
     match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_class_expression(expr, expected, transfer, context)
         }
@@ -28080,6 +28125,9 @@ fn lower_nullable_shared_reference_expression(
         });
     }
     match unparenthesized_place(expr) {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_shared_reference_expression(expr, expected, transfer, context)
         }
@@ -28426,6 +28474,9 @@ fn lower_nullable_weak_reference_expression(
         });
     }
     match unparenthesized_place(expr) {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_weak_reference_expression(expr, expected, transfer, context)
         }
@@ -29117,6 +29168,9 @@ fn lower_float_expression(
                 operand: mir::Operand::Static(id),
             })
         }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
+        }
         hir::Expr::Grouped { expr, .. } => lower_float_expression(expr, context),
         hir::Expr::Unary {
             op: hir::UnaryOp::Negate,
@@ -29524,6 +29578,9 @@ fn lower_integer_expression(
                 ty,
                 operand: mir::Operand::Static(id),
             })
+        }
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            Err(unsafe_region::bypassed(*span))
         }
         hir::Expr::Grouped { expr, .. } => {
             let lowered = lower_integer_expression(expr, context)?;

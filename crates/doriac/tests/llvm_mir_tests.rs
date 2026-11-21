@@ -817,6 +817,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                     terminator: Terminator::ReturnVoid,
                 }],
                 entry_block: BlockId(0),
+                unsafe_regions: Vec::new(),
                 closure: None,
             },
             Function {
@@ -849,6 +850,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                     ))),
                 }],
                 entry_block: BlockId(0),
+                unsafe_regions: Vec::new(),
                 closure: None,
             },
         ],
