@@ -266,6 +266,74 @@ function main(): void
     assert_runs_natively(&source, "true 4096 4108 4088 4102 4101 4104 true true true");
 }
 
+/// `?->` on `?Pointer<T>` and `?WritablePointer<T>` runs the member only
+/// when the pointer is not null, and `is Pointer<T>` holds for a pointer of
+/// exactly that type that is not null (Decision 0148 section 3).
+#[test]
+fn nullable_pointers_reach_members_null_safe_and_narrow_with_is() {
+    let source = format!(
+        "{POINTER}
+extern \"C\" struct Pair
+{{
+    int32 $first;
+    int32 $second;
+}}
+
+class Holder
+{{
+    writable ?Pointer<int32> $maybe = null;
+}}
+
+function find(bool $present, Pointer<int32> $pointer): ?Pointer<int32>
+{{
+    if ($present) {{
+        return $pointer;
+    }}
+    return null;
+}}
+
+function main(): void
+{{
+    unsafe {{
+        writable int32 $value = 7;
+        writable Pair $pair = new Pair(first: 1, second: 2);
+        ?Pointer<int32> $maybe = Pointer::to($value);
+        ?Pointer<int32> $absent = Pointer::fromAddress(0);
+        ?WritablePointer<int32> $target = WritablePointer::to($value);
+        ?WritablePointer<int32> $nowhere = null;
+        ?Pointer<Pair> $pairs = Pointer::to($pair);
+        echo ($maybe?->read() ?? -1) . \" \" . ($absent?->read() ?? -1) . \" \";
+        echo (($maybe?->address ?? 0) != 0) . \" \" . ($absent?->address ?? 0) . \" \";
+        $target?->write(9);
+        $nowhere?->write(10);
+        $nowhere?->writeUnaligned(11);
+        echo $value . \" \";
+        echo ($maybe?->offset(0)?->readUnaligned() ?? -2) . \" \";
+        echo ($absent?->byteOffset(4)?->read() ?? -2) . \" \";
+        ?Pair $copy = $pairs?->read();
+        echo ($copy?->second ?? -3) . \"\\n\";
+        echo (find(true, Pointer::to($value))?->read() ?? -4) . \" \";
+        echo (find(false, Pointer::to($value))?->read() ?? -4) . \" \";
+        writable Holder $holder = new Holder();
+        echo ($holder->maybe?->read() ?? -5) . \" \";
+        $holder->maybe = Pointer::to($value);
+        echo ($holder->maybe?->read() ?? -5) . \"\\n\";
+        if ($maybe is Pointer<int32>) {{
+            echo $maybe->read() . \" \";
+        }}
+        echo ($absent is Pointer<int32>) . \" \" . ($maybe is Pointer<int64>) . \" \";
+        echo ($target is Pointer<int32>) . \" \" . ($target is WritablePointer<int32>) . \" \";
+        Pointer<int32> $present = Pointer::to($value);
+        echo ($present is Pointer<int32>) . \" \" . ($present is Pointer<uint32>);
+    }}
+}}
+"
+    );
+    assert_runs_natively(
+        &source,
+        "7 -1 true 0 9 9 -2 2\n9 -4 -5 9\n9 false false false true true false",
+    );
+}
 #[test]
 fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [

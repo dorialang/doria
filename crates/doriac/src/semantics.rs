@@ -27050,6 +27050,9 @@ impl<'program> Checker<'program> {
                         | TypeKind::Bytes
                         | TypeKind::ByteRegion(_)
                         | TypeKind::ArrayRegion(_, _)
+                ) || matches!(
+                    self.types.kind(*inner),
+                    TypeKind::Foreign(crate::foreign::ForeignType::Pointer { .. })
                 ) || (operation == "property access"
                     && matches!(
                         self.types.kind(*inner),
@@ -27113,7 +27116,10 @@ impl<'program> Checker<'program> {
                     | TypeKind::Interface(_)
                     | TypeKind::Error
                     | TypeKind::Function(_)
-                    | TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(_))
+                    | TypeKind::Foreign(
+                        crate::foreign::ForeignType::Aggregate(_)
+                            | crate::foreign::ForeignType::Pointer { .. }
+                    )
                     | TypeKind::Unknown
             )
         {

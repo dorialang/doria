@@ -18057,6 +18057,23 @@ fn lower_is_condition(
     } else {
         context.expression_type(expr)?
     };
+    if let Some(matches) = context
+        .semantic_info
+        .type_test_type(type_test_span)
+        .and_then(|tested| foreign::pointer_type_test_matches(expr, tested, context))
+    {
+        let presence = match value_type {
+            mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(
+                Box::new(lower_nullable_scalar_presence_subject(expr, ty, context)?),
+            ),
+            _ => lower_concrete_is_presence(expr, value_type, context)?,
+        };
+        return Ok(if matches {
+            presence
+        } else {
+            evaluate_then_false(presence)
+        });
+    }
     let nominal_target = match tested_type {
         mir::Type::Scalar(mir::ScalarType::Inline(ty)) => ty.nominal_class().map(mir::Type::Class),
         mir::Type::Class(_) | mir::Type::Interface(_) => Some(tested_type),

@@ -813,6 +813,39 @@ fn pointer_members_have_their_types() {
     }
 }
 
+/// `?Pointer<T>` and `?WritablePointer<T>` narrow with `is`, `??` and `?->`
+/// (Decision 0148 section 3). `?->` reaches every pointer member, its
+/// value is nullable, and its unsafe members still need an unsafe context.
+#[test]
+fn nullable_pointers_narrow_with_is_and_reach_members_null_safe() {
+    for body in [
+        "unsafe { ?Pointer<int32> $maybe = Pointer::to($value); ?int32 $read = $maybe?->read(); echo $read ?? 0; }",
+        "unsafe { ?WritablePointer<int32> $maybe = WritablePointer::to($value); $maybe?->write(4); $maybe?->writeUnaligned(5); }",
+        "unsafe { ?Pointer<int32> $maybe = Pointer::to($value); ?Pointer<int32> $next = $maybe?->offset(1)?->byteOffset(4); echo $next == null; }",
+        "?Pointer<int32> $maybe = null; ?uint64 $address = $maybe?->address; echo $address ?? 0;",
+        "unsafe { ?Pointer<Point> $maybe = Pointer::to($point); ?Point $copy = $maybe?->read(); echo $copy?->x ?? 0; }",
+        "unsafe { ?Pointer<int32> $maybe = Pointer::to($value); if ($maybe is Pointer<int32>) { echo $maybe->read(); } }",
+        "unsafe { ?WritablePointer<int32> $maybe = WritablePointer::to($value); echo $maybe is Pointer<int32>; echo $maybe is WritablePointer<int64>; }",
+        "unsafe { let $pointer = Pointer::to($value); echo $pointer is Pointer<int32>; }",
+    ] {
+        let source = pointer_program(body);
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let read = pointer_program(
+        "?Pointer<int32> $maybe = unsafe(Pointer::to($value)); echo $maybe?->read() ?? 0;",
+    );
+    assert!(
+        only(&read, "E0785")
+            .message
+            .contains("reading through a pointer"),
+        "{:#?}",
+        findings(&read)
+    );
+    let write = pointer_program("?Pointer<int32> $maybe = null; $maybe?->write(1);");
+    only(&write, "E0304");
+    let absent = pointer_program("?Pointer<int32> $maybe = null; echo $maybe->address;");
+    only(&absent, "E0506");
+}
 #[test]
 fn pointer_operations_need_an_unsafe_context() {
     for (body, operation) in [

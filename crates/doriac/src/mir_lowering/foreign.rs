@@ -22,13 +22,44 @@ fn pointer_type(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> Option<(PointerAccess, ResolvedType)> {
+    pointer_parts(context.resolved_expression_type(expr).ok()?)
+}
+
+/// The checked `?Pointer<T>` or `?WritablePointer<T>` type of `expr`: its
+/// access and pointee.
+fn nullable_pointer_type(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> Option<(PointerAccess, ResolvedType)> {
     match context.resolved_expression_type(expr).ok()? {
+        ResolvedType::Nullable(inner) => pointer_parts(*inner),
+        _ => None,
+    }
+}
+
+fn pointer_parts(ty: ResolvedType) -> Option<(PointerAccess, ResolvedType)> {
+    match ty {
         ResolvedType::Foreign(foreign) => match *foreign {
             ForeignType::Pointer { access, pointee } => Some((access, pointee)),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Whether `$value is Pointer<T>` can hold, or `None` when `value` is not a
+/// pointer or `tested` names no pointer type. A pointer's pointee and access
+/// are checking facts that MIR does not carry, so the test compares the
+/// checked types: it holds for a pointer of exactly the tested type, which
+/// for `?Pointer<T>` means one that is not null (Decision 0148 section 3).
+pub(super) fn pointer_type_test_matches(
+    value: &hir::Expr,
+    tested: &ResolvedType,
+    context: &LoweringContext,
+) -> Option<bool> {
+    let tested = pointer_parts(tested.clone())?;
+    let value = pointer_type(value, context).or_else(|| nullable_pointer_type(value, context))?;
+    Some(value == tested)
 }
 
 /// The value a pointer member call, property or companion call produces, or
@@ -38,6 +69,9 @@ pub(super) fn expression(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if let Some(value) = null_safe_member(expr, expected, context)? {
+        return Ok(Some(value));
+    }
     match unparenthesized_place(expr) {
         // The name of a C-callable Doria function is the address of its C entry
         // (section 12).
@@ -92,51 +126,8 @@ pub(super) fn expression(
                 return Ok(None);
             };
             let pointer = materialize_pointer(object, context)?;
-            match member.operation {
-                PointerOperation::Read { aligned } => {
-                    let ty = pointee_type(&pointee, *span, context)?;
-                    let target = context.declare_return_temp(ty, false);
-                    context.push_statement(mir::Statement::Pointer {
-                        target: Some(target),
-                        operation: mir::PointerOperation::Read {
-                            pointer,
-                            ty,
-                            aligned,
-                        },
-                        span: *span,
-                    });
-                    Ok(Some(local_rvalue(target, ty, false)))
-                }
-                PointerOperation::Offset | PointerOperation::ByteOffset => {
-                    let scale = if member.operation == PointerOperation::Offset {
-                        pointee_size(&pointee, *span, context)?
-                    } else {
-                        1
-                    };
-                    let [count] = argument_values(args)[..] else {
-                        return Err(vec![unsupported(
-                            *span,
-                            "a pointer offset has one argument",
-                        )]);
-                    };
-                    let count = lower_integer_expression(count, context)?;
-                    let target = context.declare_return_temp(POINTER, false);
-                    context.push_statement(mir::Statement::Pointer {
-                        target: Some(target),
-                        operation: mir::PointerOperation::Offset {
-                            pointer,
-                            count,
-                            scale,
-                        },
-                        span: *span,
-                    });
-                    Ok(Some(local_rvalue(target, POINTER, false)))
-                }
-                _ => Err(vec![unsupported(
-                    *span,
-                    format!("pointer member `{method}` has no value"),
-                )]),
-            }
+            let (target, ty) = member_value(pointer, &pointee, member, args, *span, context)?;
+            Ok(Some(local_rvalue(target, ty, false)))
         }
         hir::Expr::PropertyAccess {
             object,
@@ -175,23 +166,17 @@ pub(super) fn expression(
                 });
                 return Ok(Some(local_rvalue(target, POINTER, false)));
             }
-            let Some((access, _)) = pointer_type(object, context) else {
+            let Some((access, pointee)) = pointer_type(object, context) else {
                 return Ok(None);
             };
-            if pointer_intrinsics::instance_member(access, property).map(|member| member.operation)
-                != Some(PointerOperation::Address)
-            {
+            let Some(member) = pointer_intrinsics::instance_member(access, property)
+                .filter(|member| member.operation == PointerOperation::Address)
+            else {
                 return Ok(None);
-            }
+            };
             let pointer = materialize_pointer(object, context)?;
-            let address = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64));
-            let target = context.declare_return_temp(address, false);
-            context.push_statement(mir::Statement::Pointer {
-                target: Some(target),
-                operation: mir::PointerOperation::Address { pointer },
-                span: *span,
-            });
-            Ok(Some(local_rvalue(target, address, false)))
+            let (target, ty) = member_value(pointer, &pointee, member, &[], *span, context)?;
+            Ok(Some(local_rvalue(target, ty, false)))
         }
         hir::Expr::StaticCall {
             class_name,
@@ -408,18 +393,23 @@ fn materialize_foreign_string(
 
 /// `$writablePointer->write($value)` and `writeUnaligned` as a statement; `false`
 /// when `expr` is not one.
+/// `$writablePointer?->write($value)` writes only when the pointer is not null.
 pub(super) fn statement(expr: &hir::Expr, context: &mut LoweringContext) -> DiagnosticResult<bool> {
     let hir::Expr::MethodCall {
         object,
         method,
         args,
-        null_safe: false,
+        null_safe,
         span,
     } = unparenthesized_place(expr)
     else {
         return Ok(false);
     };
-    let Some((access, pointee)) = pointer_type(object, context) else {
+    let Some((access, pointee)) = (if *null_safe {
+        nullable_pointer_type(object, context)
+    } else {
+        pointer_type(object, context)
+    }) else {
         return Ok(false);
     };
     let Some(PointerOperation::Write { aligned }) =
@@ -435,11 +425,93 @@ pub(super) fn statement(expr: &hir::Expr, context: &mut LoweringContext) -> Diag
             None => Ok(false),
         };
     };
-    let [value] = argument_values(args)[..] else {
-        return Err(vec![unsupported(*span, "a pointer write has one argument")]);
+    if *null_safe {
+        null_safe_pointer(object, *span, None, context, |pointer, context| {
+            write(pointer, &pointee, aligned, args, *span, context)?;
+            Ok(None)
+        })?;
+    } else {
+        let pointer = materialize_pointer(object, context)?;
+        write(pointer, &pointee, aligned, args, *span, context)?;
+    }
+    Ok(true)
+}
+
+/// The value of the pointer member `member` of the pointer in `pointer`: a
+/// read, an element or byte offset, or the address, in a new local.
+fn member_value(
+    pointer: mir::LocalId,
+    pointee: &ResolvedType,
+    member: pointer_intrinsics::PointerMember,
+    args: &[hir::Argument],
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<(mir::LocalId, mir::Type)> {
+    let (ty, operation) = match member.operation {
+        PointerOperation::Read { aligned } => {
+            let ty = pointee_type(pointee, span, context)?;
+            (
+                ty,
+                mir::PointerOperation::Read {
+                    pointer,
+                    ty,
+                    aligned,
+                },
+            )
+        }
+        PointerOperation::Offset | PointerOperation::ByteOffset => {
+            let scale = if member.operation == PointerOperation::Offset {
+                pointee_size(pointee, span, context)?
+            } else {
+                1
+            };
+            let [count] = argument_values(args)[..] else {
+                return Err(vec![unsupported(span, "a pointer offset has one argument")]);
+            };
+            let count = lower_integer_expression(count, context)?;
+            (
+                POINTER,
+                mir::PointerOperation::Offset {
+                    pointer,
+                    count,
+                    scale,
+                },
+            )
+        }
+        PointerOperation::Address => (
+            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
+            mir::PointerOperation::Address { pointer },
+        ),
+        _ => {
+            return Err(vec![unsupported(
+                span,
+                format!("pointer member `{}` has no value", member.name),
+            )])
+        }
     };
-    let pointer = materialize_pointer(object, context)?;
-    let ty = pointee_type(&pointee, *span, context)?;
+    let target = context.declare_return_temp(ty, false);
+    context.push_statement(mir::Statement::Pointer {
+        target: Some(target),
+        operation,
+        span,
+    });
+    Ok((target, ty))
+}
+
+/// `write` or `writeUnaligned` of the one argument in `args` through the
+/// pointer in `pointer`.
+fn write(
+    pointer: mir::LocalId,
+    pointee: &ResolvedType,
+    aligned: bool,
+    args: &[hir::Argument],
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let [value] = argument_values(args)[..] else {
+        return Err(vec![unsupported(span, "a pointer write has one argument")]);
+    };
+    let ty = pointee_type(pointee, span, context)?;
     let value = lower_rvalue_as_expected(value, ty, context)?;
     context.push_statement(mir::Statement::Pointer {
         target: None,
@@ -448,12 +520,101 @@ pub(super) fn statement(expr: &hir::Expr, context: &mut LoweringContext) -> Diag
             value,
             aligned,
         },
-        span: *span,
+        span,
     });
-    Ok(true)
+    Ok(())
 }
 
-/// The pointer `expr` evaluates to, in a local the operation reads.
+/// `$maybe?->read()`, `?->readUnaligned()`, `?->offset($count)`,
+/// `?->byteOffset($bytes)` and `?->address` of a `?Pointer<T>` or
+/// `?WritablePointer<T>` (Decision 0148 section 3): the member's value when
+/// the pointer is not null, and null otherwise, converted to `expected`;
+/// `None` when `expr` is not one.
+fn null_safe_member(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::Rvalue>> {
+    let (object, name, args, span) = match unparenthesized_place(expr) {
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: true,
+        } => (object, method, args.as_slice(), *span),
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            take: false,
+            span,
+            ..
+        } => (object, property, &[][..], *span),
+        _ => return Ok(None),
+    };
+    let Some((access, pointee)) = nullable_pointer_type(object, context) else {
+        return Ok(None);
+    };
+    let Some(member) = pointer_intrinsics::instance_member(access, name) else {
+        return Ok(None);
+    };
+    let result = context.expression_type(expr)?;
+    let value = null_safe_pointer(
+        object,
+        span,
+        Some((result, false)),
+        context,
+        |pointer, context| {
+            let (local, ty) = member_value(pointer, &pointee, member, args, span, context)?;
+            Ok(Some((local, ty, false)))
+        },
+    )?;
+    let (local, ty, transfer) = value.expect("a null-safe pointer member has a value");
+    convert_call_result(local, ty, expected, transfer, span, context).map(Some)
+}
+
+/// The branch of `?->` on the nullable pointer `object`, evaluated once:
+/// `operation` runs on the pointer in a local when it is not null, and the
+/// result, if any, is null otherwise.
+fn null_safe_pointer(
+    object: &hir::Expr,
+    span: Span,
+    result: Option<(mir::Type, bool)>,
+    context: &mut LoweringContext,
+    operation: impl FnOnce(
+        mir::LocalId,
+        &mut LoweringContext,
+    ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>>,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    let mir::Type::Scalar(scalar) = POINTER else {
+        unreachable!("a pointer is a scalar")
+    };
+    let selection = context.coalesce_selection(object);
+    let receiver =
+        mir::Rvalue::NullableScalar(lower_nullable_scalar_expression(object, scalar, context)?);
+    materialize_null_safe_call(
+        receiver,
+        selection,
+        false,
+        None,
+        span,
+        result,
+        |receiver, context| {
+            let pointer = context.declare_return_temp(POINTER, false);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: pointer,
+                value: mir::Rvalue::Value(value_expression_from_operand(
+                    scalar,
+                    mir::Operand::NullablePayload(receiver),
+                )),
+            });
+            operation(pointer, context)
+        },
+        context,
+    )
+}
+
 /// The handle that holds `value` of type `ty`, whose ownership moves into
 /// it (Decision 0148 section 11).
 fn create_handle(
@@ -492,6 +653,7 @@ fn handle_value_type(ty: mir::Type, span: Span) -> DiagnosticResult<()> {
     }
 }
 
+/// The pointer `expr` evaluates to, in a local the operation reads.
 pub(super) fn materialize_pointer(
     expr: &hir::Expr,
     context: &mut LoweringContext,
