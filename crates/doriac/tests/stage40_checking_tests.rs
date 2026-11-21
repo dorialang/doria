@@ -2107,3 +2107,87 @@ fn foreign_aggregate_elements_have_no_equality_hashing_or_ordering() {
         );
     }
 }
+
+/// A pointee may be a type parameter, and each call checks the type it
+/// supplies (Decision 0148 section 3, amendment of 2026-11-21): stated or
+/// inferred, passed on through a generic caller, and through a region's
+/// pointer. The error is at the call and names the type.
+#[test]
+fn generic_pointees_are_checked_at_each_call() {
+    let source = r#"
+use Doria\Std\Ffi\{Opaque, Pointer};
+
+class Box
+{
+    function __construct(int $value) {}
+}
+
+/** @safety `$address` points at a `T`. */
+unsafe function view<T>(Pointer<Opaque> $address): T
+{
+    return unsafe(Pointer::cast<T>($address)->read());
+}
+
+/** @safety `$address` points at a `U`. */
+unsafe function relay<U>(Pointer<Opaque> $address): U
+{
+    unsafe {
+        return view<U>($address);
+    }
+}
+
+function firstAddress<T>(T[] $values): uint64
+{
+    return unsafe($values->getRegion(0, 1)->pointer->address);
+}
+
+function main(): void
+{
+    int32 $number = 7;
+    unsafe {
+        let $address = Pointer::cast<Opaque>(Pointer::to($number));
+        echo view<int32>($address);
+        echo relay<int32>($address);
+        let $text = view<string>($address);
+        let $box = relay<Box>($address);
+    }
+    int32[] $numbers = [1, 2];
+    string[] $words = ["a"];
+    echo firstAddress($numbers) > 0;
+    echo firstAddress($words) > 0;
+}
+"#;
+    let found = findings(source);
+    let errors = found
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        .map(|diagnostic| {
+            (
+                diagnostic.code,
+                &source[diagnostic.span.start..diagnostic.span.end],
+                diagnostic.message.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            (
+                "E0786",
+                "view<string>($address)",
+                "`string` cannot cross the C boundary as the pointee type `T` of function `view`"
+            ),
+            (
+                "E0786",
+                "relay<Box>($address)",
+                "`Box` cannot cross the C boundary as the pointee type `U` of function `relay`"
+            ),
+            (
+                "E0786",
+                "firstAddress($words)",
+                "`string` cannot cross the C boundary as the pointee type `T` of function `firstAddress`"
+            ),
+        ],
+        "{found:#?}"
+    );
+}

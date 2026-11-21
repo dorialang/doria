@@ -1943,6 +1943,7 @@ fn collect_class_hierarchy_semantics(
 }
 
 fn collect_concrete_instances(program: &Program, checker: &mut Checker<'_>) {
+    checker.check_generic_pointee_arguments();
     let mut expanded_nominals = HashSet::new();
     loop {
         let previous_count = checker.class_instantiations.len() + checker.enum_instantiations.len();
@@ -2967,6 +2968,10 @@ struct Checker<'program> {
     core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     symbolic_collection_keys: Vec<collection_keys::SymbolicKey>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
+    /// The type parameters each generic function or method uses as a
+    /// pointer or region pointee, which each call checks for FFI safety
+    /// (Decision 0148 section 3, amendment of 2026-11-21).
+    pointee_type_parameters: HashMap<Span, std::collections::BTreeSet<String>>,
     /// Type arguments stated at calls, keyed by the call's span.
     stated_type_arguments: HashMap<Span, call_type_arguments::StatedTypeArguments>,
     pending_enum_constructions: HashMap<Span, GenericInference>,
@@ -3885,6 +3890,7 @@ impl<'program> Checker<'program> {
             core_operation_calls: HashMap::new(),
             symbolic_collection_keys: Vec::new(),
             pending_generic_calls: HashMap::new(),
+            pointee_type_parameters: HashMap::new(),
             stated_type_arguments: HashMap::new(),
             pending_enum_constructions: HashMap::new(),
             pending_availability_calls: HashMap::new(),
@@ -7628,6 +7634,9 @@ impl<'program> Checker<'program> {
                         )
                     }),
                 );
+                // The body is checked again as its callable, as `check_function`
+                // checks it.
+                let previous_callable = self.current_callable.replace(function.span);
                 let previous_owner = std::mem::replace(
                     &mut self.current_lexical_owner,
                     LexicalOwner::Callable(function.span),
@@ -7696,6 +7705,7 @@ impl<'program> Checker<'program> {
                 self.nominal_condition_scopes
                     .truncate(condition_scope_depth);
                 self.current_lexical_owner = previous_owner;
+                self.current_callable = previous_callable;
                 if inferred != signature.return_borrow {
                     self.set_return_borrow(function, declaring_class.as_deref(), inferred);
                     changed = true;
@@ -18381,6 +18391,19 @@ impl<'program> Checker<'program> {
                 }
                 self.types.intern(TypeKind::Class(class))
             }
+            // A pointer, C function pointer or fixed-length array over a
+            // type parameter, and a typed array region of one (Decision 0148
+            // section 3, amendment of 2026-11-21).
+            TypeKind::Foreign(foreign) => {
+                let foreign = foreign.map(|component| {
+                    self.substitute_type_impl(*component, substitutions, register_instances)
+                });
+                self.types.intern(TypeKind::Foreign(foreign))
+            }
+            TypeKind::ArrayRegion(kind, element) => {
+                let element = self.substitute_type_impl(element, substitutions, register_instances);
+                self.types.intern(TypeKind::ArrayRegion(kind, element))
+            }
             _ => ty,
         }
     }
@@ -25605,6 +25628,11 @@ impl<'program> Checker<'program> {
             .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Property)
             .and_then(|member| member.unsafe_operation)
         {
+            // A generic region's pointer is checked at each call with the
+            // element type the call supplies (Decision 0148 section 3).
+            if let TypeKind::ArrayRegion(_, element) = self.types.kind(ty).clone() {
+                self.defer_generic_pointee(element);
+            }
             self.require_unsafe(span, operation);
             return;
         }

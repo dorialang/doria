@@ -318,7 +318,7 @@ impl<'program> Checker<'program> {
             self.types.kind(pointee),
             TypeKind::Foreign(ForeignType::Opaque | ForeignType::Aggregate(_))
         );
-        if !addressable {
+        if !addressable && !self.defer_generic_pointee(pointee) {
             self.require_ffi_safe(pointee, span, "a pointee");
         }
         self.types
@@ -535,6 +535,135 @@ impl<'program> Checker<'program> {
             .with_help(help),
         );
         false
+    }
+
+    /// Whether `pointee` is a type parameter of the generic function or
+    /// method being checked. Its FFI safety is checked at each call, with
+    /// the type the call supplies (section 3, amendment of 2026-11-21), so
+    /// it is recorded for [`Self::check_generic_pointee_arguments`].
+    pub(super) fn defer_generic_pointee(&mut self, pointee: TypeId) -> bool {
+        let TypeKind::TypeParameter(name) = self.types.kind(pointee) else {
+            return false;
+        };
+        let Some(callable) = self.current_callable else {
+            return false;
+        };
+        if !self
+            .type_parameter_scopes
+            .last()
+            .is_some_and(|scope| scope.contains_key(name))
+        {
+            return false;
+        }
+        let name = name.clone();
+        self.pointee_type_parameters
+            .entry(callable)
+            .or_default()
+            .insert(name);
+        true
+    }
+
+    /// Checks the type each generic call supplies for a pointee type
+    /// parameter, at that call. A call inside a generic function that
+    /// supplies the caller's own type parameter passes the requirement to
+    /// that parameter, so the call that names the concrete type reports it.
+    pub(super) fn check_generic_pointee_arguments(&mut self) {
+        if self.pointee_type_parameters.is_empty() {
+            return;
+        }
+        let owners = self
+            .function_signatures
+            .values()
+            .map(|function| (function.declaration, &function.type_params))
+            .chain(self.classes.values().flat_map(|class| {
+                class
+                    .methods
+                    .values()
+                    .map(|method| (method.declaration, &method.type_params))
+            }))
+            .map(|(declaration, parameters)| {
+                (
+                    declaration,
+                    parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut calls = self
+            .pending_generic_calls
+            .iter()
+            .map(|(site, pending)| {
+                let caller = owners
+                    .iter()
+                    .filter(|(declaration, _)| declaration.contains(*site))
+                    .min_by_key(|(declaration, _)| declaration.end - declaration.start);
+                (
+                    *site,
+                    pending.declaration,
+                    pending.inference.callee.clone(),
+                    pending.inference.bindings.clone(),
+                    caller.cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|(site, ..)| *site);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (_, callee, _, bindings, caller) in &calls {
+                let Some((caller, own)) = caller else {
+                    continue;
+                };
+                let required = self
+                    .pointee_type_parameters
+                    .get(callee)
+                    .cloned()
+                    .unwrap_or_default();
+                for parameter in required {
+                    let Some(TypeKind::TypeParameter(name)) =
+                        bindings.get(&parameter).map(|ty| self.types.kind(*ty))
+                    else {
+                        continue;
+                    };
+                    if own.contains(name) {
+                        let name = name.clone();
+                        changed |= self
+                            .pointee_type_parameters
+                            .entry(*caller)
+                            .or_default()
+                            .insert(name);
+                    }
+                }
+            }
+        }
+        for (site, callee, name, bindings, _) in calls {
+            let Some(required) = self.pointee_type_parameters.get(&callee).cloned() else {
+                continue;
+            };
+            for parameter in required {
+                let Some(&supplied) = bindings.get(&parameter) else {
+                    continue;
+                };
+                if self.type_is_symbolic(supplied) {
+                    continue;
+                }
+                let place = format!("the pointee type `{parameter}` of {name}");
+                let message = format!(
+                    "`{}` cannot cross the C boundary as {place}",
+                    self.types.display(supplied)
+                );
+                if self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == NOT_FFI_SAFE_CODE
+                        && diagnostic.span == site
+                        && diagnostic.message == message
+                }) {
+                    continue;
+                }
+                self.require_ffi_safe(supplied, site, &place);
+            }
+        }
     }
 
     fn ffi_safe_replacement(&self, ty: TypeId) -> String {

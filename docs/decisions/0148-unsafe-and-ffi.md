@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles), and limited what is emitted to reachable code in section 17 on 2026-11-21 (Amendment: Emitting Only Reachable Code). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles), and limited what is emitted to reachable code in section 17 on 2026-11-21 (Amendment: Emitting Only Reachable Code), and let a type parameter be a pointee in section 3 the same day (Amendment: Type Parameters As Pointees). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -196,6 +196,13 @@ witness that reachable code dispatches to through a conformance is reachable
 code, so a class named as a type in reachable code reaches its interface
 implementations even when nothing constructs it.
 
+### Amendment: Type Parameters As Pointees (2026-11-21)
+
+Section 3 did not say whether a pointer or region pointee may be a type
+parameter, and checking rejected `function first<T>(Pointer<T> $pointer): T`
+with E0786 at the declaration. Andrew ruled on 2026-11-21: "Allow it,
+checked per use (Recommended)". Section 3 states the rule.
+
 ## Context
 
 Stage 40 is the second item of the approved execution sequence (plan §13).
@@ -378,6 +385,13 @@ the unit sections 7, 22 and 23 build on. Plan §3.5 records the body rule.
 - A bodyless foreign struct declares a named incomplete C type:
   `extern "C" struct ZStream;` gives `Pointer<ZStream>`.
 - `void` remains return-position only (Decision 0069).
+- A pointee may be a type parameter: `Pointer<T>`, `WritablePointer<T>`,
+  `Pointer::cast<T>` and the pointer of an `ArrayRegion<T>`. Each use that
+  supplies a concrete type for `T` checks it: a call, stated
+  (`first<int32>(...)`) or inferred, and a generic class's type arguments.
+  A type that is not FFI-safe is E0786 at that use, naming the type. A use
+  that supplies its own caller's type parameter passes the check to that
+  caller's uses (amendment of 2026-11-21).
 
 Consequence: the checker proves which pointers may be null at compile time, and
 `?Pointer<T>` passes to C unchanged.

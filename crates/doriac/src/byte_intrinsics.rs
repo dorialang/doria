@@ -393,7 +393,8 @@ pub fn member(receiver: &ResolvedType, name: &str) -> Option<ByteIntrinsic> {
         "pointer" | "writablePointer"
             if (matches!(receiver, ResolvedType::ByteRegion(_))
                 || matches!(receiver, ResolvedType::ArrayRegion(..))
-                    && crate::foreign::is_ffi_safe(&element))
+                    && (crate::foreign::is_ffi_safe(&element)
+                        || matches!(element, ResolvedType::TypeParameter(_))))
                 && (name == "pointer" || writable_storage) =>
         {
             let writable = name == "writablePointer";

@@ -1041,6 +1041,46 @@ function main(): void
     );
 }
 
+/// A generic helper reads and copies through `Pointer<T>` and
+/// `WritablePointer<T>` for each FFI-safe `T` a call supplies, stated or
+/// inferred (Decision 0148 section 3, amendment of 2026-11-21).
+#[test]
+fn generic_pointer_helpers_read_and_copy_each_supplied_type() {
+    let source = format!(
+        r#"{POINTER}{AGGREGATES}
+/** @safety `$pointer` points at a `T`. */
+unsafe function first<T>(Pointer<T> $pointer): T
+{{
+    return unsafe($pointer->read());
+}}
+
+/** @safety Both pointers point at a `T`. */
+unsafe function copyInto<T>(Pointer<T> $source, WritablePointer<T> $target): void
+{{
+    unsafe {{
+        $target->write($source->read());
+    }}
+}}
+
+function main(): void
+{{
+    int32 $number = 41;
+    writable int32 $other = 0;
+    Color $color = new Color(red: 1, green: 2, blue: 3);
+    writable Color $copy = new Color(red: 0, green: 0, blue: 0);
+    unsafe {{
+        echo first<int32>(Pointer::to($number)) . "\n";
+        echo first(Pointer::to($color))->green . "\n";
+        copyInto(Pointer::to($number), WritablePointer::to($other));
+        copyInto<Color>(Pointer::to($color), WritablePointer::to($copy));
+    }}
+    echo $other . " " . $copy->red . " " . $copy->blue . "\n";
+}}
+"#
+    );
+    assert_runs_natively(&source, "41\n2\n41 1 3\n");
+}
+
 /// A writable home lends the caller's storage: a closure's writable
 /// parameter and a writable capture change the caller's foreign struct in
 /// place through field writes, fixed-length array regions, pointers and

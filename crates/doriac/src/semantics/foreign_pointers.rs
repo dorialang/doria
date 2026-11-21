@@ -480,11 +480,13 @@ impl<'program> Checker<'program> {
             }
             return argument_ty;
         };
-        self.require_ffi_safe(
-            receiver.pointee,
-            argument.value.span(),
-            "an array region element",
-        );
+        if !self.defer_generic_pointee(receiver.pointee) {
+            self.require_ffi_safe(
+                receiver.pointee,
+                argument.value.span(),
+                "an array region element",
+            );
+        }
         self.types.intern(TypeKind::Foreign(ForeignType::Pointer {
             access,
             pointee: receiver.pointee,
@@ -800,7 +802,7 @@ impl<'program> Checker<'program> {
             self.types.kind(ty),
             TypeKind::Foreign(ForeignType::Aggregate(_))
         );
-        if !addressable {
+        if !addressable && !self.defer_generic_pointee(ty) {
             self.require_ffi_safe(ty, place.span(), "a pointee");
         }
     }
