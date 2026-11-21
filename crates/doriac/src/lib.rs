@@ -91,6 +91,7 @@ pub mod testing;
 pub mod trait_composition;
 pub mod types;
 pub mod unsafe_code;
+pub mod unsafe_policy;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
 pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
@@ -811,6 +812,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_concurrency::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -823,6 +825,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_term::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -835,6 +838,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_time::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -847,6 +851,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_stream::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -855,7 +860,7 @@ fn append_compiler_known_semantic_context(
     );
     source_texts.insert(
         compiler_known_ffi::SOURCE_ID,
-        compiler_known_ffi::SOURCE_TEXT,
+        compiler_known_ffi::source_text(),
     );
     contexts.insert(
         compiler_known_ffi::SOURCE_ID,
@@ -863,6 +868,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_ffi::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -871,6 +877,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_text::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -883,6 +890,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_contracts::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     if !ast_uses_compiler_known_source(program) {
@@ -895,6 +903,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
 }

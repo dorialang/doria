@@ -151,13 +151,13 @@ final class __DoriaNativeIo
         // may run a Doria drop against a runtime that has just failed.
         global $__doria_shutting_down;
         $__doria_shutting_down = true;
-        fwrite(STDERR, $__doria_native_failures[$reason]);
+        fwrite(__DORIA_STDERR, $__doria_native_failures[$reason]);
         if ($reason === "protocol") {
             $caller = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1] ?? [];
             $operation = ($caller["class"] ?? "") === "" ? ($caller["function"] ?? "")
                 : $caller["class"] . "::" . ($caller["function"] ?? "");
             if ($operation !== "") {
-                fwrite(STDERR, "The operation that failed was " . $operation .
+                fwrite(__DORIA_STDERR, "The operation that failed was " . $operation .
                     ($detail === "" ? "" : ": " . $detail) . ".\n");
             }
         }
@@ -345,6 +345,7 @@ int64_t dr_v1_host_terminal_operate(uint32_t operation, int64_t first, int64_t s
 int64_t dr_v1_terminal_await_event(uint32_t generation, uint8_t wait_kind, uint64_t wait_low,
     int64_t wait_high, DrCancellationV1 *cancellation);
 void dr_v1_terminal_process_ending(void);
+void dr_v1_provide_absent_streams(void);
 DORIA_NATIVE_ABI, $path);
         } catch (Throwable) {
             // Configuration failures are backend diagnostics, never Doria IoError.
@@ -368,6 +369,9 @@ DORIA_NATIVE_ABI, $path);
         if ($layout[0] !== FFI::sizeof($key) || $layout[1] !== FFI::alignof($key)) {
             self::fail("layout");
         }
+        // The runtime shares this process's standard streams (Decision 0148
+        // section 21).
+        $runtime->dr_v1_provide_absent_streams();
         return self::$runtime = $runtime;
     }
 }

@@ -84,6 +84,10 @@ pub struct CompilationContext {
     pub edition: Edition,
     pub package: PackageIdentity,
     pub source: SourceIdentity,
+    /// The unsafe policy the package sets for every source (Decision 0148
+    /// section 25). A file directive may deny unsafe code where this allows
+    /// it, never the reverse.
+    pub unsafe_policy: crate::build_plan::UnsafePolicy,
 }
 
 impl CompilationContext {
@@ -92,6 +96,7 @@ impl CompilationContext {
             edition: Edition::Doria2026,
             package: PackageIdentity::Standalone,
             source: SourceIdentity(source.into()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         }
     }
 }
@@ -823,15 +828,9 @@ impl<'a> Resolver<'a> {
                 },
             },
             diagnostics: {
-                // A program with unsafe or foreign forms stops here, before an
-                // unimplemented name such as `Doria\Std\Ffi\Pointer` reads as an
-                // unknown one.
-                let unavailable = crate::unsafe_code::unchecked_forms(self.authored);
-                if unavailable.is_empty() {
-                    self.diagnostics
-                } else {
-                    unavailable
-                }
+                let mut diagnostics = self.diagnostics;
+                diagnostics.extend(crate::unsafe_policy::check(self.authored, self.context));
+                diagnostics
             },
         }
     }

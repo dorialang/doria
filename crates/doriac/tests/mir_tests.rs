@@ -1228,7 +1228,8 @@ fn lowers_if_condition_to_branch_terminator() {
     let program = lower(
         r#"function main(): int
 {
-    if (40 + 2 == 42) {
+    let $value = 40;
+    if ($value + 2 == 42) {
         return 42;
     }
 
@@ -1237,6 +1238,8 @@ fn lowers_if_condition_to_branch_terminator() {
 "#,
     );
 
+    // A constant condition folds (Decision 0148 section 17), so a local
+    // keeps this comparison a branch.
     assert_eq!(
         program.functions[0].blocks[0].terminator,
         Terminator::Branch {
@@ -1247,7 +1250,7 @@ fn lowers_if_condition_to_branch_terminator() {
                     right_span: Default::default(),
                     ty: DEFAULT_INT,
                     op: IntegerBinaryOp::Add,
-                    left: Box::new(int_constant(40)),
+                    left: Box::new(local_integer_expression(LocalId(0))),
                     right: Box::new(int_constant(2)),
                 })),
                 right: Box::new(int_expression_value(int_constant(42))),
@@ -1275,9 +1278,12 @@ fn lowers_if_without_else_through_a_continuation_block() {
     );
     let blocks = &program.functions[0].blocks;
 
+    // The condition is constant true, so the implicit else side is never
+    // lowered (Decision 0148 section 17): its block stays unreachable.
     assert_eq!(blocks.len(), 4);
+    assert_eq!(blocks[0].terminator, Terminator::Jump(BlockId(1)));
     assert_eq!(blocks[1].terminator, Terminator::Jump(BlockId(3)));
-    assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
+    assert_eq!(blocks[2].terminator, Terminator::Unreachable);
     assert_eq!(
         blocks[3].terminator,
         int_return(local_integer_expression(LocalId(0)))
@@ -1289,7 +1295,8 @@ fn lowers_if_else_to_distinct_return_blocks() {
     let program = lower(
         r#"function main(): int
 {
-    if (true) {
+    let $value = 0;
+    if ($value == 0) {
         return 42;
     } else {
         return 0;
@@ -1350,7 +1357,7 @@ fn lowers_all_stage_11c_integer_comparisons() {
         (">=", CompareOp::GreaterEqual),
     ] {
         let source = format!(
-            "function main(): int\n{{\n    if (1 {operator} 1) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+            "function main(): int\n{{\n    let $value = 1;\n    if ($value {operator} 1) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
         );
         let program = lower(&source);
         let Terminator::Branch { condition, .. } = &program.functions[0].blocks[0].terminator
@@ -1369,18 +1376,18 @@ fn lowers_word_and_symbol_condition_operators_equivalently() {
     for (word, symbol) in [("and", "&&"), ("or", "||"), ("not", "!")] {
         let word_source = if word == "not" {
             format!(
-                "function main(): int\n{{\n    if ({word} false) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+                "function main(): int\n{{\n    let $flag = false;\n    if ({word} $flag) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
             )
         } else {
             format!(
-                "function main(): int\n{{\n    if (true {word} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+                "function main(): int\n{{\n    let $flag = true;\n    if ($flag {word} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
             )
         };
         let symbol_source = if symbol == "!" {
-            "function main(): int\n{\n    if (!false) {\n        return 42;\n    }\n\n    return 0;\n}\n".to_string()
+            "function main(): int\n{\n    let $flag = false;\n    if (!$flag) {\n        return 42;\n    }\n\n    return 0;\n}\n".to_string()
         } else {
             format!(
-                "function main(): int\n{{\n    if (true {symbol} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+                "function main(): int\n{{\n    let $flag = true;\n    if ($flag {symbol} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
             )
         };
 
@@ -1393,7 +1400,8 @@ fn lowers_word_and_symbol_condition_operators_equivalently() {
     let xor = lower(
         r#"function main(): int
 {
-    if (true xor false) {
+    let $flag = true;
+    if ($flag xor false) {
         return 42;
     }
 

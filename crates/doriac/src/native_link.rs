@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::c_layout::{CTarget, TargetOperatingSystem};
-use crate::diagnostics::{Diagnostic, DiagnosticKind};
+use crate::diagnostics::Diagnostic;
 use crate::source::{SourceId, Span};
 
 /// The diagnostic for a logical library emitted code references with no
@@ -299,22 +299,6 @@ impl NativeLinking {
             windows_subsystem: self.windows_subsystem,
             ..LinkPlan::default()
         };
-        if target.operating_system == TargetOperatingSystem::Windows
-            && self.windows_subsystem == WindowsSubsystem::Gui
-        {
-            // Section 21's absent-stream rule lands with the runtime's
-            // stream changes; until then a GUI program's output would fail.
-            diagnostics.push(
-                Diagnostic::new(
-                    crate::unsafe_code::NOT_AVAILABLE_CODE,
-                    "the Windows GUI subsystem is part of Doria; this compiler does not yet give a program without a console its defined standard streams",
-                    Span::default(),
-                )
-                .with_title("Windows GUI Subsystem Is Not Available Yet")
-                .with_kind(DiagnosticKind::CompilerInput)
-                .with_help("build with `--windows-subsystem console`, the default"),
-            );
-        }
         let mut referenced = BTreeSet::new();
         let mut runtime_names = BTreeMap::<OsString, PathBuf>::new();
         for (library, span) in referenced_libraries(program) {

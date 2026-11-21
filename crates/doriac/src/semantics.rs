@@ -337,6 +337,15 @@ pub struct SemanticInfo {
     pub matches: HashMap<Span, MatchSemanticInfo>,
     /// Fully checked value type for each `when` expression.
     pub whens: HashMap<Span, WhenSemanticInfo>,
+    /// The value of each `if`, `else if` and `when` branch condition that is a
+    /// constant expression, by the condition's span. A branch whose condition
+    /// is constant false for the target is neither emitted nor linked
+    /// (Decision 0148 section 17); checking still covers it.
+    pub constant_conditions: HashMap<Span, bool>,
+    /// Each free function that a call outside every constant-false branch
+    /// calls (Decision 0148 sections 17 and 18). An extern declaration no
+    /// such call reaches references no C symbol and needs no link input.
+    pub live_function_calls: HashSet<String>,
     /// Source-order statement classification for each `given` prelude.
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
@@ -1604,6 +1613,8 @@ fn finish_checked_analysis(
             type_test_types: checker.type_test_types,
             matches: checker.matches,
             whens: checker.whens,
+            constant_conditions: checker.constant_conditions,
+            live_function_calls: checker.live_function_calls,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
@@ -2934,6 +2945,10 @@ struct Checker<'program> {
     type_test_types: HashMap<Span, ResolvedType>,
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
+    constant_conditions: HashMap<Span, bool>,
+    /// How many enclosing branches are constant false for the target.
+    dead_branch_depth: usize,
+    live_function_calls: HashSet<String>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
     method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
@@ -3849,6 +3864,9 @@ impl<'program> Checker<'program> {
             type_test_types: HashMap::new(),
             matches: HashMap::new(),
             whens: HashMap::new(),
+            constant_conditions: HashMap::new(),
+            dead_branch_depth: 0,
+            live_function_calls: HashSet::new(),
             given_preludes: HashMap::new(),
             call_targets: HashMap::new(),
             method_call_targets: HashMap::new(),
@@ -10215,27 +10233,34 @@ impl<'program> Checker<'program> {
                     self.check_given_prelude(given, &mut construct_scopes, method_context);
                 }
                 self.check_condition(&if_stmt.condition, &construct_scopes, method_context);
+                let constant = self.record_constant_condition(&if_stmt.condition);
                 let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
-                self.check_block(
-                    &if_stmt.then_block,
-                    &mut then_scopes,
-                    method_context,
-                    then_constructor_init_context.as_mut(),
-                    return_context,
-                    loop_depth,
-                );
-                if let Some(else_branch) = &if_stmt.else_branch {
-                    self.check_else_branch(
-                        else_branch,
-                        &construct_scopes,
+                self.check_branch(constant == Some(false), |checker| {
+                    checker.check_block(
+                        &if_stmt.then_block,
+                        &mut then_scopes,
                         method_context,
-                        constructor_init_context.as_deref(),
+                        then_constructor_init_context.as_mut(),
                         return_context,
                         loop_depth,
-                    );
+                    )
+                });
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    // A failed `given` gate reaches the else branch.
+                    let dead = constant == Some(true) && if_stmt.given.is_none();
+                    self.check_branch(dead, |checker| {
+                        checker.check_else_branch(
+                            else_branch,
+                            &construct_scopes,
+                            method_context,
+                            constructor_init_context.as_deref(),
+                            return_context,
+                            loop_depth,
+                        )
+                    });
                 }
                 self.check_finally(
                     if_stmt.finally.as_ref(),
@@ -11556,26 +11581,32 @@ impl<'program> Checker<'program> {
                     self.check_given_prelude(given, &mut construct_scopes, method_context);
                 }
                 self.check_condition(&if_stmt.condition, &construct_scopes, method_context);
+                let constant = self.record_constant_condition(&if_stmt.condition);
                 let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context =
                     constructor_init_context.map(ConstructorInitContext::nested);
-                self.check_block(
-                    &if_stmt.then_block,
-                    &mut then_scopes,
-                    method_context,
-                    then_constructor_init_context.as_mut(),
-                    return_context,
-                    loop_depth,
-                );
-                if let Some(else_branch) = &if_stmt.else_branch {
-                    self.check_else_branch(
-                        else_branch,
-                        &construct_scopes,
+                self.check_branch(constant == Some(false), |checker| {
+                    checker.check_block(
+                        &if_stmt.then_block,
+                        &mut then_scopes,
                         method_context,
-                        constructor_init_context,
+                        then_constructor_init_context.as_mut(),
                         return_context,
                         loop_depth,
-                    );
+                    )
+                });
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    let dead = constant == Some(true) && if_stmt.given.is_none();
+                    self.check_branch(dead, |checker| {
+                        checker.check_else_branch(
+                            else_branch,
+                            &construct_scopes,
+                            method_context,
+                            constructor_init_context,
+                            return_context,
+                            loop_depth,
+                        )
+                    });
                 }
                 self.check_finally(
                     if_stmt.finally.as_ref(),
@@ -11619,6 +11650,22 @@ impl<'program> Checker<'program> {
             format!("condition must be `bool`, got `{}`", self.types.display(ty)),
             condition.span(),
         ));
+    }
+
+    /// Records a branch condition that is a constant expression.
+    fn record_constant_condition(&mut self, condition: &Expr) -> Option<bool> {
+        let value = crate::const_eval::evaluate_bool_expression(&self.const_evaluation, condition)?;
+        self.constant_conditions.insert(condition.span(), value);
+        Some(value)
+    }
+
+    /// Checks `check` as code a branch that is constant false for the target
+    /// holds when `dead`: it is checked, and its calls emit nothing.
+    fn check_branch<R>(&mut self, dead: bool, check: impl FnOnce(&mut Self) -> R) -> R {
+        self.dead_branch_depth += usize::from(dead);
+        let result = check(self);
+        self.dead_branch_depth -= usize::from(dead);
+        result
     }
 
     fn check_given_prelude(
@@ -15885,19 +15932,29 @@ impl<'program> Checker<'program> {
             saw_value: false,
         });
 
+        // A branch after one whose condition is constant true emits nothing,
+        // except the unconditioned branch a failed `given` gate reaches.
+        let mut decided = false;
         for branch in branches {
+            let mut constant = None;
             if let Some(condition) = &branch.condition {
                 self.check_condition(condition, &when_scopes, method_context);
+                constant = self.record_constant_condition(condition);
             }
+            let dead = constant == Some(false)
+                || (decided && (branch.condition.is_some() || given.is_none()));
+            decided |= constant == Some(true);
             let mut branch_scopes = when_scopes.clone();
-            self.check_block(
-                &branch.block,
-                &mut branch_scopes,
-                method_context,
-                None,
-                None,
-                enclosing_loop_depth,
-            );
+            self.check_branch(dead, |checker| {
+                checker.check_block(
+                    &branch.block,
+                    &mut branch_scopes,
+                    method_context,
+                    None,
+                    None,
+                    enclosing_loop_depth,
+                )
+            });
             if crate::return_analysis::analyze_block_with_given_and_terminals(
                 &branch.block,
                 branch.block.span,
@@ -19009,6 +19066,9 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        if self.dead_branch_depth == 0 {
+            self.live_function_calls.insert(name.to_string());
+        }
         self.call_targets.insert(
             span,
             CallableTarget::Function {

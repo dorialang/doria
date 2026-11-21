@@ -28,11 +28,7 @@ pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
-    let mut unexecutable = crate::unsafe_code::unexecutable_forms(program);
-    unexecutable.extend(crate::unsafe_code::unbuildable_bindings(
-        &semantic_info.foreign_bindings,
-    ));
-    unexecutable.sort_by_key(|diagnostic| (diagnostic.span.source.0, diagnostic.span.start));
+    let unexecutable = crate::unsafe_code::unexecutable_forms(program);
     if !unexecutable.is_empty() {
         return Err(unexecutable);
     }

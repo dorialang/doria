@@ -14,7 +14,7 @@ const EVERY_FORM: &str = r#"declare(unsafe: "allow");
 
 namespace App\Native;
 
-use Doria\Std\Ffi\{CChar, CSize, CUnsignedLong, Opaque, Pointer, WritablePointer};
+use Doria\Std\Ffi\{CChar, CSize, CUnsignedLong, Library, LinkName, Opaque, Pointer, Variadic, WritablePointer};
 
 /**
  * Bindings to zlib.
@@ -298,28 +298,31 @@ fn every_stage40_form_parses_without_a_parser_error() {
     );
 }
 
-fn check_codes(source: &str) -> Vec<Diagnostic> {
-    doriac::check_source("ffi.doria", source).expect_err("unsafe code is not checked yet")
+/// Every finding of checking `source`: its errors, or its warnings when it
+/// has no error.
+fn check_findings(source: &str) -> Vec<Diagnostic> {
+    match doriac::check_source_with_warnings("ffi.doria", source) {
+        Ok((_, warnings)) => warnings,
+        Err(diagnostics) => diagnostics,
+    }
 }
 
 #[test]
-fn every_stage40_form_reaches_checking_as_not_available_yet() {
-    let diagnostics = check_codes(EVERY_FORM);
+fn checking_covers_every_stage40_form() {
+    // Checking covers every form; none reads as not available yet. The
+    // program's own mistakes (the undeclared `free`) stay ordinary errors.
+    let diagnostics = check_findings(EVERY_FORM);
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| diagnostic.code == "E0784"),
-        "only not-available-yet diagnostics: {diagnostics:#?}"
+            .all(|diagnostic| diagnostic.code != "E0784"),
+        "{diagnostics:#?}"
     );
-    let titles = diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.title.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    // The forms checking does not cover yet; the rest are checked in
-    // stage40_checking_tests.
     assert!(
-        titles.contains("Declare Directives Are Not Available Yet"),
-        "{titles:#?}"
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("free")),
+        "{diagnostics:#?}"
     );
 }
 

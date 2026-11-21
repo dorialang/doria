@@ -513,7 +513,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
             "\n\nWhy\n  " . __doria_safe_error_message($error->message) .
             "\n\nProcess Exited With Status 70\n";
         __doria_terminal_ending();
-        @fwrite(STDERR, $message);
+        @fwrite(__DORIA_STDERR, $message);
         $caught->dropError();
         exit(70);
     }
@@ -530,7 +530,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
         __doria_safe_error_message($error->message) .
         "\n\nProcess Exited With Status 70\n";
     __doria_terminal_ending();
-    @fwrite(STDERR, $message);
+    @fwrite(__DORIA_STDERR, $message);
     $caught->dropError();
     exit(70);
 }
@@ -1719,7 +1719,7 @@ pub fn generate_artifact(
     let closure_plan = Rc::new(closure_plan);
 
     let mut output = String::from(
-        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function &value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    if (is_float($value)) { throw new LogicException(\"compiler float display has no width\"); }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+        "<?php\n\n// Decision 0148 section 21: a standard stream the process started without\n// is the null device, so writing discards, reading reports end of input and\n// no file the program opens takes its place. PHP opens its random device and\n// its scripts before this runs, each on the lowest free descriptor, so a\n// standard descriptor that holds one of them was absent at start.\nfunction __doria_standard_stream(int $descriptor, string $name, string $mode)\n{\n    global $__doria_reserved_streams;\n    $probe = @fopen('php://fd/' . $descriptor, 'rb');\n    $present = $probe !== false;\n    if ($probe !== false) {\n        $stat = @fstat($probe);\n        foreach ([...get_included_files(), '/dev/urandom', '/dev/random'] as $file) {\n            $script = @stat($file);\n            if ($stat !== false && $script !== false && $stat['dev'] === $script['dev'] &&\n                $stat['ino'] === $script['ino']) { $present = false; }\n        }\n        fclose($probe);\n    }\n    if ($present && defined($name)) { return constant($name); }\n    $null = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';\n    // Opening takes the lowest free descriptor, so a closed standard one is\n    // filled before any file the program opens.\n    for ($attempt = 0; $attempt < 3; $attempt++) {\n        $open = @fopen('php://fd/' . $descriptor, 'rb');\n        if ($open !== false) { fclose($open); break; }\n        $__doria_reserved_streams[] = fopen($null, 'r+b');\n    }\n    return fopen($null, $mode);\n}\n\n$__doria_reserved_streams = [];\ndefine('__DORIA_STDIN', __doria_standard_stream(0, 'STDIN', 'rb'));\ndefine('__DORIA_STDOUT', __doria_standard_stream(1, 'STDOUT', 'wb'));\ndefine('__DORIA_STDERR', __doria_standard_stream(2, 'STDERR', 'wb'));\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function &value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    if (is_float($value)) { throw new LogicException(\"compiler float display has no width\"); }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
     value_result::emit_runtime(program, &mut output, &specialization);
     emit_primitive_comparison_runtime(&mut output);
@@ -1851,18 +1851,18 @@ function __doria_panic(
         exit(101);
     }
     __doria_terminal_ending();
-    @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
-    @fwrite(STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n");
-    @fwrite(STDERR, __doria_source_excerpt($site, $label));
-    @fwrite(STDERR, "\n\nWhy\n" . $why);
+    @fwrite(__DORIA_STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
+    @fwrite(__DORIA_STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n");
+    @fwrite(__DORIA_STDERR, __doria_source_excerpt($site, $label));
+    @fwrite(__DORIA_STDERR, "\n\nWhy\n" . $why);
     if ($code === "P1000" && $message !== null) {
-        @fwrite(STDERR, "\n\nNote\n" . $message);
+        @fwrite(__DORIA_STDERR, "\n\nNote\n" . $message);
     }
-    @fwrite(STDERR, "\n\nCall Path");
+    @fwrite(__DORIA_STDERR, "\n\nCall Path");
     foreach ($frames as [$name, $framePath, $frameStart, $frameEnd, $frameLine]) {
-        @fwrite(STDERR, "\n" . $name . " · " . $framePath . ":" . $frameLine);
+        @fwrite(__DORIA_STDERR, "\n" . $name . " · " . $framePath . ":" . $frameLine);
     }
-    @fwrite(STDERR, "\n\nProcess Exited With Status 101\n");
+    @fwrite(__DORIA_STDERR, "\n\nProcess Exited With Status 101\n");
     $__doria_panicking = true;
     exit(101);
 }
@@ -1874,7 +1874,7 @@ function __doria_read_line(string $prompt, int $start, int $end, string $callabl
     }
     if ($prompt !== "") {
         __doria_write_all(
-            STDOUT,
+            __DORIA_STDOUT,
             $prompt,
             $start,
             $end,
@@ -1885,9 +1885,9 @@ function __doria_read_line(string $prompt, int $start, int $end, string $callabl
     }
     __doria_flush_stdout($start, $end, $callable);
     error_clear_last();
-    $line = @fgets(STDIN);
+    $line = @fgets(__DORIA_STDIN);
     if ($line === false) {
-        if (feof(STDIN)) { return null; }
+        if (feof(__DORIA_STDIN)) { return null; }
         __doria_throw_io(
             __DoriaStdIoIoOperation::Read,
             __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
@@ -2301,7 +2301,7 @@ function __doria_write_all(
 function __doria_flush_stdout(int $start, int $end, string $callable): void
 {
     error_clear_last();
-    if (@fflush(STDOUT)) { return; }
+    if (@fflush(__DORIA_STDOUT)) { return; }
     if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
     __doria_throw_io(
         __DoriaStdIoIoOperation::Flush,
@@ -2319,7 +2319,7 @@ function __doria_write_stdout(string $value, int $start, int $end, string $calla
         return;
     }
     __doria_write_all(
-        STDOUT,
+        __DORIA_STDOUT,
         $value,
         $start,
         $end,
@@ -2336,7 +2336,7 @@ function __doria_write_stderr(string $value, int $start, int $end, string $calla
         return;
     }
     __doria_write_all(
-        STDERR,
+        __DORIA_STDERR,
         $value,
         $start,
         $end,
@@ -2542,6 +2542,7 @@ function __doria_printf(
     scopes.matches = program.semantic_info.matches.clone();
     scopes.specialization = specialization;
     scopes.whens = program.semantic_info.whens.clone();
+    scopes.constant_conditions = Rc::new(program.semantic_info.constant_conditions.clone());
     scopes.given_preludes = program.semantic_info.given_preludes.clone();
     scopes.expression_types = php_expression_types(&program.semantic_info);
     scopes.flow_facts = Rc::new(program.semantic_info.flow_facts.clone());
@@ -4242,6 +4243,8 @@ struct PhpNameScopes {
     payload_case_tags: HashMap<crate::enums::EnumCaseSource, u32>,
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
+    /// Branch conditions checking found constant (Decision 0148 section 17).
+    constant_conditions: Rc<HashMap<Span, bool>>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     expression_types: HashMap<Span, ResolvedType>,
     flow_facts: Rc<crate::narrowing::FactsByUse>,
@@ -4363,6 +4366,7 @@ impl PhpNameScopes {
             payload_case_tags: HashMap::new(),
             matches: HashMap::new(),
             whens: HashMap::new(),
+            constant_conditions: Rc::default(),
             given_preludes: HashMap::new(),
             expression_types: HashMap::new(),
             flow_facts: Rc::default(),
@@ -4410,6 +4414,7 @@ impl PhpNameScopes {
         scopes.payload_case_tags = self.payload_case_tags.clone();
         scopes.matches = self.matches.clone();
         scopes.whens = self.whens.clone();
+        scopes.constant_conditions = Rc::clone(&self.constant_conditions);
         scopes.given_preludes = self.given_preludes.clone();
         scopes.expression_types = self.expression_types.clone();
         scopes.flow_facts = Rc::clone(&self.flow_facts);
@@ -9176,8 +9181,33 @@ fn emit_if(
     gate: Option<&str>,
     scopes: &mut PhpNameScopes,
 ) {
-    let condition = emit_condition(&if_stmt.condition, gate, output, indent, scopes);
-    writeln(output, indent, &format!("if ({condition})"));
+    // Decision 0148 section 17: a branch whose condition is constant false
+    // is not emitted. A failed `given` gate still reaches the else branch.
+    match scopes
+        .constant_conditions
+        .get(&if_stmt.condition.span())
+        .copied()
+    {
+        Some(false) => {
+            match &if_stmt.else_branch {
+                Some(ElseBranch::If(else_if)) => emit_if(else_if, output, indent, gate, scopes),
+                Some(ElseBranch::Block(block)) => emit_block(block, output, indent, scopes),
+                None => {}
+            }
+            return;
+        }
+        Some(true) => {
+            let Some(gate) = gate else {
+                emit_block(&if_stmt.then_block, output, indent, scopes);
+                return;
+            };
+            writeln(output, indent, &format!("if ({gate})"));
+        }
+        None => {
+            let condition = emit_condition(&if_stmt.condition, gate, output, indent, scopes);
+            writeln(output, indent, &format!("if ({condition})"));
+        }
+    }
     emit_block(&if_stmt.then_block, output, indent, scopes);
 
     if let Some(else_branch) = &if_stmt.else_branch {
@@ -11270,6 +11300,30 @@ fn emit_when_branch_chain(
     let Some((branch, rest)) = branches.split_first() else {
         return;
     };
+    // Decision 0148 section 17: a branch whose condition is constant false is
+    // not emitted, nor is a branch after one whose condition is constant
+    // true, except the unconditioned branch a failed `given` gate reaches.
+    let constant = branch
+        .condition
+        .as_ref()
+        .and_then(|condition| scopes.constant_conditions.get(&condition.span()).copied());
+    if constant == Some(false) {
+        emit_when_branch_chain(rest, gate, output, indent, scopes);
+        return;
+    }
+    if constant == Some(true) {
+        let Some(gate) = gate else {
+            emit_block(&branch.block, output, indent, scopes);
+            return;
+        };
+        writeln(output, indent, &format!("if ({gate})"));
+        emit_block(&branch.block, output, indent, scopes);
+        if let Some(fallback) = rest.iter().find(|branch| branch.condition.is_none()) {
+            writeln(output, indent, "else");
+            emit_block(&fallback.block, output, indent, scopes);
+        }
+        return;
+    }
     if let Some(condition) = &branch.condition {
         let condition = emit_condition(condition, gate, output, indent, scopes);
         writeln(output, indent, &format!("if ({condition})"));

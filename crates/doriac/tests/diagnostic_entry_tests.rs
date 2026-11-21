@@ -17,11 +17,11 @@ const CHECKED_CODES_WITHOUT_A_PROGRAM: &[&str] = &[
     // Only ever reported after another error at the same place.
     "E0454", "E0473", "E0633", "E0634", "E0696",
     // Reported when a program is compiled, not when it is checked.
-    "E0505", "E0804", "E0805",
+    "E0505", "E0784", "E0804", "E0805", "E0817",
     // Raised only through compiler interfaces that no command reaches.
     "E0673", "E0674", "E0699",
     // Reported for a project's build plan or several of its files.
-    "E0676", "E0677", "E0678", "E0679", "E0680", "E0682", "E0683", "E0684", "E0685",
+    "E0676", "E0677", "E0678", "E0679", "E0680", "E0682", "E0683", "E0684", "E0685", "E0816",
     // Reported only for a test function the compiler itself generates.
     "E0711",
 ];

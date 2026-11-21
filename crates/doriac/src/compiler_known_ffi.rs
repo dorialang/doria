@@ -18,8 +18,6 @@ pub const VARIADIC: &str = "Doria\\Std\\Ffi\\Variadic";
 pub const CAPTURE_SYSTEM_CODE: &str = "Doria\\Std\\Ffi\\CaptureSystemCode";
 pub const NON_BLOCKING: &str = "Doria\\Std\\Ffi\\NonBlocking";
 
-/// Members of `Doria\Std\Ffi` whose surface lands with later Stage 40 work.
-/// They resolve, so their use reads as not available yet rather than unknown.
 pub const PLATFORM: &str = "Doria\\Std\\Ffi\\Platform";
 pub const FOREIGN_CALL: &str = "Doria\\Std\\Ffi\\ForeignCall";
 pub const HANDLE: &str = "Doria\\Std\\Ffi\\Handle";
@@ -27,7 +25,6 @@ pub const HANDLE: &str = "Doria\\Std\\Ffi\\Handle";
 /// ([`crate::foreign::ForeignStringEncoding`]).
 pub const C_STRING: &str = "Doria\\Std\\Ffi\\CString";
 pub const UTF16_STRING: &str = "Doria\\Std\\Ffi\\Utf16String";
-pub const PENDING_TYPES: [&str; 1] = [PLATFORM];
 
 /// Members of `Doria\Std\Ffi` that checking models directly: the
 /// `ForeignCall::lastSystemCode` static (section 16) and the `Handle`
@@ -35,10 +32,11 @@ pub const PENDING_TYPES: [&str; 1] = [PLATFORM];
 pub const MODELED_TYPES: [&str; 2] = [FOREIGN_CALL, HANDLE];
 pub const LAST_SYSTEM_CODE: &str = "lastSystemCode";
 
-/// The declarations in [`SOURCE_TEXT`].
-pub const DECLARED_TYPES: [&str; 8] = [
+/// The declarations in [`source_text`].
+pub const DECLARED_TYPES: [&str; 9] = [
     OPERATING_SYSTEM,
     ARCHITECTURE,
+    PLATFORM,
     SYSTEM_CODE_SOURCE,
     LIBRARY,
     LINK_NAME,
@@ -55,7 +53,7 @@ pub const FOREIGN_FUNCTION_ATTRIBUTES: [&str; 4] =
 pub const SOURCE_ID: SourceId = SourceId(0x7fff_fff7);
 pub const SOURCE_NAME: &str = "<compiler-known:ffi>";
 
-pub const SOURCE_TEXT: &str = r#"
+const DECLARATIONS: &str = r#"
 enum OperatingSystem {
     case Linux;
     case MacOs;
@@ -90,12 +88,40 @@ class NonBlocking {
 }
 "#;
 
+/// The source of `Doria\Std\Ffi`: its declarations, and `Platform`, whose
+/// readonly statics are the compilation target's operating system and
+/// architecture (section 17). They are constants, so a branch on them that
+/// is false for the target is neither emitted nor linked. Code generation
+/// targets the host.
+pub fn source_text() -> &'static str {
+    static TEXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let target = crate::c_layout::CTarget::host();
+        let operating_system = match target.operating_system {
+            crate::c_layout::TargetOperatingSystem::Linux => "Linux",
+            crate::c_layout::TargetOperatingSystem::MacOs => "MacOs",
+            crate::c_layout::TargetOperatingSystem::Windows => "Windows",
+        };
+        let architecture = match target.architecture {
+            crate::c_layout::TargetArchitecture::X64 => "X64",
+            crate::c_layout::TargetArchitecture::Arm64 => "Arm64",
+        };
+        format!(
+            "{DECLARATIONS}class Platform {{
+    internal function __construct() {{}}
+    static Doria\\Std\\Ffi\\OperatingSystem $operatingSystem = Doria\\Std\\Ffi\\OperatingSystem::{operating_system};
+    static Doria\\Std\\Ffi\\Architecture $architecture = Doria\\Std\\Ffi\\Architecture::{architecture};
+}}
+"
+        )
+    });
+    TEXT.as_str()
+}
+
 /// Every name of `Doria\Std\Ffi` that authored source can reach.
 pub fn canonical_types() -> impl Iterator<Item = &'static str> {
     crate::foreign::type_names()
         .chain(DECLARED_TYPES)
         .chain(MODELED_TYPES)
-        .chain(PENDING_TYPES)
 }
 
 pub fn is_canonical_type(name: &str) -> bool {
@@ -115,7 +141,7 @@ pub fn resolved_facts_use_ffi(facts: &GlobalSymbolFacts) -> bool {
 fn declarations() -> &'static Program {
     static DECLARATIONS: std::sync::LazyLock<Program> = std::sync::LazyLock::new(|| {
         let mut program =
-            crate::parse_source_file(&SourceFile::with_id(SOURCE_ID, SOURCE_NAME, SOURCE_TEXT))
+            crate::parse_source_file(&SourceFile::with_id(SOURCE_ID, SOURCE_NAME, source_text()))
                 .expect("compiler-known Ffi declarations parse");
         for item in &mut program.items {
             match item {
@@ -168,7 +194,7 @@ pub(crate) fn append_hir_source(program: &mut crate::hir::Program) {
         origin: crate::build_plan::SourceOrigin::Explicit,
         generated_for: None,
         active: true,
-        source: SourceFile::with_id(SOURCE_ID, SOURCE_NAME, SOURCE_TEXT),
+        source: SourceFile::with_id(SOURCE_ID, SOURCE_NAME, source_text()),
     });
     if !program
         .packages

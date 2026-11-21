@@ -2459,3 +2459,66 @@ function main(): void
         " Ada Ada Ada Grace Grace dropped Grace end dropped Ada",
     );
 }
+
+/// Decision 0148 section 21: a standard stream the process starts without is
+/// the null device. A Unix parent can start a program with its streams
+/// closed, as a Windows GUI program starts with none.
+#[cfg(unix)]
+#[test]
+fn absent_standard_streams_discard_writes_and_report_end_of_input() {
+    const SOURCE: &str = r#"
+use Doria\Std\Io\StandardStreams;
+
+function main(): void
+{
+    echo "discarded";
+    let $line = read_line();
+    let $output = StandardStreams::output;
+    write_stderr("{$output->isInteractive} " . ($line ?? "end") . "\n");
+}
+"#;
+    let without_streams = |program: &std::path::Path, interpreter: Option<&str>| {
+        let script = match interpreter {
+            Some(interpreter) => format!("exec {interpreter} \"$0\" >&- <&-"),
+            None => "exec \"$0\" >&- <&-".to_string(),
+        };
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(program)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    let mir = program(SOURCE);
+    for profile in NativeProfile::AVAILABLE {
+        let directory = execution_directory::ExecutionDirectory::new();
+        let executable = native_execution::stage_executable(&mir, *profile, &directory);
+        let run = without_streams(&executable, None);
+        assert_eq!(run.status.code(), Some(0), "{profile:?}: {run:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            "false end\n",
+            "{profile:?}"
+        );
+    }
+
+    // PHP output reads the same rule from its own standard streams.
+    let php = doriac::compile_source_to_php(
+        "stage40.doria",
+        "function main(): void { echo \"discarded\"; let $line = read_line(); write_stderr(($line ?? \"end\") . \"\\n\"); }",
+    )
+    .unwrap();
+    let Ok(version) = std::process::Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let directory = execution_directory::ExecutionDirectory::new();
+    let script = directory.path().join("program.php");
+    std::fs::write(&script, php).unwrap();
+    let run = without_streams(&script, Some("php"));
+    assert_eq!(run.status.code(), Some(0), "PHP: {run:?}");
+    assert_eq!(String::from_utf8_lossy(&run.stderr), "end\n", "PHP");
+}

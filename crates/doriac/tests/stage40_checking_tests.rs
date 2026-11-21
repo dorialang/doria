@@ -524,24 +524,6 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
         "{diagnostics:#?}"
     );
 
-    for (declaration, title) in (!cfg!(windows)).then_some((
-        "extern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::WindowsLastError)] function close(int32 $descriptor): int32; }",
-        "Windows Last Error Capture Cannot Be Built Here Yet",
-    )) {
-        let source = format!(
-            "use Doria\\Std\\Ffi\\{{CaptureSystemCode, CChar, LinkName, Pointer, SystemCodeSource, Variadic}};\n{declaration}\nfunction main(): void {{}}"
-        );
-        assert!(codes(&source).is_empty(), "{title}: {:#?}", findings(&source));
-        let diagnostics = doriac::lower_source_to_mir("ffi.doria", source)
-            .expect_err("the binding cannot be built yet");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "E0784" && diagnostic.title == title),
-            "{title}: {diagnostics:#?}"
-        );
-    }
-
     let unsafe_only = "/** @safety None. */ unsafe function tick(): int { return 1; } function main(): void { echo unsafe(tick()); }";
     let output = doriac::compile_source_to_debug("tick.doria", unsafe_only)
         .expect("an unsafe function with no foreign code builds");
@@ -1626,4 +1608,298 @@ fn foreach_over_regions_checks_its_bindings_and_other_sources_are_not_iterable()
             "{body}: {found:#?}"
         );
     }
+}
+
+/// One file with each unsafe form of Decision 0148 section 25.
+const EVERY_UNSAFE_FORM: &str = r#"
+use Doria\Std\Ffi\{Opaque, Pointer};
+
+extern "C"
+{
+    /** @safety Any value is valid. */
+    function abs(int32 $value): int32;
+    /** @safety Any value is valid. */
+    function labs(int64 $value): int64;
+}
+
+extern "C" struct Pair
+{
+    int32 $left;
+    int32 $right;
+}
+
+/** @safety Any value is valid. */
+unsafe function absolute(int32 $value): int32
+{
+    return unsafe(abs($value));
+}
+
+extern "C" function report(Pointer<Opaque> $context): int32
+{
+    return 0;
+}
+
+function main(): void
+{
+    unsafe {
+        echo abs(-3);
+    }
+}
+"#;
+
+#[test]
+fn the_unsafe_inventory_lists_every_form_in_source_order() {
+    let program = doriac::parse_source("ffi.doria", EVERY_UNSAFE_FORM).unwrap();
+    let forms = doriac::unsafe_policy::inventory(&program)
+        .iter()
+        .map(|form| (form.kind.as_str(), form.name.clone()))
+        .collect::<Vec<_>>();
+    let named = |kind: &'static str, name: &str| (kind, Some(name.to_string()));
+    assert_eq!(
+        forms,
+        vec![
+            ("externBlock", None),
+            named("externDeclaration", "abs"),
+            named("externDeclaration", "labs"),
+            named("foreignAggregate", "Pair"),
+            named("unsafeFunction", "absolute"),
+            ("unsafeContext", None),
+            named("cCallableFunction", "report"),
+            ("unsafeContext", None),
+        ]
+    );
+}
+
+#[test]
+fn a_denying_file_reports_each_unsafe_form_once() {
+    let source = format!("declare(unsafe: \"deny\");\n{EVERY_UNSAFE_FORM}");
+    let found = findings(&source);
+    assert!(
+        found.iter().all(|diagnostic| diagnostic.code == "E0815"),
+        "{found:#?}"
+    );
+    // The extern block, not each of its declarations.
+    assert_eq!(found.len(), 6, "{found:#?}");
+    let directive = source.find("declare").unwrap();
+    for diagnostic in &found {
+        assert_eq!(diagnostic.title, "Unsafe Code Denied By This File");
+        assert!(diagnostic
+            .message
+            .starts_with("this file declares `declare(unsafe: \"deny\")`, so it may contain no "));
+        assert_eq!(diagnostic.related[0].span.start, directive);
+    }
+    let keywords = found
+        .iter()
+        .map(|diagnostic| &source[diagnostic.span.start..diagnostic.span.end])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keywords,
+        ["extern", "extern", "unsafe", "unsafe", "extern", "unsafe"]
+    );
+}
+
+#[test]
+fn an_allowing_file_and_a_file_without_a_directive_keep_unsafe_code() {
+    for prefix in ["declare(unsafe: \"allow\");\n", ""] {
+        let source = format!("{prefix}{EVERY_UNSAFE_FORM}");
+        assert!(
+            findings(&source)
+                .iter()
+                .all(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error),
+            "{prefix}"
+        );
+    }
+    // A denying file without unsafe code checks.
+    assert!(codes("declare(unsafe: \"deny\");\nfunction main(): void { echo 1; }").is_empty());
+}
+
+#[test]
+fn unknown_and_repeated_directives_are_errors() {
+    let key = only(
+        "declare(strict: \"yes\");\nfunction main(): void {}",
+        "E0813",
+    );
+    assert_eq!(key.title, "Unknown Declare Directive");
+    assert!(key
+        .message
+        .contains("`declare(strict: ...)` names no directive"));
+
+    let value = only(
+        "declare(unsafe: \"never\");\nfunction main(): void {}",
+        "E0813",
+    );
+    assert_eq!(value.title, "Unknown Unsafe Policy");
+    assert!(value
+        .message
+        .contains("`\"never\"` is not an unsafe policy"));
+
+    let same = only(
+        "declare(unsafe: \"deny\");\ndeclare(unsafe: \"deny\");\nfunction main(): void {}",
+        "E0814",
+    );
+    assert_eq!(same.title, "Repeated Declare Directive");
+    assert_eq!(same.related[0].span.start, 0);
+    assert_eq!(
+        same.fixes[0].applicability,
+        FixApplicability::MachineApplicable
+    );
+
+    let different = only(
+        "declare(unsafe: \"allow\");\ndeclare(unsafe: \"deny\");\nfunction main(): void {}",
+        "E0814",
+    );
+    assert_eq!(
+        different.fixes[0].applicability,
+        FixApplicability::RequiresReview
+    );
+}
+
+#[test]
+fn a_denying_package_reports_unsafe_code_and_a_file_cannot_relax_it() {
+    let context = |path: &str| doriac::names::CompilationContext {
+        edition: doriac::names::Edition::Doria2026,
+        package: doriac::names::PackageIdentity::Named("acme/safe".to_string()),
+        source: doriac::names::SourceIdentity(path.to_string()),
+        unsafe_policy: doriac::build_plan::UnsafePolicy::Deny,
+    };
+    let denied = doriac::check_source_with_context(
+        "src/main.doria",
+        EVERY_UNSAFE_FORM,
+        context("src/main.doria"),
+    )
+    .unwrap_err();
+    assert!(denied.iter().all(|diagnostic| diagnostic.code == "E0815"));
+    assert_eq!(denied.len(), 6, "{denied:#?}");
+    assert_eq!(denied[0].title, "Unsafe Code Denied By This Package");
+    assert!(denied[0]
+        .message
+        .contains("package `acme/safe` sets `unsafe = \"deny\"` in `Baton.toml`"));
+
+    let relaxed = doriac::check_source_with_context(
+        "src/main.doria",
+        "declare(unsafe: \"allow\");\nfunction main(): void {}",
+        context("src/main.doria"),
+    )
+    .unwrap_err();
+    assert_eq!(relaxed.len(), 1, "{relaxed:#?}");
+    assert_eq!(relaxed[0].code, "E0816");
+    assert_eq!(
+        relaxed[0].title,
+        "File Cannot Allow Unsafe Code In A Denying Package"
+    );
+    assert_eq!(
+        relaxed[0].fixes[0].applicability,
+        FixApplicability::MachineApplicable
+    );
+}
+
+/// Decision 0148 sections 16 and 17: one source branches on the platform
+/// constants. Every branch checks on every host; only the target's branch is
+/// emitted, so the Windows-only capture builds everywhere.
+const PLATFORM_BRANCHES: &str = r#"
+use Doria\Std\Ffi\{Architecture, CaptureSystemCode, LinkName, OperatingSystem, Platform, SystemCodeSource};
+
+extern "C"
+{
+    /** @safety Any descriptor is valid; an invalid one reports an error. */
+    #[LinkName("_close")]
+    #[CaptureSystemCode(SystemCodeSource::WindowsLastError)]
+    function closeDescriptor(int32 $descriptor): int32;
+}
+
+function main(): void
+{
+    if (Platform::operatingSystem == OperatingSystem::Windows) {
+        echo unsafe(closeDescriptor(-1));
+    } else if (Platform::operatingSystem == OperatingSystem::MacOs) {
+        echo "macOS";
+    } else {
+        echo "Linux";
+    }
+    string $bits = when (Platform::architecture == Architecture::Arm64): string {
+        return " arm64";
+    } else {
+        return " x64";
+    };
+    echo $bits;
+}
+"#;
+
+#[test]
+fn platform_constants_emit_only_the_target_branch() {
+    assert!(
+        codes(PLATFORM_BRANCHES).is_empty(),
+        "{:#?}",
+        findings(PLATFORM_BRANCHES)
+    );
+    let mir = doriac::lower_source_to_mir("platform.doria", PLATFORM_BRANCHES)
+        .expect("only the target's branch is emitted");
+    let foreign_calls = mir
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.statements)
+        .filter(|statement| matches!(statement, doriac::mir::Statement::ForeignCall { .. }))
+        .count();
+    assert_eq!(foreign_calls, usize::from(cfg!(windows)));
+    if cfg!(windows) {
+        return;
+    }
+    let expected = format!(
+        "{}{}",
+        if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            "Linux"
+        },
+        if cfg!(target_arch = "aarch64") {
+            " arm64"
+        } else {
+            " x64"
+        }
+    );
+    let output = doriac::mir_interpreter::interpret(&mir).expect("the interpreter runs it");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    // PHP output emits neither the Windows branch nor its binding.
+    let php = doriac::compile_source(
+        "platform.doria",
+        PLATFORM_BRANCHES,
+        doriac::backend::BackendTarget::Php,
+    )
+    .expect("PHP output builds the target's branch");
+    let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+        panic!("PHP output is text");
+    };
+    assert!(!contents.contains("closeDescriptor"), "{contents}");
+
+    // `Platform` is not constructible, and its constants are readonly.
+    let constructed = findings(
+        "use Doria\\Std\\Ffi\\Platform;\nfunction main(): void { let $platform = new Platform(); }",
+    );
+    assert!(!constructed.is_empty());
+    let assigned = findings(
+        "use Doria\\Std\\Ffi\\{OperatingSystem, Platform};\nfunction main(): void { Platform::operatingSystem = OperatingSystem::Linux; }",
+    );
+    assert!(!assigned.is_empty());
+}
+
+#[test]
+fn windows_last_error_capture_in_emitted_code_off_windows_is_an_error() {
+    if cfg!(windows) {
+        return;
+    }
+    let source = "use Doria\\Std\\Ffi\\{CaptureSystemCode, SystemCodeSource};\nextern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::WindowsLastError)] function close(int32 $descriptor): int32; }\nfunction main(): void { echo unsafe(close(-1)); }";
+    assert!(codes(source).is_empty(), "{:#?}", findings(source));
+    let diagnostics = doriac::lower_source_to_mir("ffi.doria", source)
+        .expect_err("the capture exists only on Windows");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, "E0817");
+    assert_eq!(
+        diagnostics[0].title,
+        "Windows Error Code Captured Off Windows"
+    );
+    assert!(diagnostics[0].message.contains("the binding of `close`"));
+    // A declaration that emitted code never calls builds.
+    let unused = "use Doria\\Std\\Ffi\\{CaptureSystemCode, SystemCodeSource};\nextern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::WindowsLastError)] function close(int32 $descriptor): int32; }\nfunction main(): void {}";
+    doriac::lower_source_to_mir("ffi.doria", unused).expect("nothing calls it");
 }

@@ -306,6 +306,16 @@ pub(crate) fn collect_callable_instances(
             if !callable_available(*callable, &[], semantic_info, callable.function.span)? {
                 continue;
             }
+            // Decision 0148 sections 17 and 18: an extern declaration that
+            // only calls in branches constant false for the target reach is
+            // never called, so it is not emitted and links no library.
+            if callable.function.foreign
+                && !semantic_info
+                    .live_function_calls
+                    .contains(&callable.function.name)
+            {
+                continue;
+            }
             let instance = CallableInstance {
                 declaration,
                 arguments: Vec::new(),

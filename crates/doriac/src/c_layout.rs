@@ -20,6 +20,17 @@ pub enum TargetOperatingSystem {
     Windows,
 }
 
+impl TargetOperatingSystem {
+    /// The operating system's name in prose.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Linux => "Linux",
+            Self::MacOs => "macOS",
+            Self::Windows => "Windows",
+        }
+    }
+}
+
 /// The architectures of the tier-1 targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetArchitecture {

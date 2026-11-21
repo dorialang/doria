@@ -177,6 +177,52 @@ pub fn evaluate_string_expression(evaluation: &Evaluation, expr: &Expr) -> Optio
     }
 }
 
+/// The value of a `bool` condition that is a constant expression, such as
+/// `Platform::operatingSystem == OperatingSystem::Windows` (Decision 0148
+/// section 17), or `None` when the condition reads a value only the running
+/// program has.
+pub fn evaluate_bool_expression(evaluation: &Evaluation, expr: &Expr) -> Option<bool> {
+    let mut reads_runtime_value = false;
+    crate::ast::visit::expr(expr, &mut |inner| {
+        reads_runtime_value |= !matches!(
+            inner,
+            Expr::Identifier { .. }
+                | Expr::Int { .. }
+                | Expr::Float { .. }
+                | Expr::String { .. }
+                | Expr::Bool { .. }
+                | Expr::Null { .. }
+                | Expr::StaticMember { .. }
+                | Expr::Grouped { .. }
+                | Expr::Unary { .. }
+                | Expr::Binary { .. }
+        );
+    });
+    if reads_runtime_value {
+        return None;
+    }
+    let requester = EvaluationRequester::branch_condition();
+    let mut evaluator = Evaluator {
+        nodes: HashMap::new(),
+        states: evaluation
+            .values
+            .iter()
+            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
+            .collect(),
+        stack: Vec::new(),
+        diagnostics: Vec::new(),
+        enum_cases: evaluation.enum_cases.clone(),
+        enum_names: evaluation.enum_names.clone(),
+        payload_cases: evaluation.payload_cases.clone(),
+        class_parents: evaluation.class_parents.clone(),
+    };
+    let value = evaluator.evaluate_expr(expr, Some(ConstType::Bool), &requester)?;
+    match value.value {
+        ConstValue::Bool(value) if evaluator.diagnostics.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
 pub fn evaluate_attribute_value(
     evaluation: &Evaluation,
     expr: &Expr,
@@ -261,7 +307,9 @@ enum State {
 #[derive(Clone)]
 struct EvaluationRequester {
     declaring_class: Option<String>,
-    static_initializer: bool,
+    /// A static initializer or a branch condition: a readonly static with a
+    /// const-evaluable initializer is itself const-evaluable there.
+    reads_readonly_statics: bool,
 }
 
 impl EvaluationRequester {
@@ -273,14 +321,23 @@ impl EvaluationRequester {
                 }
                 ConstKey::TopLevel(_) => None,
             },
-            static_initializer: matches!(key, ConstKey::Static { .. }),
+            reads_readonly_statics: matches!(key, ConstKey::Static { .. }),
         }
     }
 
     fn parameter_default(declaring_class: Option<&str>) -> Self {
         Self {
             declaring_class: declaring_class.map(str::to_string),
-            static_initializer: false,
+            reads_readonly_statics: false,
+        }
+    }
+
+    /// A branch condition (Decision 0148 section 17), which may read
+    /// readonly statics such as `Platform::operatingSystem`.
+    fn branch_condition() -> Self {
+        Self {
+            declaring_class: None,
+            reads_readonly_statics: true,
         }
     }
 }
@@ -667,7 +724,7 @@ impl Evaluator {
                         class_name: class_name.clone(),
                         name: member.clone(),
                     });
-                    if !requester.static_initializer {
+                    if !requester.reads_readonly_statics {
                         self.invalid(*span, "constant expressions cannot read static properties");
                         None
                     } else {
@@ -1364,7 +1421,7 @@ impl Evaluator {
     }
 
     fn unavailable(&mut self, requester: &EvaluationRequester, span: Span, operation: &str) {
-        let diagnostic = if requester.static_initializer {
+        let diagnostic = if requester.reads_readonly_statics {
             Diagnostic::new(
                 "E0485",
                 format!(

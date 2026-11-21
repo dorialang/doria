@@ -1397,14 +1397,29 @@ pub(crate) struct StructuralMetrics {
 }
 
 pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
-    lower_program_impl(program, None)
+    lower_program_impl(program, None).and_then(check_emitted_code)
+}
+
+/// The checks that read the code a program emits (Decision 0148 section
+/// 16), which exists only once lowering has left out every branch that is
+/// constant false for the target.
+fn check_emitted_code(program: mir::Program) -> DiagnosticResult<mir::Program> {
+    let diagnostics = crate::unsafe_code::windows_last_error_off_windows(
+        &program,
+        crate::c_layout::CTarget::host(),
+    );
+    if diagnostics.is_empty() {
+        Ok(program)
+    } else {
+        Err(diagnostics)
+    }
 }
 
 pub(crate) fn lower_program_with_metrics(
     program: &hir::Program,
 ) -> DiagnosticResult<(mir::Program, StructuralMetrics)> {
     let mut metrics = StructuralMetrics::default();
-    let program = lower_program_impl(program, Some(&mut metrics))?;
+    let program = check_emitted_code(lower_program_impl(program, Some(&mut metrics))?)?;
     Ok((program, metrics))
 }
 
@@ -7610,16 +7625,30 @@ fn lower_if_tree_with_predicates(
     context.current_block = Some(condition_block);
     let then_block = context.create_block();
     let else_block = context.create_block();
+    // Decision 0148 section 17: a branch whose condition is constant false
+    // for the target is neither emitted nor linked. The condition lowers as
+    // its constant, so the branch to the other side folds into a jump.
+    let constant = constant_condition(&if_stmt.condition, context);
+    let constant_expression = constant.map(|value| hir::Expr::Bool {
+        value,
+        span: if_stmt.condition.span(),
+    });
     lower_predicates_and_condition_to_blocks(
         predicates,
-        &if_stmt.condition,
+        constant_expression.as_ref().unwrap_or(&if_stmt.condition),
         then_block,
         else_block,
         context,
     )?;
 
-    let mut fallthrough_blocks =
-        lower_scoped_block(&if_stmt.then_block, then_block, return_type, context)?;
+    let mut fallthrough_blocks = Vec::new();
+    if constant != Some(false) {
+        fallthrough_blocks =
+            lower_scoped_block(&if_stmt.then_block, then_block, return_type, context)?;
+    }
+    if constant == Some(true) && predicates.is_empty() {
+        return Ok(fallthrough_blocks);
+    }
 
     match &if_stmt.else_branch {
         None => fallthrough_blocks.push(else_block),
@@ -7632,6 +7661,16 @@ fn lower_if_tree_with_predicates(
     }
 
     Ok(fallthrough_blocks)
+}
+
+/// The constant value checking found for a branch condition (Decision 0148
+/// section 17), when it is one.
+fn constant_condition(condition: &hir::Expr, context: &LoweringContext) -> Option<bool> {
+    context
+        .semantic_info
+        .constant_conditions
+        .get(&condition.span())
+        .copied()
 }
 
 fn lower_while_statement(
@@ -16266,18 +16305,46 @@ fn lower_when_rvalue(
     };
     let attached_condition = next_condition;
     let mut branch_blocks = Vec::with_capacity(branches.len());
+    // Decision 0148 section 17: a branch whose condition is constant false
+    // is neither emitted nor linked, and neither is a branch after one whose
+    // condition is constant true, except the unconditioned branch a failed
+    // `given` gate reaches.
+    let mut decided = false;
     for branch in branches {
+        let constant = branch
+            .condition
+            .as_ref()
+            .and_then(|condition| constant_condition(condition, context));
+        let dead = constant == Some(false)
+            || (decided && (branch.condition.is_some() || gate_failed.is_none()));
         context.current_block = Some(next_condition);
         let branch_block = context.create_block();
         branch_blocks.push(branch_block);
         let next = context.create_block();
         if let Some(condition) = &branch.condition {
-            lower_condition_to_blocks(condition, branch_block, next, context)?;
+            // A constant condition lowers as its constant, so the jump to
+            // the other side folds away.
+            let folded = (dead || constant == Some(true)).then(|| hir::Expr::Bool {
+                value: !dead,
+                span: condition.span(),
+            });
+            lower_condition_to_blocks(
+                folded.as_ref().unwrap_or(condition),
+                branch_block,
+                next,
+                context,
+            )?;
         } else {
             context.terminate_current(mir::Terminator::Jump(branch_block));
             if let Some(gate_failed) = gate_failed {
                 context.terminate_block(gate_failed, mir::Terminator::Jump(branch_block));
             }
+        }
+        decided |= constant == Some(true);
+        if dead {
+            context.terminate_block(branch_block, mir::Terminator::Unreachable);
+            next_condition = next;
+            continue;
         }
 
         context.current_block = Some(branch_block);

@@ -2891,12 +2891,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             present.get_type().const_zero(),
             "nullable-pointer.is-present",
         ))?;
-        Ok(build(self.builder.build_select(
+        build(self.builder.build_select(
             present,
             payload,
             payload.get_type().const_zero(),
             "nullable-pointer.word",
-        ))?)
+        ))
     }
 
     /// A stored or returned value of type `ty` with a `?T` in pair form, so

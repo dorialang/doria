@@ -205,7 +205,6 @@ unsafe extern "system" {
 
     // Standard devices and consoles.
     pub(crate) fn GetStdHandle(which: u32) -> NativeHandle;
-    #[cfg(test)]
     pub(crate) fn SetStdHandle(which: u32, handle: NativeHandle) -> i32;
     pub(crate) fn GetConsoleMode(handle: NativeHandle, mode: *mut u32) -> i32;
     pub(crate) fn ReadConsoleW(

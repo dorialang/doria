@@ -314,7 +314,7 @@ $i--;
 
 Value-producing `++` / `--` expression semantics are future work.
 
-`declare` is a structured compiler/source directive. It is not a macro system and not textual substitution. Exact grammar and allowed declaration keys require future decisions. Unknown declare keys should be rejected when `declare` is implemented. Possible future uses include warning policy, unsafe/FFI boundary policy, backend/profile constraints, platform configuration, optimization intent, feature gates, and compile-time diagnostics.
+`declare` is a structured compiler/source directive. It is not a macro system and not textual substitution. Decision 0148 section 25 gives its grammar: `declare(<key>: "<value>");` directives come first in a file, before `namespace` and `use`; each names one key, a key appears at most once, and an unknown key or value is a compile error. The one key is `unsafe`: `declare(unsafe: "deny");` forbids unsafe contexts, `unsafe function`s, extern blocks, foreign structs and unions, and C-callable functions in the file, and `"allow"` is the default. A package's `unsafe = "deny"` applies to every source of the package, and a file directive cannot relax it. Later decisions may add keys for warning policy, backend/profile constraints, optimization intent, feature gates, and compile-time diagnostics.
 
 `goto` is evaluation-only and is not accepted for implementation yet. If it is ever accepted, it should be constrained so it cannot jump into deeper scopes, bypass visible initialization, bypass cleanup or `finally` obligations, cross guarded resource regions, or cross future ownership/borrow-checking boundaries.
 

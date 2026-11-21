@@ -240,6 +240,7 @@ impl<'program> Checker<'program> {
 
     /// `$reference->toHandle()` on a `SharedReference<T>` or a
     /// `WritableSharedReference<T>`. Returns false for every other call.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn check_handle_method_call(
         &mut self,
         object: &Expr,

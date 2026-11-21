@@ -71,7 +71,7 @@ pub struct Package {
 
 /// Whether a package's sources may contain unsafe code (Decision 0148
 /// section 25).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnsafePolicy {
     Allow,

@@ -96,13 +96,14 @@ Schema 2 is schema 1 with these fields:
 ```
 
 `windowsSubsystem` is `"console"` or `"gui"` for a binary target and is absent
-for a library target. Other platforms ignore it. This compiler does not yet
-link the GUI subsystem: a Windows build with `"gui"` reports E0784 until the
-absent-stream rule of Decision 0148 section 21 lands.
+for a library target. Other platforms ignore it. A `"gui"` program starts
+with no console, and each absent standard stream is the null device (Decision
+0148 section 21): writing discards, reading reports end of input, and
+`isInteractive` is `false`.
 
-`unsafePolicy` is `"allow"` or `"deny"` (Decision 0148 section 25). This
-compiler does not yet enforce a policy, so a plan with a `"deny"` package
-reports E0784 when it is loaded.
+`unsafePolicy` is `"allow"` or `"deny"` (Decision 0148 section 25). Under
+`"deny"` every source of the package may contain no unsafe form (E0815), and
+a file cannot relax it with `declare(unsafe: "allow")` (E0816).
 
 Each entry of `nativeLibraries` gives the resolved link facts of one logical
 library that the package's sources name with `#[Library("name")]`:

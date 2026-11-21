@@ -1,14 +1,11 @@
 //! Unsafe code and the foreign function interface (Decision 0148): the forms
 //! this compiler accepts before it can check or run all of them.
 //!
-//! The parser accepts every form Decision 0148 specifies. Two gates name with
-//! E0784 what is not implemented yet, so a valid program reads as not yet
-//! supported, never as invalid:
-//!
-//! - [`unchecked_forms`] runs at name resolution, for forms checking does not
-//!   cover yet.
-//! - [`unexecutable_forms`] runs before lowering, for checked forms no
-//!   execution target runs yet.
+//! The parser accepts every form Decision 0148 specifies, and checking
+//! covers each one. The gates here name with E0784 what no execution target
+//! builds yet, so a valid program reads as not yet supported, never as
+//! invalid: [`unexecutable_forms`] runs before lowering, and the other
+//! functions run where the facts they read are known.
 
 use std::collections::HashSet;
 
@@ -21,44 +18,6 @@ use crate::types::{TypeArgumentRef, TypeRef};
 /// The diagnostic for an accepted Decision 0148 form this compiler does not
 /// implement yet.
 pub const NOT_AVAILABLE_CODE: &str = "E0784";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gate {
-    Checking,
-    Execution,
-}
-
-/// One E0784 diagnostic per form checking does not cover yet, in source
-/// order. Empty for a program without them.
-pub fn unchecked_forms(program: &Program) -> Vec<Diagnostic> {
-    let mut finder = Finder::new(Gate::Checking);
-    for directive in &program.directives {
-        finder.report(
-            directive.span,
-            "Declare Directives Are Not Available Yet",
-            format!(
-                "`declare({}: ...)` is part of Doria; this compiler does not implement `declare` directives yet",
-                directive.key.text
-            ),
-        );
-    }
-    for import in &program.imports {
-        for entry in &import.entries {
-            let target = match &import.prefix {
-                Some(prefix) => format!("{}\\{}", prefix.canonical(), entry.target.canonical()),
-                None => entry.target.canonical(),
-            };
-            finder.pending_name(&target, entry.span);
-        }
-    }
-    for name in &program.qualified_names {
-        finder.pending_name(&name.canonical(), name.span);
-    }
-    for item in &program.items {
-        finder.item(item);
-    }
-    finder.finish()
-}
 
 /// The E0784 diagnostic for a checked form the native targets build and the
 /// interpreter or PHP output does not: those run unsafe code, and take the
@@ -105,7 +64,7 @@ pub fn unbuilt_region_element(span: Span, region: &str, element: &str) -> Diagno
 /// The E0784 diagnostic for a checked form no execution target builds yet,
 /// for a gate that runs after checking, where the form's types are known.
 pub fn unbuilt_form(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
-    let mut finder = Finder::new(Gate::Execution);
+    let mut finder = Finder::new();
     finder.report(span, title, message);
     finder
         .diagnostics
@@ -169,36 +128,69 @@ const AGGREGATE_TITLE: &str = "Foreign Structs And Unions Cannot Run In The Inte
 const AGGREGATE_MESSAGE: &str =
     "foreign structs and unions are part of Doria; the interpreter does not run them yet";
 
-/// One E0784 diagnostic per extern declaration whose binding no execution
-/// target builds yet, in source order: one that captures `WindowsLastError`
-/// for a target other than Windows. A binding
-/// in a `#[Library]` block builds; the native link checks its library has
-/// link inputs ([`crate::native_link`]).
-pub fn unbuildable_bindings(
-    bindings: &std::collections::HashMap<Span, crate::foreign::ForeignBinding>,
+/// Section 16's `WindowsLastError` capture exists only on Windows, so a
+/// call that emitted code makes to a binding capturing it on another target
+/// is a compile error. A call in a branch whose condition is constant false
+/// for the target is not emitted (section 17), so a binding used only under
+/// `Platform::operatingSystem == OperatingSystem::Windows` builds everywhere.
+pub const WINDOWS_LAST_ERROR_CODE: &str = "E0817";
+
+/// One E0817 diagnostic per emitted call to a binding capturing
+/// `WindowsLastError` when `target` is not Windows, in program order.
+pub fn windows_last_error_off_windows(
+    program: &crate::mir::Program,
+    target: crate::c_layout::CTarget,
 ) -> Vec<Diagnostic> {
-    let mut finder = Finder::new(Gate::Execution);
-    for (span, binding) in bindings {
-        let symbol = &binding.symbol;
-        if binding.system_code == Some(crate::foreign::SystemCodeSource::WindowsLastError)
-            && crate::c_layout::CTarget::host().operating_system
-                != crate::c_layout::TargetOperatingSystem::Windows
-        {
-            // Section 16 makes this a compile error in emitted code, which
-            // depends on section 17's platform branches.
-            finder.report(
-                *span,
-                "Windows Last Error Capture Cannot Be Built Here Yet",
-                format!("capturing `GetLastError` after `{symbol}` on a target other than Windows is part of Doria; this compiler does not yet decide which code a target emits"),
-            );
+    if target.operating_system == crate::c_layout::TargetOperatingSystem::Windows {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut diagnostics = Vec::new();
+    for function in &program.functions {
+        for block in &function.blocks {
+            for statement in &block.statements {
+                let crate::mir::Statement::ForeignCall {
+                    function: foreign,
+                    span,
+                    ..
+                } = statement
+                else {
+                    continue;
+                };
+                if foreign.system_code != Some(crate::foreign::SystemCodeSource::WindowsLastError)
+                    || !seen.insert(*span)
+                {
+                    continue;
+                }
+                let symbol = match &foreign.callee {
+                    crate::mir::ForeignCallee::Symbol { symbol, .. } => symbol.as_str(),
+                    crate::mir::ForeignCallee::Pointer(_) => "the function",
+                };
+                diagnostics.push(
+                    Diagnostic::new(
+                        WINDOWS_LAST_ERROR_CODE,
+                        format!(
+                            "the binding of `{symbol}` captures `SystemCodeSource::WindowsLastError`, which only Windows has, and this program builds for {}",
+                            target.operating_system.display_name()
+                        ),
+                        *span,
+                    )
+                    .with_title("Windows Error Code Captured Off Windows")
+                    .with_primary_label("Called Here")
+                    .with_explanation(
+                        "`#[CaptureSystemCode(SystemCodeSource::WindowsLastError)]` reads `GetLastError` after the call, which exists only on Windows. A call in a branch whose condition is false for the target is not built, so Windows bindings belong under `Platform::operatingSystem == OperatingSystem::Windows`.",
+                    )
+                    .with_help("call it inside `if (Platform::operatingSystem == OperatingSystem::Windows) { ... }`, or capture `SystemCodeSource::Errno` in the binding this platform uses"),
+                );
+            }
         }
     }
-    finder.finish()
+    diagnostics
 }
 
 /// One E0784 diagnostic per checked form that no execution target runs yet.
 pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
-    let mut finder = Finder::new(Gate::Execution);
+    let mut finder = Finder::new();
     finder.aggregates = program
         .items
         .iter()
@@ -214,7 +206,6 @@ pub fn unexecutable_forms(program: &Program) -> Vec<Diagnostic> {
 }
 
 struct Finder {
-    gate: Gate,
     seen: HashSet<Span>,
     diagnostics: Vec<Diagnostic>,
     /// The canonical names of the program's foreign structs and unions.
@@ -222,9 +213,8 @@ struct Finder {
 }
 
 impl Finder {
-    fn new(gate: Gate) -> Self {
+    fn new() -> Self {
         Self {
-            gate,
             seen: HashSet::new(),
             diagnostics: Vec::new(),
             aggregates: HashSet::new(),
@@ -237,7 +227,7 @@ impl Finder {
     /// pointer's pointee, or in a function type. Locals, parameters,
     /// results and pointees build.
     fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
-        if self.gate != Gate::Execution || self.aggregates.is_empty() {
+        if self.aggregates.is_empty() {
             return;
         }
         let misplaced = match anywhere {
@@ -263,31 +253,12 @@ impl Finder {
         if span.source.is_compiler_owned() || !self.seen.insert(span) {
             return;
         }
-        let explanation = match self.gate {
-            Gate::Checking => {
-                "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program is not rejected; this compiler cannot check this form yet."
-            }
-            Gate::Execution => {
-                "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks; this compiler cannot build or run this form yet."
-            }
-        };
+        let explanation = "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks; this compiler cannot build or run this form yet.";
         self.diagnostics.push(
             Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
                 .with_title(title)
                 .with_explanation(explanation),
         );
-    }
-
-    /// `Doria\Std\Ffi` members whose surface lands later.
-    fn pending_name(&mut self, canonical: &str, span: Span) {
-        if crate::compiler_known_ffi::PENDING_TYPES.contains(&canonical) {
-            let short = canonical.rsplit('\\').next().unwrap_or(canonical);
-            self.report(
-                span,
-                &format!("{short} Is Not Available Yet"),
-                format!("`{short}` is part of Doria; this compiler does not implement it yet"),
-            );
-        }
     }
 
     fn item(&mut self, item: &Item) {
@@ -418,9 +389,6 @@ impl Finder {
     }
 
     fn type_refs(&mut self, node: &mut impl Transformable, span: Span) {
-        if self.gate != Gate::Execution {
-            return;
-        }
         let mut types = TypeFinder::default();
         node.transform(&mut types);
         for ty in std::mem::take(&mut types.named) {

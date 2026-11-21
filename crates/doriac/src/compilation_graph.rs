@@ -69,6 +69,9 @@ pub struct GraphSource {
     pub content_fingerprint: String,
     pub source: SourceFile,
     pub authored: Program,
+    /// The unsafe policy of the package the source belongs to (Decision 0148
+    /// section 25).
+    pub unsafe_policy: crate::build_plan::UnsafePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,34 +192,6 @@ fn load_compilation_graph_inner(
             source_map: Box::default(),
         }
     })?;
-    // Section 25's package policy is enforced with the `declare` grammar
-    // it shares; until then a "deny" package is never silently allowed.
-    let unenforced = document
-        .plan
-        .packages
-        .iter()
-        .filter(|package| package.unsafe_policy == Some(crate::build_plan::UnsafePolicy::Deny))
-        .map(|package| {
-            crate::build_plan::compiler_input_diagnostic(
-                crate::unsafe_code::NOT_AVAILABLE_CODE,
-                format!(
-                    "the unsafe policy \"deny\" of package `{}` is part of Doria; this compiler does not enforce unsafe policies yet",
-                    package.identity
-                ),
-                Span::default(),
-            )
-            .with_title("Package Unsafe Policies Are Not Available Yet")
-            .with_primary_source(crate::diagnostics::DiagnosticSource::Path(
-                document.path.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    if !unenforced.is_empty() {
-        return Err(GraphLoadFailure {
-            diagnostics: unenforced,
-            source_map: Box::default(),
-        });
-    }
     let active_scopes = document
         .plan
         .selected_target
@@ -496,6 +471,10 @@ fn load_compilation_graph_inner(
                 &mut diagnostics,
             );
         }
+        let unsafe_policy = package_specs
+            .get(pending_source.package.display_name())
+            .and_then(|package| package.unsafe_policy)
+            .unwrap_or(crate::build_plan::UnsafePolicy::Allow);
         sources.insert(
             identity,
             GraphSource {
@@ -512,6 +491,7 @@ fn load_compilation_graph_inner(
                 content_fingerprint: pending_source.provided.content_fingerprint,
                 source: source_file,
                 authored,
+                unsafe_policy,
             },
         );
     }
@@ -629,6 +609,7 @@ pub fn compilation_context(source: &GraphSource) -> CompilationContext {
         edition: Edition::Doria2026,
         package: source.package.clone(),
         source: source.identity.clone(),
+        unsafe_policy: source.unsafe_policy,
     }
 }
 
@@ -973,7 +954,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         )))
         .chain(std::iter::once((
             crate::compiler_known_ffi::SOURCE_ID,
-            crate::compiler_known_ffi::SOURCE_TEXT,
+            crate::compiler_known_ffi::source_text(),
         )))
         .collect::<HashMap<_, _>>();
     let compiler_known_context = selected_context(graph);
@@ -983,6 +964,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_contracts::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -991,6 +973,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -999,6 +982,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_time::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -1007,6 +991,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_stream::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -1015,6 +1000,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_concurrency::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -1023,6 +1009,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_term::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -1031,6 +1018,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_ffi::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -1039,6 +1027,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_text::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     let mut semantic = crate::semantics::analyze_program_for_ide_with_graph_and_test_context(

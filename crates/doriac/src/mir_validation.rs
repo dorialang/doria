@@ -6532,9 +6532,6 @@ fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// The types a handle holds (Decision 0148 section 11): class values and
-/// the shared references whose carrier is one word.
-
 /// A pointer operation reads a pointer local and assigns a result of its
 /// own type (Decision 0148 section 4).
 fn validate_pointer_operation(
@@ -16192,7 +16189,14 @@ fn validate_control_flow_plans(
                 }
                 mir::ControlFlowPlan::When(plan) => {
                     validate_conditional_error_exit(function, plan.merge, plan.error_exit)?;
+                    // A branch the program never enters, such as one whose
+                    // condition is constant false for the target (Decision
+                    // 0148 section 17), has no result path to check.
+                    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
                     for branch in &plan.branches {
+                        if !reachable[branch.0] {
+                            continue;
+                        }
                         validate_result_path(
                             function,
                             plan.result,

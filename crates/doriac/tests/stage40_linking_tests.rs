@@ -8,7 +8,7 @@ mod execution_directory;
 
 use doriac::backend::{BackendOutput, NativeProfile};
 use doriac::c_layout::{CTarget, TargetArchitecture, TargetOperatingSystem};
-use doriac::native_link::NativeLinking;
+use doriac::native_link::{NativeLinking, WindowsSubsystem};
 use execution_directory::ExecutionDirectory;
 use std::path::Path;
 use std::process::Command;
@@ -201,13 +201,12 @@ fn inputs_a_target_cannot_use_are_reported_where_the_library_is_used() {
         ("--link-library", "math=m".to_string()),
         ("--windows-subsystem", "gui".to_string()),
     ]);
-    let diagnostics = gui
+    // Decision 0148 section 21: a GUI program's absent standard streams
+    // are the null device, so the subsystem links.
+    let plan = gui
         .resolve(&mir, target(TargetOperatingSystem::Windows))
-        .unwrap_err();
-    assert_eq!(
-        (diagnostics[0].code, diagnostics[0].title.as_str()),
-        ("E0784", "Windows GUI Subsystem Is Not Available Yet")
-    );
+        .expect("the GUI subsystem links");
+    assert_eq!(plan.windows_subsystem, WindowsSubsystem::Gui);
     assert!(gui
         .resolve(&mir, target(TargetOperatingSystem::Linux))
         .is_ok());
@@ -408,12 +407,24 @@ fn a_build_plan_links_its_package_libraries_and_refuses_an_unenforced_deny_polic
         .message
         .contains("`math` in package `acme/linking`"));
 
+    // Decision 0148 section 25: the package policy denies every unsafe
+    // form of its sources, the extern block first.
     std::fs::write(&plan_path, schema_2_plan(&math_libraries(), "deny")).unwrap();
-    let diagnostics = doriac::load_build_plan_file(&plan_path).unwrap_err();
-    assert_eq!(
-        (diagnostics[0].code, diagnostics[0].title.as_str()),
-        ("E0784", "Package Unsafe Policies Are Not Available Yet")
+    let (_, graph) = doriac::load_build_plan_file(&plan_path).unwrap();
+    let diagnostics = doriac::compile_compilation_graph(&graph).unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "E0815"),
+        "{diagnostics:#?}"
     );
+    assert_eq!(
+        diagnostics[0].title.as_str(),
+        "Unsafe Code Denied By This Package"
+    );
+    assert!(diagnostics[0]
+        .message
+        .contains("package `acme/linking` sets `unsafe = \"deny\"`"));
 }
 
 /// Decision 0148 acceptance 1, 2, 4, 5, 6 and 11: the package in

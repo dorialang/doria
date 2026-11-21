@@ -1501,6 +1501,7 @@ impl Plan {
         scopes.mixed_box_plans = self.semantic.mixed_box_plans.clone();
         scopes.matches = self.semantic.matches.clone();
         scopes.whens = self.semantic.whens.clone();
+        scopes.constant_conditions = Rc::new(self.semantic.constant_conditions.clone());
         let substitute = |ty: &ResolvedType| substitute_resolved_type(ty, &callable.substitutions);
         for types in [
             &mut scopes.expression_types,

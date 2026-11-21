@@ -2476,7 +2476,8 @@ fn php_backend_preserves_byte_lexicographic_string_ordering() {
         r#"
 function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
-    if ("10" < "2") {
+    let $left = "10";
+    if ($left < "2") {
         return 42;
     }
     return 0;
@@ -2485,7 +2486,8 @@ function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("PHP should preserve Doria string ordering");
 
-    assert!(php.contains("__doria_less(\"10\", \"2\")"));
+    assert!(php.contains("__doria_less("));
+    assert!(php.contains(", \"2\")"));
     assert!(php.contains("strcmp($left, $right)"));
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
@@ -4537,7 +4539,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(php.contains("if ($prompt !== \"\")"));
     assert!(php.contains("__DoriaStdIoIoTarget::__doriaCaseStandardOutput()"));
     assert!(php.contains("__doria_flush_stdout($start, $end, $callable);"));
-    assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
+    assert!(php.contains("if (@fflush(__DORIA_STDOUT)) { return; }"));
     assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));
     assert!(php.contains("function __doria_panic("));
@@ -4550,7 +4552,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         .unwrap()
         .contains(": never"));
     assert!(php.contains("if ($line === false)"));
-    assert!(php.contains("if (feof(STDIN)) { return null; }"));
+    assert!(php.contains("if (feof(__DORIA_STDIN)) { return null; }"));
     assert!(php.contains("__DoriaStdIoIoOperation::Read"));
     assert!(php.contains("new __DoriaStdIoInvalidUtf8Error("));
     assert!(!php.contains("__doria_panic(\"P1403\""));
