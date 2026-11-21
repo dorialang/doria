@@ -100,6 +100,23 @@ impl CallGraph {
         }
     }
 
+    /// Every recorded call as its site and each target's declaration.
+    pub(super) fn edges(&self) -> impl Iterator<Item = (Span, Span)> + '_ {
+        let scopes = match self {
+            Self::Checked(scopes) => Some(scopes),
+            Self::Unprepared => None,
+        };
+        scopes
+            .into_iter()
+            .flat_map(HashMap::values)
+            .flatten()
+            .flat_map(|call| {
+                call.targets
+                    .iter()
+                    .map(move |target| (call.site, target.declaration()))
+            })
+    }
+
     pub(crate) fn calls(
         &self,
         caller: Option<Instance>,

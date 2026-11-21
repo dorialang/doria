@@ -91,8 +91,11 @@ class NonBlocking {
 /// The source of `Doria\Std\Ffi`: its declarations, and `Platform`, whose
 /// readonly statics are the compilation target's operating system and
 /// architecture (section 17). They are constants, so a branch on them that
-/// is false for the target is neither emitted nor linked. Code generation
-/// targets the host.
+/// is false for the target is neither emitted nor linked. They read the
+/// compiler's one compilation target, [`crate::c_layout::CTarget::host`],
+/// which every layout, calling-convention and link consumer also reads, so a
+/// build for another target branches on that target once code generation can
+/// select one.
 pub fn source_text() -> &'static str {
     static TEXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let target = crate::c_layout::CTarget::host();

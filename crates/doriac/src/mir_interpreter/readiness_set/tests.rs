@@ -154,8 +154,13 @@ fn llvm_membership_object_accepts_unconstrained_removal_key_declarations() {
 function removeInt(writable ReadinessSet $set, RegistrationKey<int> $key): int throws IoError {{
     return $set->unregister($key);
 }}
-{ROUND_TRIP}
+{}
 "#,
+        // Only a function value reaches a key of a type no stream has.
+        ROUND_TRIP.replace(
+            "let $copy = $key;",
+            "let $removeInt = function(writable ReadinessSet $set, RegistrationKey<int> $key): int { try { return removeInt($set, $key); } catch (IoError) { return 0; } };\n    let $copy = $key;",
+        )
     ));
     assert!(program
         .functions

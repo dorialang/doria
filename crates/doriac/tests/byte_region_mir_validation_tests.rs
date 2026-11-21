@@ -122,7 +122,7 @@ fn region_returns_preserve_view_loans_not_owned_container_contents() {
     ] {
         for expression in ["$view", "$call($view)"] {
             let mut program = lower(&format!(
-                "function forward(function(take {ty}): {ty} $call, take {ty} $view): {ty} {{ return {expression}; }} function main(): void {{}}"
+                "function forward(function(take {ty}): {ty} $call, take {ty} $view): {ty} {{ return {expression}; }} function main(): void {{ let $reach = function(function(take {ty}): {ty} $call, take {ty} $view): {ty} {{ return forward($call, $view); }}; }}"
             ));
             doriac::mir_validation::validate_program(&program).unwrap();
             let function = program
@@ -192,7 +192,13 @@ function finite(writable Link $link): void {
     $link->next->next->right[0] = 1;
     echo $view[0];
 }
-function main(): void {}
+function main(): void {
+    let $reach = function(writable Link $link): void {
+        finite($link);
+        { let $recursive = recursive($link, false); }
+        { let $mutual = mutual($link, false); }
+    };
+}
 "#,
     );
     doriac::mir_validation::validate_program(&program).unwrap();
@@ -270,7 +276,9 @@ function walk(Link $link, bool $keep): void {
     let $step = identity($link);
     while ($keep) {}
 }
-function main(): void {}
+function main(): void {
+    let $reach = function(Link $link): void { walk($link, false); };
+}
 "#,
     );
     let class = program
@@ -514,7 +522,9 @@ function touch(writable Cell $left, writable Cell $right): void {{}}
 function observe(Cell $left, writable Cell $right): void {{}}
 function identity(Cell $cell): Cell {{ return $cell; }}
 function route(writable Tree $tree): void {{ {body} }}
-function main(): void {{}}
+function main(): void {{
+    let $reach = function(writable Tree $tree): void {{ route($tree); }};
+}}
 "#
         ));
         doriac::mir_validation::validate_program(&program)
@@ -763,7 +773,12 @@ function consume(take WritableByteRegion $view): int { return $view->length; }
 function consumeWithByte(take WritableByteRegion $view, uint8 $byte): int { return $view->length; }
 function getView(writable Bytes $bytes): WritableByteRegion { return $bytes->getWritableRegion(0, 2); }
 function evaluate(writable Bytes $bytes): int { return $bytes->length; }
-function main(): void {}
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(2);
+    let $consumed = consume(getView($bytes));
+    let $withByte = consumeWithByte(getView($bytes), UInt8::from(1));
+    let $length = evaluate($bytes);
+}
 "#,
     );
     let consume = original
@@ -1172,7 +1187,13 @@ function main(): void {
 function apply(function(ByteRegion): ByteRegion $call, ByteRegion $view): ByteRegion {
     return $call($view);
 }
-function main(): void {}
+function main(): void {
+    // An `int` result keeps this function value's own type out of the
+    // region signatures the test erases.
+    let $reach = function(function(ByteRegion): ByteRegion $call, ByteRegion $view): int {
+        return apply($call, $view)->length;
+    };
+}
 "#,
     );
     for signature in &mut opaque.function_types {
@@ -1202,7 +1223,7 @@ fn consuming_receiver_cannot_be_forged_as_any_retained_return_source() {
         ),
     ] {
         let original = lower(&format!(
-            "class Packet {{ consuming function finish(Bytes $source): {result} {{ {body} }} }} function main(): void {{}}"
+            "class Packet {{ consuming function finish(Bytes $source): {result} {{ {body} }} }} function main(): void {{ let $source = Bytes::allocate(1); let $packet = new Packet(); let $finished = $packet->finish($source); }}"
         ));
         for inherited in [false, true] {
             let mut program = original.clone();

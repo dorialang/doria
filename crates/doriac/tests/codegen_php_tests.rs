@@ -3712,6 +3712,7 @@ function main(): void throws Doria\Std\Io\IoError
         echo "block {$name}";
     }
     echo $name;
+    let $greeting = greet($name);
 }
 "#,
     )
@@ -4302,6 +4303,7 @@ function accept(function(int): int $callback): void
 
 function main(): void
 {
+    accept(fn(int $value) => $value);
 }
 "#;
 
@@ -6050,7 +6052,10 @@ function failTwice(): void throws FirstError, FinalError
     }
 }
 
-function main(): void {}
+function main(): void
+{
+    try { failTwice(); } catch (Error) {}
+}
 "#;
     let php = doriac::compile_source_to_php("php-finalizer-replacement.doria", source)
         .expect("fallible finalizer source should compile for PHP");

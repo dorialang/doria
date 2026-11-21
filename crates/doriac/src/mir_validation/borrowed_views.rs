@@ -2331,7 +2331,7 @@ enum Split { case Both(function(): int $first, function(): int $second); }
 function split(take Split $pair, function(): int $a, function(): int $b): int {
     return match (take $pair) { Split::Both($first, $second) => $first() + $second(), };
 }
-function main(): void {}
+function main(): void { let $sum = split(Split::Both(fn() => 1, fn() => 2), fn() => 3, fn() => 4); }
 "#,
         )
         .unwrap();
@@ -2425,7 +2425,7 @@ function main(): void {}
 enum Retry { case Complete; case Pending(function(): int $resume); }
 function classify(Retry $retry): void {}
 function classifyNullable(?Retry $retry): void { if ($retry == null) { return; } }
-function main(): void {}
+function main(): void { classify(Retry::Complete); classifyNullable(null); }
 "#,
         )
         .unwrap();
@@ -2505,7 +2505,7 @@ function main(): void {}
     fn graph(edges: &[Vec<usize>]) -> mir::Function {
         let program = crate::lower_source_to_mir(
             "block-worklist.doria",
-            "function graph(bool $condition): void {} function main(): void {}",
+            "function graph(bool $condition): void {} function main(): void { graph(false); }",
         )
         .unwrap();
         let mut function = program
@@ -2633,7 +2633,7 @@ function main(): void {}
             r#"class Failure implements Error { function __construct(string $message) {} }
 function prepare(): void throws Failure {}
 function graph(): void { try { prepare(); } catch (Failure) {} }
-function main(): void {}"#,
+function main(): void { graph(); }"#,
         )
         .unwrap();
         let function = program

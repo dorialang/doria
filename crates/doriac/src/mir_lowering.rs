@@ -526,6 +526,11 @@ impl NativeTypeRegistry {
                 // collection implementations remain a separate core-operation beat.
                 continue;
             };
+            // A class reachable code never constructs has no value to erase,
+            // and its methods are not emitted (Decision 0148 section 17).
+            if !semantic_info.reachable.constructs(&class.name) {
+                continue;
+            }
             let Some(class) = classes.get(class).copied() else {
                 continue;
             };

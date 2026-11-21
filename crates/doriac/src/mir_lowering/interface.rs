@@ -1916,11 +1916,26 @@ function values(): Dictionary<string, Value> { return ["a" => new Item(1), "b" =
 
     #[test]
     fn nested_operand_calls_invalidate_type_proofs_in_evaluation_order() {
-        for (ty, condition, message) in [
-            ("?int", "$value != null", "dominating presence proof"),
-            ("?Value", "$value != null", "dominating presence proof"),
-            ("mixed", "$value is int", "dominating exact `is` proof"),
-            ("Value", "$value is Item", "dominating hierarchy `is` proof"),
+        for (ty, initial, condition, message) in [
+            (
+                "?int",
+                "null",
+                "$value != null",
+                "dominating presence proof",
+            ),
+            (
+                "?Value",
+                "null",
+                "$value != null",
+                "dominating presence proof",
+            ),
+            ("mixed", "1", "$value is int", "dominating exact `is` proof"),
+            (
+                "Value",
+                "new Item()",
+                "$value is Item",
+                "dominating hierarchy `is` proof",
+            ),
         ] {
             let source = format!(
                 r#"
@@ -1930,7 +1945,14 @@ function read(Item $item): int {{ return 1; }}
 function readValue(Value $item): int {{ return 1; }}
 function touch(writable {ty} $value): int {{ return 0; }}
 function probe(writable {ty} $value): int {{ if ({condition}) {{ return 1; }} return 0; }}
-function main(): void {{}}
+function main(): void {{
+    let $item = new Item();
+    let $read = read($item);
+    let $readValue = readValue($item);
+    writable {ty} $value = {initial};
+    let $touched = touch($value);
+    let $probed = probe($value);
+}}
 "#
             );
             let original = lower_checked_source(&source);
@@ -2059,33 +2081,37 @@ function main(): void {{}}
 
     #[test]
     fn indirect_result_writes_invalidate_previous_type_proofs() {
-        for (ty, condition, value, expected) in [
-            ("?int", "$value != null", "$value", "presence proof"),
+        for (ty, initial, condition, value, expected) in [
+            ("?int", "null", "$value != null", "$value", "presence proof"),
             (
                 "?string",
+                "null",
                 "$value != null",
                 "$value->length",
                 "presence proof",
             ),
             (
                 "?Item",
+                "null",
                 "$value != null",
                 "$value->number()",
                 "presence proof",
             ),
             (
                 "?Value",
+                "null",
                 "$value != null",
                 "$value->number()",
                 "presence proof",
             ),
             (
                 "Value",
+                "new Item()",
                 "$value is Item",
                 "$value->number()",
                 "hierarchy `is` proof",
             ),
-            ("mixed", "$value is int", "$value", "exact `is` proof"),
+            ("mixed", "1", "$value is int", "$value", "exact `is` proof"),
         ] {
             let source = format!(
                 r#"
@@ -2096,7 +2122,10 @@ function probe(function(): {ty} $read): int {{
     if ({condition}) {{ $read(); return {value}; }}
     return 0;
 }}
-function main(): void {{}}
+function main(): void {{
+    let $item = new Item();
+    let $probed = probe(function(): {ty} {{ return {initial}; }});
+}}
 "#
             );
             let mut program = lower_checked_source(&source);

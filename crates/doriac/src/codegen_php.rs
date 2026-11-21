@@ -5023,20 +5023,28 @@ fn emit_class(
         .iter()
         .filter(|class| class.declaration_name == class_decl.name)
     {
-        let mut scopes =
-            if crate::inline_value::InlineValueKind::for_name(&class_decl.name).is_some() {
-                scopes.expression_scope()
-            } else {
-                let constructor = scopes
-                    .specialization
-                    .callables
-                    .iter()
-                    .find(|callable| {
-                        callable.class == Some(class.id) && callable.symbol == "__construct"
-                    })
-                    .expect("each owned class has a checked constructor instance");
+        // An inline value has no constructor instance, and neither has a
+        // class reachable code never constructs (Decision 0148 section 17):
+        // only its static members and reachable static methods are emitted.
+        let constructor =
+            scopes.specialization.callables.iter().find(|callable| {
+                callable.class == Some(class.id) && callable.symbol == "__construct"
+            });
+        let mut scopes = match constructor {
+            Some(constructor)
+                if crate::inline_value::InlineValueKind::for_name(&class_decl.name).is_none() =>
+            {
                 scopes.specialization.scope(scopes, constructor)
-            };
+            }
+            _ => {
+                assert!(
+                    crate::inline_value::InlineValueKind::for_name(&class_decl.name).is_some()
+                        || !semantic_info.reachable.constructs(&class_decl.name),
+                    "each constructed class has a checked constructor instance"
+                );
+                scopes.expression_scope()
+            }
+        };
         scopes.current_class_id = Some(class.id);
         emit_class_instance(class_decl, semantic_info, output, indent, &scopes);
     }
@@ -5171,6 +5179,12 @@ fn emit_class_instance(
     }
     if is_error {
         interfaces.push("__DoriaErrorValue".to_string());
+    }
+    // A class reachable code never constructs has no instance and none of
+    // its instance members are emitted (Decision 0148 section 17), so it
+    // implements nothing.
+    if !semantic_info.reachable.constructs(&class_decl.name) {
+        interfaces.clear();
     }
     interfaces.sort();
     interfaces.dedup();
@@ -5548,7 +5562,12 @@ fn emit_class_instance(
         }
         output.push('\n');
     }
-    if !has_constructor && (!instance_initializers.is_empty() || parent_has_constructor) {
+    // A class reachable code never constructs has no generated constructor
+    // (Decision 0148 section 17).
+    if !has_constructor
+        && (!instance_initializers.is_empty() || parent_has_constructor)
+        && semantic_info.reachable.constructs(&class_decl.name)
+    {
         let mut constructor_scopes = scopes.expression_scope();
         constructor_scopes.current_callable = Some(format!("{}::__construct", class_decl.name));
         let parent_completed = parent_has_destructor

@@ -6111,6 +6111,7 @@ impl Parser {
         match token.kind {
             TokenKind::Identifier(name) => Some(name),
             TokenKind::Use => Some("use".to_string()),
+            TokenKind::Open => Some("open".to_string()),
             _ => {
                 self.error(message, token.span);
                 None
@@ -6134,21 +6135,28 @@ impl Parser {
 
     /// The member name `kind` spells after `->`, `?->` or `::`, if it can be
     /// one: an identifier, a reserved future keyword, or a keyword that never
-    /// begins syntax there: `use`, `not`, and `borrow`, which Decision 0148
-    /// section 11 spells as `Handle::borrow`. A method declaration takes a
-    /// reserved future keyword only (`expect_callable_name` otherwise).
+    /// begins syntax there: `use`, `not`, `borrow`, which Decision 0148
+    /// section 11 spells as `Handle::borrow`, and `open`, which its section 17
+    /// spells as `Win32Window::open`. A method declaration takes a reserved
+    /// future keyword only (`expect_callable_name` otherwise).
     fn member_name(kind: &TokenKind) -> Option<String> {
         match kind {
             TokenKind::Identifier(name) | TokenKind::Reserved(name) => Some(name.clone()),
-            TokenKind::Use | TokenKind::Not | TokenKind::Borrow => {
+            TokenKind::Use | TokenKind::Not | TokenKind::Borrow | TokenKind::Open => {
                 Some(token_name(kind).to_string())
             }
             _ => None,
         }
     }
 
+    /// A callable's name after `function`: an identifier, or `use` or `open`,
+    /// which never begin syntax there (`open` precedes `function` as a
+    /// modifier, so `function open(` names a callable).
     fn is_callable_name_token(token: &Token) -> bool {
-        matches!(token.kind, TokenKind::Identifier(_) | TokenKind::Use)
+        matches!(
+            token.kind,
+            TokenKind::Identifier(_) | TokenKind::Use | TokenKind::Open
+        )
     }
 
     fn is_contextual_use_call(&self) -> bool {

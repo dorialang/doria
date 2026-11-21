@@ -1059,7 +1059,7 @@ impl Checker<'_> {
                 if direct {
                     self.exact_method_calls.insert((span, method.declaration));
                 }
-                self.record_method_effect_dependency(&method, direct);
+                self.record_method_effect_dependency(&method, direct, span);
                 (target, method)
             }
             TypeKind::TypeParameter(parameter) => {

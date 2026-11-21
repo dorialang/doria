@@ -1210,7 +1210,7 @@ fn lowers_multiple_top_level_functions_in_declaration_order() {
 
 function main(): int
 {
-    return 42;
+    return 41 + helper();
 }
 "#,
     );

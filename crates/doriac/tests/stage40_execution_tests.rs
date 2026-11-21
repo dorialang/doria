@@ -8,6 +8,9 @@ mod execution_directory;
 #[path = "common/native_execution_runner.rs"]
 mod native_execution;
 
+#[path = "common/php_execution.rs"]
+mod php_execution;
+
 use doriac::backend::NativeProfile;
 use doriac::mir_interpreter::interpret;
 use native_execution::execute_native;
@@ -2521,4 +2524,306 @@ function main(): void
     let run = without_streams(&script, Some("php"));
     assert_eq!(run.status.code(), Some(0), "PHP: {run:?}");
     assert_eq!(String::from_utf8_lossy(&run.stderr), "end\n", "PHP");
+}
+
+/// Decision 0148 section 17's example: each platform's window class binds
+/// its own libraries, and only the target's branch is emitted and linked
+/// (amendment of 2026-11-21: only reachable code is emitted).
+const PLATFORM_WINDOWS: &str = r#"
+use Doria\Std\Ffi\{Library, Opaque, OperatingSystem, Platform, Pointer};
+
+#[Library("user32")]
+extern "C"
+{
+    /** @safety Any thread may call it. */
+    function GetCurrentThreadId(): uint32;
+}
+
+#[Library("x11")]
+extern "C"
+{
+    /** @safety `$display` is an open display. */
+    function XDefaultScreen(Pointer<Opaque> $display): int32;
+}
+
+extern "C"
+{
+    /** @safety Any value. */
+    function abs(int32 $value): int32;
+}
+
+class Win32Window
+{
+    static function open(string $title): void
+    {
+        echo unsafe(GetCurrentThreadId());
+        echo " {$title}";
+    }
+}
+
+class CocoaWindow
+{
+    static function open(string $title): void
+    {
+        echo unsafe(abs(-7));
+        echo " {$title}";
+    }
+}
+
+class X11Window
+{
+    static function open(string $title): void
+    {
+        echo " {$title}";
+    }
+
+    static function screen(Pointer<Opaque> $display): int32
+    {
+        return unsafe(XDefaultScreen($display));
+    }
+}
+
+function main(): void
+{
+    let $title = "Doria";
+    if (Platform::operatingSystem == OperatingSystem::Windows) {
+        Win32Window::open($title);
+    } else if (Platform::operatingSystem == OperatingSystem::MacOs) {
+        CocoaWindow::open($title);
+    } else {
+        X11Window::open($title);
+    }
+}
+"#;
+
+fn emitted_functions(mir: &doriac::mir::Program, fragment: &str) -> Vec<String> {
+    mir.functions
+        .iter()
+        .filter(|function| function.name.contains(fragment))
+        .map(|function| function.name.clone())
+        .collect()
+}
+
+#[test]
+fn only_the_target_platform_branch_is_emitted_and_linked() {
+    let mir = program(PLATFORM_WINDOWS);
+    let target = if cfg!(windows) {
+        "Win32Window"
+    } else if cfg!(target_os = "macos") {
+        "CocoaWindow"
+    } else {
+        "X11Window"
+    };
+    for class in ["Win32Window", "CocoaWindow", "X11Window"] {
+        let functions = emitted_functions(&mir, class);
+        if class == target {
+            assert_eq!(functions.len(), 1, "{functions:?}");
+            assert!(functions[0].ends_with("::open"), "{functions:?}");
+        } else {
+            assert!(functions.is_empty(), "{class}: {functions:?}");
+        }
+    }
+    // `X11Window::screen` is never called, so `XDefaultScreen` is not
+    // emitted even where the X11 branch is the target's.
+    assert!(emitted_functions(&mir, "XDefaultScreen").is_empty());
+    if cfg!(target_os = "macos") {
+        // `user32` and `x11` have no link input here, and nothing emitted
+        // references them.
+        assert_runs_natively(PLATFORM_WINDOWS, "7 Doria");
+    }
+}
+
+/// A class constructed only in a branch constant false for the target emits
+/// none of its members, so the library it binds needs no link input.
+const DEAD_HELPER: &str = r#"
+use Doria\Std\Ffi\Library;
+
+const bool TRACING = false;
+
+#[Library("tracing")]
+extern "C"
+{
+    /** @safety Any code. */
+    function traceMessage(int32 $code): int32;
+}
+
+class Tracer
+{
+    function __construct(int32 $code) {}
+
+    function emit(): int32
+    {
+        return unsafe(traceMessage($this->code));
+    }
+
+    function __destruct()
+    {
+        unsafe { traceMessage(0); }
+    }
+}
+
+function trace(int32 $code): int32
+{
+    let $tracer = new Tracer($code);
+    return $tracer->emit();
+}
+
+class Limits
+{
+    static int $count = 3;
+
+    static function describe(): string
+    {
+        return " limit " . self::count;
+    }
+}
+
+function main(): void
+{
+    if (TRACING) {
+        echo trace(1);
+    }
+    echo "ran";
+    echo Limits::describe();
+}
+"#;
+
+#[test]
+fn a_helper_class_used_only_from_a_dead_branch_is_not_emitted() {
+    let mir = program(DEAD_HELPER);
+    for fragment in ["Tracer", "trace", "traceMessage"] {
+        assert!(
+            emitted_functions(&mir, fragment).is_empty(),
+            "{fragment}: {:?}",
+            emitted_functions(&mir, fragment)
+        );
+    }
+    assert_runs_everywhere(DEAD_HELPER, "ran limit 3");
+    let contents = assert_php_prints(DEAD_HELPER, "ran limit 3");
+    assert!(!contents.contains("traceMessage"), "{contents}");
+    assert!(!contents.contains("function emit"), "{contents}");
+}
+
+/// Dispatch through an interface reaches every class reachable code
+/// constructs; an implementation nothing constructs is not emitted.
+const SHAPES: &str = r#"
+use Doria\Std\Ffi\Library;
+
+const bool EXPERIMENTAL = false;
+
+#[Library("hexagons")]
+extern "C"
+{
+    /** @safety Any side. */
+    function hexagonArea(int32 $side): int32;
+}
+
+interface Shape
+{
+    function area(): int;
+}
+
+class Square implements Shape
+{
+    function __construct(int $side) {}
+
+    function area(): int
+    {
+        return $this->side * $this->side;
+    }
+}
+
+open class Rectangle implements Shape
+{
+    function __construct(int $width, int $height) {}
+
+    open function area(): int
+    {
+        return $this->width * $this->height;
+    }
+}
+
+class Strip extends Rectangle
+{
+    function __construct(int $length)
+    {
+        parent::__construct($length, 1);
+    }
+
+    override function area(): int
+    {
+        return $this->width + 100;
+    }
+}
+
+class Hexagon implements Shape
+{
+    function __construct(int32 $side) {}
+
+    function area(): int
+    {
+        return Int64::from(unsafe(hexagonArea($this->side)));
+    }
+}
+
+function total(Shape $first, Shape $second, Rectangle $third): int
+{
+    return $first->area() + $second->area() + $third->area();
+}
+
+function main(): void
+{
+    if (EXPERIMENTAL) {
+        let $hexagon = new Hexagon(2);
+        echo $hexagon->area();
+    }
+    echo total(new Square(3), new Rectangle(2, 5), new Strip(7));
+}
+"#;
+
+#[test]
+fn dynamic_dispatch_through_an_interface_reaches_constructed_classes() {
+    let mir = program(SHAPES);
+    assert!(
+        emitted_functions(&mir, "Hexagon").is_empty(),
+        "{:?}",
+        emitted_functions(&mir, "Hexagon")
+    );
+    for class in ["Square", "Rectangle", "Strip"] {
+        assert!(
+            emitted_functions(&mir, class)
+                .iter()
+                .any(|name| name.ends_with("::area")),
+            "{class}: {:?}",
+            emitted_functions(&mir, class)
+        );
+    }
+    assert_runs_everywhere(SHAPES, "126");
+    let contents = assert_php_prints(SHAPES, "126");
+    assert!(!contents.contains("hexagonArea"), "{contents}");
+}
+
+/// PHP output of `source` prints `stdout` when PHP is installed; returns the
+/// generated PHP.
+fn assert_php_prints(source: &str, stdout: &str) -> String {
+    let text = doriac::compile_source_to_php("stage40.doria", source)
+        .unwrap_or_else(|errors| panic!("PHP output should build: {errors:#?}"));
+    if std::process::Command::new("php")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("PHP unavailable; PHP execution skipped");
+        return text;
+    }
+    let output = php_execution::Script::new(&format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        text.strip_prefix("<?php").unwrap()
+    ))
+    .command(&[])
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
+    text
 }

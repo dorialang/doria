@@ -22,6 +22,7 @@ mod nominal_proof;
 mod nonblocking;
 mod ownership_checking;
 mod property_hooks;
+mod reachability;
 mod return_specialization;
 mod scoped_requests;
 mod specialized_ownership;
@@ -32,6 +33,7 @@ pub(crate) use callable_contracts::{
     CallGraph as GenericCallGraph, GenericCall as CheckedGenericCall,
     Instance as CallableInstanceKey, InterfaceGenericCall,
 };
+pub use reachability::Reachability;
 pub(crate) use return_specialization::Facts as SpecializedReturnBorrows;
 pub(crate) use virtual_dispatch::Family as VirtualMethodFamily;
 
@@ -342,10 +344,11 @@ pub struct SemanticInfo {
     /// is constant false for the target is neither emitted nor linked
     /// (Decision 0148 section 17); checking still covers it.
     pub constant_conditions: HashMap<Span, bool>,
-    /// Each free function that a call outside every constant-false branch
-    /// calls (Decision 0148 sections 17 and 18). An extern declaration no
-    /// such call reaches references no C symbol and needs no link input.
-    pub live_function_calls: HashSet<String>,
+    /// The functions and methods reachable from the program's roots, the one
+    /// set every backend emits (Decision 0148 section 17, amendment of
+    /// 2026-11-21). An extern declaration outside it references no C symbol
+    /// and needs no link input.
+    pub reachable: Reachability,
     /// Source-order statement classification for each `given` prelude.
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
@@ -1583,6 +1586,7 @@ fn finish_checked_analysis(
         &mut checker.contracts,
         &checker.composition,
     );
+    let reachable = Reachability::compute(&checker);
     let mut analysis = SemanticAnalysis {
         info: SemanticInfo {
             // The entry points that accept an analysis fill this from its
@@ -1614,7 +1618,7 @@ fn finish_checked_analysis(
             matches: checker.matches,
             whens: checker.whens,
             constant_conditions: checker.constant_conditions,
-            live_function_calls: checker.live_function_calls,
+            reachable,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
@@ -2946,9 +2950,12 @@ struct Checker<'program> {
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
     constant_conditions: HashMap<Span, bool>,
-    /// How many enclosing branches are constant false for the target.
-    dead_branch_depth: usize,
-    live_function_calls: HashSet<String>,
+    /// The body of each branch whose condition is constant false for the
+    /// target: checked, never emitted (Decision 0148 section 17).
+    dead_branches: Vec<Span>,
+    /// Each call, construction and hook access by site, the edges
+    /// reachability follows.
+    reach_sites: Vec<(Span, reachability::ReachTarget)>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
     method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
@@ -3865,8 +3872,8 @@ impl<'program> Checker<'program> {
             matches: HashMap::new(),
             whens: HashMap::new(),
             constant_conditions: HashMap::new(),
-            dead_branch_depth: 0,
-            live_function_calls: HashSet::new(),
+            dead_branches: Vec::new(),
+            reach_sites: Vec::new(),
             given_preludes: HashMap::new(),
             call_targets: HashMap::new(),
             method_call_targets: HashMap::new(),
@@ -9728,11 +9735,17 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn record_callable_dependency(&mut self, callee: Span) {
+    fn record_callable_dependency(&mut self, callee: Span, site: Span) {
+        self.reach_sites
+            .push((site, reachability::ReachTarget::Callable(callee)));
         self.record_effect_dependency(callable_contracts::EffectDependency::Exact(callee));
     }
 
-    fn record_method_effect_dependency(&mut self, method: &MethodInfo, direct: bool) {
+    fn record_method_effect_dependency(&mut self, method: &MethodInfo, direct: bool, site: Span) {
+        self.reach_sites.push((
+            site,
+            reachability::ReachTarget::Callable(method.declaration),
+        ));
         let target = if direct || method.virtual_root.is_none() {
             callable_contracts::EffectDependency::Exact(method.declaration)
         } else {
@@ -10238,20 +10251,24 @@ impl<'program> Checker<'program> {
                 let mut then_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
-                self.check_branch(constant == Some(false), |checker| {
-                    checker.check_block(
-                        &if_stmt.then_block,
-                        &mut then_scopes,
-                        method_context,
-                        then_constructor_init_context.as_mut(),
-                        return_context,
-                        loop_depth,
-                    )
-                });
+                self.check_branch(
+                    constant == Some(false),
+                    if_stmt.then_block.span,
+                    |checker| {
+                        checker.check_block(
+                            &if_stmt.then_block,
+                            &mut then_scopes,
+                            method_context,
+                            then_constructor_init_context.as_mut(),
+                            return_context,
+                            loop_depth,
+                        )
+                    },
+                );
                 if let Some(else_branch) = &if_stmt.else_branch {
                     // A failed `given` gate reaches the else branch.
                     let dead = constant == Some(true) && if_stmt.given.is_none();
-                    self.check_branch(dead, |checker| {
+                    self.check_branch(dead, else_branch.span(), |checker| {
                         checker.check_else_branch(
                             else_branch,
                             &construct_scopes,
@@ -11585,19 +11602,23 @@ impl<'program> Checker<'program> {
                 let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context =
                     constructor_init_context.map(ConstructorInitContext::nested);
-                self.check_branch(constant == Some(false), |checker| {
-                    checker.check_block(
-                        &if_stmt.then_block,
-                        &mut then_scopes,
-                        method_context,
-                        then_constructor_init_context.as_mut(),
-                        return_context,
-                        loop_depth,
-                    )
-                });
+                self.check_branch(
+                    constant == Some(false),
+                    if_stmt.then_block.span,
+                    |checker| {
+                        checker.check_block(
+                            &if_stmt.then_block,
+                            &mut then_scopes,
+                            method_context,
+                            then_constructor_init_context.as_mut(),
+                            return_context,
+                            loop_depth,
+                        )
+                    },
+                );
                 if let Some(else_branch) = &if_stmt.else_branch {
                     let dead = constant == Some(true) && if_stmt.given.is_none();
-                    self.check_branch(dead, |checker| {
+                    self.check_branch(dead, else_branch.span(), |checker| {
                         checker.check_else_branch(
                             else_branch,
                             &construct_scopes,
@@ -11659,13 +11680,18 @@ impl<'program> Checker<'program> {
         Some(value)
     }
 
-    /// Checks `check` as code a branch that is constant false for the target
-    /// holds when `dead`: it is checked, and its calls emit nothing.
-    fn check_branch<R>(&mut self, dead: bool, check: impl FnOnce(&mut Self) -> R) -> R {
-        self.dead_branch_depth += usize::from(dead);
-        let result = check(self);
-        self.dead_branch_depth -= usize::from(dead);
-        result
+    /// Checks `branch` with `check`; when `dead` its condition is constant
+    /// false for the target, so it is checked and emits nothing.
+    fn check_branch<R>(
+        &mut self,
+        dead: bool,
+        branch: Span,
+        check: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if dead && !self.dead_branches.contains(&branch) {
+            self.dead_branches.push(branch);
+        }
+        check(self)
     }
 
     fn check_given_prelude(
@@ -15945,7 +15971,7 @@ impl<'program> Checker<'program> {
                 || (decided && (branch.condition.is_some() || given.is_none()));
             decided |= constant == Some(true);
             let mut branch_scopes = when_scopes.clone();
-            self.check_branch(dead, |checker| {
+            self.check_branch(dead, branch.block.span, |checker| {
                 checker.check_block(
                     &branch.block,
                     &mut branch_scopes,
@@ -19066,9 +19092,6 @@ impl<'program> Checker<'program> {
             return;
         };
 
-        if self.dead_branch_depth == 0 {
-            self.live_function_calls.insert(name.to_string());
-        }
         self.call_targets.insert(
             span,
             CallableTarget::Function {
@@ -19080,7 +19103,7 @@ impl<'program> Checker<'program> {
             function_info.declaration,
             name.rsplit('\\').next().unwrap_or(name),
         );
-        self.record_callable_dependency(function_info.declaration);
+        self.record_callable_dependency(function_info.declaration, span);
         let function_info = self.instantiate_generic_call(
             &format!("function `{name}`"),
             &function_info,
@@ -19550,6 +19573,7 @@ impl<'program> Checker<'program> {
             &method_info,
             self.exact_method_calls
                 .contains(&(span, method_info.declaration)),
+            span,
         );
         if method_info.is_static {
             self.diagnostics.push(Diagnostic::new(
@@ -20214,7 +20238,7 @@ impl<'program> Checker<'program> {
                 direct_parent: parent_qualified,
             },
         );
-        self.record_method_effect_dependency(&method_info, parent_qualified);
+        self.record_method_effect_dependency(&method_info, parent_qualified, access.span);
         if !(parent_qualified && access.member == "__construct")
             && self.check_direct_lifecycle_method_call(
                 &declaring_class.name,
@@ -20924,6 +20948,10 @@ impl<'program> Checker<'program> {
         let Some(class_info) = self.classes.get(class_name).cloned() else {
             return;
         };
+        self.reach_sites.push((
+            span,
+            reachability::ReachTarget::Class(class_name.to_string()),
+        ));
 
         let Some(constructor) = class_info.methods.get("__construct").cloned() else {
             if !args.is_empty() {
@@ -20969,7 +20997,7 @@ impl<'program> Checker<'program> {
                 direct_parent: false,
             },
         );
-        self.record_callable_dependency(constructor.declaration);
+        self.record_callable_dependency(constructor.declaration, span);
         let constructor = self.specialize_method_for_class(&constructor, class_type);
         let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(

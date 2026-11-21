@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles), and limited what is emitted to reachable code in section 17 on 2026-11-21 (Amendment: Emitting Only Reachable Code). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -184,6 +184,14 @@ conversions of section 4 follow the same ruling: `Pointer::cast`,
 type parameter (`Pointer::cast<int32>($pointer)`), `Pointer::toFunction`
 declares the C function pointer type, and each reads a stated argument before
 the expected type.
+
+### Amendment: Emitting Only Reachable Code (2026-11-21)
+
+Section 17 said a branch whose condition is constant false for the target is
+neither emitted nor linked, but not whether a function called only from such a
+branch is emitted. Its own example still emitted `Win32Window::open` on macOS,
+with the Windows symbols it references. Andrew ruled on 2026-11-21: "Emit only
+reachable code (Recommended)". Section 17 states the rule.
 
 ## Context
 
@@ -777,6 +785,20 @@ if (Platform::operatingSystem == OperatingSystem::Windows) {
   constants of the compilation target.
 - Every branch is parsed and type-checked on every host. A branch whose
   condition is constant false for the target is neither emitted nor linked.
+- Checking computes once which functions and methods are reachable from the
+  program's roots: the entry point, tests and static initializers. A call,
+  construction or C-callable function value outside every constant-false
+  branch of reachable code reaches its target, and code a closure or function
+  value in reachable code can call is reachable. A class constructed in
+  reachable code makes every member of it and of its ancestors reachable: its
+  constructor, property initializers, destructor, property hooks and methods,
+  which covers each virtual and interface dispatch target of its instances.
+  The declarations of the compiler's own sources are roots, since runtime
+  operations create their values. A program without an entry point is a
+  library, and each declaration with a body is a root.
+- Only reachable code is compiled and linked, by Cranelift, LLVM, the
+  interpreter and PHP output alike, and every function is still fully checked
+  (amendment of 2026-11-21).
 - A foreign library is required only when emitted code references it.
 
 Consequence: Doria gains structured conditional compilation of the kind

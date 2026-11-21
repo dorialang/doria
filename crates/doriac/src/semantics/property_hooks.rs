@@ -681,6 +681,7 @@ impl Checker<'_> {
             method,
             self.exact_method_calls
                 .contains(&(span, method.declaration)),
+            span,
         );
         let declaring_type = self.types.resolved(declaring_type);
         let target = match &declaring_type {

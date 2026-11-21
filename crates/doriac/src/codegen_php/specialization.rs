@@ -632,7 +632,11 @@ impl Plan {
             let ResolvedType::Class(class) = &conformance.implementing_type else {
                 continue;
             };
-            if !plan.classes.contains_key(class) {
+            // A class reachable code never constructs has no value to erase,
+            // and its methods are not emitted (Decision 0148 section 17).
+            if !plan.classes.contains_key(class)
+                || !program.semantic_info.reachable.constructs(&class.name)
+            {
                 continue;
             }
             let witnesses = program
