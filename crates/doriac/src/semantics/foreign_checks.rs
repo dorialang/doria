@@ -5,7 +5,7 @@
 //! operation that needs one asks [`Checker::require_unsafe`], which marks the
 //! enclosing context used or reports E0785.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::*;
 use crate::attributes::{AttributeTarget, AttributeValueKind};
@@ -53,6 +53,14 @@ pub(super) struct ForeignState {
     /// Each name of a C-callable function used as a value, by its span, with the
     /// function's canonical name (section 12).
     pub(super) c_abi_function_values: HashMap<Span, String>,
+    /// Each pointer or region pointee written as a type parameter, by the
+    /// site that writes it (section 3, amendment of 2026-11-21).
+    generic_pointee_sites: HashSet<(Span, TypeId)>,
+    /// Each use of a generic class, interface or enum, with the type
+    /// arguments it supplies.
+    generic_nominal_uses: HashSet<(Span, String, Vec<TypeId>)>,
+    /// Whether the uses have been checked, after which none is recorded.
+    generic_pointees_checked: bool,
 }
 
 impl<'program> Checker<'program> {
@@ -318,7 +326,7 @@ impl<'program> Checker<'program> {
             self.types.kind(pointee),
             TypeKind::Foreign(ForeignType::Opaque | ForeignType::Aggregate(_))
         );
-        if !addressable && !self.defer_generic_pointee(pointee) {
+        if !addressable && !self.defer_generic_pointee(pointee, span) {
             self.require_ffi_safe(pointee, span, "a pointee");
         }
         self.types
@@ -521,13 +529,18 @@ impl<'program> Checker<'program> {
             return true;
         }
         let display = self.types.display(ty);
+        let message = format!("`{display}` cannot cross the C boundary as {place}");
+        // Bodies are checked in more than one pass; each site reports once.
+        if self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == NOT_FFI_SAFE_CODE
+                && diagnostic.span == span
+                && diagnostic.message == message
+        }) {
+            return false;
+        }
         let help = self.ffi_safe_replacement(ty);
         self.diagnostics.push(
-            Diagnostic::new(
-                NOT_FFI_SAFE_CODE,
-                format!("`{display}` cannot cross the C boundary as {place}"),
-                span,
-            )
+            Diagnostic::new(NOT_FFI_SAFE_CODE, message, span)
             .with_title("Type Cannot Cross The C Boundary")
             .with_explanation(
                 "A foreign signature, foreign aggregate field or C function pointer type uses only fixed-width integers and floats, `bool`, pointers, the `Doria\\Std\\Ffi` boundary types, C function pointer types and foreign structs and unions.",
@@ -537,130 +550,195 @@ impl<'program> Checker<'program> {
         false
     }
 
-    /// Whether `pointee` is a type parameter of the generic function or
-    /// method being checked. Its FFI safety is checked at each call, with
-    /// the type the call supplies (section 3, amendment of 2026-11-21), so
-    /// it is recorded for [`Self::check_generic_pointee_arguments`].
-    pub(super) fn defer_generic_pointee(&mut self, pointee: TypeId) -> bool {
+    /// Whether `pointee` is a type parameter in scope. Its FFI safety is
+    /// checked at each use of the function, method, class, interface or
+    /// enum that declares it, with the type the use supplies (section 3,
+    /// amendment of 2026-11-21), so the site is recorded for
+    /// [`Self::check_generic_pointee_arguments`].
+    pub(super) fn defer_generic_pointee(&mut self, pointee: TypeId, site: Span) -> bool {
         let TypeKind::TypeParameter(name) = self.types.kind(pointee) else {
-            return false;
-        };
-        let Some(callable) = self.current_callable else {
             return false;
         };
         if !self
             .type_parameter_scopes
-            .last()
-            .is_some_and(|scope| scope.contains_key(name))
+            .iter()
+            .any(|scope| scope.contains_key(name))
         {
             return false;
         }
-        let name = name.clone();
-        self.pointee_type_parameters
-            .entry(callable)
-            .or_default()
-            .insert(name);
+        self.foreign.generic_pointee_sites.insert((site, pointee));
         true
     }
 
-    /// Checks the type each generic call supplies for a pointee type
-    /// parameter, at that call. A call inside a generic function that
-    /// supplies the caller's own type parameter passes the requirement to
-    /// that parameter, so the call that names the concrete type reports it.
+    /// Records a use of a generic class, interface or enum with the type
+    /// arguments it supplies, which [`Self::check_generic_pointee_arguments`]
+    /// checks against the declaration's pointee type parameters.
+    pub(super) fn record_generic_nominal_use(
+        &mut self,
+        name: &str,
+        arguments: &[TypeId],
+        site: Span,
+    ) {
+        if !arguments.is_empty() && !self.foreign.generic_pointees_checked {
+            self.foreign
+                .generic_nominal_uses
+                .insert((site, name.to_string(), arguments.to_vec()));
+        }
+    }
+
+    /// Checks the type each use of a generic declaration supplies for a
+    /// pointee type parameter, at that use. The uses are generic calls and
+    /// the type arguments of generic classes, interfaces and enums. A use
+    /// that supplies a type parameter of its own enclosing declaration
+    /// passes the requirement to that parameter, so the use that names the
+    /// concrete type reports it; any other type is checked where it is
+    /// supplied.
     pub(super) fn check_generic_pointee_arguments(&mut self) {
-        if self.pointee_type_parameters.is_empty() {
+        // Concrete instances are collected again after each expansion, and
+        // the instances an expansion materializes are not source uses.
+        if std::mem::replace(&mut self.foreign.generic_pointees_checked, true)
+            || self.foreign.generic_pointee_sites.is_empty()
+        {
             return;
         }
-        let owners = self
+        let names =
+            |parameters: &[TypeParamInfo]| parameters.iter().map(|p| p.name.clone()).collect();
+        let mut owners: Vec<(Span, HashSet<String>)> = self
             .function_signatures
             .values()
-            .map(|function| (function.declaration, &function.type_params))
-            .chain(self.classes.values().flat_map(|class| {
+            .map(|function| (function.declaration, names(&function.type_params)))
+            .collect();
+        let mut nominals: HashMap<String, (Span, Vec<String>, &'static str)> = HashMap::new();
+        for (name, class) in &self.classes {
+            owners.extend(
                 class
                     .methods
                     .values()
-                    .map(|method| (method.declaration, &method.type_params))
-            }))
-            .map(|(declaration, parameters)| {
-                (
-                    declaration,
-                    parameters
-                        .iter()
-                        .map(|parameter| parameter.name.clone())
-                        .collect::<HashSet<_>>(),
-                )
-            })
+                    .map(|method| (method.declaration, names(&method.type_params))),
+            );
+            let parameters = class.type_params.iter().map(|p| p.name.clone()).collect();
+            nominals.insert(name.clone(), (class.declaration, parameters, "class"));
+        }
+        for (name, definition) in &self.enums {
+            let parameters = definition
+                .type_params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            nominals.insert(name.clone(), (definition.span, parameters, "enum"));
+        }
+        for name in self.interface_definitions.keys() {
+            if let Some(declaration) = self.interface_declaration(name) {
+                let parameters = declaration
+                    .type_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
+                nominals.insert(name.clone(), (declaration.span, parameters, "interface"));
+            }
+        }
+        owners.extend(
+            nominals
+                .values()
+                .map(|(span, parameters, _)| (*span, parameters.iter().cloned().collect())),
+        );
+        owners.retain(|(_, parameters)| !parameters.is_empty());
+        // The innermost declaration around `site` that declares `name`.
+        let owner_of = |site: Span, name: &str| {
+            owners
+                .iter()
+                .filter(|(declaration, parameters)| {
+                    declaration.contains(site) && parameters.contains(name)
+                })
+                .min_by_key(|(declaration, _)| declaration.end - declaration.start)
+                .map(|(declaration, _)| *declaration)
+        };
+        let mut required: HashMap<Span, BTreeSet<String>> = HashMap::new();
+        let mut sites = self
+            .foreign
+            .generic_pointee_sites
+            .iter()
+            .copied()
             .collect::<Vec<_>>();
-        let mut calls = self
+        sites.sort_by_key(|(site, _)| (site.start, site.end));
+        let mut unowned = Vec::new();
+        for (site, pointee) in sites {
+            let TypeKind::TypeParameter(name) = self.types.kind(pointee) else {
+                continue;
+            };
+            match owner_of(site, name) {
+                Some(owner) => {
+                    required.entry(owner).or_default().insert(name.clone());
+                }
+                None => unowned.push((site, pointee)),
+            }
+        }
+        // A type parameter no declaration owns has no use to check it, so
+        // its pointee is checked where it is written.
+        for (site, pointee) in unowned {
+            self.require_ffi_safe(pointee, site, "a pointee");
+        }
+        let mut uses = self
             .pending_generic_calls
             .iter()
             .map(|(site, pending)| {
-                let caller = owners
-                    .iter()
-                    .filter(|(declaration, _)| declaration.contains(*site))
-                    .min_by_key(|(declaration, _)| declaration.end - declaration.start);
                 (
                     *site,
                     pending.declaration,
                     pending.inference.callee.clone(),
                     pending.inference.bindings.clone(),
-                    caller.cloned(),
                 )
             })
             .collect::<Vec<_>>();
-        calls.sort_by_key(|(site, ..)| *site);
+        for (site, name, arguments) in &self.foreign.generic_nominal_uses {
+            let Some((declaration, parameters, kind)) = nominals.get(name) else {
+                continue;
+            };
+            if parameters.len() != arguments.len() {
+                continue;
+            }
+            let bindings = parameters.iter().cloned().zip(arguments.iter().copied());
+            uses.push((
+                *site,
+                *declaration,
+                format!("{kind} `{name}`"),
+                bindings.collect(),
+            ));
+        }
+        uses.sort_by_key(|(site, ..)| (site.start, site.end));
         let mut changed = true;
         while changed {
             changed = false;
-            for (_, callee, _, bindings, caller) in &calls {
-                let Some((caller, own)) = caller else {
+            for (site, callee, _, bindings) in &uses {
+                let Some(parameters) = required.get(callee).cloned() else {
                     continue;
                 };
-                let required = self
-                    .pointee_type_parameters
-                    .get(callee)
-                    .cloned()
-                    .unwrap_or_default();
-                for parameter in required {
+                for parameter in parameters {
                     let Some(TypeKind::TypeParameter(name)) =
                         bindings.get(&parameter).map(|ty| self.types.kind(*ty))
                     else {
                         continue;
                     };
-                    if own.contains(name) {
-                        let name = name.clone();
-                        changed |= self
-                            .pointee_type_parameters
-                            .entry(*caller)
-                            .or_default()
-                            .insert(name);
+                    if let Some(owner) = owner_of(*site, name) {
+                        changed |= required.entry(owner).or_default().insert(name.clone());
                     }
                 }
             }
         }
-        for (site, callee, name, bindings, _) in calls {
-            let Some(required) = self.pointee_type_parameters.get(&callee).cloned() else {
+        for (site, callee, name, bindings) in uses {
+            let Some(parameters) = required.get(&callee).cloned() else {
                 continue;
             };
-            for parameter in required {
+            for parameter in parameters {
                 let Some(&supplied) = bindings.get(&parameter) else {
                     continue;
                 };
-                if self.type_is_symbolic(supplied) {
-                    continue;
+                if let TypeKind::TypeParameter(own) = self.types.kind(supplied) {
+                    if owner_of(site, own).is_some() {
+                        continue;
+                    }
                 }
                 let place = format!("the pointee type `{parameter}` of {name}");
-                let message = format!(
-                    "`{}` cannot cross the C boundary as {place}",
-                    self.types.display(supplied)
-                );
-                if self.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == NOT_FFI_SAFE_CODE
-                        && diagnostic.span == site
-                        && diagnostic.message == message
-                }) {
-                    continue;
-                }
                 self.require_ffi_safe(supplied, site, &place);
             }
         }

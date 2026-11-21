@@ -2968,10 +2968,6 @@ struct Checker<'program> {
     core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     symbolic_collection_keys: Vec<collection_keys::SymbolicKey>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
-    /// The type parameters each generic function or method uses as a
-    /// pointer or region pointee, which each call checks for FFI safety
-    /// (Decision 0148 section 3, amendment of 2026-11-21).
-    pointee_type_parameters: HashMap<Span, std::collections::BTreeSet<String>>,
     /// Type arguments stated at calls, keyed by the call's span.
     stated_type_arguments: HashMap<Span, call_type_arguments::StatedTypeArguments>,
     pending_enum_constructions: HashMap<Span, GenericInference>,
@@ -3890,7 +3886,6 @@ impl<'program> Checker<'program> {
             core_operation_calls: HashMap::new(),
             symbolic_collection_keys: Vec::new(),
             pending_generic_calls: HashMap::new(),
-            pointee_type_parameters: HashMap::new(),
             stated_type_arguments: HashMap::new(),
             pending_enum_constructions: HashMap::new(),
             pending_availability_calls: HashMap::new(),
@@ -23263,6 +23258,7 @@ impl<'program> Checker<'program> {
         if self.nominal_identity_depth > 0 {
             return true;
         }
+        self.record_generic_nominal_use(name, arguments, span);
         let identity = (name.to_string(), arguments.to_vec());
         if !self.checking_type_constraints.insert(identity.clone()) {
             return true;
@@ -25631,7 +25627,7 @@ impl<'program> Checker<'program> {
             // A generic region's pointer is checked at each call with the
             // element type the call supplies (Decision 0148 section 3).
             if let TypeKind::ArrayRegion(_, element) = self.types.kind(ty).clone() {
-                self.defer_generic_pointee(element);
+                self.defer_generic_pointee(element, span);
             }
             self.require_unsafe(span, operation);
             return;

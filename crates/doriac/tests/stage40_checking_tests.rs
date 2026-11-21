@@ -2191,3 +2191,108 @@ function main(): void
         "{found:#?}"
     );
 }
+
+/// A generic class's pointee type parameter is checked at each use of the
+/// class, a use inside a generic declaration passes the check on to that
+/// declaration's uses, and a supplied type that contains a type parameter
+/// without being one is checked where it is supplied (Decision 0148 section
+/// 3, amendment of 2026-11-21).
+#[test]
+fn generic_class_pointees_are_checked_at_each_use() {
+    let source = r#"
+use Doria\Std\Ffi\{Opaque, Pointer};
+
+class Reader<T>
+{
+    function __construct(internal Pointer<T> $start) {}
+
+    /** @safety `$pointer` points at a `T`. */
+    unsafe function first(Pointer<T> $pointer): T
+    {
+        return unsafe($pointer->read());
+    }
+}
+
+interface Source<T>
+{
+    /** @safety `$pointer` points at a `T`. */
+    unsafe function first(Pointer<T> $pointer): T;
+}
+
+function drain(Source<string> $source): void {}
+
+function reader<U>(Pointer<Opaque> $start): Reader<U>
+{
+    return new Reader<U>(unsafe(Pointer::cast<U>($start)));
+}
+
+/** @safety `$address` points at a `T`. */
+unsafe function view<T>(Pointer<Opaque> $address): T
+{
+    return unsafe(Pointer::cast<T>($address)->read());
+}
+
+/** @safety `$address` points at a `?V`. */
+unsafe function maybe<V>(Pointer<Opaque> $address): ?V
+{
+    unsafe {
+        return view<?V>($address);
+    }
+}
+
+function main(): void
+{
+    int32 $number = 7;
+    unsafe {
+        let $address = Pointer::cast<Opaque>(Pointer::to($number));
+        let $numbers = reader<int32>($address);
+        let $words = reader<string>($address);
+        let $direct = new Reader<string>(Pointer::cast<string>($address));
+        echo maybe<int32>($address) ?? 0;
+    }
+}
+"#;
+    let found = findings(source);
+    let errors = found
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        .map(|diagnostic| {
+            (
+                diagnostic.code,
+                &source[diagnostic.span.start..diagnostic.span.end],
+                diagnostic.message.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            (
+                "E0786",
+                "Pointer::cast<string>($address)",
+                "`string` cannot cross the C boundary as a pointee"
+            ),
+            (
+                "E0786",
+                "Source<string> $source",
+                "`string` cannot cross the C boundary as the pointee type `T` of interface `Source`"
+            ),
+            (
+                "E0786",
+                "view<?V>($address)",
+                "`?V` cannot cross the C boundary as the pointee type `T` of function `view`"
+            ),
+            (
+                "E0786",
+                "reader<string>($address)",
+                "`string` cannot cross the C boundary as the pointee type `U` of function `reader`"
+            ),
+            (
+                "E0786",
+                "new Reader<string>(Pointer::cast<string>($address))",
+                "`string` cannot cross the C boundary as the pointee type `T` of class `Reader`"
+            ),
+        ],
+        "{found:#?}"
+    );
+}

@@ -3839,3 +3839,48 @@ function main(): void
         "10 255 2 2 9 13 4 10 2 102 -1 6 true 2 2 257 7 4 65 0 1 30 255 255 255 3 solid 9 7",
     );
 }
+
+/// A generic class's type parameter is a pointee of its methods and
+/// properties, checked at each use of the class with the type it supplies
+/// (Decision 0148 section 3, amendment of 2026-11-21).
+#[test]
+fn generic_class_pointees_read_through_each_supplied_type() {
+    let source = format!(
+        r#"{POINTER}{AGGREGATES}
+class Reader<T>
+{{
+    function __construct(internal Pointer<T> $start) {{}}
+
+    /** @safety `$pointer` points at a `T`. */
+    unsafe function first(Pointer<T> $pointer): T
+    {{
+        return unsafe($pointer->read());
+    }}
+
+    /** @safety `$start` still points at a `T`. */
+    unsafe function current(): T
+    {{
+        return unsafe($this->start->read());
+    }}
+}}
+
+function reader<U>(Pointer<U> $start): Reader<U>
+{{
+    return new Reader<U>($start);
+}}
+
+function main(): void
+{{
+    int32 $number = 41;
+    Color $color = new Color(red: 1, green: 2, blue: 3);
+    unsafe {{
+        let $numbers = new Reader<int32>(Pointer::to($number));
+        echo $numbers->first(Pointer::to($number)) . " " . $numbers->current() . "\n";
+        let $colors = reader<Color>(Pointer::to($color));
+        echo $colors->current()->blue . "\n";
+    }}
+}}
+"#
+    );
+    assert_runs_natively(&source, "41 41\n3\n");
+}

@@ -480,7 +480,7 @@ impl<'program> Checker<'program> {
             }
             return argument_ty;
         };
-        if !self.defer_generic_pointee(receiver.pointee) {
+        if !self.defer_generic_pointee(receiver.pointee, argument.value.span()) {
             self.require_ffi_safe(
                 receiver.pointee,
                 argument.value.span(),
@@ -802,7 +802,7 @@ impl<'program> Checker<'program> {
             self.types.kind(ty),
             TypeKind::Foreign(ForeignType::Aggregate(_))
         );
-        if !addressable && !self.defer_generic_pointee(ty) {
+        if !addressable && !self.defer_generic_pointee(ty, place.span()) {
             self.require_ffi_safe(ty, place.span(), "a pointee");
         }
     }
