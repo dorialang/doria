@@ -4289,3 +4289,35 @@ fn unsafe_contexts_lower_to_regions_with_their_exits() {
 
     assert_runs_natively(&source, "1 3 4\n1 3 4 5 6 70\n1 11\n5 caught\n23\n1");
 }
+
+/// An unsafe context in a branch checking finds dead for the target is not
+/// lowered and needs no region; the one in the live branch is a region,
+/// and the program-level region check accepts both.
+#[test]
+fn only_live_branches_lower_their_unsafe_regions() {
+    let source = format!(
+        "{C_LIBRARY}
+use Doria\\Std\\Ffi\\{{OperatingSystem, Platform}};
+
+function main(): void
+{{
+    if (Platform::operatingSystem == OperatingSystem::Windows) {{
+        echo unsafe(abs(-1));
+    }} else {{
+        echo unsafe(abs(-2));
+    }}
+}}
+"
+    );
+    let mir = program(&source);
+    let main = function_named(&mir, "main");
+    let [region] = main.unsafe_regions.as_slice() else {
+        panic!("{:#?}", main.unsafe_regions);
+    };
+    let live = if cfg!(windows) { "abs(-1)" } else { "abs(-2)" };
+    assert_eq!(
+        &source[region.span.start..region.span.end],
+        format!("unsafe({live})")
+    );
+    assert_runs_natively(&source, if cfg!(windows) { "1" } else { "2" });
+}

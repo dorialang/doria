@@ -2653,6 +2653,7 @@ fn lower_program_impl(
         })
         .collect::<Vec<_>>();
     c_entries.sort_by_key(|id| id.0);
+    let checked = &program.semantic_info;
     let mut program = mir::Program {
         interface_types,
         interface_vtables,
@@ -2709,6 +2710,7 @@ fn lower_program_impl(
         entry,
     };
     specialize_retained_sources(&mut program);
+    unsafe_region::require_every_live_region(&program, checked)?;
     Ok(program)
 }
 
@@ -5751,10 +5753,14 @@ fn lower_expression_statement(
     if context
         .semantic_info
         .property_accessor_calls
-        .get(&unparenthesized_place(expr).span())
+        .get(&unparenthesized_place(expr, context).span())
         .is_some_and(|calls| calls.getter.is_some())
     {
-        let _ = property_hooks::materialize_getter(unparenthesized_place(expr), false, context)?;
+        let _ = property_hooks::materialize_getter(
+            unparenthesized_place(expr, context),
+            false,
+            context,
+        )?;
         return Ok(());
     }
     if let Some(value) = iteration::builtin_acquire(expr, context)? {
@@ -8308,7 +8314,7 @@ fn lower_foreach_statement(
                     "foreach iterable is not a collection",
                 )]);
             };
-            let borrowed = collection_place_is_borrowed(collection_expr);
+            let borrowed = collection_place_is_borrowed(collection_expr, context);
             let value =
                 lower_collection_expression(collection_expr, collection_type, !borrowed, context)?;
             let local = if borrowed {
@@ -11202,7 +11208,7 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn narrowed_nominal_local(&self, expr: &hir::Expr, target: mir::Type) -> Option<mir::LocalId> {
-        let hir::Expr::Variable { name, span } = unparenthesized_place(expr) else {
+        let hir::Expr::Variable { name, span } = unparenthesized_place(expr, self) else {
             return None;
         };
         let local = self.lookup_local(name, *span).ok()?;
@@ -11221,7 +11227,7 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn exact_mixed_local(&self, expr: &hir::Expr) -> Option<(mir::LocalId, mir::Type)> {
-        let hir::Expr::Variable { name, span } = unparenthesized_place(expr) else {
+        let hir::Expr::Variable { name, span } = unparenthesized_place(expr, self) else {
             return None;
         };
         let local = self.lookup_local(name, *span).ok()?;
@@ -11236,7 +11242,7 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn narrowed_class_local(&self, expr: &hir::Expr) -> Option<(mir::LocalId, ClassId)> {
-        let hir::Expr::Variable { name, span } = unparenthesized_place(expr) else {
+        let hir::Expr::Variable { name, span } = unparenthesized_place(expr, self) else {
             return None;
         };
         let local = self.lookup_local(name, *span).ok()?;
@@ -12110,9 +12116,14 @@ impl ScalarPlace {
     }
 }
 
-fn unparenthesized_place(expr: &hir::Expr) -> &hir::Expr {
+/// The expression under `expr`'s parentheses. An unsafe region keeps
+/// them: its value comes from its own blocks (Decision 0148 section 23), so
+/// a path that would evaluate inside it reaches the region hook or fails.
+fn unparenthesized_place<'e>(expr: &'e hir::Expr, context: &LoweringContext) -> &'e hir::Expr {
     match expr {
-        hir::Expr::Grouped { expr, .. } => unparenthesized_place(expr),
+        hir::Expr::Grouped { expr: inner, span } if context.unsafe_region_fact(*span).is_none() => {
+            unparenthesized_place(inner, context)
+        }
         _ => expr,
     }
 }
@@ -12121,7 +12132,7 @@ fn semantic_property_write(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> DiagnosticResult<(mir::PropertyWriteKind, Span)> {
-    let span = unparenthesized_place(expr).span();
+    let span = unparenthesized_place(expr, context).span();
     let Some(info) = context.semantic_info.property_writes.get(&span) else {
         return Err(vec![unsupported(
             span,
@@ -12142,7 +12153,7 @@ fn lower_scalar_place(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(ScalarPlace, mir::ScalarType)> {
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
@@ -12295,7 +12306,7 @@ fn lower_assignment(
     }
 
     materialize_nested_collection_places(&assignment.value, false, context)?;
-    let target = unparenthesized_place(&assignment.target);
+    let target = unparenthesized_place(&assignment.target, context);
     if let hir::Expr::StaticMember {
         class_name,
         member,
@@ -12492,7 +12503,7 @@ fn lower_assignment_target(
     target: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::LocalId> {
-    match unparenthesized_place(target) {
+    match unparenthesized_place(target, context) {
         hir::Expr::Variable { name, span } => context.lookup_local(name, *span),
         _ => Err(vec![unsupported(
             target.span(),
@@ -13304,7 +13315,7 @@ fn lower_nullable_scalar_expression(
         args,
         span,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     {
         if let (Some(boundary), "tryFrom", mir::ScalarType::Integer(ty)) = (
             crate::foreign::CBoundaryType::from_source_name(class_name),
@@ -14664,7 +14675,7 @@ fn lower_call_argument(
             // Writable arguments of every type denote exclusive borrowed
             // storage. Keep a local of the parameter type as a place, even
             // when flow analysis knows its current nullable value.
-            if let hir::Expr::Variable { name, span } = unparenthesized_place(argument) {
+            if let hir::Expr::Variable { name, span } = unparenthesized_place(argument, context) {
                 let local = context.lookup_local(name, *span)?;
                 if context.local_type(local) == expected {
                     return Ok(local_rvalue(local, expected, false));
@@ -16072,7 +16083,8 @@ fn lower_coalesce_rvalue(
         CoalesceSelection::Dynamic => {}
     }
 
-    let left_type = if let hir::Expr::Variable { name, span } = unparenthesized_place(left) {
+    let left_type = if let hir::Expr::Variable { name, span } = unparenthesized_place(left, context)
+    {
         context
             .lookup_local(name, *span)
             .map(|local| context.local_type(local))
@@ -17547,7 +17559,7 @@ fn lower_condition_to_blocks_inner(
     else_block: mir::BlockId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Unary {
             op: hir::UnaryOp::Not,
             expr,
@@ -17748,8 +17760,11 @@ fn lower_condition(
             | hir::BinaryOp::Greater
             | hir::BinaryOp::GreaterEqual => {
                 if matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
-                    && !matches!(unparenthesized_place(left), hir::Expr::Null { .. })
-                    && !matches!(unparenthesized_place(right), hir::Expr::Null { .. })
+                    && !matches!(unparenthesized_place(left, context), hir::Expr::Null { .. })
+                    && !matches!(
+                        unparenthesized_place(right, context),
+                        hir::Expr::Null { .. }
+                    )
                     && (matches!(
                         non_null_match_type(context.expression_type(left)?).0,
                         mir::Type::Class(_)
@@ -17766,8 +17781,11 @@ fn lower_condition(
                         expr.span(),
                         context,
                     )
-                } else if matches!(unparenthesized_place(left), hir::Expr::Null { .. })
-                    || matches!(unparenthesized_place(right), hir::Expr::Null { .. })
+                } else if matches!(unparenthesized_place(left, context), hir::Expr::Null { .. })
+                    || matches!(
+                        unparenthesized_place(right, context),
+                        hir::Expr::Null { .. }
+                    )
                 {
                     lower_null_comparison(left, op, right, context)
                 } else if lower_bytes_local(left, context).is_ok()
@@ -18047,20 +18065,21 @@ fn lower_null_comparison(
     right: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
-    let value = if matches!(unparenthesized_place(left), hir::Expr::Null { .. }) {
+    let value = if matches!(unparenthesized_place(left, context), hir::Expr::Null { .. }) {
         right
     } else {
         left
     };
-    let value_type = if let hir::Expr::Variable { name, span } = unparenthesized_place(value) {
-        if let Ok(local) = context.lookup_local(name, *span) {
-            context.local_type(local)
+    let value_type =
+        if let hir::Expr::Variable { name, span } = unparenthesized_place(value, context) {
+            if let Ok(local) = context.lookup_local(name, *span) {
+                context.local_type(local)
+            } else {
+                context.expression_type(value)?
+            }
         } else {
             context.expression_type(value)?
-        }
-    } else {
-        context.expression_type(value)?
-    };
+        };
     let present = match value_type {
         mir::Type::NullableRegion(kind) => {
             mir::BoolExpression::NullableByteRegionIsPresent(Box::new(
@@ -18184,11 +18203,12 @@ fn lower_is_condition(
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(false)),
         });
     }
-    let value_type = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
-        context.local_type(context.lookup_local(name, *span)?)
-    } else {
-        context.expression_type(expr)?
-    };
+    let value_type =
+        if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
+            context.local_type(context.lookup_local(name, *span)?)
+        } else {
+            context.expression_type(expr)?
+        };
     if let Some(matches) = context
         .semantic_info
         .type_test_type(type_test_span)
@@ -18255,7 +18275,8 @@ fn lower_is_condition(
                 | mir::Type::NullableMixed
         ) && matches!(nominal_target, Some(mir::Type::Class(_))))
     {
-        let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context)
+        {
             context.lookup_local(name, *span)?
         } else {
             let value = lower_rvalue_as_borrowed(expr, value_type, context)?;
@@ -18563,7 +18584,7 @@ fn lower_nullable_mixed_local(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::LocalId> {
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::NullableMixed {
             return Ok(local);
@@ -18589,7 +18610,7 @@ fn lower_nullable_scalar_presence_subject(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::NullableScalar(expected) {
             return Ok(mir::NullableScalarExpression::Local {
@@ -18605,7 +18626,7 @@ fn lower_nullable_string_presence_subject(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::NullableString {
             return Ok(mir::NullableStringExpression::Local(local));
@@ -18619,7 +18640,7 @@ fn lower_nullable_payload_enum_presence_subject(
     expected: mir::PayloadEnumType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullablePayloadEnumExpression> {
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::NullablePayloadEnum(expected) {
             return Ok(mir::NullablePayloadEnumExpression::Use {
@@ -18637,7 +18658,7 @@ fn lower_nullable_class_presence_subject(
     expected: ClassId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::NullableClass(expected) {
             return Ok(mir::NullableClassExpression::Local {
@@ -19573,7 +19594,7 @@ fn lower_shared_interface_payload(
     nullable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::InterfaceTypeId)>> {
-    let expr = match unparenthesized_place(expr) {
+    let expr = match unparenthesized_place(expr, context) {
         hir::Expr::PropertyAccess {
             object, property, ..
         } if property == "referencedValue" => object,
@@ -19707,7 +19728,7 @@ fn lower_nullable_interface_expression(
     if context.expression_is_null(expr) {
         return Ok(mir::NullableInterfaceValue::Null);
     }
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == expected {
             return Ok(mir::NullableInterfaceValue::Local { local, transfer });
@@ -20152,7 +20173,7 @@ fn lower_nullable_function_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableFunctionExpression> {
-    if matches!(unparenthesized_place(expr), hir::Expr::Null { .. }) {
+    if matches!(unparenthesized_place(expr, context), hir::Expr::Null { .. }) {
         return Ok(mir::NullableFunctionExpression::Null { function_type });
     }
     if !context.expression_is_null(expr)
@@ -21307,11 +21328,11 @@ fn materialize_checked_rvalue(
         return Ok(Some(value));
     }
     if matches!(
-        unparenthesized_place(expr),
+        unparenthesized_place(expr, context),
         hir::Expr::PropertyAccess { take: true, .. }
     ) {
         return lower_property_take(
-            unparenthesized_place(expr),
+            unparenthesized_place(expr, context),
             expected,
             consume_result,
             context,
@@ -22467,7 +22488,7 @@ fn lower_payload_enum_expression(
     }
     if let hir::Expr::Index {
         collection, index, ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     {
         let (collection, index) =
             lower_collection_index_operand(collection, index, mir::Type::PayloadEnum(ty), context)?;
@@ -22704,7 +22725,7 @@ fn lower_nullable_payload_enum_expression(
         args,
         null_safe: false,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     {
         if let Some((collection, key, value_type, access)) =
             lower_dictionary_get(object, method, args, context)?
@@ -22785,7 +22806,7 @@ fn lower_nullable_payload_enum_expression(
     }
     if let hir::Expr::Index {
         collection, index, ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     {
         let (collection, index) = lower_collection_index_operand(
             collection,
@@ -22902,7 +22923,7 @@ fn lower_mixed_expression(
             remove: true,
         });
     }
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::Mixed {
             return Ok(mir::MixedExpression::Local { local, transfer });
@@ -22915,7 +22936,7 @@ fn lower_mixed_expression(
         }
     }
     if matches!(
-        unparenthesized_place(expr),
+        unparenthesized_place(expr, context),
         hir::Expr::PropertyAccess { .. }
     ) {
         let (object, property, ty) = lower_property_place(expr, context)?;
@@ -22925,7 +22946,7 @@ fn lower_mixed_expression(
     }
     if let hir::Expr::Index {
         collection, index, ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     {
         let (collection, index) =
             lower_collection_index_operand(collection, index, mir::Type::Mixed, context)?;
@@ -23741,7 +23762,7 @@ fn lower_collection_expression(
                     format!("{class_name}::from expects one argument"),
                 )]);
             };
-            let source = unparenthesized_place(source);
+            let source = unparenthesized_place(source, context);
             if let Some(result) = core_value::preserving_from(source, expected, context)? {
                 return Ok(result);
             }
@@ -24053,7 +24074,7 @@ fn lower_list_remove_at(
         args,
         null_safe: false,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(None);
     };
@@ -24450,8 +24471,8 @@ fn materialize_nested_collection_places(
             }
             materialize_nested_collection_places(index, false, context)?;
 
-            let place = unparenthesized_place(collection);
-            if collection_place_is_borrowed(place)
+            let place = unparenthesized_place(collection, context);
+            if collection_place_is_borrowed(place, context)
                 && matches!(context.expression_type(place)?, mir::Type::Collection(_))
             {
                 let key = place.span();
@@ -24531,7 +24552,7 @@ fn materialize_nested_collection_places(
             if class_name == "Set" && method == "from" {
                 if let Some(source) = args.first() {
                     if !matches!(
-                        unparenthesized_place(&source.value),
+                        unparenthesized_place(&source.value, context),
                         hir::Expr::Array { .. }
                     ) {
                         materialize_collection_place(&source.value, false, context)?;
@@ -24597,7 +24618,7 @@ fn lower_collection_local(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
-    let expr = unparenthesized_place(expr);
+    let expr = unparenthesized_place(expr, context);
     if let Some(place) = materialized_collection_local(expr, false, context)? {
         return Ok(place);
     }
@@ -24624,7 +24645,7 @@ fn materialized_collection_local(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::CollectionTypeId)>> {
-    let expr = unparenthesized_place(expr);
+    let expr = unparenthesized_place(expr, context);
     if let Some(local) = context
         .materialized_collection_places
         .get(&expr.span())
@@ -24720,7 +24741,7 @@ fn lower_nullable_collection_access_receiver(
         return Ok(None);
     };
 
-    let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         context.lookup_local(name, *span)?
     } else {
         let value = lower_nullable_shared_reference_access_expression(
@@ -24792,7 +24813,7 @@ fn lower_null_safe_collection_scalar(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::NullableScalarExpression>> {
-    let (object, operation) = match unparenthesized_place(expr) {
+    let (object, operation) = match unparenthesized_place(expr, context) {
         hir::Expr::PropertyAccess {
             object,
             property,
@@ -25108,7 +25129,7 @@ fn lower_list_index_of(
         args,
         null_safe: false,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(None);
     };
@@ -25148,7 +25169,7 @@ fn materialize_collection_place(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    let expr = unparenthesized_place(expr);
+    let expr = unparenthesized_place(expr, context);
     if materialized_collection_local(expr, writable, context)?.is_some() {
         return Ok(());
     }
@@ -25164,7 +25185,7 @@ fn materialize_collection_place_as(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    let expr = unparenthesized_place(expr);
+    let expr = unparenthesized_place(expr, context);
     if let Some((_, actual)) = materialized_collection_local(expr, writable, context)? {
         if actual != collection {
             return Err(vec![unsupported(
@@ -25246,9 +25267,9 @@ fn method_receiver_is_writable(
     }
 }
 
-fn collection_place_is_borrowed(expr: &hir::Expr) -> bool {
+fn collection_place_is_borrowed(expr: &hir::Expr, context: &LoweringContext) -> bool {
     matches!(
-        unparenthesized_place(expr),
+        unparenthesized_place(expr, context),
         hir::Expr::Index { .. } | hir::Expr::PropertyAccess { .. }
     )
 }
@@ -25837,7 +25858,7 @@ fn lower_collection_nullable_property(
         property,
         null_safe: false,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(None);
     };
@@ -25942,7 +25963,7 @@ fn lower_class_expression(
         });
     }
     if !matches!(
-        unparenthesized_place(expr),
+        unparenthesized_place(expr, context),
         hir::Expr::New { shared: false, .. }
     ) && context.expression_type(expr).ok()
         == Some(mir::Type::SharedReference(mir::SharedPayload::Class(
@@ -26418,7 +26439,7 @@ fn lower_shared_reference_expression(
             remove: true,
         });
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             let ty = context.local_type(local);
@@ -26642,7 +26663,7 @@ fn lower_writable_shared_reference_expression(
     )? {
         return Ok(value);
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             let ty = context.local_type(local);
@@ -26873,7 +26894,7 @@ fn lower_writable_weak_reference_expression(
     )? {
         return Ok(value);
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             let ty = context.local_type(local);
@@ -27003,7 +27024,7 @@ fn lower_nullable_writable_shared_reference_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableWritableSharedReferenceExpression> {
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Index {
             collection,
             index,
@@ -27279,7 +27300,7 @@ fn lower_nullable_writable_weak_reference_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableWritableWeakReferenceExpression> {
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Index {
             collection,
             index,
@@ -27361,7 +27382,7 @@ fn lower_shared_access_payload_local(
         mir::Type::WritableSharedReferenceAccess(payload) if payload == expected => true,
         _ => return Ok(None),
     };
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         return Ok(Some((context.lookup_local(name, *span)?, writable)));
     }
     let value = lower_shared_reference_access_expression(expr, expected, writable, false, context)?;
@@ -27417,7 +27438,7 @@ fn lower_shared_reference_access_expression(
             remove: true,
         });
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             let expected_ty = if writable {
@@ -27652,7 +27673,7 @@ fn lower_nullable_shared_reference_access_expression(
             },
         );
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Null { .. } => Ok(mir::NullableSharedReferenceAccessExpression::Null {
             payload: expected,
             writable,
@@ -27898,7 +27919,7 @@ fn lower_weak_reference_expression(
             remove: true,
         });
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             let ty = context.local_type(local);
@@ -28124,7 +28145,7 @@ fn lower_nullable_shared_reference_expression(
             remove: true,
         });
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
             Err(unsafe_region::bypassed(*span))
         }
@@ -28414,7 +28435,7 @@ fn lower_nullable_shared_reference_expression(
             })
         }
         _ if matches!(
-            unparenthesized_place(expr),
+            unparenthesized_place(expr, context),
             hir::Expr::New { shared: true, .. }
         ) || context.expression_type(expr)? == mir::Type::SharedReference(expected) =>
         {
@@ -28473,7 +28494,7 @@ fn lower_nullable_weak_reference_expression(
             remove: true,
         });
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
             Err(unsafe_region::bypassed(*span))
         }
@@ -28767,7 +28788,7 @@ fn lower_property_place(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, crate::class_layout::PropertyId, mir::Type)> {
-    let expr = unparenthesized_place(expr);
+    let expr = unparenthesized_place(expr, context);
     let hir::Expr::PropertyAccess {
         object,
         property,
@@ -28780,7 +28801,7 @@ fn lower_property_place(
             "expected class property access",
         )]);
     };
-    let mut object_local = match unparenthesized_place(object) {
+    let mut object_local = match unparenthesized_place(object, context) {
         hir::Expr::Variable { name, span } => context.lookup_local(name, *span)?,
         hir::Expr::This { span } => context.lookup_local("this", *span)?,
         _ => match context.expression_type(object)? {

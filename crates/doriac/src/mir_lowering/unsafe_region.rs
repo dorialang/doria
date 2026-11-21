@@ -272,3 +272,46 @@ pub(super) fn finish(
     }
     Ok(regions)
 }
+
+/// Every unsafe context recorded by checking inside an emitted function is
+/// a region of some lowered function, unless it lies in a branch checking
+/// found dead for the target (`Reachability::is_live`, the one owner of
+/// that fact). A lowering path that evaluated a context without its region
+/// fails here instead of running it as plain code.
+pub(super) fn require_every_live_region(
+    program: &mir::Program,
+    semantic_info: &SemanticInfo,
+) -> DiagnosticResult<()> {
+    let recorded = program
+        .functions
+        .iter()
+        .flat_map(|function| function.unsafe_regions.iter().map(|region| region.span))
+        .collect::<HashSet<_>>();
+    let mut missing = semantic_info
+        .unsafe_contexts
+        .values()
+        .filter(|fact| !recorded.contains(&fact.span))
+        .filter(|fact| semantic_info.reachable.is_live(fact.span))
+        .filter(|fact| {
+            program
+                .functions
+                .iter()
+                .any(|function| function.source_span.contains(fact.span))
+        })
+        .map(|fact| fact.span)
+        .collect::<Vec<_>>();
+    missing.sort();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(missing
+        .into_iter()
+        .map(|span| {
+            Diagnostic::internal_compiler_error(
+                "the compiler lowered an unsafe context without its region",
+                "an unsafe context in an emitted function and a live branch has no MIR region",
+                span,
+            )
+        })
+        .collect())
+}

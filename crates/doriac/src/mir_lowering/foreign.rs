@@ -122,7 +122,7 @@ pub(super) fn expression(
     if let Some(value) = null_safe_member(expr, expected, context)? {
         return Ok(Some(value));
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         // The name of a C-callable Doria function is the address of its C entry
         // (section 12).
         hir::Expr::Identifier { name, span }
@@ -248,7 +248,7 @@ pub(super) fn expression(
                 }
                 crate::foreign_handles::HandleOperation::Reclaim
                 | crate::foreign_handles::HandleOperation::Borrow => {
-                    let ty = context.expression_type(unparenthesized_place(expr))?;
+                    let ty = context.expression_type(unparenthesized_place(expr, context))?;
                     let reclaim = operation == crate::foreign_handles::HandleOperation::Reclaim;
                     let handle = materialize_pointer(argument, context)?;
                     handle_value_type(ty, *span)?;
@@ -419,7 +419,7 @@ pub(super) fn statement(expr: &hir::Expr, context: &mut LoweringContext) -> Diag
         args,
         null_safe,
         span,
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(false);
     };
@@ -553,7 +553,7 @@ fn null_safe_member(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
-    let (object, name, args, span) = match unparenthesized_place(expr) {
+    let (object, name, args, span) = match unparenthesized_place(expr, context) {
         hir::Expr::MethodCall {
             object,
             method,
@@ -911,7 +911,7 @@ fn field_place(
         null_safe,
         span,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(None);
     };
@@ -962,7 +962,7 @@ fn field_place(
     }
     let aggregate_type = aggregate_type(&object_type, object.span(), context)?;
     let mut stored = true;
-    let aggregate = match unparenthesized_place(object) {
+    let aggregate = match unparenthesized_place(object, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
@@ -1121,7 +1121,7 @@ fn pointer_place(
     writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::InlinePlace, u64)> {
-    let place = unparenthesized_place(expr);
+    let place = unparenthesized_place(expr, context);
     if let Some(field) = field_place(place, writable, context)? {
         if !field.stored {
             return Err(vec![unsupported(
@@ -1191,7 +1191,7 @@ fn element_rvalue(
     }
     let hir::Expr::Index {
         collection, index, ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(None);
     };
@@ -1331,7 +1331,7 @@ fn null_safe_field_read(
         take: false,
         span,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     else {
         return Ok(None);
     };
@@ -1351,7 +1351,7 @@ fn null_safe_field_read(
     let writable = present.is_writable_region();
     // A local is tested and read in place. A stored receiver is tested
     // through a copy and read in place.
-    let local = match unparenthesized_place(object) {
+    let local = match unparenthesized_place(object, context) {
         hir::Expr::Variable { name, span } => Some(context.lookup_local(name, *span)?)
             .filter(|local| context.local_type(*local) == nullable_type),
         _ => None,
@@ -1420,7 +1420,7 @@ fn stored_nullable_receiver(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::NullableForeignAggregateExpression, mir::InlinePlace)>> {
     let nullable = mir::Type::NullableForeignAggregate(aggregate);
-    let object = unparenthesized_place(object);
+    let object = unparenthesized_place(object, context);
     if context.constant_value(object).is_some() {
         return Ok(None);
     }
@@ -1657,7 +1657,10 @@ pub(super) fn aggregate_expression(
     ty: mir::ForeignAggregateType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ForeignAggregateExpression> {
-    if let Some(value) = context.constant_value(unparenthesized_place(expr)).cloned() {
+    if let Some(value) = context
+        .constant_value(unparenthesized_place(expr, context))
+        .cloned()
+    {
         let lowered = lower_const_rvalue(
             &value,
             mir::Type::ForeignAggregate(ty),
@@ -1673,9 +1676,9 @@ pub(super) fn aggregate_expression(
     }
     // `??`, `when` and `match` merge their branches through the shared
     // branching lowering, as every other value family's does.
-    if is_branching_expr(unparenthesized_place(expr)) {
+    if is_branching_expr(unparenthesized_place(expr, context)) {
         let value = lower_branching_rvalue(
-            unparenthesized_place(expr),
+            unparenthesized_place(expr, context),
             mir::Type::ForeignAggregate(ty),
             false,
             context,
@@ -1694,7 +1697,7 @@ pub(super) fn aggregate_expression(
         };
         return Ok(element);
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::New {
             class_type,
             args,
@@ -1841,7 +1844,7 @@ pub(super) fn nullable_aggregate_expression(
     let nullable = mir::Type::NullableForeignAggregate(ty);
     if context.expression_is_null(expr)
         || matches!(
-            context.constant_value(unparenthesized_place(expr)),
+            context.constant_value(unparenthesized_place(expr, context)),
             Some(crate::const_eval::ConstValue::Null)
         )
     {
@@ -1849,12 +1852,12 @@ pub(super) fn nullable_aggregate_expression(
     }
     let present = |value| Ok(mir::NullableForeignAggregateExpression::Present(value));
     if context
-        .constant_value(unparenthesized_place(expr))
+        .constant_value(unparenthesized_place(expr, context))
         .is_some()
     {
         return present(aggregate_expression(expr, ty, context)?);
     }
-    match unparenthesized_place(expr) {
+    match unparenthesized_place(expr, context) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             if context.local_type(local) == nullable {
@@ -1900,7 +1903,7 @@ pub(super) fn nullable_aggregate_expression(
         return Ok(element);
     }
     if let Some((function, args, span)) =
-        aggregate_call(unparenthesized_place(expr), nullable, context)?
+        aggregate_call(unparenthesized_place(expr, context), nullable, context)?
     {
         return Ok(mir::NullableForeignAggregateExpression::Call {
             ty,
@@ -1909,9 +1912,9 @@ pub(super) fn nullable_aggregate_expression(
             span,
         });
     }
-    let value = if is_branching_expr(unparenthesized_place(expr)) {
+    let value = if is_branching_expr(unparenthesized_place(expr, context)) {
         Some(lower_branching_rvalue(
-            unparenthesized_place(expr),
+            unparenthesized_place(expr, context),
             nullable,
             false,
             context,

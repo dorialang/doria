@@ -226,7 +226,7 @@ pub(super) fn nullable_expression(
         args,
         null_safe: false,
         ..
-    } = unparenthesized_place(expr)
+    } = unparenthesized_place(expr, context)
     {
         if let Some((collection, key, stored, access)) =
             lower_dictionary_get(object, method, args, context)?
@@ -717,7 +717,7 @@ fn null_safe_operation<'e>(
     expr: &'e hir::Expr,
     context: &LoweringContext<'_>,
 ) -> DiagnosticResult<Option<NullSafeMember<'e>>> {
-    let (object, name, args, span, method) = match unparenthesized_place(expr) {
+    let (object, name, args, span, method) = match unparenthesized_place(expr, context) {
         hir::Expr::MethodCall {
             object,
             method,
@@ -946,7 +946,7 @@ pub(super) fn local(
             "byte region access requires a present region",
         )]);
     };
-    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr, context) {
         let local = context.lookup_local(name, *span)?;
         if context.local_type(local) == mir::Type::Region(kind) {
             return Ok(local);
