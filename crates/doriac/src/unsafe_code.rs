@@ -43,7 +43,7 @@ fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     (
         "Foreign Aggregates Cannot Be Built Here Yet",
         format!(
-            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results, pointer targets and instance properties, and not here yet"
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results, pointer targets, instance properties and enum payloads, and not here yet"
         ),
     )
 }
@@ -119,7 +119,7 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
         let holds_aggregate = function
             .locals
             .iter()
-            .any(|local| matches!(local.ty, crate::mir::Type::ForeignAggregate(_)));
+            .any(|local| holds_foreign_aggregate(program, local.ty, &mut HashSet::new()));
         if holds_aggregate && diagnostics.is_empty() && seen.insert(function.source_span) {
             diagnostics.push(companion_form(
                 function.source_span,
@@ -129,6 +129,29 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
         }
     }
     diagnostics
+}
+
+/// Whether a value of `ty` holds a foreign struct or union: the aggregate
+/// itself, or a payload enum with one in a case's payload.
+fn holds_foreign_aggregate(
+    program: &crate::mir::Program,
+    ty: crate::mir::Type,
+    visited: &mut HashSet<crate::enums::EnumId>,
+) -> bool {
+    match ty {
+        crate::mir::Type::ForeignAggregate(_) => true,
+        crate::mir::Type::PayloadEnum(payload) | crate::mir::Type::NullablePayloadEnum(payload) => {
+            visited.insert(payload.id)
+                && program.enums.get(payload.id.0).is_some_and(|definition| {
+                    definition.cases.iter().any(|case| {
+                        case.payload
+                            .iter()
+                            .any(|field| holds_foreign_aggregate(program, field.ty, visited))
+                    })
+                })
+        }
+        _ => false,
+    }
 }
 
 const AGGREGATE_TITLE: &str = "Foreign Structs And Unions Cannot Run In The Interpreter Yet";
@@ -229,10 +252,10 @@ impl Finder {
     }
 
     /// Reports a foreign struct or union `ty` holds where no execution
-    /// target builds one yet: anywhere in a static property or enum payload
-    /// type (`anywhere`), otherwise nullable, as a type argument other than
-    /// a pointer's pointee, or in a function type. Locals, parameters,
-    /// results, instance properties and pointees build.
+    /// target builds one yet: anywhere in a static property type
+    /// (`anywhere`), otherwise nullable, as a type argument other than a
+    /// pointer's pointee, or in a function type. Locals, parameters,
+    /// results, instance properties, enum payloads and pointees build.
     fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
         if self.aggregates.is_empty() {
             return;
@@ -282,8 +305,9 @@ impl Finder {
             }
             Item::Enum(declaration) => {
                 for case in &declaration.cases {
+                    // A payload field holds a foreign struct or union by
+                    // value in the enum's storage (Decision 0148 section 6).
                     for field in &case.payload {
-                        self.misplaced_aggregate(&field.ty, field.span, Some("an enum payload"));
                         self.type_refs(&mut field.ty.clone(), field.span);
                     }
                     if let Some(value) = &case.backing_value {

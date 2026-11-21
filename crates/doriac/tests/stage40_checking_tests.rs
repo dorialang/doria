@@ -1946,3 +1946,22 @@ fn foreign_aggregate_properties_follow_the_object_path() {
         "a readonly parameter's property field"
     );
 }
+
+#[test]
+fn enum_payloads_holding_foreign_aggregates_have_no_equality() {
+    // A foreign struct or union has no `==` (Decision 0148 section 6), so
+    // neither has an enum whose payload holds one.
+    let declaration =
+        "extern \"C\" struct Color { uint8 $red; } enum Paint { case Solid(Color $color); }";
+    let built = format!(
+        "{declaration} function main(): void {{ let $paint = Paint::Solid(new Color(red: 1)); }}"
+    );
+    assert!(codes(&built).is_empty(), "{:#?}", findings(&built));
+    let compared = format!(
+        "{declaration} function main(): void {{ let $paint = Paint::Solid(new Color(red: 1)); echo $paint == $paint; }}"
+    );
+    assert!(
+        !codes(&compared).is_empty(),
+        "an aggregate payload has no equality"
+    );
+}

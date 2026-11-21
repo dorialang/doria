@@ -668,7 +668,6 @@ fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
         ),
         ("function main(): void { ?Color $maybe = null; }", "a nullable value"),
         ("function keep(Color[] $colors): void {}", "a nullable value"),
-        ("enum Paint { case Solid(Color $color); }", "an enum payload"),
         ("function main(): void { let $show = function(Color $color): void {}; }", "a closure parameter"),
         (
             "function main(): void { let $color = new Color(red: 1, green: 2, blue: 3); let $show = function(): void with ($color) { echo $color->red; }; $show(); }",
@@ -737,6 +736,22 @@ fn the_interpreter_and_php_output_report_foreign_aggregates() {
     let debug = doriac::compile_source(
         "stage40.doria",
         property,
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter runs foreign aggregates through the companion");
+    assert!(
+        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
+        "{debug:#?}"
+    );
+    // An enum whose payload holds an aggregate is reported where it is
+    // held.
+    let payload = format!(
+        "{AGGREGATES}enum Paint {{ case Solid(Color $color); }} function show(Paint $paint): void {{}} function main(): void {{ show(Paint::Solid(new Color(red: 1, green: 2, blue: 3))); }}"
+    );
+    let debug = doriac::compile_source(
+        "stage40.doria",
+        payload,
         doriac::backend::BackendTarget::Debug,
     )
     .expect_err("the interpreter runs foreign aggregates through the companion");
@@ -3040,4 +3055,50 @@ function main(): void
 "
     );
     assert_runs_natively(&source, "105 7 111 9 2 257");
+}
+
+#[test]
+fn foreign_aggregates_are_enum_payloads() {
+    // Decision 0148 section 6: a payload field holds the aggregate by
+    // value in the enum's storage, through construction, matching, copies
+    // and a property of the enum type.
+    let source = format!(
+        "{AGGREGATES}
+enum Paint
+{{
+    case None;
+    case Solid(Color $color);
+    case Mixed(Color $first, int32 $weight, Pixel $pixel);
+}}
+
+function describe(Paint $paint): string
+{{
+    return match ($paint) {{
+        Paint::None => \"none\",
+        Paint::Solid($color) => \"solid {{$color->red}}\",
+        Paint::Mixed($first, $weight, $pixel) => \"mixed {{$first->green}} {{$weight}} {{$pixel->color->blue}}\",
+    }};
+}}
+
+class Canvas
+{{
+    writable Paint $paint = Paint::None;
+}}
+
+function main(): void
+{{
+    let $color = new Color(red: 10, green: 20, blue: 30);
+    echo describe(Paint::None) . \" \";
+    let writable $paint = Paint::Solid($color);
+    echo describe($paint) . \" \";
+    $paint = Paint::Mixed($color, 7, new Pixel(x: 1, y: 2, color: new Color(red: 4, green: 5, blue: 6), weight: 0.5, visible: true));
+    echo describe($paint) . \" \";
+    writable Canvas $canvas = new Canvas();
+    $canvas->paint = $paint;
+    $paint = Paint::None;
+    echo describe($canvas->paint) . \" \" . describe($paint);
+}}
+"
+    );
+    assert_runs_natively(&source, "none solid 10 mixed 20 7 6 mixed 20 7 6 none");
 }
