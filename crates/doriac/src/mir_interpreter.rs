@@ -14175,6 +14175,40 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// A writable parameter or capture names a place outside its frame, and
+    /// the frame keeps a working copy of it. A call that received the same
+    /// place may have changed it, so when control returns to the frame the
+    /// copy is reloaded from the place, as the native backends reload a
+    /// borrowed slot from its home before reading it.
+    fn refresh_writable_homes(&mut self) -> Result<(), InterpreterError> {
+        let Some(frame) = self.frames.last() else {
+            return Ok(());
+        };
+        let function = function_in(self.program, frame.function)?;
+        let captures = function
+            .closure
+            .iter()
+            .flat_map(|closure| closure.capture_locals.iter().map(|(_, local)| *local));
+        let mut updates = Vec::new();
+        for local in function.params.iter().copied().chain(captures) {
+            let Some(origin) = frame.local_origins.get(local.0).copied().flatten() else {
+                continue;
+            };
+            if !function.is_writable_borrowed_place(local)
+                || frame.locals.get(local.0).is_none_or(Option::is_none)
+            {
+                continue;
+            }
+            let ty = local_in(function, local)?.ty;
+            updates.push((local, self.read_place(InterpreterPlace { ty, ..origin })?));
+        }
+        let frame = self.current_frame_mut()?;
+        for (local, value) in updates {
+            frame.locals[local.0] = Some(value);
+        }
+        Ok(())
+    }
+
     fn complete_frame(
         &mut self,
         outcome: FunctionOutcome,
@@ -14187,6 +14221,7 @@ impl<'a> Interpreter<'a> {
         for drop in closure_drops.into_iter().rev() {
             self.push_owned_drop_task(drop)?;
         }
+        self.refresh_writable_homes()?;
         if let Some((result, target)) = frame.indirect_continuation {
             let assignment = match (result, outcome) {
                 (Some(result), FunctionOutcome::Value(value)) => Some((result, value)),

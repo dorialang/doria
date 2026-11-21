@@ -7665,7 +7665,7 @@ impl Checker<'_> {
                         let mode = self.use_owned_expression(key, scopes);
                         self.activate_place_input_borrows(key, scopes);
                         if mode == UseMode::Read {
-                            self.activate_borrow(key, mode, scopes);
+                            self.record_checked_borrow(key, mode, scopes);
                         }
                     }
                     let mode = self.use_owned_expression(&element.value, scopes);
@@ -7678,7 +7678,7 @@ impl Checker<'_> {
                     }
                     self.activate_place_input_borrows(&element.value, scopes);
                     if mode == UseMode::Read {
-                        self.activate_borrow(&element.value, mode, scopes);
+                        self.record_checked_borrow(&element.value, mode, scopes);
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
@@ -7694,7 +7694,7 @@ impl Checker<'_> {
                     );
                 }
                 self.activate_place_input_borrows(value, scopes);
-                self.activate_borrow(value, UseMode::Read, scopes);
+                self.record_checked_borrow(value, UseMode::Read, scopes);
                 self.use_read_with_place_borrow(count, scopes);
                 self.active_borrows.truncate(borrow_depth);
             }
@@ -8094,7 +8094,7 @@ impl Checker<'_> {
         let retained_scrutinee = self.retained_value_from_expr(scrutinee, scopes);
         let borrow_root = self.borrow_source_root(scrutinee, scopes);
         if !consuming {
-            self.activate_place_borrow(scrutinee, UseMode::Read, scopes);
+            self.record_checked_borrow(scrutinee, UseMode::Read, scopes);
         }
 
         let mut remaining = scopes.clone();
@@ -8739,7 +8739,7 @@ impl Checker<'_> {
             }
             self.activate_place_input_borrows(&argument.value, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.activate_borrow(&argument.value, mode, scopes);
+                self.record_checked_borrow(&argument.value, mode, scopes);
             }
             self.activate_retained_value_borrows(&argument.value, scopes);
         }
@@ -8966,7 +8966,7 @@ impl Checker<'_> {
             }
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.activate_borrow(arg, mode, scopes);
+                self.record_checked_borrow(arg, mode, scopes);
             }
             self.activate_retained_value_borrows(arg, scopes);
         }
@@ -9014,6 +9014,22 @@ impl Checker<'_> {
         let through = self.borrow_input_bindings(expr, scopes);
         for root in self.borrow_root_keys(expr, scopes) {
             self.activate_borrow_root(root, mode, expr.span(), &through, scopes);
+        }
+    }
+
+    /// Records the loan an expression keeps after its use: a call argument
+    /// or receiver, an operand, an element or a scrutinee. The use, in the
+    /// same mode, already checked that access against every live loan,
+    /// retained value and assignment destination, so the access is checked
+    /// once and each conflict is reported once. Later accesses still meet
+    /// the recorded loan.
+    fn record_checked_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
+        for root in self.borrow_root_keys(expr, scopes) {
+            self.active_borrows.push(ActiveBorrow {
+                root,
+                mode,
+                span: expr.span(),
+            });
         }
     }
 
@@ -9109,16 +9125,13 @@ impl Checker<'_> {
         }
         match expr {
             Expr::PropertyAccess { object, .. } => {
-                let through = self.borrow_input_bindings(expr, scopes);
                 for root in self.borrow_root_keys(expr, scopes) {
                     if !self.active_assignment_writes.contains(&root) {
-                        self.activate_borrow_root(
+                        self.active_borrows.push(ActiveBorrow {
                             root,
-                            UseMode::Read,
-                            expr.span(),
-                            &through,
-                            scopes,
-                        );
+                            mode: UseMode::Read,
+                            span: expr.span(),
+                        });
                     }
                 }
                 self.activate_place_input_borrows(object, scopes);
@@ -9233,7 +9246,7 @@ impl Checker<'_> {
                 .is_some_and(|borrow| borrow.source == BorrowSource::Receiver);
             if !result_continues_receiver_borrow {
                 if let Some(mode @ (UseMode::Read | UseMode::Write)) = signature.receiver {
-                    self.activate_borrow(receiver, mode, scopes);
+                    self.record_checked_borrow(receiver, mode, scopes);
                 }
             }
         }
@@ -9260,7 +9273,7 @@ impl Checker<'_> {
                         .is_some_and(|borrow| borrow.source == BorrowSource::Parameter(param))
                 });
             if matches!(mode, UseMode::Read | UseMode::Write) && !result_continues_argument_borrow {
-                self.activate_borrow(arg, mode, scopes);
+                self.record_checked_borrow(arg, mode, scopes);
             }
         }
     }
@@ -9268,7 +9281,7 @@ impl Checker<'_> {
     fn use_read_with_place_borrow(&mut self, expr: &Expr, scopes: &mut Scopes) {
         self.use_expr(expr, scopes, UseMode::Read);
         self.activate_place_input_borrows(expr, scopes);
-        self.activate_borrow(expr, UseMode::Read, scopes);
+        self.record_checked_borrow(expr, UseMode::Read, scopes);
     }
 
     fn check_writable_move_argument(&mut self, expr: &Expr, scopes: &Scopes) {

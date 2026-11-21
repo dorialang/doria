@@ -1971,9 +1971,8 @@ function main(): void
 "#;
     let diagnostics = doriac::check_source("writable-copy-places.doria", source)
         .expect_err("writable Copy arguments need writable places");
-    // The checking API returns raw findings, which repeat the conflict;
-    // diagnostic presentation shows it once.
-    let mut found = diagnostics
+    // Each conflict is one finding: the argument's access is checked once.
+    let found = diagnostics
         .iter()
         .map(|diagnostic| {
             (
@@ -1982,7 +1981,6 @@ function main(): void
             )
         })
         .collect::<Vec<_>>();
-    found.dedup();
     assert_eq!(
         found,
         [
@@ -1994,5 +1992,48 @@ function main(): void
             ("E0477", "$n"),
         ],
         "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn lent_copy_parameters_read_their_own_and_nested_writes_on_every_backend() {
+    // A lent parameter's working copy follows its home after the callee
+    // assigns it and after a call it lends the same home to returns. LLVM
+    // once cleared the copy at assignment, so `$value != null` read false.
+    assert_execution(
+        r#"
+enum Packet { case Number(int $count); case Label(string $text); case Empty; }
+function replaceOptional(writable ?Packet $value): bool { $value = Packet::Number(7); return $value != null; }
+function relabel(writable Packet $value): bool { $value = Packet::Label("new"); return $value == Packet::Label("new"); }
+function forward(writable ?Packet $value): bool { let $changed = replaceOptional($value); return $changed && $value != null; }
+function append(writable string $text, string $suffix): void { $text = $text . $suffix; }
+function bumpBy(writable int $count, int $step): void { $count += $step; }
+function bumpTwice(writable int $count): int { bumpBy($count, 1); echo "mid {$count}\n"; bumpBy($count, 1); return $count; }
+class Builder {
+    function twice(writable string $text): string { append($text, "a"); append($text, "b"); return $text; }
+}
+function main(): void {
+    writable ?Packet $optional = null;
+    let $replaced = replaceOptional($optional);
+    echo "{$replaced} " . ($optional != null) . "\n";
+    let writable $packet = Packet::Empty;
+    let $relabeled = relabel($packet);
+    echo "{$relabeled} " . ($packet == Packet::Label("new")) . "\n";
+    $optional = null;
+    let $forwarded = forward($optional);
+    echo "{$forwarded} " . ($optional != null) . "\n";
+    let writable $count = 1;
+    let $result = bumpTwice($count);
+    echo "{$result} {$count}\n";
+    let writable $text = "x";
+    let $builder = new Builder();
+    let $built = $builder->twice($text);
+    echo "{$built} {$text}\n";
+    let $closure = function (writable int $value): int { bumpBy($value, 2); bumpBy($value, 3); return $value; };
+    let $total = $closure($count);
+    echo "{$total} {$count}\n";
+}
+"#,
+        "true true\ntrue true\ntrue true\nmid 2\n3 3\nxab xab\n8 8\n",
     );
 }

@@ -4581,7 +4581,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
-    fn sync_nominal_borrow_home(
+    /// Writes a writable home's working copy back to the place it names, in
+    /// that place's stored form. The home owns the value; the local's slot
+    /// stays its current copy, so a read after the write sees it whether or
+    /// not the read refreshes from the home (Cranelift's
+    /// `restore_nominal_borrow_home` keeps the same rule).
+    fn restore_nominal_borrow_home(
         &self,
         home: BorrowHome<'ctx>,
         source: PointerValue<'ctx>,
@@ -4600,9 +4605,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             build(self.builder.build_store(home.address, projected))?;
             Ok(())
-        })?;
-        build(self.builder.build_store(source, source_ty.const_zero()))?;
-        Ok(())
+        })
     }
 
     fn direct_call_borrow_home(
@@ -6119,7 +6122,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     {
                         self.sync_borrowed_string_capture(home, slot, local.ty)?;
                     } else if native_closure_abi::borrow_home_type_key(local.ty) != 0 {
-                        self.sync_nominal_borrow_home(home, slot, local.ty)?;
+                        self.restore_nominal_borrow_home(home, slot, local.ty)?;
                     } else if let Some(layout) = native_closure_abi::memory_value_layout(local.ty) {
                         self.copy_memory_value(address, slot, layout)?;
                     } else {
@@ -10175,6 +10178,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let _ =
                 self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed_value.into()])?;
             return Ok(destination);
+        }
+        // A writable home's slot is its working copy; a call that received the
+        // same home may have changed it, so the copy is reloaded before use.
+        if let mir::PayloadEnumPlace::Local(local)
+        | mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) = place
+        {
+            self.refresh_borrowed_local(*local)?;
         }
         let (source, narrowed_nullable_source) = match place {
             mir::PayloadEnumPlace::Local(local) => (local_slot(&self.local_slots, *local)?, None),

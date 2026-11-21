@@ -12470,6 +12470,13 @@ fn lower_payload_enum_place(
         )?;
         return Ok(destination);
     }
+    // A writable home's slot is its working copy; a call that received the
+    // same home may have changed it, so the copy is reloaded before use.
+    if let mir::PayloadEnumPlace::Local(local)
+    | mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) = place
+    {
+        refresh_borrowed_local(builder, *local, resources)?;
+    }
     let (source, narrowed_nullable_source) = match place {
         mir::PayloadEnumPlace::Local(local) => (
             builder
