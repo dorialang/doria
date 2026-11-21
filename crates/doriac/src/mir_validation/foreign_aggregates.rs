@@ -134,6 +134,17 @@ fn place_facts(
             let local = local_in(function, local)?;
             (local.ty, local.writable)
         }
+        // Checking proved the `?Name` local present; its payload is the
+        // aggregate.
+        mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
+            let local = local_in(function, local)?;
+            let mir::Type::NullableForeignAggregate(aggregate) = local.ty else {
+                return Err(malformed_mir(
+                    "a narrowed foreign field access names a local without a `?Name` value",
+                ));
+            };
+            (mir::Type::ForeignAggregate(aggregate), local.writable)
+        }
         mir::ForeignAggregatePlace::Property { object, property } => {
             let object = local_in(function, object)?;
             let mir::Type::Class(class) = object.ty else {
@@ -276,14 +287,73 @@ pub(super) fn validate_expression(
             function: callee,
             args,
             ..
-        } => {
-            let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::ForeignAggregate(ty)) {
+        } => validate_call(
+            program,
+            function,
+            *callee,
+            args,
+            mir::Type::ForeignAggregate(ty),
+        ),
+        mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { local, .. } => {
+            if local_in(function, *local)?.ty != mir::Type::NullableForeignAggregate(ty) {
                 return Err(malformed_mir(
-                    "a foreign aggregate call targets a function with another return type",
+                    "a narrowed foreign aggregate copy names a local without its `?Name` value",
                 ));
             }
-            validate_call_args(program, function, callee, args)
+            Ok(())
         }
+    }
+}
+
+fn validate_call(
+    program: &mir::Program,
+    function: &mir::Function,
+    callee: mir::FunctionId,
+    args: &[mir::Rvalue],
+    result: mir::Type,
+) -> Result<(), BackendError> {
+    let callee = function_in(program, callee)?;
+    if callee.return_type != mir::ReturnType::Value(result) {
+        return Err(malformed_mir(
+            "a foreign aggregate call targets a function with another return type",
+        ));
+    }
+    validate_call_args(program, function, callee, args)
+}
+
+/// A `?Name` value: `null`, a present aggregate value, or a copy of a
+/// local, property, static property or call result of the nullable type.
+pub(super) fn validate_nullable_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableForeignAggregateExpression,
+) -> Result<(), BackendError> {
+    let ty = expression.ty();
+    definition_in(program, ty)?;
+    let nullable = mir::Type::NullableForeignAggregate(ty);
+    match expression {
+        mir::NullableForeignAggregateExpression::Null(_) => Ok(()),
+        mir::NullableForeignAggregateExpression::Present(value) => {
+            validate_expression(program, function, value)
+        }
+        mir::NullableForeignAggregateExpression::Local { local, .. } => {
+            if local_in(function, *local)?.ty != nullable {
+                return Err(malformed_mir(
+                    "a `?Name` copy names a local of another type",
+                ));
+            }
+            Ok(())
+        }
+        mir::NullableForeignAggregateExpression::Property {
+            object, property, ..
+        } => validate_property_operand(program, function, *object, *property, nullable),
+        mir::NullableForeignAggregateExpression::Static { id, .. } => {
+            validate_static_operand(program, *id, nullable)
+        }
+        mir::NullableForeignAggregateExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => validate_call(program, function, *callee, args, nullable),
     }
 }

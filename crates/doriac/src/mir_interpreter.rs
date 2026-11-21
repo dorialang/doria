@@ -1943,7 +1943,10 @@ impl<'a> Interpreter<'a> {
                 let definition = local_in(function, target)?;
                 self.queue_assignment_origin(function, target, &value)?;
                 match (definition.ty, value) {
-                    (mir::Type::ForeignAggregate(_), _) => return Err(foreign_aggregate_refusal()),
+                    (
+                        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_),
+                        _,
+                    ) => return Err(foreign_aggregate_refusal()),
                     (mir::Type::String, mir::Rvalue::String(expression)) => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
@@ -3305,7 +3308,9 @@ impl<'a> Interpreter<'a> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableFunction(value)),
-                mir::Rvalue::ForeignAggregate(_) => return Err(foreign_aggregate_refusal()),
+                mir::Rvalue::ForeignAggregate(_) | mir::Rvalue::NullableForeignAggregate(_) => {
+                    return Err(foreign_aggregate_refusal())
+                }
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -7944,6 +7949,9 @@ impl<'a> Interpreter<'a> {
                 frame
                     .tasks
                     .push(EvaluationTask::NullablePayloadEnum(*value));
+            }
+            mir::BoolExpression::NullableForeignAggregateIsPresent(_) => {
+                return Err(foreign_aggregate_refusal())
             }
             mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
                 let frame = self.current_frame_mut()?;

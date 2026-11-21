@@ -1249,7 +1249,8 @@ fn static_value_matches(
             mir::StaticValue::Null,
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
-            | mir::Type::NullablePayloadEnum(_),
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::NullableForeignAggregate(_),
         ) => Ok(true),
         (
             mir::StaticValue::PayloadEnum(value),
@@ -1271,11 +1272,10 @@ fn static_value_matches(
             }
             Ok(true)
         }
-        (mir::StaticValue::ForeignAggregate(value), mir::Type::ForeignAggregate(expected))
-            if value.ty == expected =>
-        {
-            foreign_aggregates::constant_matches(program, value)
-        }
+        (
+            mir::StaticValue::ForeignAggregate(value),
+            mir::Type::ForeignAggregate(expected) | mir::Type::NullableForeignAggregate(expected),
+        ) if value.ty == expected => foreign_aggregates::constant_matches(program, value),
         _ => Ok(false),
     }
 }
@@ -1835,6 +1835,10 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         }
         mir::Type::ForeignAggregate(ty) => FieldType::Aggregate {
             size: ty.size,
+            align: ty.align,
+        },
+        mir::Type::NullableForeignAggregate(ty) => FieldType::Aggregate {
+            size: ty.nullable_size,
             align: ty.align,
         },
     }
@@ -2676,7 +2680,7 @@ fn validate_payload_enum_type(
             ty.id.0
         )));
     }
-    let nullable = crate::enums::nullable_enum_layout(&definition.layout)
+    let nullable = crate::enums::nullable_inline_layout(definition.layout.shape())
         .map_err(|_| malformed_mir("payload enum has an invalid nullable layout"))?;
     if ty.size != definition.layout.size
         || ty.align != definition.layout.align
@@ -2960,12 +2964,20 @@ fn validate_statement(
                 ) if expression.ty() == expected => {
                     foreign_aggregates::validate_expression(program, function, expression)
                 }
-                (mir::Type::ForeignAggregate(_), _) | (_, mir::Rvalue::ForeignAggregate(_)) => {
-                    Err(malformed_mir(format!(
-                        "local{} and its foreign aggregate value have different types",
-                        target.0
-                    )))
+                (
+                    mir::Type::NullableForeignAggregate(expected),
+                    mir::Rvalue::NullableForeignAggregate(expression),
+                ) if expression.ty() == expected => {
+                    foreign_aggregates::validate_nullable_expression(program, function, expression)
                 }
+                (mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_), _)
+                | (
+                    _,
+                    mir::Rvalue::ForeignAggregate(_) | mir::Rvalue::NullableForeignAggregate(_),
+                ) => Err(malformed_mir(format!(
+                    "local{} and its foreign aggregate value have different types",
+                    target.0
+                ))),
                 (mir::Type::PayloadEnum(expected), mir::Rvalue::PayloadEnum(expression))
                     if expression.ty() == expected =>
                 {
@@ -6885,6 +6897,9 @@ fn validate_rvalue(
         }
         mir::Rvalue::ForeignAggregate(value) => {
             foreign_aggregates::validate_expression(program, function, value)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => {
+            foreign_aggregates::validate_nullable_expression(program, function, value)
         }
     }?;
     let mut accesses = ClassLocalAccesses::default();
@@ -13010,24 +13025,80 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullableFunction(value) => {
             collect_nullable_function_class_local_accesses(value, accesses)
         }
-        mir::Rvalue::ForeignAggregate(value) => match value {
-            mir::ForeignAggregateExpression::Construct { fields, .. } => {
-                for field in fields {
-                    collect_rvalue_class_local_accesses(&field.value, accesses);
-                }
+        mir::Rvalue::ForeignAggregate(value) => {
+            collect_foreign_aggregate_class_local_accesses(value, accesses)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => {
+            collect_rvalue_class_local_accesses_of_nullable_aggregate(value, accesses)
+        }
+    }
+}
+
+fn collect_rvalue_class_local_accesses_of_nullable_aggregate<'a>(
+    value: &'a mir::NullableForeignAggregateExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullableForeignAggregateExpression::Present(value) => {
+            collect_foreign_aggregate_class_local_accesses(value, accesses)
+        }
+        mir::NullableForeignAggregateExpression::Local { local, .. } => {
+            accesses.resource_read(*local)
+        }
+        mir::NullableForeignAggregateExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        mir::NullableForeignAggregateExpression::Null(_)
+        | mir::NullableForeignAggregateExpression::Static { .. } => {}
+        mir::NullableForeignAggregateExpression::Call { args, .. } => {
+            for arg in args {
+                collect_rvalue_class_local_accesses(arg, accesses);
             }
-            mir::ForeignAggregateExpression::Local { local, .. } => accesses.resource_read(*local),
-            mir::ForeignAggregateExpression::Property {
-                object, property, ..
-            } => accesses.borrow_property(*object, *property),
-            // A static is no local's storage.
-            mir::ForeignAggregateExpression::Static { .. } => {}
-            mir::ForeignAggregateExpression::Call { args, .. } => {
-                for arg in args {
-                    collect_rvalue_class_local_accesses(arg, accesses);
-                }
+        }
+    }
+}
+
+/// Whether the `?Name` value is present on every path: a present value, or
+/// a copy of a local proved present.
+fn nullable_foreign_aggregate_is_present(
+    value: &mir::NullableForeignAggregateExpression,
+    present: &HashSet<mir::LocalId>,
+) -> bool {
+    match value {
+        mir::NullableForeignAggregateExpression::Present(_) => true,
+        mir::NullableForeignAggregateExpression::Local { local, .. } => present.contains(local),
+        mir::NullableForeignAggregateExpression::Null(_)
+        | mir::NullableForeignAggregateExpression::Property { .. }
+        | mir::NullableForeignAggregateExpression::Static { .. }
+        | mir::NullableForeignAggregateExpression::Call { .. } => false,
+    }
+}
+
+fn collect_foreign_aggregate_class_local_accesses<'a>(
+    value: &'a mir::ForeignAggregateExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::ForeignAggregateExpression::Construct { fields, .. } => {
+            for field in fields {
+                collect_rvalue_class_local_accesses(&field.value, accesses);
             }
-        },
+        }
+        mir::ForeignAggregateExpression::Local { local, .. } => accesses.resource_read(*local),
+        mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { local, .. } => {
+            accesses.resource_read(*local);
+            accesses.assume_nullable_present(*local)
+        }
+        mir::ForeignAggregateExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        // A static is no local's storage.
+        mir::ForeignAggregateExpression::Static { .. } => {}
+        mir::ForeignAggregateExpression::Call { args, .. } => {
+            for arg in args {
+                collect_rvalue_class_local_accesses(arg, accesses);
+            }
+        }
     }
 }
 
@@ -14465,6 +14536,9 @@ fn collect_bool_class_local_accesses<'a>(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             collect_nullable_payload_enum_class_local_accesses(value, accesses);
         }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            collect_rvalue_class_local_accesses_of_nullable_aggregate(value, accesses);
+        }
         mir::BoolExpression::NullableFunctionIsPresent(value) => {
             collect_nullable_function_class_local_accesses(value, accesses);
         }
@@ -14754,6 +14828,10 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         } => {
             match aggregate {
                 mir::ForeignAggregatePlace::Local(local) => accesses.resource_read(*local),
+                mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
+                    accesses.resource_read(*local);
+                    accesses.assume_nullable_present(*local)
+                }
                 // A field access uses one stored path, not the receiver as a
                 // whole (Decision 0136), as a property store does.
                 mir::ForeignAggregatePlace::Property { object, property } => {
@@ -18596,6 +18674,10 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullablePayloadEnum(_), mir::Rvalue::NullablePayloadEnum(value)) => {
                     nullable_payload_enum_expression_is_present(value, present)
                 }
+                (
+                    mir::Type::NullableForeignAggregate(_),
+                    mir::Rvalue::NullableForeignAggregate(value),
+                ) => nullable_foreign_aggregate_is_present(value, present),
                 _ => return Ok(()),
             };
             if value_is_present {
@@ -18628,6 +18710,10 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullablePayloadEnum(_), mir::Rvalue::NullablePayloadEnum(value)) => {
                     nullable_payload_enum_expression_is_present(value, present)
                 }
+                (
+                    mir::Type::NullableForeignAggregate(_),
+                    mir::Rvalue::NullableForeignAggregate(value),
+                ) => nullable_foreign_aggregate_is_present(value, present),
                 _ => return Ok(()),
             };
             for target in targets {
@@ -19312,6 +19398,11 @@ fn apply_nullable_presence_condition(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             if let Some(local) = nullable_payload_enum_presence_local(value) {
                 set_nullable_presence(local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            if let mir::NullableForeignAggregateExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
             }
         }
         mir::BoolExpression::PayloadEnumIsCase {
@@ -21067,21 +21158,48 @@ fn rvalue_observes_property(
         mir::Rvalue::NullablePayloadEnum(value) => {
             nullable_payload_enum_observes_property(value, receiver, property)
         }
-        mir::Rvalue::ForeignAggregate(value) => match value {
-            mir::ForeignAggregateExpression::Construct { fields, .. } => fields
-                .iter()
-                .any(|field| rvalue_observes_property(&field.value, receiver, property)),
-            mir::ForeignAggregateExpression::Call { args, .. } => args
+        mir::Rvalue::ForeignAggregate(value) => {
+            foreign_aggregate_observes_property(value, receiver, property)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => match value {
+            mir::NullableForeignAggregateExpression::Present(value) => {
+                foreign_aggregate_observes_property(value, receiver, property)
+            }
+            mir::NullableForeignAggregateExpression::Call { args, .. } => args
                 .iter()
                 .any(|arg| rvalue_observes_property(arg, receiver, property)),
-            mir::ForeignAggregateExpression::Property {
+            mir::NullableForeignAggregateExpression::Property {
                 object,
                 property: observed,
                 ..
             } => *object == receiver && *observed == property,
-            mir::ForeignAggregateExpression::Local { .. }
-            | mir::ForeignAggregateExpression::Static { .. } => false,
+            mir::NullableForeignAggregateExpression::Null(_)
+            | mir::NullableForeignAggregateExpression::Local { .. }
+            | mir::NullableForeignAggregateExpression::Static { .. } => false,
         },
+    }
+}
+
+fn foreign_aggregate_observes_property(
+    value: &mir::ForeignAggregateExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::ForeignAggregateExpression::Construct { fields, .. } => fields
+            .iter()
+            .any(|field| rvalue_observes_property(&field.value, receiver, property)),
+        mir::ForeignAggregateExpression::Call { args, .. } => args
+            .iter()
+            .any(|arg| rvalue_observes_property(arg, receiver, property)),
+        mir::ForeignAggregateExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::ForeignAggregateExpression::Local { .. }
+        | mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { .. }
+        | mir::ForeignAggregateExpression::Static { .. } => false,
     }
 }
 
@@ -22125,6 +22243,11 @@ fn bool_observes_property(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             nullable_payload_enum_observes_property(value, receiver, property)
         }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => rvalue_observes_property(
+            &mir::Rvalue::NullableForeignAggregate(value.as_ref().clone()),
+            receiver,
+            property,
+        ),
         mir::BoolExpression::PayloadEnumCompare { left, right, .. } => {
             payload_enum_observes_property(left, receiver, property)
                 || payload_enum_observes_property(right, receiver, property)
@@ -23745,6 +23868,9 @@ fn validate_condition(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             validate_nullable_payload_enum_expression(program, function, value)
         }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            foreign_aggregates::validate_nullable_expression(program, function, value)
+        }
         mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
             validate_payload_enum_comparison(program, function, *op, left, right)
         }
@@ -24875,14 +25001,10 @@ fn validate_null_safe_call(
         mir::Type::Region(kind) => mir::Type::NullableRegion(kind),
         mir::Type::PayloadEnum(payload) => mir::Type::NullablePayloadEnum(payload),
         mir::Type::Function(function_type) => mir::Type::NullableFunction(function_type),
+        mir::Type::ForeignAggregate(ty) => mir::Type::NullableForeignAggregate(ty),
         mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "null-safe calls cannot expose closure environments",
-            ));
-        }
-        mir::Type::ForeignAggregate(_) => {
-            return Err(malformed_mir(
-                "a foreign struct or union has no nullable form for a null-safe call",
             ));
         }
         mir::Type::NullableScalar(_)
@@ -24894,6 +25016,7 @@ fn validate_null_safe_call(
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableFunction(_)
         | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)

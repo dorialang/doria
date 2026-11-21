@@ -22366,47 +22366,54 @@ impl<'program> Checker<'program> {
         if let crate::const_eval::ConstType::NullOnly(ty) = &ty {
             return self.resolve_type_ref(ty, Span::default());
         }
-        let kind = match ty {
-            crate::const_eval::ConstType::NullOnly(_) => unreachable!(),
-            crate::const_eval::ConstType::Inline(ty) => {
-                TypeKind::Class(ClassType::new(ty.name().to_string(), Vec::new()))
-            }
-            crate::const_eval::ConstType::NullableInline(ty) => {
-                let inner = self.const_type_id(crate::const_eval::ConstType::Inline(ty));
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
-            crate::const_eval::ConstType::NullableInteger(ty) => {
-                let inner = self.types.intern(TypeKind::Integer(ty));
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::Float(ty) => TypeKind::Float(ty),
-            crate::const_eval::ConstType::NullableFloat(ty) => {
-                let inner = self.types.intern(TypeKind::Float(ty));
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::String => TypeKind::String,
-            crate::const_eval::ConstType::Bool => TypeKind::Bool,
-            crate::const_eval::ConstType::NullableBool => {
-                let inner = self.types.intern(TypeKind::Bool);
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::Enum(ty) => {
-                return self.types.intern_resolved(&ResolvedType::Enum(ty));
-            }
-            crate::const_eval::ConstType::NullableEnum(ty) => {
-                let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(ty));
-                TypeKind::Nullable(enum_type)
-            }
-            crate::const_eval::ConstType::ForeignAggregate(aggregate) => {
-                TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(aggregate))
-            }
-            crate::const_eval::ConstType::Null => TypeKind::Null,
-            crate::const_eval::ConstType::NullableString => {
-                let string = self.types.intern(TypeKind::String);
-                TypeKind::Nullable(string)
-            }
-        };
+        let kind =
+            match ty {
+                crate::const_eval::ConstType::NullOnly(_) => unreachable!(),
+                crate::const_eval::ConstType::Inline(ty) => {
+                    TypeKind::Class(ClassType::new(ty.name().to_string(), Vec::new()))
+                }
+                crate::const_eval::ConstType::NullableInline(ty) => {
+                    let inner = self.const_type_id(crate::const_eval::ConstType::Inline(ty));
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
+                crate::const_eval::ConstType::NullableInteger(ty) => {
+                    let inner = self.types.intern(TypeKind::Integer(ty));
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::Float(ty) => TypeKind::Float(ty),
+                crate::const_eval::ConstType::NullableFloat(ty) => {
+                    let inner = self.types.intern(TypeKind::Float(ty));
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::String => TypeKind::String,
+                crate::const_eval::ConstType::Bool => TypeKind::Bool,
+                crate::const_eval::ConstType::NullableBool => {
+                    let inner = self.types.intern(TypeKind::Bool);
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::Enum(ty) => {
+                    return self.types.intern_resolved(&ResolvedType::Enum(ty));
+                }
+                crate::const_eval::ConstType::NullableEnum(ty) => {
+                    let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(ty));
+                    TypeKind::Nullable(enum_type)
+                }
+                crate::const_eval::ConstType::ForeignAggregate(aggregate) => {
+                    TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(aggregate))
+                }
+                crate::const_eval::ConstType::NullableForeignAggregate(aggregate) => {
+                    let aggregate = self.types.intern(TypeKind::Foreign(
+                        crate::foreign::ForeignType::Aggregate(aggregate),
+                    ));
+                    TypeKind::Nullable(aggregate)
+                }
+                crate::const_eval::ConstType::Null => TypeKind::Null,
+                crate::const_eval::ConstType::NullableString => {
+                    let string = self.types.intern(TypeKind::String);
+                    TypeKind::Nullable(string)
+                }
+            };
         self.types.intern(kind)
     }
 
@@ -27044,7 +27051,11 @@ impl<'program> Checker<'program> {
                         | TypeKind::ByteRegion(_)
                         | TypeKind::ArrayRegion(_, _)
                 ) || (operation == "property access"
-                    && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
+                    && matches!(
+                        self.types.kind(*inner),
+                        TypeKind::Enum(_)
+                            | TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(_))
+                    ));
                 if !member_receiver {
                     self.diagnostics.push(Diagnostic::new(
                         "E0507",
@@ -27102,6 +27113,7 @@ impl<'program> Checker<'program> {
                     | TypeKind::Interface(_)
                     | TypeKind::Error
                     | TypeKind::Function(_)
+                    | TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(_))
                     | TypeKind::Unknown
             )
         {

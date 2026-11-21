@@ -2277,7 +2277,8 @@ pub(super) fn validate(
 /// static property's storage belongs to no local.
 fn aggregate_owner(place: mir::ForeignAggregatePlace) -> Option<mir::LocalId> {
     match place {
-        mir::ForeignAggregatePlace::Local(local) => Some(local),
+        mir::ForeignAggregatePlace::Local(local)
+        | mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => Some(local),
         mir::ForeignAggregatePlace::Property { object, .. } => Some(object),
         mir::ForeignAggregatePlace::Static(_) => None,
     }

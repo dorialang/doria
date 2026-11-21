@@ -1647,7 +1647,7 @@ fn php_mir_type(
         mir::Type::NullableFunction(_) => "?__DoriaFunctionValue".to_string(),
         // PHP output reports every foreign-typed expression before it
         // reaches MIR types (Decision 0148 section 23).
-        mir::Type::ForeignAggregate(_) => {
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
             unreachable!("PHP output reports foreign structs and unions first")
         }
         mir::Type::Collection(id) | mir::Type::NullableCollection(id) => {

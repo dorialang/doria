@@ -1601,6 +1601,7 @@ pub enum ConstType {
     NullableInline(crate::inline_value::InlineValueType),
     /// A foreign struct or union (Decision 0148 section 6).
     ForeignAggregate(crate::foreign::ForeignAggregateType),
+    NullableForeignAggregate(crate::foreign::ForeignAggregateType),
     /// A nullable type with no constant values of its own, so `null` is its
     /// only constant: the nullable runtime handles and keys, the nullable
     /// pointers `?Pointer<T>` and `?WritablePointer<T>`, and the nullable C function
@@ -1629,6 +1630,7 @@ impl ConstType {
                 Self::String => Self::NullableString,
                 Self::Bool => Self::NullableBool,
                 Self::Enum(ty) => Self::NullableEnum(ty),
+                Self::ForeignAggregate(aggregate) => Self::NullableForeignAggregate(aggregate),
                 _ => return None,
             },
             _ => return None,
@@ -1683,6 +1685,10 @@ impl ConstType {
                 | (Self::NullableBool, Self::Bool | Self::Null) => true,
                 (Self::NullableEnum(expected), Self::Enum(actual)) => expected == actual,
                 (Self::NullableEnum(_), Self::Null) => true,
+                (Self::NullableForeignAggregate(expected), Self::ForeignAggregate(actual)) => {
+                    expected == actual
+                }
+                (Self::NullableForeignAggregate(_), Self::Null) => true,
                 (Self::NullableInline(_), Self::Null) => true,
                 (Self::NullOnly(_), Self::Null) => true,
                 (Self::NullableInline(expected), Self::Inline(actual)) => expected == actual,
@@ -1701,6 +1707,7 @@ impl ConstType {
                 | Self::NullableString
                 | Self::NullableEnum(_)
                 | Self::NullableInline(_)
+                | Self::NullableForeignAggregate(_)
                 | Self::NullOnly(_)
         )
     }
@@ -1713,6 +1720,9 @@ impl ConstType {
             Self::NullableString => Some(Self::String),
             Self::NullableEnum(ty) => Some(Self::Enum(ty.clone())),
             Self::NullableInline(ty) => Some(Self::Inline(*ty)),
+            Self::NullableForeignAggregate(aggregate) => {
+                Some(Self::ForeignAggregate(aggregate.clone()))
+            }
             _ => None,
         }
     }
@@ -1755,11 +1765,14 @@ impl fmt::Display for ConstType {
             Self::Inline(ty) => formatter.write_str(ty.name()),
             Self::NullableInline(ty) => write!(formatter, "?{}", ty.name()),
             Self::NullOnly(ty) => write!(formatter, "{ty}"),
-            Self::ForeignAggregate(aggregate) => {
+            Self::ForeignAggregate(aggregate) | Self::NullableForeignAggregate(aggregate) => {
                 let mut types = crate::types::TypeRegistry::new();
                 let id = types.intern_resolved(&ResolvedType::Foreign(Box::new(
                     crate::foreign::ForeignType::Aggregate(aggregate.clone()),
                 )));
+                if matches!(self, Self::NullableForeignAggregate(_)) {
+                    formatter.write_str("?")?;
+                }
                 formatter.write_str(&types.display(id))
             }
         }

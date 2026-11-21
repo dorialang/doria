@@ -681,7 +681,8 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::NullableScalar(_) => Some(16),
         mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::ForeignAggregate(_) => None,
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => None,
     }
 }
 
@@ -763,6 +764,7 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableRegion(kind) => Some(mir::Type::Region(kind)),
         mir::Type::NullableFunction(value) => Some(mir::Type::Function(value)),
         mir::Type::NullablePayloadEnum(value) => Some(mir::Type::PayloadEnum(value)),
+        mir::Type::NullableForeignAggregate(value) => Some(mir::Type::ForeignAggregate(value)),
         _ => None,
     }
 }

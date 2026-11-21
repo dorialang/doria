@@ -643,6 +643,38 @@ fn foreign_aggregates_have_fields_and_constants_only() {
     only(recursive, "E0786");
 }
 
+/// `?Color` narrows with `!= null` and `is Color`, coalesces with `??` and
+/// reads a field with `?->` (Decision 0148 section 6); a foreign aggregate
+/// still has no methods, through `?->` as through `->`.
+#[test]
+fn nullable_foreign_aggregates_narrow_and_read_fields_null_safe() {
+    for body in [
+        "?Color $maybe = null; echo $maybe?->red ?? 0;",
+        "?Color $maybe = new Color(red: 1, green: 2, blue: 3); if ($maybe is Color) { echo $maybe->green; }",
+        "?Color $maybe = null; if ($maybe != null) { echo $maybe->blue; }",
+        "?Color $maybe = null; let $color = $maybe ?? new Color(red: 1, green: 2, blue: 3); echo $color->alpha;",
+        "let $color = new Color(red: 1, green: 2, blue: 3); echo $color is Color;",
+        "?Value $value = null; unsafe { echo $value?->number ?? 0; }",
+    ] {
+        let source = format!("{COLOR}function main(): void {{ {body} }}");
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    let union_read = format!(
+        "{COLOR}function main(): void {{ ?Value $value = null; echo $value?->number ?? 0; }}"
+    );
+    only(&union_read, "E0785");
+    let method =
+        format!("{COLOR}function main(): void {{ ?Color $maybe = null; $maybe?->blend(); }}");
+    assert!(
+        codes(&method).contains(&"E0507"),
+        "{:#?}",
+        findings(&method)
+    );
+    let absent =
+        format!("{COLOR}function main(): void {{ ?Color $maybe = null; echo $maybe->red; }}");
+    only(&absent, "E0506");
+}
+
 #[test]
 fn an_incomplete_struct_is_used_only_through_a_pointer() {
     let pointer = format!(

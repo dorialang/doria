@@ -172,7 +172,7 @@ function main(): void {}
         );
 
         let definition = &enums[payload_id];
-        let nullable = crate::enums::nullable_enum_layout(&definition.layout).unwrap();
+        let nullable = crate::enums::nullable_inline_layout(definition.layout.shape()).unwrap();
         let ty = mir::PayloadEnumType {
             id: definition.id,
             capabilities: definition.capabilities,
@@ -397,9 +397,6 @@ impl NativeTypeRegistry {
             .foreign_aggregates
             .iter()
             .filter_map(|(name, facts)| Some((name, facts.layout.clone()?)))
-            .filter(|(_, layout)| {
-                u32::try_from(layout.size).is_ok() && u32::try_from(layout.align).is_ok()
-            })
             .collect::<Vec<_>>();
         aggregates.sort_by_key(|(name, _)| *name);
         for (name, layout) in aggregates {
@@ -408,9 +405,10 @@ impl NativeTypeRegistry {
                 name: name.clone(),
                 layout,
             };
-            registry
-                .foreign_aggregate_types
-                .insert(name.clone(), definition.ty());
+            let Some(ty) = definition.checked_ty() else {
+                continue;
+            };
+            registry.foreign_aggregate_types.insert(name.clone(), ty);
             registry.foreign_aggregates.push(definition);
         }
         registry.interface_types.push(mir::InterfaceType::error());
@@ -1213,7 +1211,10 @@ fn build_closure_plans(
                             capture.declaration_span,
                         )]
                     })?;
-                    if matches!(ty, mir::Type::ForeignAggregate(_)) {
+                    if matches!(
+                        ty,
+                        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_)
+                    ) {
                         return Err(vec![crate::unsafe_code::misplaced_aggregate(
                             capture.declaration_span,
                             "a closure capture",
@@ -1535,7 +1536,7 @@ fn lower_program_impl(
             .iter()
             .filter(|definition| definition.cases.iter().any(|case| !case.payload.is_empty()))
             .map(|definition| {
-                let nullable = crate::enums::nullable_enum_layout(&definition.layout)
+                let nullable = crate::enums::nullable_inline_layout(definition.layout.shape())
                     .expect("checked payload enum has finite nullable layout");
                 (
                     definition.id,
@@ -3120,6 +3121,7 @@ fn intern_resolved_collection_types(
                 }
                 mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
                 mir::Type::PayloadEnum(ty) => mir::Type::NullablePayloadEnum(ty),
+                mir::Type::ForeignAggregate(ty) => mir::Type::NullableForeignAggregate(ty),
                 mir::Type::Function(function_type) => mir::Type::NullableFunction(function_type),
                 mir::Type::NullableCollection(collection) => {
                     mir::Type::NullableCollection(collection)
@@ -3138,8 +3140,8 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::NullablePayloadEnum(_)
                 | mir::Type::NullableFunction(_)
-                | mir::Type::ClosureEnvironment(_)
-                | mir::Type::ForeignAggregate(_) => return None,
+                | mir::Type::NullableForeignAggregate(_)
+                | mir::Type::ClosureEnvironment(_) => return None,
             }
         }
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
@@ -3363,7 +3365,8 @@ fn lower_static_value(
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
             | mir::Type::NullableClass(_)
-            | mir::Type::NullablePayloadEnum(_),
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::NullableForeignAggregate(_),
         ) => Ok(mir::StaticValue::Null),
         (
             crate::const_eval::ConstValue::PayloadEnum(value),
@@ -3398,7 +3401,7 @@ fn lower_static_value(
         }
         (
             crate::const_eval::ConstValue::ForeignAggregate(value),
-            mir::Type::ForeignAggregate(expected),
+            mir::Type::ForeignAggregate(expected) | mir::Type::NullableForeignAggregate(expected),
         ) => {
             let fields = foreign::constant_fields(value, expected, aggregates, span, resolve_type)?
                 .into_iter()
@@ -3876,7 +3879,9 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
             .enums
             .iter()
             .find(|definition| definition.id == ty.id)
-            .and_then(|definition| crate::enums::nullable_enum_layout(&definition.layout).ok())
+            .and_then(|definition| {
+                crate::enums::nullable_inline_layout(definition.layout.shape()).ok()
+            })
             .map(|layout| FieldType::Aggregate {
                 size: layout.size,
                 align: layout.align,
@@ -3888,6 +3893,10 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         // layout (Decision 0148 section 6).
         mir::Type::ForeignAggregate(ty) => Some(FieldType::Aggregate {
             size: ty.size,
+            align: ty.align,
+        }),
+        mir::Type::NullableForeignAggregate(ty) => Some(FieldType::Aggregate {
+            size: ty.nullable_size,
             align: ty.align,
         }),
     }
@@ -7030,6 +7039,9 @@ fn null_rvalue_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::Rval
         mir::Type::NullableFunction(function_type) => {
             mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Null { function_type })
         }
+        mir::Type::NullableForeignAggregate(ty) => {
+            mir::Rvalue::NullableForeignAggregate(mir::NullableForeignAggregateExpression::Null(ty))
+        }
         _ => {
             return Err(vec![Diagnostic::new(
                 "I7101",
@@ -8765,7 +8777,7 @@ fn element_write_back(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) => {
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
             unreachable!(
                 "the execution gate keeps foreign aggregates out of collections and regions"
             )
@@ -9080,7 +9092,7 @@ fn collection_value_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) => {
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
             unreachable!("the execution gate keeps foreign aggregates out of collections")
         }
         mir::Type::NullableWritableSharedReference(_)
@@ -11319,6 +11331,7 @@ impl<'semantic> LoweringContext<'semantic> {
                     Some(mir::Type::NullableCollection(collection))
                 }
                 mir::Type::PayloadEnum(ty) => Some(mir::Type::NullablePayloadEnum(ty)),
+                mir::Type::ForeignAggregate(ty) => Some(mir::Type::NullableForeignAggregate(ty)),
                 mir::Type::Function(function_type) => {
                     Some(mir::Type::NullableFunction(function_type))
                 }
@@ -11338,9 +11351,9 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::NullablePayloadEnum(_)
-                | mir::Type::NullableFunction(_)) => Some(already),
+                | mir::Type::NullableFunction(_)
+                | mir::Type::NullableForeignAggregate(_)) => Some(already),
                 mir::Type::ClosureEnvironment(_) => None,
-                mir::Type::ForeignAggregate(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
@@ -11640,7 +11653,10 @@ fn lower_grouped_var_decl(
                 context,
             )?),
         ),
-        mir::Type::Region(_) | mir::Type::NullableRegion(_) | mir::Type::ForeignAggregate(_) => {
+        mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             lower_rvalue_as_expected(&decl.initializer, ty, context)?
         }
         mir::Type::Scalar(scalar) => {
@@ -14391,10 +14407,12 @@ fn lower_display_string_expression(
             expr.span(),
             "payload enum values do not have an implicit display representation",
         )]),
-        mir::Type::ForeignAggregate(_) => Err(vec![unsupported(
-            expr.span(),
-            "foreign structs and unions do not have a display representation",
-        )]),
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
+            Err(vec![unsupported(
+                expr.span(),
+                "foreign structs and unions do not have a display representation",
+            )])
+        }
         mir::Type::WritableSharedReference(_) | mir::Type::WritableWeakReference(_) => {
             Err(vec![unsupported(
                 expr.span(),
@@ -14717,7 +14735,9 @@ fn hoist_argument_temporary(
         {
             context.declare_borrowed_temp(ty, false)
         }
-        mir::Type::ForeignAggregate(_) => context.declare_borrowed_temp(ty, false),
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
+            context.declare_borrowed_temp(ty, false)
+        }
         // Borrow-mode payload enums can be source-level Copy while still
         // containing managed fields. Staging their view does not acquire
         // those fields, so it must not introduce a second drop obligation.
@@ -16890,6 +16910,11 @@ fn match_presence_condition(
                 mode: mir::PayloadEnumUseMode::Borrow,
             }),
         ),
+        mir::Type::NullableForeignAggregate(ty) => {
+            mir::BoolExpression::NullableForeignAggregateIsPresent(Box::new(
+                mir::NullableForeignAggregateExpression::Local { ty, local },
+            ))
+        }
         mir::Type::NullableFunction(function_type) => {
             mir::BoolExpression::NullableFunctionIsPresent(Box::new(
                 mir::NullableFunctionExpression::Local {
@@ -17181,6 +17206,13 @@ fn narrowed_match_local_rvalue(
                 place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local),
                 mode: payload_enum_use_mode(target, transfer),
             })
+        }
+        (mir::Type::NullableForeignAggregate(source), mir::Type::ForeignAggregate(target))
+            if source == target =>
+        {
+            mir::Rvalue::ForeignAggregate(
+                mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty: target, local },
+            )
         }
         (mir::Type::NullableFunction(source), mir::Type::Function(target)) if source == target => {
             mir::Rvalue::Function(mir::FunctionExpression::AssumePresent {
@@ -17981,6 +18013,11 @@ fn lower_null_comparison(
                 lower_nullable_function_expression(value, function_type, false, context)?,
             ))
         }
+        mir::Type::NullableForeignAggregate(ty) => {
+            mir::BoolExpression::NullableForeignAggregateIsPresent(Box::new(
+                foreign::nullable_aggregate_expression(value, ty, context)?,
+            ))
+        }
         _ => {
             return Err(vec![unsupported(
                 value.span(),
@@ -18351,11 +18388,15 @@ fn lower_is_condition(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
-        mir::Type::ForeignAggregate(_) => {
-            return Err(vec![unsupported(
-                expr.span(),
-                "a foreign struct or union is never null and has one type",
-            )]);
+        // A foreign struct or union has one type and is never null; its
+        // nullable form is present exactly when it holds a value.
+        mir::Type::ForeignAggregate(ty) | mir::Type::NullableForeignAggregate(ty) => {
+            let present = lower_concrete_is_presence(expr, value_type, context)?;
+            if tested_type == mir::Type::ForeignAggregate(ty) {
+                present
+            } else {
+                evaluate_then_false(present)
+            }
         }
     };
     Ok(result)
@@ -18633,10 +18674,18 @@ fn lower_concrete_is_presence(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
-        mir::Type::ForeignAggregate(_) => Err(vec![unsupported(
-            expr.span(),
-            "a foreign struct or union is never null and has one type",
-        )]),
+        mir::Type::ForeignAggregate(ty) => {
+            let value = foreign::aggregate_expression(expr, ty, context)?;
+            lower_discarded_rvalue(mir::Rvalue::ForeignAggregate(value), context);
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
+        mir::Type::NullableForeignAggregate(ty) => {
+            Ok(mir::BoolExpression::NullableForeignAggregateIsPresent(
+                Box::new(foreign::nullable_aggregate_expression(expr, ty, context)?),
+            ))
+        }
     }
 }
 
@@ -20461,6 +20510,10 @@ fn lower_rvalue_as_expected(
         mir::Type::ForeignAggregate(ty) => {
             foreign::aggregate_expression(expr, ty, context).map(mir::Rvalue::ForeignAggregate)
         }
+        mir::Type::NullableForeignAggregate(ty) => {
+            foreign::nullable_aggregate_expression(expr, ty, context)
+                .map(mir::Rvalue::NullableForeignAggregate)
+        }
         mir::Type::NullablePayloadEnum(ty) => {
             lower_nullable_payload_enum_expression(expr, ty, true, context)
                 .map(mir::Rvalue::NullablePayloadEnum)
@@ -20788,6 +20841,13 @@ fn borrowed_stored_property_rvalue(
         }
         Type::ForeignAggregate(ty) => {
             Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Property {
+                ty,
+                object,
+                property,
+            })
+        }
+        Type::NullableForeignAggregate(ty) => {
+            Rvalue::NullableForeignAggregate(mir::NullableForeignAggregateExpression::Property {
                 ty,
                 object,
                 property,
@@ -21810,7 +21870,36 @@ fn materialize_null_safe_call(
         target: receiver,
         value: object,
     });
+    null_safe_call_on(
+        receiver,
+        receiver_type,
+        selection,
+        return_borrow,
+        span,
+        result,
+        call,
+        context,
+    )
+}
 
+/// The branch of a null-safe call or read on the nullable value `receiver`
+/// already holds: `call` runs on it when it is present, and the result is
+/// null otherwise. A receiver evaluated in place, such as a local whose
+/// storage the present branch borrows, takes this path directly.
+#[allow(clippy::too_many_arguments)]
+fn null_safe_call_on(
+    receiver: mir::LocalId,
+    receiver_type: mir::Type,
+    selection: CoalesceSelection,
+    return_borrow: Option<mir::ReturnBorrow>,
+    span: Span,
+    result: Option<(mir::Type, bool)>,
+    call: impl FnOnce(
+        mir::LocalId,
+        &mut LoweringContext,
+    ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>>,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
     let result = result.map(|(ty, consume)| {
         let owned = !ty.borrows_returned_value(return_borrow) && user_local_type_owns_value(ty);
         let local = context.declare_call_result_slot(ty, owned, return_borrow);
@@ -22805,10 +22894,12 @@ fn lower_mixed_expression(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
-        mir::Type::ForeignAggregate(_) => Err(vec![crate::unsafe_code::misplaced_aggregate(
-            expr.span(),
-            "a `mixed` value",
-        )]),
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
+            Err(vec![crate::unsafe_code::misplaced_aggregate(
+                expr.span(),
+                "a `mixed` value",
+            )])
+        }
     }
 }
 
@@ -22858,10 +22949,12 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments cannot be tested as source values")
         }
-        mir::Type::ForeignAggregate(_) => Err(vec![crate::unsafe_code::misplaced_aggregate(
-            span,
-            "a `mixed` value",
-        )]),
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
+            Err(vec![crate::unsafe_code::misplaced_aggregate(
+                span,
+                "a `mixed` value",
+            )])
+        }
     }
 }
 
@@ -24042,7 +24135,7 @@ fn collection_remove_at_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) => {
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
             unreachable!("the execution gate keeps foreign aggregates out of collections")
         }
         mir::Type::NullableWritableSharedReference(_)
@@ -25353,7 +25446,7 @@ fn nullable_collection_access_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::ForeignAggregate(_) => {
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
             unreachable!("the execution gate keeps foreign aggregates out of collections")
         }
         mir::Type::Collection(payload) | mir::Type::NullableCollection(payload) => Ok(

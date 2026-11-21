@@ -658,14 +658,128 @@ function main(): void
     );
 }
 
+/// `?Name` of a foreign struct or union (Decision 0148 section 6) is the
+/// shared nullable inline layout: a presence byte, then the C layout. It
+/// narrows with `!= null` and `is`, coalesces, reads fields with `?->`, and
+/// is a local, parameter, result, property, static property, constant and
+/// enum payload field.
+#[test]
+fn nullable_foreign_aggregates_narrow_coalesce_and_read_fields_null_safe() {
+    let source = format!(
+        "{AGGREGATES}
+extern \"C\" struct Tip
+{{
+    int32 $id;
+    uint16[3] $text;
+}}
+
+const ?Color NONE = null;
+const ?Color WHITE = new Color(red: 250, green: 251, blue: 252);
+
+class Holder
+{{
+    writable ?Color $maybe = WHITE;
+    static writable ?Color $current = new Color(red: 5, green: 6, blue: 7);
+    static writable ?Color $absent = null;
+}}
+
+enum Paint
+{{
+    case None;
+    case Maybe(?Color $color);
+}}
+
+function find(bool $present): ?Color
+{{
+    if ($present) {{
+        return new Color(red: 1, green: 2, blue: 3);
+    }}
+    return null;
+}}
+
+function pick(?Color $first, ?Color $second): ?Color
+{{
+    return $first ?? $second;
+}}
+
+function describe(Paint $paint): string
+{{
+    return match ($paint) {{
+        Paint::None => \"none\",
+        Paint::Maybe($color) => \"maybe \" . ($color?->blue ?? 0),
+    }};
+}}
+
+function main(): void
+{{
+    let $none = find(false);
+    let $some = find(true);
+    echo ($none?->red ?? 7) . \" \" . ($some?->green ?? 7) . \" \";
+    let $chosen = $none ?? new Color(red: 9, green: 9, blue: 9);
+    echo $chosen->red . \" \";
+    if ($some != null) {{
+        echo $some->blue . \" \";
+    }}
+    if ($some is Color) {{
+        let $copy = $some;
+        echo $copy->alpha . \" \";
+    }}
+    echo ($chosen is Color) . \" \" . ($none is Color) . \"\\n\";
+    writable ?Color $later = null;
+    echo ($later == null) . \" \";
+    $later = new Color(red: 4, green: 5, blue: 6);
+    if ($later != null) {{
+        $later->red = 40;
+        $later->green += 1;
+        echo $later->red . \" \" . $later->green . \" \";
+    }}
+    echo (pick(null, $some)?->red ?? 0) . \" \" . (pick(null, null) == null) . \" \";
+    ?Color $branch = when ($some != null): ?Color {{
+        return $some;
+    }} else {{
+        return null;
+    }};
+    echo ($branch?->blue ?? 0) . \"\\n\";
+    echo (NONE == null) . \" \" . (WHITE?->green ?? 0) . \" \";
+    writable Holder $holder = new Holder();
+    echo ($holder->maybe?->blue ?? 0) . \" \";
+    $holder->maybe = $none;
+    echo ($holder->maybe == null) . \" \";
+    $holder->maybe = $some;
+    echo ($holder->maybe?->red ?? 0) . \" \";
+    echo (Holder::current?->blue ?? 0) . \" \" . (Holder::absent == null) . \" \";
+    Holder::current = null;
+    Holder::absent = $chosen;
+    echo (Holder::current?->blue ?? 0) . \" \" . (Holder::absent?->red ?? 0) . \"\\n\";
+    echo describe(Paint::Maybe(null)) . \" \" . describe(Paint::Maybe($some)) . \" \" . describe(Paint::None) . \"\\n\";
+    writable ?Tip $tip = new Tip(id: 3);
+    if ($tip != null) {{
+        $tip->text[1] = 77;
+        echo $tip->id . \" \" . $tip->text[1] . \" \";
+    }}
+    echo ($tip?->text?->length ?? -1) . \" \";
+    let $noTip = when (false): ?Tip {{
+        return new Tip(id: 1);
+    }} else {{
+        return null;
+    }};
+    echo ($noTip?->text?->length ?? -1) . \" \" . Color::SIZE;
+}}
+"
+    );
+    assert_runs_natively(
+        &source,
+        "7 2 9 3 255 true false\ntrue 40 6 1 true 3\ntrue 251 252 true 1 7 true 0 9\nmaybe 0 maybe 3 none\n3 77 3 -1 4",
+    );
+}
+
 #[test]
 fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
     for (body, position) in [
-        ("class Holder { ?Color $color = null; }", "a nullable value"),
-        ("class Holder { static ?Color $color = null; }", "a nullable value"),
-        ("function main(): void { ?Color $maybe = null; }", "a nullable value"),
-        ("function keep(Color[] $colors): void {}", "a nullable value"),
+        ("function keep(Color[] $colors): void {}", "a type argument"),
+        ("function keep(?Color[] $colors): void {}", "a type argument"),
         ("function main(): void { let $show = function(Color $color): void {}; }", "a closure parameter"),
+        ("function main(): void { let $show = function(?Color $color): void {}; }", "a closure parameter"),
         (
             "function main(): void { let $color = new Color(red: 1, green: 2, blue: 3); let $show = function(): void with ($color) { echo $color->red; }; $show(); }",
             "a closure capture",

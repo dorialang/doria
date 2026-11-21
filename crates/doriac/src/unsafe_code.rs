@@ -43,7 +43,7 @@ fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     (
         "Foreign Aggregates Cannot Be Built Here Yet",
         format!(
-            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results, pointer targets, properties, constants and enum payloads, and not here yet"
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions and their nullable forms as locals, parameters, results, pointer targets, properties, constants and enum payloads, and not here yet"
         ),
     )
 }
@@ -145,14 +145,17 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
 }
 
 /// Whether a value of `ty` holds a foreign struct or union: the aggregate
-/// itself, or a payload enum with one in a case's payload.
+/// itself or its nullable form, or a payload enum with one in a case's
+/// payload.
 fn holds_foreign_aggregate(
     program: &crate::mir::Program,
     ty: crate::mir::Type,
     visited: &mut HashSet<crate::enums::EnumId>,
 ) -> bool {
     match ty {
-        crate::mir::Type::ForeignAggregate(_) => true,
+        crate::mir::Type::ForeignAggregate(_) | crate::mir::Type::NullableForeignAggregate(_) => {
+            true
+        }
         crate::mir::Type::PayloadEnum(payload) | crate::mir::Type::NullablePayloadEnum(payload) => {
             visited.insert(payload.id)
                 && program.enums.get(payload.id.0).is_some_and(|definition| {
@@ -266,9 +269,10 @@ impl Finder {
 
     /// Reports a foreign struct or union `ty` holds where no execution
     /// target builds one yet: anywhere in a closure's signature or
-    /// captures (`anywhere`), otherwise nullable, as a type argument other
-    /// than a pointer's pointee, or in a function type. Locals, parameters,
-    /// results, properties, constants, enum payloads and pointees build.
+    /// captures (`anywhere`), otherwise as a type argument other than a
+    /// pointer's pointee, or in a function type. Locals, parameters,
+    /// results, properties, constants, enum payloads and pointees build,
+    /// each also as `?Name`.
     fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
         if self.aggregates.is_empty() {
             return;
@@ -278,9 +282,8 @@ impl Finder {
             None => aggregate_outside_value_position(ty, &self.aggregates, true),
         };
         if misplaced {
-            let position = anywhere.unwrap_or(
-                "a nullable value, a type argument other than a pointer's pointee, or a function type",
-            );
+            let position = anywhere
+                .unwrap_or("a type argument other than a pointer's pointee, or a function type");
             let (title, message) = misplaced_aggregate_text(position);
             self.report(span, title, message);
         }
@@ -472,14 +475,14 @@ fn mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
         || doria_function_mentions_aggregate(ty, aggregates)
 }
 
-/// Whether `ty` holds a foreign struct or union other than by value in a
-/// value position or as a pointer's pointee.
+/// Whether `ty` holds a foreign struct or union other than by value, or
+/// as `?Name`, in a value position or as a pointer's pointee.
 fn aggregate_outside_value_position(
     ty: &TypeRef,
     aggregates: &HashSet<String>,
     value_position: bool,
 ) -> bool {
-    if aggregates.contains(&ty.name) && (!value_position || ty.nullable) {
+    if aggregates.contains(&ty.name) && !value_position {
         return true;
     }
     let pointer = crate::foreign::PointerAccess::from_source_name(&ty.name).is_some();

@@ -351,7 +351,7 @@ impl EnumDefinition {
             .iter()
             .any(|case| !case.payload.is_empty())
             .then(|| {
-                let nullable = crate::enums::nullable_enum_layout(&self.layout)
+                let nullable = crate::enums::nullable_inline_layout(self.layout.shape())
                     .expect("validated payload enum has finite nullable layout");
                 PayloadEnumType {
                     id: self.id,
@@ -852,6 +852,17 @@ impl ForeignAggregateConstant {
             let start = offset as usize;
             bytes[start..start + data.len()].copy_from_slice(&data);
         }
+        bytes
+    }
+
+    /// The bytes of the value present in a `?Name` static: the presence
+    /// byte 1 at offset 0 and [`Self::bytes`] at the payload offset, in the
+    /// nullable inline layout of its type.
+    pub fn nullable_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.ty.nullable_size as usize];
+        bytes[0] = 1;
+        let start = self.ty.nullable_payload_offset as usize;
+        bytes[start..start + self.ty.size as usize].copy_from_slice(&self.bytes());
         bytes
     }
 
@@ -1518,6 +1529,9 @@ pub enum Type {
     /// A foreign struct or union (Decision 0148 section 6): an inline Copy
     /// value held in memory with its C layout. It needs no cleanup.
     ForeignAggregate(ForeignAggregateType),
+    /// `?Name` of a foreign struct or union: the value in the nullable
+    /// inline layout its type records, a presence byte and the C layout.
+    NullableForeignAggregate(ForeignAggregateType),
 }
 
 /// What a region views and the access it grants (Decision 0110's byte
@@ -1552,12 +1566,26 @@ impl RegionType {
 
 /// A foreign struct or union as a value type: its definition and the size
 /// and alignment of its C layout on the native target, so storage for one
-/// is sized without a lookup.
+/// is sized without a lookup. `?Name` stores the value in the shared
+/// nullable inline layout (`crate::enums::nullable_inline_layout`): a
+/// presence byte at offset 0 and the C layout at `nullable_payload_offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ForeignAggregateType {
     pub id: ForeignAggregateId,
     pub size: u32,
     pub align: u32,
+    pub nullable_size: u32,
+    pub nullable_payload_offset: u32,
+}
+
+impl ForeignAggregateType {
+    pub const fn storage_size(self, nullable: bool) -> u32 {
+        if nullable {
+            self.nullable_size
+        } else {
+            self.size
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1574,12 +1602,26 @@ pub struct ForeignAggregateDefinition {
 }
 
 impl ForeignAggregateDefinition {
-    pub fn ty(&self) -> ForeignAggregateType {
-        ForeignAggregateType {
+    /// The value type, or `None` when the C layout or its nullable form does
+    /// not fit the 32-bit sizes MIR storage uses.
+    pub fn checked_ty(&self) -> Option<ForeignAggregateType> {
+        let shape = crate::enums::LayoutShape {
+            size: u32::try_from(self.layout.size).ok()?,
+            align: u32::try_from(self.layout.align).ok()?,
+        };
+        let nullable = crate::enums::nullable_inline_layout(shape).ok()?;
+        Some(ForeignAggregateType {
             id: self.id,
-            size: u32::try_from(self.layout.size).expect("a lowered foreign layout fits in u32"),
-            align: u32::try_from(self.layout.align).expect("a lowered foreign layout fits in u32"),
-        }
+            size: shape.size,
+            align: shape.align,
+            nullable_size: nullable.size,
+            nullable_payload_offset: nullable.payload_offset,
+        })
+    }
+
+    pub fn ty(&self) -> ForeignAggregateType {
+        self.checked_ty()
+            .expect("a lowered foreign layout and its nullable form fit in u32")
     }
 }
 
@@ -2097,6 +2139,7 @@ pub enum Rvalue {
     Function(FunctionExpression),
     NullableFunction(NullableFunctionExpression),
     ForeignAggregate(ForeignAggregateExpression),
+    NullableForeignAggregate(NullableForeignAggregateExpression),
 }
 
 /// A foreign struct or union value (Decision 0148 section 6). Each form
@@ -2133,6 +2176,12 @@ pub enum ForeignAggregateExpression {
         args: Vec<Rvalue>,
         span: Span,
     },
+    /// A copy of the value the `?Name` local `local` holds, which checking
+    /// has narrowed to present.
+    NullableLocalAssumeNonNull {
+        ty: ForeignAggregateType,
+        local: LocalId,
+    },
 }
 
 impl ForeignAggregateExpression {
@@ -2142,7 +2191,49 @@ impl ForeignAggregateExpression {
             | Self::Local { ty, .. }
             | Self::Property { ty, .. }
             | Self::Static { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::NullableLocalAssumeNonNull { ty, .. } => *ty,
+        }
+    }
+}
+
+/// A `?Name` value of a foreign struct or union (Decision 0148 section 6).
+/// Each form produces the value's bytes in the nullable inline layout of
+/// its type; storing one copies them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableForeignAggregateExpression {
+    Null(ForeignAggregateType),
+    Present(ForeignAggregateExpression),
+    Local {
+        ty: ForeignAggregateType,
+        local: LocalId,
+    },
+    Property {
+        ty: ForeignAggregateType,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Static {
+        ty: ForeignAggregateType,
+        id: StaticId,
+    },
+    Call {
+        ty: ForeignAggregateType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+    },
+}
+
+impl NullableForeignAggregateExpression {
+    pub const fn ty(&self) -> ForeignAggregateType {
+        match self {
+            Self::Null(ty)
+            | Self::Local { ty, .. }
+            | Self::Property { ty, .. }
+            | Self::Static { ty, .. }
             | Self::Call { ty, .. } => *ty,
+            Self::Present(value) => value.ty(),
         }
     }
 }
@@ -2154,6 +2245,9 @@ impl ForeignAggregateExpression {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeignAggregatePlace {
     Local(LocalId),
+    /// The value of the `?Name` local `local`, which checking has narrowed
+    /// to present, in place at its payload offset.
+    NullableLocalAssumeNonNull(LocalId),
     Property {
         object: LocalId,
         property: PropertyId,
@@ -2161,10 +2255,78 @@ pub enum ForeignAggregatePlace {
     Static(StaticId),
 }
 
+impl fmt::Display for ForeignAggregateExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Construct { ty, fields, .. } => {
+                let fields = fields
+                    .iter()
+                    .map(|field| format!("@{}: {}", field.offset, field.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "foreign_aggregate#{}{{{fields}}}", ty.id.0)
+            }
+            Self::Local { local, .. } => {
+                write!(formatter, "copy local{}", local.0)
+            }
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "copy local{}->property{}",
+                object.0, property.index
+            ),
+            Self::Static { id, .. } => {
+                write!(formatter, "copy static{}", id.0)
+            }
+            Self::Call { function, args, .. } => {
+                let args = args
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "call fn{}({args})", function.0)
+            }
+            Self::NullableLocalAssumeNonNull { local, .. } => {
+                write!(formatter, "copy assume_non_null(local{})", local.0)
+            }
+        }
+    }
+}
+
+impl fmt::Display for NullableForeignAggregateExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null(ty) => write!(formatter, "null(?foreign_aggregate#{})", ty.id.0),
+            Self::Present(value) => write!(formatter, "present({value})"),
+            Self::Local { local, .. } => write!(formatter, "copy local{}", local.0),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "copy local{}->property{}",
+                object.0, property.index
+            ),
+            Self::Static { id, .. } => write!(formatter, "copy static{}", id.0),
+            Self::Call { function, args, .. } => {
+                let args = args
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "call fn{}({args})", function.0)
+            }
+        }
+    }
+}
+
 impl fmt::Display for ForeignAggregatePlace {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Local(local) => write!(formatter, "local{}", local.0),
+            Self::NullableLocalAssumeNonNull(local) => {
+                write!(formatter, "assume_non_null(local{})", local.0)
+            }
             Self::Property { object, property } => {
                 write!(formatter, "local{}->property{}", object.0, property.index)
             }
@@ -2248,6 +2410,7 @@ impl Rvalue {
             Self::Function(value) => Type::Function(value.function_type()),
             Self::NullableFunction(value) => Type::NullableFunction(value.function_type()),
             Self::ForeignAggregate(value) => Type::ForeignAggregate(value.ty()),
+            Self::NullableForeignAggregate(value) => Type::NullableForeignAggregate(value.ty()),
         }
     }
 
@@ -2281,7 +2444,8 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
-            | Self::ForeignAggregate(_) => None,
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_) => None,
         }
     }
 
@@ -2314,6 +2478,7 @@ impl Rvalue {
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
             | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2376,6 +2541,7 @@ impl Rvalue {
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
             | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2418,6 +2584,7 @@ impl Rvalue {
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
             | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => false,
         }
@@ -2464,7 +2631,8 @@ impl Rvalue {
             Self::Value(_)
             | Self::String(_)
             | Self::NullableString(_)
-            | Self::ForeignAggregate(_) => false,
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_) => false,
         }
     }
 
@@ -2703,6 +2871,7 @@ impl Rvalue {
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
             | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2841,9 +3010,14 @@ impl Rvalue {
                     PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
                 ..
             })
-            | Self::ForeignAggregate(ForeignAggregateExpression::Local { local, .. }) => {
-                Some(*local)
-            }
+            | Self::ForeignAggregate(
+                ForeignAggregateExpression::Local { local, .. }
+                | ForeignAggregateExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::NullableForeignAggregate(NullableForeignAggregateExpression::Local {
+                local,
+                ..
+            }) => Some(*local),
             _ => None,
         }
     }
@@ -2877,6 +3051,7 @@ impl Rvalue {
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
             | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => MixedOwnership::None,
         }
@@ -6178,6 +6353,7 @@ pub enum BoolExpression {
     NullableMixedIsPresent(Box<NullableMixedExpression>),
     NullableErrorIsPresent(Box<NullableInterfaceExpression>),
     NullablePayloadEnumIsPresent(Box<NullablePayloadEnumExpression>),
+    NullableForeignAggregateIsPresent(Box<NullableForeignAggregateExpression>),
     NullableFunctionIsPresent(Box<NullableFunctionExpression>),
     PayloadEnumCompare {
         op: CompareOp,
@@ -8011,19 +8187,44 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             }
             Rvalue::Function(value) => function_class_temporary_capacity(value),
             Rvalue::NullableFunction(value) => nullable_function_class_temporary_capacity(value),
-            Rvalue::ForeignAggregate(value) => match value {
-                ForeignAggregateExpression::Construct { fields, .. } => fields
-                    .iter()
-                    .map(|field| rvalue_class_temporary_capacity(&field.value))
-                    .sum(),
-                ForeignAggregateExpression::Call { args, .. } => {
-                    args.iter().map(rvalue_class_temporary_capacity).sum()
-                }
-                ForeignAggregateExpression::Local { .. }
-                | ForeignAggregateExpression::Property { .. }
-                | ForeignAggregateExpression::Static { .. } => 0,
-            },
+            Rvalue::ForeignAggregate(value) => foreign_aggregate_class_temporary_capacity(value),
+            Rvalue::NullableForeignAggregate(value) => {
+                nullable_foreign_aggregate_class_temporary_capacity(value)
+            }
         }
+}
+
+fn foreign_aggregate_class_temporary_capacity(value: &ForeignAggregateExpression) -> usize {
+    match value {
+        ForeignAggregateExpression::Construct { fields, .. } => fields
+            .iter()
+            .map(|field| rvalue_class_temporary_capacity(&field.value))
+            .sum(),
+        ForeignAggregateExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        ForeignAggregateExpression::Local { .. }
+        | ForeignAggregateExpression::Property { .. }
+        | ForeignAggregateExpression::Static { .. }
+        | ForeignAggregateExpression::NullableLocalAssumeNonNull { .. } => 0,
+    }
+}
+
+fn nullable_foreign_aggregate_class_temporary_capacity(
+    value: &NullableForeignAggregateExpression,
+) -> usize {
+    match value {
+        NullableForeignAggregateExpression::Present(value) => {
+            foreign_aggregate_class_temporary_capacity(value)
+        }
+        NullableForeignAggregateExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableForeignAggregateExpression::Null(_)
+        | NullableForeignAggregateExpression::Local { .. }
+        | NullableForeignAggregateExpression::Property { .. }
+        | NullableForeignAggregateExpression::Static { .. } => 0,
+    }
 }
 
 fn byte_region_class_temporary_capacity(value: &RegionExpression) -> usize {
@@ -8822,6 +9023,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_payload_enum_class_temporary_capacity(value)
         }
         BoolExpression::NullableFunctionIsPresent(_) => 0,
+        BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            nullable_foreign_aggregate_class_temporary_capacity(value)
+        }
         BoolExpression::PayloadEnumCompare { left, right, .. } => {
             payload_enum_class_temporary_capacity(left)
                 + payload_enum_class_temporary_capacity(right)
@@ -9120,6 +9324,9 @@ impl fmt::Display for Type {
                 write!(formatter, "?payload-enum#{}", ty.id.0)
             }
             Type::ForeignAggregate(ty) => write!(formatter, "foreign-aggregate#{}", ty.id.0),
+            Type::NullableForeignAggregate(ty) => {
+                write!(formatter, "?foreign-aggregate#{}", ty.id.0)
+            }
             Type::Function(function_type) => {
                 write!(formatter, "function-type#{}", function_type.0)
             }
@@ -9444,37 +9651,8 @@ impl fmt::Display for Rvalue {
             }
             Rvalue::Function(value) => write!(formatter, "{value}"),
             Rvalue::NullableFunction(value) => write!(formatter, "{value}"),
-            Rvalue::ForeignAggregate(value) => match value {
-                ForeignAggregateExpression::Construct { ty, fields, .. } => {
-                    let fields = fields
-                        .iter()
-                        .map(|field| format!("@{}: {}", field.offset, field.value))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    write!(formatter, "foreign_aggregate#{}{{{fields}}}", ty.id.0)
-                }
-                ForeignAggregateExpression::Local { local, .. } => {
-                    write!(formatter, "copy local{}", local.0)
-                }
-                ForeignAggregateExpression::Property {
-                    object, property, ..
-                } => write!(
-                    formatter,
-                    "copy local{}->property{}",
-                    object.0, property.index
-                ),
-                ForeignAggregateExpression::Static { id, .. } => {
-                    write!(formatter, "copy static{}", id.0)
-                }
-                ForeignAggregateExpression::Call { function, args, .. } => {
-                    let args = args
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    write!(formatter, "call fn{}({args})", function.0)
-                }
-            },
+            Rvalue::ForeignAggregate(value) => write!(formatter, "{value}"),
+            Rvalue::NullableForeignAggregate(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -10717,6 +10895,9 @@ impl fmt::Display for BoolExpression {
                 write!(formatter, "present(?payload-enum#{})", value.ty().id.0)
             }
             Self::NullableFunctionIsPresent(value) => write!(formatter, "present({value})"),
+            Self::NullableForeignAggregateIsPresent(value) => {
+                write!(formatter, "present(?foreign-aggregate#{})", value.ty().id.0)
+            }
             Self::PayloadEnumCompare { op, left, right } => {
                 write!(formatter, "{left:?} {op} {right:?}")
             }

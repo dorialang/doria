@@ -829,6 +829,7 @@ pub const fn direct_value_slots(ty: mir::Type) -> DirectValueSlots {
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
         | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => DirectValueSlots::integer(1),
     }
 }
@@ -859,7 +860,8 @@ pub const fn returns_through_result_slot(return_type: mir::ReturnType, checked: 
         mir::ReturnType::Value(
             mir::Type::PayloadEnum(_)
             | mir::Type::NullablePayloadEnum(_)
-            | mir::Type::ForeignAggregate(_),
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_),
         ) => true,
         mir::ReturnType::Value(ty) => !direct_value_slots(ty).fits(DIRECT_RETURN_SLOTS),
     }
@@ -1045,6 +1047,10 @@ pub const fn memory_value_layout(ty: mir::Type) -> Option<NativeLayout> {
             size: aggregate.size,
             align: aggregate.align,
         }),
+        mir::Type::NullableForeignAggregate(aggregate) => Some(NativeLayout {
+            size: aggregate.nullable_size,
+            align: aggregate.align,
+        }),
         _ => None,
     }
 }
@@ -1152,6 +1158,10 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
         },
         mir::Type::ForeignAggregate(ty) => NativeLayout {
             size: ty.size,
+            align: ty.align,
+        },
+        mir::Type::NullableForeignAggregate(ty) => NativeLayout {
+            size: ty.nullable_size,
             align: ty.align,
         },
         mir::Type::String

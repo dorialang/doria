@@ -619,6 +619,10 @@ fn declare_statics<'ctx>(
                 let ty = llvm_type(context, target_data, program, property.ty);
                 let global = module.add_global(ty, None, &symbol);
                 global.set_initializer(&ty.const_zero());
+                // A value held in memory is read with its own alignment.
+                if let Some(layout) = native_closure_abi::memory_value_layout(property.ty) {
+                    global.set_alignment(layout.align);
+                }
                 global
             }
             mir::StaticValue::String(value) => {
@@ -669,7 +673,12 @@ fn declare_statics<'ctx>(
             // A foreign struct or union is plain bytes: its static data is
             // the constant's bytes (Decision 0148 section 6).
             mir::StaticValue::ForeignAggregate(value) => {
-                let initializer = context.const_string(&value.bytes(), false);
+                let bytes = if matches!(property.ty, mir::Type::NullableForeignAggregate(_)) {
+                    value.nullable_bytes()
+                } else {
+                    value.bytes()
+                };
+                let initializer = context.const_string(&bytes, false);
                 let global = module.add_global(initializer.get_type(), None, &symbol);
                 global.set_initializer(&initializer);
                 global.set_alignment(value.ty.align);
@@ -2221,6 +2230,13 @@ fn initialize_payload_static_value_llvm<'ctx>(
             if value.ty == expected =>
         {
             build(builder.build_store(address, context.const_string(&value.bytes(), false)))?;
+        }
+        (
+            mir::StaticValue::ForeignAggregate(value),
+            mir::Type::NullableForeignAggregate(expected),
+        ) if value.ty == expected => {
+            let bytes = context.const_string(&value.nullable_bytes(), false);
+            build(builder.build_store(address, bytes))?;
         }
         _ => {
             return Err(malformed_mir(
@@ -6287,7 +6303,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         // nothing to release (Decision 0148 section 6).
                         mir::Type::Function(_)
                         | mir::Type::NullableFunction(_)
-                        | mir::Type::ForeignAggregate(_) => None,
+                        | mir::Type::ForeignAggregate(_)
+                        | mir::Type::NullableForeignAggregate(_) => None,
                         mir::Type::ClosureEnvironment(_) => {
                             return Err(malformed_mir(
                                 "closure environment pointer is not a property value",
@@ -10383,7 +10400,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
                 "closure environment pointer reached ordinary value cleanup",
             )),
-            mir::Type::ForeignAggregate(_) => Ok(()),
+            mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => Ok(()),
             mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                 let value = build(self.builder.build_load(
                     error_carrier_type(self.context),
@@ -11356,6 +11373,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::ForeignAggregate(value) => {
                 Ok(self.lower_foreign_aggregate_expression(value)?.into())
             }
+            mir::Rvalue::NullableForeignAggregate(value) => Ok(self
+                .lower_nullable_foreign_aggregate_expression(value)?
+                .into()),
         }?;
         self.remember_explicit_borrow_home(expression, value)?;
         Ok(value)
@@ -11414,7 +11434,87 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call_at(*function, args, true, *span)?
                 .ok_or_else(|| malformed_mir("a foreign aggregate call returned void"))?
                 .into_pointer_value()),
+            // Checking proved the `?Name` local present; its value is its
+            // payload, which the consumer copies.
+            mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty, local } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                self.byte_offset(slot, ty.nullable_payload_offset, "foreign.payload")
+            }
         }
+    }
+
+    /// The address of a `?Name` value in the nullable inline layout of its
+    /// type: fresh storage for `null` and for a present value, or the
+    /// storage a copy reads, which the consumer copies from.
+    fn lower_nullable_foreign_aggregate_expression(
+        &mut self,
+        expression: &mir::NullableForeignAggregateExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let ty = expression.ty();
+        match expression {
+            mir::NullableForeignAggregateExpression::Null(_) => {
+                let address = self.entry_foreign_storage_alloca(ty, true, "foreign.null")?;
+                self.zero_foreign_storage(address, ty, true)?;
+                Ok(address)
+            }
+            mir::NullableForeignAggregateExpression::Present(value) => {
+                let payload = self.lower_foreign_aggregate_expression(value)?;
+                let address = self.entry_foreign_storage_alloca(ty, true, "foreign.present")?;
+                self.zero_foreign_storage(address, ty, true)?;
+                build(
+                    self.builder
+                        .build_store(address, self.context.i8_type().const_int(1, false)),
+                )?;
+                let destination =
+                    self.byte_offset(address, ty.nullable_payload_offset, "foreign.payload")?;
+                self.copy_memory_value(
+                    destination,
+                    payload,
+                    native_closure_abi::NativeLayout {
+                        size: ty.size,
+                        align: ty.align,
+                    },
+                )?;
+                Ok(address)
+            }
+            mir::NullableForeignAggregateExpression::Local { local, .. } => {
+                local_slot(&self.local_slots, *local)
+            }
+            mir::NullableForeignAggregateExpression::Property {
+                object, property, ..
+            } => self.lower_property_address(*object, *property),
+            mir::NullableForeignAggregateExpression::Static { id, .. } => self.static_address(*id),
+            mir::NullableForeignAggregateExpression::Call {
+                function,
+                args,
+                span,
+                ..
+            } => Ok(self
+                .lower_call_at(*function, args, true, *span)?
+                .ok_or_else(|| malformed_mir("a nullable foreign aggregate call returned void"))?
+                .into_pointer_value()),
+        }
+    }
+
+    /// Sets every byte of Doria storage of a foreign struct or union, or of
+    /// its `?Name` form when `nullable`, to zero.
+    fn zero_foreign_storage(
+        &self,
+        address: PointerValue<'ctx>,
+        ty: mir::ForeignAggregateType,
+        nullable: bool,
+    ) -> Result<(), BackendError> {
+        let size = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(ty.storage_size(nullable)), false);
+        build(self.builder.build_memset(
+            address,
+            ty.align,
+            self.context.i8_type().const_zero(),
+            size,
+        ))?;
+        Ok(())
     }
 
     fn entry_foreign_aggregate_alloca(
@@ -11422,7 +11522,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ty: mir::ForeignAggregateType,
         name: &str,
     ) -> Result<PointerValue<'ctx>, BackendError> {
-        let slot = self.entry_alloca(self.context.i8_type().array_type(ty.size), name)?;
+        self.entry_foreign_storage_alloca(ty, false, name)
+    }
+
+    /// Entry-block storage for a foreign struct or union, or for its
+    /// `?Name` form when `nullable`, aligned as the C layout is.
+    fn entry_foreign_storage_alloca(
+        &self,
+        ty: mir::ForeignAggregateType,
+        nullable: bool,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let slot = self.entry_alloca(
+            self.context.i8_type().array_type(ty.storage_size(nullable)),
+            name,
+        )?;
         slot.as_instruction_value()
             .ok_or_else(|| backend_failure("foreign aggregate alloca has no instruction"))?
             .set_alignment(ty.align)
@@ -11498,6 +11612,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         let base = match aggregate {
             mir::ForeignAggregatePlace::Local(local) => local_slot(&self.local_slots, local)?,
+            // Checking proved the `?Name` local present; the aggregate is its
+            // payload.
+            mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
+                let mir::Type::NullableForeignAggregate(ty) = local_in(self.function, local)?.ty
+                else {
+                    return Err(malformed_mir(
+                        "a narrowed foreign field access names a local without a `?Name` value",
+                    ));
+                };
+                let slot = local_slot(&self.local_slots, local)?;
+                self.byte_offset(slot, ty.nullable_payload_offset, "foreign.payload")?
+            }
             mir::ForeignAggregatePlace::Property { object, property } => {
                 self.lower_property_address(object, property)?
             }
@@ -12503,6 +12629,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::Region(_)
             | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
                     "function, region, and closure-environment values do not support collection comparison",
@@ -12596,6 +12723,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::Region(_)
             | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
                 "aggregate carriers cannot use scalar collection transport",
             )),
@@ -12703,6 +12831,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::Region(_)
             | mir::Type::NullableRegion(_)
             | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_)
             | mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
                     "function carriers require aggregate collection transport",
@@ -16583,7 +16712,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Type::NullableScalar(_)
             | mir::Type::Region(_)
             | mir::Type::NullableRegion(_)
-            | mir::Type::ForeignAggregate(_) => Ok(()),
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_) => Ok(()),
             mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
                 self.drop_function_carrier(value.into_struct_value())
             }
@@ -25250,6 +25380,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .build_conditional_branch(condition, then_block, else_block),
                 )?;
             }
+            mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+                let address = self.lower_nullable_foreign_aggregate_expression(value)?;
+                let present = build(self.builder.build_load(
+                    self.context.i8_type(),
+                    address,
+                    "nullable.foreign.present",
+                ))?
+                .into_int_value();
+                let condition = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    present,
+                    self.context.i8_type().const_zero(),
+                    "nullable.foreign.is-present",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(condition, then_block, else_block),
+                )?;
+            }
             mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
                 let owned = value.owned_temporary();
                 let ty = value.ty();
@@ -26838,6 +26987,7 @@ fn collection_storage_type<'ctx>(
         | mir::Type::Region(_)
         | mir::Type::NullableRegion(_)
         | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "function carriers require aggregate collection storage",
@@ -27031,6 +27181,9 @@ fn llvm_type<'ctx>(
         }
         mir::Type::ForeignAggregate(aggregate) => {
             context.i8_type().array_type(aggregate.size).into()
+        }
+        mir::Type::NullableForeignAggregate(aggregate) => {
+            context.i8_type().array_type(aggregate.nullable_size).into()
         }
     }
 }

@@ -179,6 +179,14 @@ pub(crate) fn direct_call_result(
                 span,
             })
         }
+        Type::NullableForeignAggregate(ty) => {
+            Rvalue::NullableForeignAggregate(mir::NullableForeignAggregateExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+            })
+        }
         Type::NullablePayloadEnum(ty) => {
             Rvalue::NullablePayloadEnum(NullablePayloadEnumExpression::Call {
                 span,
@@ -527,6 +535,12 @@ pub(crate) fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -
         mir::Type::ForeignAggregate(ty) => {
             mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Local { ty, local })
         }
+        mir::Type::NullableForeignAggregate(ty) => {
+            mir::Rvalue::NullableForeignAggregate(mir::NullableForeignAggregateExpression::Local {
+                ty,
+                local,
+            })
+        }
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are compiler-private and cannot be source rvalues")
         }
@@ -558,6 +572,9 @@ pub(crate) fn nullable_present_rvalue(value: mir::Rvalue) -> mir::Rvalue {
         Rvalue::Function(value) => {
             Rvalue::NullableFunction(mir::NullableFunctionExpression::Present(value))
         }
+        Rvalue::ForeignAggregate(value) => Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::Present(value),
+        ),
         Rvalue::SharedReference(value) => {
             Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Shared(value))
         }

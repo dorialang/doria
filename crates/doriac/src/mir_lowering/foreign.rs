@@ -739,7 +739,7 @@ fn field_place(
     if *null_safe {
         return Err(vec![unsupported(
             *span,
-            "a nullable foreign struct or union is not built yet",
+            "a null-safe foreign field access reached the in-place field path",
         )]);
     }
     let Some(layout) = facts.layout.clone() else {
@@ -778,13 +778,22 @@ fn field_place(
     let aggregate = match unparenthesized_place(object) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            if context.local_type(local) != mir::Type::ForeignAggregate(aggregate_type) {
-                return Err(vec![unsupported(
-                    *span,
-                    "a field access names a local that holds no foreign struct or union",
-                )]);
+            match context.local_type(local) {
+                mir::Type::ForeignAggregate(ty) if ty == aggregate_type => {
+                    mir::ForeignAggregatePlace::Local(local)
+                }
+                // Checking narrowed the `?Name` local to present, so the
+                // field is in its storage at the payload offset.
+                mir::Type::NullableForeignAggregate(ty) if ty == aggregate_type => {
+                    mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local)
+                }
+                _ => {
+                    return Err(vec![unsupported(
+                        *span,
+                        "a field access names a local that holds no foreign struct or union",
+                    )])
+                }
             }
-            mir::ForeignAggregatePlace::Local(local)
         }
         place @ hir::Expr::PropertyAccess { .. } if stored_property_place(place, context) => {
             let (object, property, ty) = lower_property_place(place, context)?;
@@ -861,6 +870,9 @@ pub(super) fn field_read(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if let Some(value) = null_safe_field_read(expr, expected, context)? {
+        return Ok(Some(value));
+    }
     let Some(place) = field_place(expr, context)? else {
         return Ok(None);
     };
@@ -898,6 +910,151 @@ pub(super) fn field_read(
         span: expr.span(),
     });
     convert_call_result(target, ty, expected, false, expr.span(), context).map(Some)
+}
+
+/// `$maybe?->field` of a `?Name` value (Decision 0148 section 6): the
+/// field when the value is present, and null otherwise, converted to
+/// `expected`; `None` when `expr` is not one. The receiver is evaluated
+/// once into a local, and the field is read from that local's payload in
+/// the present branch.
+fn null_safe_field_read(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::Rvalue>> {
+    let hir::Expr::PropertyAccess {
+        object,
+        property,
+        null_safe: true,
+        take: false,
+        span,
+        ..
+    } = unparenthesized_place(expr)
+    else {
+        return Ok(None);
+    };
+    let Ok(mir::Type::NullableForeignAggregate(aggregate)) = context.expression_type(object) else {
+        return Ok(None);
+    };
+    let result = context.expression_type(expr)?;
+    let (present, nullable) = non_null_match_type(result);
+    if !nullable {
+        return Err(vec![unsupported(
+            *span,
+            "a null-safe foreign field read has no nullable result type",
+        )]);
+    }
+    let nullable_type = mir::Type::NullableForeignAggregate(aggregate);
+    let selection = context.coalesce_selection(object);
+    let read = |receiver, context: &mut LoweringContext| {
+        let field = present_field(receiver, aggregate, property, *span, present, context)?;
+        // A writable region is a move carrier the result takes over, as
+        // every null-safe region result is.
+        Ok(Some((field, present, present.is_writable_region())))
+    };
+    // A local is read in place, so a region over a fixed-length array field
+    // borrows the local itself; any other receiver is evaluated once into a
+    // local first.
+    let local = match unparenthesized_place(object) {
+        hir::Expr::Variable { name, span } => Some(context.lookup_local(name, *span)?)
+            .filter(|local| context.local_type(*local) == nullable_type),
+        _ => None,
+    };
+    let value = match local {
+        Some(local) => null_safe_call_on(
+            local,
+            nullable_type,
+            selection,
+            None,
+            *span,
+            Some((result, false)),
+            read,
+            context,
+        )?,
+        None => {
+            if matches!(present, mir::Type::Region(region) if region.is_writable()) {
+                return Err(vec![crate::unsafe_code::unbuilt_form(
+                    *span,
+                    "Foreign Aggregates Cannot Be Built Here Yet",
+                    format!(
+                        "a writable fixed-length array field read with `?->` from a property, static property or call result is part of Doria; this compiler builds `?->` of `${property}` on a local, and not here yet"
+                    ),
+                )]);
+            }
+            let receiver = mir::Rvalue::NullableForeignAggregate(nullable_aggregate_expression(
+                object, aggregate, context,
+            )?);
+            materialize_null_safe_call(
+                receiver,
+                selection,
+                false,
+                None,
+                *span,
+                Some((result, false)),
+                read,
+                context,
+            )?
+        }
+    };
+    let (local, ty, transfer) = value.expect("a null-safe field read has a value");
+    convert_call_result(local, ty, expected, transfer, *span, context).map(Some)
+}
+
+/// The field `property` of the present `?Name` value in `receiver`, read
+/// into a local of type `ty`.
+fn present_field(
+    receiver: mir::LocalId,
+    aggregate: mir::ForeignAggregateType,
+    property: &str,
+    span: Span,
+    ty: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::LocalId> {
+    let mismatch = || {
+        vec![unsupported(
+            span,
+            "a null-safe foreign field read names no checked field",
+        )]
+    };
+    let definition = context
+        .collection_registry
+        .foreign_aggregates
+        .get(aggregate.id.0)
+        .cloned()
+        .ok_or_else(mismatch)?;
+    let facts = context
+        .semantic_info
+        .foreign_aggregates
+        .get(&definition.name)
+        .ok_or_else(mismatch)?;
+    let (index, field) = facts.field(property).ok_or_else(mismatch)?;
+    let offset = definition.layout.fields[index].offset;
+    let array = fixed_array(&field.ty).map(|(_, length)| length);
+    // A writable region the read forms is a fresh move carrier, which the
+    // statement owns until the null-safe result takes it over.
+    let owned = ty.is_writable_region();
+    let target = context.declare_checked_call_slot(ty, owned);
+    let access = match array {
+        Some(length) => {
+            let mir::Type::Region(region) = ty else {
+                return Err(mismatch());
+            };
+            byte_region::built_element(region, span, context)?;
+            context.locals[target.0].writable = region.is_writable();
+            mir::ForeignFieldAccess::Region { target, length }
+        }
+        None => mir::ForeignFieldAccess::Read { target },
+    };
+    context.push_statement(mir::Statement::ForeignField {
+        aggregate: mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(receiver),
+        offset,
+        access,
+        span,
+    });
+    if owned {
+        context.track_statement_owned_local(target, ty);
+    }
+    Ok(target)
 }
 
 /// `$aggregate->field = $value`, a compound assignment to a field, and
@@ -1031,13 +1188,19 @@ pub(super) fn aggregate_expression(
         }),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            if context.local_type(local) != mir::Type::ForeignAggregate(ty) {
-                return Err(vec![unsupported(
+            match context.local_type(local) {
+                mir::Type::ForeignAggregate(actual) if actual == ty => {
+                    Ok(mir::ForeignAggregateExpression::Local { ty, local })
+                }
+                // Checking narrowed the `?Name` local to present.
+                mir::Type::NullableForeignAggregate(actual) if actual == ty => {
+                    Ok(mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty, local })
+                }
+                _ => Err(vec![unsupported(
                     *span,
                     "a foreign struct or union local has another type",
-                )]);
+                )]),
             }
-            Ok(mir::ForeignAggregateExpression::Local { ty, local })
         }
         // Getter hooks and interface properties are calls the shared
         // checked-call path lowers first, so a property access that
@@ -1056,15 +1219,35 @@ pub(super) fn aggregate_expression(
                 property,
             })
         }
+        call => match aggregate_call(call, mir::Type::ForeignAggregate(ty), context)? {
+            Some((function, args, span)) => Ok(mir::ForeignAggregateExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+            }),
+            None => Err(vec![unsupported(
+                call.span(),
+                "this foreign struct or union value is not built yet",
+            )]),
+        },
+    }
+}
+
+/// The function a call of a Doria function, method or static method
+/// returning `result`, a foreign struct or union or its `?Name` form,
+/// calls, with its lowered arguments and span; `None` when `expr` is not
+/// such a call.
+fn aggregate_call(
+    expr: &hir::Expr,
+    result: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::FunctionId, Vec<mir::Rvalue>, Span)>> {
+    let (signature, args, span) = match expr {
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;
-            returns_aggregate(signature.return_type, ty, *span)?;
-            Ok(mir::ForeignAggregateExpression::Call {
-                ty,
-                function: signature.id,
-                args: lower_call_args(name, args, signature, *span, context)?,
-                span: *span,
-            })
+            let args = lower_call_args(name, args, signature.clone(), *span, context)?;
+            (signature, args, *span)
         }
         hir::Expr::MethodCall {
             object,
@@ -1075,13 +1258,7 @@ pub(super) fn aggregate_expression(
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
-            returns_aggregate(signature.return_type, ty, *span)?;
-            Ok(mir::ForeignAggregateExpression::Call {
-                ty,
-                function: signature.id,
-                args,
-                span: *span,
-            })
+            (signature, args, *span)
         }
         hir::Expr::StaticCall {
             class_name,
@@ -1091,17 +1268,103 @@ pub(super) fn aggregate_expression(
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
-            returns_aggregate(signature.return_type, ty, *span)?;
-            Ok(mir::ForeignAggregateExpression::Call {
-                ty,
-                function: signature.id,
-                args,
-                span: *span,
-            })
+            (signature, args, *span)
         }
-        other => Err(vec![unsupported(
-            other.span(),
-            "this foreign struct or union value is not built yet",
+        _ => return Ok(None),
+    };
+    if signature.return_type != mir::ReturnType::Value(result) {
+        return Err(vec![unsupported(
+            span,
+            "a call returns another type than the foreign struct or union expected",
+        )]);
+    }
+    Ok(Some((signature.id, args, span)))
+}
+
+/// A `?Name` value of type `ty`: `null`, a value of type `Name` made
+/// present, or a copy of a `?Name` local, stored property, static property
+/// or call result. Calls, branches and null-safe reads go through the shared
+/// paths, which place their value in a local first.
+pub(super) fn nullable_aggregate_expression(
+    expr: &hir::Expr,
+    ty: mir::ForeignAggregateType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableForeignAggregateExpression> {
+    let nullable = mir::Type::NullableForeignAggregate(ty);
+    if context.expression_is_null(expr)
+        || matches!(
+            context.constant_value(unparenthesized_place(expr)),
+            Some(crate::const_eval::ConstValue::Null)
+        )
+    {
+        return Ok(mir::NullableForeignAggregateExpression::Null(ty));
+    }
+    let present = |value| Ok(mir::NullableForeignAggregateExpression::Present(value));
+    if context
+        .constant_value(unparenthesized_place(expr))
+        .is_some()
+    {
+        return present(aggregate_expression(expr, ty, context)?);
+    }
+    match unparenthesized_place(expr) {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            if context.local_type(local) == nullable {
+                return Ok(mir::NullableForeignAggregateExpression::Local { ty, local });
+            }
+        }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => {
+            let (id, actual) = context.static_property(class_name, member, *span)?;
+            if actual == nullable {
+                return Ok(mir::NullableForeignAggregateExpression::Static { ty, id });
+            }
+        }
+        place @ hir::Expr::PropertyAccess { .. } if stored_property_place(place, context) => {
+            let (object, property, actual) = lower_property_place(place, context)?;
+            if actual == nullable {
+                return Ok(mir::NullableForeignAggregateExpression::Property {
+                    ty,
+                    object,
+                    property,
+                });
+            }
+            if actual == mir::Type::ForeignAggregate(ty) {
+                return present(mir::ForeignAggregateExpression::Property {
+                    ty,
+                    object,
+                    property,
+                });
+            }
+        }
+        _ => {}
+    }
+    if context.expression_type(expr)? == mir::Type::ForeignAggregate(ty) {
+        return present(aggregate_expression(expr, ty, context)?);
+    }
+    if let Some((function, args, span)) =
+        aggregate_call(unparenthesized_place(expr), nullable, context)?
+    {
+        return Ok(mir::NullableForeignAggregateExpression::Call {
+            ty,
+            function,
+            args,
+            span,
+        });
+    }
+    let value = if is_branching_expr(expr) {
+        Some(lower_branching_rvalue(expr, nullable, false, context)?)
+    } else {
+        materialize_checked_rvalue(expr, nullable, false, context)?
+    };
+    match value {
+        Some(mir::Rvalue::NullableForeignAggregate(value)) => Ok(value),
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this nullable foreign struct or union value is not built yet",
         )]),
     }
 }
@@ -1160,21 +1423,6 @@ pub(super) fn constant_fields<'v>(
         fields.push((placed.offset, ty, field));
     }
     Ok(fields)
-}
-
-fn returns_aggregate(
-    return_type: mir::ReturnType,
-    ty: mir::ForeignAggregateType,
-    span: Span,
-) -> DiagnosticResult<()> {
-    if return_type == mir::ReturnType::Value(mir::Type::ForeignAggregate(ty)) {
-        Ok(())
-    } else {
-        Err(vec![unsupported(
-            span,
-            "a call returns another type than the foreign struct or union expected",
-        )])
-    }
 }
 
 /// `new Name(...)` of a foreign struct or union (Decision 0148 section 6,

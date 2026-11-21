@@ -800,7 +800,8 @@ fn append_type_abi_params(
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::ForeignAggregate(_) => {
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             params.push(AbiParam::new(pointer_type));
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -1034,7 +1035,8 @@ fn lowered_from_direct_results(
         }
         mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::ForeignAggregate(_) => {
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             return Err(malformed_mir(
                 "a payload enum or foreign aggregate returns through its result slot",
             ))
@@ -1332,7 +1334,12 @@ fn define_static_data(
             // the constant's bytes (Decision 0148 section 6).
             mir::StaticValue::ForeignAggregate(value) => {
                 description.set_align(value.ty.align.into());
-                description.define(value.bytes().into_boxed_slice());
+                let bytes = if matches!(property.ty, mir::Type::NullableForeignAggregate(_)) {
+                    value.nullable_bytes()
+                } else {
+                    value.bytes()
+                };
+                description.define(bytes.into_boxed_slice());
             }
         }
         module
@@ -1691,10 +1698,11 @@ fn define_function(
                         ty.align.trailing_zeros() as u8,
                     )))
                 }
-                mir::Type::ForeignAggregate(ty) => {
+                mir::Type::ForeignAggregate(ty) | mir::Type::NullableForeignAggregate(ty) => {
+                    let nullable = matches!(local.ty, mir::Type::NullableForeignAggregate(_));
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
-                        ty.size,
+                        ty.storage_size(nullable),
                         ty.align.trailing_zeros() as u8,
                     )))
                 }
@@ -2329,11 +2337,15 @@ fn initialize_locals(
             builder.call_memset(frontend_config, address, zero, size);
             continue;
         }
-        if let mir::Type::ForeignAggregate(ty) = local.ty {
+        if let mir::Type::ForeignAggregate(ty) | mir::Type::NullableForeignAggregate(ty) = local.ty
+        {
+            let nullable = matches!(local.ty, mir::Type::NullableForeignAggregate(_));
             let slot = local_slot(slots, local.id)?;
             let address = builder.ins().stack_addr(pointer_type, slot, 0);
             let zero = builder.ins().iconst(types::I8, 0);
-            let size = builder.ins().iconst(pointer_type, i64::from(ty.size));
+            let size = builder
+                .ins()
+                .iconst(pointer_type, i64::from(ty.storage_size(nullable)));
             builder.call_memset(frontend_config, address, zero, size);
             continue;
         }
@@ -2422,7 +2434,8 @@ fn initialize_locals(
             }
             mir::Type::PayloadEnum(_)
             | mir::Type::NullablePayloadEnum(_)
-            | mir::Type::ForeignAggregate(_) => unreachable!(),
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_) => unreachable!(),
         };
         builder
             .ins()
@@ -2510,16 +2523,18 @@ fn bind_parameters(
                 payload.storage_size(matches!(ty, mir::Type::NullablePayloadEnum(_))),
                 pointer_type,
             );
-        } else if let mir::Type::ForeignAggregate(aggregate) = ty {
+        } else if let mir::Type::ForeignAggregate(aggregate)
+        | mir::Type::NullableForeignAggregate(aggregate) = ty
+        {
             // The caller passes the address of its value; the callee keeps
             // its own copy, as every Copy argument is.
             let destination = builder.ins().stack_addr(pointer_type, slot, 0);
-            copy_foreign_aggregate(
+            copy_foreign_storage(
                 builder,
                 destination,
                 first,
                 aggregate,
-                AggregateAccess::Storage,
+                matches!(ty, mir::Type::NullableForeignAggregate(_)),
                 pointer_type,
             );
         } else if matches!(ty, mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -3205,12 +3220,22 @@ fn initialize_payload_static_value(
             }
         }
         // The storage starts zero, so each scalar field is stored over it.
-        (mir::StaticValue::ForeignAggregate(value), mir::Type::ForeignAggregate(expected))
-            if value.ty == expected =>
-        {
+        (
+            mir::StaticValue::ForeignAggregate(value),
+            mir::Type::ForeignAggregate(expected) | mir::Type::NullableForeignAggregate(expected),
+        ) if value.ty == expected => {
+            let payload = if matches!(ty, mir::Type::NullableForeignAggregate(_)) {
+                let present = builder.ins().iconst(types::I8, 1);
+                builder.ins().store(flags, present, address, 0);
+                expected.nullable_payload_offset as i32
+            } else {
+                0
+            };
             for (offset, scalar) in value.scalar_fields() {
                 let scalar = cranelift_scalar_constant(builder, scalar);
-                builder.ins().store(flags, scalar, address, offset as i32);
+                builder
+                    .ins()
+                    .store(flags, scalar, address, payload + offset as i32);
             }
         }
         _ => {
@@ -5003,7 +5028,8 @@ fn lower_statement(
                     // to release (Decision 0148 section 6).
                     mir::Type::Function(_)
                     | mir::Type::NullableFunction(_)
-                    | mir::Type::ForeignAggregate(_) => None,
+                    | mir::Type::ForeignAggregate(_)
+                    | mir::Type::NullableForeignAggregate(_) => None,
                     mir::Type::ClosureEnvironment(_) => {
                         return Err(malformed_mir(
                             "closure environment pointer reached a Doria property",
@@ -5701,7 +5727,8 @@ fn load_lowered_from_stack(
         )),
         mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::ForeignAggregate(_) => {
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             LoweredValue::Single(builder.ins().stack_addr(pointer, slot, 0))
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -5787,14 +5814,14 @@ fn store_lowered_to_stack(
                 pointer,
             );
         }
-        mir::Type::ForeignAggregate(aggregate) => {
+        mir::Type::ForeignAggregate(aggregate) | mir::Type::NullableForeignAggregate(aggregate) => {
             let destination = builder.ins().stack_addr(pointer, slot, 0);
-            copy_foreign_aggregate(
+            copy_foreign_storage(
                 builder,
                 destination,
                 value.single()?,
                 aggregate,
-                AggregateAccess::Storage,
+                matches!(ty, mir::Type::NullableForeignAggregate(_)),
                 pointer,
             );
         }
@@ -5894,7 +5921,8 @@ fn load_lowered_from_address(
         )),
         mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::ForeignAggregate(_) => LoweredValue::Single(address),
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => LoweredValue::Single(address),
         mir::Type::Class(class) | mir::Type::NullableClass(class)
             if class_uses_open_carrier(program, class) =>
         {
@@ -5975,14 +6003,16 @@ fn store_lowered_to_address(
                 pointer,
             );
         }
-        mir::Type::ForeignAggregate(aggregate) => copy_foreign_aggregate(
-            builder,
-            address,
-            value.single()?,
-            aggregate,
-            AggregateAccess::Storage,
-            pointer,
-        ),
+        mir::Type::ForeignAggregate(aggregate) | mir::Type::NullableForeignAggregate(aggregate) => {
+            copy_foreign_storage(
+                builder,
+                address,
+                value.single()?,
+                aggregate,
+                matches!(ty, mir::Type::NullableForeignAggregate(_)),
+                pointer,
+            )
+        }
         mir::Type::NullableScalar(scalar) => {
             store_nullable_scalar(builder, scalar, address, value, flags.into(), pointer)?;
         }
@@ -9028,6 +9058,10 @@ fn lower_rvalue(
         mir::Rvalue::ForeignAggregate(value) => {
             lower_foreign_aggregate_expression(builder, value, resources).map(LoweredValue::Single)
         }
+        mir::Rvalue::NullableForeignAggregate(value) => {
+            lower_nullable_foreign_aggregate_expression(builder, value, resources)
+                .map(LoweredValue::Single)
+        }
     }?;
     let function = &resources.program.functions[resources.function_id.0];
     if expression.is_null_value() && expression.ty().has_move_ownership() {
@@ -10565,11 +10599,8 @@ const FOREIGN_AGGREGATE_UNROLLED_UNITS: u32 = 16;
 /// The memory unit a foreign aggregate copy or fill moves: its alignment up
 /// to 8 bytes. A C layout's size is a multiple of its alignment, so the
 /// units cover it exactly.
-fn foreign_aggregate_unit(
-    ty: mir::ForeignAggregateType,
-    access: AggregateAccess,
-) -> (ClifType, u32, MemFlagsData) {
-    let unit = ty.align.min(8);
+fn foreign_aggregate_unit(align: u32, access: AggregateAccess) -> (ClifType, u32, MemFlagsData) {
+    let unit = align.min(8);
     let clif = match unit {
         1 => types::I8,
         2 => types::I16,
@@ -10588,12 +10619,12 @@ fn foreign_aggregate_unit(
 /// offset as a value of `pointer` type.
 fn for_each_foreign_aggregate_unit(
     builder: &mut FunctionBuilder,
-    ty: mir::ForeignAggregateType,
+    size: u32,
     unit: u32,
     pointer: ClifType,
     mut step: impl FnMut(&mut FunctionBuilder, Value),
 ) {
-    let units = ty.size / unit;
+    let units = size / unit;
     if units <= FOREIGN_AGGREGATE_UNROLLED_UNITS {
         for index in 0..units {
             let offset = builder.ins().iconst(pointer, i64::from(index * unit));
@@ -10612,7 +10643,7 @@ fn for_each_foreign_aggregate_unit(
     let next = builder.ins().iadd_imm_u(offset, i64::from(unit));
     let more = builder
         .ins()
-        .icmp_imm_u(IntCC::UnsignedLessThan, next, i64::from(ty.size));
+        .icmp_imm_u(IntCC::UnsignedLessThan, next, i64::from(size));
     builder
         .ins()
         .brif(more, body, &[BlockArg::Value(next)], done, &[]);
@@ -10629,8 +10660,51 @@ fn copy_foreign_aggregate(
     access: AggregateAccess,
     pointer: ClifType,
 ) {
-    let (clif, unit, flags) = foreign_aggregate_unit(ty, access);
-    for_each_foreign_aggregate_unit(builder, ty, unit, pointer, |builder, offset| {
+    copy_foreign_bytes(
+        builder,
+        destination,
+        source,
+        ty.size,
+        ty.align,
+        access,
+        pointer,
+    );
+}
+
+/// Copies Doria storage of a foreign struct or union of type `ty`, or of
+/// its `?Name` form when `nullable`, from `source` to `destination`.
+fn copy_foreign_storage(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    ty: mir::ForeignAggregateType,
+    nullable: bool,
+    pointer: ClifType,
+) {
+    copy_foreign_bytes(
+        builder,
+        destination,
+        source,
+        ty.storage_size(nullable),
+        ty.align,
+        AggregateAccess::Storage,
+        pointer,
+    );
+}
+
+/// Copies `size` bytes of storage aligned to `align`, a multiple of its
+/// copy unit, from `source` to `destination`.
+fn copy_foreign_bytes(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    size: u32,
+    align: u32,
+    access: AggregateAccess,
+    pointer: ClifType,
+) {
+    let (clif, unit, flags) = foreign_aggregate_unit(align, access);
+    for_each_foreign_aggregate_unit(builder, size, unit, pointer, |builder, offset| {
         let from = builder.ins().iadd(source, offset);
         let to = builder.ins().iadd(destination, offset);
         let value = builder.ins().load(clif, flags, from, 0);
@@ -10643,11 +10717,13 @@ fn zero_foreign_aggregate(
     builder: &mut FunctionBuilder,
     address: Value,
     ty: mir::ForeignAggregateType,
+    nullable: bool,
     pointer: ClifType,
 ) {
-    let (clif, unit, flags) = foreign_aggregate_unit(ty, AggregateAccess::Storage);
+    let (clif, unit, flags) = foreign_aggregate_unit(ty.align, AggregateAccess::Storage);
     let zero = builder.ins().iconst(clif, 0);
-    for_each_foreign_aggregate_unit(builder, ty, unit, pointer, |builder, offset| {
+    let size = ty.storage_size(nullable);
+    for_each_foreign_aggregate_unit(builder, size, unit, pointer, |builder, offset| {
         let to = builder.ins().iadd(address, offset);
         builder.ins().store(flags, zero, to, 0);
     });
@@ -10666,7 +10742,7 @@ fn lower_foreign_aggregate_expression(
         mir::ForeignAggregateExpression::Construct { ty, fields, span } => {
             let address =
                 create_call_storage(builder, mir::Type::ForeignAggregate(*ty), resources)?;
-            zero_foreign_aggregate(builder, address, *ty, pointer);
+            zero_foreign_aggregate(builder, address, *ty, false, pointer);
             for field in fields {
                 let value = lower_rvalue(builder, &field.value, resources)?;
                 let field_address = builder.ins().iadd_imm_u(address, field.offset as i64);
@@ -10699,6 +10775,67 @@ fn lower_foreign_aggregate_expression(
             ..
         } => lower_function_call_at(builder, *function, args, *span, resources)?
             .ok_or_else(|| malformed_mir("a foreign aggregate call returned void"))?
+            .single(),
+        // Checking proved the `?Name` local present; its value is its
+        // payload, which the consumer copies.
+        mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty, local } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            Ok(builder
+                .ins()
+                .stack_addr(pointer, slot, ty.nullable_payload_offset as i32))
+        }
+    }
+}
+
+/// The address of a `?Name` value in the nullable inline layout of its
+/// type: fresh storage for `null` and for a present value, or the storage a
+/// copy reads, which the consumer copies from.
+fn lower_nullable_foreign_aggregate_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableForeignAggregateExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let ty = expression.ty();
+    match expression {
+        mir::NullableForeignAggregateExpression::Null(_) => {
+            let storage = mir::Type::NullableForeignAggregate(ty);
+            let address = create_call_storage(builder, storage, resources)?;
+            zero_foreign_aggregate(builder, address, ty, true, pointer);
+            Ok(address)
+        }
+        mir::NullableForeignAggregateExpression::Present(value) => {
+            let payload = lower_foreign_aggregate_expression(builder, value, resources)?;
+            let storage = mir::Type::NullableForeignAggregate(ty);
+            let address = create_call_storage(builder, storage, resources)?;
+            zero_foreign_aggregate(builder, address, ty, true, pointer);
+            let present = builder.ins().iconst(types::I8, 1);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), present, address, 0);
+            let destination = builder
+                .ins()
+                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset));
+            copy_foreign_storage(builder, destination, payload, ty, false, pointer);
+            Ok(address)
+        }
+        mir::NullableForeignAggregateExpression::Local { local, .. } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            Ok(builder.ins().stack_addr(pointer, slot, 0))
+        }
+        mir::NullableForeignAggregateExpression::Property {
+            object, property, ..
+        } => lower_property_address(builder, *object, *property, resources),
+        mir::NullableForeignAggregateExpression::Static { id, .. } => {
+            lower_static_address(builder, *id, resources)
+        }
+        mir::NullableForeignAggregateExpression::Call {
+            function,
+            args,
+            span,
+            ..
+        } => lower_function_call_at(builder, *function, args, *span, resources)?
+            .ok_or_else(|| malformed_mir("a nullable foreign aggregate call returned void"))?
             .single(),
     }
 }
@@ -10776,6 +10913,21 @@ fn lower_foreign_field(
         mir::ForeignAggregatePlace::Local(local) => {
             let slot = local_slot(resources.local_slots, local)?;
             builder.ins().stack_addr(pointer, slot, 0)
+        }
+        // Checking proved the `?Name` local present; the aggregate is its
+        // payload.
+        mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
+            let slot = local_slot(resources.local_slots, local)?;
+            let mir::Type::NullableForeignAggregate(ty) =
+                local_definition(resources.program, resources.function_id, local)?.ty
+            else {
+                return Err(malformed_mir(
+                    "a narrowed foreign field access names a local without a `?Name` value",
+                ));
+            };
+            builder
+                .ins()
+                .stack_addr(pointer, slot, ty.nullable_payload_offset as i32)
         }
         mir::ForeignAggregatePlace::Property { object, property } => {
             lower_property_address(builder, object, property, resources)?
@@ -12805,7 +12957,8 @@ fn lower_drop_value_at_address(
         | mir::Type::NullableScalar(_)
         | mir::Type::Region(_)
         | mir::Type::NullableRegion(_)
-        | mir::Type::ForeignAggregate(_) => Ok(()),
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => Ok(()),
         mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "closure environment pointer reached ordinary value cleanup",
         )),
@@ -12972,6 +13125,7 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         | mir::Type::Region(_)
         | mir::Type::NullableRegion(_)
         | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "function, region, foreign aggregate and closure-environment values do not support collection comparison",
         )),
@@ -13046,6 +13200,7 @@ fn value_to_collection_word(
         | mir::Type::Region(_)
         | mir::Type::NullableRegion(_)
         | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
@@ -13121,6 +13276,7 @@ fn collection_word_to_value(
         | mir::Type::Region(_)
         | mir::Type::NullableRegion(_)
         | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
@@ -16267,7 +16423,8 @@ fn lower_drop_stored_value(
         | mir::Type::NullableScalar(_)
         | mir::Type::Region(_)
         | mir::Type::NullableRegion(_)
-        | mir::Type::ForeignAggregate(_) => Ok(()),
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => Ok(()),
         mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "closure environment pointer reached stored-value cleanup",
         )),
@@ -24329,6 +24486,20 @@ fn lower_condition_to_branch(
                 _ => return Err(malformed_mir("ordered nullable comparison is invalid")),
             };
             builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            let address = lower_nullable_foreign_aggregate_expression(builder, value, resources)?;
+            let present = builder.ins().load(
+                types::I8,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            );
+            let zero = builder.ins().iconst(types::I8, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             let owned = value.owned_temporary();
