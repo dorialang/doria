@@ -1965,3 +1965,43 @@ fn enum_payloads_holding_foreign_aggregates_have_no_equality() {
         "an aggregate payload has no equality"
     );
 }
+
+#[test]
+fn foreign_aggregate_statics_are_constants_written_through_writable_statics() {
+    // Decision 0148 section 6: a static holds a constant foreign struct or
+    // union, and a field write through a static needs a writable static.
+    let declaration = "extern \"C\" struct Color { uint8 $red; uint8 $green; } function pick(): uint8 { return 1; }";
+    let built = format!(
+        "{declaration} class Palette {{ static writable Color $current = new Color(red: 1, green: 2); static Color $fixed = new Color(red: 3, green: 4); }} function main(): void {{ Palette::current->red = 5; Palette::current->green++; Palette::current = Palette::fixed; }}"
+    );
+    assert!(codes(&built).is_empty(), "{:#?}", findings(&built));
+    for body in [
+        "function main(): void { Palette::fixed->red = 5; }",
+        "function main(): void { Palette::fixed->green += 1; }",
+    ] {
+        let source = format!(
+            "{declaration} class Palette {{ static Color $fixed = new Color(red: 3, green: 4); }} {body}"
+        );
+        assert!(
+            codes(&source).contains(&"E0201"),
+            "{body}: {:#?}",
+            findings(&source)
+        );
+    }
+    // A field that is not constant leaves the static without a constant
+    // initializer.
+    let runtime = format!(
+        "{declaration} class Palette {{ static Color $picked = new Color(red: pick(), green: 0); }}"
+    );
+    assert!(
+        codes(&runtime).contains(&"E0485"),
+        "{:#?}",
+        findings(&runtime)
+    );
+    // A missing field is the construction's own error, reported once.
+    let missing =
+        format!("{declaration} class Palette {{ static Color $partial = new Color(red: 1); }}");
+    let found = codes(&missing);
+    assert!(!found.is_empty(), "a missing field is reported");
+    assert!(!found.contains(&"E0485"), "{:#?}", findings(&missing));
+}

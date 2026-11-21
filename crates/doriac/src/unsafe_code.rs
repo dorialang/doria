@@ -43,7 +43,7 @@ fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     (
         "Foreign Aggregates Cannot Be Built Here Yet",
         format!(
-            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results, pointer targets, instance properties and enum payloads, and not here yet"
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results, pointer targets, properties, constants and enum payloads, and not here yet"
         ),
     )
 }
@@ -123,6 +123,19 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
         if holds_aggregate && diagnostics.is_empty() && seen.insert(function.source_span) {
             diagnostics.push(companion_form(
                 function.source_span,
+                AGGREGATE_TITLE,
+                AGGREGATE_MESSAGE,
+            ));
+        }
+    }
+    // A static property's foreign struct or union lives in static data the
+    // program reads and writes in place.
+    for property in &program.statics {
+        if holds_foreign_aggregate(program, property.ty, &mut HashSet::new())
+            && seen.insert(property.source_span)
+        {
+            diagnostics.push(companion_form(
+                property.source_span,
                 AGGREGATE_TITLE,
                 AGGREGATE_MESSAGE,
             ));
@@ -252,10 +265,10 @@ impl Finder {
     }
 
     /// Reports a foreign struct or union `ty` holds where no execution
-    /// target builds one yet: anywhere in a static property type
-    /// (`anywhere`), otherwise nullable, as a type argument other than a
-    /// pointer's pointee, or in a function type. Locals, parameters,
-    /// results, instance properties, enum payloads and pointees build.
+    /// target builds one yet: anywhere in a closure's signature or
+    /// captures (`anywhere`), otherwise nullable, as a type argument other
+    /// than a pointer's pointee, or in a function type. Locals, parameters,
+    /// results, properties, constants, enum payloads and pointees build.
     fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
         if self.aggregates.is_empty() {
             return;
@@ -351,9 +364,9 @@ impl Finder {
 
     fn property(&mut self, property: &PropertyDecl) {
         // An instance property holds a foreign struct or union by value in
-        // the object's storage (Decision 0148 section 6).
-        let position = property.is_static.then_some("a static property");
-        self.misplaced_aggregate(&property.ty, property.span, position);
+        // the object's storage, and a static property in its static data
+        // (Decision 0148 section 6).
+        self.misplaced_aggregate(&property.ty, property.span, None);
         self.type_refs(&mut property.ty.clone(), property.span);
         if let Some(initializer) = &property.initializer {
             self.expression(initializer);

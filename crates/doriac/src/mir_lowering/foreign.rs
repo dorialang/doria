@@ -796,6 +796,13 @@ fn field_place(
             }
             mir::ForeignAggregatePlace::Property { object, property }
         }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } if context.constant_value(object).is_none() => mir::ForeignAggregatePlace::Static(
+            static_aggregate(class_name, member, *span, aggregate_type, context)?,
+        ),
         _ => {
             let value = lower_rvalue_as_expected(
                 object,
@@ -993,6 +1000,20 @@ pub(super) fn aggregate_expression(
     ty: mir::ForeignAggregateType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ForeignAggregateExpression> {
+    if let Some(value) = context.constant_value(unparenthesized_place(expr)).cloned() {
+        let lowered = lower_const_rvalue(
+            &value,
+            mir::Type::ForeignAggregate(ty),
+            expr.span(),
+            &context.semantic_info.enums,
+            &context.semantic_info.foreign_aggregates,
+            &mut |ty| context.mir_resolved_type(ty),
+        )?;
+        let mir::Rvalue::ForeignAggregate(value) = lowered else {
+            unreachable!("a foreign aggregate constant lowers to a foreign aggregate value");
+        };
+        return Ok(value);
+    }
     match unparenthesized_place(expr) {
         hir::Expr::New {
             class_type,
@@ -1000,6 +1021,14 @@ pub(super) fn aggregate_expression(
             span,
             ..
         } => construct(class_type, args, ty, *span, context),
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => Ok(mir::ForeignAggregateExpression::Static {
+            ty,
+            id: static_aggregate(class_name, member, *span, ty, context)?,
+        }),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             if context.local_type(local) != mir::Type::ForeignAggregate(ty) {
@@ -1075,6 +1104,62 @@ pub(super) fn aggregate_expression(
             "this foreign struct or union value is not built yet",
         )]),
     }
+}
+
+/// The static property `class_name::member`, which holds a foreign struct
+/// or union of type `ty`.
+fn static_aggregate(
+    class_name: &str,
+    member: &str,
+    span: Span,
+    ty: mir::ForeignAggregateType,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::StaticId> {
+    let (id, actual) = context.static_property(class_name, member, span)?;
+    if actual != mir::Type::ForeignAggregate(ty) {
+        return Err(vec![unsupported(
+            span,
+            "a static property holds another type than the foreign struct or union expected",
+        )]);
+    }
+    Ok(id)
+}
+
+/// The supplied fields of the constant foreign struct or union `value` of
+/// type `expected` (Decision 0148 section 6): each one's offset in the
+/// target's C layout, MIR type and constant value, in declaration order.
+pub(super) fn constant_fields<'v>(
+    value: &'v crate::const_eval::ConstForeignAggregateValue,
+    expected: mir::ForeignAggregateType,
+    aggregates: &HashMap<String, crate::foreign::ForeignAggregateFacts>,
+    span: Span,
+    resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
+) -> DiagnosticResult<Vec<(u64, mir::Type, &'v crate::const_eval::ConstValue)>> {
+    let mismatch = || {
+        vec![unsupported(
+            span,
+            "a constant foreign struct or union does not match its checked layout",
+        )]
+    };
+    let facts = aggregates.get(&value.aggregate.name).ok_or_else(mismatch)?;
+    let layout = facts.layout.as_ref().ok_or_else(mismatch)?;
+    let aggregate =
+        ResolvedType::Foreign(Box::new(ForeignType::Aggregate(value.aggregate.clone())));
+    if resolve_type(&aggregate) != Some(mir::Type::ForeignAggregate(expected))
+        || value.fields.len() != facts.fields.len()
+        || layout.fields.len() != facts.fields.len()
+    {
+        return Err(mismatch());
+    }
+    let mut fields = Vec::with_capacity(value.fields.len());
+    for ((field, declared), placed) in value.fields.iter().zip(&facts.fields).zip(&layout.fields) {
+        let Some(field) = field else {
+            continue;
+        };
+        let ty = resolve_type(&declared.ty).ok_or_else(mismatch)?;
+        fields.push((placed.offset, ty, field));
+    }
+    Ok(fields)
 }
 
 fn returns_aggregate(
@@ -1165,6 +1250,7 @@ fn construct(
             field_type,
             span,
             &context.semantic_info.enums,
+            &context.semantic_info.foreign_aggregates,
             &mut |ty| context.mir_resolved_type(ty),
         )?;
         fields.push(mir::ForeignFieldValue {

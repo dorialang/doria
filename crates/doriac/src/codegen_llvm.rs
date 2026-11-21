@@ -666,6 +666,15 @@ fn declare_statics<'ctx>(
                 global.set_alignment(value.ty.align);
                 global
             }
+            // A foreign struct or union is plain bytes: its static data is
+            // the constant's bytes (Decision 0148 section 6).
+            mir::StaticValue::ForeignAggregate(value) => {
+                let initializer = context.const_string(&value.bytes(), false);
+                let global = module.add_global(initializer.get_type(), None, &symbol);
+                global.set_initializer(&initializer);
+                global.set_alignment(value.ty.align);
+                global
+            }
         };
         global.set_constant(
             !property.writable && !matches!(property.initializer, mir::StaticValue::PayloadEnum(_)),
@@ -2207,6 +2216,11 @@ fn initialize_payload_static_value_llvm<'ctx>(
                     &format!("{symbol}_field_{index}"),
                 )?;
             }
+        }
+        (mir::StaticValue::ForeignAggregate(value), mir::Type::ForeignAggregate(expected))
+            if value.ty == expected =>
+        {
+            build(builder.build_store(address, context.const_string(&value.bytes(), false)))?;
         }
         _ => {
             return Err(malformed_mir(
@@ -11390,6 +11404,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::ForeignAggregateExpression::Property {
                 object, property, ..
             } => self.lower_property_address(*object, *property),
+            mir::ForeignAggregateExpression::Static { id, .. } => self.static_address(*id),
             mir::ForeignAggregateExpression::Call {
                 function,
                 args,
@@ -11486,6 +11501,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::ForeignAggregatePlace::Property { object, property } => {
                 self.lower_property_address(object, property)?
             }
+            mir::ForeignAggregatePlace::Static(id) => self.static_address(id)?,
         };
         let offset = u32::try_from(offset)
             .map_err(|_| malformed_mir("a foreign field offset exceeds its aggregate"))?;

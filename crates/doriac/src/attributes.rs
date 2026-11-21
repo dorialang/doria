@@ -1075,6 +1075,8 @@ pub fn attribute_value_from_const(
                 fields,
             }
         }
+        // Attribute schemas admit no foreign struct or union type.
+        ConstValue::ForeignAggregate(_) => return None,
     };
     Some(AttributeValue {
         semantic_type,

@@ -146,6 +146,11 @@ fn place_facts(
                 object.writable || is_direct_constructor_receiver(program, function, object)?;
             (property.ty, receiver && property.permits_write_through())
         }
+        // A static property is written through only when it is writable.
+        mir::ForeignAggregatePlace::Static(id) => {
+            let property = static_in(program, id)?;
+            (property.ty, property.writable)
+        }
     };
     let mir::Type::ForeignAggregate(aggregate) = ty else {
         return Err(malformed_mir(
@@ -192,6 +197,34 @@ pub(super) fn validate_field_access(
     }
 }
 
+/// Whether the constant `value` stores each field at the offset of a field
+/// of its definition's layout with that field's C type, and a union at most
+/// one member, each field's value being a constant of its type (section 6).
+pub(super) fn constant_matches(
+    program: &mir::Program,
+    value: &mir::ForeignAggregateConstant,
+) -> Result<bool, BackendError> {
+    let layout = &definition_in(program, value.ty)?.layout;
+    if layout.kind == crate::ast::ForeignAggregateKind::Union && value.fields.len() > 1 {
+        return Ok(false);
+    }
+    for field in &value.fields {
+        let Some(expected) =
+            mir::foreign_c_type(field.ty, &program.foreign_aggregates, CTarget::host())
+        else {
+            return Ok(false);
+        };
+        let declared = layout
+            .fields
+            .iter()
+            .any(|candidate| candidate.offset == field.offset && candidate.ty == expected);
+        if !declared || !static_value_matches(program, &field.value, field.ty)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn validate_expression(
     program: &mir::Program,
     function: &mir::Function,
@@ -236,6 +269,9 @@ pub(super) fn validate_expression(
             *property,
             mir::Type::ForeignAggregate(ty),
         ),
+        mir::ForeignAggregateExpression::Static { id, .. } => {
+            validate_static_operand(program, *id, mir::Type::ForeignAggregate(ty))
+        }
         mir::ForeignAggregateExpression::Call {
             function: callee,
             args,

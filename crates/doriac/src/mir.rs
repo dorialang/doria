@@ -818,6 +818,62 @@ pub enum StaticValue {
     String(String),
     Null,
     PayloadEnum(PayloadEnumConstant),
+    ForeignAggregate(ForeignAggregateConstant),
+}
+
+/// A foreign struct or union built from constant fields (Decision 0148
+/// section 6): every byte zero, with each field's value stored at its
+/// offset in the target's C layout. A union holds at most one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAggregateConstant {
+    pub ty: ForeignAggregateType,
+    pub fields: Vec<ForeignFieldConstant>,
+}
+
+/// One constant field: `value`, of the field's type `ty`, at `offset`
+/// bytes from the start of the aggregate. `ty` is a scalar, a nullable
+/// pointer, whose `null` is address zero, or a nested foreign struct or
+/// union.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignFieldConstant {
+    pub offset: u64,
+    pub ty: Type,
+    pub value: StaticValue,
+}
+
+impl ForeignAggregateConstant {
+    /// The aggregate's bytes on the target: zero, with each field's bytes
+    /// in the target's byte order at its offset. Static data of the
+    /// aggregate is exactly these bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.ty.size as usize];
+        for (offset, value) in self.scalar_fields() {
+            let data = value.data_bytes();
+            let start = offset as usize;
+            bytes[start..start + data.len()].copy_from_slice(&data);
+        }
+        bytes
+    }
+
+    /// Each scalar field's bytes and absolute offset, nested aggregates
+    /// included; a `null` pointer is zero and stores nothing.
+    pub fn scalar_fields(&self) -> Vec<(u64, ScalarValue)> {
+        let mut scalars = Vec::new();
+        self.collect_scalars(0, &mut scalars);
+        scalars
+    }
+
+    fn collect_scalars(&self, base: u64, scalars: &mut Vec<(u64, ScalarValue)>) {
+        for field in &self.fields {
+            match &field.value {
+                StaticValue::Scalar(value) => scalars.push((base + field.offset, *value)),
+                StaticValue::ForeignAggregate(nested) => {
+                    nested.collect_scalars(base + field.offset, scalars)
+                }
+                StaticValue::Null | StaticValue::String(_) | StaticValue::PayloadEnum(_) => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1382,6 +1438,33 @@ impl ScalarValue {
             Self::Bool(_) => ScalarType::Bool,
             Self::Enum(value) => ScalarType::Enum(value.enum_id),
             Self::Inline(value) => ScalarType::Inline(value.ty),
+        }
+    }
+
+    /// The value's storage bytes in the target's byte order. Native code
+    /// generation targets the host, so the host order is the target's.
+    pub fn data_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Integer(value) => match value.ty.bit_width() {
+                8 => vec![value.bits as u8],
+                16 => (value.bits as u16).to_ne_bytes().to_vec(),
+                32 => (value.bits as u32).to_ne_bytes().to_vec(),
+                64 => value.bits.to_ne_bytes().to_vec(),
+                width => unreachable!("canonical Doria integer has unsupported width {width}"),
+            },
+            Self::Float(value) => match value.ty {
+                FloatType::Float32 => (value.bits as u32).to_ne_bytes().to_vec(),
+                FloatType::Float64 => value.bits.to_ne_bytes().to_vec(),
+            },
+            Self::Bool(value) => vec![u8::from(value)],
+            Self::Enum(value) => (value.case_id.index as u32).to_ne_bytes().to_vec(),
+            Self::Inline(value) => {
+                if value.ty.storage_bytes() == 8 {
+                    (value.bits as u64).to_ne_bytes().to_vec()
+                } else {
+                    value.bits.to_ne_bytes().to_vec()
+                }
+            }
         }
     }
 }
@@ -2039,6 +2122,11 @@ pub enum ForeignAggregateExpression {
         object: LocalId,
         property: PropertyId,
     },
+    /// A copy of the value the static property `id` holds.
+    Static {
+        ty: ForeignAggregateType,
+        id: StaticId,
+    },
     Call {
         ty: ForeignAggregateType,
         function: FunctionId,
@@ -2053,15 +2141,16 @@ impl ForeignAggregateExpression {
             Self::Construct { ty, .. }
             | Self::Local { ty, .. }
             | Self::Property { ty, .. }
+            | Self::Static { ty, .. }
             | Self::Call { ty, .. } => *ty,
         }
     }
 }
 
 /// Where a foreign struct or union field access finds the aggregate
-/// (Decision 0148 section 6): the value a local holds, or the value a
-/// stored class property holds, addressed in place so that a write
-/// through the property changes the object.
+/// (Decision 0148 section 6): the value a local holds, a stored class
+/// property holds or a static property holds, each addressed in place so
+/// that a write through the property changes the object or the static.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeignAggregatePlace {
     Local(LocalId),
@@ -2069,6 +2158,7 @@ pub enum ForeignAggregatePlace {
         object: LocalId,
         property: PropertyId,
     },
+    Static(StaticId),
 }
 
 impl fmt::Display for ForeignAggregatePlace {
@@ -2078,6 +2168,7 @@ impl fmt::Display for ForeignAggregatePlace {
             Self::Property { object, property } => {
                 write!(formatter, "local{}->property{}", object.0, property.index)
             }
+            Self::Static(id) => write!(formatter, "static{}", id.0),
         }
     }
 }
@@ -7929,7 +8020,8 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
                     args.iter().map(rvalue_class_temporary_capacity).sum()
                 }
                 ForeignAggregateExpression::Local { .. }
-                | ForeignAggregateExpression::Property { .. } => 0,
+                | ForeignAggregateExpression::Property { .. }
+                | ForeignAggregateExpression::Static { .. } => 0,
             },
         }
 }
@@ -9371,6 +9463,9 @@ impl fmt::Display for Rvalue {
                     "copy local{}->property{}",
                     object.0, property.index
                 ),
+                ForeignAggregateExpression::Static { id, .. } => {
+                    write!(formatter, "copy static{}", id.0)
+                }
                 ForeignAggregateExpression::Call { function, args, .. } => {
                     let args = args
                         .iter()

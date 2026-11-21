@@ -16635,6 +16635,11 @@ impl<'program> Checker<'program> {
             crate::const_eval::ConstValue::PayloadEnum(value) => self
                 .types
                 .intern_resolved(&ResolvedType::Enum(value.value.enum_type.clone())),
+            crate::const_eval::ConstValue::ForeignAggregate(value) => {
+                self.types.intern_resolved(&ResolvedType::Foreign(Box::new(
+                    crate::foreign::ForeignType::Aggregate(value.aggregate.clone()),
+                )))
+            }
         }
     }
 
@@ -22392,6 +22397,9 @@ impl<'program> Checker<'program> {
             crate::const_eval::ConstType::NullableEnum(ty) => {
                 let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(ty));
                 TypeKind::Nullable(enum_type)
+            }
+            crate::const_eval::ConstType::ForeignAggregate(aggregate) => {
+                TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(aggregate))
             }
             crate::const_eval::ConstType::Null => TypeKind::Null,
             crate::const_eval::ConstType::NullableString => {

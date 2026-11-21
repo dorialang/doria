@@ -150,6 +150,7 @@ function main(): void {}
                 mir::Type::Scalar(scalar_type),
                 span,
                 &enums,
+                &HashMap::new(),
                 &mut resolve
             )
             .unwrap(),
@@ -161,6 +162,7 @@ function main(): void {}
                 mir::Type::NullableScalar(scalar_type),
                 span,
                 &enums,
+                &HashMap::new(),
                 &mut resolve
             )
             .unwrap(),
@@ -197,6 +199,7 @@ function main(): void {}
             mir::Type::PayloadEnum(ty),
             span,
             &enums,
+            &HashMap::new(),
             &mut resolve,
         )
         .unwrap() else {
@@ -214,6 +217,7 @@ function main(): void {}
             mir::Type::NullablePayloadEnum(ty),
             span,
             &enums,
+            &HashMap::new(),
             &mut resolve,
         )
         .unwrap()
@@ -237,6 +241,7 @@ function main(): void {}
                 mir::Type::PayloadEnum(ty),
                 span,
                 &enums,
+                &HashMap::new(),
                 &mut resolve
             )
             .is_err());
@@ -245,6 +250,7 @@ function main(): void {}
                 mir::Type::PayloadEnum(ty),
                 span,
                 &enums,
+                &HashMap::new(),
                 &mut resolve
             )
             .is_err());
@@ -1681,6 +1687,7 @@ fn lower_program_impl(
                 ty,
                 property.span,
                 &program.semantic_info.enums,
+                &program.semantic_info.foreign_aggregates,
                 &mut |field| {
                     intern_resolved_collection_types(
                         &substitute_resolved_type(field, &substitutions),
@@ -3313,6 +3320,7 @@ fn lower_static_value(
     ty: mir::Type,
     span: Span,
     enums: &[crate::semantics::EnumSemanticInfo],
+    aggregates: &HashMap<String, crate::foreign::ForeignAggregateFacts>,
     resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
 ) -> DiagnosticResult<mir::StaticValue> {
     match (value, ty) {
@@ -3379,7 +3387,7 @@ fn lower_static_value(
                             "payload enum static field has no native constant representation",
                         )]
                     })?;
-                    lower_static_value(field, field_ty, span, enums, resolve_type)
+                    lower_static_value(field, field_ty, span, enums, aggregates, resolve_type)
                 })
                 .collect::<DiagnosticResult<Vec<_>>>()?;
             Ok(mir::StaticValue::PayloadEnum(mir::PayloadEnumConstant {
@@ -3387,6 +3395,34 @@ fn lower_static_value(
                 case: case.id,
                 fields,
             }))
+        }
+        (
+            crate::const_eval::ConstValue::ForeignAggregate(value),
+            mir::Type::ForeignAggregate(expected),
+        ) => {
+            let fields = foreign::constant_fields(value, expected, aggregates, span, resolve_type)?
+                .into_iter()
+                .map(|(offset, ty, field)| {
+                    Ok(mir::ForeignFieldConstant {
+                        offset,
+                        ty,
+                        value: lower_static_value(
+                            field,
+                            ty,
+                            span,
+                            enums,
+                            aggregates,
+                            resolve_type,
+                        )?,
+                    })
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            Ok(mir::StaticValue::ForeignAggregate(
+                mir::ForeignAggregateConstant {
+                    ty: expected,
+                    fields,
+                },
+            ))
         }
         _ => Err(vec![unsupported(
             span,
@@ -13072,6 +13108,7 @@ fn lower_nullable_scalar_expression(
             mir::Type::NullableScalar(expected),
             expr.span(),
             &context.semantic_info.enums,
+            &context.semantic_info.foreign_aggregates,
             &mut |ty| context.mir_resolved_type(ty),
         )?
         else {
@@ -14592,15 +14629,7 @@ fn lower_call_args_with_ownership(
         lowered_args[param_index] = Some(lowered);
     }
 
-    splice_omitted_parameter_defaults(
-        name,
-        &bound,
-        &signature,
-        span,
-        &mut lowered_args,
-        &context.semantic_info.enums,
-        &mut |ty| context.mir_resolved_type(ty),
-    )?;
+    splice_omitted_parameter_defaults(name, &bound, &signature, span, &mut lowered_args, context)?;
 
     Ok(lowered_args
         .into_iter()
@@ -14753,8 +14782,7 @@ fn splice_omitted_parameter_defaults(
     signature: &FunctionSignature,
     span: Span,
     args: &mut [Option<mir::Rvalue>],
-    enums: &[crate::semantics::EnumSemanticInfo],
-    resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
+    context: &LoweringContext,
 ) -> DiagnosticResult<()> {
     for index in 0..signature.parameter_types.len() {
         if bound.param_to_arg[index].is_some() {
@@ -14776,8 +14804,9 @@ fn splice_omitted_parameter_defaults(
             value,
             signature.parameter_types[index],
             span,
-            enums,
-            resolve_type,
+            &context.semantic_info.enums,
+            &context.semantic_info.foreign_aggregates,
+            &mut |ty| context.mir_resolved_type(ty),
         )?);
     }
     Ok(())
@@ -14788,6 +14817,7 @@ fn lower_const_rvalue(
     expected: mir::Type,
     span: Span,
     enums: &[crate::semantics::EnumSemanticInfo],
+    aggregates: &HashMap<String, crate::foreign::ForeignAggregateFacts>,
     resolve_type: &mut impl FnMut(&ResolvedType) -> Option<mir::Type>,
 ) -> DiagnosticResult<mir::Rvalue> {
     if let (crate::const_eval::ConstValue::String(value), mir::Type::String) = (value, expected) {
@@ -14846,7 +14876,7 @@ fn lower_const_rvalue(
                         span,
                     )]
                 })?;
-                lower_const_rvalue(field, expected, span, enums, resolve_type)
+                lower_const_rvalue(field, expected, span, enums, aggregates, resolve_type)
             })
             .collect::<DiagnosticResult<Vec<_>>>()?;
         let value = mir::PayloadEnumExpression::Construct {
@@ -14860,6 +14890,35 @@ fn lower_const_rvalue(
         } else {
             mir::Rvalue::PayloadEnum(value)
         });
+    }
+
+    // A constant foreign struct or union is the construction of its
+    // constant fields (Decision 0148 section 6).
+    if let crate::const_eval::ConstValue::ForeignAggregate(value) = value {
+        let mir::Type::ForeignAggregate(expected) = expected else {
+            return Err(vec![Diagnostic::new(
+                "I2003",
+                "checked foreign struct or union constant does not match its MIR type",
+                span,
+            )]);
+        };
+        let fields = foreign::constant_fields(value, expected, aggregates, span, resolve_type)?
+            .into_iter()
+            .map(|(offset, ty, field)| {
+                Ok(mir::ForeignFieldValue {
+                    offset,
+                    value: lower_const_rvalue(field, ty, span, enums, aggregates, resolve_type)?,
+                    copied_elements: None,
+                })
+            })
+            .collect::<DiagnosticResult<Vec<_>>>()?;
+        return Ok(mir::Rvalue::ForeignAggregate(
+            mir::ForeignAggregateExpression::Construct {
+                ty: expected,
+                fields,
+                span,
+            },
+        ));
     }
 
     let scalar_expected = match expected {
@@ -16655,6 +16714,7 @@ fn lower_match_constant_to_blocks(
         base,
         Span::default(),
         &context.semantic_info.enums,
+        &context.semantic_info.foreign_aggregates,
         &mut |ty| context.mir_resolved_type(ty),
     )?;
     let condition = match (base, constant) {
@@ -22046,6 +22106,7 @@ fn lower_payload_enum_expression(
             mir::Type::PayloadEnum(ty),
             expr.span(),
             &context.semantic_info.enums,
+            &context.semantic_info.foreign_aggregates,
             &mut |ty| context.mir_resolved_type(ty),
         )?;
         let mir::Rvalue::PayloadEnum(value) = lowered else {

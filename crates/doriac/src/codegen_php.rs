@@ -2725,6 +2725,26 @@ impl<'a> PhpValidation<'a> {
 }
 
 fn validate_program(program: &Program, plan: &specialization::Plan) -> Result<(), BackendError> {
+    // A constant or static holding a foreign struct or union is C data,
+    // which PHP output takes through the native companion library.
+    let mut aggregates = program
+        .semantic_info
+        .const_evaluation
+        .values
+        .values()
+        .filter_map(|decl| {
+            decl.value
+                .foreign_aggregate()
+                .map(|value| (decl.span, value.aggregate.clone()))
+        })
+        .collect::<Vec<_>>();
+    aggregates.sort_by_key(|(span, _)| (span.source.0, span.start));
+    if let Some((span, aggregate)) = aggregates.into_iter().next() {
+        foreign_value(
+            &ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Aggregate(aggregate))),
+            span,
+        )?;
+    }
     let empty = HashMap::new();
     let context = PhpValidation::new(&program.semantic_info, plan, &empty);
     for item in &program.items {
@@ -6264,6 +6284,9 @@ fn emit_const_value(value: &ConstValue, plan: &specialization::Plan) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
+        }
+        ConstValue::ForeignAggregate(_) => {
+            unreachable!("PHP validation reports constant foreign structs and unions, which PHP output takes through the native companion library")
         }
     }
 }

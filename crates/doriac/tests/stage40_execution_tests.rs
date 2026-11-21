@@ -662,10 +662,7 @@ function main(): void
 fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
     for (body, position) in [
         ("class Holder { ?Color $color = null; }", "a nullable value"),
-        (
-            "class Holder { static Color $color = new Color(red: 1, green: 2, blue: 3); }",
-            "a static property",
-        ),
+        ("class Holder { static ?Color $color = null; }", "a nullable value"),
         ("function main(): void { ?Color $maybe = null; }", "a nullable value"),
         ("function keep(Color[] $colors): void {}", "a nullable value"),
         ("function main(): void { let $show = function(Color $color): void {}; }", "a closure parameter"),
@@ -743,6 +740,27 @@ fn the_interpreter_and_php_output_report_foreign_aggregates() {
         debug.iter().any(|diagnostic| diagnostic.code == "E0784"
             && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
         "{debug:#?}"
+    );
+    // A static property holding one is reported where it is declared.
+    let held = format!(
+        "{AGGREGATES}class Palette {{ static Color $primary = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ echo Palette::primary->red; }}"
+    );
+    let debug = doriac::compile_source(
+        "stage40.doria",
+        held.clone(),
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter runs foreign aggregates through the companion");
+    assert!(
+        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
+        "{debug:#?}"
+    );
+    let php = doriac::compile_source("stage40.doria", held, doriac::backend::BackendTarget::Php)
+        .expect_err("PHP output takes the C data model through the companion");
+    assert!(
+        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
+        "{php:#?}"
     );
     // An enum whose payload holds an aggregate is reported where it is
     // held.
@@ -3101,4 +3119,88 @@ function main(): void
 "
     );
     assert_runs_natively(&source, "none solid 10 mixed 20 7 6 mixed 20 7 6 none");
+}
+
+#[test]
+fn foreign_aggregates_are_static_properties_and_constants() {
+    // Decision 0148 section 6: a static property holds a foreign struct or
+    // union in its static data, read, written and viewed in place, and the
+    // shared constant evaluator builds constant ones from their fields.
+    let source = format!(
+        "{AGGREGATES}
+extern \"C\" struct Tip
+{{
+    uint16[4] $text;
+    uint8 $flags = 7;
+}}
+
+extern \"C\" struct Framed
+{{
+    Color $border = new Color(red: 1, green: 1, blue: 1);
+    int32 $width;
+}}
+
+enum Paint
+{{
+    case None;
+    case Solid(Color $color);
+}}
+
+const Color RED = new Color(red: 255, green: 0, blue: 0);
+
+class Palette
+{{
+    const Color BLUE = new Color(red: 0, green: 0, blue: 255);
+    static Color $primary = new Color(red: 10, green: 20, blue: 30);
+    static writable Color $current = new Color(red: 1, green: 2, blue: 3, alpha: 4);
+    static Pixel $origin = new Pixel(x: -1, y: 2, color: new Color(red: 5, green: 6, blue: 7), weight: 0.5, visible: true);
+    static writable Word $word = new Word(whole: 258);
+    static writable Tip $tip = new Tip();
+    static Tip $blank = new Tip(flags: 1);
+    static Color $copy = self::primary;
+    static Paint $paint = Paint::Solid(new Color(red: 9, green: 8, blue: 7));
+}}
+
+function describe(Paint $paint): string
+{{
+    return match ($paint) {{
+        Paint::None => \"none\",
+        Paint::Solid($color) => \"solid {{$color->red}} {{$color->blue}}\",
+    }};
+}}
+
+function main(): void
+{{
+    echo Palette::primary->red . \" \" . Palette::primary->alpha . \" \";
+    echo Palette::current->green . \" \";
+    Palette::current->green = 9;
+    Palette::current->blue += 10;
+    Palette::current->red++;
+    echo Palette::current->red . \" \" . Palette::current->green . \" \" . Palette::current->blue . \" \" . Palette::current->alpha . \" \";
+    let $saved = Palette::current;
+    Palette::current = Palette::primary;
+    echo Palette::current->red . \" \" . $saved->red . \" \";
+    Palette::current = new Color(red: 100, green: 101, blue: 102);
+    echo Palette::current->blue . \" \";
+    echo Palette::origin->x . \" \" . Palette::origin->color->green . \" \" . Palette::origin->visible . \" \" . Float::toInt(Palette::origin->weight * 4.0) . \" \";
+    unsafe {{
+        echo Palette::word->low . \" \";
+    }}
+    Palette::word->low = 1;
+    unsafe {{
+        echo Palette::word->whole . \" \";
+    }}
+    echo Palette::tip->flags . \" \" . Palette::tip->text->length . \" \";
+    Palette::tip->text[2] = UInt16::from(65);
+    echo Palette::tip->text[2] . \" \" . Palette::blank->text[0] . \" \" . Palette::blank->flags . \" \";
+    echo Palette::copy->blue . \" \" . RED->red . \" \" . Palette::BLUE->blue . \" \";
+    let $framed = new Framed(width: 3);
+    echo $framed->border->alpha . \" \" . $framed->width . \" \" . describe(Palette::paint);
+}}
+"
+    );
+    assert_runs_natively(
+        &source,
+        "10 255 2 2 9 13 4 10 2 102 -1 6 true 2 2 257 7 4 65 0 1 30 255 255 255 3 solid 9 7",
+    );
 }

@@ -1042,12 +1042,17 @@ impl State {
             } => Some((*target, self.roots[collection.0].clone())),
             // A fixed-length array field's region views the aggregate that
             // holds the field (Decision 0148 section 6): a local, or the
-            // object whose property holds it.
+            // object whose property holds it. A static's storage belongs to
+            // no local, as for every other static place.
             mir::Statement::ForeignField {
                 aggregate,
                 access: mir::ForeignFieldAccess::Region { target, .. },
                 ..
-            } => Some((*target, self.roots[aggregate_owner(*aggregate).0].clone())),
+            } => Some((
+                *target,
+                aggregate_owner(*aggregate)
+                    .map_or_else(HashSet::new, |owner| self.roots[owner.0].clone()),
+            )),
             mir::Statement::AssignLocal { target, value }
                 if !local_in(function, *target)?.owned =>
             {
@@ -1098,7 +1103,7 @@ impl State {
                 aggregate,
                 access: mir::ForeignFieldAccess::Region { .. },
                 ..
-            } => HashSet::from([aggregate_owner(*aggregate)]),
+            } => aggregate_owner(*aggregate).into_iter().collect(),
             _ => HashSet::new(),
         };
         let assigned_storage = match statement {
@@ -2268,11 +2273,13 @@ pub(super) fn validate(
 }
 
 /// The local that owns the storage of a foreign struct or union place: the
-/// local itself, or the class value whose property holds the aggregate.
-fn aggregate_owner(place: mir::ForeignAggregatePlace) -> mir::LocalId {
+/// local itself, or the class value whose property holds the aggregate. A
+/// static property's storage belongs to no local.
+fn aggregate_owner(place: mir::ForeignAggregatePlace) -> Option<mir::LocalId> {
     match place {
-        mir::ForeignAggregatePlace::Local(local) => local,
-        mir::ForeignAggregatePlace::Property { object, .. } => object,
+        mir::ForeignAggregatePlace::Local(local) => Some(local),
+        mir::ForeignAggregatePlace::Property { object, .. } => Some(object),
+        mir::ForeignAggregatePlace::Static(_) => None,
     }
 }
 

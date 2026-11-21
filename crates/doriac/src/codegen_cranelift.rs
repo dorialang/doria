@@ -1273,7 +1273,7 @@ fn define_static_data(
         description.set_align(u64::from(layout.align));
         match &property.initializer {
             mir::StaticValue::Scalar(value) => {
-                let scalar = scalar_data_bytes(*value);
+                let scalar = value.data_bytes();
                 if let mir::Type::NullableScalar(stored) = property.ty {
                     let form =
                         native_closure_abi::nullable_scalar_form(stored, pointer_bytes as u32);
@@ -1327,6 +1327,12 @@ fn define_static_data(
                 let nullable = matches!(property.ty, mir::Type::NullablePayloadEnum(_));
                 description.set_align(value.ty.align.into());
                 description.define_zeroinit(value.ty.storage_size(nullable) as usize);
+            }
+            // A foreign struct or union is plain bytes: its static data is
+            // the constant's bytes (Decision 0148 section 6).
+            mir::StaticValue::ForeignAggregate(value) => {
+                description.set_align(value.ty.align.into());
+                description.define(value.bytes().into_boxed_slice());
             }
         }
         module
@@ -1556,31 +1562,6 @@ fn append_target_word(bytes: &mut Vec<u8>, value: u64, width: usize) {
         bytes.extend_from_slice(&encoded[..width]);
     } else {
         bytes.extend_from_slice(&encoded[encoded.len() - width..]);
-    }
-}
-
-fn scalar_data_bytes(value: mir::ScalarValue) -> Vec<u8> {
-    match value {
-        mir::ScalarValue::Integer(value) => match value.ty.bit_width() {
-            8 => vec![value.bits as u8],
-            16 => (value.bits as u16).to_ne_bytes().to_vec(),
-            32 => (value.bits as u32).to_ne_bytes().to_vec(),
-            64 => value.bits.to_ne_bytes().to_vec(),
-            width => unreachable!("canonical Doria integer has unsupported width {width}"),
-        },
-        mir::ScalarValue::Float(value) => match value.ty {
-            FloatType::Float32 => (value.bits as u32).to_ne_bytes().to_vec(),
-            FloatType::Float64 => value.bits.to_ne_bytes().to_vec(),
-        },
-        mir::ScalarValue::Bool(value) => vec![u8::from(value)],
-        mir::ScalarValue::Enum(value) => (value.case_id.index as u32).to_ne_bytes().to_vec(),
-        mir::ScalarValue::Inline(value) => {
-            if value.ty.storage_bytes() == 8 {
-                (value.bits as u64).to_ne_bytes().to_vec()
-            } else {
-                value.bits.to_ne_bytes().to_vec()
-            }
-        }
     }
 }
 
@@ -3221,6 +3202,15 @@ fn initialize_payload_static_value(
                     field_address,
                     &format!("{symbol}_field_{index}"),
                 )?;
+            }
+        }
+        // The storage starts zero, so each scalar field is stored over it.
+        (mir::StaticValue::ForeignAggregate(value), mir::Type::ForeignAggregate(expected))
+            if value.ty == expected =>
+        {
+            for (offset, scalar) in value.scalar_fields() {
+                let scalar = cranelift_scalar_constant(builder, scalar);
+                builder.ins().store(flags, scalar, address, offset as i32);
             }
         }
         _ => {
@@ -10699,6 +10689,9 @@ fn lower_foreign_aggregate_expression(
         mir::ForeignAggregateExpression::Property {
             object, property, ..
         } => lower_property_address(builder, *object, *property, resources),
+        mir::ForeignAggregateExpression::Static { id, .. } => {
+            lower_static_address(builder, *id, resources)
+        }
         mir::ForeignAggregateExpression::Call {
             function,
             args,
@@ -10787,6 +10780,7 @@ fn lower_foreign_field(
         mir::ForeignAggregatePlace::Property { object, property } => {
             lower_property_address(builder, object, property, resources)?
         }
+        mir::ForeignAggregatePlace::Static(id) => lower_static_address(builder, id, resources)?,
     };
     let address = builder.ins().iadd_imm_u(base, offset as i64);
     match access {

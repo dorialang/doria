@@ -1271,6 +1271,11 @@ fn static_value_matches(
             }
             Ok(true)
         }
+        (mir::StaticValue::ForeignAggregate(value), mir::Type::ForeignAggregate(expected))
+            if value.ty == expected =>
+        {
+            foreign_aggregates::constant_matches(program, value)
+        }
         _ => Ok(false),
     }
 }
@@ -13015,6 +13020,8 @@ fn collect_rvalue_class_local_accesses<'a>(
             mir::ForeignAggregateExpression::Property {
                 object, property, ..
             } => accesses.borrow_property(*object, *property),
+            // A static is no local's storage.
+            mir::ForeignAggregateExpression::Static { .. } => {}
             mir::ForeignAggregateExpression::Call { args, .. } => {
                 for arg in args {
                     collect_rvalue_class_local_accesses(arg, accesses);
@@ -14752,6 +14759,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 mir::ForeignAggregatePlace::Property { object, property } => {
                     accesses.borrow_property(*object, *property)
                 }
+                mir::ForeignAggregatePlace::Static(_) => {}
             }
             if let mir::ForeignFieldAccess::Write { value, .. } = access {
                 collect_rvalue_class_local_accesses(value, &mut accesses);
@@ -21071,7 +21079,8 @@ fn rvalue_observes_property(
                 property: observed,
                 ..
             } => *object == receiver && *observed == property,
-            mir::ForeignAggregateExpression::Local { .. } => false,
+            mir::ForeignAggregateExpression::Local { .. }
+            | mir::ForeignAggregateExpression::Static { .. } => false,
         },
     }
 }

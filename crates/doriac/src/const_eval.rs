@@ -18,6 +18,7 @@ pub enum ConstValue {
     Null,
     Enum(ConstEnumValue),
     PayloadEnum(ConstPayloadEnumValue),
+    ForeignAggregate(ConstForeignAggregateValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +34,30 @@ pub struct ConstPayloadEnumValue {
     pub field_types: Vec<ResolvedType>,
 }
 
+/// A foreign struct or union built from constant fields (Decision 0148
+/// section 6). Construction runs no code: the value is every byte zero with
+/// each field stored over it. `fields` holds one entry per declared field in
+/// declaration order, and `None` is a field whose bytes stay zero: an
+/// omitted fixed-length array field, or a union member other than the one
+/// supplied. Field offsets belong to the target's C layout, which lowering
+/// applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstForeignAggregateValue {
+    pub aggregate: crate::foreign::ForeignAggregateType,
+    pub fields: Vec<Option<ConstValue>>,
+}
+
 impl ConstValue {
+    /// The foreign struct or union this value is or holds in an enum
+    /// payload, if any.
+    pub fn foreign_aggregate(&self) -> Option<&ConstForeignAggregateValue> {
+        match self {
+            Self::ForeignAggregate(value) => Some(value),
+            Self::PayloadEnum(value) => value.fields.iter().find_map(Self::foreign_aggregate),
+            _ => None,
+        }
+    }
+
     fn display(&self) -> Option<String> {
         match self {
             Self::Integer(value) => Some(value.display()),
@@ -41,7 +65,7 @@ impl ConstValue {
             Self::String(value) => Some(value.clone()),
             Self::Bool(value) => Some(value.to_string()),
             Self::Null => None,
-            Self::Enum(_) | Self::PayloadEnum(_) => None,
+            Self::Enum(_) | Self::PayloadEnum(_) | Self::ForeignAggregate(_) => None,
         }
     }
 }
@@ -113,6 +137,22 @@ pub struct Evaluation {
     enum_names: HashMap<String, (EnumId, usize)>,
     payload_cases: HashMap<(String, String), PayloadCaseSchema>,
     class_parents: HashMap<String, String>,
+    aggregates: HashMap<String, ForeignAggregateSchema>,
+}
+
+/// A foreign struct or union declaration as constant evaluation reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForeignAggregateSchema {
+    aggregate: crate::foreign::ForeignAggregateType,
+    /// `None` for an incomplete type declared without a body.
+    fields: Option<Vec<ForeignFieldSchema>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForeignFieldSchema {
+    name: String,
+    ty: TypeRef,
+    default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,42 +174,17 @@ pub fn evaluate_parameter_default(
     expected: &TypeRef,
     declaring_class: Option<&str>,
 ) -> Option<ConstValue> {
-    let expected = const_type_with_enums(expected, &evaluation.enum_names)?;
+    let expected =
+        const_type_with_nominals(expected, &evaluation.enum_names, &evaluation.aggregates)?;
     let requester = EvaluationRequester::parameter_default(declaring_class);
-    let mut evaluator = Evaluator {
-        nodes: HashMap::new(),
-        states: evaluation
-            .values
-            .iter()
-            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
-            .collect(),
-        stack: Vec::new(),
-        diagnostics: Vec::new(),
-        enum_cases: evaluation.enum_cases.clone(),
-        enum_names: evaluation.enum_names.clone(),
-        payload_cases: evaluation.payload_cases.clone(),
-        class_parents: evaluation.class_parents.clone(),
-    };
+    let mut evaluator = Evaluator::resume(evaluation);
     let value = evaluator.evaluate_expr(expr, Some(expected.clone()), &requester)?;
     (evaluator.diagnostics.is_empty() && expected.accepts(&value.ty)).then_some(value.value)
 }
 
 pub fn evaluate_string_expression(evaluation: &Evaluation, expr: &Expr) -> Option<String> {
     let requester = EvaluationRequester::parameter_default(None);
-    let mut evaluator = Evaluator {
-        nodes: HashMap::new(),
-        states: evaluation
-            .values
-            .iter()
-            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
-            .collect(),
-        stack: Vec::new(),
-        diagnostics: Vec::new(),
-        enum_cases: evaluation.enum_cases.clone(),
-        enum_names: evaluation.enum_names.clone(),
-        payload_cases: evaluation.payload_cases.clone(),
-        class_parents: evaluation.class_parents.clone(),
-    };
+    let mut evaluator = Evaluator::resume(evaluation);
     let value = evaluator.evaluate_expr(expr, Some(ConstType::String), &requester)?;
     match value.value {
         ConstValue::String(value) if evaluator.diagnostics.is_empty() => Some(value),
@@ -202,20 +217,7 @@ pub fn evaluate_bool_expression(evaluation: &Evaluation, expr: &Expr) -> Option<
         return None;
     }
     let requester = EvaluationRequester::branch_condition();
-    let mut evaluator = Evaluator {
-        nodes: HashMap::new(),
-        states: evaluation
-            .values
-            .iter()
-            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
-            .collect(),
-        stack: Vec::new(),
-        diagnostics: Vec::new(),
-        enum_cases: evaluation.enum_cases.clone(),
-        enum_names: evaluation.enum_names.clone(),
-        payload_cases: evaluation.payload_cases.clone(),
-        class_parents: evaluation.class_parents.clone(),
-    };
+    let mut evaluator = Evaluator::resume(evaluation);
     let value = evaluator.evaluate_expr(expr, Some(ConstType::Bool), &requester)?;
     match value.value {
         ConstValue::Bool(value) if evaluator.diagnostics.is_empty() => Some(value),
@@ -229,7 +231,9 @@ pub fn evaluate_attribute_value(
     expected: &TypeRef,
     declaring_class: Option<&str>,
 ) -> DiagnosticResult<ConstValue> {
-    let Some(expected) = const_type_with_enums(expected, &evaluation.enum_names) else {
+    let Some(expected) =
+        const_type_with_nominals(expected, &evaluation.enum_names, &evaluation.aggregates)
+    else {
         return Err(vec![Diagnostic::new(
             "E0692",
             format!("type `{expected}` is not compatible with attribute metadata"),
@@ -238,20 +242,7 @@ pub fn evaluate_attribute_value(
         .with_title("Attribute Schema Type Is Not Metadata Compatible")]);
     };
     let requester = EvaluationRequester::parameter_default(declaring_class);
-    let mut evaluator = Evaluator {
-        nodes: HashMap::new(),
-        states: evaluation
-            .values
-            .iter()
-            .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
-            .collect(),
-        stack: Vec::new(),
-        diagnostics: Vec::new(),
-        enum_cases: evaluation.enum_cases.clone(),
-        enum_names: evaluation.enum_names.clone(),
-        payload_cases: evaluation.payload_cases.clone(),
-        class_parents: evaluation.class_parents.clone(),
-    };
+    let mut evaluator = Evaluator::resume(evaluation);
     let value = evaluator.evaluate_expr(expr, Some(expected.clone()), &requester);
     if let Some(value) = &value {
         if !expected.accepts(&value.ty) {
@@ -370,6 +361,7 @@ pub(crate) fn evaluate_program_with_diagnostics(
             enum_names: evaluator.enum_names,
             payload_cases: evaluator.payload_cases,
             class_parents: evaluator.class_parents,
+            aggregates: evaluator.aggregates,
         },
         evaluator.diagnostics,
     )
@@ -384,9 +376,31 @@ struct Evaluator {
     enum_names: HashMap<String, (EnumId, usize)>,
     payload_cases: HashMap<(String, String), PayloadCaseSchema>,
     class_parents: HashMap<String, String>,
+    aggregates: HashMap<String, ForeignAggregateSchema>,
 }
 
 impl Evaluator {
+    /// An evaluator over a finished program evaluation, for a constant
+    /// expression outside the declaration graph: a default, an attribute
+    /// argument or a branch condition.
+    fn resume(evaluation: &Evaluation) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            states: evaluation
+                .values
+                .iter()
+                .map(|(key, value)| (key.clone(), State::Done(Box::new(value.clone()))))
+                .collect(),
+            stack: Vec::new(),
+            diagnostics: Vec::new(),
+            enum_cases: evaluation.enum_cases.clone(),
+            enum_names: evaluation.enum_names.clone(),
+            payload_cases: evaluation.payload_cases.clone(),
+            class_parents: evaluation.class_parents.clone(),
+            aggregates: evaluation.aggregates.clone(),
+        }
+    }
+
     fn collect(program: &ast::Program) -> Self {
         let mut evaluator = Self {
             nodes: HashMap::new(),
@@ -397,7 +411,32 @@ impl Evaluator {
             enum_names: HashMap::new(),
             payload_cases: HashMap::new(),
             class_parents: HashMap::new(),
+            aggregates: HashMap::new(),
         };
+        for item in &program.items {
+            if let Item::ForeignAggregate(declaration) = item {
+                let fields = declaration.fields.as_ref().map(|fields| {
+                    fields
+                        .iter()
+                        .map(|field| ForeignFieldSchema {
+                            name: field.name.clone(),
+                            ty: field.ty.clone(),
+                            default: field.default.clone(),
+                        })
+                        .collect()
+                });
+                evaluator.aggregates.insert(
+                    declaration.name.clone(),
+                    ForeignAggregateSchema {
+                        aggregate: crate::foreign::ForeignAggregateType {
+                            name: declaration.name.clone(),
+                            kind: declaration.kind,
+                        },
+                        fields,
+                    },
+                );
+            }
+        }
         for item in &program.items {
             if let Item::Class(declaration) = item {
                 if let Some(parent) = &declaration.parent {
@@ -599,7 +638,7 @@ impl Evaluator {
         let expected = node
             .annotation
             .as_ref()
-            .and_then(|ty| const_type_with_enums(ty, &self.enum_names));
+            .and_then(|ty| const_type_with_nominals(ty, &self.enum_names, &self.aggregates));
         if let Some(annotation) = &node.annotation {
             if expected.is_none() && !matches!(node.key, ConstKey::Static { .. }) {
                 self.diagnostics.push(Diagnostic::new(
@@ -807,6 +846,14 @@ impl Evaluator {
                 }
                 self.convert(&class_name, method, args, *span, requester)
             }
+            Expr::New {
+                class_type,
+                args,
+                shared: false,
+                ..
+            } if self.aggregates.contains_key(&class_type.name) => {
+                self.foreign_aggregate(&class_type.name, args, requester)
+            }
             _ => {
                 self.unavailable(requester, expr.span(), "expression");
                 None
@@ -973,6 +1020,97 @@ impl Evaluator {
         })
     }
 
+    /// `new Name(...)` of a foreign struct or union whose fields are
+    /// constant (Decision 0148 section 6, with the amendment of
+    /// 2026-11-16). A foreign aggregate has no constructor, so the value
+    /// runs no code: a struct takes each supplied field and each omitted
+    /// field's default, and a union at most one member. An argument that
+    /// names no field, a missing field or a second union member is a
+    /// construction error checking reports at the expression (E0798,
+    /// E0799), so constant evaluation adds no second diagnostic for it.
+    fn foreign_aggregate(
+        &mut self,
+        name: &str,
+        args: &[Argument],
+        requester: &EvaluationRequester,
+    ) -> Option<TypedValue> {
+        let schema = self.aggregates.get(name).cloned()?;
+        let fields = schema.fields.as_ref()?;
+        let union = schema.aggregate.kind == ast::ForeignAggregateKind::Union;
+        let parameter_names = fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        // A union member, a fixed-length array field and a field with a
+        // default may each be omitted.
+        let optional = fields
+            .iter()
+            .map(|field| union || field.default.is_some() || field.ty.fixed_array_parts().is_some())
+            .collect::<Vec<_>>();
+        let argument_names = args
+            .iter()
+            .map(|argument| argument.name.as_ref().map(|name| name.text.as_str()))
+            .collect::<Vec<_>>();
+        let bound =
+            crate::arg_binding::bind_arguments(&parameter_names, &optional, &argument_names);
+        if !bound.unknown.is_empty()
+            || !bound.duplicate.is_empty()
+            || !bound.missing.is_empty()
+            || bound.overflow != 0
+            || (union && args.len() > 1)
+        {
+            return None;
+        }
+        let mut values = Vec::with_capacity(fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let source = match bound.param_to_arg[index] {
+                Some(argument) => Some((&args[argument].value, requester.clone())),
+                None if union => None,
+                None => field
+                    .default
+                    .as_ref()
+                    .map(|default| (default, EvaluationRequester::parameter_default(None))),
+            };
+            let Some((expression, field_requester)) = source else {
+                // An omitted fixed-length array field and every union
+                // member not supplied stay zero.
+                values.push(None);
+                continue;
+            };
+            let Some(expected) =
+                const_type_with_nominals(&field.ty, &self.enum_names, &self.aggregates)
+            else {
+                self.invalid(
+                    expression.span(),
+                    format!(
+                        "foreign field `${}` of `{}` has no constant value; a constant foreign struct or union holds integers, floats, `bool`, `null` and foreign structs and unions built from constants",
+                        field.name,
+                        schema.aggregate.name.rsplit('\\').next().unwrap_or(name)
+                    ),
+                );
+                return None;
+            };
+            let value = self.evaluate_expr(expression, Some(expected.clone()), &field_requester)?;
+            if !expected.accepts(&value.ty) {
+                self.invalid(
+                    expression.span(),
+                    format!(
+                        "foreign field `${}` expects `{expected}`, found `{}`",
+                        field.name, value.ty
+                    ),
+                );
+                return None;
+            }
+            values.push(Some(value.value));
+        }
+        Some(TypedValue::new(ConstValue::ForeignAggregate(
+            ConstForeignAggregateValue {
+                aggregate: schema.aggregate.clone(),
+                fields: values,
+            },
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn payload_enum(
         &mut self,
@@ -1018,7 +1156,7 @@ impl Evaluator {
         let field_patterns = schema
             .fields
             .iter()
-            .map(|(_, ty)| resolve_const_type(ty, &self.enum_names, &patterns))
+            .map(|(_, ty)| resolve_const_type(ty, &self.enum_names, &self.aggregates, &patterns))
             .collect::<Option<Vec<_>>>()?;
         let mut value = schema.value;
         let mut types = TypeRegistry::new();
@@ -1461,6 +1599,8 @@ pub enum ConstType {
     NullableEnum(EnumType),
     Inline(crate::inline_value::InlineValueType),
     NullableInline(crate::inline_value::InlineValueType),
+    /// A foreign struct or union (Decision 0148 section 6).
+    ForeignAggregate(crate::foreign::ForeignAggregateType),
     /// A nullable type with no constant values of its own, so `null` is its
     /// only constant: the nullable runtime handles and keys, the nullable
     /// pointers `?Pointer<T>` and `?WritablePointer<T>`, and the nullable C function
@@ -1477,6 +1617,12 @@ impl ConstType {
             ResolvedType::Bool => Self::Bool,
             ResolvedType::Null => Self::Null,
             ResolvedType::Enum(ty) => Self::Enum(ty),
+            ResolvedType::Foreign(foreign) => match *foreign {
+                crate::foreign::ForeignType::Aggregate(aggregate) => {
+                    Self::ForeignAggregate(aggregate)
+                }
+                _ => return None,
+            },
             ResolvedType::Nullable(inner) => match Self::from_resolved(*inner)? {
                 Self::Integer(ty) => Self::NullableInteger(ty),
                 Self::Float(ty) => Self::NullableFloat(ty),
@@ -1497,6 +1643,9 @@ impl ConstType {
             Self::Bool => ResolvedType::Bool,
             Self::Null => ResolvedType::Null,
             Self::Enum(ty) => ResolvedType::Enum(ty.clone()),
+            Self::ForeignAggregate(aggregate) => ResolvedType::Foreign(Box::new(
+                crate::foreign::ForeignType::Aggregate(aggregate.clone()),
+            )),
             ty => crate::types::nullable_of(ty.nullable_payload()?.resolved()?),
         })
     }
@@ -1510,6 +1659,7 @@ impl ConstType {
             ConstValue::Null => Self::Null,
             ConstValue::Enum(value) => Self::Enum(value.enum_type.clone()),
             ConstValue::PayloadEnum(value) => Self::Enum(value.value.enum_type.clone()),
+            ConstValue::ForeignAggregate(value) => Self::ForeignAggregate(value.aggregate.clone()),
         }
     }
 
@@ -1605,6 +1755,13 @@ impl fmt::Display for ConstType {
             Self::Inline(ty) => formatter.write_str(ty.name()),
             Self::NullableInline(ty) => write!(formatter, "?{}", ty.name()),
             Self::NullOnly(ty) => write!(formatter, "{ty}"),
+            Self::ForeignAggregate(aggregate) => {
+                let mut types = crate::types::TypeRegistry::new();
+                let id = types.intern_resolved(&ResolvedType::Foreign(Box::new(
+                    crate::foreign::ForeignType::Aggregate(aggregate.clone()),
+                )));
+                formatter.write_str(&types.display(id))
+            }
         }
     }
 }
@@ -1674,21 +1831,39 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
     }
 }
 
-fn const_type_with_enums(
+/// The constant type of `ty`, reading the program's enums and foreign
+/// structs and unions by name.
+fn const_type_with_nominals(
     ty: &TypeRef,
     enum_names: &HashMap<String, (EnumId, usize)>,
+    aggregates: &HashMap<String, ForeignAggregateSchema>,
 ) -> Option<ConstType> {
-    const_type(ty)
-        .or_else(|| ConstType::from_resolved(resolve_const_type(ty, enum_names, &HashMap::new())?))
+    const_type(ty).or_else(|| {
+        ConstType::from_resolved(resolve_const_type(
+            ty,
+            enum_names,
+            aggregates,
+            &HashMap::new(),
+        )?)
+    })
 }
 
 fn resolve_const_type(
     ty: &TypeRef,
     enum_names: &HashMap<String, (EnumId, usize)>,
+    aggregates: &HashMap<String, ForeignAggregateSchema>,
     substitutions: &HashMap<String, ResolvedType>,
 ) -> Option<ResolvedType> {
     let ty = crate::types::resolved_type_ref_with_substitutions(ty, substitutions)?;
     Some(crate::types::resolve_nominal_kinds_with(ty, &|class| {
+        if let Some(schema) = aggregates
+            .get(&class.name)
+            .filter(|_| class.arguments.is_empty())
+        {
+            return ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Aggregate(
+                schema.aggregate.clone(),
+            )));
+        }
         if let Some(&(id, arity)) = enum_names.get(&class.name) {
             if class.arguments.len() == arity {
                 return ResolvedType::Enum(EnumType::with_arguments(
