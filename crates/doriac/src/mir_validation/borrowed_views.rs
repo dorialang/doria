@@ -1041,12 +1041,13 @@ impl State {
                     | mir::CoreCollectionOperation::ValueAt { target, .. },
             } => Some((*target, self.roots[collection.0].clone())),
             // A fixed-length array field's region views the aggregate that
-            // holds the field (Decision 0148 section 6).
+            // holds the field (Decision 0148 section 6): a local, or the
+            // object whose property holds it.
             mir::Statement::ForeignField {
                 aggregate,
                 access: mir::ForeignFieldAccess::Region { target, .. },
                 ..
-            } => Some((*target, self.roots[aggregate.0].clone())),
+            } => Some((*target, self.roots[aggregate_owner(*aggregate).0].clone())),
             mir::Statement::AssignLocal { target, value }
                 if !local_in(function, *target)?.owned =>
             {
@@ -1097,7 +1098,7 @@ impl State {
                 aggregate,
                 access: mir::ForeignFieldAccess::Region { .. },
                 ..
-            } => HashSet::from([*aggregate]),
+            } => HashSet::from([aggregate_owner(*aggregate)]),
             _ => HashSet::new(),
         };
         let assigned_storage = match statement {
@@ -2264,6 +2265,15 @@ pub(super) fn validate(
     stored_owners::validate_returned_storage(function, returned_storage)?;
     stored_owners::validate_removals(function, normal_removals, exceptional_removals)?;
     Ok(())
+}
+
+/// The local that owns the storage of a foreign struct or union place: the
+/// local itself, or the class value whose property holds the aggregate.
+fn aggregate_owner(place: mir::ForeignAggregatePlace) -> mir::LocalId {
+    match place {
+        mir::ForeignAggregatePlace::Local(local) => local,
+        mir::ForeignAggregatePlace::Property { object, .. } => object,
+    }
 }
 
 #[cfg(test)]

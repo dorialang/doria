@@ -43,7 +43,7 @@ fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     (
         "Foreign Aggregates Cannot Be Built Here Yet",
         format!(
-            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results and pointer targets, and not here yet"
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions as locals, parameters, results, pointer targets and instance properties, and not here yet"
         ),
     )
 }
@@ -93,6 +93,13 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
                     ),
                     crate::mir::Statement::ForeignField { span, .. }
                     | crate::mir::Statement::AssignLocal {
+                        value:
+                            crate::mir::Rvalue::ForeignAggregate(
+                                crate::mir::ForeignAggregateExpression::Construct { span, .. },
+                            ),
+                        ..
+                    }
+                    | crate::mir::Statement::AssignProperty {
                         value:
                             crate::mir::Rvalue::ForeignAggregate(
                                 crate::mir::ForeignAggregateExpression::Construct { span, .. },
@@ -222,10 +229,10 @@ impl Finder {
     }
 
     /// Reports a foreign struct or union `ty` holds where no execution
-    /// target builds one yet: anywhere in a property or enum payload type
-    /// (`anywhere`), otherwise nullable, as a type argument other than a
-    /// pointer's pointee, or in a function type. Locals, parameters,
-    /// results and pointees build.
+    /// target builds one yet: anywhere in a static property or enum payload
+    /// type (`anywhere`), otherwise nullable, as a type argument other than
+    /// a pointer's pointee, or in a function type. Locals, parameters,
+    /// results, instance properties and pointees build.
     fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
         if self.aggregates.is_empty() {
             return;
@@ -319,7 +326,10 @@ impl Finder {
     }
 
     fn property(&mut self, property: &PropertyDecl) {
-        self.misplaced_aggregate(&property.ty, property.span, Some("a property"));
+        // An instance property holds a foreign struct or union by value in
+        // the object's storage (Decision 0148 section 6).
+        let position = property.is_static.then_some("a static property");
+        self.misplaced_aggregate(&property.ty, property.span, position);
         self.type_refs(&mut property.ty.clone(), property.span);
         if let Some(initializer) = &property.initializer {
             self.expression(initializer);

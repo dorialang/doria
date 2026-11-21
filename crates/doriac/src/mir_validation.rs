@@ -13012,6 +13012,9 @@ fn collect_rvalue_class_local_accesses<'a>(
                 }
             }
             mir::ForeignAggregateExpression::Local { local, .. } => accesses.resource_read(*local),
+            mir::ForeignAggregateExpression::Property {
+                object, property, ..
+            } => accesses.borrow_property(*object, *property),
             mir::ForeignAggregateExpression::Call { args, .. } => {
                 for arg in args {
                     collect_rvalue_class_local_accesses(arg, accesses);
@@ -14742,7 +14745,14 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::ForeignField {
             aggregate, access, ..
         } => {
-            accesses.resource_read(*aggregate);
+            match aggregate {
+                mir::ForeignAggregatePlace::Local(local) => accesses.resource_read(*local),
+                // A field access uses one stored path, not the receiver as a
+                // whole (Decision 0136), as a property store does.
+                mir::ForeignAggregatePlace::Property { object, property } => {
+                    accesses.borrow_property(*object, *property)
+                }
+            }
             if let mir::ForeignFieldAccess::Write { value, .. } = access {
                 collect_rvalue_class_local_accesses(value, &mut accesses);
             }
@@ -20726,12 +20736,22 @@ fn statement_observes_property(
 ) -> bool {
     match statement {
         mir::Statement::SetDiagnosticSite { .. } | mir::Statement::ForeignCall { .. } => false,
-        mir::Statement::ForeignField { access, .. } => match access {
-            mir::ForeignFieldAccess::Read { .. } | mir::ForeignFieldAccess::Region { .. } => false,
-            mir::ForeignFieldAccess::Write { value, .. } => {
-                rvalue_observes_property(value, receiver, property)
+        mir::Statement::ForeignField {
+            aggregate, access, ..
+        } => {
+            matches!(
+                aggregate,
+                mir::ForeignAggregatePlace::Property { object, property: observed }
+                    if *object == receiver && *observed == property
+            ) || match access {
+                mir::ForeignFieldAccess::Read { .. } | mir::ForeignFieldAccess::Region { .. } => {
+                    false
+                }
+                mir::ForeignFieldAccess::Write { value, .. } => {
+                    rvalue_observes_property(value, receiver, property)
+                }
             }
-        },
+        }
         mir::Statement::Pointer { operation, .. } => match operation {
             mir::PointerOperation::Write { value, .. }
             | mir::PointerOperation::CreateHandle { value } => {
@@ -21046,6 +21066,11 @@ fn rvalue_observes_property(
             mir::ForeignAggregateExpression::Call { args, .. } => args
                 .iter()
                 .any(|arg| rvalue_observes_property(arg, receiver, property)),
+            mir::ForeignAggregateExpression::Property {
+                object,
+                property: observed,
+                ..
+            } => *object == receiver && *observed == property,
             mir::ForeignAggregateExpression::Local { .. } => false,
         },
     }

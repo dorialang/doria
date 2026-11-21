@@ -1903,3 +1903,46 @@ fn windows_last_error_capture_in_emitted_code_off_windows_is_an_error() {
     let unused = "use Doria\\Std\\Ffi\\{CaptureSystemCode, SystemCodeSource};\nextern \"C\" { /** @safety Any value. */ #[CaptureSystemCode(SystemCodeSource::WindowsLastError)] function close(int32 $descriptor): int32; }\nfunction main(): void {}";
     doriac::lower_source_to_mir("ffi.doria", unused).expect("nothing calls it");
 }
+
+#[test]
+fn foreign_aggregate_properties_follow_the_object_path() {
+    // Decision 0148 section 6: a field of a property is writable exactly
+    // when the property and its object are.
+    let declaration = "extern \"C\" struct Color { uint8 $red; uint8 $green; } class Holder { writable Color $color; Color $fixed; function __construct() { $this->color = new Color(red: 1, green: 2); $this->fixed = new Color(red: 3, green: 4); } }";
+    let writable = format!(
+        "{declaration} function main(): void {{ writable Holder $holder = new Holder(); $holder->color->red = 5; $holder->color->green += 1; $holder->color = $holder->fixed; }}"
+    );
+    assert!(codes(&writable).is_empty(), "{:#?}", findings(&writable));
+    for (body, code) in [
+        (
+            "writable Holder $holder = new Holder(); $holder->fixed->red = 5;",
+            "E0201",
+        ),
+        (
+            "writable Holder $holder = new Holder(); $holder->fixed->green += 1;",
+            "E0201",
+        ),
+        (
+            "let $holder = new Holder(); $holder->color->red = 5;",
+            "E0201",
+        ),
+        (
+            "let $holder = new Holder(); $holder->color = new Color(red: 0, green: 0);",
+            "E0201",
+        ),
+    ] {
+        let source = format!("{declaration} function main(): void {{ {body} }}");
+        assert!(
+            codes(&source).contains(&code),
+            "{body}: {:#?}",
+            findings(&source)
+        );
+    }
+    let method = format!(
+        "{declaration} function paint(Holder $holder): void {{ $holder->color->red = 5; }}"
+    );
+    assert!(
+        !codes(&method).is_empty(),
+        "a readonly parameter's property field"
+    );
+}

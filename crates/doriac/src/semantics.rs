@@ -16676,6 +16676,38 @@ impl<'program> Checker<'program> {
         }
     }
 
+    /// A field write changes the foreign struct or union that holds the
+    /// field, so `object`, the aggregate, must be a writable object path,
+    /// exactly as the receiver of a class property write must be (Decision
+    /// 0148 section 6). An aggregate held by a property is readonly when
+    /// the property is or when the object holding it is. A readonly binding
+    /// holding the aggregate is the ownership checker's finding (E0479).
+    fn check_foreign_field_container(
+        &mut self,
+        object: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let mut container = Self::ungroup_expr(object);
+        while let Expr::PropertyAccess { object: inner, .. } = container {
+            let inner_ty = self.infer_expr_type(inner, scopes, method_context);
+            if self.aggregate_of(inner_ty).is_none() {
+                break;
+            }
+            container = Self::ungroup_expr(inner);
+        }
+        if matches!(container, Expr::Variable { .. })
+            || self.is_writable_object_path(object, scopes, method_context)
+        {
+            return;
+        }
+        self.diagnostics.push(Diagnostic::new(
+            "E0201",
+            "cannot write through readonly object path",
+            object.span(),
+        ));
+    }
+
     fn ungroup_expr(mut expr: &Expr) -> &Expr {
         while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
             expr = inner;
@@ -18711,6 +18743,7 @@ impl<'program> Checker<'program> {
                 if let Some(field) =
                     self.check_foreign_field_write(object_ty, property, *member_span)
                 {
+                    self.check_foreign_field_container(object, scopes, method_context);
                     return field.map(|ty| AssignmentTarget {
                         ty,
                         destination: AssignmentDestination::Type,

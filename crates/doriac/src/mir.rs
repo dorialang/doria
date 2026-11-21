@@ -2032,6 +2032,13 @@ pub enum ForeignAggregateExpression {
         ty: ForeignAggregateType,
         local: LocalId,
     },
+    /// A copy of the value the stored property `property` of the class
+    /// value `object` holds.
+    Property {
+        ty: ForeignAggregateType,
+        object: LocalId,
+        property: PropertyId,
+    },
     Call {
         ty: ForeignAggregateType,
         function: FunctionId,
@@ -2043,7 +2050,34 @@ pub enum ForeignAggregateExpression {
 impl ForeignAggregateExpression {
     pub const fn ty(&self) -> ForeignAggregateType {
         match self {
-            Self::Construct { ty, .. } | Self::Local { ty, .. } | Self::Call { ty, .. } => *ty,
+            Self::Construct { ty, .. }
+            | Self::Local { ty, .. }
+            | Self::Property { ty, .. }
+            | Self::Call { ty, .. } => *ty,
+        }
+    }
+}
+
+/// Where a foreign struct or union field access finds the aggregate
+/// (Decision 0148 section 6): the value a local holds, or the value a
+/// stored class property holds, addressed in place so that a write
+/// through the property changes the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForeignAggregatePlace {
+    Local(LocalId),
+    Property {
+        object: LocalId,
+        property: PropertyId,
+    },
+}
+
+impl fmt::Display for ForeignAggregatePlace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(local) => write!(formatter, "local{}", local.0),
+            Self::Property { object, property } => {
+                write!(formatter, "local{}->property{}", object.0, property.index)
+            }
         }
     }
 }
@@ -6380,13 +6414,13 @@ pub enum Statement {
         target: Option<LocalId>,
         span: Span,
     },
-    /// One field access of the foreign struct or union `aggregate` holds
+    /// One field access of the foreign struct or union at `aggregate`
     /// (Decision 0148 section 6): the field, or the nested field, whose C
     /// layout starts `offset` bytes into the aggregate. A union member
     /// starts at offset zero, so reading one reads the bytes written last
     /// through any member.
     ForeignField {
-        aggregate: LocalId,
+        aggregate: ForeignAggregatePlace,
         offset: u64,
         access: ForeignFieldAccess,
         span: Span,
@@ -7894,7 +7928,8 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
                 ForeignAggregateExpression::Call { args, .. } => {
                     args.iter().map(rvalue_class_temporary_capacity).sum()
                 }
-                ForeignAggregateExpression::Local { .. } => 0,
+                ForeignAggregateExpression::Local { .. }
+                | ForeignAggregateExpression::Property { .. } => 0,
             },
         }
 }
@@ -9329,6 +9364,13 @@ impl fmt::Display for Rvalue {
                 ForeignAggregateExpression::Local { local, .. } => {
                     write!(formatter, "copy local{}", local.0)
                 }
+                ForeignAggregateExpression::Property {
+                    object, property, ..
+                } => write!(
+                    formatter,
+                    "copy local{}->property{}",
+                    object.0, property.index
+                ),
                 ForeignAggregateExpression::Call { function, args, .. } => {
                     let args = args
                         .iter()
@@ -11217,29 +11259,24 @@ impl fmt::Display for Statement {
             } => match access {
                 ForeignFieldAccess::Read { target } => write!(
                     formatter,
-                    "local{} = foreign_field(local{}, @{offset})",
-                    target.0, aggregate.0
+                    "local{} = foreign_field({aggregate}, @{offset})",
+                    target.0
                 ),
                 ForeignFieldAccess::Write {
                     value,
                     copied_elements: None,
-                } => write!(
-                    formatter,
-                    "foreign_field(local{}, @{offset}) = {value}",
-                    aggregate.0
-                ),
+                } => write!(formatter, "foreign_field({aggregate}, @{offset}) = {value}"),
                 ForeignFieldAccess::Write {
                     value,
                     copied_elements: Some(length),
                 } => write!(
                     formatter,
-                    "foreign_field(local{}, @{offset}) = copy_elements({value}, {length})",
-                    aggregate.0
+                    "foreign_field({aggregate}, @{offset}) = copy_elements({value}, {length})"
                 ),
                 ForeignFieldAccess::Region { target, length } => write!(
                     formatter,
-                    "local{} = foreign_field_region(local{}, @{offset}, {length})",
-                    target.0, aggregate.0
+                    "local{} = foreign_field_region({aggregate}, @{offset}, {length})",
+                    target.0
                 ),
             },
             Statement::ForeignCall {

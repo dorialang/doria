@@ -120,18 +120,49 @@ fn validate_stored_field(
     }
 }
 
+/// The aggregate type `place` holds, and whether a field write may go
+/// through it: a writable local, or a property that permits writes through
+/// it on a writable receiver or on the constructor's direct receiver, as
+/// checking proves of the place's object path (section 6).
+fn place_facts(
+    program: &mir::Program,
+    function: &mir::Function,
+    place: mir::ForeignAggregatePlace,
+) -> Result<(mir::ForeignAggregateType, bool), BackendError> {
+    let (ty, writable) = match place {
+        mir::ForeignAggregatePlace::Local(local) => {
+            let local = local_in(function, local)?;
+            (local.ty, local.writable)
+        }
+        mir::ForeignAggregatePlace::Property { object, property } => {
+            let object = local_in(function, object)?;
+            let mir::Type::Class(class) = object.ty else {
+                return Err(malformed_mir(
+                    "a foreign field access names a property of a local without a class value",
+                ));
+            };
+            let property = property_in(program, class, property)?;
+            let receiver =
+                object.writable || is_direct_constructor_receiver(program, function, object)?;
+            (property.ty, receiver && property.permits_write_through())
+        }
+    };
+    let mir::Type::ForeignAggregate(aggregate) = ty else {
+        return Err(malformed_mir(
+            "a foreign field access names a place without a foreign aggregate",
+        ));
+    };
+    Ok((aggregate, writable))
+}
+
 pub(super) fn validate_field_access(
     program: &mir::Program,
     function: &mir::Function,
-    aggregate: mir::LocalId,
+    aggregate: mir::ForeignAggregatePlace,
     offset: u64,
     access: &mir::ForeignFieldAccess,
 ) -> Result<(), BackendError> {
-    let mir::Type::ForeignAggregate(aggregate_type) = local_in(function, aggregate)?.ty else {
-        return Err(malformed_mir(
-            "a foreign field access names a local without a foreign aggregate",
-        ));
-    };
+    let (aggregate_type, writable) = place_facts(program, function, aggregate)?;
     match access {
         mir::ForeignFieldAccess::Read { target } => {
             let target = local_in(function, *target)?;
@@ -141,9 +172,9 @@ pub(super) fn validate_field_access(
             value,
             copied_elements,
         } => {
-            if !local_in(function, aggregate)?.writable {
+            if !writable {
                 return Err(malformed_mir(
-                    "a foreign field write names a readonly local",
+                    "a foreign field write names a readonly place",
                 ));
             }
             validate_stored_field(program, aggregate_type, offset, value, *copied_elements)?;
@@ -151,9 +182,9 @@ pub(super) fn validate_field_access(
         }
         mir::ForeignFieldAccess::Region { target, length } => {
             let target = local_in(function, *target)?;
-            if target.ty.is_writable_region() && !local_in(function, aggregate)?.writable {
+            if target.ty.is_writable_region() && !writable {
                 return Err(malformed_mir(
-                    "a writable fixed-length array field region names a readonly local",
+                    "a writable fixed-length array field region names a readonly place",
                 ));
             }
             validate_array_field(program, aggregate_type, offset, target.ty, *length)
@@ -196,6 +227,15 @@ pub(super) fn validate_expression(
             }
             Ok(())
         }
+        mir::ForeignAggregateExpression::Property {
+            object, property, ..
+        } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::ForeignAggregate(ty),
+        ),
         mir::ForeignAggregateExpression::Call {
             function: callee,
             args,

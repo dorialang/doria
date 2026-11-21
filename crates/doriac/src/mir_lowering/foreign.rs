@@ -298,22 +298,29 @@ pub(super) fn expression(
                     lower_rvalue_as_expected(argument, expected, context).map(Some)
                 }
                 PointerOperation::AddressOf => {
+                    // A field of an aggregate a property holds lives in the
+                    // object's storage, as the property does.
+                    let property_pointer = || {
+                        vec![crate::unsafe_code::unbuilt_form(
+                            *span,
+                            "Pointers To Properties Cannot Be Built Yet",
+                            format!(
+                                "`{}::{method}` of a property is part of Doria; this compiler does not build it yet",
+                                access.short_name()
+                            ),
+                        )]
+                    };
                     let (local, offset) = match unparenthesized_place(argument) {
                         hir::Expr::Variable { name, span: place } => {
                             (context.lookup_local(name, *place)?, 0)
                         }
                         place => match field_place(place, context)? {
-                            Some(field) => (field.aggregate, field.offset),
-                            None => {
-                                return Err(vec![crate::unsafe_code::unbuilt_form(
-                                    *span,
-                                    "Pointers To Properties Cannot Be Built Yet",
-                                    format!(
-                                        "`{}::{method}` of a property is part of Doria; this compiler does not build it yet",
-                                        access.short_name()
-                                    ),
-                                )]);
-                            }
+                            Some(FieldPlace {
+                                aggregate: mir::ForeignAggregatePlace::Local(local),
+                                offset,
+                                ..
+                            }) => (local, offset),
+                            Some(_) | None => return Err(property_pointer()),
                         },
                     };
                     let target = context.declare_return_temp(POINTER, false);
@@ -652,10 +659,10 @@ pub(super) fn function_pointer_call(
     ))
 }
 
-/// A field of a foreign struct or union as a place: the local holding the
-/// outermost aggregate, the field's byte offset in it, and the field's type.
+/// A field of a foreign struct or union as a place: where the outermost
+/// aggregate is, the field's byte offset in it, and the field's type.
 struct FieldPlace {
-    aggregate: mir::LocalId,
+    aggregate: mir::ForeignAggregatePlace,
     offset: u64,
     field: FieldKind,
 }
@@ -704,9 +711,11 @@ fn aggregate_type(
 
 /// `$aggregate->field` and `$aggregate->field->nested` as a place, or
 /// `None` when `expr` is not a field access of a foreign struct or union.
-/// An aggregate that is not a local's whole value, such as a call result,
-/// is first copied to a temporary; writes reach only locals, which checking
-/// proves writable.
+/// The outermost aggregate is a local or a stored class property, each
+/// addressed in place, so a write reaches it; checking proves the place
+/// writable. Any other aggregate, such as a call result or a property a
+/// getter hook computes, is first copied to a temporary, which only reads
+/// reach.
 fn field_place(
     expr: &hir::Expr,
     context: &mut LoweringContext,
@@ -765,34 +774,66 @@ fn field_place(
             field,
         }));
     }
+    let aggregate_type = aggregate_type(&object_type, object.span(), context)?;
     let aggregate = match unparenthesized_place(object) {
-        hir::Expr::Variable { name, span } => context.lookup_local(name, *span)?,
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            if context.local_type(local) != mir::Type::ForeignAggregate(aggregate_type) {
+                return Err(vec![unsupported(
+                    *span,
+                    "a field access names a local that holds no foreign struct or union",
+                )]);
+            }
+            mir::ForeignAggregatePlace::Local(local)
+        }
+        place @ hir::Expr::PropertyAccess { .. } if stored_property_place(place, context) => {
+            let (object, property, ty) = lower_property_place(place, context)?;
+            if ty != mir::Type::ForeignAggregate(aggregate_type) {
+                return Err(vec![unsupported(
+                    place.span(),
+                    "a field access names a property that holds no foreign struct or union",
+                )]);
+            }
+            mir::ForeignAggregatePlace::Property { object, property }
+        }
         _ => {
-            let aggregate = aggregate_type(&object_type, object.span(), context)?;
-            let value =
-                lower_rvalue_as_expected(object, mir::Type::ForeignAggregate(aggregate), context)?;
-            let local = context.declare_return_temp(mir::Type::ForeignAggregate(aggregate), false);
+            let value = lower_rvalue_as_expected(
+                object,
+                mir::Type::ForeignAggregate(aggregate_type),
+                context,
+            )?;
+            let local =
+                context.declare_return_temp(mir::Type::ForeignAggregate(aggregate_type), false);
             context.push_statement(mir::Statement::AssignLocal {
                 target: local,
                 value,
             });
-            local
+            mir::ForeignAggregatePlace::Local(local)
         }
     };
-    if !matches!(
-        context.local_type(aggregate),
-        mir::Type::ForeignAggregate(_)
-    ) {
-        return Err(vec![unsupported(
-            *span,
-            "a field access names a local that holds no foreign struct or union",
-        )]);
-    }
     Ok(Some(FieldPlace {
         aggregate,
         offset: field_offset,
         field,
     }))
+}
+
+/// Whether `expr` reads a stored class property in place: a property
+/// access that is not null-safe, takes nothing and has no getter hook
+/// (Decision 0135), whose value lives in the object's storage.
+fn stored_property_place(expr: &hir::Expr, context: &LoweringContext) -> bool {
+    matches!(
+        expr,
+        hir::Expr::PropertyAccess {
+            null_safe: false,
+            take: false,
+            ..
+        }
+    ) && !context
+        .semantic_info
+        .property_accessor_calls
+        .get(&expr.span())
+        .is_some_and(|calls| calls.getter.is_some())
 }
 
 /// The element type and count of a fixed-length array field type.
@@ -968,6 +1009,23 @@ pub(super) fn aggregate_expression(
                 )]);
             }
             Ok(mir::ForeignAggregateExpression::Local { ty, local })
+        }
+        // Getter hooks and interface properties are calls the shared
+        // checked-call path lowers first, so a property access that
+        // reaches here reads a stored property.
+        place @ hir::Expr::PropertyAccess { .. } if stored_property_place(place, context) => {
+            let (object, property, actual) = lower_property_place(place, context)?;
+            if actual != mir::Type::ForeignAggregate(ty) {
+                return Err(vec![unsupported(
+                    place.span(),
+                    "a property holds another type than the foreign struct or union expected",
+                )]);
+            }
+            Ok(mir::ForeignAggregateExpression::Property {
+                ty,
+                object,
+                property,
+            })
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;

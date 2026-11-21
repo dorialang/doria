@@ -661,7 +661,11 @@ function main(): void
 #[test]
 fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
     for (body, position) in [
-        ("class Holder { Color $color; function __construct(Color $initial) { $this->color = $initial; } }", "a property"),
+        ("class Holder { ?Color $color = null; }", "a nullable value"),
+        (
+            "class Holder { static Color $color = new Color(red: 1, green: 2, blue: 3); }",
+            "a static property",
+        ),
         ("function main(): void { ?Color $maybe = null; }", "a nullable value"),
         ("function keep(Color[] $colors): void {}", "a nullable value"),
         ("enum Paint { case Solid(Color $color); }", "an enum payload"),
@@ -724,6 +728,22 @@ fn the_interpreter_and_php_output_report_foreign_aggregates() {
     assert!(
         php.iter().any(|diagnostic| diagnostic.code == "E0784"),
         "{php:#?}"
+    );
+    // A construction stored straight into a property is a companion
+    // operation too.
+    let property = format!(
+        "{AGGREGATES}class Holder {{ Color $color = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ let $holder = new Holder(); }}"
+    );
+    let debug = doriac::compile_source(
+        "stage40.doria",
+        property,
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter runs foreign aggregates through the companion");
+    assert!(
+        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
+        "{debug:#?}"
     );
     let constant = format!("{AGGREGATES}function main(): void {{ echo Color::SIZE; }}");
     let php = doriac::compile_source(
@@ -2926,4 +2946,98 @@ fn assert_php_prints(source: &str, stdout: &str) -> String {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
     text
+}
+
+#[test]
+fn foreign_aggregates_are_class_properties() {
+    let source = format!(
+        "{AGGREGATES}
+class Holder
+{{
+    writable Color $color;
+    Pixel $origin = new Pixel(x: 7, y: 8, color: new Color(red: 1, green: 1, blue: 1), weight: 0.5, visible: false);
+
+    function __construct(Color $initial)
+    {{
+        $this->color = $initial;
+    }}
+
+    writable function brighten(uint8 $step): void
+    {{
+        $this->color->red = $this->color->red + $step;
+    }}
+}}
+
+function main(): void
+{{
+    writable Holder $holder = new Holder(new Color(red: 10, green: 20, blue: 30));
+    echo $holder->color->red . \" \";
+    $holder->brighten(5);
+    echo $holder->color->red . \" \";
+    let $copy = $holder->color;
+    $holder->color = new Color(red: 1, green: 2, blue: 3);
+    $holder->color->green += 40;
+    echo $copy->red . \" \" . $holder->color->red . \" \" . $holder->color->green . \" \" . $holder->color->alpha . \" \";
+    echo $holder->origin->x . \" \" . $holder->origin->color->red;
+}}
+"
+    );
+    assert_runs_natively(&source, "10 15 15 1 42 255 7 1");
+}
+
+#[test]
+fn foreign_aggregate_properties_are_changed_in_place() {
+    // Decision 0148 section 6: a union property, a promoted writable
+    // property and fixed-length array fields read, indexed, changed and
+    // assigned through the object.
+    let source = format!(
+        "{AGGREGATES}
+extern \"C\" struct Tip
+{{
+    uint16[3] $text;
+    int32 $length = 7;
+}}
+
+function total(ArrayRegion<uint16> $values): int
+{{
+    writable int $sum = 0;
+    for (writable int $index = 0; $index < $values->length; $index++) {{
+        $sum += Int64::from($values[$index]);
+    }}
+    return $sum;
+}}
+
+class Note
+{{
+    writable Word $word = new Word(whole: 258);
+
+    function __construct(writable Tip $tip) {{}}
+
+    writable function retitle(ArrayRegion<uint16> $text): void
+    {{
+        $this->tip->text = $text;
+    }}
+}}
+
+function main(): void
+{{
+    uint16[] $letters = [72, 105, 33, 9, 8, 7];
+    writable Note $note = new Note(new Tip(text: $letters->getRegion(0, 3)));
+    echo $note->tip->text[1] . \" \" . $note->tip->length . \" \";
+    $note->tip->text[1] = UInt16::from(5);
+    $note->tip->text[2] += UInt16::from(1);
+    echo total($note->tip->text->getRegion(0, 3)) . \" \";
+    $note->retitle($letters->getRegion(3, 3));
+    echo $note->tip->text[0] . \" \";
+    unsafe {{
+        echo $note->word->low . \" \";
+    }}
+    $note->word->low = 1;
+    unsafe {{
+        echo $note->word->whole;
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "105 7 111 9 2 257");
 }

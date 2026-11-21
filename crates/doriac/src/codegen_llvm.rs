@@ -6269,10 +6269,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         | mir::Type::NullableRegion(_)
                         | mir::Type::Interface(_)
                         | mir::Type::NullableInterface(_) => None,
-                        mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
-                        mir::Type::ClosureEnvironment(_) | mir::Type::ForeignAggregate(_) => {
+                        // A foreign struct or union is plain bytes with
+                        // nothing to release (Decision 0148 section 6).
+                        mir::Type::Function(_)
+                        | mir::Type::NullableFunction(_)
+                        | mir::Type::ForeignAggregate(_) => None,
+                        mir::Type::ClosureEnvironment(_) => {
                             return Err(malformed_mir(
-                                "closure environment pointer or foreign aggregate is not a property value",
+                                "closure environment pointer is not a property value",
                             ));
                         }
                     }
@@ -6288,6 +6292,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         payload,
                         matches!(property_ty, mir::Type::NullablePayloadEnum(_)),
                     )?;
+                } else if let Some(layout) = native_closure_abi::memory_value_layout(property_ty) {
+                    self.copy_memory_value(address, value.into_pointer_value(), layout)?;
                 } else {
                     build(self.builder.build_store(address, value))?;
                 }
@@ -11381,6 +11387,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::ForeignAggregateExpression::Local { local, .. } => {
                 local_slot(&self.local_slots, *local)
             }
+            mir::ForeignAggregateExpression::Property {
+                object, property, ..
+            } => self.lower_property_address(*object, *property),
             mir::ForeignAggregateExpression::Call {
                 function,
                 args,
@@ -11467,12 +11476,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     /// `aggregate`'s slot, `offset` bytes from its start.
     fn lower_foreign_field(
         &mut self,
-        aggregate: mir::LocalId,
+        aggregate: mir::ForeignAggregatePlace,
         offset: u64,
         access: &mir::ForeignFieldAccess,
         span: crate::source::Span,
     ) -> Result<(), BackendError> {
-        let base = local_slot(&self.local_slots, aggregate)?;
+        let base = match aggregate {
+            mir::ForeignAggregatePlace::Local(local) => local_slot(&self.local_slots, local)?,
+            mir::ForeignAggregatePlace::Property { object, property } => {
+                self.lower_property_address(object, property)?
+            }
+        };
         let offset = u32::try_from(offset)
             .map_err(|_| malformed_mir("a foreign field offset exceeds its aggregate"))?;
         let address = self.byte_offset(base, offset, "foreign.field")?;

@@ -3848,7 +3848,12 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         mir::Type::Function(_) => Some(FieldType::Function),
         mir::Type::NullableFunction(_) => Some(FieldType::NullableFunction),
         mir::Type::ClosureEnvironment(_) => None,
-        mir::Type::ForeignAggregate(_) => None,
+        // A foreign struct or union property holds the value in its C
+        // layout (Decision 0148 section 6).
+        mir::Type::ForeignAggregate(ty) => Some(FieldType::Aggregate {
+            size: ty.size,
+            align: ty.align,
+        }),
     }
 }
 
@@ -20721,10 +20726,14 @@ fn borrowed_stored_property_rvalue(
             field!(NullableSharedReferenceAccess, NullableSharedReferenceAccessExpression,
                 payload: payload, writable: matches!(ty, Type::NullableWritableSharedReferenceAccess(_)))
         }
-        Type::Region(_)
-        | Type::NullableRegion(_)
-        | Type::ClosureEnvironment(_)
-        | Type::ForeignAggregate(_) => {
+        Type::ForeignAggregate(ty) => {
+            Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Property {
+                ty,
+                object,
+                property,
+            })
+        }
+        Type::Region(_) | Type::NullableRegion(_) | Type::ClosureEnvironment(_) => {
             return Err(vec![unsupported(
                 span,
                 "this type has no stored-property MIR representation",

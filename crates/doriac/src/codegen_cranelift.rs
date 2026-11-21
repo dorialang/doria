@@ -5009,10 +5009,14 @@ fn lower_statement(
                     | mir::Type::NullableClass(_)
                     | mir::Type::Interface(_)
                     | mir::Type::NullableInterface(_) => None,
-                    mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
-                    mir::Type::ClosureEnvironment(_) | mir::Type::ForeignAggregate(_) => {
+                    // A foreign struct or union is plain bytes with nothing
+                    // to release (Decision 0148 section 6).
+                    mir::Type::Function(_)
+                    | mir::Type::NullableFunction(_)
+                    | mir::Type::ForeignAggregate(_) => None,
+                    mir::Type::ClosureEnvironment(_) => {
                         return Err(malformed_mir(
-                            "closure environment pointer or foreign aggregate reached a Doria property",
+                            "closure environment pointer reached a Doria property",
                         ));
                     }
                 }
@@ -10692,6 +10696,9 @@ fn lower_foreign_aggregate_expression(
             let slot = local_slot(resources.local_slots, *local)?;
             Ok(builder.ins().stack_addr(pointer, slot, 0))
         }
+        mir::ForeignAggregateExpression::Property {
+            object, property, ..
+        } => lower_property_address(builder, *object, *property, resources),
         mir::ForeignAggregateExpression::Call {
             function,
             args,
@@ -10765,15 +10772,22 @@ fn store_foreign_field(
 /// slot, `offset` bytes from its start.
 fn lower_foreign_field(
     builder: &mut FunctionBuilder,
-    aggregate: mir::LocalId,
+    aggregate: mir::ForeignAggregatePlace,
     offset: u64,
     access: &mir::ForeignFieldAccess,
     span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
-    let slot = local_slot(resources.local_slots, aggregate)?;
-    let base = builder.ins().stack_addr(pointer, slot, 0);
+    let base = match aggregate {
+        mir::ForeignAggregatePlace::Local(local) => {
+            let slot = local_slot(resources.local_slots, local)?;
+            builder.ins().stack_addr(pointer, slot, 0)
+        }
+        mir::ForeignAggregatePlace::Property { object, property } => {
+            lower_property_address(builder, object, property, resources)?
+        }
+    };
     let address = builder.ins().iadd_imm_u(base, offset as i64);
     match access {
         mir::ForeignFieldAccess::Read { target } => {
