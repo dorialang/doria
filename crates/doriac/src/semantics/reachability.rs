@@ -15,7 +15,11 @@
 //! instance can reach. A call, construction or C-callable function value
 //! written in a reachable body reaches its target, except inside a branch
 //! whose condition is constant false for the target; a closure belongs to the
-//! body it is written in.
+//! body it is written in. An Error class named as a type in reachable code
+//! (in `throws`, a `catch` or any other type position) reaches its Error
+//! implementation, which identifies the class in reports and catches even
+//! when nothing constructs it. Sites in a class declaration outside its
+//! members belong to the class.
 
 use super::*;
 
@@ -26,6 +30,9 @@ pub(super) enum ReachTarget {
     Callable(Span),
     /// The construction of a class, by canonical name.
     Class(String),
+    /// A class named as a type, by canonical name: its Error implementation,
+    /// when it implements Error.
+    NamedType(String),
 }
 
 /// The functions and methods a program emits.
@@ -33,6 +40,7 @@ pub(super) enum ReachTarget {
 pub struct Reachability {
     callables: HashSet<Span>,
     classes: HashSet<String>,
+    error_implementations: HashSet<String>,
     dead_branches: Vec<Span>,
 }
 
@@ -45,6 +53,13 @@ impl Reachability {
     /// Whether reachable code constructs the class or a class derived from it.
     pub fn constructs(&self, class: &str) -> bool {
         self.classes.contains(class)
+    }
+
+    /// Whether the Error implementation of an Error class is emitted:
+    /// reachable code constructs the class or names it as a type. It is the
+    /// one interface implementation an unconstructed class has.
+    pub fn reaches_error_implementation(&self, class: &str) -> bool {
+        self.error_implementations.contains(class)
     }
 
     /// Whether code at `site` runs: it lies outside every branch whose
@@ -79,6 +94,7 @@ impl Reachability {
                     }
                 }
                 Item::Class(class) => {
+                    regions.push((class.span, Owner::Class(class.name.as_str())));
                     let members = class_members.entry(class.name.as_str()).or_default();
                     for member in &class.members {
                         for callable in crate::property_hooks::member_callables(
@@ -157,6 +173,21 @@ impl Reachability {
                 .map(|(site, declaration)| (site, ReachTarget::Callable(declaration))),
         );
 
+        let error_classes = checker
+            .contracts
+            .conformances
+            .iter()
+            .filter(|conformance| {
+                conformance.status == super::contracts::ConformanceStatus::Checked
+                    && conformance.interface
+                        == crate::types::InterfaceType::new("Error", Vec::new())
+            })
+            .filter_map(|conformance| match &conformance.implementing_type {
+                ResolvedType::Class(class) => Some(class.name.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
         let dead_branches = checker.dead_branches.clone();
         let mut by_owner = HashMap::<Owner<'_>, Vec<ReachTarget>>::new();
         for (site, target) in sites {
@@ -188,6 +219,9 @@ impl Reachability {
                 }
                 Owner::Class(name) => {
                     reachability.classes.insert(name.to_string());
+                    if error_classes.contains(name) {
+                        reachability.error_implementations.insert(name.to_string());
+                    }
                     pending.extend(
                         class_members
                             .get(name)
@@ -214,6 +248,12 @@ impl Reachability {
                         Some((name, _)) => Owner::Class(*name),
                         None => continue,
                     },
+                    ReachTarget::NamedType(name) => {
+                        if error_classes.contains(name.as_str()) {
+                            reachability.error_implementations.insert(name.clone());
+                        }
+                        continue;
+                    }
                 });
             }
         }
@@ -229,7 +269,8 @@ enum Owner<'a> {
     Root,
     /// A function, method, hook or constructor body, closures included.
     Callable(Span),
-    /// The instance property initializers of a class.
+    /// A class's instance property initializers and every other site in its
+    /// declaration outside its members and static initializers.
     Class(&'a str),
 }
 

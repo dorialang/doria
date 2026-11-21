@@ -910,6 +910,13 @@ fn validate_interface_metadata(program: &mir::Program) -> Result<(), BackendErro
                         "interface vtable Error metadata does not belong to its implementing type",
                     ));
                 }
+                // An unconstructed class has no value to erase; only its Error
+                // implementation identifies it in reports and catches.
+                if !class.constructed && table.interface != mir::InterfaceTypeId::ERROR {
+                    return Err(malformed_mir(
+                        "interface vtable implements a class that is never constructed",
+                    ));
+                }
             }
             mir::ImplementingType::Collection(_) | mir::ImplementingType::CollectionIterator(_) => {
                 iteration::builtin_vtable(program, table)?
@@ -1440,7 +1447,12 @@ fn validate_class(
         {
             return Err(malformed_mir("inherited retained field changes its type"));
         }
-        if property.borrowed_source.is_some() && property_index >= parent_properties.len() {
+        // Only a constructed class has a constructor to map its retained
+        // sources (Decision 0148 section 17).
+        if property.borrowed_source.is_some()
+            && property_index >= parent_properties.len()
+            && class.constructed
+        {
             let constructor = class
                 .constructor
                 .map(|id| function_in(program, id))
@@ -1521,6 +1533,21 @@ fn validate_class(
         )));
     }
 
+    // A class reachable code never constructs has no instance, so it has no
+    // lifecycle, and constructing a class constructs its ancestors (Decision
+    // 0148 section 17).
+    if !class.constructed && (class.constructor.is_some() || class.destructor.is_some()) {
+        return Err(malformed_mir(format!(
+            "class#{} is never constructed but has a constructor or destructor",
+            class.id.0
+        )));
+    }
+    if class.constructed && parent.is_some_and(|parent| !parent.constructed) {
+        return Err(malformed_mir(format!(
+            "class#{} is constructed but its parent is not",
+            class.id.0
+        )));
+    }
     if let Some(constructor) = class.constructor {
         validate_lifecycle(program, class.id, constructor, "constructor", false)?;
     }

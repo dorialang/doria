@@ -8758,6 +8758,7 @@ fn class_program() -> Program {
             arguments: Vec::new(),
             source_span: Default::default(),
             is_open: false,
+            constructed: true,
             parent: None,
             ancestors: Vec::new(),
             virtual_methods: Vec::new(),

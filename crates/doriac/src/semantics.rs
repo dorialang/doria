@@ -2953,8 +2953,8 @@ struct Checker<'program> {
     /// The body of each branch whose condition is constant false for the
     /// target: checked, never emitted (Decision 0148 section 17).
     dead_branches: Vec<Span>,
-    /// Each call, construction and hook access by site, the edges
-    /// reachability follows.
+    /// Each call, construction, hook access and class named as a type by
+    /// site, the edges reachability follows.
     reach_sites: Vec<(Span, reachability::ReachTarget)>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
@@ -22801,6 +22801,12 @@ impl<'program> Checker<'program> {
                     .collect::<Vec<_>>();
                 if !self.check_nominal_type_constraints(name, &type_params, &arguments, span) {
                     return self.types.unknown();
+                }
+                // Naming an Error class reaches its Error implementation
+                // (Decision 0148 section 17).
+                if !span.source.is_compiler_owned() {
+                    self.reach_sites
+                        .push((span, reachability::ReachTarget::NamedType(name.to_string())));
                 }
                 let class = ClassType::new(name, arguments);
                 self.record_class_instantiation(class.clone(), declaring_class);

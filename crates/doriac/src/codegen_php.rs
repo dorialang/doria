@@ -5158,7 +5158,12 @@ fn emit_class_instance(
         .classes
         .iter()
         .find(|class| Some(class.id) == scopes.current_class_id);
-    let is_error = checked_class.is_some_and(|class| class.implements(BuiltinInterface::Error));
+    // The Error implementation is emitted when reachable code constructs or
+    // names the class (Decision 0148 section 17).
+    let is_error = checked_class.is_some_and(|class| class.implements(BuiltinInterface::Error))
+        && semantic_info
+            .reachable
+            .reaches_error_implementation(&class_decl.name);
     let class_type = crate::types::ClassType::new(
         class_decl.name.clone(),
         checked_class.unwrap().arguments.clone(),
@@ -5182,9 +5187,9 @@ fn emit_class_instance(
     }
     // A class reachable code never constructs has no instance and none of
     // its instance members are emitted (Decision 0148 section 17), so it
-    // implements nothing.
+    // implements only Error, for reports and catches that name it.
     if !semantic_info.reachable.constructs(&class_decl.name) {
-        interfaces.clear();
+        interfaces.retain(|interface| interface == "__DoriaErrorValue");
     }
     interfaces.sort();
     interfaces.dedup();
