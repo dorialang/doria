@@ -31,19 +31,11 @@ pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Di
         )
 }
 
-/// The E0784 diagnostic for a foreign struct or union in `position`, a
-/// place no execution target builds one yet, found after checking: a value
-/// boxed as `mixed`, or a closure capture.
-pub fn misplaced_aggregate(span: Span, position: &str) -> Diagnostic {
-    let (title, message) = misplaced_aggregate_text(position);
-    unbuilt_form(span, title, message)
-}
-
 fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     (
         "Foreign Aggregates Cannot Be Built Here Yet",
         format!(
-            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions and their nullable forms as locals, parameters, results, pointer targets, properties, constants, enum payloads and collection and region elements, and foreign structs and unions as `mixed` values, and not here yet"
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions and their nullable forms as locals, parameters, results, pointer targets, properties, constants, enum payloads, collection and region elements and the parameters, results and captures of closures and function types, and foreign structs and unions as `mixed` values, and not here yet"
         ),
     )
 }
@@ -285,26 +277,21 @@ impl Finder {
     }
 
     /// Reports a foreign struct or union `ty` holds where no execution
-    /// target builds one yet: anywhere in a closure's signature or
-    /// captures (`anywhere`), otherwise as a type argument other than a
-    /// pointer's pointee or a collection or region element, or in a
-    /// function type. Locals, parameters, results, properties, constants,
-    /// enum payloads, pointees and elements build, each also as `?Name`.
-    fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span, anywhere: Option<&str>) {
-        if self.aggregates.is_empty() {
+    /// target builds one yet: a type argument other than a pointer's
+    /// pointee or a collection or region element. Locals, parameters,
+    /// results, properties, constants, enum payloads, pointees, elements and
+    /// the parameters and results of function types and closures build,
+    /// each also as `?Name`.
+    fn misplaced_aggregate(&mut self, ty: &TypeRef, span: Span) {
+        if self.aggregates.is_empty()
+            || !aggregate_outside_value_position(ty, &self.aggregates, true)
+        {
             return;
         }
-        let misplaced = match anywhere {
-            Some(_) => mentions_aggregate(ty, &self.aggregates),
-            None => aggregate_outside_value_position(ty, &self.aggregates, true),
-        };
-        if misplaced {
-            let position = anywhere.unwrap_or(
-                "a type argument other than a pointer's pointee or an element, or a function type",
-            );
-            let (title, message) = misplaced_aggregate_text(position);
-            self.report(span, title, message);
-        }
+        let (title, message) = misplaced_aggregate_text(
+            "a type argument other than a pointer's pointee or an element",
+        );
+        self.report(span, title, message);
     }
 
     fn finish(mut self) -> Vec<Diagnostic> {
@@ -387,7 +374,7 @@ impl Finder {
         // An instance property holds a foreign struct or union by value in
         // the object's storage, and a static property in its static data
         // (Decision 0148 section 6).
-        self.misplaced_aggregate(&property.ty, property.span, None);
+        self.misplaced_aggregate(&property.ty, property.span);
         self.type_refs(&mut property.ty.clone(), property.span);
         if let Some(initializer) = &property.initializer {
             self.expression(initializer);
@@ -439,16 +426,14 @@ impl Finder {
 
     /// One expression, without its children: the visitors above reach those.
     fn expression_node(&mut self, expression: &Expr) {
+        // A closure's parameters, result and captures build as the same
+        // positions of a function do; its body is visited for the rest.
         if let Expr::Closure(closure) = expression {
             for parameter in &closure.parameters {
-                self.misplaced_aggregate(
-                    &parameter.ty,
-                    parameter.span,
-                    Some("a closure parameter"),
-                );
+                self.misplaced_aggregate(&parameter.ty, parameter.span);
             }
             if let Some(result) = &closure.return_type {
-                self.misplaced_aggregate(&result.ty, closure.span, Some("a closure result"));
+                self.misplaced_aggregate(&result.ty, closure.span);
             }
             if let ClosureBody::Block(body) = &closure.body {
                 self.block(body);
@@ -460,7 +445,7 @@ impl Finder {
         let mut types = TypeFinder::default();
         node.transform(&mut types);
         for ty in std::mem::take(&mut types.named) {
-            self.misplaced_aggregate(&ty, span, None);
+            self.misplaced_aggregate(&ty, span);
         }
     }
 }
@@ -483,16 +468,6 @@ impl Transform for TypeFinder {
     }
 }
 
-/// Whether `ty` names a foreign struct or union anywhere.
-fn mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
-    aggregates.contains(&ty.name)
-        || ty.arguments.iter().any(|argument| match argument {
-            TypeArgumentRef::Type(inner) => mentions_aggregate(inner, aggregates),
-            TypeArgumentRef::Value(_) => false,
-        })
-        || doria_function_mentions_aggregate(ty, aggregates)
-}
-
 /// Whether `ty` holds a foreign struct or union other than by value, or
 /// as `?Name`, in a value position, as a pointer's pointee, or as an
 /// element a collection or typed array region holds.
@@ -510,7 +485,7 @@ fn aggregate_outside_value_position(
             aggregate_outside_value_position(inner, aggregates, by_value)
         }
         TypeArgumentRef::Value(_) => false,
-    }) || doria_function_mentions_aggregate(ty, aggregates)
+    }) || function_type_misplaces_aggregate(ty, aggregates)
 }
 
 /// Whether the type named `name` holds a foreign struct or union type
@@ -534,16 +509,15 @@ fn holds_arguments_by_value(name: &str) -> bool {
         )
 }
 
-/// Whether `ty` is a Doria function type whose signature names a foreign
-/// struct or union. A C function pointer type passes them by value, as an
-/// extern declaration does, and holds only an address (section 12).
-fn doria_function_mentions_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
+/// Whether the function type `ty` holds a foreign struct or union outside
+/// a value position. Its parameters and result are value positions, as a
+/// function's are, for Doria function types and C function pointer types.
+fn function_type_misplaces_aggregate(ty: &TypeRef, aggregates: &HashSet<String>) -> bool {
     ty.function.as_ref().is_some_and(|function| {
-        function.c_abi.is_none()
-            && (function
-                .parameters
-                .iter()
-                .any(|parameter| mentions_aggregate(&parameter.ty, aggregates))
-                || mentions_aggregate(&function.return_type, aggregates))
+        function
+            .parameters
+            .iter()
+            .any(|parameter| aggregate_outside_value_position(&parameter.ty, aggregates, true))
+            || aggregate_outside_value_position(&function.return_type, aggregates, true)
     })
 }

@@ -4679,16 +4679,7 @@ fn lower_statement(
                 new_value,
                 pointer,
             )?;
-            let writable_home = resources.program.functions[resources.function_id.0]
-                .is_writable_borrowed_place(*target)
-                || resources.writable_parameter_addresses.contains_key(target)
-                || resources
-                    .closure_bound_fields
-                    .get(target)
-                    .is_some_and(|field| {
-                        field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
-                    });
-            if writable_home {
+            if is_writable_home(resources, *target) {
                 let home = closure_source_home(builder, *target, resources)?;
                 let current = load_lowered_from_stack(
                     builder,
@@ -9711,6 +9702,34 @@ fn closure_source_address(
     Ok(builder.ins().stack_addr(pointer, slot, 0))
 }
 
+/// A writable home is storage the local names but does not own: a writable
+/// parameter, a writable borrowed place or a writable closure capture. Its
+/// stack slot holds a working copy that whole-value assignment writes back.
+fn is_writable_home(resources: &LoweringResources<'_, '_>, local: mir::LocalId) -> bool {
+    resources.program.functions[resources.function_id.0].is_writable_borrowed_place(local)
+        || resources.writable_parameter_addresses.contains_key(&local)
+        || resources
+            .closure_bound_fields
+            .get(&local)
+            .is_some_and(|field| field.storage == mir::ClosureEnvironmentStorage::WritableBorrow)
+}
+
+/// The storage of an inline local that is read or changed in place: the home
+/// of a writable home, so field writes, region writes and pointers reach the
+/// caller's value, and the local's own slot otherwise.
+fn inline_local_address(
+    builder: &mut FunctionBuilder,
+    local: mir::LocalId,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    if is_writable_home(resources, local) {
+        return Ok(closure_source_home(builder, local, resources)?.address);
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, local)?;
+    Ok(builder.ins().stack_addr(pointer, slot, 0))
+}
+
 fn closure_source_home(
     builder: &mut FunctionBuilder,
     local: mir::LocalId,
@@ -10760,8 +10779,7 @@ fn lower_foreign_aggregate_expression(
             Ok(address)
         }
         mir::ForeignAggregateExpression::Local { local, .. } => {
-            let slot = local_slot(resources.local_slots, *local)?;
-            Ok(builder.ins().stack_addr(pointer, slot, 0))
+            inline_local_address(builder, *local, resources)
         }
         mir::ForeignAggregateExpression::Property {
             object, property, ..
@@ -10780,10 +10798,10 @@ fn lower_foreign_aggregate_expression(
         // Checking proved the `?Name` local present; its value is its
         // payload, which the consumer copies.
         mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty, local } => {
-            let slot = local_slot(resources.local_slots, *local)?;
+            let address = inline_local_address(builder, *local, resources)?;
             Ok(builder
                 .ins()
-                .stack_addr(pointer, slot, ty.nullable_payload_offset as i32))
+                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset)))
         }
         mir::ForeignAggregateExpression::CollectionIndex {
             ty,
@@ -10976,8 +10994,7 @@ fn lower_nullable_foreign_aggregate_expression(
             Ok(address)
         }
         mir::NullableForeignAggregateExpression::Local { local, .. } => {
-            let slot = local_slot(resources.local_slots, *local)?;
-            Ok(builder.ins().stack_addr(pointer, slot, 0))
+            inline_local_address(builder, *local, resources)
         }
         mir::NullableForeignAggregateExpression::Property {
             object, property, ..
@@ -11101,13 +11118,12 @@ fn lower_foreign_field(
     let pointer = resources.module.target_config().pointer_type();
     let base = match aggregate {
         mir::ForeignAggregatePlace::Local(local) => {
-            let slot = local_slot(resources.local_slots, local)?;
-            builder.ins().stack_addr(pointer, slot, 0)
+            inline_local_address(builder, local, resources)?
         }
         // Checking proved the `?Name` local present; the aggregate is its
         // payload.
         mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
-            let slot = local_slot(resources.local_slots, local)?;
+            let address = inline_local_address(builder, local, resources)?;
             let mir::Type::NullableForeignAggregate(ty) =
                 local_definition(resources.program, resources.function_id, local)?.ty
             else {
@@ -11117,7 +11133,7 @@ fn lower_foreign_field(
             };
             builder
                 .ins()
-                .stack_addr(pointer, slot, ty.nullable_payload_offset as i32)
+                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset))
         }
         mir::ForeignAggregatePlace::Property { object, property } => {
             lower_property_address(builder, object, property, resources)?
@@ -21777,8 +21793,7 @@ fn lower_pointer_operation(
             address_of(builder, *local, resources)?,
         )),
         mir::PointerOperation::AddressOf { local, offset } => {
-            refresh_borrowed_local(builder, *local, resources)?;
-            let place = closure_source_address(builder, *local, resources)?;
+            let place = inline_local_address(builder, *local, resources)?;
             Some(LoweredValue::Single(if *offset == 0 {
                 place
             } else {

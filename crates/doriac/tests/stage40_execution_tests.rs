@@ -952,12 +952,6 @@ fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
             "class Box<T> { function __construct(take T $value) {} } function keep(Box<?Color> $box): void {}",
             "a type argument",
         ),
-        ("function main(): void { let $show = function(Color $color): void {}; }", "a closure parameter"),
-        ("function main(): void { let $show = function(?Color $color): void {}; }", "a closure parameter"),
-        (
-            "function main(): void { let $color = new Color(red: 1, green: 2, blue: 3); let $show = function(): void with ($color) { echo $color->red; }; $show(); }",
-            "a closure capture",
-        ),
     ] {
         let source = format!("{AGGREGATES}{body}");
         let diagnostics = doriac::compile_source(
@@ -973,6 +967,135 @@ fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
             "{body}: {diagnostics:#?}"
         );
     }
+}
+
+/// Closures and function types carry foreign structs and unions as their
+/// parameters, results and captures, as functions do (Decision 0148 section
+/// 6), and the interpreter and PHP output reach them through the companion.
+#[test]
+fn closures_and_function_types_carry_foreign_aggregates() {
+    let source = format!(
+        r#"{AGGREGATES}
+extern "C" struct Wide
+{{
+    int64 $first;
+    int64 $second;
+    int64 $third;
+}}
+
+class Painter
+{{
+    function __construct(internal take function(Color): Color $step) {{}}
+
+    function paint(Color $color): Color
+    {{
+        return ($this->step)($color);
+    }}
+}}
+
+function apply(function(Color): Color $change, Color $color): Color
+{{
+    return $change($color);
+}}
+
+function makeShift(take Wide $offset): function(Wide): Wide
+{{
+    return function(Wide $value): Wide with (take $offset) {{
+        return new Wide(first: $value->first + $offset->first, second: $value->second + $offset->second, third: $value->third + $offset->third);
+    }};
+}}
+
+function main(): void
+{{
+    let $brighten = function(Color $color): Color {{
+        return new Color(red: $color->red + 1, green: $color->green + 1, blue: $color->blue + 1);
+    }};
+    let $result = apply($brighten, new Color(red: 1, green: 2, blue: 3));
+    echo $result->red . " " . $result->green . " " . $result->blue . "\n";
+    let $moved = makeShift(new Wide(first: 1, second: 2, third: 3))(new Wide(first: 10, second: 20, third: 30));
+    echo $moved->first . " " . $moved->second . " " . $moved->third . "\n";
+    ?Color $absent = null;
+    let $pick = fn(?Color $value) => Int64::from($value?->green ?? 0);
+    echo $pick($absent) . " " . $pick($result) . "\n";
+    List<function(Color): Color> $steps = [
+        function(Color $color): Color {{ return new Color(red: $color->blue, green: $color->green, blue: $color->red); }},
+    ];
+    let $swapped = $steps[0]($result);
+    echo $swapped->red . " " . $swapped->blue . "\n";
+    let $painter = new Painter(function(Color $color): Color {{ return new Color(red: 1, green: $color->green, blue: 1); }});
+    echo $painter->paint($result)->green . "\n";
+    writable Color $tint = new Color(red: 10, green: 20, blue: 30);
+    let $show = function(): string with ($tint) {{
+        return $tint->red . "/" . $tint->blue;
+    }};
+    echo $show() . "\n";
+}}
+"#
+    );
+    assert_runs_natively(&source, "2 3 4\n11 22 33\n0 3\n4 2\n3\n10/30\n");
+    let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+        .expect_err("PHP output takes the C data model through the companion");
+    assert!(
+        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
+        "{php:#?}"
+    );
+}
+
+/// A writable home lends the caller's storage: a closure's writable
+/// parameter and a writable capture change the caller's foreign struct in
+/// place through field writes, fixed-length array regions, pointers and
+/// narrowed `?Name` places, as whole-value assignment does.
+#[test]
+fn writable_homes_change_the_callers_foreign_aggregate_in_place() {
+    let source = format!(
+        r#"{POINTER}{AGGREGATES}
+extern "C" struct Label
+{{
+    uint8[4] $text;
+}}
+
+function main(): void
+{{
+    writable Color $tint = new Color(red: 10, green: 20, blue: 30);
+    let $redden = function(writable Color $color): void {{
+        $color->red = 77;
+    }};
+    $redden($tint);
+    echo $tint->red . "\n";
+    let writable $green = function(): void with (writable $tint, $redden) {{
+        unsafe {{
+            WritablePointer::to($tint->green)->write(55);
+        }}
+        $tint->blue = 66;
+        $redden($tint);
+    }};
+    $green();
+    echo $tint->red . " " . $tint->green . " " . $tint->blue . "\n";
+    let writable $replace = function(): void with (writable $tint) {{
+        $tint = new Color(red: 1, green: 2, blue: 3);
+    }};
+    $replace();
+    echo $tint->red . " " . $tint->blue . "\n";
+    writable ?Color $maybe = new Color(red: 1, green: 2, blue: 3);
+    let writable $touch = function(): void with (writable $maybe) {{
+        if ($maybe is Color) {{
+            $maybe->green = 42;
+        }}
+    }};
+    $touch();
+    if ($maybe is Color) {{
+        echo $maybe->green . "\n";
+    }}
+    writable Label $label = new Label();
+    let writable $write = function(): void with (writable $label) {{
+        $label->text[1] = 9;
+    }};
+    $write();
+    echo $label->text[1] . "\n";
+}}
+"#
+    );
+    assert_runs_natively(&source, "77\n77 55 66\n1 3\n42\n9\n");
 }
 
 /// A collection stores foreign structs and unions inline in its element

@@ -1233,15 +1233,6 @@ fn build_closure_plans(
                             capture.declaration_span,
                         )]
                     })?;
-                    if matches!(
-                        ty,
-                        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_)
-                    ) {
-                        return Err(vec![crate::unsafe_code::misplaced_aggregate(
-                            capture.declaration_span,
-                            "a closure capture",
-                        )]);
-                    }
                     let storage = match acquisition.kind {
                         CaptureAcquisitionKind::ReadonlyLease => {
                             mir::ClosureEnvironmentStorage::ReadonlyBorrow
