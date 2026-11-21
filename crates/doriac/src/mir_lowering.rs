@@ -21189,12 +21189,16 @@ fn materialize_checked_rvalue(
         return Ok(Some(value));
     }
     // A pointer operation or a foreign field read yields its own type; a
-    // nullable expected type receives it present.
-    if let Some(value) = foreign::expression(expr, expected, context)? {
-        return Ok(Some(present_as_expected(value, expected)));
-    }
-    if let Some(value) = foreign::field_read(expr, expected, context)? {
-        return Ok(Some(present_as_expected(value, expected)));
+    // nullable expected type receives it present. A `mixed` destination
+    // boxes the value by its checked type in `lower_mixed_expression`, so
+    // these paths do not produce a value for it.
+    if !matches!(expected, mir::Type::Mixed | mir::Type::NullableMixed) {
+        if let Some(value) = foreign::expression(expr, expected, context)? {
+            return Ok(Some(present_as_expected(value, expected)));
+        }
+        if let Some(value) = foreign::field_read(expr, expected, context)? {
+            return Ok(Some(present_as_expected(value, expected)));
+        }
     }
     if matches!(
         expr,
@@ -22787,7 +22791,11 @@ fn lower_mixed_expression(
             remove: false,
         });
     }
-    if let hir::Expr::FunctionCall { name, args, span } = expr {
+    // A call yields a `mixed` value of its own only when it returns one;
+    // any other result, including a compiler intrinsic's, is boxed by its
+    // checked type below.
+    let returns_mixed = context.expression_type(expr)? == mir::Type::Mixed;
+    if let (true, hir::Expr::FunctionCall { name, args, span }) = (returns_mixed, expr) {
         let signature = context.lookup_function(name, *span)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
             return Ok(mir::MixedExpression::Call {
@@ -22798,13 +22806,16 @@ fn lower_mixed_expression(
             });
         }
     }
-    if let hir::Expr::MethodCall {
-        object,
-        method,
-        args,
-        span,
-        ..
-    } = expr
+    if let (
+        true,
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        },
+    ) = (returns_mixed, expr)
     {
         let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
@@ -22827,13 +22838,16 @@ fn lower_mixed_expression(
             });
         }
     }
-    if let hir::Expr::StaticCall {
-        class_name,
-        method,
-        args,
-        span,
-        ..
-    } = expr
+    if let (
+        true,
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+            ..
+        },
+    ) = (returns_mixed, expr)
     {
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {

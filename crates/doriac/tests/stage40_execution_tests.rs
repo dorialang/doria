@@ -334,6 +334,28 @@ function main(): void
         "7 -1 true 0 9 9 -2 2\n9 -4 -5 9\n9 false false false true true false",
     );
 }
+/// A pointer operation's result flows into `mixed` as every value does
+/// (Decision 0148 section 4): the box holds the pointer, and `is` narrows
+/// it back.
+#[test]
+fn a_pointer_operation_result_is_boxed_as_mixed() {
+    let source = format!(
+        "{POINTER}
+function main(): void
+{{
+    writable int32 $value = 7;
+    unsafe {{
+        mixed $box = Pointer::to($value);
+        if ($box is Pointer<int32>) {{
+            echo $box->read();
+        }}
+    }}
+}}
+"
+    );
+    assert_runs_natively(&source, "7");
+}
+
 #[test]
 fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [
