@@ -11938,41 +11938,68 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
-    /// One field read or write of the foreign struct or union in
-    /// `aggregate`'s slot, `offset` bytes from its start.
-    fn lower_foreign_field(
+    /// The address of the storage `place` names: a writable home's place
+    /// for a local that borrows one, and the slot, property, static or
+    /// element otherwise. Field access and `Pointer::to` share it.
+    /// The payload of the `?T` value of type `ty` stored at `address`, which
+    /// checking or a null-safe test found present.
+    fn narrowed_payload_address(
+        &self,
+        address: PointerValue<'ctx>,
+        ty: mir::Type,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let payload = native_closure_abi::nullable_payload_offset(
+            ty,
+            self.target_data.get_pointer_byte_size(None),
+        )
+        .ok_or_else(|| malformed_mir("a narrowed place holds no nullable inline value"))?;
+        self.byte_offset(address, payload, "inline.payload")
+    }
+
+    fn inline_place_address(
         &mut self,
-        aggregate: mir::ForeignAggregatePlace,
-        offset: u64,
-        access: &mir::ForeignFieldAccess,
-        span: crate::source::Span,
-    ) -> Result<(), BackendError> {
-        let base = match aggregate {
-            mir::ForeignAggregatePlace::Local(local) => self.inline_local_address(local)?,
-            // Checking proved the `?Name` local present; the aggregate is its
-            // payload.
-            mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
-                let mir::Type::NullableForeignAggregate(ty) = local_in(self.function, local)?.ty
-                else {
-                    return Err(malformed_mir(
-                        "a narrowed foreign field access names a local without a `?Name` value",
-                    ));
-                };
+        place: mir::InlinePlace,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        Ok(match place {
+            mir::InlinePlace::Local(local) => self.inline_local_address(local)?,
+            // Checking proved the `?Name` or `?T` local present; the value is
+            // its payload.
+            mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
+                let ty = local_in(self.function, local)?.ty;
                 let address = self.inline_local_address(local)?;
-                self.byte_offset(address, ty.nullable_payload_offset, "foreign.payload")?
+                self.narrowed_payload_address(address, ty)?
             }
-            mir::ForeignAggregatePlace::Property { object, property } => {
+            mir::InlinePlace::Property { object, property } => {
                 self.lower_property_address(object, property)?
             }
-            mir::ForeignAggregatePlace::Static(id) => self.static_address(id)?,
+            mir::InlinePlace::NullablePropertyAssumeNonNull { object, property } => {
+                let ty = property_definition(self.program, property)?.ty;
+                let address = self.lower_property_address(object, property)?;
+                self.narrowed_payload_address(address, ty)?
+            }
+            mir::InlinePlace::Static(id) => self.static_address(id)?,
+            mir::InlinePlace::NullableStaticAssumeNonNull(id) => {
+                let ty = static_definition(self.program, id)?.ty;
+                let address = self.static_address(id)?;
+                self.narrowed_payload_address(address, ty)?
+            }
             // The element's slot in the collection's storage, which a field
             // write changes in place.
-            mir::ForeignAggregatePlace::CollectionElement {
+            // A `?Name` element the enclosing null-safe access found present
+            // is its payload.
+            mir::InlinePlace::CollectionElement {
+                collection,
+                index,
+                positional,
+                index_span,
+            }
+            | mir::InlinePlace::NullableCollectionElementAssumeNonNull {
                 collection,
                 index,
                 positional,
                 index_span,
             } => {
+                let collection_type = local_in(self.function, collection)?.ty;
                 let index_type = local_in(self.function, index)?.ty;
                 let index = build(self.builder.build_load(
                     llvm_type(self.context, self.target_data, self.program, index_type),
@@ -11981,15 +12008,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 let (collection, index_type, index_word) =
                     self.collection_element_key(collection, index, positional, index_span)?;
-                self.collection_borrow_slot(
+                let slot = self.collection_borrow_slot(
                     collection,
                     index_word,
                     index_type,
                     mir::NullableCollectionAccess::Index,
                     positional,
-                )?
+                )?;
+                if place.nullable_holder().is_some() {
+                    let mir::Type::Collection(id) = collection_type else {
+                        return Err(malformed_mir("an element place names no collection"));
+                    };
+                    let element = self.collection_definition(id)?.value;
+                    self.narrowed_payload_address(slot, element)?
+                } else {
+                    slot
+                }
             }
-            mir::ForeignAggregatePlace::RegionElement {
+            mir::InlinePlace::RegionElement {
                 region,
                 index,
                 index_span,
@@ -12003,7 +12039,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| malformed_mir("a typed array region has elements"))?
                     .1
             }
-        };
+        })
+    }
+
+    /// One field read or write of the foreign struct or union in
+    /// `aggregate`'s slot, `offset` bytes from its start.
+    fn lower_foreign_field(
+        &mut self,
+        aggregate: mir::InlinePlace,
+        offset: u64,
+        access: &mir::ForeignFieldAccess,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let base = self.inline_place_address(aggregate)?;
         let offset = u32::try_from(offset)
             .map_err(|_| malformed_mir("a foreign field offset exceeds its aggregate"))?;
         let address = self.byte_offset(base, offset, "foreign.field")?;
@@ -23357,8 +23405,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::PointerOperation::Address { pointer } => {
                 Some(self.pointer_local(*pointer)?.into())
             }
-            mir::PointerOperation::AddressOf { local, offset } => {
-                let mut place = self.inline_local_address(*local)?;
+            mir::PointerOperation::AddressOf { place, offset } => {
+                let mut place = self.inline_place_address(*place)?;
                 if *offset != 0 {
                     let offset = u32::try_from(*offset)
                         .map_err(|_| malformed_mir("a field offset exceeds its aggregate"))?;

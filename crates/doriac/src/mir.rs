@@ -2402,25 +2402,45 @@ impl NullableForeignAggregateExpression {
     }
 }
 
-/// Where a foreign struct or union field access finds the aggregate
-/// (Decision 0148 section 6): the value a local holds, a stored class
-/// property holds or a static property holds, each addressed in place so
-/// that a write through the property changes the object or the static.
+/// Storage that holds an inline Copy value in place (Decision 0148
+/// sections 6 and 7): a local, a narrowed nullable local, a stored class
+/// property, a static property, a collection element or a region element.
+/// A foreign field access finds its aggregate here, so a write through a
+/// property changes the object or the static, and `Pointer::to` addresses
+/// the same storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ForeignAggregatePlace {
+pub enum InlinePlace {
     Local(LocalId),
-    /// The value of the `?Name` local `local`, which checking has narrowed
-    /// to present, in place at its payload offset.
+    /// The value of the `?Name` or `?T` local `local`, which checking has
+    /// narrowed to present, in place at its payload offset.
     NullableLocalAssumeNonNull(LocalId),
     Property {
         object: LocalId,
         property: PropertyId,
     },
+    /// The value of a stored `?Name` property, which the enclosing
+    /// null-safe access found present, in place at its payload offset.
+    NullablePropertyAssumeNonNull {
+        object: LocalId,
+        property: PropertyId,
+    },
     Static(StaticId),
+    /// The value of a `?Name` static property, which the enclosing
+    /// null-safe access found present, in place at its payload offset.
+    NullableStaticAssumeNonNull(StaticId),
     /// The element of the collection `collection` at the position or key
     /// `index` holds, in its slot, as
     /// `ForeignAggregateExpression::CollectionIndex` finds it.
     CollectionElement {
+        collection: LocalId,
+        index: LocalId,
+        positional: bool,
+        index_span: Span,
+    },
+    /// The value of the `?Name` element `CollectionElement` would name,
+    /// which the enclosing null-safe access found present, in place at its
+    /// payload offset.
+    NullableCollectionElementAssumeNonNull {
         collection: LocalId,
         index: LocalId,
         positional: bool,
@@ -2537,7 +2557,46 @@ impl fmt::Display for NullableForeignAggregateExpression {
     }
 }
 
-impl fmt::Display for ForeignAggregatePlace {
+impl InlinePlace {
+    /// The place that holds the `?T` value whose present payload this
+    /// narrowed place is, or `None` for a place that is not narrowed.
+    pub fn nullable_holder(self) -> Option<Self> {
+        match self {
+            Self::NullableLocalAssumeNonNull(local) => Some(Self::Local(local)),
+            Self::NullablePropertyAssumeNonNull { object, property } => {
+                Some(Self::Property { object, property })
+            }
+            Self::NullableStaticAssumeNonNull(id) => Some(Self::Static(id)),
+            Self::NullableCollectionElementAssumeNonNull {
+                collection,
+                index,
+                positional,
+                index_span,
+            } => Some(Self::CollectionElement {
+                collection,
+                index,
+                positional,
+                index_span,
+            }),
+            Self::Local(_)
+            | Self::Property { .. }
+            | Self::Static(_)
+            | Self::CollectionElement { .. }
+            | Self::RegionElement { .. } => None,
+        }
+    }
+
+    /// The stored class property this place is in, narrowed or not, as its
+    /// object local and property.
+    pub fn stored_property(self) -> Option<(LocalId, PropertyId)> {
+        match self.nullable_holder().unwrap_or(self) {
+            Self::Property { object, property } => Some((object, property)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for InlinePlace {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Local(local) => write!(formatter, "local{}", local.0),
@@ -2547,10 +2606,25 @@ impl fmt::Display for ForeignAggregatePlace {
             Self::Property { object, property } => {
                 write!(formatter, "local{}->property{}", object.0, property.index)
             }
+            Self::NullablePropertyAssumeNonNull { object, property } => write!(
+                formatter,
+                "assume_non_null(local{}->property{})",
+                object.0, property.index
+            ),
             Self::Static(id) => write!(formatter, "static{}", id.0),
+            Self::NullableStaticAssumeNonNull(id) => {
+                write!(formatter, "assume_non_null(static{})", id.0)
+            }
             Self::CollectionElement {
                 collection, index, ..
             } => write!(formatter, "local{}[local{}]", collection.0, index.0),
+            Self::NullableCollectionElementAssumeNonNull {
+                collection, index, ..
+            } => write!(
+                formatter,
+                "assume_non_null(local{}[local{}])",
+                collection.0, index.0
+            ),
             Self::RegionElement { region, index, .. } => {
                 write!(formatter, "local{}[local{}]", region.0, index.0)
             }
@@ -6936,7 +7010,7 @@ pub enum Statement {
     /// starts at offset zero, so reading one reads the bytes written last
     /// through any member.
     ForeignField {
-        aggregate: ForeignAggregatePlace,
+        aggregate: InlinePlace,
         offset: u64,
         access: ForeignFieldAccess,
         span: Span,
@@ -7075,12 +7149,12 @@ pub enum PointerOperation {
     Address { pointer: LocalId },
     /// `Pointer::fromAddress`: `?Pointer`, absent for address zero.
     FromAddress { address: IntegerExpression },
-    /// `Pointer::to($place)` and `WritablePointer::to($place)`: the address of the place
-    /// the local names, its own storage or the place it borrows, `offset`
-    /// bytes in: zero for the whole local, a field's offset for a field of
-    /// a foreign struct or union. Checking pins that place for the
-    /// enclosing unsafe context.
-    AddressOf { local: LocalId, offset: u64 },
+    /// `Pointer::to($place)` and `WritablePointer::to($place)`: the address
+    /// of `place` (for a local, its own storage or the place it borrows),
+    /// `offset` bytes in: zero for the whole value, a field's offset for a
+    /// field of a foreign struct or union. Checking pins that place, or the
+    /// value containing it, for the enclosing unsafe context.
+    AddressOf { place: InlinePlace, offset: u64 },
     /// `$region->pointer` and `$region->writablePointer` (section 7): the
     /// address of the first element of the region local `region`. An empty
     /// region may have no storage; its pointer is then `align`, a non-null
@@ -11771,8 +11845,8 @@ impl fmt::Display for Statement {
                         "foreign_range(local{}, {length} * {stride} @{align})",
                         pointer.0
                     ),
-                    PointerOperation::AddressOf { local, offset } => {
-                        write!(formatter, "pointer_to(local{} @{offset})", local.0)
+                    PointerOperation::AddressOf { place, offset } => {
+                        write!(formatter, "pointer_to({place} @{offset})")
                     }
                     PointerOperation::RegionData { region, align } => {
                         write!(

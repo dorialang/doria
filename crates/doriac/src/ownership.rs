@@ -1118,13 +1118,17 @@ impl RetainedLoan {
 struct BorrowPlace {
     owner: String,
     fields: Vec<crate::class_layout::PropertyId>,
-    /// Fields of a foreign struct or union reached after `fields`, by name.
-    /// Foreign values are Copy and contain no properties, so this path
-    /// only ever extends the end of `fields`; owned storage, which tracks
-    /// property paths, never needs it.
+    /// Fields of a foreign struct or union reached after `fields`, by name,
+    /// and `ELEMENT` for an element of a collection of Copy values. These
+    /// values contain no properties, so this path only ever extends the end
+    /// of `fields`; owned storage, which tracks property paths, never needs
+    /// it.
     foreign_fields: Vec<String>,
     projectable: bool,
 }
+
+/// The `foreign_fields` component naming a collection element.
+const ELEMENT_PLACE: &str = "[]";
 
 impl BorrowPlace {
     fn overlaps(&self, other: &Self) -> bool {
@@ -1156,10 +1160,22 @@ impl BorrowPlace {
     }
 
     fn project(mut self, property: crate::class_layout::PropertyId) -> Self {
+        if !self.foreign_fields.is_empty() {
+            self.projectable = false;
+        }
         if self.projectable {
             self.fields.push(property);
         }
         self
+    }
+
+    /// An element of the collection this place holds. Every index is the
+    /// same element place, since checking does not know which one a
+    /// position names: elements overlap each other and the collection
+    /// contains them, while a field inside an element is disjoint from its
+    /// sibling fields (Decision 0148 section 7, amended 2026-11-21).
+    fn project_element(self) -> Self {
+        self.project_foreign(ELEMENT_PLACE)
     }
 
     fn extend(&mut self, fields: &[crate::class_layout::PropertyId]) {
@@ -9609,9 +9625,24 @@ impl Checker<'_> {
                     None => place.opaque(),
                 }))
             }
-            Expr::Index { collection, .. } => self
-                .borrow_source_root(collection, scopes)
-                .map(|root| root.map_places(BorrowPlace::opaque)),
+            // An element of Copy values is a place inside its collection,
+            // which a pin on one element field leaves the other fields of.
+            // An element that owns its value stays the whole collection.
+            Expr::Index { collection, .. } => {
+                let copy_element = self.resolved_type(expr).is_some_and(|ty| {
+                    !resolved_type_is_move_type(ty, &self.move_enum_names)
+                        && !resolved_type_requires_conservative_move(ty)
+                });
+                self.borrow_source_root(collection, scopes).map(|root| {
+                    root.map_places(|place| {
+                        if copy_element {
+                            place.project_element()
+                        } else {
+                            place.opaque()
+                        }
+                    })
+                })
+            }
             Expr::CallableCall { args, span, .. } => {
                 let call = self.callable_value_calls.get(span)?;
                 let function = non_null_function_type(&call.function_type)?;

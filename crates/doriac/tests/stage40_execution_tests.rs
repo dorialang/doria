@@ -488,6 +488,54 @@ fn the_interpreter_and_php_output_report_pointer_operations() {
 }
 
 #[test]
+fn pointers_address_elements_properties_statics_and_narrowed_places() {
+    // Decision 0148 section 7, amended 2026-11-21: elements of `T[]`,
+    // `List<T>` and typed regions, fields of elements, properties, static
+    // properties and a narrowed `?T` local are places, addressed in place.
+    let source = format!(
+        "{POINTER}extern \"C\" struct Color
+{{
+    uint8 $red;
+    uint8 $green;
+    uint8 $blue;
+}}
+class Palette
+{{
+    writable int32 $count = 3;
+    writable Color $accent = new Color(red: 1, green: 2, blue: 3);
+    static writable int32 $total = 10;
+    static writable Color $base = new Color(red: 4, green: 5, blue: 6);
+}}
+function main(): void
+{{
+    writable Color[] $colors = [new Color(red: 10, green: 20, blue: 30), new Color(red: 40, green: 50, blue: 60)];
+    writable List<int32> $numbers = [7, 8];
+    writable int64[] $wide = [1, 2, 3];
+    let writable $palette = new Palette();
+    writable ?int32 $maybe = 5;
+    unsafe {{
+        WritablePointer::to($colors[1]->green)->write(99);
+        echo Pointer::to($colors[0])->read()->blue . \" \";
+        WritablePointer::to($numbers[1])->write(80);
+        let writable $region = $wide->getWritableRegion(1, 2);
+        WritablePointer::to($region[1])->write(33);
+        WritablePointer::to($palette->count)->write(30);
+        WritablePointer::to($palette->accent->red)->write(11);
+        WritablePointer::to(Palette::total)->write(100);
+        WritablePointer::to(Palette::base->blue)->write(66);
+        if ($maybe is int32) {{
+            WritablePointer::to($maybe)->write(50);
+        }}
+    }}
+    echo $colors[1]->green . \" \" . $numbers[1] . \" \" . $wide[2] . \" \" . $palette->count . \" \";
+    echo $palette->accent->red . \" \" . Palette::total . \" \" . Palette::base->blue . \" \" . ($maybe ?? 0);
+}}
+"
+    );
+    assert_runs_natively(&source, "30 99 80 33 30 11 100 66 50");
+}
+
+#[test]
 fn a_pointer_to_a_local_reads_and_writes_its_place() {
     let source = format!(
         "{POINTER}
@@ -938,6 +986,74 @@ function main(): void
         &source,
         "7 2 9 3 255 true false\ntrue 40 6 1 true 3\ntrue 251 252 true 1 7 true 0 9\nmaybe 0 maybe 3 none\n3 77 3 -1 4",
     );
+}
+
+/// `?->` of a fixed-length array field of a `?Name` property, static
+/// property or collection element views the stored array (Decision 0148
+/// section 6): a writable region written through it changes the stored
+/// value, and an absent receiver gives `null`.
+#[test]
+fn null_safe_writable_regions_view_stored_fields() {
+    let source = format!(
+        "{AGGREGATES}
+extern \"C\" struct Tip
+{{
+    int32 $id;
+    uint16[3] $text;
+}}
+
+class Holder
+{{
+    writable ?Tip $tip = new Tip(id: 1);
+    writable ?Tip $none = null;
+    static writable ?Tip $kept = new Tip(id: 2);
+}}
+
+function first(?Tip $tip): string
+{{
+    if ($tip != null) {{
+        return $tip->id . \":\" . $tip->text[0] . \",\" . $tip->text[2];
+    }}
+    return \"-\";
+}}
+
+function main(): void
+{{
+    uint16[] $source = [7, 8, 9];
+    let writable $holder = new Holder();
+    writable List<?Tip> $tips = [new Tip(id: 3), null];
+    {{
+        writable ?WritableArrayRegion<uint16> $view = $holder->tip?->text;
+        if ($view != null) {{
+            echo $view->copyFrom($source->getRegion(0, 3)) . \" \";
+        }}
+    }}
+    {{
+        writable ?WritableArrayRegion<uint16> $view = $holder->none?->text;
+        echo ($view == null) . \" \";
+    }}
+    {{
+        writable ?WritableArrayRegion<uint16> $view = Holder::kept?->text;
+        if ($view != null) {{
+            echo $view->copyFrom($source->getRegion(0, 3)) . \" \";
+        }}
+    }}
+    {{
+        writable ?WritableArrayRegion<uint16> $view = $tips[0]?->text;
+        if ($view != null) {{
+            echo $view->copyFrom($source->getRegion(0, 3)) . \" \";
+        }}
+    }}
+    {{
+        writable ?WritableArrayRegion<uint16> $view = $tips[1]?->text;
+        echo ($view == null) . \"\n\";
+    }}
+    echo first($holder->tip) . \" \" . first($holder->none) . \" \" . first(Holder::kept) . \" \";
+    echo first($tips[0]) . \" \" . first($tips[1]);
+}}
+"
+    );
+    assert_runs_natively(&source, "3 true 3 3 true\n1:7,9 - 2:7,9 3:7,9 -");
 }
 
 #[test]

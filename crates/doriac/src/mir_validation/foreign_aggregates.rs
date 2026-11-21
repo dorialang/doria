@@ -121,31 +121,62 @@ fn validate_stored_field(
 }
 
 /// The aggregate type `place` holds, and whether a field write may go
-/// through it: a writable local, or a property that permits writes through
-/// it on a writable receiver or on the constructor's direct receiver, as
-/// checking proves of the place's object path (section 6).
+/// through it (`place_value`).
 fn place_facts(
     program: &mir::Program,
     function: &mir::Function,
-    place: mir::ForeignAggregatePlace,
+    place: mir::InlinePlace,
 ) -> Result<(mir::ForeignAggregateType, bool), BackendError> {
-    let (ty, writable) = match place {
-        mir::ForeignAggregatePlace::Local(local) => {
+    let (ty, writable) = place_value(program, function, place)?;
+    let mir::Type::ForeignAggregate(aggregate) = ty else {
+        return Err(malformed_mir(
+            "a foreign field access names a place without a foreign aggregate",
+        ));
+    };
+    Ok((aggregate, writable))
+}
+
+/// The present value of a narrowed `?Name` or `?T` place of type `ty`.
+fn narrowed_value(ty: mir::Type) -> Result<mir::Type, BackendError> {
+    match ty {
+        mir::Type::NullableForeignAggregate(aggregate) => {
+            Ok(mir::Type::ForeignAggregate(aggregate))
+        }
+        mir::Type::NullableScalar(scalar) => Ok(mir::Type::Scalar(scalar)),
+        _ => Err(malformed_mir(
+            "a narrowed place holds no nullable inline value",
+        )),
+    }
+}
+
+/// The type of the value `place` holds in place, and whether a write may go
+/// through it: a writable local, or a property that permits writes through
+/// it on a writable receiver or on the constructor's direct receiver, as
+/// checking proves of the place's object path (section 6).
+pub(super) fn place_value(
+    program: &mir::Program,
+    function: &mir::Function,
+    place: mir::InlinePlace,
+) -> Result<(mir::Type, bool), BackendError> {
+    // Checking, or the enclosing null-safe access, proved the `?Name` or
+    // `?T` value present; its payload is the value, written through as its
+    // holder is.
+    if let Some(holder) = place.nullable_holder() {
+        let (ty, writable) = place_value(program, function, holder)?;
+        return Ok((narrowed_value(ty)?, writable));
+    }
+    Ok(match place {
+        mir::InlinePlace::Local(local) => {
             let local = local_in(function, local)?;
             (local.ty, local.writable)
         }
-        // Checking proved the `?Name` local present; its payload is the
-        // aggregate.
-        mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
-            let local = local_in(function, local)?;
-            let mir::Type::NullableForeignAggregate(aggregate) = local.ty else {
-                return Err(malformed_mir(
-                    "a narrowed foreign field access names a local without a `?Name` value",
-                ));
-            };
-            (mir::Type::ForeignAggregate(aggregate), local.writable)
+        mir::InlinePlace::NullableLocalAssumeNonNull(_)
+        | mir::InlinePlace::NullablePropertyAssumeNonNull { .. }
+        | mir::InlinePlace::NullableStaticAssumeNonNull(_)
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull { .. } => {
+            unreachable!("a narrowed place has its holder")
         }
-        mir::ForeignAggregatePlace::Property { object, property } => {
+        mir::InlinePlace::Property { object, property } => {
             let object = local_in(function, object)?;
             let mir::Type::Class(class) = object.ty else {
                 return Err(malformed_mir(
@@ -158,13 +189,13 @@ fn place_facts(
             (property.ty, receiver && property.permits_write_through())
         }
         // A static property is written through only when it is writable.
-        mir::ForeignAggregatePlace::Static(id) => {
+        mir::InlinePlace::Static(id) => {
             let property = static_in(program, id)?;
             (property.ty, property.writable)
         }
         // An element is written through a writable collection, which
         // checking proves of the collection's place.
-        mir::ForeignAggregatePlace::CollectionElement {
+        mir::InlinePlace::CollectionElement {
             collection,
             index,
             positional,
@@ -184,19 +215,13 @@ fn place_facts(
             (definition.value, local.writable)
         }
         // An element is written through a writable region.
-        mir::ForeignAggregatePlace::RegionElement { region, index, .. } => {
+        mir::InlinePlace::RegionElement { region, index, .. } => {
             let index = index_rvalue(function, index)?;
             let writable = local_in(function, region)?.ty.is_writable_region();
             byte_regions::validate_index(program, function, region, &index, writable)?;
             (byte_regions::element(program, function, region)?, writable)
         }
-    };
-    let mir::Type::ForeignAggregate(aggregate) = ty else {
-        return Err(malformed_mir(
-            "a foreign field access names a place without a foreign aggregate",
-        ));
-    };
-    Ok((aggregate, writable))
+    })
 }
 
 /// The position or key an element place reads from the local `index`.
@@ -214,7 +239,7 @@ fn index_rvalue(
 pub(super) fn validate_field_access(
     program: &mir::Program,
     function: &mir::Function,
-    aggregate: mir::ForeignAggregatePlace,
+    aggregate: mir::InlinePlace,
     offset: u64,
     access: &mir::ForeignFieldAccess,
 ) -> Result<(), BackendError> {

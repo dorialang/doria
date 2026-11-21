@@ -11105,48 +11105,68 @@ fn store_foreign_field(
     store_lowered_to_address(builder, resources.program, ty, address, value, pointer)
 }
 
-/// One field read or write of the foreign struct or union in `aggregate`'s
-/// slot, `offset` bytes from its start.
-fn lower_foreign_field(
+/// The payload of the `?T` value of type `ty` stored at `address`, which
+/// checking or a null-safe test found present.
+fn narrowed_payload_address(
     builder: &mut FunctionBuilder,
-    aggregate: mir::ForeignAggregatePlace,
-    offset: u64,
-    access: &mir::ForeignFieldAccess,
-    span: crate::source::Span,
+    address: Value,
+    ty: mir::Type,
+    pointer: cranelift_codegen::ir::Type,
+) -> Result<Value, BackendError> {
+    let payload = native_closure_abi::nullable_payload_offset(ty, pointer.bytes())
+        .ok_or_else(|| malformed_mir("a narrowed place holds no nullable inline value"))?;
+    Ok(builder.ins().iadd_imm_u(address, i64::from(payload)))
+}
+
+/// The address of the storage `place` names: a writable home's place for a
+/// local that borrows one, and the slot, property, static or element
+/// otherwise. Field access and `Pointer::to` share it.
+fn inline_place_address(
+    builder: &mut FunctionBuilder,
+    place: mir::InlinePlace,
     resources: &mut LoweringResources<'_, '_>,
-) -> Result<(), BackendError> {
+) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
-    let base = match aggregate {
-        mir::ForeignAggregatePlace::Local(local) => {
-            inline_local_address(builder, local, resources)?
-        }
-        // Checking proved the `?Name` local present; the aggregate is its
-        // payload.
-        mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
+    Ok(match place {
+        mir::InlinePlace::Local(local) => inline_local_address(builder, local, resources)?,
+        // Checking proved the `?Name` or `?T` local present; the value is
+        // its payload.
+        mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
             let address = inline_local_address(builder, local, resources)?;
-            let mir::Type::NullableForeignAggregate(ty) =
-                local_definition(resources.program, resources.function_id, local)?.ty
-            else {
-                return Err(malformed_mir(
-                    "a narrowed foreign field access names a local without a `?Name` value",
-                ));
-            };
-            builder
-                .ins()
-                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset))
+            let ty = local_definition(resources.program, resources.function_id, local)?.ty;
+            narrowed_payload_address(builder, address, ty, pointer)?
         }
-        mir::ForeignAggregatePlace::Property { object, property } => {
+        mir::InlinePlace::NullablePropertyAssumeNonNull { object, property } => {
+            let ty = property_definition(resources.program, property)?.ty;
+            let address = lower_property_address(builder, object, property, resources)?;
+            narrowed_payload_address(builder, address, ty, pointer)?
+        }
+        mir::InlinePlace::NullableStaticAssumeNonNull(id) => {
+            let ty = static_definition(resources.program, id)?.ty;
+            let address = lower_static_address(builder, id, resources)?;
+            narrowed_payload_address(builder, address, ty, pointer)?
+        }
+        mir::InlinePlace::Property { object, property } => {
             lower_property_address(builder, object, property, resources)?
         }
-        mir::ForeignAggregatePlace::Static(id) => lower_static_address(builder, id, resources)?,
+        mir::InlinePlace::Static(id) => lower_static_address(builder, id, resources)?,
         // The element's slot in the collection's storage, which a field
-        // write changes in place.
-        mir::ForeignAggregatePlace::CollectionElement {
+        // write changes in place; a `?Name` element the enclosing null-safe
+        // access found present is its payload.
+        mir::InlinePlace::CollectionElement {
+            collection,
+            index,
+            positional,
+            index_span,
+        }
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull {
             collection,
             index,
             positional,
             index_span,
         } => {
+            let collection_type =
+                local_definition(resources.program, resources.function_id, collection)?.ty;
             let index_type = local_definition(resources.program, resources.function_id, index)?.ty;
             let index_slot = local_slot(resources.local_slots, index)?;
             let index = load_lowered_from_stack(
@@ -11160,7 +11180,7 @@ fn lower_foreign_field(
             let (collection, index_type, index_word) = collection_element_key(
                 builder, collection, index, positional, index_span, resources,
             )?;
-            lower_collection_borrow_slot(
+            let slot = lower_collection_borrow_slot(
                 builder,
                 collection,
                 index_word,
@@ -11168,9 +11188,18 @@ fn lower_foreign_field(
                 mir::NullableCollectionAccess::Index,
                 positional,
                 resources,
-            )?
+            )?;
+            if place.nullable_holder().is_some() {
+                let mir::Type::Collection(id) = collection_type else {
+                    return Err(malformed_mir("an element place names no collection"));
+                };
+                let element = collection_definition(resources.program, id)?.value;
+                narrowed_payload_address(builder, slot, element, pointer)?
+            } else {
+                slot
+            }
         }
-        mir::ForeignAggregatePlace::RegionElement {
+        mir::InlinePlace::RegionElement {
             region,
             index,
             index_span,
@@ -11181,7 +11210,21 @@ fn lower_foreign_field(
                 .ok_or_else(|| malformed_mir("a typed array region has elements"))?
                 .1
         }
-    };
+    })
+}
+
+/// One field read or write of the foreign struct or union in `aggregate`'s
+/// slot, `offset` bytes from its start.
+fn lower_foreign_field(
+    builder: &mut FunctionBuilder,
+    aggregate: mir::InlinePlace,
+    offset: u64,
+    access: &mir::ForeignFieldAccess,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let base = inline_place_address(builder, aggregate, resources)?;
     let address = builder.ins().iadd_imm_u(base, offset as i64);
     match access {
         mir::ForeignFieldAccess::Read { target } => {
@@ -21799,8 +21842,8 @@ fn lower_pointer_operation(
         mir::PointerOperation::Address { pointer: local } => Some(LoweredValue::Single(
             address_of(builder, *local, resources)?,
         )),
-        mir::PointerOperation::AddressOf { local, offset } => {
-            let place = inline_local_address(builder, *local, resources)?;
+        mir::PointerOperation::AddressOf { place, offset } => {
+            let place = inline_place_address(builder, *place, resources)?;
             Some(LoweredValue::Single(if *offset == 0 {
                 place
             } else {

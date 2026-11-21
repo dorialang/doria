@@ -1,6 +1,6 @@
 # Decision 0148: Unsafe Code And The Foreign Function Interface
 
-- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles), and limited what is emitted to reachable code in section 17 on 2026-11-21 (Amendment: Emitting Only Reachable Code), and let a type parameter be a pointee in section 3 the same day (Amendment: Type Parameters As Pointees). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles), and limited what is emitted to reachable code in section 17 on 2026-11-21 (Amendment: Emitting Only Reachable Code), and let a type parameter be a pointee in section 3 the same day (Amendment: Type Parameters As Pointees), and let a pointer address a collection element in section 7 the same day (Amendment: Pointers To Elements). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
 - **Date:** 2026-11-16
 - **Owners:** Doria language, compiler, runtime and Baton design
 - **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
@@ -202,6 +202,17 @@ Section 3 did not say whether a pointer or region pointee may be a type
 parameter, and checking rejected `function first<T>(Pointer<T> $pointer): T`
 with E0786 at the declaration. Andrew ruled on 2026-11-21: "Allow it,
 checked per use (Recommended)". Section 3 states the rule.
+
+### Amendment: Pointers To Elements (2026-11-21)
+
+Section 7 listed the places `Pointer::to` addresses as "a local, a foreign
+struct field, or a property of FFI-safe type", without an element of a
+collection, while a field of such an element is a foreign struct field.
+Andrew ruled on 2026-11-21: "Allow it for arrays, lists and regions
+(Recommended)". Section 7 states the rule. An element of `T[]`, `List<T>`,
+`ArrayRegion<T>` or `WritableArrayRegion<T>` whose `T` is FFI-safe is a
+place, pinned as a field of that element is. Dictionary values and set
+members have no stable position and are not places.
 
 ## Context
 
@@ -518,9 +529,11 @@ Formation:
 - `$text->byteRegion->pointer` addresses a string's UTF-8 bytes, without a NUL
   terminator.
 - `Pointer::to($place)` and `WritablePointer::to($place)` address an FFI-safe
-  Copy place: a local, a foreign struct field, or a property of FFI-safe type.
-  `WritablePointer::to` takes a `writable` parameter, so the place must be
-  writable.
+  Copy place: a local, a foreign struct field, a property or static property
+  of FFI-safe type, or an element of `T[]`, `List<T>`, `ArrayRegion<T>` or
+  `WritableArrayRegion<T>` with an FFI-safe `T` (amendment of 2026-11-21).
+  Dictionary values and set members are not places. `WritablePointer::to`
+  takes a `writable` parameter, so the place must be writable.
 - A class payload has no pointer form; classes reach C only as handles
   (section 11).
 - An empty region's pointer is a non-null address aligned for `T` that must not
@@ -534,7 +547,11 @@ any of them. It may read the value, and read and write its fields and
 elements directly between foreign calls, as C code does with a struct it
 shares with a library; the unsafe context is where the programmer vouches that
 C is not using the value at that moment (amendment of 2026-11-16). Forming
-another pointer to a pinned place is not a conflict. The pointer is valid only
+another pointer to a pinned place is not a conflict. A pin on an element, or a
+field of one, keeps its collection from being resized, replaced or released
+and its elements from being replaced, since checking does not know which
+position an index names; the fields of the elements stay writable as fields
+of any pinned value are (amendment of 2026-11-21). The pointer is valid only
 within that context on every target; using it after the context ends is
 undefined behavior. Pointers to foreign memory (from C) follow the foreign library's own
 rules and are unaffected.

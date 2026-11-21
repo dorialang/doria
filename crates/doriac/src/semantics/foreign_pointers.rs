@@ -422,7 +422,7 @@ impl<'program> Checker<'program> {
         );
         if let Some((_, owner)) = owner {
             if !matches!(ungroup_place(&owner.value), Expr::This { .. })
-                && !self.is_pointer_place(&owner.value, method_context)
+                && !self.is_pointer_place(&owner.value, scopes, method_context)
             {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -769,9 +769,12 @@ impl<'program> Checker<'program> {
         fits.then_some(target)
     }
 
-    /// `Pointer::to($place)` and `WritablePointer::to($place)`: a local, a foreign struct
-    /// field or a property, of an FFI-safe type. Whether a `WritablePointer::to`
-    /// place is writable is the ownership checker's rule, as for every write.
+    /// `Pointer::to($place)` and `WritablePointer::to($place)`: a local, a
+    /// foreign struct field, a property or static property, or an element
+    /// of `T[]`, `List<T>` or a typed array region (amendment of
+    /// 2026-11-21), of an FFI-safe type. Whether a `WritablePointer::to`
+    /// place is writable is the ownership checker's rule, as for every
+    /// write.
     fn check_pointer_place(
         &mut self,
         pointer: PointerAccess,
@@ -780,7 +783,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let companion = pointer.short_name();
-        if !self.is_pointer_place(place, method_context) {
+        if !self.is_pointer_place(place, scopes, method_context) {
             self.diagnostics.push(
                 Diagnostic::new(
                     POINTER_PLACE_CODE,
@@ -789,7 +792,7 @@ impl<'program> Checker<'program> {
                 )
                 .with_title("Pointer Source Is Not A Place")
                 .with_explanation(
-                    "`Pointer::to` and `WritablePointer::to` address a local, a foreign struct field or a property, and keep it in place until the unsafe context ends. A computed value has no lasting storage to address.",
+                    "`Pointer::to` and `WritablePointer::to` address a local, a foreign struct field, a property or static property, or an element of `T[]`, `List<T>` or a typed array region, and keep it in place until the unsafe context ends. A computed value, a value inside `mixed`, and a dictionary value or set member have no lasting position to address.",
                 )
                 .with_help("store the value in a local first, then form the pointer to the local"),
             );
@@ -808,12 +811,34 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn is_pointer_place(&self, expr: &Expr, method_context: Option<&MethodContext>) -> bool {
+    fn is_pointer_place(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
         match expr {
             Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
-                self.is_pointer_place(expr, method_context)
+                self.is_pointer_place(expr, scopes, method_context)
             }
-            Expr::Variable { .. } => true,
+            // A `mixed` box is shared by its copies; a value inside it has
+            // no storage of its own.
+            Expr::Variable { name, .. } => scopes.lookup(name).is_none_or(|binding| {
+                let declared = match self.types.kind(binding.declared_ty) {
+                    TypeKind::Nullable(inner) => *inner,
+                    _ => binding.declared_ty,
+                };
+                !matches!(self.types.kind(declared), TypeKind::Mixed)
+            }),
+            // An element of a sequence keeps its position while the
+            // sequence is pinned (amendment of 2026-11-21).
+            Expr::Index { collection, .. } => {
+                let sequence = self.infer_expr_type(collection, scopes, method_context);
+                matches!(
+                    self.types.kind(sequence),
+                    TypeKind::TypedArray(_) | TypeKind::List(_) | TypeKind::ArrayRegion(..)
+                ) && self.is_pointer_place(collection, scopes, method_context)
+            }
             Expr::PropertyAccess {
                 object,
                 null_safe: false,
@@ -823,7 +848,7 @@ impl<'program> Checker<'program> {
             } => {
                 !self.property_accessor_calls.contains_key(span)
                     && (matches!(ungroup_place(object), Expr::This { .. })
-                        || self.is_pointer_place(object, method_context))
+                        || self.is_pointer_place(object, scopes, method_context))
             }
             Expr::StaticMember {
                 qualifier,

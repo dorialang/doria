@@ -1083,6 +1083,20 @@ pub const fn nullable_scalar_is_zero_is_null(scalar: mir::ScalarType) -> bool {
     )
 }
 
+/// Where the payload of a `?T` value starts in its storage, for a place
+/// checking narrowed to present that is read or addressed in place: a
+/// nullable foreign aggregate or an FFI-safe nullable scalar. `None` for
+/// every other type.
+pub const fn nullable_payload_offset(ty: mir::Type, pointer_size: u32) -> Option<u32> {
+    match ty {
+        mir::Type::NullableForeignAggregate(aggregate) => Some(aggregate.nullable_payload_offset),
+        mir::Type::NullableScalar(scalar) => {
+            Some(nullable_scalar_form(scalar, pointer_size).payload_offset())
+        }
+        _ => None,
+    }
+}
+
 pub const fn nullable_scalar_form(
     scalar: mir::ScalarType,
     pointer_size: u32,

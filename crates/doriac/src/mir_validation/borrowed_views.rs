@@ -2276,14 +2276,19 @@ pub(super) fn validate(
 /// local itself, the class value whose property holds the aggregate, the
 /// collection whose element it is, or the region viewing the element. A
 /// static property's storage belongs to no local.
-fn aggregate_owner(place: mir::ForeignAggregatePlace) -> Option<mir::LocalId> {
+fn aggregate_owner(place: mir::InlinePlace) -> Option<mir::LocalId> {
     match place {
-        mir::ForeignAggregatePlace::Local(local)
-        | mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => Some(local),
-        mir::ForeignAggregatePlace::Property { object, .. } => Some(object),
-        mir::ForeignAggregatePlace::CollectionElement { collection, .. } => Some(collection),
-        mir::ForeignAggregatePlace::RegionElement { region, .. } => Some(region),
-        mir::ForeignAggregatePlace::Static(_) => None,
+        mir::InlinePlace::Local(local) | mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
+            Some(local)
+        }
+        mir::InlinePlace::Property { object, .. }
+        | mir::InlinePlace::NullablePropertyAssumeNonNull { object, .. } => Some(object),
+        mir::InlinePlace::CollectionElement { collection, .. }
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull { collection, .. } => {
+            Some(collection)
+        }
+        mir::InlinePlace::RegionElement { region, .. } => Some(region),
+        mir::InlinePlace::Static(_) | mir::InlinePlace::NullableStaticAssumeNonNull(_) => None,
     }
 }
 

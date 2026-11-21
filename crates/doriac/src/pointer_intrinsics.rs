@@ -180,7 +180,7 @@ pub fn static_member(access: PointerAccess, name: &str) -> Option<PointerMember>
         (_, "to") => member(
             "to",
             PointerOperation::AddressOf,
-            "The address of a local, a foreign struct field or a property of FFI-safe type. `WritablePointer::to` needs a writable place. Forming it pins the place until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
+            "The address of an FFI-safe place: a local, a foreign struct field, a property or static property, or an element of a `T[]`, a `List<T>` or a typed array region. `WritablePointer::to` needs a writable place. Forming it pins the place until the innermost enclosing unsafe context ends; the pointer is valid only within that context.",
         ),
         (PointerAccess::Read, "fromAddress") => member(
             "fromAddress",

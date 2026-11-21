@@ -338,35 +338,12 @@ pub(super) fn expression(
                     lower_rvalue_as_expected(argument, expected, context).map(Some)
                 }
                 PointerOperation::AddressOf => {
-                    // A field of an aggregate a property holds lives in the
-                    // object's storage, as the property does.
-                    let property_pointer = || {
-                        vec![crate::unsafe_code::unbuilt_form(
-                            *span,
-                            "Pointers To Properties Cannot Be Built Yet",
-                            format!(
-                                "`{}::{method}` of a property is part of Doria; this compiler does not build it yet",
-                                access.short_name()
-                            ),
-                        )]
-                    };
-                    let (local, offset) = match unparenthesized_place(argument) {
-                        hir::Expr::Variable { name, span: place } => {
-                            (context.lookup_local(name, *place)?, 0)
-                        }
-                        place => match field_place(place, false, context)? {
-                            Some(FieldPlace {
-                                aggregate: mir::ForeignAggregatePlace::Local(local),
-                                offset,
-                                ..
-                            }) => (local, offset),
-                            Some(_) | None => return Err(property_pointer()),
-                        },
-                    };
+                    let (place, offset) =
+                        pointer_place(argument, access == PointerAccess::Write, context)?;
                     let target = context.declare_return_temp(POINTER, false);
                     context.push_statement(mir::Statement::Pointer {
                         target: Some(target),
-                        operation: mir::PointerOperation::AddressOf { local, offset },
+                        operation: mir::PointerOperation::AddressOf { place, offset },
                         span: *span,
                     });
                     Ok(Some(local_rvalue(target, POINTER, false)))
@@ -879,9 +856,13 @@ pub(super) fn function_pointer_call(
 /// A field of a foreign struct or union as a place: where the outermost
 /// aggregate is, the field's byte offset in it, and the field's type.
 struct FieldPlace {
-    aggregate: mir::ForeignAggregatePlace,
+    aggregate: mir::InlinePlace,
     offset: u64,
     field: FieldKind,
+    /// The aggregate is in lasting storage. A computed value, or a copy
+    /// read from a `mixed` box, lives in a temporary instead, which a
+    /// field read may use and `Pointer::to` may not address.
+    stored: bool,
 }
 
 /// What a foreign field holds.
@@ -990,24 +971,27 @@ fn field_place(
             aggregate: outer.aggregate,
             offset: outer.offset + field_offset,
             field,
+            stored: outer.stored,
         }));
     }
     let aggregate_type = aggregate_type(&object_type, object.span(), context)?;
+    let mut stored = true;
     let aggregate = match unparenthesized_place(object) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
                 mir::Type::ForeignAggregate(ty) if ty == aggregate_type => {
-                    mir::ForeignAggregatePlace::Local(local)
+                    mir::InlinePlace::Local(local)
                 }
                 // Checking narrowed the `?Name` local to present, so the
                 // field is in its storage at the payload offset.
                 mir::Type::NullableForeignAggregate(ty) if ty == aggregate_type => {
-                    mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local)
+                    mir::InlinePlace::NullableLocalAssumeNonNull(local)
                 }
                 // An exact `is` narrowed the `mixed` local: a read copies the
                 // boxed value, which other copies of the box share.
                 mir::Type::Mixed | mir::Type::NullableMixed if !writable => {
+                    stored = false;
                     let value = aggregate_expression(object, aggregate_type, context)?;
                     let local = context
                         .declare_return_temp(mir::Type::ForeignAggregate(aggregate_type), false);
@@ -1015,7 +999,7 @@ fn field_place(
                         target: local,
                         value: mir::Rvalue::ForeignAggregate(value),
                     });
-                    mir::ForeignAggregatePlace::Local(local)
+                    mir::InlinePlace::Local(local)
                 }
                 mir::Type::Mixed | mir::Type::NullableMixed => {
                     return Err(vec![unsupported(
@@ -1039,26 +1023,31 @@ fn field_place(
                     "a field access names a property that holds no foreign struct or union",
                 )]);
             }
-            mir::ForeignAggregatePlace::Property { object, property }
+            mir::InlinePlace::Property { object, property }
         }
         hir::Expr::StaticMember {
             class_name,
             member,
             span,
-        } if context.constant_value(object).is_none() => mir::ForeignAggregatePlace::Static(
-            static_aggregate(class_name, member, *span, aggregate_type, context)?,
-        ),
+        } if context.constant_value(object).is_none() => mir::InlinePlace::Static(static_place(
+            class_name,
+            member,
+            *span,
+            mir::Type::ForeignAggregate(aggregate_type),
+            context,
+        )?),
         hir::Expr::Index {
             collection, index, ..
         } => element_place(
             collection,
             index,
-            aggregate_type,
+            mir::Type::ForeignAggregate(aggregate_type),
             object.span(),
             writable,
             context,
         )?,
         _ => {
+            stored = false;
             let value = lower_rvalue_as_expected(
                 object,
                 mir::Type::ForeignAggregate(aggregate_type),
@@ -1070,13 +1059,14 @@ fn field_place(
                 target: local,
                 value,
             });
-            mir::ForeignAggregatePlace::Local(local)
+            mir::InlinePlace::Local(local)
         }
     };
     Ok(Some(FieldPlace {
         aggregate,
         offset: field_offset,
         field,
+        stored,
     }))
 }
 
@@ -1088,24 +1078,23 @@ fn field_place(
 fn element_place(
     collection: &hir::Expr,
     index: &hir::Expr,
-    ty: mir::ForeignAggregateType,
+    element: mir::Type,
     index_span: Span,
     writable: bool,
     context: &mut LoweringContext,
-) -> DiagnosticResult<mir::ForeignAggregatePlace> {
-    let element = mir::Type::ForeignAggregate(ty);
+) -> DiagnosticResult<mir::InlinePlace> {
     let position = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
     if let mir::Type::Region(region) = context.expression_type(collection)? {
         if super::byte_region::element_type(region, index_span, context)? != element {
             return Err(vec![unsupported(
                 index_span,
-                "a region element field access names a region of another element type",
+                "a region element place names a region of another element type",
             )]);
         }
         let region = super::byte_region::local(collection, writable, context)?;
         let index = lower_rvalue_as_expected(index, position, context)?;
         let (index, _) = core_value::materialize_value(index, context);
-        return Ok(mir::ForeignAggregatePlace::RegionElement {
+        return Ok(mir::InlinePlace::RegionElement {
             region,
             index,
             index_span,
@@ -1116,24 +1105,84 @@ fn element_place(
     else {
         return Err(vec![unsupported(
             index_span,
-            "a field access names an element of a value that is not a collection",
+            "an element place names a value that is not a collection",
         )]);
     };
     let info = context.collection_type(collection_type).clone();
     if info.value != element {
         return Err(vec![unsupported(
             index_span,
-            "a collection element field access names a collection of another element type",
+            "an element place names a collection of another element type",
         )]);
     }
     let index = lower_rvalue_as_expected(index, info.key.unwrap_or(position), context)?;
     let (index, _) = core_value::materialize_value(index, context);
-    Ok(mir::ForeignAggregatePlace::CollectionElement {
+    Ok(mir::InlinePlace::CollectionElement {
         collection,
         index,
         positional: false,
         index_span,
     })
+}
+
+/// The storage `Pointer::to($place)` and `WritablePointer::to($place)`
+/// address in place (Decision 0148 section 7, amended 2026-11-21): a local,
+/// a narrowed nullable local, a foreign struct or union field, a stored
+/// property, a static property, or an element of `T[]`, `List<T>` or a
+/// typed array region. Checking admits only these and pins each one.
+fn pointer_place(
+    expr: &hir::Expr,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<(mir::InlinePlace, u64)> {
+    let place = unparenthesized_place(expr);
+    if let Some(field) = field_place(place, writable, context)? {
+        if !field.stored {
+            return Err(vec![unsupported(
+                place.span(),
+                "checking admitted a pointer to a field of a value without lasting storage",
+            )]);
+        }
+        return Ok((field.aggregate, field.offset));
+    }
+    let ty = context.expression_type(place)?;
+    let addressed = match place {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            let stored = context.local_type(local);
+            // Checking narrowed a `?T` local to present: the pointee is its
+            // payload, in place.
+            if stored != ty
+                && matches!(
+                    stored,
+                    mir::Type::NullableScalar(_) | mir::Type::NullableForeignAggregate(_)
+                )
+            {
+                mir::InlinePlace::NullableLocalAssumeNonNull(local)
+            } else {
+                mir::InlinePlace::Local(local)
+            }
+        }
+        hir::Expr::PropertyAccess { .. } if stored_property_place(place, context) => {
+            let (object, property, _) = lower_property_place(place, context)?;
+            mir::InlinePlace::Property { object, property }
+        }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => mir::InlinePlace::Static(static_place(class_name, member, *span, ty, context)?),
+        hir::Expr::Index {
+            collection, index, ..
+        } => element_place(collection, index, ty, place.span(), writable, context)?,
+        _ => {
+            return Err(vec![unsupported(
+                place.span(),
+                "checking admitted a pointer to a value that is not a place",
+            )])
+        }
+    };
+    Ok((addressed, 0))
 }
 
 /// `$values[$index]` and `$values->removeAt($index)` of a collection or
@@ -1280,8 +1329,10 @@ pub(super) fn field_read(
 /// `$maybe?->field` of a `?Name` value (Decision 0148 section 6): the
 /// field when the value is present, and null otherwise, converted to
 /// `expected`; `None` when `expr` is not one. The receiver is evaluated
-/// once into a local, and the field is read from that local's payload in
-/// the present branch.
+/// once. A local, stored property, static property or collection element
+/// is read in place in the present branch, so a region over a
+/// fixed-length array field views the stored value; any other receiver is
+/// read from a local it is copied into.
 fn null_safe_field_read(
     expr: &hir::Expr,
     expected: mir::Type,
@@ -1311,19 +1362,37 @@ fn null_safe_field_read(
     }
     let nullable_type = mir::Type::NullableForeignAggregate(aggregate);
     let selection = context.coalesce_selection(object);
-    let read = |receiver, context: &mut LoweringContext| {
-        let field = present_field(receiver, aggregate, property, *span, present, context)?;
-        // A writable region is a move carrier the result takes over, as
-        // every null-safe region result is.
-        Ok(Some((field, present, present.is_writable_region())))
-    };
-    // A local is read in place, so a region over a fixed-length array field
-    // borrows the local itself; any other receiver is evaluated once into a
-    // local first.
+    let writable = present.is_writable_region();
+    // A local is tested and read in place. A stored receiver is tested
+    // through a copy and read in place.
     let local = match unparenthesized_place(object) {
         hir::Expr::Variable { name, span } => Some(context.lookup_local(name, *span)?)
             .filter(|local| context.local_type(*local) == nullable_type),
         _ => None,
+    };
+    let receiver = match local {
+        Some(_) => None,
+        None => Some(match stored_nullable_receiver(object, aggregate, writable, context)? {
+            Some((copy, place)) => (copy, Some(place)),
+            // Checking gives a region writable access only through a
+            // writable place, and a call result of an inline Copy type is
+            // never one (Decision 0089), so a temporary is only read.
+            None if writable => {
+                return Err(vec![unsupported(
+                    *span,
+                    "checking gave writable access to a field of a `?Name` value without lasting storage",
+                )])
+            }
+            None => (nullable_aggregate_expression(object, aggregate, context)?, None),
+        }),
+    };
+    let stored = receiver.as_ref().and_then(|(_, place)| *place);
+    let read = move |receiver, context: &mut LoweringContext| {
+        let place = stored.unwrap_or(mir::InlinePlace::NullableLocalAssumeNonNull(receiver));
+        let field = present_field(place, aggregate, property, *span, present, context)?;
+        // A writable region is a move carrier the result takes over, as
+        // every null-safe region result is.
+        Ok(Some((field, present, writable)))
     };
     let value = match local {
         Some(local) => null_safe_call_on(
@@ -1337,20 +1406,9 @@ fn null_safe_field_read(
             context,
         )?,
         None => {
-            if matches!(present, mir::Type::Region(region) if region.is_writable()) {
-                return Err(vec![crate::unsafe_code::unbuilt_form(
-                    *span,
-                    "Foreign Aggregates Cannot Be Built Here Yet",
-                    format!(
-                        "a writable fixed-length array field read with `?->` from a property, static property or call result is part of Doria; this compiler builds `?->` of `${property}` on a local, and not here yet"
-                    ),
-                )]);
-            }
-            let receiver = mir::Rvalue::NullableForeignAggregate(nullable_aggregate_expression(
-                object, aggregate, context,
-            )?);
+            let (receiver, _) = receiver.expect("a receiver that is not a local is lowered");
             materialize_null_safe_call(
-                receiver,
+                mir::Rvalue::NullableForeignAggregate(receiver),
                 selection,
                 false,
                 None,
@@ -1365,10 +1423,101 @@ fn null_safe_field_read(
     convert_call_result(local, ty, expected, transfer, *span, context).map(Some)
 }
 
-/// The field `property` of the present `?Name` value in `receiver`, read
-/// into a local of type `ty`.
+/// A `?Name` receiver of type `aggregate` in lasting storage: a stored
+/// property, a static property or a collection element, as a copy for the
+/// presence test and the narrowed place a present field is in. `writable`
+/// gives a collection writable access. `None` for any other receiver.
+fn stored_nullable_receiver(
+    object: &hir::Expr,
+    aggregate: mir::ForeignAggregateType,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::NullableForeignAggregateExpression, mir::InlinePlace)>> {
+    let nullable = mir::Type::NullableForeignAggregate(aggregate);
+    let object = unparenthesized_place(object);
+    if context.constant_value(object).is_some() {
+        return Ok(None);
+    }
+    let mismatch = || {
+        vec![unsupported(
+            object.span(),
+            "a null-safe field read names stored storage without a `?Name` value",
+        )]
+    };
+    Ok(Some(match object {
+        place @ hir::Expr::PropertyAccess { .. } if stored_property_place(place, context) => {
+            let (object, property, actual) = lower_property_place(place, context)?;
+            if actual != nullable {
+                return Err(mismatch());
+            }
+            (
+                mir::NullableForeignAggregateExpression::Property {
+                    ty: aggregate,
+                    object,
+                    property,
+                },
+                mir::InlinePlace::NullablePropertyAssumeNonNull { object, property },
+            )
+        }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => {
+            let (id, actual) = context.static_property(class_name, member, *span)?;
+            if actual != nullable {
+                return Err(mismatch());
+            }
+            (
+                mir::NullableForeignAggregateExpression::Static { ty: aggregate, id },
+                mir::InlinePlace::NullableStaticAssumeNonNull(id),
+            )
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let mir::InlinePlace::CollectionElement {
+                collection,
+                index,
+                positional,
+                index_span,
+            } = element_place(
+                collection,
+                index,
+                nullable,
+                object.span(),
+                writable,
+                context,
+            )?
+            else {
+                return Err(mismatch());
+            };
+            let position = local_rvalue(index, context.local_type(index), false);
+            (
+                mir::NullableForeignAggregateExpression::CollectionIndex {
+                    ty: aggregate,
+                    collection,
+                    index: Box::new(position),
+                    index_span,
+                    positional,
+                    remove: false,
+                },
+                mir::InlinePlace::NullableCollectionElementAssumeNonNull {
+                    collection,
+                    index,
+                    positional,
+                    index_span,
+                },
+            )
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// The field `property` of the present `?Name` value in `place`, read into
+/// a local of type `ty`.
 fn present_field(
-    receiver: mir::LocalId,
+    place: mir::InlinePlace,
     aggregate: mir::ForeignAggregateType,
     property: &str,
     span: Span,
@@ -1411,7 +1560,7 @@ fn present_field(
         None => mir::ForeignFieldAccess::Read { target },
     };
     context.push_statement(mir::Statement::ForeignField {
-        aggregate: mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(receiver),
+        aggregate: place,
         offset,
         access,
         span,
@@ -1572,7 +1721,13 @@ pub(super) fn aggregate_expression(
             span,
         } => Ok(mir::ForeignAggregateExpression::Static {
             ty,
-            id: static_aggregate(class_name, member, *span, ty, context)?,
+            id: static_place(
+                class_name,
+                member,
+                *span,
+                mir::Type::ForeignAggregate(ty),
+                context,
+            )?,
         }),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -1789,18 +1944,20 @@ pub(super) fn nullable_aggregate_expression(
 
 /// The static property `class_name::member`, which holds a foreign struct
 /// or union of type `ty`.
-fn static_aggregate(
+/// The static property `class_name::member`, which holds `expected` in
+/// place.
+fn static_place(
     class_name: &str,
     member: &str,
     span: Span,
-    ty: mir::ForeignAggregateType,
+    expected: mir::Type,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::StaticId> {
     let (id, actual) = context.static_property(class_name, member, span)?;
-    if actual != mir::Type::ForeignAggregate(ty) {
+    if actual != expected {
         return Err(vec![unsupported(
             span,
-            "a static property holds another type than the foreign struct or union expected",
+            "a static property holds another type than its place expects",
         )]);
     }
     Ok(id)

@@ -1059,6 +1059,45 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
     assert!(readonly.message.contains("$fixed"));
 }
 
+#[test]
+fn an_element_pointer_pins_its_collection_and_other_places_are_rejected() {
+    // Decision 0148 section 7, amended 2026-11-21: "Allow it for arrays,
+    // lists and regions (Recommended)".
+    let elements = "writable Point[] $points = [new Point(x: 1, y: 2), new Point(x: 3, y: 4)]; writable List<int32> $counts = [1, 2];";
+    for body in [
+        "unsafe { let $pointer = WritablePointer::to($points[0]); $points[1] = new Point(x: 5, y: 6); }",
+        "unsafe { let $field = WritablePointer::to($points[0]->x); $points[0] = new Point(x: 5, y: 6); }",
+        "unsafe { let $pointer = Pointer::to($counts[1]); $counts->add(3); }",
+        "unsafe { let $pointer = Pointer::to($counts[0]); $counts[0] = 9; }",
+        // Checking does not know which position an index names, so the
+        // same field of another element may be the pinned value.
+        "unsafe { let $field = WritablePointer::to($points[0]->x); $points[1]->x = 8; }",
+    ] {
+        let found = findings(&pin_program(&format!("{elements} {body}")));
+        assert!(
+            found.len() == 1
+                && found[0].code == "E0477"
+                && found[0].title == "Pinned Value Cannot Be Moved Or Replaced",
+            "{body}: {found:#?}"
+        );
+    }
+    for body in [
+        "unsafe { let $field = WritablePointer::to($points[0]->x); $points[0]->y = 7; $points[1]->y = 8; echo $points[1]->x; }",
+        "unsafe { let $pointer = WritablePointer::to($counts[0]); echo $counts[1]; let $again = Pointer::to($counts[1]); }",
+        "unsafe { let $region = $points->getRegion(0, 2); let $element = Pointer::to($region[1]); }",
+        "unsafe { let $pointer = WritablePointer::to($points[1]); } $points[1] = new Point(x: 0, y: 0);",
+    ] {
+        let source = pin_program(&format!("{elements} {body}"));
+        assert!(codes(&source).is_empty(), "{body}: {:#?}", findings(&source));
+    }
+    for body in [
+        "writable Dictionary<string, int32> $named = [\"a\" => 1]; unsafe { let $pointer = Pointer::to($named[\"a\"]); }",
+        "mixed $boxed = new Point(x: 1, y: 2); if ($boxed is Point) { unsafe { let $field = Pointer::to($boxed->x); } }",
+    ] {
+        let place = only(&pointer_program(body), "E0801");
+        assert_eq!(place.title, "Pointer Source Is Not A Place", "{body}");
+    }
+}
 fn region_program(body: &str) -> String {
     format!(
         "use Doria\\Std\\Ffi\\{{Pointer, WritablePointer}}; use Doria\\Std\\Io\\{{ByteRegion, WritableByteRegion}}; function consume(take Bytes $bytes): void {{}} function main(): void {{ writable Bytes $buffer = Bytes::allocate(8); {body} }}"
@@ -1183,22 +1222,16 @@ fn pointer_operations_report_that_they_cannot_be_built_yet() {
         ["Pointer Operations Cannot Run In The Interpreter Yet"],
         "{diagnostics:#?}"
     );
-    // A pointer to a foreign struct field builds; one to a class property
-    // does not yet.
+    // A pointer to a class property builds for the native targets, as one
+    // to a foreign struct field does (section 7, amended 2026-11-21).
     let property = "use Doria\\Std\\Ffi\\Pointer; class Box { int32 $count = 0; } function main(): void { let $box = new Box(); let $pointer = unsafe(Pointer::to($box->count)); }";
-    let diagnostics = doriac::compile_source(
+    if let Err(diagnostics) = doriac::compile_source(
         "ffi.doria",
         property.to_string(),
         doriac::backend::BackendTarget::Native,
-    )
-    .expect_err("a pointer to a property cannot be built yet");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Pointers To Properties Cannot Be Built Yet"),
-        "{diagnostics:#?}"
-    );
+    ) {
+        panic!("a pointer to a property builds: {diagnostics:#?}");
+    }
 }
 
 #[test]

@@ -6634,11 +6634,11 @@ fn validate_pointer_operation(
         mir::PointerOperation::Address { .. } => Some(mir::Type::Scalar(mir::ScalarType::Integer(
             IntegerType::UInt64,
         ))),
-        mir::PointerOperation::AddressOf { local, offset } => {
-            let ty = local_in(function, *local)?.ty;
+        mir::PointerOperation::AddressOf { place, offset } => {
+            let (ty, _) = foreign_aggregates::place_value(program, function, *place)?;
             if !accessed(ty)? {
                 return Err(malformed_mir(
-                    "a pointer addresses a local of a value with a C layout",
+                    "a pointer addresses a place of a value with a C layout",
                 ));
             }
             let inside = match ty {
@@ -14864,6 +14864,43 @@ fn collect_format_class_local_accesses<'a>(
     }
 }
 
+/// The accesses a statement makes to reach the storage `place` names: a
+/// field read or write, or a pointer formed to it.
+fn collect_inline_place_accesses(
+    place: mir::InlinePlace,
+    write: bool,
+    accesses: &mut ClassLocalAccesses,
+) {
+    match place {
+        mir::InlinePlace::Local(local) => accesses.resource_read(local),
+        mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
+            accesses.resource_read(local);
+            accesses.assume_nullable_present(local)
+        }
+        // A field access uses one stored path, not the receiver as a
+        // whole (Decision 0136), as a property store does.
+        mir::InlinePlace::Property { object, property }
+        | mir::InlinePlace::NullablePropertyAssumeNonNull { object, property } => {
+            accesses.borrow_property(object, property)
+        }
+        mir::InlinePlace::Static(_) | mir::InlinePlace::NullableStaticAssumeNonNull(_) => {}
+        mir::InlinePlace::CollectionElement {
+            collection, index, ..
+        }
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull {
+            collection, index, ..
+        } => {
+            accesses.resource_read(index);
+            accesses.collection_access(collection, false);
+        }
+        mir::InlinePlace::RegionElement { region, index, .. } => {
+            accesses.resource_read(region);
+            accesses.resource_read(index);
+            accesses.contents_access(region, write);
+        }
+    }
+}
+
 fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
@@ -14879,33 +14916,11 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::ForeignField {
             aggregate, access, ..
         } => {
-            match aggregate {
-                mir::ForeignAggregatePlace::Local(local) => accesses.resource_read(*local),
-                mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local) => {
-                    accesses.resource_read(*local);
-                    accesses.assume_nullable_present(*local)
-                }
-                // A field access uses one stored path, not the receiver as a
-                // whole (Decision 0136), as a property store does.
-                mir::ForeignAggregatePlace::Property { object, property } => {
-                    accesses.borrow_property(*object, *property)
-                }
-                mir::ForeignAggregatePlace::Static(_) => {}
-                mir::ForeignAggregatePlace::CollectionElement {
-                    collection, index, ..
-                } => {
-                    accesses.resource_read(*index);
-                    accesses.collection_access(*collection, false);
-                }
-                mir::ForeignAggregatePlace::RegionElement { region, index, .. } => {
-                    accesses.resource_read(*region);
-                    accesses.resource_read(*index);
-                    accesses.contents_access(
-                        *region,
-                        matches!(access, mir::ForeignFieldAccess::Write { .. }),
-                    );
-                }
-            }
+            collect_inline_place_accesses(
+                *aggregate,
+                matches!(access, mir::ForeignFieldAccess::Write { .. }),
+                &mut accesses,
+            );
             if let mir::ForeignFieldAccess::Write { value, .. } = access {
                 collect_rvalue_class_local_accesses(value, &mut accesses);
             }
@@ -14915,6 +14930,9 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 accesses.resource_read(pointer);
             }
             match operation {
+                mir::PointerOperation::AddressOf { place, .. } => {
+                    collect_inline_place_accesses(*place, false, &mut accesses)
+                }
                 mir::PointerOperation::Write { value, .. }
                 | mir::PointerOperation::CreateHandle { value } => {
                     collect_rvalue_class_local_accesses(value, &mut accesses)
@@ -14924,8 +14942,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
                 | mir::PointerOperation::ForeignRange { length: value, .. } => {
                     collect_integer_class_local_accesses(value, &mut accesses)
                 }
-                mir::PointerOperation::AddressOf { local, .. }
-                | mir::PointerOperation::RegionData { region: local, .. }
+                mir::PointerOperation::RegionData { region: local, .. }
                 | mir::PointerOperation::ForeignStringData { string: local } => {
                     accesses.resource_read(*local)
                 }
@@ -20929,18 +20946,14 @@ fn statement_observes_property(
         mir::Statement::ForeignField {
             aggregate, access, ..
         } => {
-            matches!(
-                aggregate,
-                mir::ForeignAggregatePlace::Property { object, property: observed }
-                    if *object == receiver && *observed == property
-            ) || match access {
-                mir::ForeignFieldAccess::Read { .. } | mir::ForeignFieldAccess::Region { .. } => {
-                    false
+            aggregate.stored_property() == Some((receiver, property))
+                || match access {
+                    mir::ForeignFieldAccess::Read { .. }
+                    | mir::ForeignFieldAccess::Region { .. } => false,
+                    mir::ForeignFieldAccess::Write { value, .. } => {
+                        rvalue_observes_property(value, receiver, property)
+                    }
                 }
-                mir::ForeignFieldAccess::Write { value, .. } => {
-                    rvalue_observes_property(value, receiver, property)
-                }
-            }
         }
         mir::Statement::Pointer { operation, .. } => match operation {
             mir::PointerOperation::Write { value, .. }
@@ -20952,9 +20965,13 @@ fn statement_observes_property(
             | mir::PointerOperation::ForeignRange { length: value, .. } => {
                 integer_observes_property(value, receiver, property)
             }
+            // A pointer to the property exposes its storage, which a
+            // foreign call may then read.
+            mir::PointerOperation::AddressOf { place, .. } => {
+                place.stored_property() == Some((receiver, property))
+            }
             mir::PointerOperation::Read { .. }
             | mir::PointerOperation::Address { .. }
-            | mir::PointerOperation::AddressOf { .. }
             | mir::PointerOperation::RegionData { .. }
             | mir::PointerOperation::ForeignStringData { .. }
             | mir::PointerOperation::ReadForeignString { .. }
