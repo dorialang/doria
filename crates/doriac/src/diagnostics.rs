@@ -1641,35 +1641,29 @@ fn format_summary(summary: DiagnosticSummary) -> String {
     format!("{}: {}", summary.status(), counts.join(" And "))
 }
 
+/// Title-cases prose words and keeps code in backticks exactly as written
+/// (docs/diagnostic-style.md): a word is capitalized at its first letter only
+/// when that letter is outside a code span, wherever the span starts or ends.
 fn to_title_case(message: &str) -> String {
     let mut in_code = false;
-    message
-        .split_inclusive(char::is_whitespace)
-        .enumerate()
-        .map(|(index, word)| {
-            for character in word.chars() {
-                if character == '`' {
-                    in_code = !in_code;
+    let mut title = String::with_capacity(message.len());
+    for (index, word) in message.split_inclusive(char::is_whitespace).enumerate() {
+        let mut first_letter = true;
+        for (offset, character) in word.char_indices() {
+            if character == '`' {
+                in_code = !in_code;
+            } else if first_letter && character.is_alphabetic() {
+                first_letter = false;
+                let minor = index > 0 && is_minor_title_word(word[offset..].trim_end());
+                if !in_code && !minor {
+                    title.extend(character.to_uppercase());
+                    continue;
                 }
             }
-            if in_code || word.starts_with('`') {
-                return word.to_string();
-            }
-            let trimmed = word.trim_start_matches(|character: char| !character.is_alphabetic());
-            let prefix_len = word.len().saturating_sub(trimmed.len());
-            let (prefix, rest) = word.split_at(prefix_len);
-            let mut characters = rest.chars();
-            let Some(first) = characters.next() else {
-                return word.to_string();
-            };
-            let minor = is_minor_title_word(rest.trim_end());
-            if index > 0 && minor {
-                word.to_string()
-            } else {
-                format!("{prefix}{}{}", first.to_uppercase(), characters.as_str())
-            }
-        })
-        .collect()
+            title.push(character);
+        }
+    }
+    title
 }
 
 pub fn is_title_case(title: &str) -> bool {
@@ -1868,6 +1862,25 @@ mod tests {
         ));
         assert!(!is_title_case("`when` is not available"));
         assert!(!is_title_case("Unclosed `syntax"));
+    }
+
+    /// Code in backticks keeps its exact text in a title, including a word
+    /// that closes a span which opened in an earlier word.
+    #[test]
+    fn titles_keep_code_spans_exactly() {
+        use super::to_title_case;
+        assert_eq!(
+            to_title_case("argument 1 expects `extern \"C\" function(int32): int32`, got `int`"),
+            "Argument 1 Expects `extern \"C\" function(int32): int32`, Got `int`"
+        );
+        assert_eq!(
+            to_title_case("cannot call `$value ?? other` on a value of `List<int> items`"),
+            "Cannot Call `$value ?? other` on a Value of `List<int> items`"
+        );
+        assert_eq!(
+            to_title_case("(`first`) is not a type"),
+            "(`first`) Is Not a Type"
+        );
     }
 
     #[test]
