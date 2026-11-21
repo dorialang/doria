@@ -27119,6 +27119,8 @@ impl<'program> Checker<'program> {
                     | TypeKind::Foreign(
                         crate::foreign::ForeignType::Aggregate(_)
                             | crate::foreign::ForeignType::Pointer { .. }
+                            | crate::foreign::ForeignType::Function(_)
+                            | crate::foreign::ForeignType::Boundary(_)
                     )
                     | TypeKind::Unknown
             )

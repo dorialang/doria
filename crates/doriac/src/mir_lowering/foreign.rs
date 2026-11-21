@@ -47,19 +47,69 @@ fn pointer_parts(ty: ResolvedType) -> Option<(PointerAccess, ResolvedType)> {
     }
 }
 
-/// Whether `$value is Pointer<T>` can hold, or `None` when `value` is not a
-/// pointer or `tested` names no pointer type. A pointer's pointee and access
-/// are checking facts that MIR does not carry, so the test compares the
-/// checked types: it holds for a pointer of exactly the tested type, which
-/// for `?Pointer<T>` means one that is not null (Decision 0148 section 3).
-pub(super) fn pointer_type_test_matches(
+/// The data or C function pointer type `ty` names in this instance, with
+/// its type arguments substituted: the canonical checked type that pointer
+/// type tests compare and an exact `mixed` tag interns.
+pub(super) fn exact_pointer_type(
+    ty: &ResolvedType,
+    context: &LoweringContext,
+) -> Option<ForeignType<ResolvedType>> {
+    match substitute_resolved_type(ty, &context.type_substitutions) {
+        ResolvedType::Foreign(foreign)
+            if matches!(
+                *foreign,
+                ForeignType::Pointer { .. } | ForeignType::Function(_)
+            ) =>
+        {
+            Some(*foreign)
+        }
+        _ => None,
+    }
+}
+
+/// The foreign Copy type `ty` names in this instance whose identity its MIR
+/// type does not carry: a data or C function pointer, or a C boundary type,
+/// which is the target integer of its width.
+fn exact_foreign_scalar(
+    ty: &ResolvedType,
+    context: &LoweringContext,
+) -> Option<ForeignType<ResolvedType>> {
+    exact_pointer_type(ty, context).or_else(|| {
+        match substitute_resolved_type(ty, &context.type_substitutions) {
+            ResolvedType::Foreign(foreign) if matches!(*foreign, ForeignType::Boundary(_)) => {
+                Some(*foreign)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Whether `$value is T` can hold for a scalar `value` when `T` or the
+/// value's type is a pointer, a C function pointer or a C boundary type, or
+/// `None` otherwise. Their MIR types do not carry their identity (a
+/// `CLong` is the target's integer), so the test compares the checked
+/// types: it holds for a value of exactly the tested type, which for a
+/// nullable value means one that is not null (Decision 0148 sections 3, 5
+/// and 12).
+pub(super) fn foreign_type_test_matches(
     value: &hir::Expr,
+    value_type: mir::Type,
     tested: &ResolvedType,
     context: &LoweringContext,
 ) -> Option<bool> {
-    let tested = pointer_parts(tested.clone())?;
-    let value = pointer_type(value, context).or_else(|| nullable_pointer_type(value, context))?;
-    Some(value == tested)
+    if !matches!(
+        value_type,
+        mir::Type::Scalar(_) | mir::Type::NullableScalar(_)
+    ) {
+        return None;
+    }
+    let value = match context.resolved_expression_type(value).ok()? {
+        ResolvedType::Nullable(inner) => *inner,
+        value => value,
+    };
+    let tested = exact_foreign_scalar(tested, context);
+    let value = exact_foreign_scalar(&value, context);
+    (tested.is_some() || value.is_some()).then(|| tested == value)
 }
 
 /// The value a pointer member call, property or companion call produces, or
@@ -955,6 +1005,24 @@ fn field_place(
                 mir::Type::NullableForeignAggregate(ty) if ty == aggregate_type => {
                     mir::ForeignAggregatePlace::NullableLocalAssumeNonNull(local)
                 }
+                // An exact `is` narrowed the `mixed` local: a read copies the
+                // boxed value, which other copies of the box share.
+                mir::Type::Mixed | mir::Type::NullableMixed if !writable => {
+                    let value = aggregate_expression(object, aggregate_type, context)?;
+                    let local = context
+                        .declare_return_temp(mir::Type::ForeignAggregate(aggregate_type), false);
+                    context.push_statement(mir::Statement::AssignLocal {
+                        target: local,
+                        value: mir::Rvalue::ForeignAggregate(value),
+                    });
+                    mir::ForeignAggregatePlace::Local(local)
+                }
+                mir::Type::Mixed | mir::Type::NullableMixed => {
+                    return Err(vec![unsupported(
+                        *span,
+                        "a field of a `mixed` value narrowed to a foreign struct or union cannot be written in place yet",
+                    )])
+                }
                 _ => {
                     return Err(vec![unsupported(
                         *span,
@@ -1515,6 +1583,13 @@ pub(super) fn aggregate_expression(
                 // Checking narrowed the `?Name` local to present.
                 mir::Type::NullableForeignAggregate(actual) if actual == ty => {
                     Ok(mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty, local })
+                }
+                // An exact `is` narrowed the `mixed` local to `Name`.
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context.exact_mixed_tag(expr)
+                        == Some(mir::MixedTag::ForeignAggregate(ty)) =>
+                {
+                    Ok(mir::ForeignAggregateExpression::MixedPayload { ty, mixed: local })
                 }
                 _ => Err(vec![unsupported(
                     *span,

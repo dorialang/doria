@@ -328,6 +328,10 @@ struct NativeTypeRegistry {
     /// Every foreign struct and union, with or without a body.
     foreign_aggregate_kinds: HashMap<String, crate::ast::ForeignAggregateKind>,
     foreign_aggregates: Vec<mir::ForeignAggregateDefinition>,
+    /// Every data and C function pointer type, by its canonical checked
+    /// type: the identity an exact `mixed` tag records.
+    pointer_ids: HashMap<crate::foreign::ForeignType<ResolvedType>, mir::PointerTypeId>,
+    pointer_types: Vec<mir::PointerType>,
 }
 
 impl mir::return_adaptation::TypeFacts for NativeTypeRegistry {
@@ -352,6 +356,24 @@ impl mir::return_adaptation::TypeFacts for NativeTypeRegistry {
 }
 
 impl NativeTypeRegistry {
+    /// The identity of the data or C function pointer type `pointer`,
+    /// interned on first sight.
+    fn intern_pointer(
+        &mut self,
+        pointer: &crate::foreign::ForeignType<ResolvedType>,
+    ) -> mir::PointerTypeId {
+        if let Some(id) = self.pointer_ids.get(pointer) {
+            return *id;
+        }
+        let id = mir::PointerTypeId(self.pointer_types.len());
+        self.pointer_types.push(mir::PointerType {
+            id,
+            name: pointer.display_with(crate::attributes::metadata_type_name),
+        });
+        self.pointer_ids.insert(pointer.clone(), id);
+        id
+    }
+
     fn class_interface_vtable(
         &self,
         class: ClassId,
@@ -2618,6 +2640,7 @@ fn lower_program_impl(
         interface_types,
         interface_vtables,
         foreign_aggregates,
+        pointer_types,
         ..
     } = collection_registry;
     // Each C-callable Doria function has a C entry (Decision 0148 sections 12
@@ -2687,6 +2710,7 @@ fn lower_program_impl(
         closure_descriptors,
         closure_environment_layouts,
         foreign_aggregates,
+        pointer_types,
         c_entries,
         functions,
         selected_entry,
@@ -2867,9 +2891,16 @@ fn intern_resolved_collection_types(
         }
         ResolvedType::Mixed => mir::Type::Mixed,
         ResolvedType::Foreign(foreign) => {
-            if let crate::foreign::ForeignType::OwnedString(encoding) = foreign.as_ref() {
-                let (kind, key, unit) = foreign_string_key(*encoding);
-                collections.intern(kind, key, unit);
+            match foreign.as_ref() {
+                crate::foreign::ForeignType::OwnedString(encoding) => {
+                    let (kind, key, unit) = foreign_string_key(*encoding);
+                    collections.intern(kind, key, unit);
+                }
+                crate::foreign::ForeignType::Pointer { .. }
+                | crate::foreign::ForeignType::Function(_) => {
+                    collections.intern_pointer(foreign);
+                }
+                _ => {}
             }
             foreign_mir_type(foreign, collections)?
         }
@@ -5658,6 +5689,7 @@ fn lower_try_statement(
                 protected_error,
                 mir::Type::ERROR,
                 catch_ty,
+                Some(&clause.error_type),
                 true,
                 clause.span,
                 context,
@@ -6540,6 +6572,7 @@ fn lower_caught_throw_assertion(
                     caught,
                     mir::Type::ERROR,
                     ty,
+                    None,
                     false,
                     assertion.span,
                     context,
@@ -10923,6 +10956,12 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn native_type_ref(&self, ty: &crate::types::TypeRef) -> Option<mir::Type> {
+        self.mir_resolved_type(&self.lowering_type_ref(ty)?)
+    }
+
+    /// The checked type `ty` names in this instance: type arguments
+    /// substituted and enum names resolved, as `native_type_ref` maps it.
+    fn lowering_type_ref(&self, ty: &crate::types::TypeRef) -> Option<ResolvedType> {
         let resolved = crate::types::resolved_type_ref_with_checked_functions(
             ty,
             &self.type_substitutions,
@@ -10947,8 +10986,59 @@ impl<'semantic> LoweringContext<'semantic> {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let resolved = lowering_nominal_kinds(resolved, &enum_types, &self.collection_registry);
-        self.mir_resolved_type(&resolved)
+        Some(lowering_nominal_kinds(
+            resolved,
+            &enum_types,
+            &self.collection_registry,
+        ))
+    }
+
+    /// The exact `mixed` tag of a value of MIR type `ty` whose checked type
+    /// is `checked`. A pointer's tag names its checked pointer type, which
+    /// its one-word MIR type does not carry.
+    fn mixed_tag(
+        &self,
+        ty: mir::Type,
+        checked: Option<&ResolvedType>,
+        span: Span,
+    ) -> DiagnosticResult<mir::MixedTag> {
+        if ty == foreign::POINTER {
+            let pointer = checked
+                .and_then(|checked| foreign::exact_pointer_type(checked, self))
+                .and_then(|pointer| self.collection_registry.pointer_ids.get(&pointer).copied());
+            return pointer.map(mir::MixedTag::Pointer).ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2201",
+                    "a pointer boxed into or tested against `mixed` has no checked pointer type",
+                    span,
+                )]
+            });
+        }
+        // A C boundary value is the target's integer of its width, and its
+        // tag keeps it distinct from that integer (section 5).
+        if let Some(ResolvedType::Foreign(foreign)) =
+            checked.map(|checked| substitute_resolved_type(checked, &self.type_substitutions))
+        {
+            if let crate::foreign::ForeignType::Boundary(boundary) = *foreign {
+                let tag = mir::MixedTag::Boundary(boundary);
+                if tag.ty() != ty {
+                    return Err(vec![Diagnostic::new(
+                        "I2201",
+                        "a C boundary value has another MIR type than its target integer",
+                        span,
+                    )]);
+                }
+                return Ok(tag);
+            }
+        }
+        mixed_tag_for_type(ty, span)
+    }
+
+    /// The exact tag a flow fact proves the `mixed` local `expr` holds.
+    fn exact_mixed_tag(&self, expr: &hir::Expr) -> Option<mir::MixedTag> {
+        let (_, ty) = self.exact_mixed_local(expr)?;
+        let checked = self.lowering_type_ref(self.flow_fact(expr)?.tested_type()?)?;
+        self.mixed_tag(ty, Some(&checked), expr.span()).ok()
     }
 
     fn lookup_function(&self, name: &str, span: Span) -> DiagnosticResult<FunctionSignature> {
@@ -11980,9 +12070,11 @@ impl ScalarPlace {
                 value: mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)),
             },
             Self::MixedLocal {
-                local, nullable, ..
+                local,
+                tag,
+                nullable,
             } => {
-                let value = mir::MixedExpression::BoxValue(value);
+                let value = mir::MixedExpression::BoxValue { value, tag };
                 mir::Statement::AssignLocal {
                     target: local,
                     value: if nullable {
@@ -12079,10 +12171,16 @@ fn lower_scalar_place(
                         )]);
                     };
                     ensure_local_assignment_ownership(local, *span, context)?;
+                    let Some(tag) = context.exact_mixed_tag(expr) else {
+                        return Err(vec![unsupported(
+                            *span,
+                            "mixed mutation requires an exactly narrowed scalar",
+                        )]);
+                    };
                     Ok((
                         ScalarPlace::MixedLocal {
                             local,
-                            tag: mixed_tag_for_type(mir::Type::Scalar(scalar), *span)?,
+                            tag,
                             nullable: context.local_type(local) == mir::Type::NullableMixed,
                         },
                         scalar,
@@ -16062,6 +16160,7 @@ fn lower_coalesce_rvalue(
             left_local,
             left_type,
             present_type,
+            None,
             result_transfer,
             left.span(),
             context,
@@ -16686,7 +16785,7 @@ fn lower_match_pattern_to_blocks(
                         local: scrutinee,
                         transfer: false,
                     }),
-                    tag: mixed_tag_for_type(narrowed, match_pattern_span(pattern))?,
+                    tag: context.mixed_tag(narrowed, Some(ty), match_pattern_span(pattern))?,
                 },
                 mir::Type::Class(source) => {
                     let mir::Type::Class(target) = narrowed else {
@@ -17058,6 +17157,7 @@ fn bind_match_arm(
                 scrutinee,
                 scrutinee_type,
                 ty,
+                Some(&binding_info.ty),
                 owned,
                 binding.span,
                 context,
@@ -17073,6 +17173,8 @@ fn narrowed_match_local_rvalue(
     local: mir::LocalId,
     source: mir::Type,
     narrowed: mir::Type,
+    // The checked narrowed type, which an exact `mixed` pointer tag needs.
+    checked: Option<&ResolvedType>,
     transfer: bool,
     span: Span,
     context: &LoweringContext,
@@ -17252,7 +17354,7 @@ fn narrowed_match_local_rvalue(
         (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Scalar(target)) => {
             let operand = mir::Operand::MixedPayload {
                 mixed: local,
-                tag: mixed_tag_for_type(mir::Type::Scalar(target), span)?,
+                tag: context.mixed_tag(mir::Type::Scalar(target), checked, span)?,
             };
             match target {
                 mir::ScalarType::Inline(ty) if transfer && ty.requires_owned_cleanup() => {
@@ -17289,6 +17391,12 @@ fn narrowed_match_local_rvalue(
                 function_type,
                 mixed: local,
                 transfer,
+            })
+        }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::ForeignAggregate(ty)) => {
+            mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::MixedPayload {
+                ty,
+                mixed: local,
             })
         }
         (source, target) if source == target => local_rvalue(local, target, transfer),
@@ -18085,7 +18193,7 @@ fn lower_is_condition(
     if let Some(matches) = context
         .semantic_info
         .type_test_type(type_test_span)
-        .and_then(|tested| foreign::pointer_type_test_matches(expr, tested, context))
+        .and_then(|tested| foreign::foreign_type_test_matches(expr, value_type, tested, context))
     {
         let presence = match value_type {
             mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(
@@ -18290,7 +18398,11 @@ fn lower_is_condition(
         }
         mir::Type::Mixed => mir::BoolExpression::MixedIs {
             mixed: Box::new(lower_mixed_expression(expr, false, context)?),
-            tag: mixed_tag_for_type(tested_type, type_test_span)?,
+            tag: context.mixed_tag(
+                tested_type,
+                context.semantic_info.type_test_type(type_test_span),
+                type_test_span,
+            )?,
         },
         mir::Type::NullableMixed => {
             let local = lower_nullable_mixed_local(expr, context)?;
@@ -18307,7 +18419,11 @@ fn lower_is_condition(
                         local,
                         transfer: false,
                     }),
-                    tag: mixed_tag_for_type(tested_type, type_test_span)?,
+                    tag: context.mixed_tag(
+                        tested_type,
+                        context.semantic_info.type_test_type(type_test_span),
+                        type_test_span,
+                    )?,
                 }),
             }
         }
@@ -22864,9 +22980,14 @@ fn lower_mixed_expression(
         mir::Type::Region(_) | mir::Type::NullableRegion(_) => {
             unreachable!("byte region boxing is rejected by semantic lifetime checking")
         }
-        mir::Type::Scalar(_) => Ok(mir::MixedExpression::BoxValue(lower_value_expression(
-            expr, context,
-        )?)),
+        ty @ mir::Type::Scalar(_) => {
+            let checked = context.resolved_expression_type(expr)?;
+            let tag = context.mixed_tag(ty, Some(&checked), expr.span())?;
+            Ok(mir::MixedExpression::BoxValue {
+                value: lower_value_expression(expr, context)?,
+                tag,
+            })
+        }
         mir::Type::String => {
             let value = lower_string_expression(expr, context)?;
             let payload_owned = transfer || !value.is_borrowed_place();
@@ -22950,12 +23071,30 @@ fn lower_mixed_expression(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
-        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
-            Err(vec![crate::unsafe_code::misplaced_aggregate(
-                expr.span(),
-                "a `mixed` value",
-            )])
+        // The box copies the value from a local, so every foreign struct or
+        // union a function handles is held by one of its locals, which the
+        // companion refusal in `crate::unsafe_code` reads.
+        mir::Type::ForeignAggregate(ty) => {
+            let local = match foreign::aggregate_expression(expr, ty, context)? {
+                mir::ForeignAggregateExpression::Local { local, .. } => local,
+                value => {
+                    let local = context.declare_return_temp(mir::Type::ForeignAggregate(ty), false);
+                    context.push_statement(mir::Statement::AssignLocal {
+                        target: local,
+                        value: mir::Rvalue::ForeignAggregate(value),
+                    });
+                    local
+                }
+            };
+            Ok(mir::MixedExpression::BoxForeignAggregate(
+                mir::ForeignAggregateExpression::Local { ty, local },
+            ))
         }
+        mir::Type::NullableForeignAggregate(_) => Err(vec![Diagnostic::unsupported_stage(
+            "M1101",
+            "boxing nullable values into `mixed` lands after Stage 23 Slice 3",
+            expr.span(),
+        )]),
     }
 }
 
@@ -22968,8 +23107,17 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Ok(mir::MixedTag::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Ok(mir::MixedTag::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => Ok(mir::MixedTag::Enum(enum_id)),
+        // A pointer's exact tag names its checked type (`LoweringContext::mixed_tag`).
+        mir::Type::Scalar(mir::ScalarType::Inline(
+            crate::inline_value::InlineValueType::Pointer,
+        )) => Err(vec![Diagnostic::new(
+            "I2201",
+            "a pointer boxed into or tested against `mixed` has no checked pointer type",
+            span,
+        )]),
         mir::Type::Scalar(mir::ScalarType::Inline(ty)) => Ok(mir::MixedTag::Inline(ty)),
         mir::Type::PayloadEnum(ty) => Ok(mir::MixedTag::PayloadEnum(ty)),
+        mir::Type::ForeignAggregate(ty) => Ok(mir::MixedTag::ForeignAggregate(ty)),
         mir::Type::String => Ok(mir::MixedTag::String),
         mir::Type::Interface(interface) => Ok(mir::MixedTag::Interface(interface)),
         mir::Type::SharedReference(_)
@@ -22997,19 +23145,14 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableCollection(_)
         | mir::Type::Collection(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::NullableFunction(_) => Err(vec![Diagnostic::unsupported_stage(
+        | mir::Type::NullableFunction(_)
+        | mir::Type::NullableForeignAggregate(_) => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "this type has no exact runtime `mixed` tag",
             span,
         )]),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments cannot be tested as source values")
-        }
-        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
-            Err(vec![crate::unsafe_code::misplaced_aggregate(
-                span,
-                "a `mixed` value",
-            )])
         }
     }
 }
@@ -29267,12 +29410,16 @@ fn lower_integer_expression(
                             narrowed == mir::Type::Scalar(mir::ScalarType::Integer(ty))
                         }) =>
                 {
+                    // A C boundary value's tag differs from its integer's.
+                    let Some(tag) = context.exact_mixed_tag(expr) else {
+                        return Err(vec![unsupported(
+                            *span,
+                            "a narrowed `mixed` integer has no exact tag",
+                        )]);
+                    };
                     Ok(mir::IntegerExpression::Use {
                         ty,
-                        operand: mir::Operand::MixedPayload {
-                            mixed: local,
-                            tag: mir::MixedTag::Integer(ty),
-                        },
+                        operand: mir::Operand::MixedPayload { mixed: local, tag },
                     })
                 }
                 mir::Type::NullableScalar(mir::ScalarType::Integer(local_ty)) if local_ty == ty => {

@@ -366,6 +366,14 @@ pub(super) fn validate_expression(
                 mir::Type::ForeignAggregate(ty),
             )
         }
+        mir::ForeignAggregateExpression::MixedPayload { mixed, .. } => {
+            validate_mixed_payload_operand(
+                function,
+                *mixed,
+                mir::MixedTag::ForeignAggregate(ty),
+                mir::Type::ForeignAggregate(ty),
+            )
+        }
     }
 }
 

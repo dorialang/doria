@@ -71,6 +71,22 @@ pub struct ErrorOriginId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionTypeId(pub usize);
 
+/// The exact checked type of a data or C function pointer (Decision 0148
+/// sections 3 and 12), which a `mixed` box records so that `is` tests the
+/// access and pointee, or the C signature, exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PointerTypeId(pub usize);
+
+/// A pointer type of the program, interned by its canonical checked type.
+/// MIR carries no pointee: every pointer value is one address word, and the
+/// identity exists only for exact `mixed` tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerType {
+    pub id: PointerTypeId,
+    /// The canonical Doria spelling, such as `WritablePointer<int32>`.
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClosureDescriptorId(pub usize);
 
@@ -101,6 +117,8 @@ pub struct Program {
     pub closure_descriptors: Vec<ClosureDescriptor>,
     pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
     pub foreign_aggregates: Vec<ForeignAggregateDefinition>,
+    /// Every pointer type a `mixed` tag names, by `PointerTypeId`.
+    pub pointer_types: Vec<PointerType>,
     /// The C-callable Doria functions (Decision 0148 section 12). Each has a C
     /// entry under the target's C convention, which checks the calling
     /// thread, links the Call Path to the outbound foreign call in
@@ -130,6 +148,7 @@ impl PartialEq for Program {
             && self.closure_descriptors == other.closure_descriptors
             && self.closure_environment_layouts == other.closure_environment_layouts
             && self.foreign_aggregates == other.foreign_aggregates
+            && self.pointer_types == other.pointer_types
             && self.functions == other.functions
             && self.selected_entry == other.selected_entry
             && self.entry == other.entry
@@ -2271,6 +2290,12 @@ pub enum ForeignAggregateExpression {
         index: Box<Rvalue>,
         index_span: Span,
     },
+    /// A copy of the payload of the `mixed` local `mixed`, which a
+    /// dominating exact `is` proved holds a `ty` value.
+    MixedPayload {
+        ty: ForeignAggregateType,
+        mixed: LocalId,
+    },
 }
 
 impl ForeignAggregateExpression {
@@ -2283,7 +2308,8 @@ impl ForeignAggregateExpression {
             | Self::Call { ty, .. }
             | Self::NullableLocalAssumeNonNull { ty, .. }
             | Self::CollectionIndex { ty, .. }
-            | Self::RegionIndex { ty, .. } => *ty,
+            | Self::RegionIndex { ty, .. }
+            | Self::MixedPayload { ty, .. } => *ty,
         }
     }
 }
@@ -2430,6 +2456,9 @@ impl fmt::Display for ForeignAggregateExpression {
             } => write_collection_index(formatter, *collection, index, *remove),
             Self::RegionIndex { region, index, .. } => {
                 write!(formatter, "copy local{}[{index}]", region.0)
+            }
+            Self::MixedPayload { mixed, .. } => {
+                write!(formatter, "copy payload(local{})", mixed.0)
             }
         }
     }
@@ -5084,6 +5113,15 @@ pub enum MixedTag {
     PayloadEnum(PayloadEnumType),
     Function(FunctionTypeId),
     Inline(crate::inline_value::InlineValueType),
+    /// A data or C function pointer of the exact checked pointer type. Its
+    /// payload is the one-word inline pointer value.
+    Pointer(PointerTypeId),
+    /// A foreign struct or union (Decision 0148 section 6), boxed as a copy
+    /// of its C layout.
+    ForeignAggregate(ForeignAggregateType),
+    /// A C boundary value (Decision 0148 section 5): the target integer of
+    /// its width, distinct from that integer.
+    Boundary(crate::foreign::CBoundaryType),
 }
 
 impl MixedTag {
@@ -5101,6 +5139,13 @@ impl MixedTag {
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
             Self::Function(ty) => Type::Function(ty),
             Self::Inline(ty) => Type::Scalar(ScalarType::Inline(ty)),
+            Self::Pointer(_) => Type::Scalar(ScalarType::Inline(
+                crate::inline_value::InlineValueType::Pointer,
+            )),
+            Self::ForeignAggregate(ty) => Type::ForeignAggregate(ty),
+            Self::Boundary(boundary) => Type::Scalar(ScalarType::Integer(
+                crate::c_layout::CTarget::host().boundary_integer(boundary),
+            )),
         }
     }
 
@@ -5113,6 +5158,9 @@ impl MixedTag {
                 | Self::PayloadEnum(_)
                 | Self::Function(_)
                 | Self::Inline(_)
+                | Self::Pointer(_)
+                | Self::ForeignAggregate(_)
+                | Self::Boundary(_)
         )
     }
 }
@@ -5147,7 +5195,14 @@ pub enum MixedExpression {
         span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
-    BoxValue(ValueExpression),
+    /// A scalar boxed with its exact tag. The tag is the scalar's type,
+    /// except that a pointer's names its checked pointer type.
+    BoxValue {
+        value: ValueExpression,
+        tag: MixedTag,
+    },
+    /// A copy of a foreign struct or union, tagged with its type.
+    BoxForeignAggregate(ForeignAggregateExpression),
     BoxString {
         value: StringExpression,
         payload_owned: bool,
@@ -5194,7 +5249,7 @@ impl MixedExpression {
                     }),
                 ..
             } => MixedOwnership::Owned,
-            Self::BoxValue(_) => MixedOwnership::ShellOnly,
+            Self::BoxValue { .. } | Self::BoxForeignAggregate(_) => MixedOwnership::ShellOnly,
             Self::BoxPayloadEnum { .. } => MixedOwnership::Owned,
             Self::BoxString { payload_owned, .. }
             | Self::BoxClass { payload_owned, .. }
@@ -8382,7 +8437,8 @@ fn foreign_aggregate_class_temporary_capacity(value: &ForeignAggregateExpression
         ForeignAggregateExpression::Local { .. }
         | ForeignAggregateExpression::Property { .. }
         | ForeignAggregateExpression::Static { .. }
-        | ForeignAggregateExpression::NullableLocalAssumeNonNull { .. } => 0,
+        | ForeignAggregateExpression::NullableLocalAssumeNonNull { .. }
+        | ForeignAggregateExpression::MixedPayload { .. } => 0,
     }
 }
 
@@ -8790,7 +8846,10 @@ fn nullable_weak_class_temporary_capacity(value: &NullableWeakReferenceExpressio
 
 fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
     match value {
-        MixedExpression::BoxValue(value) => value_class_temporary_capacity(value),
+        MixedExpression::BoxValue { value, .. } => value_class_temporary_capacity(value),
+        MixedExpression::BoxForeignAggregate(value) => {
+            foreign_aggregate_class_temporary_capacity(value)
+        }
         MixedExpression::BoxString { value, .. } => string_class_temporary_capacity(value),
         MixedExpression::BoxClass { value, .. } => class_expression_temporary_capacity(value),
         MixedExpression::BoxInterface { value, .. } => {
@@ -10436,6 +10495,9 @@ impl fmt::Display for MixedTag {
             Self::Class(class) => write!(formatter, "class#{}", class.0),
             Self::Interface(interface) => write!(formatter, "interface#{}", interface.0),
             Self::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
+            Self::Pointer(ty) => write!(formatter, "pointer-type#{}", ty.0),
+            Self::ForeignAggregate(ty) => write!(formatter, "foreign-aggregate#{}", ty.id.0),
+            Self::Boundary(boundary) => write!(formatter, "c-boundary:{boundary:?}"),
         }
     }
 }
@@ -10458,7 +10520,8 @@ impl fmt::Display for MixedExpression {
                 object.0, property.class.0, property.index
             ),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
-            Self::BoxValue(value) => write!(formatter, "mixed({value})"),
+            Self::BoxValue { value, tag } => write!(formatter, "mixed<{tag}>({value})"),
+            Self::BoxForeignAggregate(value) => write!(formatter, "mixed({value})"),
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxFunction { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),

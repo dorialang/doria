@@ -356,6 +356,84 @@ function main(): void
     assert_runs_natively(&source, "7");
 }
 
+/// A `mixed` box records the exact type of what it holds (Decision 0148
+/// sections 3, 5, 6 and 12): `is` tells pointers apart by access and
+/// pointee, C function pointers by signature, a C boundary value from the
+/// integer of its width, and foreign structs and unions by declaration,
+/// both when the value is boxed and when it is tested directly.
+#[test]
+fn mixed_tags_name_foreign_types_exactly() {
+    let source = format!(
+        "use Doria\\Std\\Ffi\\{{CLong, Pointer, WritablePointer}};
+{AGGREGATES}
+extern \"C\" struct Shade
+{{
+    uint8 $red;
+    uint8 $green;
+    uint8 $blue;
+    uint8 $alpha = 255;
+}}
+
+extern \"C\" function twice(int32 $value): int32
+{{
+    return $value * 2;
+}}
+
+function describe(mixed $value): string
+{{
+    if ($value is Color) {{
+        return \"color \" . $value->green;
+    }}
+    if ($value is Shade) {{
+        return \"shade \" . $value->blue;
+    }}
+    if ($value is WritablePointer<int32>) {{
+        return \"writable\";
+    }}
+    if ($value is Pointer<int32>) {{
+        return \"pointer \" . unsafe($value->read());
+    }}
+    if ($value is extern \"C\" function(int32): int32) {{
+        return \"callback \" . unsafe($value(21));
+    }}
+    if ($value is int64) {{
+        return \"int64 \" . $value;
+    }}
+    if ($value is CLong) {{
+        return \"long \" . Int64::from($value);
+    }}
+    return \"other\";
+}}
+
+function main(): void
+{{
+    writable int32 $number = 7;
+    echo describe(new Color(red: 1, green: 2, blue: 3)) . \" \";
+    echo describe(new Shade(red: 4, green: 5, blue: 6)) . \" \";
+    mixed $box = new Color(red: 9, green: 8, blue: 7);
+    if ($box is Color) {{
+        Color $copy = $box;
+        echo $copy->blue . \" \";
+    }}
+    unsafe {{
+        echo describe(Pointer::to($number)) . \" \";
+        echo describe(WritablePointer::to($number)) . \" \";
+        echo describe(Pointer::cast<uint8>(Pointer::to($number))) . \" \";
+    }}
+    echo describe(twice) . \" \";
+    echo describe(CLong::from(5)) . \" \" . describe(6) . \" \";
+    let $long = CLong::from(8);
+    int64 $plain = 8;
+    echo ($long is int64) . \" \" . ($plain is CLong) . \" \" . ($long is CLong);
+}}
+"
+    );
+    assert_runs_natively(
+        &source,
+        "color 2 shade 6 7 pointer 7 writable other callback 42 long 5 int64 6 false false true",
+    );
+}
+
 #[test]
 fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
     for body in [
@@ -895,22 +973,6 @@ fn foreign_aggregates_report_where_they_cannot_be_built_yet() {
             "{body}: {diagnostics:#?}"
         );
     }
-    let boxed = format!(
-        "{AGGREGATES}function main(): void {{ mixed $value = new Color(red: 1, green: 2, blue: 3); }}"
-    );
-    let diagnostics = doriac::compile_source(
-        "stage40.doria",
-        boxed,
-        doriac::backend::BackendTarget::Native,
-    )
-    .expect_err("a foreign aggregate cannot be boxed as `mixed` yet");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Foreign Aggregates Cannot Be Built Here Yet"),
-        "{diagnostics:#?}"
-    );
 }
 
 /// A collection stores foreign structs and unions inline in its element
@@ -1109,6 +1171,27 @@ fn the_interpreter_and_php_output_report_foreign_aggregates() {
         "{debug:#?}"
     );
     let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+        .expect_err("PHP output takes the C data model through the companion");
+    assert!(
+        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
+        "{php:#?}"
+    );
+    // A value boxed as `mixed` is one too, and so is the box's test.
+    let boxed = format!(
+        "{AGGREGATES}function main(): void {{ mixed $value = new Color(red: 1, green: 2, blue: 3); echo $value is Color; }}"
+    );
+    let debug = doriac::compile_source(
+        "stage40.doria",
+        boxed.clone(),
+        doriac::backend::BackendTarget::Debug,
+    )
+    .expect_err("the interpreter runs foreign aggregates through the companion");
+    assert!(
+        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
+            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
+        "{debug:#?}"
+    );
+    let php = doriac::compile_source("stage40.doria", boxed, doriac::backend::BackendTarget::Php)
         .expect_err("PHP output takes the C data model through the companion");
     assert!(
         php.iter().any(|diagnostic| diagnostic.code == "E0784"),

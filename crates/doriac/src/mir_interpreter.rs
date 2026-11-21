@@ -456,7 +456,12 @@ enum EvaluationValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MixedValue {
     Null,
-    Scalar(mir::ScalarValue),
+    /// A scalar with the exact tag it was boxed with, which names a
+    /// pointer's checked type as the native box does.
+    Scalar {
+        value: mir::ScalarValue,
+        tag: mir::MixedTag,
+    },
     String(SharedString),
     Class {
         object: usize,
@@ -486,13 +491,7 @@ impl MixedValue {
     fn tag(&self) -> Option<mir::MixedTag> {
         match self {
             Self::Null => None,
-            Self::Scalar(mir::ScalarValue::Bool(_)) => Some(mir::MixedTag::Bool),
-            Self::Scalar(mir::ScalarValue::Integer(value)) => {
-                Some(mir::MixedTag::Integer(value.ty))
-            }
-            Self::Scalar(mir::ScalarValue::Float(value)) => Some(mir::MixedTag::Float(value.ty)),
-            Self::Scalar(mir::ScalarValue::Enum(value)) => Some(mir::MixedTag::Enum(value.enum_id)),
-            Self::Scalar(mir::ScalarValue::Inline(value)) => Some(mir::MixedTag::Inline(value.ty)),
+            Self::Scalar { tag, .. } => Some(*tag),
             Self::String(_) => Some(mir::MixedTag::String),
             Self::Class { class, .. } => Some(mir::MixedTag::Class(*class)),
             Self::PayloadEnum { value, .. } => Some(mir::MixedTag::PayloadEnum(value.ty)),
@@ -828,7 +827,7 @@ enum EvaluationTask {
         interface: mir::InterfaceTypeId,
         nullable: bool,
     },
-    BuildMixedValue,
+    BuildMixedValue(mir::MixedTag),
     BuildMixedString,
     BuildMixedClass(bool),
     BuildMixedPayloadEnum,
@@ -5600,9 +5599,9 @@ impl<'a> Interpreter<'a> {
                 };
                 self.push_nullable_error(interface, value)?;
             }
-            EvaluationTask::BuildMixedValue => {
+            EvaluationTask::BuildMixedValue(tag) => {
                 let value = self.pop_scalar()?;
-                self.push_mixed(MixedValue::Scalar(value))?;
+                self.push_mixed(MixedValue::Scalar { value, tag })?;
             }
             EvaluationTask::BuildMixedString => {
                 let value = self.pop_string()?;
@@ -8532,11 +8531,12 @@ impl<'a> Interpreter<'a> {
                     span,
                 )?;
             }
-            mir::MixedExpression::BoxValue(value) => {
+            mir::MixedExpression::BoxValue { value, tag } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::BuildMixedValue);
+                frame.tasks.push(EvaluationTask::BuildMixedValue(tag));
                 frame.tasks.push(EvaluationTask::Value(value));
             }
+            mir::MixedExpression::BoxForeignAggregate(_) => return Err(foreign_aggregate_refusal()),
             mir::MixedExpression::BoxString { value, .. } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::BuildMixedString);
@@ -16818,7 +16818,7 @@ impl<'a> Interpreter<'a> {
                         "MIR mixed scalar payload observed another tag",
                     ));
                 }
-                let MixedValue::Scalar(value) = value else {
+                let MixedValue::Scalar { value, .. } = value else {
                     return Err(InterpreterError::new(
                         "MIR mixed scalar payload observed non-scalar payload",
                     ));
@@ -19412,7 +19412,7 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
         | MixedValue::Function { owner, .. } => {
             owner.set(owner.get().saturating_add(1));
         }
-        MixedValue::Null | MixedValue::Scalar(_) | MixedValue::String(_) => {}
+        MixedValue::Null | MixedValue::Scalar { .. } | MixedValue::String(_) => {}
     }
 }
 

@@ -613,6 +613,7 @@ fn void_program() -> Program {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
         c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),

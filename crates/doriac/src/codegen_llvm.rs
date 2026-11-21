@@ -59,14 +59,15 @@ use crate::native_abi::{
     COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, ERROR_ASSERTION_PRESENTATION, FLOAT_PARSE,
     FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED,
     MIXED_FREE, MIXED_NEW, MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED,
-    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
-    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INLINE, MIXED_TAG_INT16,
+    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_BOUNDARY,
+    MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64,
+    MIXED_TAG_FOREIGN_AGGREGATE, MIXED_TAG_FUNCTION, MIXED_TAG_INLINE, MIXED_TAG_INT16,
     MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_INTERFACE, MIXED_TAG_PAYLOAD_ENUM,
-    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
-    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
-    READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_PAYLOAD, SHARED_PAYLOAD_DESCRIPTOR,
-    SHARED_RELEASE, SHARED_RELEASE_WEAK, STRING_ASSERTION_DIFFERENCE, STRING_ASSERTION_QUOTE,
-    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    MIXED_TAG_POINTER, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_PAYLOAD,
+    SHARED_PAYLOAD_DESCRIPTOR, SHARED_RELEASE, SHARED_RELEASE_WEAK, STRING_ASSERTION_DIFFERENCE,
+    STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_DISPLAY_WIDTH,
     STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL,
     STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
@@ -11591,6 +11592,42 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
                 Ok(destination)
             }
+            // The payload is copied out of the box, which a later
+            // replacement of the `mixed` local releases.
+            mir::ForeignAggregateExpression::MixedPayload { ty, mixed } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let i64_type = self.context.i64_type();
+                let mixed = build(self.builder.build_load(
+                    pointer,
+                    local_slot(&self.local_slots, *mixed)?,
+                    "mixed.aggregate.local",
+                ))?
+                .into_pointer_value();
+                let payload = self
+                    .call_runtime(
+                        MIXED_PAYLOAD,
+                        &[pointer.into()],
+                        Some(i64_type.into()),
+                        &[mixed.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("mixed payload read produced no result"))?
+                    .into_int_value();
+                let address = build(self.builder.build_int_to_ptr(
+                    payload,
+                    pointer,
+                    "mixed.aggregate.address",
+                ))?;
+                let destination = self.entry_foreign_aggregate_alloca(*ty, "foreign.payload")?;
+                self.copy_memory_value(
+                    destination,
+                    address,
+                    native_closure_abi::NativeLayout {
+                        size: ty.size,
+                        align: ty.align,
+                    },
+                )?;
+                Ok(destination)
+            }
         }
     }
 
@@ -20407,6 +20444,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::MixedTag::Inline(ty) => (MIXED_TAG_INLINE, ty.type_id()),
             mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
             mir::MixedTag::Function(ty) => (MIXED_TAG_FUNCTION, ty.0 as u32),
+            mir::MixedTag::Pointer(ty) => (MIXED_TAG_POINTER, ty.0 as u32),
+            mir::MixedTag::Boundary(boundary) => (MIXED_TAG_BOUNDARY, boundary as u32),
+            mir::MixedTag::ForeignAggregate(ty) => (MIXED_TAG_FOREIGN_AGGREGATE, ty.id.0 as u32),
         }
     }
 
@@ -20517,16 +20557,42 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call_at(*function, args, true, *span)?
                 .ok_or_else(|| malformed_mir("mixed call produced no result"))?
                 .into_pointer_value()),
-            mir::MixedExpression::BoxValue(value) => {
-                let tag = match value.ty() {
-                    mir::ScalarType::Bool => mir::MixedTag::Bool,
-                    mir::ScalarType::Integer(ty) => mir::MixedTag::Integer(ty),
-                    mir::ScalarType::Float(ty) => mir::MixedTag::Float(ty),
-                    mir::ScalarType::Enum(enum_id) => mir::MixedTag::Enum(enum_id),
-                    mir::ScalarType::Inline(ty) => mir::MixedTag::Inline(ty),
-                };
+            mir::MixedExpression::BoxValue { value, tag } => {
                 let payload = self.lower_value_expression(value)?;
-                self.lower_mixed_box(tag, payload, false)
+                self.lower_mixed_box(*tag, payload, false)
+            }
+            // The box copies the C layout from the value's address.
+            mir::MixedExpression::BoxForeignAggregate(value) => {
+                let ty = value.ty();
+                let source = self.lower_foreign_aggregate_expression(value)?;
+                let (tag, type_id) = self.mixed_tag_value(mir::MixedTag::ForeignAggregate(ty));
+                let i8_type = self.context.i8_type();
+                let i32_type = self.context.i32_type();
+                let i64_type = self.context.i64_type();
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                Ok(self
+                    .call_runtime(
+                        MIXED_NEW_AGGREGATE_BORROWED,
+                        &[
+                            i8_type.into(),
+                            i32_type.into(),
+                            pointer.into(),
+                            i64_type.into(),
+                            i64_type.into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            i8_type.const_int(u64::from(tag), false).into(),
+                            i32_type.const_int(u64::from(type_id), false).into(),
+                            source.into(),
+                            i64_type.const_int(u64::from(ty.size), false).into(),
+                            i64_type.const_int(u64::from(ty.align), false).into(),
+                        ],
+                    )?
+                    .ok_or_else(|| {
+                        backend_failure("mixed foreign aggregate allocation produced no result")
+                    })?
+                    .into_pointer_value())
             }
             mir::MixedExpression::BoxString {
                 value,
@@ -24408,12 +24474,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 Ok(self.nullable_parts(value)?.1.into_int_value())
             }
             mir::Operand::MixedPayload { mixed, tag } => {
-                let mir::MixedTag::Integer(integer) = tag else {
-                    return Err(malformed_mir("integer mixed payload uses non-integer tag"));
-                };
-                if *integer != ty {
+                // A C boundary value's tag names its boundary type, whose
+                // payload is the target integer.
+                if tag.ty() != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
                     return Err(malformed_mir(
-                        "integer mixed payload uses another integer type",
+                        "integer mixed payload uses another type's tag",
                     ));
                 }
                 Ok(self.lower_mixed_payload(*mixed, *tag)?.into_int_value())
@@ -26733,7 +26798,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .lower_collection_key_at(*index_span, *collection, offset, expected)?
                     .into_int_value())
             }
-            mir::Operand::MixedPayload { mixed, tag } if *tag == mir::MixedTag::Inline(ty) => {
+            // A pointer's tag names its checked type; its payload is the
+            // inline word.
+            mir::Operand::MixedPayload { mixed, tag }
+                if tag.ty() == mir::Type::Scalar(mir::ScalarType::Inline(ty)) =>
+            {
                 Ok(self.lower_mixed_payload(*mixed, *tag)?.into_int_value())
             }
             _ => Err(malformed_mir(

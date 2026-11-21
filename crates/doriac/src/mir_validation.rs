@@ -9205,8 +9205,18 @@ fn validate_mixed_expression(
             }
             validate_call_args(program, function, callee, args)
         }
-        mir::MixedExpression::BoxValue(value) => {
+        mir::MixedExpression::BoxValue { value, tag } => {
+            validate_mixed_tag(program, *tag)?;
+            if tag.ty() != mir::Type::Scalar(value.ty()) {
+                return Err(malformed_mir(format!(
+                    "a {} value is boxed with the mixed tag {tag}",
+                    value.ty()
+                )));
+            }
             validate_value_expression(program, function, value)
+        }
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            foreign_aggregates::validate_expression(program, function, value)
         }
         mir::MixedExpression::BoxString {
             value,
@@ -11803,7 +11813,8 @@ fn infer_mixed_expression_return_borrow(
             return_borrow: None,
             ..
         }
-        | mir::MixedExpression::BoxValue(_)
+        | mir::MixedExpression::BoxValue { .. }
+        | mir::MixedExpression::BoxForeignAggregate(_)
         | mir::MixedExpression::BoxString { .. }
         | mir::MixedExpression::BoxClass { .. }
         | mir::MixedExpression::BoxInterface { .. }
@@ -13135,6 +13146,9 @@ fn collect_foreign_aggregate_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(index, accesses);
             accesses.contents_access(*region, false);
         }
+        mir::ForeignAggregateExpression::MixedPayload { ty, mixed } => {
+            accesses.assume_mixed_tag(*mixed, mir::MixedTag::ForeignAggregate(*ty))
+        }
     }
 }
 
@@ -13713,8 +13727,11 @@ fn collect_mixed_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::MixedExpression::BoxValue(value) => {
+        mir::MixedExpression::BoxValue { value, .. } => {
             collect_value_class_local_accesses(value, accesses)
+        }
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            collect_foreign_aggregate_class_local_accesses(value, accesses)
         }
         mir::MixedExpression::BoxString { value, .. } => {
             collect_string_class_local_accesses(value, accesses)
@@ -21281,7 +21298,8 @@ fn foreign_aggregate_observes_property(
         }
         mir::ForeignAggregateExpression::Local { .. }
         | mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { .. }
-        | mir::ForeignAggregateExpression::Static { .. } => false,
+        | mir::ForeignAggregateExpression::Static { .. }
+        | mir::ForeignAggregateExpression::MixedPayload { .. } => false,
     }
 }
 
@@ -21890,7 +21908,12 @@ fn mixed_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::MixedExpression::BoxValue(value) => value_observes_property(value, receiver, property),
+        mir::MixedExpression::BoxValue { value, .. } => {
+            value_observes_property(value, receiver, property)
+        }
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            foreign_aggregate_observes_property(value, receiver, property)
+        }
         mir::MixedExpression::BoxString { value, .. } => {
             string_observes_property(value, receiver, property)
         }
@@ -24002,20 +24025,7 @@ fn validate_condition(
         }
         mir::BoolExpression::MixedIs { mixed, tag } => {
             validate_mixed_expression(program, function, mixed)?;
-            validate_type(program, tag.ty())?;
-            if let mir::MixedTag::Class(class) = tag {
-                class_in(program, *class)?;
-            }
-            if let mir::MixedTag::Enum(enum_id) = tag {
-                enum_in(program, *enum_id)?;
-            }
-            if let mir::MixedTag::PayloadEnum(payload) = tag {
-                validate_payload_enum_type(program, *payload)?;
-            }
-            if let mir::MixedTag::Function(function_type) = tag {
-                function_type_in(program, *function_type)?;
-            }
-            Ok(())
+            validate_mixed_tag(program, *tag)
         }
         mir::BoolExpression::Not(condition) => validate_condition(program, function, condition),
         mir::BoolExpression::Binary { left, right, .. } => {
@@ -25431,6 +25441,48 @@ fn function_in(
         .get(id.0)
         .filter(|function| function.id == id)
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
+}
+
+/// A `mixed` tag names a type of the program exactly. A pointer's tag
+/// names its checked pointer type; the bare inline pointer tag would make
+/// every pointer type test match every other.
+fn validate_mixed_tag(program: &mir::Program, tag: mir::MixedTag) -> Result<(), BackendError> {
+    validate_type(program, tag.ty())?;
+    match tag {
+        mir::MixedTag::Class(class) => {
+            class_in(program, class)?;
+        }
+        mir::MixedTag::Enum(enum_id) => {
+            enum_in(program, enum_id)?;
+        }
+        mir::MixedTag::PayloadEnum(payload) => {
+            validate_payload_enum_type(program, payload)?;
+        }
+        mir::MixedTag::Function(function_type) => {
+            function_type_in(program, function_type)?;
+        }
+        mir::MixedTag::Pointer(id) => {
+            program
+                .pointer_types
+                .get(id.0)
+                .filter(|pointer| pointer.id == id)
+                .ok_or_else(|| malformed_mir(format!("pointer type#{} does not exist", id.0)))?;
+        }
+        mir::MixedTag::Inline(crate::inline_value::InlineValueType::Pointer) => {
+            return Err(malformed_mir(
+                "a pointer `mixed` tag must name its checked pointer type",
+            ));
+        }
+        mir::MixedTag::Bool
+        | mir::MixedTag::Integer(_)
+        | mir::MixedTag::Float(_)
+        | mir::MixedTag::String
+        | mir::MixedTag::Interface(_)
+        | mir::MixedTag::Inline(_)
+        | mir::MixedTag::ForeignAggregate(_)
+        | mir::MixedTag::Boundary(_) => {}
+    }
+    Ok(())
 }
 
 fn function_type_in(

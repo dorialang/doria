@@ -309,6 +309,7 @@ pub(super) fn nullable_expression(
                         source,
                         source_type,
                         present_type,
+                        None,
                         false,
                         *span,
                         context,

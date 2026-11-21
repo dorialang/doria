@@ -625,6 +625,13 @@ pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
 pub const MIXED_TAG_INTERFACE: u8 = 16;
 pub const MIXED_TAG_FUNCTION: u8 = 17;
 pub const MIXED_TAG_INLINE: u8 = 18;
+/// A data or C function pointer; the type id is its `PointerTypeId`.
+pub const MIXED_TAG_POINTER: u8 = 19;
+/// A foreign struct or union, boxed as a copy of its C layout; the type id is
+/// its `ForeignAggregateId`.
+pub const MIXED_TAG_FOREIGN_AGGREGATE: u8 = 20;
+/// A C boundary value; the type id is its `CBoundaryType` position.
+pub const MIXED_TAG_BOUNDARY: u8 = 21;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     if ty.shared_interface().is_some() {

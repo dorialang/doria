@@ -239,6 +239,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
         c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
@@ -953,6 +954,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
         c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
@@ -1650,6 +1652,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
         c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
@@ -3249,6 +3252,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
         c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),

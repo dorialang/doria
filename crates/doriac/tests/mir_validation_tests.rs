@@ -3185,9 +3185,10 @@ function main(): void
     );
 
     let mut mixed_identity = valid;
-    let Rvalue::Mixed(MixedExpression::BoxValue(ValueExpression::Enum(EnumExpression::Case(
-        value,
-    )))) = assignment_rvalue(&mut mixed_identity, "boxed")
+    let Rvalue::Mixed(MixedExpression::BoxValue {
+        value: ValueExpression::Enum(EnumExpression::Case(value)),
+        ..
+    }) = assignment_rvalue(&mut mixed_identity, "boxed")
     else {
         panic!("expected mixed enum box");
     };
@@ -4980,15 +4981,16 @@ fn shared_validator_requires_exact_is_proof_for_mixed_payload_reads() {
         .statements
         .push(Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Mixed(doriac::mir::MixedExpression::BoxValue(
-                ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
+            value: Rvalue::Mixed(doriac::mir::MixedExpression::BoxValue {
+                value: ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
                     ty: IntegerType::Int64,
                     operand: Operand::Scalar(ScalarValue::Integer(IntegerValue::from_bits(
                         IntegerType::Int64,
                         1,
                     ))),
                 }),
-            )),
+                tag: doriac::mir::MixedTag::Integer(IntegerType::Int64),
+            }),
         });
     program.functions[0].blocks[0].terminator = Terminator::Return(Rvalue::Value(
         ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
@@ -8721,6 +8723,7 @@ fn valid_void_program() -> Program {
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
         foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
         c_entries: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),

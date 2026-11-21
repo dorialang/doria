@@ -43,7 +43,7 @@ fn misplaced_aggregate_text(position: &str) -> (&'static str, String) {
     (
         "Foreign Aggregates Cannot Be Built Here Yet",
         format!(
-            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions and their nullable forms as locals, parameters, results, pointer targets, properties, constants and enum payloads, and not here yet"
+            "a foreign struct or union in {position} is part of Doria; this compiler builds foreign structs and unions and their nullable forms as locals, parameters, results, pointer targets, properties, constants, enum payloads and collection and region elements, and foreign structs and unions as `mixed` values, and not here yet"
         ),
     )
 }

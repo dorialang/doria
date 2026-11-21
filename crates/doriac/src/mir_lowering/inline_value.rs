@@ -272,10 +272,13 @@ pub(super) fn lower_expression_with_ownership(
                         .exact_mixed_local(expr)
                         .is_some_and(|(_, actual)| actual == expected) =>
                 {
-                    mir::Operand::MixedPayload {
-                        mixed: local,
-                        tag: mir::MixedTag::Inline(ty),
-                    }
+                    let Some(tag) = context.exact_mixed_tag(expr) else {
+                        return Err(vec![unsupported(
+                            expr.span(),
+                            "a narrowed `mixed` inline value has no exact tag",
+                        )]);
+                    };
+                    mir::Operand::MixedPayload { mixed: local, tag }
                 }
                 _ => {
                     return Err(vec![unsupported(
