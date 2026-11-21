@@ -58,7 +58,16 @@ fn completion_source() -> String {
         r#"use Doria\Std\Io\{{ReadTransferKey, WriteTransferKey, ReadOutcome, WriteOutcome,
     TransferCompletion, TransferWaitResult}};
 {COMPLETION_HELPERS}
-function main(): void {{}}"#
+function main(): void {{
+    let $reach = function(ReadTransferKey $read, WriteTransferKey $write, TransferWaitResult $result): void {{
+        let $madeRead = makeRead($read, null);
+        let $madeWrite = makeWrite($write, null);
+        let $copied = copyResult($result);
+        let $readMatches = verifyRead($result, $read, null);
+        let $writeMatches = verifyWrite($result, $write, null);
+        let $kept = optional($result);
+    }};
+}}"#
     )
 }
 

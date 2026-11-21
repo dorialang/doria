@@ -2803,6 +2803,106 @@ fn dynamic_dispatch_through_an_interface_reaches_constructed_classes() {
     assert!(!contents.contains("hexagonArea"), "{contents}");
 }
 
+/// Reachable code that dispatches through a conformance of a class nothing
+/// constructs: iteration, display conversion, equality, hashing and
+/// ordering of class-typed values. Naming each class reaches its interface
+/// implementations and their witnesses, and nothing else of it.
+const NAMED_CONFORMANCES: &str = r#"
+class Cursor implements Iterator<int>
+{
+    writable int $position = 0;
+    function hasCurrent(): bool { return $this->position < 2; }
+    function getCurrent(): int { return $this->position; }
+    writable function advance(): void { $this->position = $this->position + 1; }
+}
+
+class Counter implements Iterable<int>
+{
+    function iterator(): Iterator<int> { return new Cursor(); }
+    function unused(): int { return 1; }
+}
+
+class Label implements Displayable
+{
+    function toString(): string { return "label"; }
+}
+
+class Key implements Comparable<Key>, Equatable<Key>, Hashable
+{
+    function __construct(int $value) {}
+    function compare(Key $other): Ordering { return Ordering::Equal; }
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function hash(): uint64 { return 7; }
+}
+
+function total(Counter $counter): int
+{
+    writable int $sum = 0;
+    foreach ($counter as int $value) { $sum += $value; }
+    return $sum;
+}
+
+function show(Label $label): string { return "{$label}"; }
+function same(Key $left, Key $right): bool { return $left == $right; }
+function distinct(take Key $key): int
+{
+    writable Set<Key> $set = Set::from([]);
+    let $added = $set->add($key);
+    return $set->count;
+}
+function ordered(take Key $key): int
+{
+    writable SortedSet<Key> $sorted = SortedSet::from([]);
+    let $added = $sorted->add($key);
+    return $sorted->count;
+}
+
+function main(): void
+{
+    let $reach = function(Counter $counter, Label $label, Key $left, Key $right,
+        take Key $hashed, take Key $sorted): void {
+        let $sum = total($counter);
+        let $text = show($label);
+        let $equal = same($left, $right);
+        let $count = distinct($hashed);
+        let $sortedCount = ordered($sorted);
+    };
+    echo "ok";
+}
+"#;
+
+#[test]
+fn naming_a_class_reaches_its_interface_implementations() {
+    let mir = program(NAMED_CONFORMANCES);
+    for (class, witnesses) in [
+        ("Counter", &["::iterator"][..]),
+        ("Label", &["::toString"][..]),
+        ("Key", &["::compare", "::equals", "::hash"][..]),
+    ] {
+        let emitted = emitted_functions(&mir, class);
+        for witness in witnesses {
+            assert!(
+                emitted.iter().any(|name| name.ends_with(witness)),
+                "{class}{witness}: {emitted:?}"
+            );
+        }
+        assert!(
+            !emitted
+                .iter()
+                .any(|name| name.ends_with("::__construct") || name.ends_with("::unused")),
+            "{class}: {emitted:?}"
+        );
+        let definition = mir
+            .classes
+            .iter()
+            .find(|definition| definition.name == class)
+            .unwrap();
+        assert!(!definition.constructed && definition.implementations_reached);
+    }
+    assert_runs_everywhere(NAMED_CONFORMANCES, "ok");
+    assert_php_prints(NAMED_CONFORMANCES, "ok");
+}
+
 /// PHP output of `source` prints `stdout` when PHP is installed; returns the
 /// generated PHP.
 fn assert_php_prints(source: &str, stdout: &str) -> String {

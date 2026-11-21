@@ -526,19 +526,10 @@ impl NativeTypeRegistry {
                 // collection implementations remain a separate core-operation beat.
                 continue;
             };
-            // A class reachable code never constructs has no value to erase,
-            // and its methods are not emitted; its Error implementation still
-            // identifies it in reports and catches when reachable code names
-            // it (Decision 0148 section 17).
-            let emitted =
-                if conformance.interface == crate::types::InterfaceType::new("Error", Vec::new()) {
-                    semantic_info
-                        .reachable
-                        .reaches_error_implementation(&class.name)
-                } else {
-                    semantic_info.reachable.constructs(&class.name)
-                };
-            if !emitted {
+            // Reachable code dispatches through a conformance of a class it
+            // constructs or names as a type; another class has none
+            // (Decision 0148 section 17).
+            if !semantic_info.reachable.reaches_implementations(&class.name) {
                 continue;
             }
             let Some(class) = classes.get(class).copied() else {
@@ -2536,6 +2527,10 @@ fn lower_program_impl(
                     .semantic_info
                     .reachable
                     .constructs(&class.declaration_name),
+                implementations_reached: program
+                    .semantic_info
+                    .reachable
+                    .reaches_implementations(&class.declaration_name),
                 parent: class.parent.as_ref().and_then(|parent| class_ids.get(parent)).copied(),
                 ancestors: class
                     .ancestors

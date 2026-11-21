@@ -910,11 +910,11 @@ fn validate_interface_metadata(program: &mir::Program) -> Result<(), BackendErro
                         "interface vtable Error metadata does not belong to its implementing type",
                     ));
                 }
-                // An unconstructed class has no value to erase; only its Error
-                // implementation identifies it in reports and catches.
-                if !class.constructed && table.interface != mir::InterfaceTypeId::ERROR {
+                // Only a class reachable code constructs or names has its
+                // interface implementations emitted.
+                if !class.implementations_reached {
                     return Err(malformed_mir(
-                        "interface vtable implements a class that is never constructed",
+                        "interface vtable implements a class whose implementations are unreachable",
                     ));
                 }
             }
@@ -1545,6 +1545,15 @@ fn validate_class(
     if class.constructed && parent.is_some_and(|parent| !parent.constructed) {
         return Err(malformed_mir(format!(
             "class#{} is constructed but its parent is not",
+            class.id.0
+        )));
+    }
+    if (class.constructed && !class.implementations_reached)
+        || (class.implementations_reached
+            && parent.is_some_and(|parent| !parent.implementations_reached))
+    {
+        return Err(malformed_mir(format!(
+            "class#{} reaches its interface implementations without its own construction or its parent's implementations",
             class.id.0
         )));
     }

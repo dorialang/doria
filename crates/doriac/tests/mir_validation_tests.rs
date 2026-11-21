@@ -285,6 +285,7 @@ function main(): void {
     let $source = new CancellationSource();
     List<Held> $tokens = [Held::Token($source->token); 2];
     visit($tokens);
+    inspect(null);
 }
 "#,
     )
@@ -639,10 +640,9 @@ class Key implements Hashable, Equatable<Key>, Comparable<Key>
     function compare(Key $other): Ordering {{ return Ordering::Equal; }}
 }}
 function inspect(writable {type_name} $items): void {{}}
-function main(): void {{}}
 "#
         );
-        let mut valid = doriac::lower_source_to_mir(
+        let mut valid = doriac::lower_library_source_to_mir(
             "core-collection-view-capability.doria",
             source,
         )
@@ -1007,10 +1007,9 @@ fn unused_move_returns_cannot_erase_or_forge_their_borrow_contract() {
     ] {
         let source = format!(
             "class Book {{}}\n\
-             function first({input} $source, int $other): {output} {{ return {value}; }}\n\
-             function main(): void {{}}"
+             function first({input} $source, int $other): {output} {{ return {value}; }}"
         );
-        let program = doriac::lower_source_to_mir("unused-return-borrow.doria", &source)
+        let program = doriac::lower_library_source_to_mir("unused-return-borrow.doria", &source)
             .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
         doriac::mir_validation::validate_program(&program).unwrap();
         let first = program
@@ -1080,11 +1079,11 @@ fn collection_removal_returns_owned_values_without_borrowing_the_container() {
                  enum Parcel {{ case Item(Book $book); }}\n\
                  function remove(writable {collection} $source): {output} {{\n\
                      return $source->{operation};\n\
-                 }}\n\
-                 function main(): void {{}}"
+                 }}"
             );
-            let program = doriac::lower_source_to_mir("owned-removal-return.doria", &source)
-                .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+            let program =
+                doriac::lower_library_source_to_mir("owned-removal-return.doria", &source)
+                    .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
             doriac::mir_validation::validate_program(&program)
                 .unwrap_or_else(|error| panic!("{source}\n{error:#?}"));
             let remove = program
@@ -1110,7 +1109,7 @@ fn collection_removal_returns_owned_values_without_borrowing_the_container() {
 
 #[test]
 fn nullable_callable_absence_is_neutral_but_conflicting_provenance_is_rejected() {
-    let mut program = doriac::lower_source_to_mir(
+    let mut program = doriac::lower_library_source_to_mir(
         "nullable-callable-provenance.doria",
         r#"
 class Source {
@@ -1119,7 +1118,6 @@ class Source {
 }
 function forward(?Source $source): ?function(): int { return $source?->make(); }
 function independent(): function(): int { return fn() => 0; }
-function main(): void {}
 "#,
     )
     .unwrap();
@@ -1203,10 +1201,10 @@ function capture({callback_type} $callback): function(): bool {{
 function forward({callback_type} $callback): function(): bool {{
     return capture($callback);
 }}
-function main(): void {{}}
 "#
         );
-        let program = doriac::lower_source_to_mir("callable-provenance.doria", &source).unwrap();
+        let program =
+            doriac::lower_library_source_to_mir("callable-provenance.doria", &source).unwrap();
         doriac::mir_validation::validate_program(&program).unwrap();
         let mut missing_provenance = program.clone();
         let forward = missing_provenance
@@ -1814,6 +1812,7 @@ function overlap(writable Box $left, Box $right): void {}
 function main(): void {
     let writable $owner = new Box();
     change($owner);
+    let $reach = function(writable Box $left, Box $right): void { overlap($left, $right); };
 }
 "#,
     )
@@ -2572,6 +2571,11 @@ function takeMove(take MoveResult $result): Box
 function main(): void throws Doria\Std\Io\IoError
 {
     echo copyLabel(CopyResult::Text("ready"));
+    let $reach = function(MoveResult $result, mixed $value, take MoveResult $owned): void {
+        let $moved = moveLabel($result);
+        let $mixed = mixedLabel($value);
+        let $taken = takeMove($owned);
+    };
 }
 "#;
     let valid = doriac::lower_source_to_mir("stage28-validation.doria", source)
@@ -3346,6 +3350,7 @@ function repeat(): void
 function main(): void throws Doria\Std\Io\IoError
 {
     echo "{choose(true)}";
+    let $reach = function(bool $ready): void { gated($ready); repeat(); };
 }
 "#;
     let valid = doriac::lower_source_to_mir("stage28a-validation.doria", source)
@@ -8759,6 +8764,7 @@ fn class_program() -> Program {
             source_span: Default::default(),
             is_open: false,
             constructed: true,
+            implementations_reached: true,
             parent: None,
             ancestors: Vec::new(),
             virtual_methods: Vec::new(),

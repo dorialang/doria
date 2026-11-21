@@ -191,7 +191,10 @@ Section 17 said a branch whose condition is constant false for the target is
 neither emitted nor linked, but not whether a function called only from such a
 branch is emitted. Its own example still emitted `Win32Window::open` on macOS,
 with the Windows symbols it references. Andrew ruled on 2026-11-21: "Emit only
-reachable code (Recommended)". Section 17 states the rule.
+reachable code (Recommended)". Section 17 states the rule. Applying it, a
+witness that reachable code dispatches to through a conformance is reachable
+code, so a class named as a type in reachable code reaches its interface
+implementations even when nothing constructs it.
 
 ## Context
 
@@ -793,6 +796,12 @@ if (Platform::operatingSystem == OperatingSystem::Windows) {
   reachable code makes every member of it and of its ancestors reachable: its
   constructor, property initializers, destructor, property hooks and methods,
   which covers each virtual and interface dispatch target of its instances.
+  A class named as a type in reachable code, including by its construction,
+  reaches every checked interface implementation of it and of its ancestors
+  and their witnesses, and nothing else of it: reachable code dispatches to
+  them through the conformance, as a stream registration, `foreach`, display
+  conversion, equality, hashing, ordering and an Error report or `catch` do
+  for a class-typed value.
   The declarations of the compiler's own sources are roots, since runtime
   operations create their values. A program without an entry point is a
   library, and each declaration with a body is a root.

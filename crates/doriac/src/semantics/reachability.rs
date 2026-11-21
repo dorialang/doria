@@ -15,11 +15,16 @@
 //! instance can reach. A call, construction or C-callable function value
 //! written in a reachable body reaches its target, except inside a branch
 //! whose condition is constant false for the target; a closure belongs to the
-//! body it is written in. An Error class named as a type in reachable code
-//! (in `throws`, a `catch` or any other type position) reaches its Error
-//! implementation, which identifies the class in reports and catches even
-//! when nothing constructs it. Sites in a class declaration outside its
-//! members belong to the class.
+//! body it is written in. A class named as a type in reachable code (in a
+//! signature, `throws`, a `catch` or any other type position) reaches every
+//! checked interface implementation of it and of its ancestors: the
+//! implementation tables and their witness callables. Reachable code
+//! dispatches to those witnesses through a conformance even when nothing
+//! constructs the class: a stream registration's readiness callback,
+//! iteration, display conversion, equality, hashing and ordering of a
+//! class-typed value, and the Error implementation that identifies an Error
+//! class in reports and catches. Constructing a class names it. Sites in a
+//! class declaration outside its members belong to the class.
 
 use super::*;
 
@@ -30,8 +35,8 @@ pub(super) enum ReachTarget {
     Callable(Span),
     /// The construction of a class, by canonical name.
     Class(String),
-    /// A class named as a type, by canonical name: its Error implementation,
-    /// when it implements Error.
+    /// A class named as a type, by canonical name: its interface
+    /// implementations and their witnesses.
     NamedType(String),
 }
 
@@ -40,8 +45,9 @@ pub(super) enum ReachTarget {
 pub struct Reachability {
     callables: HashSet<Span>,
     classes: HashSet<String>,
-    error_implementations: HashSet<String>,
+    implementations: HashSet<String>,
     dead_branches: Vec<Span>,
+    library: bool,
 }
 
 impl Reachability {
@@ -55,11 +61,18 @@ impl Reachability {
         self.classes.contains(class)
     }
 
-    /// Whether the Error implementation of an Error class is emitted:
-    /// reachable code constructs the class or names it as a type. It is the
-    /// one interface implementation an unconstructed class has.
-    pub fn reaches_error_implementation(&self, class: &str) -> bool {
-        self.error_implementations.contains(class)
+    /// Whether the class's checked interface implementations and their
+    /// witnesses are emitted: reachable code constructs the class or names
+    /// it, or a class derived from it, as a type. They are the only instance
+    /// parts an unconstructed class has.
+    pub fn reaches_implementations(&self, class: &str) -> bool {
+        self.implementations.contains(class)
+    }
+
+    /// Whether the program has no entry point, so each declaration with a
+    /// body is a root.
+    pub fn is_library(&self) -> bool {
+        self.library
     }
 
     /// Whether code at `site` runs: it lies outside every branch whose
@@ -173,20 +186,32 @@ impl Reachability {
                 .map(|(site, declaration)| (site, ReachTarget::Callable(declaration))),
         );
 
-        let error_classes = checker
-            .contracts
-            .conformances
-            .iter()
-            .filter(|conformance| {
-                conformance.status == super::contracts::ConformanceStatus::Checked
-                    && conformance.interface
-                        == crate::types::InterfaceType::new("Error", Vec::new())
-            })
-            .filter_map(|conformance| match &conformance.implementing_type {
-                ResolvedType::Class(class) => Some(class.name.as_str()),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
+        // The witness callables of each class's checked conformances: every
+        // callable declared within a requirement's implementation, so a
+        // property implementation brings its hooks.
+        let mut witnesses = HashMap::<&str, Vec<Span>>::new();
+        for conformance in &checker.contracts.conformances {
+            let ResolvedType::Class(class) = &conformance.implementing_type else {
+                continue;
+            };
+            if conformance.status != super::contracts::ConformanceStatus::Checked {
+                continue;
+            }
+            let Some((class, _)) = class_members.get_key_value(class.name.as_str()) else {
+                continue;
+            };
+            let entry = witnesses.entry(*class).or_default();
+            for implementation in conformance
+                .implementations
+                .iter()
+                .filter_map(|implementation| implementation.implementation)
+            {
+                entry.extend(regions.iter().filter_map(|(region, owner)| {
+                    matches!(owner, Owner::Callable(_) if implementation.contains(*region))
+                        .then_some(*region)
+                }));
+            }
+        }
 
         let dead_branches = checker.dead_branches.clone();
         let mut by_owner = HashMap::<Owner<'_>, Vec<ReachTarget>>::new();
@@ -202,6 +227,7 @@ impl Reachability {
 
         let mut reachability = Self {
             dead_branches,
+            library: !entry,
             ..Self::default()
         };
         let mut pending = vec![Owner::Root];
@@ -217,11 +243,29 @@ impl Reachability {
                 Owner::Callable(declaration) => {
                     reachability.callables.insert(declaration);
                 }
+                Owner::Implementations(name) => {
+                    reachability.implementations.insert(name.to_string());
+                    pending.extend(
+                        witnesses
+                            .get(name)
+                            .into_iter()
+                            .flatten()
+                            .map(|witness| Owner::Callable(*witness)),
+                    );
+                    if let Some(parent) = checker
+                        .classes
+                        .get(name)
+                        .and_then(|class| class.parent.as_ref())
+                    {
+                        if let Some((parent, _)) = class_members.get_key_value(parent.name.as_str())
+                        {
+                            pending.push(Owner::Implementations(*parent));
+                        }
+                    }
+                }
                 Owner::Class(name) => {
                     reachability.classes.insert(name.to_string());
-                    if error_classes.contains(name) {
-                        reachability.error_implementations.insert(name.to_string());
-                    }
+                    pending.push(Owner::Implementations(name));
                     pending.extend(
                         class_members
                             .get(name)
@@ -249,10 +293,10 @@ impl Reachability {
                         None => continue,
                     },
                     ReachTarget::NamedType(name) => {
-                        if error_classes.contains(name.as_str()) {
-                            reachability.error_implementations.insert(name.clone());
+                        match class_members.get_key_value(name.as_str()) {
+                            Some((name, _)) => Owner::Implementations(*name),
+                            None => continue,
                         }
-                        continue;
                     }
                 });
             }
@@ -272,6 +316,8 @@ enum Owner<'a> {
     /// A class's instance property initializers and every other site in its
     /// declaration outside its members and static initializers.
     Class(&'a str),
+    /// A class's checked interface implementations and their witnesses.
+    Implementations(&'a str),
 }
 
 /// The innermost region holding `site`.

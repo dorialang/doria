@@ -107,18 +107,16 @@ class Pipeline implements {contract} {{
         return ReadOutcome::WouldBlock;
     }}
 }}
-function main(): void {{}}
 "#
     );
-    doriac::lower_source_to_mir("pending-selected-storage-mir.doria", source).unwrap_or_else(
-        |diagnostics| {
+    doriac::lower_library_source_to_mir("pending-selected-storage-mir.doria", source)
+        .unwrap_or_else(|diagnostics| {
             let failures = diagnostics
                 .iter()
                 .map(|diagnostic| (&diagnostic.code, &diagnostic.message, diagnostic.span))
                 .collect::<Vec<_>>();
             panic!("fixture must lower before forging: {failures:#?}")
-        },
-    )
+        })
 }
 
 fn helper(program: &mut Program) -> &mut Function {
@@ -597,9 +595,9 @@ class Pipeline implements PreparedWrite {
     writable function completeWrite(WriteRequest $request,
         ByteRegion $source): ?WriteOutcome throws IoError { return WriteOutcome::WouldBlock; }
 }
-function main(): void {}
 "#;
-    let original = doriac::lower_source_to_mir("pending-write-origins.doria", source).unwrap();
+    let original =
+        doriac::lower_library_source_to_mir("pending-write-origins.doria", source).unwrap();
     for renamed in [false, true] {
         for local_storage in [false, true] {
             let mut program = original.clone();
@@ -785,9 +783,9 @@ open class Ready implements ReadinessStream {
 class Child extends Ready {
     function __construct(parameter take ReadableFile $file) { parent::__construct($file); }
 }
-function main(): void {}
 "#;
-    let program = doriac::lower_source_to_mir("open-stream-callback.doria", source).unwrap();
+    let program =
+        doriac::lower_library_source_to_mir("open-stream-callback.doria", source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     let class = program
         .classes

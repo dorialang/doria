@@ -1181,7 +1181,7 @@ fn interface_dispatch_mir() -> mir::Program {
         r#"
 interface Marker {}
 class Box implements Marker { function read(): int { return 42; } }
-function main(): int { return 42; }
+function main(): int { let $box = new Box(); return 42; }
 "#,
     )
     .unwrap();
@@ -1256,6 +1256,10 @@ function main(): int { return 42; }
     entry.params = vec![receiver.id];
     entry.parameter_modes = vec![mir::FunctionParameterMode::Readonly];
     entry.locals = vec![receiver.clone()];
+    // The entry keeps only the template's first block, whose terminator it
+    // replaces; main's construction of `Box` stays in main.
+    entry.blocks.truncate(1);
+    entry.blocks[0].statements.clear();
     entry.blocks[0].terminator = mir::Terminator::Return(mir::Rvalue::Value(
         mir::ValueExpression::Integer(mir::IntegerExpression::Call {
             span: entry.source_span,

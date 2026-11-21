@@ -51,6 +51,14 @@ fn fixture_mir(name: &str, source: &str) -> doriac::mir::Program {
     })
 }
 
+/// A fixture without `main` lowers as a library, so every helper it declares
+/// is emitted for the test to inspect (Decision 0148 section 17).
+fn library_fixture_mir(name: &str, source: &str) -> doriac::mir::Program {
+    doriac::lower_library_source_to_mir(name, source).unwrap_or_else(|diagnostics| {
+        panic!("MIR lowering failed for {name}:\n{source}\n{diagnostics:#?}")
+    })
+}
+
 fn validate_fixture(program: &doriac::mir::Program, source: &str) {
     doriac::mir_validation::validate_program(program).unwrap_or_else(|error| {
         panic!("Unmodified fixture validation failed:\n{source}\n{error:#?}")
@@ -811,9 +819,8 @@ function probe(writable TransferGroup $group, ReadTransferKey $key, Wait $wait):
     $group->resubmitRead($key, 0, 0);
     return $copy;
 }
-function main(): void {}
 "#;
-    let program = fixture_mir("completion-copy-loans.doria", source);
+    let program = library_fixture_mir("completion-copy-loans.doria", source);
     validate_fixture(&program, source);
     for name in ["fetch", "probe"] {
         let function = program
@@ -886,7 +893,6 @@ function probe(writable TransferGroup $group, {key_type} $key, Wait $wait): Tran
     }};
     {body}
 }}
-function main(): void {{}}
 "#,
             ));
         }
@@ -897,7 +903,7 @@ function main(): void {{}}
 #[test]
 fn completion_writeback_preserves_nested_inline_copy_homes() {
     for source in completion_writeback_fixtures() {
-        let program = fixture_mir("completion-writeback.doria", &source);
+        let program = library_fixture_mir("completion-writeback.doria", &source);
         validate_fixture(&program, &source);
     }
     let nullable = r#"
@@ -909,9 +915,8 @@ function probe(writable TransferGroup $group, Wait $wait): ?TransferWaitResult t
     $group->getNextCompletion($wait);
     return $result;
 }
-function main(): void {}
 "#;
-    let program = fixture_mir("nullable-completion-writeback.doria", nullable);
+    let program = library_fixture_mir("nullable-completion-writeback.doria", nullable);
     validate_fixture(&program, nullable);
 }
 
@@ -920,7 +925,7 @@ fn shared_mir_validation_rejects_null_completion_writeback_into_nonnullable_home
     use doriac::mir::{NullablePayloadEnumExpression, Rvalue, Statement, Terminator, Type};
 
     for source in completion_writeback_fixtures() {
-        let mut program = fixture_mir("forged-completion-writeback.doria", &source);
+        let mut program = library_fixture_mir("forged-completion-writeback.doria", &source);
         validate_fixture(&program, &source);
         let function = program
             .functions
@@ -977,9 +982,8 @@ function probe(writable TransferGroup $group, ReadTransferKey $key, Wait $wait):
         let $completion = $group->getNextCompletion($wait);
     }
 }
-function main(): void {}
 "#;
-    let mut program = fixture_mir("completion-region-last-use.doria", source);
+    let mut program = library_fixture_mir("completion-region-last-use.doria", source);
     validate_fixture(&program, source);
     let conflicting = source.replace(
         "        echo $region->length;\n        let $completion = $group->getNextCompletion($wait);",
@@ -1663,7 +1667,9 @@ fn shared_mir_validation_rejects_forged_covariant_replacements() {
         ("function replacement(): Counted { return new Other(); }",
          "let writable $owner = new Counter(); let writable $view = lendInterface($owner); let $run = function(writable Counted $counter): void { $counter->bump(); }; $run($view);"),
     ] {
-        let source = format!("{DECLARATIONS} {declaration} function main(): void {{ {body} }}");
+        // `main` makes the replacement factory reachable without running it
+        // from the forged closure.
+        let source = format!("{DECLARATIONS} {declaration} function main(): void {{ let $made = replacement(); {body} }}");
         let mut program = fixture_mir("forged-covariant-writeback.doria", &source);
         validate_fixture(&program, &source);
         let replacement = program.functions.iter().find(|function| function.name == "replacement")
@@ -1707,10 +1713,9 @@ function unknown(function(writable ?Counter): void $callback, writable Counter $
     let $safe = function(writable ?Counter $counter): void {{ $counter?->bump(); }};
     $safe($owner);
 }}
-function main(): void {{}}
 "#
     );
-    let mut program = fixture_mir("forged-unknown-writeback.doria", &source);
+    let mut program = library_fixture_mir("forged-unknown-writeback.doria", &source);
     validate_fixture(&program, &source);
     let function = program
         .functions
@@ -1770,9 +1775,8 @@ function probe(function(writable ?int): void $callback, writable int $owner): vo
     };
     $replace($owner);
 }
-function main(): void {}
 "#;
-    let mut program = fixture_mir("forged-unknown-copy-effects.doria", source);
+    let mut program = library_fixture_mir("forged-unknown-copy-effects.doria", source);
     validate_fixture(&program, source);
     let function = program
         .functions

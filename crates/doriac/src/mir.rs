@@ -838,10 +838,12 @@ pub struct Class {
     pub is_open: bool,
     /// Whether reachable code constructs the class or a class derived from
     /// it (Decision 0148 section 17). An unconstructed class has no instance:
-    /// no constructor, destructor or interface implementation is emitted for
-    /// it, except the Error implementation reports and catches use when
-    /// reachable code names it.
+    /// no constructor or destructor is emitted for it.
     pub constructed: bool,
+    /// Whether the class's interface implementations are emitted: reachable
+    /// code constructs it or names it, or a class derived from it, as a type,
+    /// and dispatches to their witnesses through a conformance.
+    pub implementations_reached: bool,
     pub parent: Option<ClassId>,
     pub ancestors: Vec<ClassId>,
     pub virtual_methods: Vec<VirtualMethodSlot>,

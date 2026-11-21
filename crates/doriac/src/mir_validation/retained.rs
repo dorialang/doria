@@ -607,8 +607,10 @@ pub(super) fn possible_callees(
             .virtual_family
             .as_ref()
             .ok_or_else(|| malformed_mir("virtual callable has no canonical family"))?;
+        // Only a constructed class can be a receiver's dynamic class
+        // (Decision 0148 section 17); an unconstructed one emits no methods.
         for class in &program.classes {
-            if class.id == receiver || class.ancestors.contains(&receiver) {
+            if class.constructed && (class.id == receiver || class.ancestors.contains(&receiver)) {
                 let entry = class
                     .virtual_methods
                     .get(slot as usize)

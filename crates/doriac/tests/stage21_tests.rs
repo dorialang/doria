@@ -487,9 +487,8 @@ function select(Item $value, bool $present): ?Item {
     if ($present) { return $value; }
     return null;
 }
-function main(): void {}
 "#;
-    let mut program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let mut program = doriac::lower_library_source_to_mir("borrows.doria", source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     let function = program
         .functions
@@ -551,9 +550,8 @@ function select(Item $value, bool $present): ?Item {
     if ($present) { return $value; } else { return null; }
     finally { let $finalizer = new Item(); }
 }
-function main(): void {}
 "#;
-    let program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let program = doriac::lower_library_source_to_mir("borrows.doria", source).unwrap();
     let function = program
         .functions
         .iter()

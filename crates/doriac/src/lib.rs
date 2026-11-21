@@ -451,6 +451,27 @@ pub fn lower_source_to_mir(
     lower_hir_to_mir(&lower_source(path, text)?)
 }
 
+/// Lowers one source without an entry point to validated MIR as a library
+/// (Decision 0148 section 17): each declaration with a body is a root and is
+/// emitted, and the program has no process entry. A source that declares
+/// `main` is a program; `lower_source_to_mir` lowers it.
+pub fn lower_library_source_to_mir(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<mir::Program> {
+    let mut hir = lower_source(path, text)?;
+    if !hir.semantic_info.reachable.is_library() {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "a library source declares no `main` entry point",
+            Span::default(),
+        )]);
+    }
+    hir.selected_target.kind = build_plan::TargetKind::Library;
+    hir.selected_target.entry_source = None;
+    lower_hir_to_mir(&hir)
+}
+
 /// Lowers checked HIR to validated MIR.
 pub fn lower_hir_to_mir(hir: &hir::Program) -> DiagnosticResult<mir::Program> {
     let mir = mir_lowering::lower_program(hir)?;

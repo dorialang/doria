@@ -665,7 +665,13 @@ function probe(Delay $first, Delay $second, Deadline $deadline, Deadline $otherD
     }
 }
 function seed(): void {}
-function main(): void { seed(); echo "copy preserved\n"; }
+function main(): void {
+    seed();
+    echo "copy preserved\n";
+    let $reach = function(Delay $first, Delay $second, Deadline $deadline, Deadline $otherDeadline): void {
+        probe($first, $second, $deadline, $otherDeadline);
+    };
+}
 "#;
 
 // Opaque test-only constants exercise deterministic carrier boundaries without
@@ -940,12 +946,11 @@ fn mir_rejects_inline_identity_changes_and_heap_class_carriers() {
 
 #[test]
 fn mir_rejects_every_heap_carrier_for_inline_time_values() {
-    let valid = doriac::lower_source_to_mir(
+    let valid = doriac::lower_library_source_to_mir(
         "inline-heap-carriers.doria",
         r#"
 use Doria\Std\Time\{Duration, Deadline};
 function unused(Duration $duration, Deadline $deadline): void {}
-function main(): void {}
 "#,
     )
     .unwrap();

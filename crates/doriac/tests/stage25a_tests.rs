@@ -951,9 +951,8 @@ function transferred(take SharedReference<Node> $value): SharedReference<Node>
 }
 
 function consume(take SharedReference<Node> $value): void {}
-function main(): void {}
 "#;
-    let program = doriac::lower_source_to_mir("stage25a-return.doria", source)
+    let program = doriac::lower_library_source_to_mir("stage25a-return.doria", source)
         .expect("handle returns must distinguish elided borrows from ownership transfers");
     let borrowed = program
         .functions
