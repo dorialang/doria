@@ -997,6 +997,9 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
         "let writable $box = new Box(); unsafe { let $field = Pointer::to($box->count); $box->reset(); }",
         "let writable $box = new Box(); unsafe { let $field = WritablePointer::to($box->count); $box->count = 2; }",
         "let writable $box = new Box(); unsafe { let $field = Pointer::to($box->count); consume($box); }",
+        // A `writable` parameter lends the pinned value itself (section 7:
+        // the program "cannot pass `writable` access to any of them").
+        "unsafe { let $pointer = Pointer::to($point); shift($point); }",
     ];
     for body in conflicting {
         let found = findings(&pin_program(body));
@@ -1027,8 +1030,6 @@ fn a_pin_stops_moves_and_replacement_but_not_field_access() {
         "unsafe { let $pointer = WritablePointer::to($point); $point->x = 5; echo $point->y; $pointer->write(new Point(x: 1, y: 1)); echo $point->x; }",
         "unsafe { let $field = WritablePointer::to($point->y); $point->x = 3; echo $point->y; }",
         "unsafe { let $pointer = Pointer::to($point); show($point); }",
-        // A `writable` parameter of a Copy type receives its own copy.
-        "unsafe { let $pointer = Pointer::to($point); shift($point); }",
         "let writable $box = new Box(); unsafe { let $field = WritablePointer::to($box->count); $box->other = 2; echo $box->count; }",
     ] {
         let source = pin_program(body);

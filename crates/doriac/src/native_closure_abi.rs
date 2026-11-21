@@ -531,14 +531,13 @@ pub struct NativeCallableSignaturePlan {
     pub checked: bool,
 }
 
-pub fn parameter_uses_borrow_home(
-    ty: mir::Type,
-    mode: mir::FunctionParameterMode,
-    writable_copy: bool,
-) -> bool {
-    mode != mir::FunctionParameterMode::Take
-        && (ty.has_move_ownership()
-            || writable_copy && mode == mir::FunctionParameterMode::Writable)
+/// Whether a parameter receives the caller's place as a borrow home: every
+/// borrowed move-owned value, and every writable parameter of any type in
+/// functions, methods and closures alike (Decision 0121; Andrew's ruling of
+/// 2026-11-21, "Writable always borrows (Recommended)").
+pub fn parameter_uses_borrow_home(ty: mir::Type, mode: mir::FunctionParameterMode) -> bool {
+    mode == mir::FunctionParameterMode::Writable
+        || mode != mir::FunctionParameterMode::Take && ty.has_move_ownership()
 }
 
 impl NativeCallableSignaturePlan {
@@ -563,7 +562,6 @@ impl NativeCallableSignaturePlan {
             function.return_borrow.map(|borrow| {
                 return_borrow_argument_index(borrow, function.receiver_mode.is_some())
             }),
-            function.closure.is_some(),
             |index| {
                 let local = function.params[index + usize::from(function.closure.is_some())];
                 function.retains_writable_input(local)
@@ -583,7 +581,6 @@ impl NativeCallableSignaturePlan {
             function
                 .return_borrow
                 .map(|borrow| return_borrow_argument_index(borrow, false)),
-            true,
             |_| false,
         )
     }
@@ -600,7 +597,6 @@ impl NativeCallableSignaturePlan {
             function
                 .return_borrow
                 .map(|borrow| return_borrow_argument_index(borrow, false)),
-            false,
             |_| false,
         )
     }
@@ -609,7 +605,6 @@ impl NativeCallableSignaturePlan {
         mut self,
         parameters: impl Iterator<Item = mir::FunctionParameter>,
         returned_source: Option<usize>,
-        writable_copy: bool,
         retained_place: impl Fn(usize) -> bool,
     ) -> Self {
         // A borrowed input may be retained in caller-owned storage without
@@ -618,9 +613,8 @@ impl NativeCallableSignaturePlan {
         let homes = parameters
             .enumerate()
             .filter_map(|(index, parameter)| {
-                (parameter_uses_borrow_home(parameter.ty, parameter.mode, writable_copy)
-                    || retained_place(index))
-                .then_some(NativeCallableHiddenInput::ParameterBorrowHome(index))
+                (parameter_uses_borrow_home(parameter.ty, parameter.mode) || retained_place(index))
+                    .then_some(NativeCallableHiddenInput::ParameterBorrowHome(index))
             })
             .collect::<Vec<_>>();
         if returned_source.is_some_and(|index| {
@@ -1231,7 +1225,7 @@ fn malformed(message: impl Into<String>) -> BackendError {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn parameter_homes_distinguish_copy_values_writable_callbacks_and_move_loans() {
+    fn parameter_homes_distinguish_copy_values_writable_places_and_move_loans() {
         use super::parameter_uses_borrow_home;
         use crate::mir::{FunctionParameterMode as Mode, ScalarType, Type};
         for ty in [
@@ -1239,18 +1233,14 @@ mod tests {
             Type::NullableScalar(ScalarType::Bool),
             Type::String,
         ] {
-            assert!(!parameter_uses_borrow_home(ty, Mode::Readonly, false));
-            assert!(!parameter_uses_borrow_home(ty, Mode::Writable, false));
-            assert!(!parameter_uses_borrow_home(ty, Mode::Readonly, true));
-            assert!(parameter_uses_borrow_home(ty, Mode::Writable, true));
-            assert!(!parameter_uses_borrow_home(ty, Mode::Take, true));
+            assert!(!parameter_uses_borrow_home(ty, Mode::Readonly));
+            assert!(parameter_uses_borrow_home(ty, Mode::Writable));
+            assert!(!parameter_uses_borrow_home(ty, Mode::Take));
         }
         for ty in [Type::Mixed, Type::NullableMixed] {
-            for callback in [false, true] {
-                assert!(parameter_uses_borrow_home(ty, Mode::Readonly, callback));
-                assert!(parameter_uses_borrow_home(ty, Mode::Writable, callback));
-                assert!(!parameter_uses_borrow_home(ty, Mode::Take, callback));
-            }
+            assert!(parameter_uses_borrow_home(ty, Mode::Readonly));
+            assert!(parameter_uses_borrow_home(ty, Mode::Writable));
+            assert!(!parameter_uses_borrow_home(ty, Mode::Take));
         }
     }
 

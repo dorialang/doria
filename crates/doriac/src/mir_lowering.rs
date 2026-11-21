@@ -3620,9 +3620,15 @@ fn collect_function_signature(
             .cloned();
         parameter_types.push(parameter_type);
         parameter_defaults.push(default);
+        // A writable parameter lends the caller's place, except a promoted
+        // constructor parameter, whose `writable` makes the property writable
+        // and which receives a copy (Decision 0083; Andrew's ruling of
+        // 2026-11-21, "Writable always borrows (Recommended)").
+        let promoted =
+            function.name == "__construct" && param.constructor_role.is_promoted() && !param.borrow;
         parameter_modes.push(if transfers {
             mir::FunctionParameterMode::Take
-        } else if param.writable {
+        } else if param.writable && !promoted {
             mir::FunctionParameterMode::Writable
         } else {
             mir::FunctionParameterMode::Readonly
@@ -3971,10 +3977,14 @@ fn lower_function(
             .iter()
             .zip(signature.parameter_types.iter().copied())
             .zip(signature.parameter_owns.iter().copied())
-            .map(|((param, ty), owned)| {
+            .zip(signature.parameter_modes.iter().copied())
+            .map(|(((param, ty), owned), mode)| {
                 let local =
                     context.declare_user_local_owned(&param.name, param.writable, ty, owned);
-                if param.writable && ty.has_move_ownership() {
+                // A lent place is the caller's storage, as for a closure.
+                if mode == mir::FunctionParameterMode::Writable
+                    || param.writable && ty.has_move_ownership()
+                {
                     context.replaceable_writable_bindings.insert(local);
                 } else if param.writable && ty.requires_owned_cleanup() && !owned {
                     // Ordinary Copy parameters replace a private value. The ABI
@@ -14654,15 +14664,13 @@ fn lower_call_argument(
             lower_rvalue_as_borrowed(argument, expected, context)
         }
         mir::FunctionParameterMode::Writable => {
-            // Writable move-owned arguments denote exclusive borrowed storage.
-            // Keep a local as a place when flow analysis knows its current
-            // nullable value; Copy arguments retain ordinary value semantics.
-            if expected.has_move_ownership() {
-                if let hir::Expr::Variable { name, span } = unparenthesized_place(argument) {
-                    let local = context.lookup_local(name, *span)?;
-                    if context.local_type(local) == expected {
-                        return Ok(local_rvalue(local, expected, false));
-                    }
+            // Writable arguments of every type denote exclusive borrowed
+            // storage. Keep a local of the parameter type as a place, even
+            // when flow analysis knows its current nullable value.
+            if let hir::Expr::Variable { name, span } = unparenthesized_place(argument) {
+                let local = context.lookup_local(name, *span)?;
+                if context.local_type(local) == expected {
+                    return Ok(local_rvalue(local, expected, false));
                 }
             }
             lower_rvalue_as_borrowed(argument, expected, context)

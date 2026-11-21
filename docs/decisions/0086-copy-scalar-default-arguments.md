@@ -1,6 +1,6 @@
 # Decision 0086: Copy-scalar default arguments
 
-**Status:** Accepted
+**Status:** Accepted. Amended 2026-11-21 (Amendment: Writable Parameters Lend The Caller's Storage).
 
 ## Context
 
@@ -57,7 +57,8 @@ a default value must be a constant expression
 
 A `writable` Copy-scalar parameter remains supported. `writable` controls
 mutation and does not turn a Copy scalar into an owned move value. This includes
-writable constructor-promoted scalar properties:
+writable constructor-promoted scalar properties (the 2026-11-21 amendment below
+removes defaults from every other `writable` parameter):
 
 ```doria
 class Counter
@@ -177,3 +178,22 @@ tests, the language specification, status documentation, and the master plan.
 Decision 0131 applies the same caller-side default splice to promoted,
 constructor-only, and inherited-property override parameters. A child default is
 callable API only; it neither changes nor implicitly forwards a parent default.
+
+## Amendment, 2026-11-21: Writable Parameters Lend The Caller's Storage
+
+Andrew ruled on a card: "Writable always borrows (Recommended)". A `writable`
+parameter of any Copy type lends the caller's storage in functions, methods and
+closures alike, so its writes reach the caller (SPEC.md, function parameters).
+An omitted argument has no storage to lend, so a default on a `writable`
+parameter is E0818 with a reviewed fix that removes it. This supersedes the
+statement above that writable Copy parameters accept defaults, and the
+Alternatives entry that rejected rejecting writable defaults.
+
+The two rules sit side by side. A `writable` parameter that is a passing mode
+lends the caller's place: with `function bump(writable int $count): void`,
+`bump(3)` is E0204 and `bump(writable int $count = 0)` is E0818. On a promoted
+constructor parameter `writable` is the property's access modifier (Decision
+0083, Amendment of 2026-11-20): the argument is copied into the new writable
+property, so with `function __construct(writable int $value = 0)` both
+`new Counter(0)` and `new Counter()` stay valid and the caller-side splice is
+unchanged.

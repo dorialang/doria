@@ -174,7 +174,7 @@ function main(): void {
     echo $copy;
 }
 "#,
-        "drop1;2;drop2;3;drop3;7",
+        "drop1;2;drop2;3;drop3;99",
     );
 }
 
@@ -306,15 +306,15 @@ class Item {
 function clearGeneric<T>(writable ?T $target): void { $target = null; }
 function forwardGeneric<T>(writable ?T $target): void { clearGeneric($target); }
 function main(): void {
-    let writable $copy = 7;
+    writable ?int $copy = 7;
     forwardGeneric($copy);
-    echo "{$copy};";
+    echo "{$copy ?? 0};";
     writable ?Item $owner = new Item(1);
     forwardGeneric($owner);
     echo $owner == null;
 }
 "#,
-        "7;drop1;true",
+        "0;drop1;true",
     );
 }
 
@@ -335,6 +335,7 @@ function forwardGeneric<T>(writable ?T $target): void {{ clearGeneric($target); 
         "let writable $owner = new Child(); replace($owner);",
         "let writable $owner = new Counter(); replaceInterface($owner);",
         "let writable $owner = new Counter(); forwardGeneric($owner);",
+        "let writable $copy = 7; forwardGeneric($copy);",
     ] {
         let source = format!("{declarations} function main(): void {{ {body} }}");
         let diagnostics = doriac::check_source("named-writeback-types.doria", &source)
@@ -1852,4 +1853,146 @@ function probe(function(writable ?int): void $callback, writable int $owner): vo
     let error = doriac::mir_validation::validate_program(&program)
         .expect_err(&format!("unknown callback may clear nullable storage before it is copied into the later environment:\n{source}"));
     assert!(error.message.contains("storage"), "{error:#?}");
+}
+
+/// A writable parameter of a Copy type lends the caller's storage in
+/// functions and methods as in closures, so every write reaches the caller,
+/// through forwarding, properties and collection elements. A promoted
+/// constructor parameter's `writable` makes the property writable and keeps
+/// its default (Andrew's ruling of 2026-11-21, "Writable always borrows
+/// (Recommended)").
+#[test]
+fn writable_copy_parameters_lend_the_callers_storage() {
+    assert_execution(
+        r#"
+class Box
+{
+    writable int $count = 1;
+
+    writable function bump(writable int $by): void
+    {
+        $by += 10;
+        $this->count += $by;
+    }
+}
+
+class Counter
+{
+    function __construct(writable int $count = 0) {}
+}
+
+function add(writable int $value, int $step): void
+{
+    $value += $step;
+}
+
+function forward(writable int $value): void
+{
+    add($value, 100);
+}
+
+function rename(writable string $name): void
+{
+    $name = $name . "!";
+}
+
+function flip(writable bool $flag, writable float $ratio): void
+{
+    $flag = !$flag;
+    $ratio = $ratio * 2.0;
+}
+
+function main(): void
+{
+    let writable $n = 1;
+    add($n, 2);
+    forward($n);
+    let writable $text = "hi";
+    rename($text);
+    rename($text);
+    let writable $box = new Box();
+    let writable $by = 5;
+    $box->bump($by);
+    add($box->count, 1000);
+    let writable $flag = false;
+    let writable $ratio = 1.5;
+    flip($flag, $ratio);
+    writable List<int> $numbers = [1, 2];
+    add($numbers[1], 40);
+    let writable $counter = new Counter();
+    echo "{$n} {$text} {$by} {$box->count} {$flag} {$ratio} {$numbers[1]} {$counter->count}";
+}
+"#,
+        "103 hi!! 15 1016 true 3.0 42 0",
+    );
+}
+
+/// A writable Copy argument must be a writable place, and a writable
+/// parameter has no default; a promoted constructor parameter keeps one.
+#[test]
+fn writable_copy_arguments_require_writable_places() {
+    let source = r#"
+class Counter
+{
+    function __construct(writable int $count = 0) {}
+}
+
+function add(writable int $value, int $step = 1): void
+{
+    $value += $step;
+}
+
+function zero(writable int $value = 0): void
+{
+    $value = 0;
+}
+
+function make(): int
+{
+    return 3;
+}
+
+function both(writable int $left, int $right): void
+{
+    $left += $right;
+}
+
+function main(): void
+{
+    let $counter = new Counter();
+    let writable $n = 1;
+    add(5);
+    add(make());
+    add($n + 1);
+    both($n, $n);
+    let $closure = function (writable int $value): void { $value += 1; };
+    $closure(4);
+}
+"#;
+    let diagnostics = doriac::check_source("writable-copy-places.doria", source)
+        .expect_err("writable Copy arguments need writable places");
+    // The checking API returns raw findings, which repeat the conflict;
+    // diagnostic presentation shows it once.
+    let mut found = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.code,
+                &source[diagnostic.span.start..diagnostic.span.end],
+            )
+        })
+        .collect::<Vec<_>>();
+    found.dedup();
+    assert_eq!(
+        found,
+        [
+            ("E0818", "0"),
+            ("E0204", "5"),
+            ("E0204", "make()"),
+            ("E0204", "$n + 1"),
+            ("E0651", "4"),
+            ("E0477", "$n"),
+        ],
+        "{diagnostics:#?}"
+    );
 }

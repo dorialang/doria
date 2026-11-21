@@ -3056,7 +3056,7 @@ function main(): int
 }
 
 #[test]
-fn stage_11f_interprets_call_arguments_and_preserves_caller_locals() {
+fn stage_11f_interprets_call_arguments_and_lends_writable_locals() {
     let argument_output = interpret(
         r#"function add(int $left, int $right): int
 {
@@ -3088,7 +3088,9 @@ function main(): int
 }
 "#,
     );
-    assert_eq!(caller_output.exit_status, 41);
+    // A writable parameter lends the caller's local (Andrew's ruling of
+    // 2026-11-21, "Writable always borrows").
+    assert_eq!(caller_output.exit_status, 42);
 }
 
 #[test]

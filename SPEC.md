@@ -402,7 +402,7 @@ Writable properties must be initialized before observation or normal constructor
 
 The access `__construct` has to the instance under construction is granted by the construction protocol itself and is never declared. Explicit `writable` on `__construct` or `__destruct` is a compile error with a machine-applicable fix that removes `writable`. This removes a spelling, not an access rule: it does not make `$this` writable and does not widen constructor init access beyond the narrow rules above plus normal mutation of writable properties. Lifecycle methods are compiler-invoked protocol points, not ordinary methods. Stages 19 and 21 formalize construction natively through drop elaboration and definite initialization without changing these source-level rules.
 
-Function parameters are readonly by default and become writable only with `writable`. A `take` parameter gives the callee ownership of a class move value; the call site remains unmarked, and the caller cannot use that value afterward. `take` and `writable` are mutually exclusive. Copy-type arguments retain their ordinary Copy behavior.
+Function parameters are readonly by default and become writable only with `writable`. A `take` parameter gives the callee ownership of a class move value; the call site remains unmarked, and the caller cannot use that value afterward. `take` and `writable` are mutually exclusive. A `writable` parameter of any type, Copy types included, lends the caller's storage in functions, methods and closures alike: the argument must be a writable variable, property or element, and every write the callee makes reaches the caller. A literal, a readonly value or a computed value is rejected (E0204), and a `writable` parameter has no default value (E0818). On a promoted constructor parameter `writable` is the property's access modifier instead: it makes the property writable and the argument is copied into it (Decision 0083). So with `function bump(writable int $count): void` the call `bump(3)` is an error, while with `class Counter { function __construct(writable int $count = 0) {} }` both `new Counter(0)` and `new Counter()` are valid. Amendment of 2026-11-21: Andrew ruled "Writable always borrows (Recommended)", replacing the earlier sentence "Copy-type arguments retain their ordinary Copy behavior."
 
 Decision 0136 permits independent borrowing of disjoint stored owned-property
 paths, including nested paths and aliases. The same field and its ancestors or
@@ -1115,8 +1115,9 @@ Const-evaluable parameter defaults for nullable Copy scalars, Copy enums, and
 compiler-known inline Copy values
 use ordinary caller-side default materialization. `null` preserves absence;
 a present constant preserves its exact declared type. Authored and
-compiler-known callables follow the same rule, including writable Copy
-parameters and named omissions. Nullable string and move/take defaults remain
+compiler-known callables follow the same rule, including named omissions. A
+`writable` parameter has no default, because it lends the caller's storage
+(E0818); a promoted constructor parameter keeps its default. Nullable string and move/take defaults remain
 separate implementation boundaries under Decision 0086.
 An absent managed Copy token holds no ownership claim.
 
@@ -2584,7 +2585,7 @@ Because a callable can be invoked by parameter name, its parameter names are par
 of its public interface: renaming a parameter is a breaking change for
 named-argument callers. Language intrinsics keep positional-only binding.
 
-Native execution currently supports omitted trailing defaults when the parameter is a fixed-width integer, float, bool, or readonly string and the default is accepted by the Stage 20 constant-evaluation tier. This applies uniformly to free functions, instance methods, static methods, and constructors. A writable Copy-scalar parameter may use such a default because writability does not change its ownership classification. For a readonly string parameter, the caller materializes the folded value as an ordinary string-literal argument. Ordinary call temporaries are released after the call; a constructor-promoted value is retained by the property and released with the object. The compiler inserts each folded value at its omitted call position before MIR execution.
+Native execution currently supports omitted trailing defaults when the parameter is a fixed-width integer, float, bool, or readonly string and the default is accepted by the Stage 20 constant-evaluation tier. This applies uniformly to free functions, instance methods, static methods, and constructors. A `writable` parameter has no default, because it lends the caller's storage (E0818, amendment of 2026-11-21); on a promoted constructor parameter `writable` makes the property writable, and the default remains. For a readonly string parameter, the caller materializes the folded value as an ordinary string-literal argument. Ordinary call temporaries are released after the call; a constructor-promoted value is retained by the property and released with the object. The compiler inserts each folded value at its omitted call position before MIR execution.
 
 Defaults for `?string`, `writable string`, `take string`, other move types, and `take` parameters remain deferred until their representation, mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. A named argument may skip any parameter whose default is supported above, including a middle one; the compiler splices the folded value at that parameter's position.
 

@@ -576,7 +576,10 @@ impl Plan {
                                     cell: requires_parameter_cell(
                                         &ty,
                                         parameter.take,
-                                        parameter.writable,
+                                        crate::php_closure::signature_parameter_lends_place(
+                                            &program.semantic_info,
+                                            parameter,
+                                        ),
                                         &program.semantic_info.enums,
                                     ) || requirement.return_borrow.is_some_and(|borrow| {
                                         returns_borrow
@@ -1721,7 +1724,7 @@ impl Plan {
                 parameter.cell |= requires_parameter_cell(
                     &ty,
                     checked.take,
-                    checked.writable,
+                    crate::php_closure::signature_parameter_lends_place(&self.semantic, checked),
                     &self.semantic.enums,
                 );
             }

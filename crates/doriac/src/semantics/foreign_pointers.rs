@@ -48,6 +48,7 @@ impl<'program> Checker<'program> {
             ty,
             take: false,
             writable: false,
+            lends_storage: false,
             has_default: false,
             default: None,
             declaration: None,

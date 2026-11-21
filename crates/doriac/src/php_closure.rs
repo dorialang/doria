@@ -490,11 +490,58 @@ fn mark_parameter_home_bindings(program: &hir::Program, cells: &mut HashSet<Bind
     let _ = resolution;
 }
 
+/// Whether a parameter lends the caller's place: every `writable` parameter
+/// except a promoted constructor parameter, where `writable` makes the
+/// property writable (Decision 0083; Andrew's ruling of 2026-11-21,
+/// "Writable always borrows (Recommended)").
+pub(crate) fn parameter_lends_place(function: &hir::FunctionDecl, parameter: &hir::Param) -> bool {
+    parameter.writable
+        && (!(function.name == "__construct" && parameter.constructor_role.is_promoted())
+            || parameter.borrow)
+}
+
+/// [`parameter_lends_place`] for a checked signature parameter, whose
+/// promotion is recorded in the constructor parameter roles.
+pub(crate) fn signature_parameter_lends_place(
+    semantic: &crate::semantics::SemanticInfo,
+    parameter: &crate::semantics::CallableParameterSemanticInfo,
+) -> bool {
+    parameter.writable
+        && (parameter.borrow
+            || !parameter
+                .declaration
+                .and_then(|declaration| semantic.constructor_parameters.get(&declaration))
+                .is_some_and(|info| {
+                    matches!(
+                        info.role,
+                        crate::semantics::ConstructorParameterSemanticRole::Promoted { .. }
+                    )
+                }))
+}
+
 fn mark_callable_parameter_homes(
     function: &hir::FunctionDecl,
     program: &hir::Program,
     cells: &mut HashSet<BindingId>,
 ) {
+    // A lent Copy parameter shares its caller's cell; a region keeps its
+    // storage provenance in its own descriptor.
+    let signature = program
+        .semantic_info
+        .callable_signatures
+        .get(&function.span);
+    for (index, parameter) in function.params.iter().enumerate() {
+        let ty = signature.and_then(|signature| signature.parameters.get(index));
+        if parameter_lends_place(function, parameter)
+            && ty.is_none_or(|parameter| borrowed_value_uses_cell(&parameter.r#type))
+        {
+            if let Some(binding) =
+                binding_declared_in_span(program, &parameter.name, parameter.span)
+            {
+                cells.insert(binding);
+            }
+        }
+    }
     let Some(borrow) = program.semantic_info.return_borrows.get(&function.span) else {
         return;
     };
@@ -597,7 +644,7 @@ fn collect_callable_plans(
                         cell: requires_parameter_cell(
                             &parameter.r#type,
                             parameter.take,
-                            parameter.writable,
+                            signature_parameter_lends_place(&program.semantic_info, parameter),
                             &program.semantic_info.enums,
                         ) || requirement.return_borrow.is_some_and(|borrow| {
                             returns_borrow && borrow.source == BorrowSource::Parameter(index)
@@ -789,14 +836,19 @@ fn callable_plan(
             .enumerate()
             .map(|(index, parameter)| {
                 let binding = binding_declared_in_span(program, &parameter.name, parameter.span);
-                let copies = program
+                let signature_parameter = program
                     .semantic_info
                     .callable_signatures
                     .get(&function.span)
-                    .and_then(|signature| signature.parameters.get(index))
-                    .is_some_and(|parameter| {
-                        parameter_copies_value(&parameter.r#type, &program.semantic_info.enums)
-                    });
+                    .and_then(|signature| signature.parameters.get(index));
+                let copies = signature_parameter.is_some_and(|parameter| {
+                    parameter_copies_value(&parameter.r#type, &program.semantic_info.enums)
+                });
+                // A lent Copy place shares its caller's cell; a region keeps
+                // its storage provenance in its own descriptor.
+                let lends_place = parameter_lends_place(function, parameter)
+                    && signature_parameter
+                        .is_some_and(|parameter| borrowed_value_uses_cell(&parameter.r#type));
                 let lends = program
                     .semantic_info
                     .return_borrows
@@ -819,6 +871,7 @@ fn callable_plan(
                     name: parameter.name.clone(),
                     cell: lends
                         || retains_writable_place
+                        || (copies && lends_place)
                         || ((!copies || parameter.take)
                             && binding.is_some_and(|binding| cells.contains(&binding))),
                     take: parameter.take,
@@ -1070,7 +1123,7 @@ pub(crate) fn borrowed_value_uses_cell(ty: &ResolvedType) -> bool {
 pub(crate) fn requires_parameter_cell(
     ty: &ResolvedType,
     take: bool,
-    writable: bool,
+    lends: bool,
     enums: &[crate::semantics::EnumSemanticInfo],
 ) -> bool {
     let mut payload = ty;
@@ -1085,7 +1138,9 @@ pub(crate) fn requires_parameter_cell(
         _ => requires_owned_cell(ty),
     };
     (take && ownership_cell)
-        || (writable && !parameter_copies_value(ty, enums) && requires_writable_cell(ty))
+        || (lends
+            && (parameter_copies_value(ty, enums) && borrowed_value_uses_cell(ty)
+                || requires_writable_cell(ty)))
 }
 
 pub(crate) fn requires_writable_cell(ty: &ResolvedType) -> bool {

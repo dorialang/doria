@@ -364,6 +364,7 @@ impl Analysis {
                                 ),
                                 take: parameter.take,
                                 writable: parameter.writable,
+                                lends: parameter.writable,
                                 borrow: false,
                             })
                             .collect(),
@@ -1109,6 +1110,7 @@ impl Checker<'_> {
                             generic: false,
                             take: create,
                             writable: false,
+                            lends: false,
                             borrow: false,
                         }],
                         returns_move_type: !create,
@@ -1152,6 +1154,7 @@ impl Checker<'_> {
                                 generic: false,
                                 take: false,
                                 writable: index == 0 && writable,
+                                lends: false,
                                 borrow: false,
                             })
                             .collect(),
@@ -1212,6 +1215,7 @@ impl Checker<'_> {
                                     generic: false,
                                     take: false,
                                     writable: false,
+                                    lends: false,
                                     borrow: false,
                                 })
                                 .collect(),

@@ -1489,7 +1489,7 @@ fn define_function<'ctx>(
             .ok_or_else(|| malformed_mir("LLVM function is missing a parameter borrow home"))?
             .into_pointer_value();
         borrow_home_addresses.insert(local, home);
-        if function.promotes_writable_input(local) {
+        if function.writes_through_parameter_home(local) {
             let address = build(builder.build_load(
                 context.ptr_type(AddressSpace::default()),
                 home,

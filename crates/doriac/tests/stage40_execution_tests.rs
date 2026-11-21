@@ -528,11 +528,10 @@ function main(): void
     // Every tier-1 target is little-endian.
     assert_runs_natively(&source, "7 7 5 true 511");
 
-    // A writable Copy parameter of a function is the callee's own copy
-    // (SPEC: Copy arguments keep their Copy behavior), so a pointer to it
-    // addresses that copy. A writable closure parameter and a writable
-    // capture name the caller's place, so a write through a pointer to
-    // either is what the caller reads next.
+    // A writable parameter of a function or a closure and a writable
+    // capture name the caller's place (Andrew's ruling of 2026-11-21,
+    // "Writable always borrows (Recommended)"), so a write through a
+    // pointer to any of them is what the caller reads next.
     let parameters = format!(
         "{POINTER}function bump(writable int32 $count): void {{ unsafe {{ WritablePointer::to($count)->write(8); }} echo $count . \" \"; }}
 function main(): void {{
@@ -553,7 +552,7 @@ function main(): void {{
 }}
 "
     );
-    assert_runs_natively(&parameters, "8 1 5 5 9 10");
+    assert_runs_natively(&parameters, "8 8 5 5 9 10");
 }
 
 const C_LIBRARY: &str = r#"
@@ -2331,7 +2330,7 @@ extern \"C\" struct Outer
     Tip $tip;
 }
 
-// A writable Copy parameter is the callee's own copy.
+// A writable Copy parameter lends the caller's foreign struct.
 function replaced(writable Tip $tip, ArrayRegion<uint16> $source): Tip
 {
     $tip->text = $source;
@@ -3883,4 +3882,37 @@ function main(): void
 "#
     );
     assert_runs_natively(&source, "41 41\n3\n");
+}
+
+/// A writable foreign struct parameter of a plain function lends the
+/// caller's struct, so a field write reaches the caller as it does through
+/// a closure (Andrew's ruling of 2026-11-21, "Writable always borrows
+/// (Recommended)").
+#[test]
+fn writable_struct_parameters_change_the_callers_struct() {
+    let source = format!(
+        r#"{AGGREGATES}
+function redden(writable Color $color): void
+{{
+    $color->red = 77;
+}}
+
+function forward(writable Color $color): void
+{{
+    redden($color);
+    $color->green = 88;
+}}
+
+function main(): void
+{{
+    writable Color $tint = new Color(red: 10, green: 20, blue: 30);
+    redden($tint);
+    echo $tint->red . " ";
+    writable Color $other = new Color(red: 1, green: 2, blue: 3);
+    forward($other);
+    echo $other->red . " " . $other->green . " " . $other->blue . "\n";
+}}
+"#
+    );
+    assert_runs_natively(&source, "77 77 88 3\n");
 }

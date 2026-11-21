@@ -349,6 +349,7 @@ impl<'program> Checker<'program> {
                 ty: field.ty,
                 take: false,
                 writable: false,
+                lends_storage: false,
                 has_default: info.kind == ForeignAggregateKind::Union || field.has_default,
                 default: None,
                 declaration: Some(field.span),

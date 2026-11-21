@@ -12857,7 +12857,6 @@ impl<'a> Interpreter<'a> {
             let keeps_home = crate::native_closure_abi::parameter_uses_borrow_home(
                 function.locals[parameter.0].ty,
                 function.parameter_modes[index],
-                function.closure.is_some(),
             ) || function.retains_writable_input(*parameter)
                 || returned_source == Some(index);
             local_origins[parameter.0] = if keeps_home { origin } else { None };

@@ -87,9 +87,8 @@ class Defaults {
     static function getNumber(?float $value = 2.5): float { return $value ?? 0.0; }
     function isReady(?Mode $mode = Mode::Ready): bool { return ($mode ?? Mode::Stopped) == Mode::Ready; }
     function isAbsent(?Mode $mode = null): bool { return $mode == null; }
-    writable function update(writable ?int $value = 0): void {
-        $value = 4;
-        $this->value = $value;
+    writable function update(?int $value = 0): void {
+        $this->value = ($value ?? 0) + 4;
     }
 }
 function main(): void {

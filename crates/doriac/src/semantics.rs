@@ -103,6 +103,9 @@ pub enum ForeachIterationKind {
 
 /// A `foreach` over a value no iterable family classifies.
 const FOREACH_SOURCE_NOT_ITERABLE_CODE: &str = "E0810";
+/// A default on a parameter that lends the caller's storage (Andrew's ruling
+/// of 2026-11-21, "Writable always borrows (Recommended)").
+const WRITABLE_PARAMETER_DEFAULT_CODE: &str = "E0818";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeachIterableFamily {
@@ -8392,6 +8395,7 @@ impl<'program> Checker<'program> {
                 ty,
                 take: param.take,
                 writable: param.writable,
+                lends_storage: param.writable && (!promoted || param.borrow_span.is_some()),
                 has_default,
                 default,
                 declaration: Some(param.span),
@@ -9903,6 +9907,43 @@ impl<'program> Checker<'program> {
             .as_ref()
             .expect("parameter-default validation requires a default");
         let kind = self.types.kind(ty).clone();
+
+        // A writable parameter lends the caller's own storage, so an omitted
+        // argument has none to lend (Andrew's ruling of 2026-11-21, "Writable
+        // always borrows (Recommended)"). On a promoted constructor parameter
+        // `writable` makes the property writable instead (Decision 0083).
+        let promoted = function.name == "__construct"
+            && param.constructor_role.is_promoted()
+            && param.borrow_span.is_none();
+        if param.writable && !promoted {
+            let removal = Span {
+                start: param.name_span.end,
+                end: default.span().end,
+                ..default.span()
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    WRITABLE_PARAMETER_DEFAULT_CODE,
+                    format!("writable parameter `${}` cannot have a default value", param.name),
+                    default.span(),
+                )
+                .with_title("Writable Parameter Cannot Have A Default")
+                .with_explanation(
+                    "A `writable` parameter lends the caller's own variable or property to the function, so its changes reach the caller. An omitted argument has no storage to lend.",
+                )
+                .with_help("remove the default and pass a writable variable at every call, or drop `writable` and return the new value")
+                .with_structured_fix(
+                    "Remove The Default Value",
+                    crate::diagnostics::FixApplicability::RequiresReview,
+                    vec![crate::diagnostics::FixEdit {
+                        source: crate::diagnostics::DiagnosticSource::Current,
+                        span: removal,
+                        replacement: String::new(),
+                    }],
+                ),
+            );
+            return;
+        }
 
         if matches!(kind, TypeKind::String) && param.take {
             self.diagnostics.push(Diagnostic::new(
@@ -19839,6 +19880,7 @@ impl<'program> Checker<'program> {
                 ty: self.string_surface_type(parameter.ty),
                 take: false,
                 writable: false,
+                lends_storage: false,
                 has_default: parameter.default.is_some(),
                 default: None,
                 declaration: None,
@@ -20599,6 +20641,7 @@ impl<'program> Checker<'program> {
                     ty: field.ty,
                     take: self.type_is_move_type(field.ty),
                     writable: false,
+                    lends_storage: false,
                     has_default: false,
                     default: None,
                     declaration: None,
@@ -21483,6 +21526,7 @@ impl<'program> Checker<'program> {
             ty: self.substitute_type(param.ty, bindings),
             take: param.take,
             writable: param.writable,
+            lends_storage: param.lends_storage,
             has_default: param.has_default,
             default: param.default.clone(),
             declaration: param.declaration,
@@ -21667,6 +21711,34 @@ impl<'program> Checker<'program> {
         if self.is_expr_assignable(param.ty, arg, scopes, method_context)
             || self.is_assignable(param.ty, got)
         {
+            // A writable Copy argument lends the caller's storage, so it must be
+            // a place the caller may change (Andrew's ruling of 2026-11-21,
+            // "Writable always borrows (Recommended)").
+            if param.lends_storage
+                && !parameter_is_class_like
+                && !matches!(self.types.kind(param.ty), TypeKind::Mixed)
+                && !self.type_is_move_type(got)
+                && self.storage_path_access(arg, scopes, method_context)
+                    != ObjectPathAccess::Writable
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0204",
+                        format!(
+                            "argument {} of {callee} must be a writable variable or property",
+                            index + 1
+                        ),
+                        arg.span(),
+                    )
+                    .with_title("Writable Parameter Needs A Writable Place")
+                    .with_explanation(
+                        "A `writable` parameter lends the caller's own variable or property to the function, so its changes reach the caller. A literal, a computed value or a readonly value has no storage the caller may change.",
+                    )
+                    .with_help("pass a variable or property declared `writable`")
+                    .with_help("or drop `writable` from the parameter and return the new value"),
+                );
+                return;
+            }
             if param.take {
                 self.record_capture_requirement_for_expr(arg, scopes, CaptureRequirement::Take);
             } else if param.writable {
@@ -25134,6 +25206,7 @@ impl<'program> Checker<'program> {
                 ty: payload,
                 take: true,
                 writable: false,
+                lends_storage: false,
                 has_default: false,
                 default: None,
                 declaration: None,

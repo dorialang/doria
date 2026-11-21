@@ -3231,11 +3231,13 @@ function boundaries(): int {
 }
 function main(): void { echo boundaries(); }
 "#;
+        // `replace($borrowed)` lends the caller's value, so it reads 13
+        // (Andrew's ruling of 2026-11-21, "Writable always borrows").
         let mir = crate::lower_source_to_mir("copy-enum-boundaries.doria", source).unwrap();
         let expected = crate::mir_interpreter::interpret(&mir).unwrap();
-        assert_eq!(expected.stdout, b"69");
+        assert_eq!(expected.stdout, b"78");
         assert!(expected.runtime_diagnostic.is_none(), "{expected:?}");
-        execute(source, 69, "boundaries");
+        execute(source, 78, "boundaries");
     }
 
     #[test]

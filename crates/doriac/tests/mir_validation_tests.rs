@@ -7638,6 +7638,9 @@ function main(): void {
     );
     let constructor = &mut program.functions[class.constructor.unwrap().0];
     let input = constructor.params[1];
+    // A retained writable source lends its caller's place, as a `borrow
+    // writable` promoted parameter does.
+    constructor.parameter_modes[1] = mir::FunctionParameterMode::Writable;
     constructor.blocks[constructor.entry_block.0]
         .statements
         .insert(

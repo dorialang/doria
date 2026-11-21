@@ -1156,6 +1156,29 @@ impl Function {
         })
     }
 
+    /// Whether writes to a parameter go to the caller's place through its
+    /// borrow home: a retained writable constructor input, and a writable
+    /// Copy parameter of a function or method. A closure receives such a
+    /// parameter's address directly, and a move-owned value is changed
+    /// through the value it already shares.
+    pub fn writes_through_parameter_home(&self, local: LocalId) -> bool {
+        self.promotes_writable_input(local)
+            || self.closure.is_none()
+                && self
+                    .params
+                    .iter()
+                    .position(|parameter| *parameter == local)
+                    .is_some_and(|index| {
+                        (index > 0 || self.receiver_mode.is_none())
+                            && self.parameter_modes.get(index)
+                                == Some(&FunctionParameterMode::Writable)
+                            && self
+                                .locals
+                                .get(local.0)
+                                .is_some_and(|definition| !definition.ty.has_move_ownership())
+                    })
+    }
+
     pub(crate) fn promotes_writable_input(&self, local: LocalId) -> bool {
         self.retains_writable_input(local)
             && self
@@ -1212,14 +1235,13 @@ impl Function {
             .iter()
             .position(|parameter| *parameter == local)
             .is_some_and(|index| {
+                // A writable parameter of any type lends the caller's place
+                // (Andrew's ruling of 2026-11-21, "Writable always borrows").
                 self.parameter_modes.get(index) == Some(&FunctionParameterMode::Writable)
                     && (self.closure.is_some()
                         || self.promotes_writable_input(local)
-                        || (index > 0 || self.receiver_mode.is_none())
-                            && self
-                                .locals
-                                .get(local.0)
-                                .is_some_and(|definition| definition.ty.has_move_ownership()))
+                        || index > 0
+                        || self.receiver_mode.is_none())
             })
             || self.closure.as_ref().is_some_and(|closure| {
                 closure

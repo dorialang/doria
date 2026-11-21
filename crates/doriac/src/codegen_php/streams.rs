@@ -3488,8 +3488,9 @@ function main(): void throws IoError {
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
             panic!("file transfer fixture must use native bytes");
         };
-        // A writable Copy parameter changes its local copy, not its caller.
-        // Exercise the private borrowed-slot carrier separately from that contract.
+        // A writable Copy parameter lends its caller's byte (Andrew's ruling of
+        // 2026-11-21, "Writable always borrows"). Exercise the borrowed-slot
+        // carrier directly as well.
         contents.push_str(
             r#"
 $owner = __DoriaBytes::fromArray([65, 66, 67], 0, 0, "");
@@ -3509,10 +3510,10 @@ echo $cell->value . "\n";
         };
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
-        assert_eq!(output.stdout, b"65 68 67\n90\n91\n");
+        assert_eq!(output.stdout, b"65 90 67\n90\n91\n");
         assert_eq!(
             std::fs::read(fixture.0.join("projection.bin")).unwrap(),
-            b"ADC"
+            b"AZC"
         );
     }
 

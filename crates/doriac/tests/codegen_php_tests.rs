@@ -546,7 +546,7 @@ function main(): void {
     let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert_eq!(
         expected.stdout,
-        b"7|1|c|b|makea|makec|a|c|makea|makeb|a|b|\n"
+        b"7|7|c|b|makea|makec|a|c|makea|makeb|a|b|\n"
     );
     let php = doriac::compile_source_to_php("assignment-regions.doria", source).unwrap();
     for name in ["scalar", "copyParameter", "borrowed", "owning"] {
@@ -1097,7 +1097,7 @@ function copy<T>(T $input): T {
     return $callback($input);
 }
 function replace(writable int $input, int $other): int { $input = $other; return $input; }
-function copyParameter(int $input): int { return replace($input, 7); }
+function copyParameter(writable int $input): int { return replace($input, 7); }
 function main(): void {
     let $duration = Duration::fromNanoseconds(-17);
     let $sample = new Sample();
@@ -1110,7 +1110,8 @@ function main(): void {
     if (copy(42) != 42) { panic("nested integer changed"); }
     let $wait = Wait::For($duration);
     if (copy($wait) != $wait) { panic("nested enum changed"); }
-    if (copyParameter(42) != 7) { panic("local parameter storage changed"); }
+    let writable $number = 42;
+    if (copyParameter($number) != 7 || $number != 7) { panic("lent parameter storage lost its write"); }
 }
 "#;
     let php = doriac::compile_source_to_php("generic-copy-callback.doria", source).unwrap();
@@ -2324,14 +2325,10 @@ fn php_backend_normalizes_defaulted_cell_parameters_without_leaking_transport() 
     let mir = doriac::lower_source_to_mir("defaulted-cell-parameters.doria", source).unwrap();
     let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert!(expected.runtime_diagnostic.is_none(), "{expected:?}");
-    assert_eq!(expected.stdout, b"true:false:true:false:true\n");
+    assert_eq!(expected.stdout, b"false:true:true\n");
     let php = doriac::compile_source_to_php("defaulted-cell-parameters.doria", source)
         .expect("defaulted cell parameters should lower to PHP");
 
-    assert!(php.contains(&format!(
-        "function {}(bool $value = false): bool",
-        php_function_name("invert")
-    )));
     assert!(php.contains("public bool $value;"));
     assert!(php.contains("function __construct(bool $value = false)"));
     assert!(php.contains("$value = new __DoriaCell($value);"));

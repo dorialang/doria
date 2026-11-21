@@ -173,6 +173,10 @@ struct Parameter {
     generic: bool,
     take: bool,
     writable: bool,
+    /// The argument is the caller's writable place, lent for the call: every
+    /// `writable` parameter except a promoted constructor parameter, where
+    /// `writable` makes the property writable (Decision 0083).
+    lends: bool,
     borrow: bool,
 }
 
@@ -213,6 +217,7 @@ impl Signature {
                     generic: resolved_type_requires_conservative_move(&parameter.ty),
                     take: parameter.ownership_mode == crate::types::FunctionTypeParameterMode::Take,
                     writable: parameter.ownership_mode == crate::types::FunctionTypeParameterMode::Writable,
+                    lends: parameter.ownership_mode == crate::types::FunctionTypeParameterMode::Writable,
                     borrow: false,
                 })
                 .collect(),
@@ -265,6 +270,7 @@ fn writable_shared_constructor_signature() -> Signature {
             generic: true,
             take: true,
             writable: false,
+            lends: false,
             borrow: false,
         }],
         returns_move_type: true,
@@ -2197,6 +2203,7 @@ fn check_selected_program(
                                         generic,
                                         take: move_type,
                                         writable: false,
+                                        lends: false,
                                         borrow: false,
                                     }
                                 })
@@ -3518,6 +3525,9 @@ fn signature(
                 ),
                 take: param.take,
                 writable: param.writable,
+                lends: param.writable
+                    && (!(function.name == "__construct" && param.constructor_role.is_promoted())
+                        || param.borrow_span.is_some()),
                 borrow: param.borrow_span.is_some(),
             })
             .collect(),
@@ -4115,7 +4125,14 @@ impl Checker<'_> {
                         &[],
                     ),
                     mixed,
-                    borrowed_place: !param.take,
+                    // A promoted writable Copy parameter is the constructor's own
+                    // copy; `writable` makes its property writable (Decision 0083).
+                    borrowed_place: !param.take
+                        && !(param.writable
+                            && copy_parameter
+                            && function.name == "__construct"
+                            && param.constructor_role.is_promoted()
+                            && param.borrow_span.is_none()),
                     borrow_root: None,
                     borrow_parents: Vec::new(),
                     writeback_homes: Vec::new(),
@@ -10879,6 +10896,7 @@ impl Checker<'_> {
                                 generic: false,
                                 take: move_type,
                                 writable: false,
+                                lends: false,
                                 borrow: false,
                             }
                         })
@@ -10934,7 +10952,9 @@ impl Checker<'_> {
                 }));
         if param.take && move_type {
             UseMode::Give
-        } else if param.writable && move_type {
+        } else if param.writable && (move_type || param.lends) {
+            // A writable argument of any type lends the caller's place
+            // (Andrew's ruling of 2026-11-21, "Writable always borrows").
             UseMode::Write
         } else {
             UseMode::Read

@@ -347,7 +347,7 @@ fn skipped_short_circuit_calls_preserve_narrowing_facts() {
         "stage22-skipped-short-circuit-call.doria",
         r#"
 function clear(writable ?int $value): bool { $value = null; return true; }
-function read(?int $value): int
+function read(writable ?int $value): int
 {
     if ($value == null) { return 0; }
     false && clear($value);

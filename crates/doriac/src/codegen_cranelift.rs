@@ -1802,7 +1802,7 @@ fn define_function(
             let local = function.params[parameter + usize::from(function.closure.is_some())];
             let descriptor = builder.block_params(entry)[abi];
             borrow_home_addresses.insert(local, descriptor);
-            if function.promotes_writable_input(local) {
+            if function.writes_through_parameter_home(local) {
                 let home = load_borrow_home_descriptor(&mut builder, descriptor, pointer_type);
                 writable_parameter_addresses.insert(local, home.address);
             }
