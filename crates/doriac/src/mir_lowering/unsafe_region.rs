@@ -367,7 +367,8 @@ pub(super) fn require_every_live_region(
 /// lowered so each direct call's parameter modes are known: a local the
 /// region touches is an input when code outside the region also touches it
 /// or it is a parameter, and an output when the region also writes, moves
-/// or destroys it. Inputs keep the order of first use inside the region.
+/// or destroys it. A region terminator that leaves the function counts as
+/// code outside it. Inputs keep the order of first use inside the region.
 pub(super) fn bind_values(program: &mut mir::Program) {
     use crate::mir::local_access::{statement_locals, terminator_locals, LocalAccess};
     let parameter_modes = program
@@ -391,7 +392,7 @@ pub(super) fn bind_values(program: &mut mir::Program) {
             let mut written = HashSet::new();
             for block in &function.blocks {
                 let inside = region.contains(block.id);
-                let mut note = |local: mir::LocalId, access: LocalAccess| {
+                let mut note = |inside: bool, local: mir::LocalId, access: LocalAccess| {
                     if !inside {
                         outside.insert(local);
                         return;
@@ -404,9 +405,17 @@ pub(super) fn bind_values(program: &mut mir::Program) {
                     }
                 };
                 for statement in &block.statements {
-                    statement_locals(statement, &modes, &mut note);
+                    statement_locals(statement, &modes, &mut |local, access| {
+                        note(inside, local, access)
+                    });
                 }
-                terminator_locals(&block.terminator, &modes, &mut note);
+                // The host runs a terminator that leaves the function in its
+                // own frame, so the locals it touches cross back.
+                let terminator_inside =
+                    inside && !mir::companion::leaves_function(&block.terminator);
+                terminator_locals(&block.terminator, &modes, &mut |local, access| {
+                    note(terminator_inside, local, access)
+                });
             }
             let locals = &function.locals;
             let value = |local: mir::LocalId| {

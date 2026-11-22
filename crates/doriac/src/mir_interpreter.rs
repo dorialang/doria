@@ -2663,6 +2663,13 @@ impl<'a> Interpreter<'a> {
                 ));
             }
             mir::Statement::ForeignField { .. } => return Err(foreign_aggregate_refusal()),
+            mir::Statement::HostRecord { .. }
+            | mir::Statement::RegionSlot { .. }
+            | mir::Statement::CallHost { .. } => {
+                return Err(InterpreterError::new(
+                    "companion entry statements run only in the native companion library",
+                ));
+            }
         }
         Ok(StepOutcome::Continue)
     }

@@ -286,31 +286,68 @@ impl CRecord {
     /// offset zero, and both round the size up to the largest member
     /// alignment. `None` when the size does not fit in 64 bits.
     pub fn new(kind: ForeignAggregateKind, fields: Vec<CType>) -> Option<Self> {
+        let placement = Placement::of(
+            kind,
+            fields
+                .iter()
+                .map(|ty| Some((checked_size(ty)?, ty.align())))
+                .collect::<Option<Vec<_>>>()?,
+        )?;
+        Some(Self {
+            kind,
+            fields: fields
+                .into_iter()
+                .zip(&placement.offsets)
+                .map(|(ty, offset)| CField {
+                    offset: *offset,
+                    ty,
+                })
+                .collect(),
+            size: placement.size,
+            align: placement.align,
+        })
+    }
+}
+
+/// Where the target C rules place the members of a struct or union, from
+/// each member's size and alignment in declaration order. Foreign structs
+/// and unions and the companion library's slot records (Decision 0148
+/// section 23) take their offsets from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub offsets: Vec<u64>,
+    pub size: u64,
+    pub align: u64,
+}
+
+impl Placement {
+    /// A struct places each member at the next offset aligned for it, a
+    /// union places every member at offset zero, and both round the size up
+    /// to the largest member alignment. `None` when the size does not fit
+    /// in 64 bits.
+    pub fn of(
+        kind: ForeignAggregateKind,
+        members: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Option<Self> {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1u64;
-        let mut laid_out = Vec::with_capacity(fields.len());
-        for ty in fields {
-            let field_size = checked_size(&ty)?;
-            let field_align = ty.align();
-            align = align.max(field_align);
-            let field_offset = match kind {
+        let mut offsets = Vec::new();
+        for (member_size, member_align) in members {
+            align = align.max(member_align);
+            let member_offset = match kind {
                 ForeignAggregateKind::Struct => {
-                    let start = align_up(offset, field_align)?;
-                    offset = start.checked_add(field_size)?;
+                    let start = align_up(offset, member_align)?;
+                    offset = start.checked_add(member_size)?;
                     start
                 }
                 ForeignAggregateKind::Union => 0,
             };
-            size = size.max(field_offset.checked_add(field_size)?);
-            laid_out.push(CField {
-                offset: field_offset,
-                ty,
-            });
+            size = size.max(member_offset.checked_add(member_size)?);
+            offsets.push(member_offset);
         }
         Some(Self {
-            kind,
-            fields: laid_out,
+            offsets,
             size: align_up(size, align)?,
             align,
         })

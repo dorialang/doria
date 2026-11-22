@@ -5535,6 +5535,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 target,
                 ..
             } => self.lower_foreign_call(function, args, *target)?,
+            mir::Statement::HostRecord { .. }
+            | mir::Statement::RegionSlot { .. }
+            | mir::Statement::CallHost { .. } => {
+                return Err(malformed_mir(
+                    "a companion entry statement reached the program's own code generation",
+                ))
+            }
             mir::Statement::ForeignField {
                 aggregate,
                 offset,

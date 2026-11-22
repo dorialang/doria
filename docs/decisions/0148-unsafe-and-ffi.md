@@ -1029,8 +1029,10 @@ takes a new version.
   region reads) run in the companion against the shared runtime. A panic goes
   to the panic sink.
 - Operation 0 is reserved: before its own cleanup the companion hands each
-  string output to the host through it, and the output slot carries the host
-  token the host returns.
+  output whose content it owns (a string, a buffer or a foreign string) to
+  the host through it. Its arguments and results are both the output slot;
+  the host reads the content and writes the host token it returns into the
+  slot's first word, 0 for a slot that holds no value.
 - Operation identities come from one MIR host-operation table, numbered in
   region identity order and then block order; PHP output generates the PHP for
   each operation from that table.
@@ -1040,10 +1042,31 @@ takes a new version.
   string slot is `{const uint8_t *bytes; size_t length}`, with a null `bytes`
   for an absent `?string`. A buffer or region slot is
   `{void *data; size_t length}`. A host token is a `uintptr_t`. `outputs` holds
-  the output slots in order (a return value and an error token are among
-  them), then the expression result, then an `int32` break/continue target
-  index. Host-call arguments and results follow the same slot rules in operand
-  order.
+  the output slots in order, then the expression result, then the `int32`
+  index of the exit taken, its position among the region's exits; fallthrough
+  writes none. Host-call arguments and results follow the same slot rules in
+  operand order.
+- A host token has no slot: an input, output or argument that stays on the
+  host keeps its value in the host frame. A region terminator that leaves the
+  function (`return` or an escaping Error) runs in the host frame after the
+  writeback, so the locals it reads are outputs.
+- `length` counts elements: bytes for a string, `Bytes` or byte region, code
+  units for a foreign string, without its NUL. A present value has a non-null
+  data pointer even when empty; a null one is an absent `?` value or a local
+  that holds no value yet, and loads as the zero value. The host allocates
+  every record zero-filled, so a slot nobody writes holds no value.
+- Content crosses by copy. The companion copies an input's or result's
+  content into a value it owns as it loads it; a slot the companion writes
+  lends its own storage until the companion changes or releases the value,
+  and the host's result content stays valid until its next call returns or
+  the entry does.
+- A host operation's results are the locals it writes or moves; a moved one
+  crosses back with no value.
+- The entry is a MIR function the compiler generates from the first
+  lowering's region blocks: a prologue loads `inputs`, each host-operation
+  site becomes a host call, each edge out of the region writes `outputs` and
+  releases the companion's copies in reverse order. `host->call` returns 0
+  for every operation; the companion does not read it.
 
 **Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
@@ -1215,6 +1238,20 @@ has one precise contract.
   - A successor index for terminators: the Error a failed call raises stays
     on the host, so one index rule serves every terminator and the statuses
     keep their region meaning.
+  - Operation 0 accepts every owned output: a buffer the region grew or
+    replaced, and a foreign string it built, need the same hand-off before
+    cleanup as a string, so one operation serves all three.
+  - No slot for a host token: every statement that touches one is a host
+    operation, so the companion never holds one, and a host terminator
+    reads the region's outputs from its own frame.
+  - Null data as no value: native code zeroes a local it moves out of, so
+    a moved or never-written local crosses as zero, and the host needs no
+    separate table of moved outputs.
+  - Copies at load and lent storage at store: each side keeps ownership of
+    the values it built, so destruction stays in ordinary order on each.
+  - A generated MIR entry: MIR validation and both native backends already
+    own every statement of the region, so the entry adds only its slot,
+    record and host-call statements.
 - The unsafe inventory for `baton audit unsafe` is compiler metadata (section 25).
 - `Platform::architecture` beside `Platform::operatingSystem` (section 17), and
   the placement of `Platform`, `OperatingSystem` and `Architecture` in

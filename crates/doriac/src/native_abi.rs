@@ -806,6 +806,31 @@ pub fn function_symbol(function: &mir::Function) -> String {
 
 /// The C size, equal to its alignment, of a scalar a pointer reads and
 /// writes (Decision 0148 section 4); `None` for a scalar without a C layout.
+/// The size and alignment of the companion slot holding `value`, a local
+/// of type `ty` (Decision 0148 section 23, entry ABI version 1). A native
+/// value has its native layout, a nullable one with its presence
+/// (`native_closure_abi::type_layout`); a string, buffer, region or foreign
+/// string slot is `{const void *data; size_t length}`. A host token has no
+/// slot: it stays in the host frame.
+pub fn companion_slot_layout(value: mir::UnsafeRegionValue, ty: mir::Type) -> Option<(u64, u64)> {
+    const WORD: u64 = 8;
+    match value.kind {
+        mir::UnsafeRegionValueKind::Native => {
+            let layout = crate::native_closure_abi::type_layout(ty, WORD as u32);
+            Some((u64::from(layout.size), u64::from(layout.align)))
+        }
+        mir::UnsafeRegionValueKind::Text
+        | mir::UnsafeRegionValueKind::Buffer
+        | mir::UnsafeRegionValueKind::Region
+        | mir::UnsafeRegionValueKind::ForeignString => Some((2 * WORD, WORD)),
+        mir::UnsafeRegionValueKind::HostToken => None,
+    }
+}
+
+/// The `int32` index ending an `outputs` record or a terminator host
+/// operation's results.
+pub const COMPANION_INDEX_LAYOUT: (u64, u64) = (4, 4);
+
 /// The size and alignment of a value a pointer reads or writes (Decision
 /// 0148 section 4): a scalar with a C layout, whose alignment is its size,
 /// or a foreign struct or union with its C layout.

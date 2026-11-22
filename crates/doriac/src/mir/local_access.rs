@@ -354,6 +354,29 @@ impl Walker<'_, '_> {
                     self.write(*target);
                 }
             }
+            Statement::HostRecord { target, .. } => self.write(*target),
+            Statement::RegionSlot {
+                record,
+                slot,
+                access,
+            } => {
+                self.read(*record);
+                match access {
+                    SlotAccess::Load => self.write(slot.value.local),
+                    SlotAccess::Store => self.read(slot.value.local),
+                }
+            }
+            Statement::CallHost {
+                host,
+                arguments,
+                results,
+                ..
+            } => {
+                self.read(*host);
+                for record in arguments.iter().chain(results) {
+                    self.read(*record);
+                }
+            }
             Statement::ForeignField {
                 aggregate, access, ..
             } => match access {

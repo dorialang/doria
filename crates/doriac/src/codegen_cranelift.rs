@@ -4112,6 +4112,13 @@ fn lower_statement(
             target,
             ..
         } => lower_foreign_call(builder, function, args, *target, resources)?,
+        mir::Statement::HostRecord { .. }
+        | mir::Statement::RegionSlot { .. }
+        | mir::Statement::CallHost { .. } => {
+            return Err(malformed_mir(
+                "a companion entry statement reached the program's own code generation",
+            ))
+        }
         mir::Statement::ForeignField {
             aggregate,
             offset,

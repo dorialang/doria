@@ -4238,6 +4238,52 @@ fn validate_statement(
             target,
             ..
         } => validate_foreign_call(program, function, foreign, args, *target),
+        mir::Statement::HostRecord {
+            target,
+            size,
+            align,
+        } => {
+            require_companion_entry(program, function)?;
+            require_companion_pointer(function, *target)?;
+            if !align.is_power_of_two() || size % align != 0 {
+                return Err(malformed_mir(
+                    "a host record's size is not a multiple of its power-of-two alignment",
+                ));
+            }
+            Ok(())
+        }
+        mir::Statement::RegionSlot { record, slot, .. } => {
+            require_companion_entry(program, function)?;
+            require_companion_pointer(function, *record)?;
+            let local = local_in(function, slot.value.local)?;
+            let crossing =
+                mir::UnsafeRegionValue::of(slot.value.local, local.ty, &program.collection_types);
+            let layout = crate::native_abi::companion_slot_layout(slot.value, local.ty);
+            match layout {
+                Some((_, align)) if crossing == slot.value && slot.offset % align == 0 => Ok(()),
+                _ => Err(malformed_mir(format!(
+                    "a companion slot of local{} does not match its type or alignment",
+                    slot.value.local.0
+                ))),
+            }
+        }
+        mir::Statement::CallHost {
+            host,
+            operation,
+            arguments,
+            results,
+        } => {
+            require_companion_entry(program, function)?;
+            for local in std::iter::once(host).chain(arguments).chain(results) {
+                require_companion_pointer(function, *local)?;
+            }
+            if *operation as usize > program.companion.host_operations.len() {
+                return Err(malformed_mir(format!(
+                    "a companion entry calls host operation {operation}, which the plan lacks"
+                )));
+            }
+            Ok(())
+        }
         mir::Statement::ForeignField {
             aggregate,
             offset,
@@ -6606,7 +6652,71 @@ fn validate_companion(program: &mir::Program) -> Result<(), BackendError> {
             "the companion plan differs from the one its unsafe regions give",
         ));
     }
+    if program.companion.regions.is_empty() {
+        return Ok(());
+    }
+    // Each entry is validated as the companion library compiles it, beside
+    // the program's functions, which its foreign calls reach.
+    let library = mir::companion::library(program);
+    for (index, region) in program.companion.regions.iter().enumerate() {
+        let entry = &region.entry;
+        let pointer = |local: &mir::LocalId| {
+            entry.locals.get(local.0).map(|local| local.ty) == Some(COMPANION_POINTER)
+        };
+        if entry.id != mir::FunctionId(program.functions.len() + index)
+            || entry.params.len() != 4
+            || !entry.params.iter().all(pointer)
+            || entry.return_type
+                != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int32,
+                )))
+            || !entry.unsafe_regions.is_empty()
+        {
+            return Err(malformed_mir(format!(
+                "the companion entry of region {} does not have the version-1 signature",
+                region.id
+            )));
+        }
+        validate_function(&library, entry)?;
+    }
     Ok(())
+}
+
+const COMPANION_POINTER: mir::Type = mir::Type::Scalar(mir::ScalarType::Inline(
+    crate::inline_value::InlineValueType::Pointer,
+));
+
+/// Companion statements belong to companion entries alone: the functions
+/// of the companion library that follow every function of the program.
+fn require_companion_entry(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    if program
+        .companion
+        .regions
+        .iter()
+        .any(|region| region.entry.id == function.id)
+    {
+        return Ok(());
+    }
+    Err(malformed_mir(format!(
+        "`{}` contains a companion statement outside a companion entry",
+        function.name
+    )))
+}
+
+fn require_companion_pointer(
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<(), BackendError> {
+    if local_in(function, local)?.ty == COMPANION_POINTER {
+        return Ok(());
+    }
+    Err(malformed_mir(format!(
+        "companion statement local{} is not a pointer",
+        local.0
+    )))
 }
 
 fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
@@ -14975,6 +15085,18 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
     let mut accesses = ClassLocalAccesses::default();
     match statement {
         mir::Statement::SetDiagnosticSite { .. } => {}
+        mir::Statement::HostRecord { .. } => {}
+        mir::Statement::RegionSlot { record, .. } => accesses.resource_read(*record),
+        mir::Statement::CallHost {
+            host,
+            arguments,
+            results,
+            ..
+        } => {
+            for local in std::iter::once(host).chain(arguments).chain(results) {
+                accesses.resource_read(*local);
+            }
+        }
         mir::Statement::ForeignCall { function, args, .. } => {
             if let mir::ForeignCallee::Pointer(pointer) = function.callee {
                 accesses.resource_read(pointer);
@@ -20964,7 +21086,11 @@ fn statement_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match statement {
-        mir::Statement::SetDiagnosticSite { .. } | mir::Statement::ForeignCall { .. } => false,
+        mir::Statement::SetDiagnosticSite { .. }
+        | mir::Statement::ForeignCall { .. }
+        | mir::Statement::HostRecord { .. }
+        | mir::Statement::RegionSlot { .. }
+        | mir::Statement::CallHost { .. } => false,
         mir::Statement::ForeignField {
             aggregate, access, ..
         } => {

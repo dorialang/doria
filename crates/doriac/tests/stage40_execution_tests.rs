@@ -4556,8 +4556,8 @@ function main(): void
         "{companion:#?}"
     );
     let run = function_named(&mir, "run");
-    let local = |value: &doriac::mir::UnsafeRegionValue| {
-        run.locals[value.local.0]
+    let local = |slot: &doriac::mir::CompanionSlot| {
+        run.locals[slot.value.local.0]
             .name
             .trim_start_matches('$')
             .to_string()
@@ -4573,7 +4573,8 @@ function main(): void
         operations.iter().any(|operation| {
             operation.site == doriac::mir::HostOperationSite::Terminator
                 && operation.successors.len() == 2
-                && operation.arguments.is_empty()
+                && operation.arguments.slots.is_empty()
+                && operation.results.index.is_some()
         }),
         "{operations:#?}"
     );
@@ -4589,10 +4590,144 @@ function main(): void
     );
     assert!(
         operations.iter().any(|operation| {
-            operation.arguments.iter().map(local).collect::<Vec<_>>() == ["total"]
-                && operation.results.iter().map(local).collect::<Vec<_>>() == ["total"]
+            operation
+                .arguments
+                .slots
+                .iter()
+                .map(local)
+                .collect::<Vec<_>>()
+                == ["total"]
+                && operation
+                    .results
+                    .slots
+                    .iter()
+                    .map(local)
+                    .collect::<Vec<_>>()
+                    == ["total"]
         }),
         "{operations:#?}"
     );
     assert_runs_natively(&source, "inside\n5 6");
+}
+
+/// A region's companion entry (Decision 0148 section 23, entry ABI
+/// version 1): the inputs and outputs records follow C layout, the
+/// prologue loads every input, and each edge out of the region writes the
+/// outputs, hands the string to the host through operation 0, writes the
+/// exit's index (fallthrough writes none) and releases the string the
+/// companion copied in.
+#[test]
+fn companion_entry_marshals_its_slots_on_every_edge() {
+    use doriac::mir::{SlotAccess, Statement, UnsafeRegionValueKind};
+    let source = format!(
+        "{C_LIBRARY}
+function shout(string $name, int32 $limit): string
+{{
+    writable string $text = $name;
+    writable int32 $count = 0;
+    while (true) {{
+        unsafe {{
+            $text = $text . \"!\";
+            $count = abs($count) + 1;
+            if ($count == $limit) {{
+                break;
+            }}
+        }}
+    }}
+    return $text;
+}}
+
+function main(): void
+{{
+    echo shout(\"hey\", 3) . \"\\n\";
+}}
+"
+    );
+    let mir = program(&source);
+    doriac::mir_validation::validate_program(&mir).expect("the companion entry validates");
+    let shout = function_named(&mir, "shout");
+    let (index, region) = mir
+        .companion
+        .regions
+        .iter()
+        .enumerate()
+        .find(|(_, region)| region.lowerings[0].function == shout.id)
+        .expect("`shout` has a region");
+    let layout = |record: &doriac::mir::SlotRecord| {
+        record
+            .slots
+            .iter()
+            .map(|slot| {
+                (
+                    shout.locals[slot.value.local.0].name.clone(),
+                    slot.value.kind,
+                    slot.offset,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let named = |name: &str, kind, offset| (name.to_string(), kind, offset);
+    assert_eq!(
+        layout(&region.inputs),
+        [
+            named("text", UnsafeRegionValueKind::Text, 0),
+            named("count", UnsafeRegionValueKind::Native, 16),
+            named("limit", UnsafeRegionValueKind::Native, 20),
+        ],
+        "{region:#?}"
+    );
+    assert_eq!((region.inputs.size, region.inputs.align), (24, 8));
+    assert_eq!(
+        layout(&region.outputs),
+        [
+            named("text", UnsafeRegionValueKind::Text, 0),
+            named("count", UnsafeRegionValueKind::Native, 16)
+        ]
+    );
+    assert_eq!(region.outputs.index, Some(20));
+    assert_eq!((region.outputs.size, region.outputs.align), (24, 8));
+    assert!(mir
+        .companion
+        .host_operations
+        .iter()
+        .all(|operation| operation.region != index));
+    let entry = &region.entry;
+    assert_eq!(entry.id.0, mir.functions.len() + index);
+    assert_eq!(entry.params.len(), 4);
+    assert!(entry.blocks[entry.entry_block.0]
+        .statements
+        .iter()
+        .all(|statement| matches!(
+            statement,
+            Statement::RegionSlot {
+                access: SlotAccess::Load,
+                ..
+            }
+        )));
+    let text = region.outputs.slots[0].value.local;
+    let statements = entry
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .collect::<Vec<_>>();
+    let accepted = statements
+        .iter()
+        .filter(|statement| matches!(statement, Statement::CallHost { operation: 0, .. }))
+        .count();
+    let released = statements
+        .iter()
+        .filter(|statement| matches!(statement, Statement::DropString { local } if *local == text))
+        .count();
+    let indexed = statements
+        .iter()
+        .filter(|statement| {
+            matches!(
+                statement,
+                Statement::RegionSlot { slot, access: SlotAccess::Store, .. }
+                    if Some(slot.offset) == region.outputs.index
+            )
+        })
+        .count();
+    assert_eq!((accepted, released, indexed), (2, 2, 1), "{entry:#?}");
+    assert_runs_natively(&source, "hey!!!\n");
 }

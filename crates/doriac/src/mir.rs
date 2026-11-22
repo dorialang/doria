@@ -7025,6 +7025,34 @@ pub enum Statement {
         access: ForeignFieldAccess,
         span: Span,
     },
+    /// Points the pointer local `target` at `size` zero-filled bytes of the
+    /// companion entry's own frame, aligned to `align`: a host operation's
+    /// argument or result record. Only companion entries
+    /// (`CompanionRegion::entry`) contain it.
+    HostRecord {
+        target: LocalId,
+        size: u64,
+        align: u64,
+    },
+    /// Moves `slot`'s value between the record the pointer local `record`
+    /// addresses and the slot's local (Decision 0148 section 23). Only
+    /// companion entries contain it.
+    RegionSlot {
+        record: LocalId,
+        slot: CompanionSlot,
+        access: SlotAccess,
+    },
+    /// `host->call(host, operation, arguments, results)` through the
+    /// `DrRegionHostV1` the pointer local `host` addresses; an absent
+    /// record passes a null pointer. In version 1 every operation returns
+    /// status 0, and a panic on the host never returns. Only companion
+    /// entries contain it.
+    CallHost {
+        host: LocalId,
+        operation: u32,
+        arguments: Option<LocalId>,
+        results: Option<LocalId>,
+    },
 }
 
 /// What a `Statement::ForeignField` does. The field's type is the type of
@@ -8189,6 +8217,53 @@ pub enum Terminator {
 impl Terminator {
     /// The blocks control can reach next, in a fixed order. A terminator
     /// that returns, propagates an Error, panics or is unreachable has none.
+    /// Every target of the terminator, in `targets` order, to retarget.
+    pub fn targets_mut(&mut self) -> Vec<&mut BlockId> {
+        match self {
+            Self::Jump(target) => vec![target],
+            Self::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block, else_block],
+            Self::CheckedCall {
+                success, failure, ..
+            }
+            | Self::CheckedIndirectCall {
+                success, failure, ..
+            }
+            | Self::CheckedConstruct {
+                success, failure, ..
+            }
+            | Self::CheckedIo {
+                success, failure, ..
+            }
+            | Self::CheckedDeadlineFromNow {
+                success, failure, ..
+            }
+            | Self::CheckedCancellationRequest {
+                success, failure, ..
+            } => vec![success, failure],
+            Self::IndirectCall { continuation, .. } => vec![continuation],
+            Self::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => cases
+                .iter_mut()
+                .map(|(_, target)| target)
+                .chain(catch_all.iter_mut())
+                .chain(std::iter::once(fallback))
+                .collect(),
+            Self::Return(_)
+            | Self::ReturnVoid
+            | Self::Panic { .. }
+            | Self::Unreachable
+            | Self::PropagateError { .. } => Vec::new(),
+        }
+    }
+
     pub fn targets(&self) -> Vec<BlockId> {
         match self {
             Self::Jump(target) => vec![*target],
@@ -8290,14 +8365,16 @@ pub struct Companion {
     /// One entry per region identity, in identity order.
     pub regions: Vec<CompanionRegion>,
     /// Operation `n` is `host_operations[n - 1]`; operation 0
-    /// (`ACCEPT_TEXT_OPERATION`) hands a string output to the host.
+    /// (`ACCEPT_OUTPUT_OPERATION`) hands an output to the host.
     pub host_operations: Vec<HostOperation>,
 }
 
 /// The reserved host operation through which the companion hands each
-/// string output to the host before its own cleanup; the output slot then
-/// carries the host token it returns.
-pub const ACCEPT_TEXT_OPERATION: u32 = 0;
+/// output whose content it owns (a string, a buffer or a foreign string)
+/// to the host before its own cleanup. Its arguments and results are both
+/// the output slot: the host reads the content, and writes the host token
+/// it returns into the slot's first word, 0 when the slot holds no value.
+pub const ACCEPT_OUTPUT_OPERATION: u32 = 0;
 
 /// One region identity and its C-ABI entry
 /// `int32 doria_region_v1_<id>(DrRegionHostV1 *, const void *, void *, void *)`.
@@ -8308,12 +8385,57 @@ pub struct CompanionRegion {
     /// order. The companion compiles the first; the others have the same
     /// inputs, outputs, result and exits.
     pub lowerings: Vec<RegionLowering>,
+    /// The `inputs` record: the region's inputs other than host tokens.
+    pub inputs: SlotRecord,
+    /// The `outputs` record: the region's outputs other than host tokens
+    /// and its result, then the result, then the `int32` index of the exit
+    /// taken.
+    pub outputs: SlotRecord,
+    /// The entry itself, generated from the first lowering's region
+    /// blocks. Its id follows every function of the program, and its
+    /// parameters are the host, the caller's frame, `inputs` and `outputs`.
+    pub entry: Function,
 }
 
 impl CompanionRegion {
     pub fn entry_symbol(&self) -> String {
         format!("doria_region_v1_{}", self.id)
     }
+}
+
+/// A C-layout record of companion slots (Decision 0148 section 23, entry
+/// ABI version 1): a region's inputs or outputs, or a host operation's
+/// arguments or results. The host allocates every record zero-filled; a
+/// slot nobody writes holds no value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotRecord {
+    pub slots: Vec<CompanionSlot>,
+    /// The offset of the trailing `int32` index: the exit a region took, or
+    /// the target a host operation at a terminator took.
+    pub index: Option<u64>,
+    pub size: u64,
+    pub align: u64,
+}
+
+/// One value of a slot record, `offset` bytes into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionSlot {
+    pub value: UnsafeRegionValue,
+    pub offset: u64,
+}
+
+/// How a `Statement::RegionSlot` moves a value between a slot and its local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAccess {
+    /// Assigns the slot's value to the local, releasing the value it
+    /// replaces. Content (a string, a buffer, a foreign string) is copied
+    /// into a value the companion owns; a region views the slot's memory.
+    /// A null data pointer assigns the zero value.
+    Load,
+    /// Writes the local's value into the slot. Content is lent: the slot
+    /// points at the companion's own storage until the companion changes
+    /// or releases it. A local holding no value writes a null data pointer.
+    Store,
 }
 
 /// A region of one lowered function: `functions[function].unsafe_regions[region]`.
@@ -8336,11 +8458,12 @@ pub struct HostOperation {
     pub site: HostOperationSite,
     /// The values the operation touches, in order of first touch, with
     /// their current values. Host tokens stay in the host frame.
-    pub arguments: Vec<UnsafeRegionValue>,
-    /// The arguments the operation writes, crossing back after it.
-    pub results: Vec<UnsafeRegionValue>,
-    /// For a terminator, its targets in `Terminator::targets` order; the
-    /// host's results end with the `int32` index of the one it took.
+    pub arguments: SlotRecord,
+    /// The arguments the operation writes or moves, crossing back after
+    /// it; a moved one crosses back with no value. A terminator's results
+    /// end with the `int32` index of the target the host took.
+    pub results: SlotRecord,
+    /// For a terminator, its targets in `Terminator::targets` order.
     pub successors: Vec<BlockId>,
 }
 
@@ -8546,7 +8669,10 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropCollection { .. }
         | Statement::DropFunction { .. }
         | Statement::WriteStreamBytes { .. } => 0,
-        Statement::ForeignCall { .. } => 0,
+        Statement::ForeignCall { .. }
+        | Statement::HostRecord { .. }
+        | Statement::RegionSlot { .. }
+        | Statement::CallHost { .. } => 0,
         Statement::ForeignField { access, .. } => match access {
             ForeignFieldAccess::Read { .. } | ForeignFieldAccess::Region { .. } => 0,
             ForeignFieldAccess::Write { value, .. } => rvalue_class_temporary_capacity(value),
@@ -12167,6 +12293,50 @@ impl fmt::Display for Statement {
                         pointer.0
                     ),
                 }
+            }
+            Statement::HostRecord {
+                target,
+                size,
+                align,
+            } => write!(
+                formatter,
+                "local{} = host_record({size} @{align})",
+                target.0
+            ),
+            Statement::RegionSlot {
+                record,
+                slot,
+                access,
+            } => {
+                let place = format!(
+                    "slot<{:?}{}>(local{}, @{})",
+                    slot.value.kind,
+                    if slot.value.nullable { "?" } else { "" },
+                    record.0,
+                    slot.offset
+                );
+                match access {
+                    SlotAccess::Load => write!(formatter, "local{} = {place}", slot.value.local.0),
+                    SlotAccess::Store => write!(formatter, "{place} = local{}", slot.value.local.0),
+                }
+            }
+            Statement::CallHost {
+                host,
+                operation,
+                arguments,
+                results,
+            } => {
+                let record = |record: &Option<LocalId>| match record {
+                    Some(local) => format!("local{}", local.0),
+                    None => "null".to_string(),
+                };
+                write!(
+                    formatter,
+                    "call_host(local{}, {operation}, {}, {})",
+                    host.0,
+                    record(arguments),
+                    record(results)
+                )
             }
             Statement::ForeignField {
                 aggregate,
