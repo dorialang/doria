@@ -1032,39 +1032,64 @@ function main(): void {
     for &profile in NativeProfile::AVAILABLE {
         native_execution::assert_native_execution(&program, profile, "nullable result cleared\n");
     }
+    // A writable parameter lends the caller's storage (ruling of 2026-11-21,
+    // "Writable always borrows"), so the closure call passes `$value`'s own
+    // home and ends the presence proof `create()` established. A later read
+    // that still assumes presence must be rejected.
     let mut forged = program.clone();
     let function = forged
         .functions
         .iter_mut()
         .find(|function| function.name == "probe")
         .unwrap();
-    let block = function
+    let args = function
         .blocks
-        .iter_mut()
-        .find(|block| {
-            matches!(
-                block.terminator,
-                mir::Terminator::CheckedIndirectCall { .. }
-            )
+        .iter()
+        .find_map(|block| match &block.terminator {
+            mir::Terminator::CheckedIndirectCall { args, .. } => Some(args.clone()),
+            _ => None,
         })
         .unwrap();
-    let mir::Terminator::CheckedIndirectCall { args, .. } = &block.terminator else {
+    let [mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+        place: mir::PayloadEnumPlace::Local(home),
+        mode: mir::PayloadEnumUseMode::Borrow,
+        ..
+    })] = args.as_slice()
+    else {
+        panic!("a writable nullable argument must lend its home: {args:?}")
+    };
+    let home = *home;
+    let returned = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| block.statements.iter_mut())
+        .find_map(|statement| match statement {
+            mir::Statement::AssignLocal { value, .. }
+                if matches!(
+                    &*value,
+                    mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+                        place: mir::PayloadEnumPlace::Local(local),
+                        ..
+                    }) if *local == home
+                ) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("the returned nullable home is read after the call");
+    let mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use { ty, .. }) =
+        returned.clone()
+    else {
         unreachable!()
     };
-    let mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(
+    *returned = mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(
         mir::PayloadEnumExpression::Use {
             ty,
-            place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(target),
-            ..
+            place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(home),
+            mode: mir::PayloadEnumUseMode::Copy,
         },
-    )) = &args[0]
-    else {
-        panic!("nullable call must use its proved present source")
-    };
-    block.statements.push(mir::Statement::AssignLocal {
-        target: *target,
-        value: mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Null(*ty)),
-    });
+    ));
     let error = doriac::mir_validation::validate_program(&forged).unwrap_err();
     assert!(
         error
