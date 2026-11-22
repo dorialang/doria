@@ -2710,6 +2710,7 @@ fn lower_program_impl(
         entry,
     };
     specialize_retained_sources(&mut program);
+    unsafe_region::bind_values(&mut program);
     unsafe_region::require_every_live_region(&program, checked)?;
     Ok(program)
 }
@@ -9914,6 +9915,9 @@ impl<'semantic> LoweringContext<'semantic> {
             terminator: None,
         });
         self.reachable_blocks.push(false);
+        if let Some(region) = self.active_unsafe_region {
+            self.unsafe_regions[region].blocks.push(id);
+        }
         id
     }
 
@@ -10203,6 +10207,10 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn route_structured_exit(&mut self, route: RoutedExit, source_scope_depth: usize) {
+        if self.route_leaves_unsafe_region(&route) {
+            self.leave_unsafe_region(route, source_scope_depth);
+            return;
+        }
         if self.active_finalizers.len() > route.target_finalizer_depth {
             let region_id = *self
                 .active_finalizers
@@ -15841,20 +15849,17 @@ fn lower_function_return(
     }
     match (return_type, expr) {
         (mir::ReturnType::Void, None) => {
-            if context.active_finalizers.is_empty() {
-                context.cleanup_scopes_from(0);
-                context.terminate_current(mir::Terminator::ReturnVoid);
-            } else {
-                let source_scope_depth = context.local_scopes.len();
-                context.route_structured_exit(
-                    RoutedExit {
-                        exit: StructuredExit::FunctionReturn { value: None },
-                        target_finalizer_depth: 0,
-                        cleanup_depth: 0,
-                    },
-                    source_scope_depth,
-                );
-            }
+            // One route for every return: it cleans each scope, crosses each
+            // finalizer and leaves an unsafe region on the host side.
+            let source_scope_depth = context.local_scopes.len();
+            context.route_structured_exit(
+                RoutedExit {
+                    exit: StructuredExit::FunctionReturn { value: None },
+                    target_finalizer_depth: 0,
+                    cleanup_depth: 0,
+                },
+                source_scope_depth,
+            );
             Ok(())
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
@@ -15899,20 +15904,15 @@ fn lower_function_return(
                     transfer: !borrowed_move,
                 };
                 context.push_statement(mir::Statement::SetDiagnosticSite { span });
-                if context.active_finalizers.is_empty() {
-                    context.cleanup_scopes_from(0);
-                    context.terminate_current(mir::Terminator::Return(value.rvalue()));
-                } else {
-                    let source_scope_depth = context.local_scopes.len();
-                    context.route_structured_exit(
-                        RoutedExit {
-                            exit: StructuredExit::FunctionReturn { value: Some(value) },
-                            target_finalizer_depth: 0,
-                            cleanup_depth: 0,
-                        },
-                        source_scope_depth,
-                    );
-                }
+                let source_scope_depth = context.local_scopes.len();
+                context.route_structured_exit(
+                    RoutedExit {
+                        exit: StructuredExit::FunctionReturn { value: Some(value) },
+                        target_finalizer_depth: 0,
+                        cleanup_depth: 0,
+                    },
+                    source_scope_depth,
+                );
             } else {
                 context.terminate_current(mir::Terminator::Return(value));
             }

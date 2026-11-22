@@ -613,3 +613,80 @@ fn the_zlib_package_links_from_a_schema_2_plan_on_both_profiles() {
         }
     }
 }
+
+/// Decision 0148 section 23: the zlib package's regions take their
+/// surroundings as inputs with the marshalling kind of each value, and
+/// return the ones zlib or the region writes, including the `Bytes` a
+/// writable region views and the lengths whose addresses zlib receives.
+#[test]
+fn zlib_regions_name_their_inputs_and_write_backs() {
+    use doriac::mir::UnsafeRegionValueKind;
+    let mir = program(ZLIB_PACKAGE);
+    let main = mir
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("`main` is emitted");
+    let named = |values: &[doriac::mir::UnsafeRegionValue]| {
+        values
+            .iter()
+            .map(|value| {
+                let local = &main.locals[value.local.0];
+                (local.name.trim_start_matches('$').to_string(), value.kind)
+            })
+            .collect::<Vec<_>>()
+    };
+    let region = |name: &str| {
+        main.unsafe_regions
+            .iter()
+            .find(|region| {
+                region
+                    .inputs
+                    .iter()
+                    .any(|value| main.locals[value.local.0].name.trim_start_matches('$') == name)
+            })
+            .unwrap_or_else(|| panic!("a region of `main` uses `{name}`"))
+    };
+    for region in &main.unsafe_regions {
+        assert!(region
+            .outputs
+            .iter()
+            .all(|output| region.inputs.contains(output)));
+    }
+    let compress = region("packedLength");
+    let inputs = named(&compress.inputs);
+    let outputs = named(&compress.outputs);
+    for expected in [
+        ("packed".to_string(), UnsafeRegionValueKind::Buffer),
+        ("packedLength".to_string(), UnsafeRegionValueKind::Native),
+        ("input".to_string(), UnsafeRegionValueKind::Buffer),
+    ] {
+        assert!(inputs.contains(&expected), "{expected:?} in {inputs:?}");
+    }
+    assert!(
+        outputs.contains(&("packed".to_string(), UnsafeRegionValueKind::Buffer)),
+        "{outputs:?}"
+    );
+    assert!(
+        outputs.contains(&("packedLength".to_string(), UnsafeRegionValueKind::Native)),
+        "{outputs:?}"
+    );
+    assert!(
+        !outputs.iter().any(|(name, _)| name == "input"),
+        "{outputs:?}"
+    );
+
+    let deflate = region("stream");
+    let inputs = named(&deflate.inputs);
+    assert!(
+        inputs.contains(&("stream".to_string(), UnsafeRegionValueKind::Native)),
+        "{inputs:?}"
+    );
+    assert!(
+        inputs.contains(&("version".to_string(), UnsafeRegionValueKind::ForeignString)),
+        "{inputs:?}"
+    );
+    assert!(
+        named(&deflate.outputs).contains(&("stream".to_string(), UnsafeRegionValueKind::Native))
+    );
+}

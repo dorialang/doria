@@ -4,6 +4,7 @@
 //! 11 grows into the debug/interpreter oracle and future native lowering input.
 //! The text dump is deterministic but not a stable public format.
 
+pub mod local_access;
 pub(crate) mod return_adaptation;
 pub(crate) mod value_factory;
 
@@ -8246,14 +8247,23 @@ pub struct UnsafeRegion {
     pub keyword: Span,
     /// The block of `unsafe { }`, or the whole `unsafe(<expression>)`.
     pub span: Span,
-    /// The region's first block. Its blocks are every block from `entry` up
-    /// to, not including, `continuation`.
+    /// The region's first block, the only one code outside it reaches.
     pub entry: BlockId,
+    /// Every block of the region in ascending order, `entry` first.
+    pub blocks: Vec<BlockId>,
     /// Where control continues when the region falls through (status 0).
     pub continuation: BlockId,
     /// The local holding an expression region's value: written inside the
     /// region and read after it.
     pub result: Option<LocalId>,
+    /// One slot per local the region reads or writes from its surroundings,
+    /// in order of first use inside it.
+    pub inputs: Vec<UnsafeRegionValue>,
+    /// The inputs the region writes, moves or destroys: their final values
+    /// cross back before the host resumes, on every exit. A local the region
+    /// writes and the host uses after it (a result, an Error, a temporary
+    /// the enclosing statement destroys) is one of them.
+    pub outputs: Vec<UnsafeRegionValue>,
     /// Every edge that leaves the region other than fallthrough, in the
     /// order lowering produced them. A break or continue target index is
     /// the position of its exit here.
@@ -8262,19 +8272,89 @@ pub struct UnsafeRegion {
 
 impl UnsafeRegion {
     pub fn contains(&self, block: BlockId) -> bool {
-        self.entry.0 <= block.0 && block.0 < self.continuation.0
+        self.blocks
+            .binary_search_by_key(&block.0, |block| block.0)
+            .is_ok()
     }
 }
 
+/// One local crossing an unsafe region's edge (Decision 0148 section 23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsafeRegionValue {
+    pub local: LocalId,
+    pub kind: UnsafeRegionValueKind,
+}
+
+/// How a value crosses between the host and the companion library, by
+/// section 23's marshalling table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeRegionValueKind {
+    /// By value in its native layout: integers, floats, `bool`, enums,
+    /// boundary types, pointers, C function pointers, handles, foreign
+    /// aggregates and Copy inline values, and their nullable forms.
+    Native,
+    /// A `string`, as UTF-8 bytes.
+    Text,
+    /// `Bytes` or a `T[]` of native elements: copied into a native buffer,
+    /// and copied back at every exit when the region writes it.
+    Buffer,
+    /// A byte or typed array region: over host storage it crosses as a
+    /// buffer does; over foreign memory, as address and length.
+    Region,
+    /// `CString` or `Utf16String`, re-materialized natively.
+    ForeignString,
+    /// Every other value stays on the host as an opaque token.
+    HostToken,
+}
+
+impl UnsafeRegionValueKind {
+    pub fn of(ty: Type, collections: &[CollectionType]) -> Self {
+        match ty {
+            Type::Scalar(scalar) | Type::NullableScalar(scalar) => Self::of_scalar(scalar),
+            Type::ForeignAggregate(_) | Type::NullableForeignAggregate(_) => Self::Native,
+            Type::String => Self::Text,
+            Type::Region(_) | Type::NullableRegion(_) => Self::Region,
+            Type::Collection(id) => {
+                let collection = collections
+                    .get(id.0)
+                    .filter(|collection| collection.id == id)
+                    .expect("a lowered collection type has its registry slot");
+                match collection.kind {
+                    CollectionKind::Bytes => Self::Buffer,
+                    CollectionKind::ForeignString(_) => Self::ForeignString,
+                    CollectionKind::TypedArray
+                        if Self::of(collection.value, collections) == Self::Native =>
+                    {
+                        Self::Buffer
+                    }
+                    _ => Self::HostToken,
+                }
+            }
+            _ => Self::HostToken,
+        }
+    }
+
+    const fn of_scalar(scalar: ScalarType) -> Self {
+        match scalar {
+            ScalarType::Integer(_)
+            | ScalarType::Float(_)
+            | ScalarType::Bool
+            | ScalarType::Enum(_) => Self::Native,
+            ScalarType::Inline(inline) if !inline.requires_owned_cleanup() => Self::Native,
+            ScalarType::Inline(_) => Self::HostToken,
+        }
+    }
+}
 /// One edge out of an unsafe region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsafeRegionExit {
     /// The region block whose terminator leaves.
     pub source: BlockId,
     pub kind: UnsafeRegionExitKind,
-    /// The block outside the region the edge reaches: a loop target, a
-    /// finalizer entry or a catch. `None` when the source block's
-    /// terminator returns or propagates the Error out of the function.
+    /// The landing block outside the region where the host finishes the
+    /// route: it destroys the values the region does not own, crosses
+    /// finalizers and reaches the loop target, catch or return. `None` when
+    /// the source block's own terminator returns from the function.
     pub target: Option<BlockId>,
 }
 

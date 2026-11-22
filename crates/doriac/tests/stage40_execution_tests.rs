@@ -4321,3 +4321,70 @@ function main(): void
     );
     assert_runs_natively(&source, if cfg!(windows) { "1" } else { "2" });
 }
+
+/// A region's inputs are the locals it shares with its surroundings, in
+/// order of first use, and its outputs the ones it writes; a string
+/// crosses as text. Inline, the writes land as before.
+#[test]
+fn region_writes_cross_back_as_outputs() {
+    use doriac::mir::UnsafeRegionValueKind;
+    let source = format!(
+        "{C_LIBRARY}
+function tally(int32 $factor): string
+{{
+    writable int32 $total = 0;
+    writable string $label = \"start\";
+    unsafe {{
+        $total = abs($factor);
+        $label = \"done\";
+    }}
+    return $label . \" \" . $total;
+}}
+
+function main(): void
+{{
+    echo tally(-4);
+}}
+"
+    );
+    let mir = program(&source);
+    let tally = function_named(&mir, "tally");
+    let [region] = tally.unsafe_regions.as_slice() else {
+        panic!("{:#?}", tally.unsafe_regions);
+    };
+    let named = |values: &[doriac::mir::UnsafeRegionValue]| {
+        values
+            .iter()
+            .map(|value| {
+                let name = tally.locals[value.local.0].name.trim_start_matches('$');
+                (name.to_string(), value.kind)
+            })
+            .collect::<Vec<_>>()
+    };
+    let inputs = named(&region.inputs);
+    let position = |name: &str| inputs.iter().position(|(input, _)| input == name);
+    assert!(position("factor").is_some(), "{inputs:?}");
+    assert!(position("total") < position("label"), "{inputs:?}");
+    assert!(
+        inputs.contains(&("label".to_string(), UnsafeRegionValueKind::Text)),
+        "{inputs:?}"
+    );
+    assert!(
+        inputs.contains(&("factor".to_string(), UnsafeRegionValueKind::Native)),
+        "{inputs:?}"
+    );
+    let outputs = named(&region.outputs);
+    assert!(
+        outputs.contains(&("total".to_string(), UnsafeRegionValueKind::Native)),
+        "{outputs:?}"
+    );
+    assert!(
+        outputs.contains(&("label".to_string(), UnsafeRegionValueKind::Text)),
+        "{outputs:?}"
+    );
+    assert!(
+        !outputs.iter().any(|(name, _)| name == "factor"),
+        "{outputs:?}"
+    );
+    assert_runs_natively(&source, "done 4");
+}

@@ -12,6 +12,12 @@ pub(super) struct UnsafeRegionBuilder {
     fact: UnsafeContextFact,
     id: String,
     entry: mir::BlockId,
+    /// The region's blocks, in creation order: every block created while
+    /// it is active, except the landing blocks of the routes leaving it.
+    pub(super) blocks: Vec<mir::BlockId>,
+    /// The first scope the region owns. A route that cleans a scope below it
+    /// leaves the region.
+    scope_boundary: usize,
     continuation: Option<mir::BlockId>,
     result: Option<mir::LocalId>,
 }
@@ -35,6 +41,8 @@ impl LoweringContext<'_> {
             fact,
             id,
             entry,
+            blocks: vec![entry],
+            scope_boundary: self.local_scopes.len(),
             continuation: None,
             result: None,
         });
@@ -47,13 +55,49 @@ impl LoweringContext<'_> {
     /// continues in a block after every block of the region.
     fn end_unsafe_region(&mut self, index: usize) {
         debug_assert_eq!(self.active_unsafe_region, Some(index));
+        self.active_unsafe_region = None;
         let continuation = self.create_block();
         if self.current_block.is_some() {
             self.terminate_current(mir::Terminator::Jump(continuation));
             self.current_block = Some(continuation);
         }
         self.unsafe_regions[index].continuation = Some(continuation);
+    }
+
+    /// Whether `route` leaves the active region: it cleans a scope the region
+    /// does not own, and no finalizer begun inside the region takes it first.
+    pub(super) fn route_leaves_unsafe_region(&self, route: &RoutedExit) -> bool {
+        let Some(index) = self.active_unsafe_region else {
+            return false;
+        };
+        let boundary = self.unsafe_regions[index].scope_boundary;
+        let inner_finalizer = self.active_finalizers.len() > route.target_finalizer_depth
+            && self
+                .active_finalizers
+                .last()
+                .is_some_and(|id| self.finalizer_regions[id.0].scope_depth >= boundary);
+        !inner_finalizer && route.cleanup_depth < boundary
+    }
+
+    /// A route out of the active region cleans the scopes the region owns
+    /// inside it, then continues from a landing block outside it, where the
+    /// host destroys its own values, crosses finalizers and reaches the
+    /// route's destination in ordinary Doria order (section 23).
+    pub(super) fn leave_unsafe_region(&mut self, route: RoutedExit, source_scope_depth: usize) {
+        let index = self
+            .active_unsafe_region
+            .expect("a route leaves the region it is in");
+        let boundary = self.unsafe_regions[index].scope_boundary;
+        self.cleanup_scope_range(boundary, source_scope_depth);
         self.active_unsafe_region = None;
+        let landing = self.create_block();
+        self.active_unsafe_region = Some(index);
+        self.note_unsafe_route(&route.exit);
+        self.terminate_current(mir::Terminator::Jump(landing));
+        self.current_block = Some(landing);
+        self.active_unsafe_region = None;
+        self.route_structured_exit(route, boundary);
+        self.active_unsafe_region = Some(index);
     }
 
     /// Records how the current block leaves through a structured route, so
@@ -222,11 +266,14 @@ pub(super) fn finish(
             keyword: builder.fact.keyword,
             span: builder.fact.span,
             entry: builder.entry,
+            blocks: builder.blocks,
             continuation,
             result: builder.result,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
             exits: Vec::new(),
         };
-        for block in &blocks[region.entry.0..continuation.0] {
+        for block in region.blocks.iter().map(|block| &blocks[block.0]) {
             let source = block.id;
             match &block.terminator {
                 mir::Terminator::Return(_) | mir::Terminator::ReturnVoid => {
@@ -314,4 +361,71 @@ pub(super) fn require_every_live_region(
             )
         })
         .collect())
+}
+
+/// Each region's inputs and outputs (section 23), once every function is
+/// lowered so each direct call's parameter modes are known: a local the
+/// region touches is an input when code outside the region also touches it
+/// or it is a parameter, and an output when the region also writes, moves
+/// or destroys it. Inputs keep the order of first use inside the region.
+pub(super) fn bind_values(program: &mut mir::Program) {
+    use crate::mir::local_access::{statement_locals, terminator_locals, LocalAccess};
+    let parameter_modes = program
+        .functions
+        .iter()
+        .map(|function| (function.id, function.parameter_modes.clone()))
+        .collect::<HashMap<_, _>>();
+    let modes = |function: mir::FunctionId, position: usize| {
+        parameter_modes
+            .get(&function)
+            .and_then(|modes| modes.get(position))
+            .copied()
+    };
+    let collections = &program.collection_types;
+    for function in &mut program.functions {
+        let mut regions = std::mem::take(&mut function.unsafe_regions);
+        for region in &mut regions {
+            let mut outside = function.params.iter().copied().collect::<HashSet<_>>();
+            let mut used = Vec::new();
+            let mut seen = HashSet::new();
+            let mut written = HashSet::new();
+            for block in &function.blocks {
+                let inside = region.contains(block.id);
+                let mut note = |local: mir::LocalId, access: LocalAccess| {
+                    if !inside {
+                        outside.insert(local);
+                        return;
+                    }
+                    if seen.insert(local) {
+                        used.push(local);
+                    }
+                    if access != LocalAccess::Read {
+                        written.insert(local);
+                    }
+                };
+                for statement in &block.statements {
+                    statement_locals(statement, &modes, &mut note);
+                }
+                terminator_locals(&block.terminator, &modes, &mut note);
+            }
+            let locals = &function.locals;
+            let value = |local: mir::LocalId| mir::UnsafeRegionValue {
+                local,
+                kind: mir::UnsafeRegionValueKind::of(locals[local.0].ty, collections),
+            };
+            region.inputs = used
+                .iter()
+                .copied()
+                .filter(|local| outside.contains(local))
+                .map(value)
+                .collect();
+            region.outputs = region
+                .inputs
+                .iter()
+                .copied()
+                .filter(|input| written.contains(&input.local))
+                .collect();
+        }
+        function.unsafe_regions = regions;
+    }
 }
