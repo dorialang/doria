@@ -8371,6 +8371,34 @@ pub struct Companion {
     /// One callback per C-callable function, in `Program::c_entries` order;
     /// their operations follow every host operation.
     pub callbacks: Vec<CompanionCallback>,
+    /// One binding entry per extern declaration's function a region
+    /// reaches, in function order.
+    pub bindings: Vec<CompanionBinding>,
+}
+
+/// The entry through which a host calls an extern declaration's function
+/// (Decision 0148 section 23): a host operation's statement can call one,
+/// and the foreign call it makes runs in the companion. The companion
+/// exports it as
+/// `int32 doria_binding_v1_<n>(DrRegionHostV1 *, const void *callerFrame,
+/// void *arguments, void *results)`: it checks the thread, runs at the
+/// caller's frame, loads the parameters from `arguments`, calls the
+/// function and stores its return value in `results`, and returns 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionBinding {
+    /// The binding's position, which its exported name carries.
+    pub index: usize,
+    pub function: FunctionId,
+    pub arguments: SlotRecord,
+    pub results: SlotRecord,
+    /// The generated entry. Its id follows every callback's forwarder.
+    pub entry: Function,
+}
+
+impl CompanionBinding {
+    pub fn entry_symbol(&self) -> String {
+        format!("doria_binding_v1_{}", self.index)
+    }
 }
 
 /// A C-callable function (Decision 0148 section 23, Callbacks): the
@@ -8405,6 +8433,14 @@ impl Companion {
         self.regions
             .iter()
             .any(|region| region.entry.id == function)
+    }
+
+    /// Whether `function` is a binding entry, whose C entry runs at the
+    /// host frame it receives.
+    pub fn is_binding_entry(&self, function: FunctionId) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.entry.id == function)
     }
 }
 

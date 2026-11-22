@@ -4,7 +4,9 @@
 //! the compiler cache.
 //!
 //! The library is `<stem>.native.<so|dylib|dll>`. It exports one
-//! `doria_region_v1_<id>` entry per region, depends on the hosted shared
+//! `doria_region_v1_<id>` entry per region, a `doria_callback_v1_<n>` entry
+//! per C-callable function and a `doria_binding_v1_<n>` entry per extern
+//! declaration's function a region reaches, depends on the hosted shared
 //! runtime, which sits at `.doria-runtime/<identity>/` beside it, and links
 //! the foreign libraries its own code calls. The runtime files those
 //! libraries load sit beside it. `<stem>.native.json` records what a host
@@ -102,6 +104,7 @@ fn publish_library(
         &object,
         &directory.join(&runtime_path),
         runtime_directory,
+        &library_file_name(stem),
         &plan,
     )?;
     let library_path = directory.join(library_file_name(stem));
@@ -234,7 +237,8 @@ fn release_object(_library: &CompanionLibrary) -> Result<Vec<u8>, BackendError> 
 /// The sidecar document (Decision 0148 section 23): its schema version,
 /// the compiler and runtime identity, the library and its SHA-256, the
 /// region entries with their slot records, the host operations, the
-/// callbacks and the foreign libraries the library links.
+/// callbacks, the binding entries and the foreign libraries the library
+/// links.
 fn sidecar(
     library: &CompanionLibrary,
     runtime: &SharedRuntimeDependency,
@@ -298,6 +302,12 @@ fn sidecar(
             "symbol": callback.entry_symbol(),
             "arguments": record(&callback.arguments),
             "results": record(&callback.results),
+        })).collect::<Vec<_>>(),
+        "bindings": companion.bindings.iter().map(|binding| json!({
+            "function": library.program.functions[binding.function.0].name,
+            "symbol": binding.entry_symbol(),
+            "arguments": record(&binding.arguments),
+            "results": record(&binding.results),
         })).collect::<Vec<_>>(),
         "foreignLibraries": foreign_libraries,
     })

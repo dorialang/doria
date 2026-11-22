@@ -268,6 +268,9 @@ pub const ENTER_C_FUNCTION: &str = "dr_v1_enter_c_function";
 /// Enters a companion region entry: the thread check, then the host's
 /// frame as the region's parent (Decision 0148 section 23).
 pub const ENTER_REGION: &str = "dr_v1_enter_region";
+/// Enters a companion binding entry: the thread check, then the host's
+/// frame as the entry's own (Decision 0148 section 23).
+pub const ENTER_BINDING: &str = "dr_v1_enter_binding";
 /// The host a companion's callback entries forward to.
 pub const REGION_HOST: &str = "dr_v1_region_host";
 /// The slot accessors of content values (Decision 0148 section 23, entry

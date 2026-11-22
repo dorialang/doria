@@ -158,10 +158,14 @@ fn check_entry(entry: &doria_diagnostic_catalogue::explanations::DiagnosticEntry
             .unwrap_or_else(|diagnostics| {
                 panic!("{code}: its example does not compile: {diagnostics:?}")
             });
-        // The interpreter runs unsafe code through the native companion
-        // library, which this compiler does not build yet; such an example
-        // runs as a native program, whose report carries the same title.
-        if !doriac::unsafe_code::companion_operations(&program).is_empty() {
+        // A panic inside an unsafe region ends the process that hosts the
+        // native companion library (Decision 0148 section 23), and the
+        // interpreter does not run every unsafe form yet, so an example with
+        // a region runs in a child process: the native program, whose report
+        // carries the same title.
+        if !program.companion.regions.is_empty()
+            || !doriac::unsafe_code::companion_operations(&program).is_empty()
+        {
             let run =
                 native_execution::execute_native(&program, doriac::backend::NativeProfile::Fast);
             let stderr = String::from_utf8_lossy(&run.stderr);

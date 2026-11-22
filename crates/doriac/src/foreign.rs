@@ -8,6 +8,11 @@
 use crate::ast::ForeignAggregateKind;
 use crate::source::Span;
 
+/// The function name of the Call Path frame that stands for the foreign
+/// code between an outbound foreign call and the C entry it led to
+/// (Decision 0148 section 13), as the runtime names it.
+pub const FOREIGN_CALL_FRAME: &str = "[foreign call]";
+
 pub const NAMESPACE: &str = "Doria\\Std\\Ffi";
 pub const POINTER: &str = "Doria\\Std\\Ffi\\Pointer";
 pub const WRITABLE_POINTER: &str = "Doria\\Std\\Ffi\\WritablePointer";

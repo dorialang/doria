@@ -28249,8 +28249,9 @@ mod tests {
     /// loads it from its import slot.
     #[test]
     fn windows_objects_reach_the_call_path_record_as_they_link_the_runtime() {
-        use crate::codegen_cranelift::runtime_data_tests::FOREIGN_CALL_IN_A_REGION;
-        use crate::coff_symbols::undefined_external_symbols;
+        use crate::codegen_cranelift::runtime_data_tests::{
+            undefined_external_symbols, FOREIGN_CALL_IN_A_REGION,
+        };
         use crate::native_abi::FOREIGN_CALL_FRAME;
 
         Target::initialize_x86(&InitializationConfig::default());

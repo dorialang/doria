@@ -2323,8 +2323,11 @@ fn validate_diagnostic_frame(
         mir::DiagnosticFrame::Caller => {
             // An extern declaration's function is its foreign call alone;
             // the Call Path shows the Doria call (Decision 0148 section 13).
+            // A companion's binding entry runs at the host frame it
+            // receives (section 23).
             if !function.source_span.source.is_compiler_owned()
                 && !function.is_foreign_binding()
+                && !program.companion.is_binding_entry(function.id)
                 && !interface_entry.is_some_and(|table| {
                     matches!(
                         table.implementing_type,
@@ -6683,6 +6686,18 @@ fn validate_companion(program: &mir::Program) -> Result<(), BackendError> {
     for callback in &program.companion.callbacks {
         validate_function(&library, &callback.forwarder)?;
     }
+    let first = program.functions.len()
+        + program.companion.regions.len()
+        + program.companion.callbacks.len();
+    for (index, binding) in program.companion.bindings.iter().enumerate() {
+        if binding.index != index || binding.entry.id != mir::FunctionId(first + index) {
+            return Err(malformed_mir(format!(
+                "the binding entry of `{}` is out of order",
+                binding.entry.name
+            )));
+        }
+        validate_function(&library, &binding.entry)?;
+    }
     Ok(())
 }
 
@@ -6707,6 +6722,7 @@ fn require_companion_entry(
                 .iter()
                 .map(|callback| callback.forwarder.id),
         )
+        .chain(companion.bindings.iter().map(|binding| binding.entry.id))
         .any(|id| id == function.id)
     {
         return Ok(());

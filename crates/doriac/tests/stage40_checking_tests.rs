@@ -500,19 +500,12 @@ function main(): void {}
 fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
     let source = format!("{ABS}function main(): void {{ echo unsafe(abs(-3)); }}");
     assert!(codes(&source).is_empty(), "{:#?}", findings(&source));
-    let diagnostics = doriac::compile_source(
+    doriac::compile_source(
         "ffi.doria",
         source.clone(),
         doriac::backend::BackendTarget::Debug,
     )
-    .expect_err("the interpreter calls C through the native companion");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Foreign Calls Cannot Run In The Interpreter Yet"),
-        "{diagnostics:#?}"
-    );
+    .expect("the interpreter calls C through the native companion");
     let diagnostics =
         doriac::compile_source("ffi.doria", source, doriac::backend::BackendTarget::Php)
             .expect_err("PHP output calls C through the native companion");
@@ -1203,25 +1196,15 @@ fn boundary_values_convert_explicitly_and_compare_only_for_equality() {
 fn pointer_operations_report_that_they_cannot_be_built_yet() {
     let source = "use Doria\\Std\\Ffi\\{CLong, Pointer}; function main(): void { writable int32 $value = 1; let $pointer = unsafe(Pointer::to($value)); let $long = CLong::from(2); }";
     assert!(codes(source).is_empty(), "{:#?}", findings(source));
-    let diagnostics = doriac::compile_source(
+    // Every target builds boundary conversions and pointer operations,
+    // including a pointer to a local; the interpreter runs those through
+    // the native companion.
+    doriac::compile_source(
         "ffi.doria",
         source.to_string(),
         doriac::backend::BackendTarget::Debug,
     )
-    .expect_err("pointer operations cannot be built yet");
-    let titles = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code == "E0784")
-        .map(|diagnostic| diagnostic.title.as_str())
-        .collect::<Vec<_>>();
-    // Every target builds boundary conversions and the native targets
-    // build pointer operations, including a pointer to a local; the
-    // interpreter runs those through the native companion.
-    assert_eq!(
-        titles,
-        ["Pointer Operations Cannot Run In The Interpreter Yet"],
-        "{diagnostics:#?}"
-    );
+    .expect("the interpreter runs pointer operations through the companion");
     // A pointer to a class property builds for the native targets, as one
     // to a foreign struct field does (section 7, amended 2026-11-21).
     let property = "use Doria\\Std\\Ffi\\Pointer; class Box { int32 $count = 0; } function main(): void { let $box = new Box(); let $pointer = unsafe(Pointer::to($box->count)); }";
@@ -1390,16 +1373,8 @@ extern \"C\" function visit(Pointer<Opaque> $item, int32 $depth): bool
     assert!(!codes(&mismatched).is_empty(), "the signatures differ");
     // The native targets build the C entry; the interpreter takes its
     // address through the native companion library.
-    let diagnostics =
-        doriac::compile_source("ffi.doria", matching, doriac::backend::BackendTarget::Debug)
-            .expect_err("the interpreter forms C entry addresses through the companion");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
-        "{diagnostics:#?}"
-    );
+    doriac::compile_source("ffi.doria", matching, doriac::backend::BackendTarget::Debug)
+        .expect("the interpreter forms C entry addresses through the companion");
 }
 
 #[test]

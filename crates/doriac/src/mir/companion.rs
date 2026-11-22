@@ -190,11 +190,197 @@ pub fn plan(program: &Program) -> Result<Companion, CompanionPlanError> {
             entry,
         });
     }
-    plan_callbacks(program, &mut companion).map_err(|details| CompanionPlanError {
-        span: companion.regions[0].entry.source_span,
-        details,
-    })?;
+    plan_callbacks(program, &mut companion)
+        .and_then(|()| plan_bindings(program, &mut companion))
+        .map_err(|details| CompanionPlanError {
+            span: companion.regions[0].entry.source_span,
+            details,
+        })?;
     Ok(companion)
+}
+
+/// The binding entries of `companion`: one per extern declaration's
+/// function a region entry reaches, in function order, after every
+/// callback's forwarder. A host operation's statement that calls one calls
+/// it through its entry, so the foreign call runs in the companion.
+fn plan_bindings(program: &Program, companion: &mut Companion) -> Result<(), String> {
+    let modes = |_: FunctionId, _: usize| None;
+    let mut reached = HashSet::new();
+    // The region's own blocks, whose host operations the entry replaced
+    // with host calls, name every function the region reaches.
+    for region in &companion.regions {
+        let lowering = region.lowerings[0];
+        let function = program
+            .functions
+            .get(lowering.function.0)
+            .ok_or("a region's lowering names a function")?;
+        let mut reach = |reach: HostReach| {
+            if let HostReach::Call(Some(function)) = reach {
+                reached.insert(function);
+            }
+        };
+        for block in &function.unsafe_regions[lowering.region].blocks {
+            let block = &function.blocks[block.0];
+            for statement in &block.statements {
+                statement_touches(statement, &modes, &mut |_, _| {}, &mut reach);
+            }
+            terminator_touches(&block.terminator, &modes, &mut |_, _| {}, &mut reach);
+        }
+    }
+    let first = program.functions.len() + companion.regions.len() + companion.callbacks.len();
+    let mut reached = reached.into_iter().collect::<Vec<_>>();
+    reached.sort_by_key(|function| function.0);
+    let bindings = reached
+        .into_iter()
+        .filter_map(|id| {
+            program
+                .functions
+                .get(id.0)
+                .filter(|function| function.id == id)
+        })
+        .filter(|function| function.is_foreign_binding())
+        .collect::<Vec<_>>();
+    companion.bindings = bindings
+        .into_iter()
+        .enumerate()
+        .map(|(index, binding)| binding_entry(program, binding, index, FunctionId(first + index)))
+        .collect::<Result<_, _>>()?;
+    Ok(())
+}
+
+/// The entry of the extern declaration's function `binding`: its
+/// parameters loaded from the argument record, the call, and its return
+/// value stored in the result record. It runs at its caller's frame.
+fn binding_entry(
+    program: &Program,
+    binding: &Function,
+    index: usize,
+    id: FunctionId,
+) -> Result<CompanionBinding, String> {
+    let mut locals = Vec::new();
+    let mut local = |name: &str, ty: Type, owned: bool| {
+        let id = LocalId(locals.len());
+        locals.push(Local {
+            id,
+            name: name.to_string(),
+            ty,
+            writable: true,
+            owned,
+            synthetic: true,
+        });
+        id
+    };
+    let host = local("$host", POINTER, false);
+    let caller_frame = local("$callerFrame", POINTER, false);
+    let arguments_record = local("$arguments", POINTER, false);
+    let results_record = local("$results", POINTER, false);
+    let parameters = binding
+        .params
+        .iter()
+        .map(|parameter| {
+            let definition = &binding.locals[parameter.0];
+            (local(&definition.name, definition.ty, false), definition.ty)
+        })
+        .collect::<Vec<_>>();
+    let result = match binding.return_type {
+        ReturnType::Value(ty) => Some((local("$result", ty, false), ty)),
+        ReturnType::Void => None,
+    };
+    let collections = &program.collection_types;
+    let shell = Function {
+        locals: locals.clone(),
+        ..binding.clone()
+    };
+    let record = |values: Vec<LocalId>| {
+        SlotRecord::of(
+            &shell,
+            values
+                .into_iter()
+                .map(|id| UnsafeRegionValue::of(id, locals[id.0].ty, collections))
+                .collect(),
+            false,
+        )
+    };
+    let arguments = record(parameters.iter().map(|(local, _)| *local).collect())
+        .ok_or("a binding's arguments fit a record")?;
+    let results = record(result.iter().map(|(local, _)| *local).collect())
+        .ok_or("a binding's result fits a record")?;
+    if arguments.slots.len() != parameters.len()
+        || results.slots.len() != usize::from(result.is_some())
+    {
+        return Err(format!(
+            "`{}` passes a value with no slot; extern declarations pass every value by value",
+            binding.name
+        ));
+    }
+    let mut statements = arguments
+        .slots
+        .iter()
+        .map(|slot| Statement::RegionSlot {
+            record: arguments_record,
+            slot: *slot,
+            access: SlotAccess::Load,
+        })
+        .collect::<Vec<_>>();
+    let args = parameters
+        .iter()
+        .map(|(local, ty)| super::value_factory::local_rvalue(*local, *ty, false))
+        .collect::<Vec<_>>();
+    match result {
+        Some((target, ty)) => statements.push(Statement::AssignLocal {
+            target,
+            value: super::value_factory::direct_call_result(
+                ty,
+                binding.id,
+                args,
+                None,
+                binding.source_span,
+            ),
+        }),
+        None => statements.push(Statement::CallVoid {
+            function: binding.id,
+            args,
+            span: binding.source_span,
+        }),
+    }
+    statements.extend(results.slots.iter().map(|slot| Statement::RegionSlot {
+        record: results_record,
+        slot: *slot,
+        access: SlotAccess::Store,
+    }));
+    let entry = Function {
+        id,
+        name: binding.name.clone(),
+        source_span: binding.source_span,
+        diagnostic_frame: DiagnosticFrame::Caller,
+        method: None,
+        virtual_slot: None,
+        receiver_mode: None,
+        closure: None,
+        params: vec![host, caller_frame, arguments_record, results_record],
+        parameter_modes: vec![FunctionParameterMode::Readonly; 4],
+        return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(INDEX))),
+        return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
+        test_assertion_checked_effects: Vec::new(),
+        checked_effects: Vec::new(),
+        locals,
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements,
+            terminator: status(0),
+        }],
+        entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
+    };
+    Ok(CompanionBinding {
+        index,
+        function: binding.id,
+        arguments,
+        results,
+        entry,
+    })
 }
 
 /// The callbacks of `companion`: every C-callable function of the program,
@@ -922,8 +1108,9 @@ fn status(status: i32) -> Terminator {
 #[derive(Debug, Clone)]
 pub struct CompanionLibrary {
     pub program: Program,
-    /// The functions the library emits, in id order: every region entry and
-    /// each extern declaration's function an entry calls. Every other
+    /// The functions the library emits, in id order: every region entry,
+    /// callback forwarder and binding entry, and each extern declaration's
+    /// function an entry calls. Every other
     /// statement of a region that reaches a function is a host operation,
     /// so nothing else is reached; the program's own functions stay on the
     /// host, and their ids keep their places only so types and calls keep
@@ -932,21 +1119,27 @@ pub struct CompanionLibrary {
 }
 
 impl CompanionLibrary {
-    /// The exported symbol of `function`, when it is a region entry or a
+    /// The exported symbol of `function`, when it is a region entry, a
     /// callback's forwarder, whose C entry the host takes as the C function
-    /// pointer value of the callback.
+    /// pointer value of the callback, or a binding entry.
     pub fn export(&self, function: FunctionId) -> Option<String> {
         let companion = &self.program.companion;
-        let first =
-            self.program.functions.len() - companion.regions.len() - companion.callbacks.len();
+        let first = self.program.functions.len()
+            - companion.regions.len()
+            - companion.callbacks.len()
+            - companion.bindings.len();
         let index = function.0.checked_sub(first)?;
-        match companion.regions.get(index) {
-            Some(region) => Some(region.entry_symbol()),
-            None => companion
-                .callbacks
-                .get(index - companion.regions.len())
-                .map(CompanionCallback::entry_symbol),
+        if let Some(region) = companion.regions.get(index) {
+            return Some(region.entry_symbol());
         }
+        let index = index - companion.regions.len();
+        if let Some(callback) = companion.callbacks.get(index) {
+            return Some(callback.entry_symbol());
+        }
+        companion
+            .bindings
+            .get(index - companion.callbacks.len())
+            .map(CompanionBinding::entry_symbol)
     }
 }
 
@@ -968,6 +1161,13 @@ pub fn library(program: &Program) -> CompanionLibrary {
             .callbacks
             .iter()
             .map(|callback| callback.forwarder.clone()),
+    );
+    library.functions.extend(
+        program
+            .companion
+            .bindings
+            .iter()
+            .map(|binding| binding.entry.clone()),
     );
     // The companion's C entries are its callbacks' forwarders; the
     // program's C-callable functions run on the host.
@@ -994,6 +1194,10 @@ pub fn library(program: &Program) -> CompanionLibrary {
         }
     }
     emitted.extend(library.c_entries.iter().copied());
+    for binding in &program.companion.bindings {
+        emitted.insert(binding.entry.id);
+        emitted.insert(binding.function);
+    }
     let mut emitted = emitted.into_iter().collect::<Vec<_>>();
     emitted.sort_by_key(|function| function.0);
     CompanionLibrary {

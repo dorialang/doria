@@ -650,11 +650,14 @@ pub(crate) fn shared_library_extension() -> &'static str {
 /// section 23's native shared-library artifact): its exported entries, the
 /// foreign link inputs of `plan`, and a dynamic dependency on the hosted
 /// shared runtime `runtime`, which the library finds at `runtime_directory`
-/// relative to itself. Returns the library's bytes.
+/// relative to itself. The library names itself `file_name`, the name it is
+/// published under, never the temporary path it links at. Returns the
+/// library's bytes.
 pub(crate) fn link_shared_library(
     object_bytes: &[u8],
     runtime: &Path,
     runtime_directory: &Path,
+    file_name: &str,
     plan: &LinkPlan,
 ) -> Result<Vec<u8>, BackendError> {
     let temp_stem = unique_temp_stem();
@@ -727,6 +730,11 @@ pub(crate) fn link_shared_library(
                     "-Wl,-rpath,{origin}/{}",
                     runtime_directory.display()
                 )));
+                arguments.push(OsString::from(if cfg!(target_os = "macos") {
+                    format!("-Wl,-install_name,@rpath/{file_name}")
+                } else {
+                    format!("-Wl,-soname,{file_name}")
+                }));
             }
             arguments.extend(plan.driver_arguments(target));
         }
@@ -746,25 +754,11 @@ fn write_runtime_import_library(
     definition: &Path,
     import: &Path,
 ) -> Result<(), BackendError> {
-    use cranelift_object::object::{Object, ObjectSymbol};
-    let object = cranelift_object::object::File::parse(object_bytes)
-        .map_err(|error| BackendError::new(format!("cannot read generated object: {error}")))?;
-    let mut symbols = object
-        .symbols()
-        .filter(|symbol| symbol.is_undefined())
-        .filter_map(|symbol| symbol.name().ok().map(str::to_string))
-        .filter(|name| name.starts_with("dr_"))
-        .collect::<Vec<_>>();
-    symbols.sort();
-    symbols.dedup();
     let name = runtime
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut text = format!("LIBRARY {name}\nEXPORTS\n");
-    for symbol in symbols {
-        text.push_str(&format!("    {symbol}\n"));
-    }
+    let text = runtime_import_definition(object_bytes, &name)?;
     fs::write(definition, text)
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     run_linker(
@@ -779,6 +773,38 @@ fn write_runtime_import_library(
         true,
     )
     .map(|_| ())
+}
+
+/// The module definition of the import library for the shared runtime DLL
+/// `name`: every runtime symbol the COFF object `object_bytes` imports.
+pub(crate) fn runtime_import_definition(
+    object_bytes: &[u8],
+    name: &str,
+) -> Result<String, BackendError> {
+    use cranelift_object::object::{Object, ObjectSymbol};
+    let object = cranelift_object::object::File::parse(object_bytes)
+        .map_err(|error| BackendError::new(format!("cannot read generated object: {error}")))?;
+    // A runtime function is named itself; runtime data is reached through
+    // its import slot (`native_abi::RuntimeDataAccess`), which the import
+    // library defines for an export marked DATA.
+    let slot = crate::native_abi::RuntimeDataAccess::ImportSlot.symbol("");
+    let mut symbols = object
+        .symbols()
+        .filter(|symbol| symbol.is_undefined())
+        .filter_map(|symbol| symbol.name().ok())
+        .filter_map(|name| match name.strip_prefix(slot.as_str()) {
+            Some(data) if data.starts_with("dr_") => Some(format!("{data} DATA")),
+            None if name.starts_with("dr_") => Some(name.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    let mut text = format!("LIBRARY {name}\nEXPORTS\n");
+    for symbol in symbols {
+        text.push_str(&format!("    {symbol}\n"));
+    }
+    Ok(text)
 }
 
 fn is_msvc_style_compiler_driver(linker: &str) -> bool {

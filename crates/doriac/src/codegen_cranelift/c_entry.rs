@@ -128,8 +128,9 @@ pub(super) fn declare(
     program: &mir::Program,
     companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Vec<(mir::FunctionId, FuncId)>, BackendError> {
-    // A companion's C entries are its exported region entries and its
-    // callbacks' forwarders (Decision 0148 section 23).
+    // A companion's C entries are its exported region entries, its
+    // callbacks' forwarders and its binding entries (Decision 0148 section
+    // 23).
     let entries = match companion {
         Some(_) => program
             .companion
@@ -137,6 +138,13 @@ pub(super) fn declare(
             .iter()
             .map(|region| region.entry.id)
             .chain(program.c_entries.iter().copied())
+            .chain(
+                program
+                    .companion
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.entry.id),
+            )
             .collect::<Vec<_>>(),
         None => program.c_entries.clone(),
     };
@@ -232,15 +240,38 @@ fn define_entry_frame(
     let mut description = DataDescription::new();
     description.set_align(width as u64);
     description.define(bytes.into_boxed_slice());
-    for (word, data) in [
-        (1, frame_data_symbols(function.id).name),
-        (3, frame_data_symbols(function.id).path),
-        (5, frame_data_symbols(function.id).text),
+    for (word, data, bytes) in [
+        (
+            1,
+            frame_data_symbols(function.id).name,
+            callable_name.as_bytes(),
+        ),
+        (
+            3,
+            frame_data_symbols(function.id).path,
+            source.path.as_bytes(),
+        ),
+        (
+            5,
+            frame_data_symbols(function.id).text,
+            source.text.as_bytes(),
+        ),
     ] {
-        let Some(cranelift_module::FuncOrDataId::Data(id)) = module.get_name(&data) else {
-            return Err(malformed_mir(
-                "a C entry's function defines its own diagnostic frame data",
-            ));
+        // A function that owns its frame defined this data; a binding
+        // entry, which runs at its caller's frame, has its own here.
+        let id = match module.get_name(&data) {
+            Some(cranelift_module::FuncOrDataId::Data(id)) => id,
+            _ => {
+                let id = module
+                    .declare_data(&data, Linkage::Local, false, false)
+                    .map_err(|error| backend_failure(error.to_string()))?;
+                let mut contents = DataDescription::new();
+                contents.define(bytes.to_vec().into_boxed_slice());
+                module
+                    .define_data(id, &contents)
+                    .map_err(|error| backend_failure(error.to_string()))?;
+                id
+            }
         };
         let reference = module.declare_data_in_data(id, &mut description);
         description.write_data_addr((word * width) as u32, reference, 0);
@@ -312,6 +343,7 @@ fn emit(
     callee: FuncId,
 ) -> Result<(), BackendError> {
     let region = program.companion.is_region_entry(function.id);
+    let binding = program.companion.is_binding_entry(function.id);
     let pointer = module.target_config().pointer_type();
     let flags = MemFlagsData::trusted();
     let (types, physical) = physical(program, function)?;
@@ -324,11 +356,17 @@ fn emit(
     // frame links to the host frame its caller passes (section 23).
     let entry_frame = module.declare_data_in_func(entry_frame, builder.func);
     let entry_frame = builder.ins().symbol_value(pointer, entry_frame);
-    let (symbol, arguments) = if region {
+    // A binding entry runs at the frame it receives.
+    let (symbol, arguments) = if region || binding {
         let caller = *received
             .get(1)
             .ok_or_else(|| malformed_mir("a region entry receives its caller's frame"))?;
-        (crate::native_abi::ENTER_REGION, [entry_frame, caller])
+        let symbol = if binding {
+            crate::native_abi::ENTER_BINDING
+        } else {
+            crate::native_abi::ENTER_REGION
+        };
+        (symbol, [entry_frame, caller])
     } else {
         let marker = slot(builder, pointer.bytes() * 11, pointer.bytes(), pointer);
         (crate::native_abi::ENTER_C_FUNCTION, [marker, entry_frame])

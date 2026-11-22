@@ -87,6 +87,14 @@ fn publish(
         sidecar["library"].as_str(),
         published.library.file_name().and_then(|name| name.to_str())
     );
+    let bindings = sidecar["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), mir.companion.bindings.len(), "{sidecar:#}");
+    for (binding, recorded) in mir.companion.bindings.iter().zip(bindings) {
+        assert_eq!(
+            recorded["symbol"].as_str(),
+            Some(binding.entry_symbol().as_str())
+        );
+    }
     let regions = sidecar["regions"].as_array().unwrap();
     assert_eq!(regions.len(), mir.companion.regions.len(), "{sidecar:#}");
     for (region, recorded) in mir.companion.regions.iter().zip(regions) {
@@ -347,6 +355,17 @@ fn the_zlib_example_builds_its_companion() {
                 library.symbol(&callback.entry_symbol()).is_some(),
                 "{profile:?}: {} is exported",
                 callback.entry_symbol()
+            );
+        }
+        assert!(
+            !mir.companion.bindings.is_empty(),
+            "the regions call extern functions"
+        );
+        for binding in &mir.companion.bindings {
+            assert!(
+                library.symbol(&binding.entry_symbol()).is_some(),
+                "{profile:?}: {} is exported",
+                binding.entry_symbol()
             );
         }
         assert!(library.symbol("deflateInit_").is_some(), "zlib is linked");

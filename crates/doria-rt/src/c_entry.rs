@@ -130,3 +130,26 @@ pub unsafe extern "C" fn dr_v1_enter_region(
     }
     (*caller).parent
 }
+
+/// Enters a binding entry of the native companion library (Decision 0148
+/// section 23), through which a host calls an extern declaration's
+/// function. Panics with P1706, reported at `entry`, when the calling
+/// thread is not the thread the host attached on. Otherwise returns
+/// `caller`, the host's frame of the function making the call: the entry
+/// runs at its caller's frame, as the extern declaration's function does.
+///
+/// # Safety
+///
+/// `entry` points to a valid frame that describes the binding, and
+/// `caller` is null or a valid frame chain.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_enter_binding(
+    entry: *const DrStackFrameV2,
+    caller: *const DrStackFrameV2,
+) -> *const DrStackFrameV2 {
+    let thread = DORIA_THREAD.load(Ordering::Relaxed);
+    if thread == 0 || thread != current_thread() {
+        panic_catalogued(entry, FOREIGN_THREAD);
+    }
+    caller
+}

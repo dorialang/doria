@@ -27,7 +27,7 @@ pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Di
     Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
         .with_title(title)
         .with_explanation(
-            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and PHP output takes the target's C data model, through the native companion library, which this compiler does not build yet.",
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and take the target's C data model, through the native companion library. The interpreter does not run foreign structs and unions through it yet, and PHP output does not use it yet.",
         )
 }
 
@@ -64,8 +64,10 @@ pub fn unbuilt_form(span: Span, title: &str, message: impl Into<String>) -> Diag
         .expect("a reported form has its diagnostic")
 }
 
-/// One E0784 diagnostic per MIR operation the native targets build and the
-/// interpreter runs through the native companion library, in program order.
+/// One E0784 diagnostic per MIR operation on a foreign struct or union or
+/// on a region over foreign memory, which the native targets build and the
+/// interpreter does not run yet, in program order. The interpreter runs every other unsafe operation through
+/// the native companion library.
 pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
     let mut seen = HashSet::new();
     let mut diagnostics = Vec::new();
@@ -73,15 +75,16 @@ pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
         for block in &function.blocks {
             for statement in &block.statements {
                 let (span, title, message) = match statement {
-                    crate::mir::Statement::Pointer { span, .. } => (
+                    // A region over memory C owns lives on the host as an
+                    // address and a length.
+                    crate::mir::Statement::Pointer {
+                        operation: crate::mir::PointerOperation::ForeignRange { .. },
                         span,
-                        "Pointer Operations Cannot Run In The Interpreter Yet",
-                        "pointer operations are part of Doria; the interpreter does not run them yet",
-                    ),
-                    crate::mir::Statement::ForeignCall { span, .. } => (
+                        ..
+                    } => (
                         span,
-                        "Foreign Calls Cannot Run In The Interpreter Yet",
-                        "foreign calls are part of Doria; the interpreter does not run them yet",
+                        "Regions Over Foreign Memory Cannot Run In The Interpreter Yet",
+                        "regions over memory a foreign library owns are part of Doria; the interpreter does not run them yet",
                     ),
                     crate::mir::Statement::ForeignField { span, .. }
                     | crate::mir::Statement::AssignLocal {

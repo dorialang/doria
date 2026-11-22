@@ -175,8 +175,16 @@ fn php_output_reports_that_it_does_not_build_boundary_values_yet() {
 /// The program prints `stdout` and exits 0 on every native profile; the
 /// interpreter reports that it runs pointer operations through the native
 /// companion library.
+/// The program prints `stdout` and exits 0 on every target. The
+/// interpreter runs unsafe code through the native companion library and
+/// reports a program with foreign structs or unions, which it does not run
+/// yet.
 fn assert_runs_natively(source: &str, stdout: &str) {
     let mir = program(source);
+    if doriac::unsafe_code::companion_operations(&mir).is_empty() {
+        assert_runs_everywhere(source, stdout);
+        return;
+    }
     assert_interpreter_reports_companion(&mir);
     for profile in NativeProfile::AVAILABLE {
         let run = execute_native(&mir, *profile);
@@ -187,9 +195,40 @@ fn assert_runs_natively(source: &str, stdout: &str) {
 }
 
 /// The program panics with `code` and `title` on every native profile.
+/// Runs `source` in the interpreter in a child process, `doriac compile
+/// --target debug`: a panic inside an unsafe region ends the process that
+/// hosts the companion (Decision 0148 section 23), which writes the
+/// program's output and the report to its own streams and exits 101.
+fn interpret_in_child(source: &str) -> std::process::Output {
+    let directory = execution_directory::ExecutionDirectory::new();
+    let path = directory.path().join("stage40.doria");
+    std::fs::write(&path, source).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_doriac"))
+        .arg("compile")
+        .arg(&path)
+        .args(["--target", "debug", "--out"])
+        .arg(directory.path().join("program.debug"))
+        .output()
+        .expect("doriac runs")
+}
+
 fn assert_panics_natively(source: &str, code: &str, title: &str) {
     let mir = program(source);
-    assert_interpreter_reports_companion(&mir);
+    if doriac::unsafe_code::companion_operations(&mir).is_empty() {
+        let interpreted = interpret_in_child(source);
+        let stderr = String::from_utf8_lossy(&interpreted.stderr);
+        assert_eq!(
+            interpreted.status.code(),
+            Some(101),
+            "interpreter: {stderr}"
+        );
+        assert!(
+            stderr.contains(code) && stderr.contains(title),
+            "interpreter: {stderr}"
+        );
+    } else {
+        assert_interpreter_reports_companion(&mir);
+    }
     for profile in NativeProfile::AVAILABLE {
         let run = execute_native(&mir, *profile);
         assert_eq!(run.status.code(), Some(101), "{profile:?}: {run:?}");
@@ -206,9 +245,8 @@ fn assert_interpreter_reports_companion(mir: &doriac::mir::Program) {
     assert!(
         companion.iter().all(|diagnostic| diagnostic.code == "E0784"
             && [
-                "Pointer Operations Cannot Run In The Interpreter Yet",
-                "Foreign Calls Cannot Run In The Interpreter Yet",
                 "Foreign Structs And Unions Cannot Run In The Interpreter Yet",
+                "Regions Over Foreign Memory Cannot Run In The Interpreter Yet",
             ]
             .contains(&diagnostic.title.as_str())),
         "{companion:#?}"
@@ -463,7 +501,7 @@ fn an_offset_that_leaves_the_address_space_panics_with_p1703() {
 }
 
 #[test]
-fn the_interpreter_and_php_output_report_pointer_operations() {
+fn the_interpreter_runs_pointer_operations_and_php_output_reports_them() {
     let source = format!(
         "{POINTER}function main(): void {{ unsafe {{ ?Pointer<int32> $pointer = Pointer::fromAddress(4096); echo $pointer == null; }} }}"
     );
@@ -472,11 +510,11 @@ fn the_interpreter_and_php_output_report_pointer_operations() {
         source.clone(),
         doriac::backend::BackendTarget::Debug,
     )
-    .expect_err("the interpreter runs pointers through the companion");
+    .expect("the interpreter runs pointers through the companion");
     assert!(
-        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Pointer Operations Cannot Run In The Interpreter Yet"),
-        "{debug:#?}"
+        matches!(&debug, doriac::backend::BackendOutput::Text { contents, .. }
+            if contents == "exit_status: 0\nstdout: false\n"),
+        "{debug:?}"
     );
     let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
         .expect_err("PHP output runs pointers through the companion");
@@ -632,6 +670,31 @@ extern "C"
     function clear(WritablePointer<Opaque> $memory, int32 $value, CSize $count): void;
 }
 "#;
+
+/// A statement that runs on the host and calls an extern function: the
+/// interpreter evaluates `echo` itself and calls `abs` through its binding
+/// entry in the companion, in the order the statement evaluates them.
+#[test]
+fn a_host_statement_calls_an_extern_function_through_its_binding_entry() {
+    let source = format!(
+        "{C_LIBRARY}
+function label(string $text): string
+{{
+    echo \"[\" . $text . \"]\";
+    return $text;
+}}
+
+function main(): void
+{{
+    unsafe {{
+        echo abs(-7);
+        echo \" \" . label(\"a\") . abs(-2) . label(\"b\");
+    }}
+}}
+"
+    );
+    assert_runs_everywhere(&source, "7[a][b] a2b");
+}
 
 #[test]
 fn foreign_calls_reach_the_platform_c_runtime() {
@@ -2741,7 +2804,18 @@ function main(): void
 }
 ";
     let mir = program(source);
-    assert_interpreter_reports_companion(&mir);
+    // The interpreter runs the callback on the host, called back from the
+    // companion's foreign call.
+    let interpreted = interpret(&mir).expect("the interpreter runs the program");
+    let stdout = String::from_utf8_lossy(&interpreted.stdout);
+    let (dots, sorted) = stdout
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("interpreter: {stdout}"));
+    assert!(
+        !dots.is_empty() && dots.chars().all(|character| character == '.'),
+        "interpreter: {stdout}"
+    );
+    assert_eq!((sorted, interpreted.exit_status), ("123", 0), "interpreter");
     for profile in NativeProfile::AVAILABLE {
         let run = execute_native(&mir, *profile);
         assert_eq!(run.status.code(), Some(0), "{profile:?}: {run:?}");

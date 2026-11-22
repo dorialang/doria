@@ -17,6 +17,7 @@ use crate::source::Span;
 
 mod byte_region;
 mod child_process;
+mod companion_host;
 mod file_stream;
 mod inline_value;
 mod readiness_set;
@@ -176,6 +177,9 @@ pub struct InterpreterLimits {
 pub struct InterpreterError {
     pub message: String,
     runtime_panic: Option<&'static str>,
+    /// The structured diagnostics of a failure to build what the program
+    /// runs with, such as its native companion library.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl InterpreterError {
@@ -183,6 +187,7 @@ impl InterpreterError {
         Self {
             message: message.into(),
             runtime_panic: None,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -190,6 +195,7 @@ impl InterpreterError {
         Self {
             message: code.to_string(),
             runtime_panic: Some(code),
+            diagnostics: Vec::new(),
         }
     }
 }
@@ -640,6 +646,7 @@ struct CheckedConstruction {
 #[derive(Debug, Clone)]
 enum EvaluationTask {
     ByteRegion(byte_region::Task),
+    HostPointer(companion_host::PointerTask),
     Inline(inline_value::Task),
     Rvalue(mir::Rvalue),
     SetPanicSite(Span),
@@ -1153,6 +1160,11 @@ struct CallFrame {
     active_panic_site: Span,
     closure_environment: Option<ClosureEnvironmentHandle>,
     consume_closure_environment: bool,
+    /// For a C-callable function C called (Decision 0148 section 13): the
+    /// site of the outbound foreign call in progress, which the Call Path
+    /// shows below a `[foreign call]` frame, or `None` when C called it
+    /// outside any foreign call and its chain starts anew.
+    foreign_caller: Option<Option<Span>>,
 }
 
 /// Evaluated borrowed call results carry their actual place alongside the
@@ -1239,6 +1251,13 @@ struct Interpreter<'program> {
     limits: InterpreterLimits,
     executed_blocks: usize,
     pending_panic: Option<&'static str>,
+    /// The native companion library that runs the program's unsafe regions
+    /// (Decision 0148 sections 22 and 23), and the region calls in progress.
+    companion: Option<companion_host::LoadedCompanion>,
+    region_calls: Vec<companion_host::ActiveRegionCall>,
+    /// The host handle table (Decision 0148 section 23): handle `n` holds
+    /// entry `n - 1`.
+    handles: Vec<Option<LocalValue>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1358,6 +1377,9 @@ pub struct MirIo {
     /// The terminal behind standard input and output. `None` runs the
     /// program as if both were redirected.
     pub terminal: Option<MirTerminal>,
+    /// The resolved link inputs the native companion library of a program
+    /// with unsafe regions builds with (Decision 0148 section 23).
+    pub linking: crate::native_link::NativeLinking,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1442,8 +1464,8 @@ fn interpret_internal_with_clock(
 ) -> Result<(InterpreterIoOutput, InterpreterMetrics), InterpreterError> {
     crate::mir_validation::validate_program(program)
         .map_err(|error| InterpreterError::new(error.message))?;
-    // Unsafe operations run through the native companion library, which
-    // this compiler does not build yet; refuse before any effect.
+    // Foreign structs and unions do not run on the companion host yet;
+    // refuse before any effect.
     if let Some(form) = crate::unsafe_code::companion_operations(program).first() {
         return Err(InterpreterError::new(form.message.clone()));
     }
@@ -1653,6 +1675,12 @@ impl<'a> Interpreter<'a> {
             .iter()
             .map(|property| static_local_value(program, &property.initializer, property.ty))
             .collect::<Result<Vec<_>, _>>()?;
+        // A C-callable function's name is the address of its callback's C
+        // entry, so a program with one has a companion even without regions.
+        let companion = (!program.companion.regions.is_empty()
+            || !program.companion.callbacks.is_empty())
+        .then(|| companion_host::LoadedCompanion::load(program, &io.linking))
+        .transpose()?;
         Ok(Self {
             program,
             monotonic_clock,
@@ -1697,6 +1725,9 @@ impl<'a> Interpreter<'a> {
             limits,
             executed_blocks: 0,
             pending_panic: None,
+            companion,
+            region_calls: Vec::new(),
+            handles: Vec::new(),
         })
     }
 
@@ -1719,6 +1750,15 @@ impl<'a> Interpreter<'a> {
         let task = self.frames.last_mut().and_then(|frame| frame.tasks.pop());
         if let Some(task) = task {
             return self.execute_task(task);
+        }
+        // Each unsafe region runs as one call into the native companion.
+        if let Some((function, region)) = self.region_at_current_block()? {
+            return self.run_region(function, region);
+        }
+        // A host operation's call of an extern declaration's function runs
+        // through its binding entry.
+        if let Some(function) = self.binding_at_current_frame()? {
+            return self.run_binding(function);
         }
 
         self.enter_current_block()?;
@@ -2652,11 +2692,9 @@ impl<'a> Interpreter<'a> {
                     .tasks
                     .push(EvaluationTask::DropFunction(local));
             }
-            mir::Statement::Pointer { .. } => {
-                return Err(InterpreterError::new(
-                    "the interpreter runs pointer operations through the native companion library",
-                ));
-            }
+            mir::Statement::Pointer {
+                target, operation, ..
+            } => return self.execute_host_pointer(target, operation),
             mir::Statement::ForeignCall { .. } => {
                 return Err(InterpreterError::new(
                     "the interpreter runs foreign calls through the native companion library",
@@ -3193,6 +3231,7 @@ impl<'a> Interpreter<'a> {
     ) -> Result<StepOutcome, InterpreterError> {
         match task {
             EvaluationTask::ByteRegion(task) => return self.execute_region_task(task),
+            EvaluationTask::HostPointer(task) => return self.finish_host_pointer(task),
             EvaluationTask::Inline(task) => return self.execute_inline_task(task),
             EvaluationTask::SetPanicSite(span) => self.set_active_panic_site(span)?,
             EvaluationTask::SetResultPlace(place) => {
@@ -7453,13 +7492,18 @@ impl<'a> Interpreter<'a> {
         expression: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            // The interpreter runs every foreign call through the native
-            // companion library (Decision 0148 section 22), so no capturing
-            // call has stored a code here and the slot keeps its initial 0.
+            // Every foreign call runs in the native companion library
+            // (Decision 0148 section 22), which stores a captured code in
+            // the shared runtime; before any capture the code is 0.
             mir::IntegerExpression::LastSystemCode => {
-                self.push_scalar(mir::ScalarValue::Integer(
-                    IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is an int64"),
-                ))?;
+                let code = self
+                    .companion
+                    .as_ref()
+                    .map_or(0, companion_host::LoadedCompanion::last_system_code);
+                self.push_scalar(mir::ScalarValue::Integer(IntegerValue::from_bits(
+                    IntegerType::Int64,
+                    code as u64,
+                )))?;
             }
             mir::IntegerExpression::InlineWord(value) => {
                 let frame = self.current_frame_mut()?;
@@ -12898,6 +12942,7 @@ impl<'a> Interpreter<'a> {
             active_panic_site,
             closure_environment: None,
             consume_closure_environment: false,
+            foreign_caller: None,
         });
         Ok(())
     }
@@ -18599,21 +18644,31 @@ impl<'a> Interpreter<'a> {
             let Some(function) = self.program.functions.get(frame.function.0) else {
                 continue;
             };
-            if !function.owns_diagnostic_frame() {
-                continue;
+            if function.owns_diagnostic_frame() {
+                let span = if Some(frame_index) == origin_index {
+                    event.operation_span
+                } else {
+                    self.frames[frame_index + 1]
+                        .entered_from
+                        .unwrap_or(function.source_span)
+                };
+                path.push(RuntimeOutcomeFrame {
+                    function: self.program.diagnostic_callable_name(function).into_owned(),
+                    source: DiagnosticSource::Current,
+                    span,
+                });
             }
-            let span = if Some(frame_index) == origin_index {
-                event.operation_span
-            } else {
-                self.frames[frame_index + 1]
-                    .entered_from
-                    .unwrap_or(function.source_span)
-            };
-            path.push(RuntimeOutcomeFrame {
-                function: self.program.diagnostic_callable_name(function).into_owned(),
-                source: DiagnosticSource::Current,
-                span,
-            });
+            // C called this function: the frames below it are the foreign
+            // call's, or none when it called outside any foreign call.
+            match frame.foreign_caller {
+                Some(Some(_)) => path.push(RuntimeOutcomeFrame {
+                    function: crate::foreign::FOREIGN_CALL_FRAME.to_string(),
+                    source: DiagnosticSource::Unavailable,
+                    span: Span::default(),
+                }),
+                Some(None) => break,
+                None => {}
+            }
         }
         let outcome = RuntimeOutcomeDetails {
             process_status: 101,

@@ -177,8 +177,9 @@ pub(super) fn declare<'ctx>(
     program: &mir::Program,
     companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Vec<(mir::FunctionId, FunctionValue<'ctx>)>, BackendError> {
-    // A companion's C entries are its exported region entries and its
-    // callbacks' forwarders (Decision 0148 section 23).
+    // A companion's C entries are its exported region entries, its
+    // callbacks' forwarders and its binding entries (Decision 0148 section
+    // 23).
     let entries = match companion {
         Some(_) => program
             .companion
@@ -186,6 +187,13 @@ pub(super) fn declare<'ctx>(
             .iter()
             .map(|region| region.entry.id)
             .chain(program.c_entries.iter().copied())
+            .chain(
+                program
+                    .companion
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.entry.id),
+            )
             .collect::<Vec<_>>(),
         None => program.c_entries.clone(),
     };
@@ -254,23 +262,30 @@ fn entry_frame<'ctx>(
     let source = program
         .source_for_span(function.source_span)
         .unwrap_or(&program.source);
-    let data = |name: String| {
-        module
-            .get_global(&name)
-            .map(|global| global.as_pointer_value())
-            .ok_or_else(|| {
-                malformed_mir("a C entry's function defines its own diagnostic frame data")
-            })
+    // A function that owns its frame defined this data; a binding entry,
+    // which runs at its caller's frame, has its own here.
+    let data = |name: String, bytes: &[u8]| -> Result<PointerValue<'ctx>, BackendError> {
+        Ok(match module.get_global(&name) {
+            Some(global) => global.as_pointer_value(),
+            None => {
+                let value = context.const_string(bytes, false);
+                let global = module.add_global(value.get_type(), None, &name);
+                global.set_initializer(&value);
+                global.set_constant(true);
+                global.set_linkage(Linkage::Private);
+                global.as_pointer_value()
+            }
+        })
     };
     let symbols = frame_data_symbols(function.id);
     let word = |value: usize| usize_type.const_int(value as u64, false).into();
     let fields: [BasicValueEnum<'ctx>; 11] = [
         pointer.const_null().into(),
-        data(symbols.name)?.into(),
+        data(symbols.name, callable_name.as_bytes())?.into(),
         word(callable_name.len()),
-        data(symbols.path)?.into(),
+        data(symbols.path, source.path.as_bytes())?.into(),
         word(source.path.len()),
-        data(symbols.text)?.into(),
+        data(symbols.text, source.text.as_bytes())?.into(),
         word(source.text.len()),
         word(function.source_span.start),
         word(function.source_span.end),
@@ -320,6 +335,7 @@ fn emit<'ctx>(
     callee: FunctionValue<'ctx>,
 ) -> Result<(), BackendError> {
     let region = program.companion.is_region_entry(function.id);
+    let binding = program.companion.is_binding_entry(function.id);
     let (types, physical) = physical(program, function)?;
     let pointer = context.ptr_type(AddressSpace::default());
     let word = context.i64_type();
@@ -330,14 +346,17 @@ fn emit<'ctx>(
 
     // The thread check and the frame link (section 13). A region entry's
     // frame links to the host frame its caller passes (section 23).
-    let (symbol, arguments) = if region {
+    // A binding entry runs at the frame it receives.
+    let (symbol, arguments) = if region || binding {
         let caller = *received
             .get(1)
             .ok_or_else(|| malformed_mir("a region entry receives its caller's frame"))?;
-        (
-            crate::native_abi::ENTER_REGION,
-            [frame.into(), caller.into()],
-        )
+        let symbol = if binding {
+            crate::native_abi::ENTER_BINDING
+        } else {
+            crate::native_abi::ENTER_REGION
+        };
+        (symbol, [frame.into(), caller.into()])
     } else {
         let frame_type = context.struct_type(&[word.into(); 11], false);
         let marker = build(builder.build_alloca(frame_type, "c.entry.marker"))?;

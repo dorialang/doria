@@ -1084,6 +1084,14 @@ takes a new version.
 - A `T[]` crosses as a buffer when a region over it addresses its
   elements (section 8): `{data, length}` then shares their C layout. Any
   other `T[]` is a host token.
+- Each extern declaration's function a region reaches has a binding
+  entry, in function order, exported as
+  `int32 doria_binding_v1_<n>(DrRegionHostV1 *host, const void *callerFrame,
+  void *arguments, void *results)`. It checks the thread
+  (`dr_v1_enter_binding`), runs at the caller's frame, loads the
+  function's parameters from `arguments`, calls it, stores its return
+  value in `results` and returns 0. A host operation's call of an extern
+  function goes through it.
 - Each C-callable function is a callback, numbered after every host
   operation in the order MIR lists the program's C entries. The companion exports its C entry as
   `doria_callback_v1_<operation>`, which checks the thread, links the Call
@@ -1091,8 +1099,9 @@ takes a new version.
   parameters and the results its return value. The host holds the
   function's C function pointer value as that entry's address.
 - The library emits the region entries, the extern declarations' functions
-  they call and the callbacks' forwarders, as the shared local walk reports
-  them; the program's other functions stay on the host.
+  they call, the callbacks' forwarders and the binding entries, as the
+  shared local walk reports them; the program's other functions stay on
+  the host.
 - The library depends on the hosted shared runtime at
   `.doria-runtime/<identity>/` beside it, through an rpath on Unix. On
   Windows the host loads that runtime before the library, which then
@@ -1104,6 +1113,20 @@ takes a new version.
   Unix library name the symbol itself.
 - The companion follows the build's native profile: Cranelift by default,
   LLVM for `--release`, and the profile is part of the cache key.
+- A region over host storage crosses as the host's native copy of the
+  elements it views, which the companion views in place; at the entry's
+  return the host copies a writable region's copy back into its storage. A
+  region output or host-operation argument that lies in such a copy
+  crosses back as a view of the host storage at the same offset.
+- A panic or exit in Doria code during a region call ends the process as
+  the panic sink does, with the program's output written first: nothing
+  returns to the companion.
+- A callback's body runs in a new host frame whose Call Path continues,
+  below a `[foreign call]` frame, at the site the runtime's record of the
+  outbound foreign call holds, or starts anew when that record is empty.
+- The host handle table gives handle `n` to its `n`th entry.
+- One shared runtime holds one attached host, so the interpretations of one
+  process that run a companion take turns.
 
 **Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
@@ -1152,8 +1175,9 @@ share one runtime state.
 
 - PHP output writes `<stem>.native.<so|dylib|dll>` and `<stem>.native.json`
   beside the generated PHP. The sidecar records its schema version, compiler
-  identity, runtime ABI version, region identities and signatures, foreign
-  libraries and the library's SHA-256. The generated PHP validates the sidecar
+  identity, runtime ABI version, region identities and signatures, the
+  callback and binding entries, foreign libraries and the library's
+  SHA-256. The generated PHP validates the sidecar
   and loads the library with `FFI::cdef(<generated declarations>, __DIR__ . ...)`,
   as it loads the runtime. Missing PHP FFI, a missing file or a mismatch fails
   explicitly with no fallback (Decision 0110's precedent).
@@ -1257,8 +1281,15 @@ has one precise contract.
   naming, cache path and key (sections 22 and 23).
 - Version 1 of the entry ABI (section 23), specified on 2026-11-22:
   - Whole statements as host operations: foreign calls and pointer operations
-    are already their own MIR statements, so a host operation holds no native
-    work, and the shared local walk names its exact arguments and results.
+    are already their own MIR statements, so a host operation holds no
+    foreign call or pointer operation; a call it makes to an extern function
+    goes through that function's binding entry, and the shared local walk
+    names its exact arguments and results.
+  - Binding entries: an extern function's call lowers as an ordinary call
+    of its function, so a host operation's statement (`echo abs(-7)`) can
+    make one. Calling it through an entry keeps evaluation order,
+    short-circuits and conditionals exactly as lowered, and leaves native
+    code unchanged.
   - Value operations stay in the companion: one runtime per process makes them
     sound, and a reverse edge per string operation would make string-heavy
     regions pay a crossing each time.
@@ -1310,6 +1341,13 @@ has one precise contract.
     reaches, so what the library emits has one owner.
   - The profile follows the program: the companion is part of the same
     build, so a release build's regions get the optimized profile.
+  - Copies of regions over host storage: the interpreter's storage is not
+    C layout, so the companion views a native copy, and the copy's address
+    range names the host storage a region the companion returns views.
+  - The process ends on a panic during a region call: the companion's
+    frames are below the host's, and neither side unwinds.
+  - The Call Path of a callback from the runtime's record: the runtime
+    already holds the outbound call's frame for every C entry.
   - Import slots for runtime data on Windows: an import library defines
     only the `__imp_` slot for a DLL's data, and COFF has no automatic
     data import. Native code keeps its direct store around each foreign

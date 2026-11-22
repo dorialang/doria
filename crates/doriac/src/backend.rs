@@ -348,24 +348,44 @@ impl Backend for DebugBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        let mir = lower_validated_mir(program)?;
-        let companion = crate::unsafe_code::companion_operations(&mir);
-        if !companion.is_empty() {
-            return Err(BackendError::from_diagnostics(companion));
-        }
-        let output = mir_interpreter::interpret(&mir).map_err(|error| {
-            BackendError::from_diagnostics(vec![Diagnostic::new(
-                "M1102",
-                format!("MIR interpreter failure: {error}"),
-                Span::default(),
-            )])
-        })?;
-
-        Ok(BackendOutput::Text {
-            extension: "debug".to_string(),
-            contents: mir_interpreter::render_debug_output(&output),
-        })
+        emit_debug(program, &crate::native_link::NativeLinking::default())
     }
+}
+
+/// Runs the program in the interpreter. Its unsafe regions run in the
+/// native companion library, built with `linking` (Decision 0148 section
+/// 23).
+fn emit_debug(
+    program: &hir::Program,
+    linking: &crate::native_link::NativeLinking,
+) -> Result<BackendOutput, BackendError> {
+    let mir = lower_validated_mir(program)?;
+    let companion = crate::unsafe_code::companion_operations(&mir);
+    if !companion.is_empty() {
+        return Err(BackendError::from_diagnostics(companion));
+    }
+    let io = mir_interpreter::MirIo {
+        linking: linking.clone(),
+        ..mir_interpreter::MirIo::default()
+    };
+    let output = mir_interpreter::interpret_with_io(&mir, io)
+        .map_err(|error| {
+            if error.diagnostics.is_empty() {
+                BackendError::from_diagnostics(vec![Diagnostic::new(
+                    "M1102",
+                    format!("MIR interpreter failure: {error}"),
+                    Span::default(),
+                )])
+            } else {
+                BackendError::from_diagnostics(error.diagnostics)
+            }
+        })?
+        .output;
+
+    Ok(BackendOutput::Text {
+        extension: "debug".to_string(),
+        contents: mir_interpreter::render_debug_output(&output),
+    })
 }
 
 fn lower_validated_mir(program: &hir::Program) -> Result<mir::Program, BackendError> {
@@ -391,7 +411,7 @@ pub fn emit_with_options(
     match options.target {
         BackendTarget::Native => emit_native(program, options.native_profile, &options.linking),
         BackendTarget::Php => PhpBackend.emit(program),
-        BackendTarget::Debug => DebugBackend.emit(program),
+        BackendTarget::Debug => emit_debug(program, &options.linking),
         BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",
             options.target.name(),
