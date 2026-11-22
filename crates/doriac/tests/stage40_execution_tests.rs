@@ -4463,3 +4463,136 @@ function main(): void
     }
     assert_runs_natively(&source, "seven 7 boxed 2");
 }
+
+/// The companion has one entry per region identity: the ordinary and the
+/// direct lowering of a method share it. A Doria call and `echo` inside a
+/// region are host operations; a call of an extern declaration and plain
+/// assignments run in the companion. Native profiles validate the plan
+/// again.
+#[test]
+fn companion_plans_one_entry_per_region_and_its_host_operations() {
+    let source = format!(
+        "{C_LIBRARY}
+open class Meter
+{{
+    open function measure(int32 $value): int32
+    {{
+        writable int32 $total = 0;
+        unsafe {{
+            $total = abs($value);
+        }}
+        return $total;
+    }}
+}}
+
+class DoubleMeter extends Meter
+{{
+    override function measure(int32 $value): int32
+    {{
+        return parent::measure($value) + parent::measure($value);
+    }}
+}}
+
+function helper(int32 $value): int32
+{{
+    return $value + 1;
+}}
+
+function run(int32 $seed): int32
+{{
+    writable int32 $total = 0;
+    unsafe {{
+        $total = abs($seed);
+        $total = helper($total);
+        echo \"inside\\n\";
+    }}
+    return $total;
+}}
+
+function main(): void
+{{
+    Meter $meter = new DoubleMeter();
+    echo \"\" . run(-4) . \" \" . $meter->measure(-3);
+}}
+"
+    );
+    let mir = program(&source);
+    let companion = &mir.companion;
+    let mut identities = mir
+        .functions
+        .iter()
+        .flat_map(|function| function.unsafe_regions.iter().map(|region| &region.id))
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    assert_eq!(companion.regions.len(), identities.len(), "{companion:#?}");
+    let name = |id: doriac::mir::FunctionId| {
+        mir.functions
+            .iter()
+            .find(|function| function.id == id)
+            .map(|function| function.name.as_str())
+            .unwrap()
+    };
+    let measure = companion
+        .regions
+        .iter()
+        .position(|region| name(region.lowerings[0].function).starts_with("Meter::measure"))
+        .expect("`Meter::measure` has a region");
+    let lowerings = companion.regions[measure]
+        .lowerings
+        .iter()
+        .map(|lowering| name(lowering.function))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lowerings,
+        ["Meter::measure", "Meter::measure::<direct>"],
+        "{companion:#?}"
+    );
+    assert!(
+        companion
+            .host_operations
+            .iter()
+            .all(|operation| operation.region != measure),
+        "{companion:#?}"
+    );
+    let run = function_named(&mir, "run");
+    let local = |value: &doriac::mir::UnsafeRegionValue| {
+        run.locals[value.local.0]
+            .name
+            .trim_start_matches('$')
+            .to_string()
+    };
+    let operations = companion
+        .host_operations
+        .iter()
+        .filter(|operation| operation.region != measure)
+        .collect::<Vec<_>>();
+    // `echo` is a checked I/O terminator: the host takes its success or
+    // failure edge, and the failure path handles a host-held Error.
+    assert!(
+        operations.iter().any(|operation| {
+            operation.site == doriac::mir::HostOperationSite::Terminator
+                && operation.successors.len() == 2
+                && operation.arguments.is_empty()
+        }),
+        "{operations:#?}"
+    );
+    assert!(
+        operations
+            .iter()
+            .enumerate()
+            .all(
+                |(index, operation)| operation.id == operations[0].id + index as u32
+                    && operation.id >= 1
+            ),
+        "{operations:#?}"
+    );
+    assert!(
+        operations.iter().any(|operation| {
+            operation.arguments.iter().map(local).collect::<Vec<_>>() == ["total"]
+                && operation.results.iter().map(local).collect::<Vec<_>>() == ["total"]
+        }),
+        "{operations:#?}"
+    );
+    assert_runs_natively(&source, "inside\n5 6");
+}

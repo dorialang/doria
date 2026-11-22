@@ -616,6 +616,7 @@ fn void_program() -> Program {
         foreign_aggregates: Vec::new(),
         pointer_types: Vec::new(),
         c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),

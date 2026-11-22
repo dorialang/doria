@@ -428,3 +428,17 @@ pub(super) fn bind_values(program: &mut mir::Program) {
         function.unsafe_regions = regions;
     }
 }
+
+/// The companion plan (sections 22 and 23): one entry per region identity
+/// and the host-operation table. Lowerings of one region that disagree are
+/// a compiler defect.
+pub(super) fn plan_companion(program: &mut mir::Program) -> DiagnosticResult<()> {
+    program.companion = mir::companion::plan(program).map_err(|error| {
+        vec![Diagnostic::internal_compiler_error(
+            "the compiler lowered one unsafe region two different ways",
+            error.details,
+            error.span,
+        )]
+    })?;
+    Ok(())
+}

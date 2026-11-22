@@ -1,6 +1,7 @@
 //! Which locals each MIR statement and terminator touches, and how. One
 //! walk over the executable MIR that every consumer shares, first the
-//! inputs and outputs of unsafe regions (Decision 0148 section 23).
+//! inputs and outputs of unsafe regions and the host operations of the
+//! companion plan (Decision 0148 section 23), which `HostReach` reports.
 //!
 //! A report is conservative toward writing: a local whose storage a
 //! statement may change is reported written, including a local passed to a
@@ -25,18 +26,29 @@ pub enum LocalAccess {
 /// when the caller knows it.
 pub type ParameterModes<'m> = &'m dyn Fn(FunctionId, usize) -> Option<FunctionParameterMode>;
 
+/// What a statement or terminator does that only the host can run inside
+/// an unsafe region (Decision 0148 section 23, entry ABI version 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostReach {
+    /// A call: of the function named, or through a closure or interface
+    /// value when `None`. A call of an extern declaration's function is a
+    /// foreign call, which the companion runs itself.
+    Call(Option<FunctionId>),
+    /// The construction of a class.
+    Construct,
+    /// A static property read or write.
+    Static,
+    /// Doria I/O: output, file and stream I/O, `read_line`, the terminal.
+    Io,
+}
+
 /// Every local `statement` touches, in the order its parts are written.
 pub fn statement_locals(
     statement: &Statement,
     modes: ParameterModes<'_>,
     visit: &mut dyn FnMut(LocalId, LocalAccess),
 ) {
-    Walker {
-        visit,
-        modes,
-        argument: false,
-    }
-    .statement(statement);
+    statement_touches(statement, modes, visit, &mut |_| {});
 }
 
 /// Every local `terminator` touches, in the order its parts are written.
@@ -45,22 +57,50 @@ pub fn terminator_locals(
     modes: ParameterModes<'_>,
     visit: &mut dyn FnMut(LocalId, LocalAccess),
 ) {
+    terminator_touches(terminator, modes, visit, &mut |_| {});
+}
+
+/// `statement_locals`, also reporting each part only the host can run.
+pub fn statement_touches(
+    statement: &Statement,
+    modes: ParameterModes<'_>,
+    visit: &mut dyn FnMut(LocalId, LocalAccess),
+    host: &mut dyn FnMut(HostReach),
+) {
     Walker {
         visit,
         modes,
+        host,
+        argument: false,
+    }
+    .statement(statement);
+}
+
+/// `terminator_locals`, also reporting each part only the host can run.
+pub fn terminator_touches(
+    terminator: &Terminator,
+    modes: ParameterModes<'_>,
+    visit: &mut dyn FnMut(LocalId, LocalAccess),
+    host: &mut dyn FnMut(HostReach),
+) {
+    Walker {
+        visit,
+        modes,
+        host,
         argument: false,
     }
     .terminator(terminator);
 }
 
-struct Walker<'v> {
+struct Walker<'v, 'h> {
     visit: &'v mut dyn FnMut(LocalId, LocalAccess),
     modes: ParameterModes<'v>,
+    host: &'h mut dyn FnMut(HostReach),
     /// Inside a call argument, where a read may be a writable borrow.
     argument: bool,
 }
 
-impl Walker<'_> {
+impl Walker<'_, '_> {
     fn report(&mut self, local: LocalId, access: LocalAccess) {
         let access = if self.argument && access == LocalAccess::Read {
             LocalAccess::Write
@@ -102,6 +142,7 @@ impl Walker<'_> {
     /// A direct call: a readonly or taking parameter reads its argument (a
     /// move is the argument's own transfer), a writable one may write it.
     fn call(&mut self, function: FunctionId, args: &[Rvalue]) {
+        (self.host)(HostReach::Call(Some(function)));
         for (position, arg) in args.iter().enumerate() {
             match (self.modes)(function, position) {
                 Some(FunctionParameterMode::Readonly | FunctionParameterMode::Take) => {
@@ -124,8 +165,8 @@ impl Walker<'_> {
 
     fn statement(&mut self, statement: &Statement) {
         match statement {
+            Statement::EchoStringLiteral(_) => (self.host)(HostReach::Io),
             Statement::SetDiagnosticSite { .. }
-            | Statement::EchoStringLiteral(_)
             | Statement::ControlFlowPlan(_)
             | Statement::MatchResultPlan { .. } => {}
             Statement::CompletePendingRequest {
@@ -192,7 +233,10 @@ impl Walker<'_> {
                     self.write(*target);
                 }
             }
-            Statement::EchoString(value) | Statement::WriteStderr(value) => self.string(value),
+            Statement::EchoString(value) | Statement::WriteStderr(value) => {
+                (self.host)(HostReach::Io);
+                self.string(value);
+            }
             Statement::CallVoid { function, args, .. }
             | Statement::CallBorrowed { function, args, .. } => self.call(*function, args),
             Statement::CallNullSafe {
@@ -204,21 +248,32 @@ impl Walker<'_> {
                 self.nullable_class(object);
                 self.call(*function, args);
             }
-            Statement::Printf(format) => self.format(format),
+            Statement::Printf(format) => {
+                (self.host)(HostReach::Io);
+                self.format(format);
+            }
             Statement::WriteFile { path, contents } | Statement::AppendFile { path, contents } => {
+                (self.host)(HostReach::Io);
                 self.string(path);
                 self.string(contents);
             }
             Statement::WriteFileBytes { path, contents, .. } => {
+                (self.host)(HostReach::Io);
                 self.string(path);
                 self.read(*contents);
             }
-            Statement::WriteStreamBytes { contents, .. } => self.read(*contents),
+            Statement::WriteStreamBytes { contents, .. } => {
+                (self.host)(HostReach::Io);
+                self.read(*contents);
+            }
             Statement::AssignProperty { object, value, .. } => {
                 self.rvalue(value);
                 self.write(*object);
             }
-            Statement::AssignStatic { value, .. } => self.rvalue(value),
+            Statement::AssignStatic { value, .. } => {
+                (self.host)(HostReach::Static);
+                self.rvalue(value);
+            }
             Statement::DropClass { local, .. }
             | Statement::DropSharedReference { local, .. }
             | Statement::DropWeakReference { local, .. }
@@ -363,6 +418,7 @@ impl Walker<'_> {
                 error,
                 ..
             } => {
+                (self.host)(HostReach::Construct);
                 self.property_values(properties);
                 self.call(*constructor, args);
                 self.results(Some(*result), Some(*error));
@@ -373,6 +429,7 @@ impl Walker<'_> {
                 error,
                 ..
             } => {
+                (self.host)(HostReach::Io);
                 self.checked_io(operation);
                 self.results(*result, Some(*error));
             }
@@ -409,6 +466,7 @@ impl Walker<'_> {
     }
 
     fn indirect_callee(&mut self, callee: &IndirectCallee) {
+        (self.host)(HostReach::Call(None));
         match callee {
             IndirectCallee::Closure(function) => self.function(function),
             IndirectCallee::InterfaceMethod { receiver, .. } => self.write(*receiver),
@@ -534,7 +592,9 @@ impl Walker<'_> {
             }
             InlinePlace::Property { object, .. }
             | InlinePlace::NullablePropertyAssumeNonNull { object, .. } => storage(self, *object),
-            InlinePlace::Static(_) | InlinePlace::NullableStaticAssumeNonNull(_) => {}
+            InlinePlace::Static(_) | InlinePlace::NullableStaticAssumeNonNull(_) => {
+                (self.host)(HostReach::Static)
+            }
             InlinePlace::CollectionElement {
                 collection, index, ..
             }
@@ -776,7 +836,8 @@ impl Walker<'_> {
                 self.rvalue(index);
                 self.read(*region);
             }
-            Operand::Scalar(_) | Operand::Static(_) => {}
+            Operand::Scalar(_) => {}
+            Operand::Static(_) => (self.host)(HostReach::Static),
             Operand::Property { object, .. } => self.read(*object),
             Operand::CollectionIteratorPosition { receiver, .. } => self.read(*receiver),
             Operand::CollectionIndex {
@@ -837,27 +898,30 @@ impl Walker<'_> {
                 self.argument = outer;
                 self.rvalue(source);
             }
-            IntegerExpression::Terminal { call, .. } => match call {
-                TerminalCall::Operate {
-                    operation,
-                    first,
-                    second,
-                    text,
-                } => {
-                    for local in [operation, first, second, text] {
-                        self.write(*local);
+            IntegerExpression::Terminal { call, .. } => {
+                (self.host)(HostReach::Io);
+                match call {
+                    TerminalCall::Operate {
+                        operation,
+                        first,
+                        second,
+                        text,
+                    } => {
+                        for local in [operation, first, second, text] {
+                            self.write(*local);
+                        }
+                    }
+                    TerminalCall::AwaitEvent {
+                        generation,
+                        wait,
+                        cancellation,
+                    } => {
+                        for local in [generation, wait, cancellation] {
+                            self.write(*local);
+                        }
                     }
                 }
-                TerminalCall::AwaitEvent {
-                    generation,
-                    wait,
-                    cancellation,
-                } => {
-                    for local in [generation, wait, cancellation] {
-                        self.write(*local);
-                    }
-                }
-            },
+            }
         }
     }
 
@@ -985,7 +1049,8 @@ impl Walker<'_> {
 
     fn string(&mut self, value: &StringExpression) {
         match value {
-            StringExpression::Literal(_) | StringExpression::Static(_) => {}
+            StringExpression::Literal(_) => {}
+            StringExpression::Static(_) => (self.host)(HostReach::Static),
             StringExpression::Local(local)
             | StringExpression::NullableLocalAssumeNonNull(local)
             | StringExpression::MixedPayload(local) => self.read(*local),
@@ -1026,7 +1091,8 @@ impl Walker<'_> {
 
     fn nullable_string(&mut self, value: &NullableStringExpression) {
         match value {
-            NullableStringExpression::Null | NullableStringExpression::Static(_) => {}
+            NullableStringExpression::Null => {}
+            NullableStringExpression::Static(_) => (self.host)(HostReach::Static),
             NullableStringExpression::String(value) => self.string(value),
             NullableStringExpression::Local(local) => self.read(*local),
             NullableStringExpression::Property { object, .. } => self.read(*object),
@@ -1061,7 +1127,8 @@ impl Walker<'_> {
 
     fn nullable_scalar(&mut self, value: &NullableScalarExpression) {
         match value {
-            NullableScalarExpression::Null(_) | NullableScalarExpression::Static { .. } => {}
+            NullableScalarExpression::Null(_) => {}
+            NullableScalarExpression::Static { .. } => (self.host)(HostReach::Static),
             NullableScalarExpression::InlineClaim { value, .. }
             | NullableScalarExpression::EnumBacking { value, .. } => self.nullable_scalar(value),
             NullableScalarExpression::TransferGroupKey { group, .. } => self.write(*group),
@@ -1332,6 +1399,7 @@ impl Walker<'_> {
                 args,
                 ..
             } => {
+                (self.host)(HostReach::Construct);
                 for property in properties {
                     match &property.source {
                         PropertyValueSource::Expression(value) => self.rvalue(value),
@@ -1797,7 +1865,7 @@ impl Walker<'_> {
         match place {
             PayloadEnumPlace::Local(local)
             | PayloadEnumPlace::NullableLocalAssumeNonNull(local) => self.write(*local),
-            PayloadEnumPlace::Static(_) => {}
+            PayloadEnumPlace::Static(_) => (self.host)(HostReach::Static),
             PayloadEnumPlace::Property { object, .. } => self.write(*object),
             PayloadEnumPlace::CollectionIndex {
                 collection, index, ..
@@ -1924,7 +1992,7 @@ impl Walker<'_> {
             | ForeignAggregateExpression::NullableLocalAssumeNonNull { local, .. }
             | ForeignAggregateExpression::MixedPayload { mixed: local, .. } => self.read(*local),
             ForeignAggregateExpression::Property { object, .. } => self.read(*object),
-            ForeignAggregateExpression::Static { .. } => {}
+            ForeignAggregateExpression::Static { .. } => (self.host)(HostReach::Static),
             ForeignAggregateExpression::Call { function, args, .. } => self.call(*function, args),
             ForeignAggregateExpression::CollectionIndex {
                 collection,
@@ -1944,8 +2012,8 @@ impl Walker<'_> {
 
     fn nullable_foreign_aggregate(&mut self, value: &NullableForeignAggregateExpression) {
         match value {
-            NullableForeignAggregateExpression::Null(_)
-            | NullableForeignAggregateExpression::Static { .. } => {}
+            NullableForeignAggregateExpression::Null(_) => {}
+            NullableForeignAggregateExpression::Static { .. } => (self.host)(HostReach::Static),
             NullableForeignAggregateExpression::Present(value) => self.foreign_aggregate(value),
             NullableForeignAggregateExpression::Local { local, .. } => self.read(*local),
             NullableForeignAggregateExpression::Property { object, .. } => self.read(*object),

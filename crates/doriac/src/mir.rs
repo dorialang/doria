@@ -4,6 +4,7 @@
 //! 11 grows into the debug/interpreter oracle and future native lowering input.
 //! The text dump is deterministic but not a stable public format.
 
+pub mod companion;
 pub mod local_access;
 pub(crate) mod return_adaptation;
 pub(crate) mod value_factory;
@@ -125,6 +126,10 @@ pub struct Program {
     /// thread, links the Call Path to the outbound foreign call in
     /// progress (section 13) and calls the function as Doria code does.
     pub c_entries: Vec<FunctionId>,
+    /// The native companion library the interpreter and PHP output run the
+    /// program's unsafe regions in (Decision 0148 sections 22 and 23).
+    /// Empty for a program without regions.
+    pub companion: Companion,
     pub functions: Vec<Function>,
     /// The validated process entry. Libraries deliberately have no entry.
     pub selected_entry: Option<FunctionId>,
@@ -8276,6 +8281,73 @@ impl UnsafeRegion {
             .binary_search_by_key(&block.0, |block| block.0)
             .is_ok()
     }
+}
+
+/// The native companion library's plan (Decision 0148 sections 22 and 23,
+/// entry ABI version 1), built by `companion::plan`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Companion {
+    /// One entry per region identity, in identity order.
+    pub regions: Vec<CompanionRegion>,
+    /// Operation `n` is `host_operations[n - 1]`; operation 0
+    /// (`ACCEPT_TEXT_OPERATION`) hands a string output to the host.
+    pub host_operations: Vec<HostOperation>,
+}
+
+/// The reserved host operation through which the companion hands each
+/// string output to the host before its own cleanup; the output slot then
+/// carries the host token it returns.
+pub const ACCEPT_TEXT_OPERATION: u32 = 0;
+
+/// One region identity and its C-ABI entry
+/// `int32 doria_region_v1_<id>(DrRegionHostV1 *, const void *, void *, void *)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionRegion {
+    pub id: String,
+    /// Every lowering of the region, ordinary and direct, in function
+    /// order. The companion compiles the first; the others have the same
+    /// inputs, outputs, result and exits.
+    pub lowerings: Vec<RegionLowering>,
+}
+
+impl CompanionRegion {
+    pub fn entry_symbol(&self) -> String {
+        format!("doria_region_v1_{}", self.id)
+    }
+}
+
+/// A region of one lowered function: `functions[function].unsafe_regions[region]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionLowering {
+    pub function: FunctionId,
+    pub region: usize,
+}
+
+/// One statement or terminator of a region that runs on the host, inside
+/// the host frame suspended at the region entry, through
+/// `host->call(host, id, arguments, results)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOperation {
+    pub id: u32,
+    /// The index of its region in `Companion::regions`; the site is in that
+    /// region's first lowering.
+    pub region: usize,
+    pub block: BlockId,
+    pub site: HostOperationSite,
+    /// The values the operation touches, in order of first touch, with
+    /// their current values. Host tokens stay in the host frame.
+    pub arguments: Vec<UnsafeRegionValue>,
+    /// The arguments the operation writes, crossing back after it.
+    pub results: Vec<UnsafeRegionValue>,
+    /// For a terminator, its targets in `Terminator::targets` order; the
+    /// host's results end with the `int32` index of the one it took.
+    pub successors: Vec<BlockId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOperationSite {
+    Statement(usize),
+    Terminator,
 }
 
 /// One local crossing an unsafe region's edge (Decision 0148 section 23).

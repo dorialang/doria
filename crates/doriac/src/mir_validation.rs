@@ -41,6 +41,7 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     validate_interface_metadata(program)?;
     validate_closure_metadata(program)?;
     validate_c_entries(program)?;
+    validate_companion(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
         if definition.id != crate::enums::EnumId(index) {
             return Err(malformed_mir(format!(
@@ -6539,6 +6540,75 @@ fn validate_enum_operand(
 /// function with its own diagnostic frame, no checked effects, and a C form
 /// for every parameter and its result, which its entry receives and returns
 /// under the target's C convention.
+/// Every unsafe region's blocks, edges and values are well formed, and the
+/// companion plan is the one `mir::companion::plan` derives from them
+/// (Decision 0148 sections 22 and 23).
+fn validate_companion(program: &mir::Program) -> Result<(), BackendError> {
+    for function in &program.functions {
+        let blocks = function.blocks.len();
+        let locals = function.locals.len();
+        for region in &function.unsafe_regions {
+            let fail = |problem: &str| {
+                Err(malformed_mir(format!(
+                    "unsafe region {} of `{}` {problem}",
+                    region.id, function.name
+                )))
+            };
+            if region.blocks.first() != Some(&region.entry) {
+                return fail("does not start at its entry block");
+            }
+            if !region.blocks.iter().all(|block| block.0 < blocks)
+                || !region.blocks.windows(2).all(|pair| pair[0].0 < pair[1].0)
+            {
+                return fail("has blocks out of range or out of order");
+            }
+            if region.continuation.0 >= blocks || region.contains(region.continuation) {
+                return fail("continues inside itself or past the function");
+            }
+            let entered_elsewhere = function.blocks.iter().any(|block| {
+                !region.contains(block.id)
+                    && block
+                        .terminator
+                        .targets()
+                        .into_iter()
+                        .any(|target| target != region.entry && region.contains(target))
+            });
+            if entered_elsewhere || region.contains(function.entry_block) {
+                return fail("is entered other than at its entry block");
+            }
+            for exit in &region.exits {
+                if !region.contains(exit.source)
+                    || exit
+                        .target
+                        .is_some_and(|target| target.0 >= blocks || region.contains(target))
+                {
+                    return fail("has an exit that does not leave it");
+                }
+            }
+            let values = region.inputs.iter().chain(&region.outputs);
+            if values.clone().any(|value| value.local.0 >= locals)
+                || region.result.is_some_and(|local| local.0 >= locals)
+            {
+                return fail("names a local the function does not have");
+            }
+            if !region
+                .outputs
+                .iter()
+                .all(|output| region.inputs.contains(output))
+            {
+                return fail("has an output that is not one of its inputs");
+            }
+        }
+    }
+    let derived = mir::companion::plan(program).map_err(|error| malformed_mir(error.details))?;
+    if derived != program.companion {
+        return Err(malformed_mir(
+            "the companion plan differs from the one its unsafe regions give",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
     let mut seen = std::collections::HashSet::new();
     for id in &program.c_entries {

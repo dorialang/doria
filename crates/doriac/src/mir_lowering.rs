@@ -2705,6 +2705,7 @@ fn lower_program_impl(
         foreign_aggregates,
         pointer_types,
         c_entries,
+        companion: mir::Companion::default(),
         functions,
         selected_entry,
         entry,
@@ -2712,6 +2713,7 @@ fn lower_program_impl(
     specialize_retained_sources(&mut program);
     unsafe_region::bind_values(&mut program);
     unsafe_region::require_every_live_region(&program, checked)?;
+    unsafe_region::plan_companion(&mut program)?;
     Ok(program)
 }
 

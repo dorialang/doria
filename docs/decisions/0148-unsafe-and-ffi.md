@@ -1015,7 +1015,13 @@ takes a new version.
 - One host operation is one whole MIR statement or terminator that needs the
   host. It runs inside the host frame suspended at the region entry; the locals
   it reads cross as its arguments and the locals it writes as its results.
-  Values on the host, the host tokens, never leave that frame.
+  Values on the host, the host tokens, never leave that frame. Its arguments
+  are every other local it touches, with its current value; the companion
+  starts every local it owns zeroed, so a local written before it is read
+  crosses defined.
+- A host operation at a terminator ends its results with an `int32` index
+  into the terminator's targets, the one the host took, and `host->call`
+  returns status 0.
 - The host runs Doria calls, construction, static property access, every
   operation that touches a host token, and Doria I/O (`echo`, `printf`,
   `write_stderr`, file and stream I/O, `read_line`). Value operations on the
@@ -1203,6 +1209,12 @@ has one precise contract.
     second classification in the PHP backend could drift from it.
   - The slot layout is C layout, so the companion, the interpreter's loader and
     PHP's `FFI::cdef` declarations read one shape.
+  - Current values as arguments: the shared local walk reports a write it
+    cannot prove whole, such as a writable borrow, as a write, so the host
+    needs the value the local holds.
+  - A successor index for terminators: the Error a failed call raises stays
+    on the host, so one index rule serves every terminator and the statuses
+    keep their region meaning.
 - The unsafe inventory for `baton audit unsafe` is compiler metadata (section 25).
 - `Platform::architecture` beside `Platform::operatingSystem` (section 17), and
   the placement of `Platform`, `OperatingSystem` and `Architecture` in
