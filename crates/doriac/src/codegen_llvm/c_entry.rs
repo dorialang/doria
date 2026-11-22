@@ -208,21 +208,34 @@ pub(super) fn declare<'ctx>(
         .collect()
 }
 
-/// The runtime's record of the outbound foreign call in progress
-/// (`dr_v1_foreign_call_frame`).
-pub(super) fn foreign_call_record<'ctx>(
+/// Declares the runtime's record of the outbound foreign call in progress
+/// (`dr_v1_foreign_call_frame`), reached as `access` says. An import slot
+/// is LLVM's DLL import, which loads the address from `__imp_<symbol>`.
+pub(super) fn declare_runtime_data<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-) -> PointerValue<'ctx> {
-    let name = crate::native_abi::FOREIGN_CALL_FRAME;
+    access: crate::native_abi::RuntimeDataAccess,
+) {
+    let global = module.add_global(
+        context.ptr_type(AddressSpace::default()),
+        None,
+        crate::native_abi::FOREIGN_CALL_FRAME,
+    );
+    global.set_linkage(Linkage::External);
+    if access == crate::native_abi::RuntimeDataAccess::ImportSlot {
+        global.set_dll_storage_class(inkwell::DLLStorageClass::Import);
+    }
+}
+
+/// The runtime's record of the outbound foreign call in progress, as
+/// [`declare_runtime_data`] declared it.
+pub(super) fn foreign_call_record<'ctx>(
+    module: &Module<'ctx>,
+) -> Result<PointerValue<'ctx>, BackendError> {
     module
-        .get_global(name)
-        .unwrap_or_else(|| {
-            let global = module.add_global(context.ptr_type(AddressSpace::default()), None, name);
-            global.set_linkage(Linkage::External);
-            global
-        })
-        .as_pointer_value()
+        .get_global(crate::native_abi::FOREIGN_CALL_FRAME)
+        .map(|global| global.as_pointer_value())
+        .ok_or_else(|| malformed_mir("the runtime's foreign call record is declared"))
 }
 
 /// The frame that describes `function` for a P1706 report: its name and

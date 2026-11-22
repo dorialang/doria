@@ -2,6 +2,9 @@
 extern crate self as doriac;
 
 #[cfg(test)]
+#[path = "../tests/common/coff_symbols.rs"]
+mod coff_symbols;
+#[cfg(test)]
 #[path = "../tests/common/execution_directory.rs"]
 mod execution_directory;
 #[cfg(test)]

@@ -91,6 +91,8 @@ mod process;
 mod readiness_set;
 #[cfg(test)]
 mod return_transport_tests;
+#[cfg(test)]
+pub(crate) mod runtime_data_tests;
 mod stream_callbacks;
 mod terminal;
 
@@ -102,6 +104,7 @@ struct DeclaredNativeItems<'a> {
     closure_descriptor_ids: &'a [DataId],
     class_descriptor_ids: &'a [DataId],
     static_ids: &'a [DataId],
+    runtime_data: crate::native_abi::RuntimeDataAccess,
 }
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
@@ -174,6 +177,10 @@ fn lower_validated_mir_to_object_for_isa(
         ObjectBuilder::new(isa, "doria_stage_13", default_libcall_names())
             .map_err(|error| backend_failure(error.to_string()))?,
     );
+    let runtime_data = crate::native_abi::RuntimeDataAccess::for_object(
+        &module.isa().triple().to_string(),
+        companion.is_some(),
+    );
 
     // A companion emits only its own functions; every other function of
     // the program stays on the host and is not declared.
@@ -203,6 +210,7 @@ fn lower_validated_mir_to_object_for_isa(
             closure_descriptor_ids: &[],
             class_descriptor_ids: &[],
             static_ids: &[],
+            runtime_data,
         };
         for function in program.functions.iter().filter(|function| emits(function)) {
             define_function(
@@ -250,6 +258,7 @@ fn lower_validated_mir_to_object_for_isa(
         closure_descriptor_ids: &closure_descriptor_ids,
         class_descriptor_ids: &class_descriptor_ids,
         static_ids: &static_ids,
+        runtime_data,
     };
     let stream_callbacks = stream_callbacks::declare(&mut module, program)?;
 
@@ -1648,6 +1657,7 @@ fn define_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = function_ids
@@ -2021,6 +2031,7 @@ fn define_function(
             checked_error_address,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         retain_string_parameters(&mut builder, function, &mut resources)?;
         for local in &function.locals {
@@ -2098,6 +2109,7 @@ fn define_class_drop_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = *class_drop_function_ids
@@ -2147,6 +2159,7 @@ fn define_class_drop_function(
             checked_error_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         if let Some(ty) = class_definition(program, class)?.inline_copy_type() {
             if ty.requires_owned_cleanup() {
@@ -2184,6 +2197,7 @@ fn define_collection_drop_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = *collection_drop_function_ids
@@ -2233,6 +2247,7 @@ fn define_collection_drop_function(
             checked_error_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         lower_drop_collection_value(&mut builder, value, collection, &mut resources)?;
         builder.ins().return_(&[]);
@@ -2260,6 +2275,7 @@ fn define_closure_drop_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = *closure_drop_function_ids
@@ -2318,6 +2334,7 @@ fn define_closure_drop_function(
             checked_error_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         if let Some((logical, native)) = &environment_layout {
             for logical_index in &logical.logical_release_order {
@@ -3375,6 +3392,8 @@ struct LoweringResources<'module, 'program> {
     checked_error_address: Option<Value>,
     defer_class_temporary_drops: bool,
     deferred_class_temporary_drops: Vec<(StackSlot, DeferredOwnedTemporary)>,
+    /// How this object reaches the runtime's data symbols.
+    runtime_data: crate::native_abi::RuntimeDataAccess,
 }
 
 #[derive(Clone, Copy)]
@@ -22171,7 +22190,7 @@ fn lower_foreign_call(
     }
     // The Call Path record of this call (Decision 0148 section 13): the
     // calling frame for its length, and the enclosing call's afterwards.
-    let record = c_entry::foreign_call_record(builder, resources.module)?;
+    let record = c_entry::foreign_call_record(builder, resources.module, resources.runtime_data)?;
     let enclosing = builder
         .ins()
         .load(pointer, MemFlagsData::trusted(), record, 0);

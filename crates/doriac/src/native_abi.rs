@@ -223,6 +223,47 @@ pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
 /// the thread and links the function's frame to that record; and the
 /// recording of the thread running Doria code at process entry.
 pub const FOREIGN_CALL_FRAME: &str = "dr_v1_foreign_call_frame";
+
+/// How generated code addresses a data symbol the runtime defines, such as
+/// [`FOREIGN_CALL_FRAME`]. Every object decides it once from its target and
+/// from how it links the runtime, and both native backends follow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeDataAccess {
+    /// The symbol itself. The runtime is linked into the same image (an
+    /// executable links the runtime archive), or the dynamic linker binds
+    /// data across images through position-independent references (ELF
+    /// and Mach-O).
+    Direct,
+    /// The import slot `__imp_<symbol>` that holds the symbol's address. A
+    /// Windows DLL that links the runtime DLL (the native companion) reaches
+    /// runtime data only through it: the import library defines no data
+    /// symbol of its own, and COFF has no automatic data import.
+    ImportSlot,
+}
+
+impl RuntimeDataAccess {
+    /// The access of an object for the target `triple`
+    /// (`<architecture>-<vendor>-<system>[-<environment>]`), linking the
+    /// shared runtime (a companion library) or the runtime archive.
+    pub fn for_object(triple: &str, shared_runtime: bool) -> Self {
+        let windows = triple.split('-').nth(2) == Some("windows");
+        if windows && shared_runtime {
+            Self::ImportSlot
+        } else {
+            Self::Direct
+        }
+    }
+
+    /// The symbol generated code references for the runtime data `name`.
+    /// For an import slot it holds the address of `name`.
+    pub fn symbol(self, name: &str) -> String {
+        match self {
+            Self::Direct => name.to_string(),
+            Self::ImportSlot => format!("__imp_{name}"),
+        }
+    }
+}
+
 pub const ENTER_C_FUNCTION: &str = "dr_v1_enter_c_function";
 /// Enters a companion region entry: the thread check, then the host's
 /// frame as the region's parent (Decision 0148 section 23).
@@ -1145,5 +1186,25 @@ mod tests {
             doria_rt::DR_COLLECTION_SIZE
         );
         assert_eq!(align_of::<usize>(), doria_rt::DR_COLLECTION_ALIGN);
+    }
+
+    #[test]
+    fn only_a_windows_library_over_the_shared_runtime_uses_import_slots() {
+        use super::RuntimeDataAccess::{Direct, ImportSlot};
+        for (triple, shared, access) in [
+            ("x86_64-pc-windows-msvc", true, ImportSlot),
+            ("aarch64-pc-windows-msvc", true, ImportSlot),
+            ("x86_64-pc-windows-msvc", false, Direct),
+            ("x86_64-unknown-linux-gnu", true, Direct),
+            ("aarch64-apple-darwin", true, Direct),
+        ] {
+            assert_eq!(
+                super::RuntimeDataAccess::for_object(triple, shared),
+                access,
+                "{triple}, shared runtime: {shared}"
+            );
+        }
+        assert_eq!(ImportSlot.symbol("dr_v1_x"), "__imp_dr_v1_x");
+        assert_eq!(Direct.symbol("dr_v1_x"), "dr_v1_x");
     }
 }

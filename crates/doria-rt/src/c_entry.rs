@@ -29,7 +29,8 @@ static FOREIGN_CALL: &[u8] = b"[foreign call]";
 
 /// The Doria frame of the outbound foreign call in progress, or null.
 /// Generated code stores to it directly around every foreign call: one store
-/// before the call and one after.
+/// before the call and one after. A Windows companion library reaches it
+/// through its import slot `__imp_dr_v1_foreign_call_frame`.
 #[no_mangle]
 #[allow(non_upper_case_globals)]
 pub static dr_v1_foreign_call_frame: AtomicPtr<DrStackFrameV2> = AtomicPtr::new(ptr::null_mut());

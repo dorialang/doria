@@ -129,19 +129,24 @@ pub fn lower_mir_to_optimized_llvm_ir(program: &mir::Program) -> Result<String, 
 
 fn host_target_machine() -> Result<TargetMachine, BackendError> {
     initialize_native_target()?;
-    let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple)
-        .map_err(|error| backend_failure(format!("failed to select host LLVM target: {error}")))?;
+    target_machine(&TargetMachine::get_default_triple())
+}
+
+/// The machine Doria objects for `triple` are emitted with. Its target must
+/// be initialized.
+fn target_machine(triple: &inkwell::targets::TargetTriple) -> Result<TargetMachine, BackendError> {
+    let target = Target::from_triple(triple)
+        .map_err(|error| backend_failure(format!("failed to select the LLVM target: {error}")))?;
     target
         .create_target_machine(
-            &triple,
+            triple,
             "generic",
             "",
             OptimizationLevel::Aggressive,
             RelocMode::PIC,
             CodeModel::Default,
         )
-        .ok_or_else(|| backend_failure("failed to create host LLVM target machine"))
+        .ok_or_else(|| backend_failure("failed to create the LLVM target machine"))
 }
 
 pub(crate) fn lower_validated_mir_to_object(
@@ -172,16 +177,22 @@ pub(crate) fn lower_validated_mir_to_object_with_metrics(
 pub(crate) fn lower_companion_object(
     library: &mir::companion::CompanionLibrary,
 ) -> Result<Vec<u8>, BackendError> {
-    let target_machine = host_target_machine()?;
+    lower_companion_object_for(library, &host_target_machine()?)
+}
+
+fn lower_companion_object_for(
+    library: &mir::companion::CompanionLibrary,
+    target_machine: &TargetMachine,
+) -> Result<Vec<u8>, BackendError> {
     let context = Context::create();
     let module = build_module(
         &context,
-        &target_machine,
+        target_machine,
         &library.program,
         None,
         Some(library),
     )?;
-    optimize_module(&module, &target_machine)?;
+    optimize_module(&module, target_machine)?;
     let object = target_machine
         .write_to_memory_buffer(&module, FileType::Object)
         .map_err(|error| backend_failure(format!("LLVM object emission failed: {error}")))?;
@@ -211,11 +222,19 @@ fn build_module<'ctx>(
     metrics: Option<&mut mir_validation::OptimizationMetrics>,
     companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Module<'ctx>, BackendError> {
-    let triple = TargetMachine::get_default_triple();
+    let triple = target_machine.get_triple();
     let module = context.create_module("doria_stage_15");
     module.set_triple(&triple);
     let target_data = target_machine.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
+    c_entry::declare_runtime_data(
+        context,
+        &module,
+        crate::native_abi::RuntimeDataAccess::for_object(
+            &triple.as_str().to_string_lossy(),
+            companion.is_some(),
+        ),
+    );
 
     let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
     let functions = declare_functions(context, &module, &target_data, program)?;
@@ -23849,7 +23868,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         // The Call Path record of this call (Decision 0148 section 13): the
         // calling frame for its length, and the enclosing call's afterwards.
-        let record = c_entry::foreign_call_record(self.context, self.module);
+        let record = c_entry::foreign_call_record(self.module)?;
         let pointer = self.context.ptr_type(AddressSpace::default());
         let enclosing = build(
             self.builder
@@ -28223,6 +28242,44 @@ mod tests {
                 "nullable scalar aggregates never receive integer extension attributes",
             );
         }
+    }
+
+    /// The LLVM side of the Cranelift test of the same name: a Windows
+    /// executable names the runtime data symbol, and the companion DLL
+    /// loads it from its import slot.
+    #[test]
+    fn windows_objects_reach_the_call_path_record_as_they_link_the_runtime() {
+        use crate::codegen_cranelift::runtime_data_tests::FOREIGN_CALL_IN_A_REGION;
+        use crate::coff_symbols::undefined_external_symbols;
+        use crate::native_abi::FOREIGN_CALL_FRAME;
+
+        Target::initialize_x86(&InitializationConfig::default());
+        let triple = inkwell::targets::TargetTriple::create("x86_64-pc-windows-msvc");
+        let machine = target_machine(&triple).expect("the x86-64 LLVM target exists");
+        let program = crate::lower_source_to_mir("record.doria", FOREIGN_CALL_IN_A_REGION)
+            .unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let import_slot = format!("__imp_{FOREIGN_CALL_FRAME}");
+
+        let context = Context::create();
+        let module = build_module(&context, &machine, &program, None, None).unwrap();
+        let executable = machine
+            .write_to_memory_buffer(&module, FileType::Object)
+            .unwrap();
+        let imports = undefined_external_symbols(executable.as_slice());
+        assert!(
+            imports.iter().any(|name| name == FOREIGN_CALL_FRAME),
+            "{imports:?}"
+        );
+        assert!(!imports.contains(&import_slot), "{imports:?}");
+
+        let library = crate::mir::companion::library(&program);
+        let companion = lower_companion_object_for(&library, &machine).unwrap();
+        let imports = undefined_external_symbols(&companion);
+        assert!(imports.contains(&import_slot), "{imports:?}");
+        assert!(
+            !imports.iter().any(|name| name == FOREIGN_CALL_FRAME),
+            "{imports:?}"
+        );
     }
 
     #[test]

@@ -1097,6 +1097,11 @@ takes a new version.
   `.doria-runtime/<identity>/` beside it, through an rpath on Unix. On
   Windows the host loads that runtime before the library, which then
   resolves to the loaded module.
+- Generated code reaches a runtime data symbol, such as the record of the
+  outbound foreign call, as its object links the runtime. On Windows the
+  library loads the symbol's address from its import slot
+  `__imp_<symbol>`; an executable, which links the runtime archive, and a
+  Unix library name the symbol itself.
 - The companion follows the build's native profile: Cranelift by default,
   LLVM for `--release`, and the profile is part of the cache key.
 
@@ -1305,6 +1310,12 @@ has one precise contract.
     reaches, so what the library emits has one owner.
   - The profile follows the program: the companion is part of the same
     build, so a release build's regions get the optimized profile.
+  - Import slots for runtime data on Windows: an import library defines
+    only the `__imp_` slot for a DLL's data, and COFF has no automatic
+    data import. Native code keeps its direct store around each foreign
+    call, where an accessor call would add two calls to every one, and one
+    shared description tells both native backends which form an object
+    uses.
 - The unsafe inventory for `baton audit unsafe` is compiler metadata (section 25).
 - `Platform::architecture` beside `Platform::operatingSystem` (section 17), and
   the placement of `Platform`, `OperatingSystem` and `Architecture` in

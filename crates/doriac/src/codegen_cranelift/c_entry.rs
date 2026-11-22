@@ -176,22 +176,32 @@ pub(super) fn address(
 }
 
 /// The address of the runtime's record of the outbound foreign call in
-/// progress (`dr_v1_foreign_call_frame`).
+/// progress (`dr_v1_foreign_call_frame`), reached as `access` says: the
+/// symbol itself, or the address its import slot holds.
 pub(super) fn foreign_call_record(
     builder: &mut FunctionBuilder,
     module: &mut ObjectModule,
+    access: crate::native_abi::RuntimeDataAccess,
 ) -> Result<Value, BackendError> {
     let id = module
         .declare_data(
-            crate::native_abi::FOREIGN_CALL_FRAME,
+            &access.symbol(crate::native_abi::FOREIGN_CALL_FRAME),
             Linkage::Import,
-            true,
+            access == crate::native_abi::RuntimeDataAccess::Direct,
             false,
         )
         .map_err(|error| backend_failure(error.to_string()))?;
     let global = module.declare_data_in_func(id, builder.func);
     let pointer = module.target_config().pointer_type();
-    Ok(builder.ins().symbol_value(pointer, global))
+    let symbol = builder.ins().symbol_value(pointer, global);
+    Ok(match access {
+        crate::native_abi::RuntimeDataAccess::Direct => symbol,
+        crate::native_abi::RuntimeDataAccess::ImportSlot => {
+            builder
+                .ins()
+                .load(pointer, MemFlagsData::trusted().with_readonly(), symbol, 0)
+        }
+    })
 }
 
 /// Defines the frame that describes `function` for a P1706 report: its name
