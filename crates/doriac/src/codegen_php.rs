@@ -22,6 +22,7 @@ use crate::types::{ResolvedType, TypeRef};
 
 mod assignment_place;
 mod bytes;
+mod companion;
 mod concurrency;
 mod core_collection;
 mod core_value;
@@ -1688,10 +1689,10 @@ fn php_mir_type(
 }
 
 pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String, BackendError> {
-    match generate_artifact(program, mir)? {
-        BackendOutput::Text { contents, .. } | BackendOutput::TextWithRuntime { contents, .. } => {
-            Ok(contents)
-        }
+    match generate_artifact(program, mir, &crate::native_link::NativeLinking::default())? {
+        BackendOutput::Text { contents, .. }
+        | BackendOutput::TextWithRuntime { contents, .. }
+        | BackendOutput::TextWithCompanion { contents, .. } => Ok(contents),
         _ => unreachable!("PHP emission always produces text"),
     }
 }
@@ -1699,14 +1700,20 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
 pub fn generate_artifact(
     program: &Program,
     mir: Option<&mir::Program>,
+    linking: &crate::native_link::NativeLinking,
 ) -> Result<BackendOutput, BackendError> {
     let mut closure_plan = PhpClosurePlan::build(program, mir);
     let specialization = Rc::new(specialization::Plan::build(program, &closure_plan)?);
     validate_program(program, &specialization)?;
     specialization.prepare_call_sites(&mut closure_plan, &HashMap::new());
-    let runtime = (native_runtime::required(program) || specialization.native_standard_io)
-        .then(crate::runtime_artifact::shared_runtime_dependency)
-        .transpose()?;
+    // A program with unsafe regions runs them in its native companion
+    // library, which links the shared runtime (Decision 0148 section 23).
+    let companion = companion::Sites::build(program, mir)?;
+    let runtime = (native_runtime::required(program)
+        || specialization.native_standard_io
+        || companion.is_some())
+    .then(crate::runtime_artifact::shared_runtime_dependency)
+    .transpose()?;
     for descriptor in closure_plan.descriptors.values_mut() {
         let class = match descriptor.source_instance {
             mir::ClosureOwner::Callable(id) => specialization.callable(id).class,
@@ -1740,6 +1747,9 @@ pub fn generate_artifact(
     output.push_str(core_collection::RUNTIME);
     if let Some(runtime) = &runtime {
         native_runtime::emit(&mut output, program, runtime);
+    }
+    if let Some(sites) = &companion {
+        companion::emit_runtime(&mut output, program, sites)?;
     }
     standard_io::emit_runtime(&mut output, runtime.is_some());
     bytes::emit_runtime(&mut output, runtime.is_some());
@@ -1821,6 +1831,7 @@ function __doria_panic(
     ?string $callable = null,
     array $facts = [],
     ?array $operation = null,
+    ?array $frames = null,
 )
 {
     global $__doria_catalogue, $__doria_panicking;
@@ -1838,7 +1849,8 @@ function __doria_panic(
     if (!$site["known"]) { $sourcePath = "<source unavailable>"; }
     // Primary labels and operation frames are separate compiler-owned spans.
     // Human rendering and private V2 transport consume this same snapshot.
-    $frames = __doria_panic_frames($operation ?? $site);
+    // A panic the native companion reports carries its own native frames.
+    $frames ??= __doria_panic_frames($operation ?? $site);
     $function = $callable ?? "main";
     if ($callable === null && isset($frames[0])) {
         $function = $frames[0][0];
@@ -1848,7 +1860,7 @@ function __doria_panic(
         $channel, $code, $message, $site, $function, $facts, $frames,
     )) {
         $__doria_panicking = true;
-        exit(101);
+        __doria_end_panic();
     }
     __doria_terminal_ending();
     @fwrite(__DORIA_STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
@@ -1864,6 +1876,17 @@ function __doria_panic(
     }
     @fwrite(__DORIA_STDERR, "\n\nProcess Exited With Status 101\n");
     $__doria_panicking = true;
+    __doria_end_panic();
+}
+
+// PHP cannot unwind through the native companion library, so a panic during
+// a region call ends the process through the shared runtime (Decision 0148
+// section 23).
+function __doria_end_panic(): never
+{
+    if (class_exists("__DoriaCompanion", false) && __DoriaCompanion::active()) {
+        __DoriaCompanion::endProcess(101);
+    }
     exit(101);
 }
 
@@ -2540,6 +2563,7 @@ function __doria_printf(
         .and_then(|program| program.selected_entry)
         .map(mir::ClosureOwner::Callable);
     scopes.matches = program.semantic_info.matches.clone();
+    scopes.companion = companion.clone();
     scopes.specialization = specialization;
     scopes.whens = program.semantic_info.whens.clone();
     scopes.constant_conditions = Rc::new(program.semantic_info.constant_conditions.clone());
@@ -2632,13 +2656,23 @@ function __doria_printf(
         }
         output.push_str("\n}\n");
     }
-    Ok(match runtime {
-        Some(runtime) => BackendOutput::TextWithRuntime {
+    Ok(match (runtime, companion) {
+        (Some(runtime), Some(sites)) => BackendOutput::TextWithCompanion {
+            extension: "php".into(),
+            contents: output,
+            runtime: Box::new(runtime),
+            companion: Box::new(crate::backend::CompanionBuild {
+                program: sites.program().clone(),
+                profile: crate::backend::NativeProfile::Fast,
+                linking: linking.clone(),
+            }),
+        },
+        (Some(runtime), None) => BackendOutput::TextWithRuntime {
             extension: "php".into(),
             contents: output,
             runtime: Box::new(runtime),
         },
-        None => BackendOutput::Text {
+        (None, _) => BackendOutput::Text {
             extension: "php".into(),
             contents: output,
         },
@@ -2890,19 +2924,10 @@ fn validate_function(
             function.name
         )));
     }
-    // PHP output calls C through the native companion library (Decision
-    // 0148 section 23), which this compiler does not build yet.
+    // An extern declaration's function runs in the native companion
+    // library (Decision 0148 section 23); PHP output emits none of it.
     if function.foreign {
-        return Err(BackendError::from_diagnostics(vec![
-            crate::unsafe_code::companion_form(
-                function.span,
-                "Foreign Calls Cannot Be Built For PHP Output Yet",
-                format!(
-                    "the extern declaration `{}` is part of Doria; PHP output does not call foreign functions yet",
-                    function.name
-                ),
-            ),
-        ]));
+        return Ok(());
     }
     for (parameter_index, param) in function.params.iter().enumerate() {
         validate_type(&param.ty, param.span, semantic_info)?;
@@ -3131,6 +3156,16 @@ fn validate_statement(
     semantic_info: &PhpValidation<'_>,
 ) -> Result<(), BackendError> {
     match statement {
+        // Unsafe code runs in the native companion library, which the
+        // native backends build (Decision 0148 section 23).
+        Stmt::Block(block)
+            if semantic_info
+                .semantic
+                .unsafe_contexts
+                .contains_key(&block.span) =>
+        {
+            Ok(())
+        }
         Stmt::Block(block) => validate_block(block, semantic_info),
         Stmt::VarDecl(decl) => {
             if let Some(ty) = &decl.ty {
@@ -3633,6 +3668,9 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             validate_arguments(args, semantic_info)
         }
         Expr::StaticMember { .. } => Ok(()),
+        Expr::Grouped { span, .. } if semantic_info.semantic.unsafe_contexts.contains_key(span) => {
+            Ok(())
+        }
         Expr::Grouped { expr, .. } => validate_expr(expr, semantic_info),
         Expr::IsType { expr, ty, span } => {
             validate_expr(expr, semantic_info)?;
@@ -4290,6 +4328,8 @@ struct PhpNameScopes {
     file_payload: bool,
     readiness_set_payload: bool,
     specialization: Rc<specialization::Plan>,
+    /// The native companion plan of a program with unsafe regions.
+    companion: Option<Rc<companion::Sites>>,
     substitutions: HashMap<String, ResolvedType>,
     // The enum specialization whose PHP class is being emitted.
     enum_instance: Option<crate::enums::EnumType>,
@@ -4410,6 +4450,7 @@ impl PhpNameScopes {
             file_payload: false,
             readiness_set_payload: false,
             specialization: Rc::default(),
+            companion: None,
             substitutions: HashMap::new(),
             enum_instance: None,
             returns_borrow: false,
@@ -4431,6 +4472,7 @@ impl PhpNameScopes {
         let mut scopes = Self::new(self.symbols.clone(), Rc::clone(&self.closure_plan));
         scopes.diagnostic_sites = Rc::clone(&self.diagnostic_sites);
         scopes.core_helpers = Rc::clone(&self.core_helpers);
+        scopes.companion = self.companion.clone();
         scopes.payload_case_tags = self.payload_case_tags.clone();
         scopes.matches = self.matches.clone();
         scopes.whens = self.whens.clone();
@@ -6347,6 +6389,11 @@ fn emit_function(
     shared_scopes: &PhpNameScopes,
     emission: PhpFunctionEmission<'_>,
 ) {
+    // The native companion library holds every extern declaration's
+    // function (Decision 0148 section 23).
+    if function.foreign {
+        return;
+    }
     for callable in shared_scopes
         .specialization
         .callables
@@ -7436,7 +7483,11 @@ fn emit_statement_inner(
     scopes: &mut PhpNameScopes,
 ) {
     match statement {
-        Stmt::Block(block) => emit_block(block, output, indent, scopes),
+        Stmt::Block(block) => {
+            if !companion::emit_region_block(block, output, indent, scopes) {
+                emit_block(block, output, indent, scopes);
+            }
+        }
         Stmt::VarDecl(decl) => {
             if value_result::emit_local(decl, output, indent, scopes) {
                 return;
@@ -7653,6 +7704,9 @@ fn emit_statement_inner(
         Stmt::Expr { expr, .. } => {
             if let Expr::Assertion(assertion) = expr {
                 emit_assertion_statement(assertion, output, indent, scopes);
+                return;
+            }
+            if companion::emit_region_expression_statement(expr, output, indent, scopes) {
                 return;
             }
             if let Expr::FunctionCall {
@@ -9782,6 +9836,9 @@ fn emit_range_foreach(
 }
 
 fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    if let Some(value) = companion::emit_region_value(expr, scopes) {
+        return value;
+    }
     if let Some(value) = scopes
         .prepared_receiver
         .as_ref()

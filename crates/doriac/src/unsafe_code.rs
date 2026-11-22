@@ -27,7 +27,7 @@ pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Di
     Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
         .with_title(title)
         .with_explanation(
-            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and take the target's C data model, through the native companion library. PHP output does not use it yet.",
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and take the target's C data model, through the native companion library. PHP output does not build this form there yet.",
         )
 }
 

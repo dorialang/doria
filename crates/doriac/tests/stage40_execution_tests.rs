@@ -490,10 +490,12 @@ fn the_interpreter_runs_pointer_operations_and_php_output_reports_them() {
         "{debug:?}"
     );
     let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
-        .expect_err("PHP output runs pointers through the companion");
+        .expect_err("PHP output does not run `echo` inside unsafe code yet");
+    // The pointer runs in the companion; `echo` is a host operation.
     assert!(
         php.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Pointers Cannot Be Built For PHP Output Yet"),
+            && diagnostic.title
+                == "Host Operations In Unsafe Code Cannot Be Built For PHP Output Yet"),
         "{php:#?}"
     );
 }

@@ -22,6 +22,16 @@ pub enum BackendOutput {
         contents: String,
         runtime: Box<SharedRuntimeDependency>,
     },
+    /// PHP output of a program with unsafe regions: the generated PHP, the
+    /// shared runtime it loads, and the native companion library its
+    /// regions run in, built beside it as `<stem>.native.<ext>` with its
+    /// sidecar when the output is published (Decision 0148 section 23).
+    TextWithCompanion {
+        extension: String,
+        contents: String,
+        runtime: Box<SharedRuntimeDependency>,
+        companion: Box<CompanionBuild>,
+    },
     Binary {
         extension: String,
         bytes: Vec<u8>,
@@ -36,6 +46,15 @@ pub enum BackendOutput {
     Artifact {
         path: PathBuf,
     },
+}
+
+/// What a host output builds its native companion library from: the
+/// validated MIR of its program, the native profile and the link inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionBuild {
+    pub program: mir::Program,
+    pub profile: NativeProfile,
+    pub linking: crate::native_link::NativeLinking,
 }
 
 /// Publish compiler output and its verified dependencies through one CLI/library boundary.
@@ -53,6 +72,31 @@ pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), Back
             contents, runtime, ..
         } => {
             runtime.publish(directory)?;
+            write_output(out_path, contents.as_bytes())
+        }
+        BackendOutput::TextWithCompanion {
+            contents,
+            runtime,
+            companion,
+            ..
+        } => {
+            runtime.publish(directory)?;
+            let stem = out_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "the PHP output path `{}` has no file name for its companion library",
+                        out_path.display()
+                    ))
+                })?;
+            crate::native_companion::publish(
+                &companion.program,
+                companion.profile,
+                &companion.linking,
+                directory,
+                stem,
+            )?;
             write_output(out_path, contents.as_bytes())
         }
         BackendOutput::Binary { bytes, .. } => write_output(out_path, &bytes),
@@ -299,15 +343,25 @@ impl Backend for PhpBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        let mir = if program.semantic_info.closures.is_empty()
-            && program.semantic_info.callable_value_calls.is_empty()
-        {
-            None
-        } else {
-            Some(lower_validated_mir(program)?)
-        };
-        codegen_php::generate_artifact(program, mir.as_ref())
+        emit_php(program, &crate::native_link::NativeLinking::default())
     }
+}
+
+/// PHP output. A program with unsafe regions runs them in the native
+/// companion library, built with `linking` (Decision 0148 section 23).
+fn emit_php(
+    program: &hir::Program,
+    linking: &crate::native_link::NativeLinking,
+) -> Result<BackendOutput, BackendError> {
+    let mir = if program.semantic_info.closures.is_empty()
+        && program.semantic_info.callable_value_calls.is_empty()
+        && program.semantic_info.unsafe_contexts.is_empty()
+    {
+        None
+    } else {
+        Some(lower_validated_mir(program)?)
+    };
+    codegen_php::generate_artifact(program, mir.as_ref(), linking)
 }
 
 pub struct NativeBackend;
@@ -406,7 +460,7 @@ pub fn emit_with_options(
 
     match options.target {
         BackendTarget::Native => emit_native(program, options.native_profile, &options.linking),
-        BackendTarget::Php => PhpBackend.emit(program),
+        BackendTarget::Php => emit_php(program, &options.linking),
         BackendTarget::Debug => emit_debug(program, &options.linking),
         BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",

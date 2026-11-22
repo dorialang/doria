@@ -235,16 +235,40 @@ fn release_object(_library: &CompanionLibrary) -> Result<Vec<u8>, BackendError> 
 }
 
 /// The sidecar document (Decision 0148 section 23): its schema version,
-/// the compiler and runtime identity, the library and its SHA-256, the
-/// region entries with their slot records, the host operations, the
-/// callbacks, the binding entries and the foreign libraries the library
-/// links.
+/// the compiler and runtime identity, the library with its size and
+/// SHA-256, the region entries with their slot records, the host
+/// operations, the callbacks, the binding entries and the foreign
+/// libraries the library links.
 fn sidecar(
     library: &CompanionLibrary,
     runtime: &SharedRuntimeDependency,
     profile: NativeProfile,
     bytes: &[u8],
     stem: &str,
+) -> Value {
+    let mut sidecar = expected_sidecar(library, runtime, profile);
+    sidecar["library"] = json!(library_file_name(stem));
+    sidecar["bytes"] = json!(bytes.len());
+    sidecar["sha256"] = json!(sha256_hex(bytes));
+    sidecar
+}
+
+/// The sidecar of the companion library of `program` without the fields
+/// that name and digest the built file: what a host generated for this
+/// program checks a sidecar against before it loads the library.
+pub fn expected_sidecar_of(
+    program: &mir::Program,
+    profile: NativeProfile,
+) -> Result<Value, BackendError> {
+    let library = mir::companion::library(program);
+    let runtime = runtime_artifact::shared_runtime_dependency()?;
+    Ok(expected_sidecar(&library, &runtime, profile))
+}
+
+fn expected_sidecar(
+    library: &CompanionLibrary,
+    runtime: &SharedRuntimeDependency,
+    profile: NativeProfile,
 ) -> Value {
     let expectation = RuntimeExpectation::current(profile);
     let companion = &library.program.companion;
@@ -282,8 +306,6 @@ fn sidecar(
             "sha256": runtime.metadata().sha256,
             "path": runtime.relative_library_path().to_string_lossy().replace('\\', "/"),
         },
-        "library": library_file_name(stem),
-        "sha256": sha256_hex(bytes),
         "regions": companion.regions.iter().map(|region| json!({
             "id": region.id,
             "symbol": region.entry_symbol(),

@@ -1152,6 +1152,13 @@ takes a new version.
   takes that binding's PHP value before the call and gives it back after;
   temporaries and host tokens live only in the frame. Each host operation
   is a generated PHP function over that frame.
+- PHP output checks every field of the sidecar but the library's name,
+  size and digest against the plan it was generated for, and those three
+  against the library beside it, before it loads the library. A mismatch
+  or a missing file reports B3605.
+- PHP cannot unwind through the companion, so a panic or exit during a
+  region call writes its report and ends the process through the shared
+  runtime's `dr_v1_exit_process`.
 
 **Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
@@ -1202,7 +1209,7 @@ share one runtime state.
   beside the generated PHP. The sidecar records its schema version, compiler
   identity, runtime ABI version, region identities and signatures, the
   callback and binding entries, foreign libraries and the library's
-  SHA-256. The generated PHP validates the sidecar
+  size and SHA-256. The generated PHP validates the sidecar
   and loads the library with `FFI::cdef(<generated declarations>, __DIR__ . ...)`,
   as it loads the runtime. Missing PHP FFI, a missing file or a mismatch fails
   explicitly with no fallback (Decision 0110's precedent).
@@ -1398,6 +1405,12 @@ has one precise contract.
     place of its source binding, so the binding a MIR local records is the
     one map between them, and the PHP backend classifies no statement of
     its own.
+  - The PHP sidecar check: the generated PHP knows the plan but not the
+    library, which is built when the output is published, so it checks the
+    plan fields as generated and the file against the digest the sidecar
+    records.
+  - Leaving PHP through the runtime: PHP turns `exit` inside an FFI
+    callback into a fatal error, so the runtime ends the process.
   - Import slots for runtime data on Windows: an import library defines
     only the `__imp_` slot for a DLL's data, and COFF has no automatic
     data import. Native code keeps its direct store around each foreign

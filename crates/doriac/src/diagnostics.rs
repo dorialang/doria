@@ -1782,6 +1782,7 @@ pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
         title_family: match code {
             "B0003" => "Runtime Artifact Is Incompatible With This Compiler",
             "B3602" => "PHP Native Runtime Dependency Is Unavailable",
+            "B3605" => "PHP Native Companion Library Is Unavailable",
             _ => match code.as_bytes().first().copied() {
                 Some(b'L') => "Lexical Error",
                 Some(b'P') if runtime => "Runtime Panic",

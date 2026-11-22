@@ -217,7 +217,12 @@ fn assert_php_parity(
     use std::process::{Command, Stdio};
     let directory = native_execution::ExecutionDirectory::new();
     let path = directory.path().join("main.php");
-    let artifact = doriac::codegen_php::generate_artifact(hir, Some(program)).unwrap();
+    let artifact = doriac::codegen_php::generate_artifact(
+        hir,
+        Some(program),
+        &doriac::native_link::NativeLinking::default(),
+    )
+    .unwrap();
     doriac::backend::publish_output(&path, artifact).unwrap();
     let mut child = Command::new("php")
         .arg(path)

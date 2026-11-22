@@ -436,3 +436,31 @@ impl ForeignAggregateFacts {
         }
     }
 }
+
+/// The identity of the unsafe region at `span` in the specialization with
+/// type arguments `substitutions` (Decision 0148 section 22): a SHA-256
+/// over package identity, source identity, span and type arguments, in
+/// lowercase hexadecimal. MIR lowering names each region with it, and PHP
+/// output finds the companion entry of an unsafe site through it.
+/// `compilation` is the compilation context of `span`'s source.
+pub fn region_identity(
+    compilation: &crate::names::CompilationContext,
+    span: Span,
+    substitutions: &std::collections::HashMap<String, crate::types::ResolvedType>,
+) -> String {
+    let mut substitutions = substitutions.iter().collect::<Vec<_>>();
+    substitutions.sort_by(|left, right| left.0.cmp(right.0));
+    let mut text = format!(
+        "doria-region-v1\npackage {:?}\nsource {} {}\nspan {} {} {}\n",
+        compilation.package,
+        compilation.source.0,
+        span.source.0,
+        span.start,
+        span.end,
+        span.expansion.0,
+    );
+    for (name, ty) in substitutions {
+        text.push_str(&format!("type {name} {ty:?}\n"));
+    }
+    crate::runtime_digest::sha256_hex(text.as_bytes())
+}

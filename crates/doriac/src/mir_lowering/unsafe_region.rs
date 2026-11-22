@@ -229,21 +229,7 @@ fn region_identity(fact: &UnsafeContextFact, context: &LoweringContext) -> Strin
         .compilation_contexts
         .get(&fact.span.source)
         .unwrap_or(&context.semantic_info.compilation_context);
-    let mut substitutions = context.type_substitutions.iter().collect::<Vec<_>>();
-    substitutions.sort_by(|left, right| left.0.cmp(right.0));
-    let mut text = format!(
-        "doria-region-v1\npackage {:?}\nsource {} {}\nspan {} {} {}\n",
-        compilation.package,
-        compilation.source.0,
-        fact.span.source.0,
-        fact.span.start,
-        fact.span.end,
-        fact.span.expansion.0,
-    );
-    for (name, ty) in substitutions {
-        text.push_str(&format!("type {name} {ty:?}\n"));
-    }
-    crate::runtime_digest::sha256_hex(text.as_bytes())
+    crate::foreign::region_identity(compilation, fact.span, &context.type_substitutions)
 }
 
 /// The function's regions with their exits, once every block is final. A

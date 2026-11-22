@@ -253,7 +253,8 @@ pub fn compile_source_to_php(
 ) -> DiagnosticResult<String> {
     match compile_source(path, text, BackendTarget::Php)? {
         backend::BackendOutput::Text { contents, .. }
-        | backend::BackendOutput::TextWithRuntime { contents, .. } => Ok(contents),
+        | backend::BackendOutput::TextWithRuntime { contents, .. }
+        | backend::BackendOutput::TextWithCompanion { contents, .. } => Ok(contents),
         _ => Err(vec![Diagnostic::new(
             "B0002",
             "PHP backend did not return text output",

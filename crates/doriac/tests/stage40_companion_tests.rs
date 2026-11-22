@@ -409,3 +409,109 @@ fn the_zlib_example_builds_its_companion() {
         assert!(library.symbol("deflateInit_").is_some(), "zlib is linked");
     }
 }
+
+/// PHP output runs `shout`'s region in the companion it publishes beside
+/// itself: the inputs cross from the bindings' places, the string output
+/// comes back through operation 0, and the `break` edge leaves the loop
+/// (Decision 0148 section 23). A sidecar that does not match, and a
+/// missing library, fail with B3605 before any region runs.
+#[test]
+fn php_output_runs_a_region_in_its_companion() {
+    if std::process::Command::new("php")
+        .args(["-r", "exit(class_exists('FFI') ? 0 : 1);"])
+        .status()
+        .map_or(true, |status| !status.success())
+    {
+        eprintln!("PHP with FFI unavailable; PHP companion execution skipped");
+        return;
+    }
+    let source = format!("{C_LIBRARY}{SHOUT}");
+    let output = doriac::compile_source(
+        "companion.doria",
+        source,
+        doriac::backend::BackendTarget::Php,
+    )
+    .unwrap_or_else(|diagnostics| panic!("PHP output should build: {diagnostics:#?}"));
+    assert!(
+        matches!(
+            output,
+            doriac::backend::BackendOutput::TextWithCompanion { .. }
+        ),
+        "{output:?}"
+    );
+    let directory = ExecutionDirectory::new();
+    let script = directory.path().join("shout.php");
+    doriac::backend::publish_output(&script, output).unwrap();
+    let library = directory
+        .path()
+        .join(doriac::native_companion::library_file_name("shout"));
+    let sidecar = directory
+        .path()
+        .join(doriac::native_companion::sidecar_file_name("shout"));
+    assert!(library.is_file() && sidecar.is_file());
+    let run = || {
+        std::process::Command::new("php")
+            .arg(&script)
+            .output()
+            .unwrap()
+    };
+    let ran = run();
+    assert_eq!(
+        (
+            ran.status.code(),
+            String::from_utf8_lossy(&ran.stdout).into_owned()
+        ),
+        (Some(0), "hey!!!\n".to_string()),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    let document = std::fs::read_to_string(&sidecar).unwrap();
+    std::fs::write(
+        &sidecar,
+        document.replace("doria_region_v1_", "doria_region_v9_"),
+    )
+    .unwrap();
+    let mismatched = run();
+    assert_eq!(mismatched.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&mismatched.stderr).contains("B3605"));
+    std::fs::write(&sidecar, document).unwrap();
+    std::fs::remove_file(&library).unwrap();
+    let missing = run();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("B3605"));
+}
+
+/// An expression region's value reaches the PHP expression around it.
+#[test]
+fn php_output_reads_the_value_of_an_expression_region() {
+    if std::process::Command::new("php")
+        .args(["-r", "exit(class_exists('FFI') ? 0 : 1);"])
+        .status()
+        .map_or(true, |status| !status.success())
+    {
+        eprintln!("PHP with FFI unavailable; PHP companion execution skipped");
+        return;
+    }
+    let source = format!(
+        "{C_LIBRARY}function main(): void {{ let $value = unsafe(abs(-3)); echo unsafe(abs(-4)) . \" \" . $value . \"\\n\"; }}"
+    );
+    let output = doriac::compile_source("value.doria", source, doriac::backend::BackendTarget::Php)
+        .unwrap_or_else(|diagnostics| panic!("PHP output should build: {diagnostics:#?}"));
+    let directory = ExecutionDirectory::new();
+    let script = directory.path().join("value.php");
+    doriac::backend::publish_output(&script, output).unwrap();
+    let ran = std::process::Command::new("php")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert_eq!(
+        (
+            ran.status.code(),
+            String::from_utf8_lossy(&ran.stdout).into_owned()
+        ),
+        (Some(0), "4 3\n".to_string()),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}

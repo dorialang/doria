@@ -65,7 +65,7 @@ declare(strict_types=1);
         'program.semantic_info.closures.is_empty()',
         'program.semantic_info.callable_value_calls.is_empty()',
         'Some(lower_validated_mir(program)?)',
-        'codegen_php::generate_artifact(program, mir.as_ref())',
+        'codegen_php::generate_artifact(program, mir.as_ref(), linking)',
     ]);
     $forbid($paths['backend'], $files['backend'], [
         'Closure PHP Output Is Not Yet Available',

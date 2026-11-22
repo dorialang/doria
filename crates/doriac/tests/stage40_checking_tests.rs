@@ -506,15 +506,14 @@ fn foreign_calls_build_natively_and_report_what_cannot_be_built_yet() {
         doriac::backend::BackendTarget::Debug,
     )
     .expect("the interpreter calls C through the native companion");
-    let diagnostics =
-        doriac::compile_source("ffi.doria", source, doriac::backend::BackendTarget::Php)
-            .expect_err("PHP output calls C through the native companion");
+    let output = doriac::compile_source("ffi.doria", source, doriac::backend::BackendTarget::Php)
+        .expect("PHP output calls C through the native companion");
     assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E0784"
-                && diagnostic.title == "Foreign Calls Cannot Be Built For PHP Output Yet"),
-        "{diagnostics:#?}"
+        matches!(
+            output,
+            doriac::backend::BackendOutput::TextWithCompanion { .. }
+        ),
+        "{output:?}"
     );
 
     let unsafe_only = "/** @safety None. */ unsafe function tick(): int { return 1; } function main(): void { echo unsafe(tick()); }";

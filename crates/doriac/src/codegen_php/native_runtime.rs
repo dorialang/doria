@@ -346,6 +346,8 @@ int64_t dr_v1_terminal_await_event(uint32_t generation, uint8_t wait_kind, uint6
     int64_t wait_high, DrCancellationV1 *cancellation);
 void dr_v1_terminal_process_ending(void);
 void dr_v1_provide_absent_streams(uint32_t absent_at_start);
+void dr_v1_attach_region_host(void *host);
+void dr_v1_exit_process(int32_t status);
 DORIA_NATIVE_ABI, $path);
         } catch (Throwable) {
             // Configuration failures are backend diagnostics, never Doria IoError.
