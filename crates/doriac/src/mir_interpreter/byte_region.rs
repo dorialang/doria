@@ -22,23 +22,19 @@ pub(super) enum RegionSource {
     Inline(super::foreign_aggregate::InlineStorage),
 }
 
+/// The storage a region's bytes lie in. Two regions overlap only inside
+/// one storage; host storage and foreign memory never share bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RegionStorage {
+    /// Host collection storage, by its identity.
+    Collection(*const RefCell<CollectionEntries>),
+    /// The C layout of the value a host place holds.
+    Place(InterpreterPlaceStorage),
+    /// The process's memory that foreign libraries own, by address.
+    Foreign,
+}
+
 impl RegionSource {
-    /// The host collection storage the region views; `None` for elements
-    /// in their C layout.
-    pub fn elements(self) -> Option<CollectionElementPlace> {
-        match self {
-            Self::Elements(place) => Some(place),
-            Self::Inline(_) => None,
-        }
-    }
-
-    pub fn elements_mut(&mut self) -> Option<&mut CollectionElementPlace> {
-        match self {
-            Self::Elements(place) => Some(place),
-            Self::Inline(_) => None,
-        }
-    }
-
     /// The same storage `count` elements of `stride` bytes further on.
     pub fn advance(self, count: usize, stride: usize) -> Self {
         match self {
@@ -713,6 +709,44 @@ impl Interpreter<'_> {
                 self.write_inline_bytes(storage.at((from * stride) as u64), &bytes)
             }
         }
+    }
+
+    /// The storage the present region `region` views and the byte range its
+    /// elements cover in it, so that two regions can be compared wherever
+    /// they lie: host collection storage, the C layout of a host place, or
+    /// memory a foreign library owns (Decision 0148 sections 6, 8 and 10).
+    pub(super) fn region_storage_span(
+        &self,
+        region: ByteRegionValue,
+    ) -> Result<(RegionStorage, std::ops::Range<u64>), InterpreterError> {
+        let stride = self.region_element(region.kind)?.1 as u64;
+        let source = region
+            .source
+            .ok_or_else(|| InterpreterError::new("a region has no storage"))?;
+        let (storage, start) = match source {
+            RegionSource::Elements(place) => {
+                let loan = self
+                    .borrowed_collections
+                    .get(&place.collection)
+                    .ok_or_else(|| InterpreterError::new("a region's loan was released"))?;
+                (
+                    RegionStorage::Collection(loan.entries.as_ptr()),
+                    place.index as u64 * stride,
+                )
+            }
+            RegionSource::Inline(super::foreign_aggregate::InlineStorage::Place {
+                place,
+                offset,
+            }) => (RegionStorage::Place(place.storage), offset),
+            RegionSource::Inline(super::foreign_aggregate::InlineStorage::Foreign { address }) => {
+                (RegionStorage::Foreign, address)
+            }
+        };
+        let end = (region.length as u64)
+            .checked_mul(stride)
+            .and_then(|length| start.checked_add(length))
+            .ok_or_else(|| InterpreterError::new("a region's range overflows"))?;
+        Ok((storage, start..end))
     }
 
     /// Whether the storage `source` views still exists: a collection a

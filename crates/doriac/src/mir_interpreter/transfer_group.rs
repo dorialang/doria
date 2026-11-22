@@ -55,9 +55,10 @@ impl Entry {
         {
             return None;
         }
+        // A transfer moves bytes, so the offset counts one-byte elements in
+        // whatever storage the buffer views.
         let mut region = self.buffer;
-        let source = region.source.as_mut()?.elements_mut()?;
-        source.index = source.index.checked_add(offset)?;
+        region.source = Some(region.source?.advance(offset, 1));
         region.length = length;
         Some(region)
     }
@@ -1922,14 +1923,11 @@ function main(): void {
             };
             for (offset, length) in [(0, 8), (2, 3), (8, 0)] {
                 let selected = entry.resubmission_region(offset, length).unwrap();
-                assert_eq!(
-                    selected
-                        .source
-                        .and_then(super::byte_region::RegionSource::elements)
-                        .unwrap()
-                        .index,
-                    11 + offset
-                );
+                let Some(super::byte_region::RegionSource::Elements(place)) = selected.source
+                else {
+                    panic!("a resubmission keeps the buffer's storage")
+                };
+                assert_eq!(place.index, 11 + offset);
                 assert_eq!(selected.length, length);
                 assert_eq!(selected.kind, buffer.kind);
                 assert_eq!(entry.buffer, buffer);

@@ -1,5 +1,4 @@
 //! Configuration retains descriptors, never copies bytes or performs I/O.
-use super::byte_region::RegionSource;
 use super::*;
 use crate::compiler_known_io::{IoErrorReason, IoOperation, IoTarget};
 
@@ -204,35 +203,13 @@ impl Interpreter<'_> {
         prior: ByteRegionValue,
         prior_reading: bool,
     ) -> Result<bool, InterpreterError> {
-        let source = region
-            .source
-            .and_then(RegionSource::elements)
-            .ok_or_else(|| InterpreterError::new("transfer region has no storage"))?;
-        let prior_source = prior
-            .source
-            .and_then(RegionSource::elements)
-            .ok_or_else(|| InterpreterError::new("retained transfer region has no storage"))?;
-        let storage = self
-            .borrowed_collections
-            .get(&source.collection)
-            .ok_or_else(|| InterpreterError::new("transfer region loan was released"))?;
-        let prior_storage = self
-            .borrowed_collections
-            .get(&prior_source.collection)
-            .ok_or_else(|| InterpreterError::new("retained transfer region loan was released"))?;
-        let end = source
-            .index
-            .checked_add(region.length)
-            .ok_or_else(|| InterpreterError::new("transfer region range overflow"))?;
-        let prior_end = prior_source
-            .index
-            .checked_add(prior.length)
-            .ok_or_else(|| InterpreterError::new("retained transfer region range overflow"))?;
-        Ok(storage.entries.ptr_eq(&prior_storage.entries)
+        let (storage, range) = self.region_storage_span(region)?;
+        let (prior_storage, prior_range) = self.region_storage_span(prior)?;
+        Ok(storage == prior_storage
             && (reading || prior_reading)
-            && region.length != 0
-            && prior.length != 0
-            && source.index < prior_end
-            && prior_source.index < end)
+            && !range.is_empty()
+            && !prior_range.is_empty()
+            && range.start < prior_range.end
+            && prior_range.start < range.end)
     }
 }

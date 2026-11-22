@@ -3246,6 +3246,64 @@ function main(): void
 }
 
 #[test]
+fn transfer_plans_and_groups_move_bytes_of_foreign_memory() {
+    // Decision 0148 section 10: a region over memory a C allocator owns is
+    // a byte region like any other. A plan rejects a read into it that
+    // overlaps a write from it, even through another owner of the same
+    // address, and a group writes it and resubmits part of it.
+    let source = format!(
+        "{C_ALLOCATOR}
+use Doria\\Std\\Io\\{{StandardStreams, ReadinessSet, TransferPlan, Wait, TransferWaitResult,
+    TransferCompletion, WriteOutcome, WritableByteRegion}};
+
+function main(): void throws IoError
+{{
+    let $memory = allocate(3);
+    WritablePointer<uint8> $bytes = unsafe(WritablePointer::cast($memory));
+    unsafe {{
+        $bytes->write(UInt8::from(97));
+        $bytes->offset(1)->write(UInt8::from(98));
+        $bytes->offset(2)->write(UInt8::from(10));
+    }}
+    let $source = unsafe(ByteRegion::fromPointer($memory, Pointer::from($bytes), 3));
+    writable WritablePointer<Opaque> $alias = $memory;
+    let writable $destination = unsafe(WritableByteRegion::fromPointer($alias, $bytes, 3));
+    let $reader = StandardStreams::input;
+    let writable $writer = StandardStreams::output;
+    writable ReadinessSet $set = new ReadinessSet();
+    let $readerKey = $set->register($reader);
+    let $writerKey = $set->register($writer);
+    writable bool $conflict = false;
+    try {{
+        let $rejected = TransferPlan::read($readerKey, $destination)->andWriteTo($writerKey, $source);
+    }} catch (IoError $error) {{
+        $conflict = true;
+    }}
+    {{
+        let $plan = TransferPlan::writeTo($writerKey, $source);
+        let $write = $plan->getWriteKey(0);
+        let writable $group = $set->begin($plan);
+        if ($group->getNextCompletion(Wait::Indefinite)
+            != TransferWaitResult::Completed(TransferCompletion::Write($write, WriteOutcome::Accepted(3)))) {{
+            panic(\"foreign write\");
+        }}
+        $group->resubmitWrite($write, 1, 2);
+        if ($group->getNextCompletion(Wait::Indefinite)
+            != TransferWaitResult::Completed(TransferCompletion::Write($write, WriteOutcome::Accepted(2)))) {{
+            panic(\"foreign resubmission\");
+        }}
+    }}
+    if ($conflict) {{
+        echo \"conflict\\n\";
+    }}
+    unsafe {{ free($memory); }}
+}}
+"
+    );
+    assert_runs_everywhere(&source, "ab\nb\nconflict\n");
+}
+
+#[test]
 fn handles_carry_owned_and_shared_values_through_c_and_back() {
     // Decision 0148 section 11: a closed class's handle is its object, an
     // open class's a box that keeps its exact type, and a shared
