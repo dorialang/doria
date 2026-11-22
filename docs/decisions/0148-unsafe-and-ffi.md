@@ -1118,6 +1118,26 @@ takes a new version.
   return the host copies a writable region's copy back into its storage. A
   region output or host-operation argument that lies in such a copy
   crosses back as a view of the host storage at the same offset.
+- A pointer a region forms to a place on the host (a property, a static
+  property or an element of a `List<T>`) addresses a native copy the host
+  lends for the rest of the region call: of the place's value, or of the
+  whole collection for an element. Every native copy the host lends goes
+  back to its host storage whenever control passes from the companion to
+  the host, at a host operation or after a binding entry returns, and takes
+  the host storage's current content whenever control passes back.
+- A foreign struct or union lives on the host as its bytes in the target's
+  C layout, and a slot of one holds those bytes.
+- The runtime's buffer loads record the address of the companion's copy in
+  the slot they load. A region output or host-operation argument that lies
+  in the copy of a buffer input, or in a buffer operation 0 accepted,
+  crosses back as a view of that host collection at the same offset; any
+  other region crossing back views memory a foreign library owns.
+- The host reads and writes a region over foreign memory through the
+  shared runtime's `dr_v1_byte_region_copy`, and passes it to a later
+  region as its address and length.
+- Every lowering of a region numbers the locals and blocks it exchanges
+  and runs as the first lowering does; the companion plan reports one
+  that does not as a compiler defect (I0001).
 - A panic or exit in Doria code during a region call ends the process as
   the panic sink does, with the program's output written first: nothing
   returns to the companion.
@@ -1344,6 +1364,26 @@ has one precise contract.
   - Copies of regions over host storage: the interpreter's storage is not
     C layout, so the companion views a native copy, and the copy's address
     range names the host storage a region the companion returns views.
+  - Pins on host storage lent and synchronized at each crossing: the host
+    keeps a place's value in its own representation, so the pointer needs
+    native storage, and the companion and host never run at once, so
+    synchronizing at every crossing makes the copy behave as the one
+    storage section 7's pins describe. An element lends its whole
+    collection so pointer arithmetic between elements keeps its native
+    distances.
+  - Foreign structs and unions as C-layout bytes on the host: field access,
+    union overlay and every crossing then read one representation, laid out
+    by the shared C layout.
+  - Copy addresses in loaded slots: the companion's copy of a buffer is the
+    storage a region it builds views, and the slot is the one record both
+    sides already share for that input, so the host needs no second export
+    to learn the address.
+  - Foreign memory through the runtime's byte copy: the host reads memory
+    a foreign library owns through the same runtime both native backends
+    use, with no copy kept on the host.
+  - Lowering numbering checked by the plan: the plan owns the operation
+    table every host reads, so the defect is reported where the table is
+    built, for every target.
   - The process ends on a panic during a region call: the companion's
     frames are below the host's, and neither side unwinds.
   - The Call Path of a callback from the runtime's record: the runtime

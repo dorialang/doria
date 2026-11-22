@@ -56,7 +56,7 @@ impl Entry {
             return None;
         }
         let mut region = self.buffer;
-        let source = region.source.as_mut()?;
+        let source = region.source.as_mut()?.elements_mut()?;
         source.index = source.index.checked_add(offset)?;
         region.length = length;
         Some(region)
@@ -1898,12 +1898,14 @@ function main(): void {
                     mir::ByteRegionKind::Readonly
                 }),
                 nullable: false,
-                source: Some(CollectionElementPlace {
-                    collection: 4,
-                    generation: 7,
-                    index: 11,
-                    ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
-                }),
+                source: Some(super::byte_region::RegionSource::Elements(
+                    CollectionElementPlace {
+                        collection: 4,
+                        generation: 7,
+                        index: 11,
+                        ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                    },
+                )),
                 length: 8,
             };
             let mut entry = Entry {
@@ -1920,7 +1922,14 @@ function main(): void {
             };
             for (offset, length) in [(0, 8), (2, 3), (8, 0)] {
                 let selected = entry.resubmission_region(offset, length).unwrap();
-                assert_eq!(selected.source.unwrap().index, 11 + offset);
+                assert_eq!(
+                    selected
+                        .source
+                        .and_then(super::byte_region::RegionSource::elements)
+                        .unwrap()
+                        .index,
+                    11 + offset
+                );
                 assert_eq!(selected.length, length);
                 assert_eq!(selected.kind, buffer.kind);
                 assert_eq!(entry.buffer, buffer);

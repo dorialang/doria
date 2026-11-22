@@ -16,9 +16,11 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 use crate::source::Span;
 
 mod byte_region;
+mod c_value;
 mod child_process;
 mod companion_host;
 mod file_stream;
+mod foreign_aggregate;
 mod inline_value;
 mod readiness_set;
 mod standard_stream;
@@ -335,6 +337,11 @@ enum LocalValue {
         ty: mir::PayloadEnumType,
         value: Option<PayloadEnumValue>,
     },
+    ForeignAggregate(c_value::ForeignAggregateValue),
+    NullableForeignAggregate {
+        ty: mir::ForeignAggregateType,
+        value: Option<c_value::ForeignAggregateValue>,
+    },
     Function(FunctionValue),
     NullableFunction {
         function_type: mir::FunctionTypeId,
@@ -451,6 +458,11 @@ enum EvaluationValue {
         ty: mir::PayloadEnumType,
         value: Option<PayloadEnumValue>,
     },
+    ForeignAggregate(c_value::ForeignAggregateValue),
+    NullableForeignAggregate {
+        ty: mir::ForeignAggregateType,
+        value: Option<c_value::ForeignAggregateValue>,
+    },
     Function(FunctionValue),
     NullableFunction {
         function_type: mir::FunctionTypeId,
@@ -491,6 +503,8 @@ enum MixedValue {
         owner: Rc<Cell<usize>>,
         payload_owned: bool,
     },
+    /// A copy of a foreign struct or union, which is Copy.
+    ForeignAggregate(c_value::ForeignAggregateValue),
 }
 
 impl MixedValue {
@@ -503,6 +517,7 @@ impl MixedValue {
             Self::PayloadEnum { value, .. } => Some(mir::MixedTag::PayloadEnum(value.ty)),
             Self::Interface { interface, .. } => Some(mir::MixedTag::Interface(*interface)),
             Self::Function { value, .. } => Some(mir::MixedTag::Function(value.function_type)),
+            Self::ForeignAggregate(value) => Some(mir::MixedTag::ForeignAggregate(value.ty)),
         }
     }
 }
@@ -646,6 +661,7 @@ struct CheckedConstruction {
 #[derive(Debug, Clone)]
 enum EvaluationTask {
     ByteRegion(byte_region::Task),
+    ForeignAggregate(foreign_aggregate::Task),
     HostPointer(companion_host::PointerTask),
     Inline(inline_value::Task),
     Rvalue(mir::Rvalue),
@@ -1464,11 +1480,6 @@ fn interpret_internal_with_clock(
 ) -> Result<(InterpreterIoOutput, InterpreterMetrics), InterpreterError> {
     crate::mir_validation::validate_program(program)
         .map_err(|error| InterpreterError::new(error.message))?;
-    // Foreign structs and unions do not run on the companion host yet;
-    // refuse before any effect.
-    if let Some(form) = crate::unsafe_code::companion_operations(program).first() {
-        return Err(InterpreterError::new(form.message.clone()));
-    }
     let entry = function_in(program, program.entry)?;
     // Decision 0099: the entry takes either no parameters or one `List<string>`
     // of program arguments, which the glue owns and lends to `main`.
@@ -1616,6 +1627,26 @@ fn static_local_value(
                 value: None,
             })
         }
+        (mir::StaticValue::Null, mir::Type::NullableForeignAggregate(aggregate)) => {
+            Ok(LocalValue::NullableForeignAggregate {
+                ty: aggregate,
+                value: None,
+            })
+        }
+        (mir::StaticValue::ForeignAggregate(value), mir::Type::ForeignAggregate(expected))
+            if value.ty == expected =>
+        {
+            Ok(LocalValue::ForeignAggregate(
+                c_value::ForeignAggregateValue::from_constant(value),
+            ))
+        }
+        (
+            mir::StaticValue::ForeignAggregate(value),
+            mir::Type::NullableForeignAggregate(expected),
+        ) if value.ty == expected => Ok(LocalValue::NullableForeignAggregate {
+            ty: expected,
+            value: Some(c_value::ForeignAggregateValue::from_constant(value)),
+        }),
         (mir::StaticValue::Null, mir::Type::NullablePayloadEnum(payload)) => {
             Ok(LocalValue::NullablePayloadEnum {
                 ty: payload,
@@ -1808,9 +1839,10 @@ impl<'a> Interpreter<'a> {
             } => {
                 self.complete_pending_request(request, outcome)?;
             }
-            mir::Statement::EndBorrow { local } => {
-                self.current_frame_mut()?.locals[local.0].take();
-            }
+            // A borrowed descriptor's lexical lifetime ends without
+            // dropping its storage: a writable binding that borrows the
+            // descriptor keeps reading it.
+            mir::Statement::EndBorrow { .. } => {}
             mir::Statement::AssignRegionIndex {
                 region,
                 index,
@@ -1984,8 +2016,12 @@ impl<'a> Interpreter<'a> {
                 match (definition.ty, value) {
                     (
                         mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_),
-                        _,
-                    ) => return Err(foreign_aggregate_refusal()),
+                        value,
+                    ) => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::Rvalue(value));
+                    }
                     (mir::Type::String, mir::Rvalue::String(expression)) => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
@@ -2700,7 +2736,12 @@ impl<'a> Interpreter<'a> {
                     "the interpreter runs foreign calls through the native companion library",
                 ));
             }
-            mir::Statement::ForeignField { .. } => return Err(foreign_aggregate_refusal()),
+            mir::Statement::ForeignField {
+                aggregate,
+                offset,
+                access,
+                span,
+            } => return self.execute_foreign_field(aggregate, offset, access, span),
             mir::Statement::HostRecord { .. }
             | mir::Statement::RegionSlot { .. }
             | mir::Statement::CallHost { .. } => {
@@ -3231,6 +3272,9 @@ impl<'a> Interpreter<'a> {
     ) -> Result<StepOutcome, InterpreterError> {
         match task {
             EvaluationTask::ByteRegion(task) => return self.execute_region_task(task),
+            EvaluationTask::ForeignAggregate(task) => {
+                return self.execute_foreign_aggregate_task(task)
+            }
             EvaluationTask::HostPointer(task) => return self.finish_host_pointer(task),
             EvaluationTask::Inline(task) => return self.execute_inline_task(task),
             EvaluationTask::SetPanicSite(span) => self.set_active_panic_site(span)?,
@@ -3353,9 +3397,19 @@ impl<'a> Interpreter<'a> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableFunction(value)),
-                mir::Rvalue::ForeignAggregate(_) | mir::Rvalue::NullableForeignAggregate(_) => {
-                    return Err(foreign_aggregate_refusal())
+                mir::Rvalue::ForeignAggregate(value) => {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::ForeignAggregate(
+                            foreign_aggregate::Task::Value(value),
+                        ))
                 }
+                mir::Rvalue::NullableForeignAggregate(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::ForeignAggregate(
+                        foreign_aggregate::Task::Nullable(value),
+                    )),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -4286,6 +4340,8 @@ impl<'a> Interpreter<'a> {
                         | LocalValue::String(_)
                         | LocalValue::PayloadEnum(_)
                         | LocalValue::NullablePayloadEnum { .. }
+                        | LocalValue::ForeignAggregate(_)
+                        | LocalValue::NullableForeignAggregate { .. }
                 ) {
                     return Err(InterpreterError::new(
                         "MIR collection fill value is not a supported Copy value",
@@ -5000,6 +5056,26 @@ impl<'a> Interpreter<'a> {
                         .current_frame_mut()?
                         .values
                         .push(EvaluationValue::NullablePayloadEnum { ty, value: None }),
+                    (
+                        mir::Type::ForeignAggregate(ty),
+                        Some(LocalValue::ForeignAggregate(value)),
+                    ) if ty == value.ty => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableForeignAggregate {
+                            ty,
+                            value: Some(value),
+                        },
+                    ),
+                    (mir::Type::ForeignAggregate(ty), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableForeignAggregate { ty, value: None }),
+                    (
+                        mir::Type::ForeignAggregate(ty),
+                        Some(LocalValue::NullableForeignAggregate { ty: actual, value }),
+                    ) if ty == actual => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableForeignAggregate { ty, value }),
                     (
                         mir::Type::PayloadEnum(ty),
                         Some(LocalValue::NullablePayloadEnum { ty: actual, value }),
@@ -8000,8 +8076,14 @@ impl<'a> Interpreter<'a> {
                     .tasks
                     .push(EvaluationTask::NullablePayloadEnum(*value));
             }
-            mir::BoolExpression::NullableForeignAggregateIsPresent(_) => {
-                return Err(foreign_aggregate_refusal())
+            mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ForeignAggregate(
+                    foreign_aggregate::Task::IsPresent,
+                ));
+                frame.tasks.push(EvaluationTask::ForeignAggregate(
+                    foreign_aggregate::Task::Nullable(*value),
+                ));
             }
             mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
                 let frame = self.current_frame_mut()?;
@@ -8169,6 +8251,12 @@ impl<'a> Interpreter<'a> {
                             "MIR collection local local{} was used as a string value",
                             id.0
                         )));
+                    }
+                    LocalValue::ForeignAggregate(_)
+                    | LocalValue::NullableForeignAggregate { .. } => {
+                        return Err(InterpreterError::new(
+                            "MIR foreign aggregate local was used as another value type",
+                        ));
                     }
                     LocalValue::PayloadEnum(_) | LocalValue::NullablePayloadEnum { .. } => {
                         return Err(InterpreterError::new(format!(
@@ -8587,7 +8675,15 @@ impl<'a> Interpreter<'a> {
                 frame.tasks.push(EvaluationTask::BuildMixedValue(tag));
                 frame.tasks.push(EvaluationTask::Value(value));
             }
-            mir::MixedExpression::BoxForeignAggregate(_) => return Err(foreign_aggregate_refusal()),
+            mir::MixedExpression::BoxForeignAggregate(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ForeignAggregate(
+                    foreign_aggregate::Task::Box,
+                ));
+                frame.tasks.push(EvaluationTask::ForeignAggregate(
+                    foreign_aggregate::Task::Value(value),
+                ));
+            }
             mir::MixedExpression::BoxString { value, .. } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::BuildMixedString);
@@ -13509,6 +13605,20 @@ impl<'a> Interpreter<'a> {
                 }
             }
             (
+                mir::Type::ForeignAggregate(expected),
+                LocalValue::NullableForeignAggregate {
+                    ty,
+                    value: Some(value),
+                },
+            ) if expected == ty => LocalValue::ForeignAggregate(value),
+            (
+                mir::Type::NullableForeignAggregate(expected),
+                LocalValue::ForeignAggregate(value),
+            ) if expected == value.ty => LocalValue::NullableForeignAggregate {
+                ty: expected,
+                value: Some(value),
+            },
+            (
                 mir::Type::SharedReference(expected),
                 LocalValue::NullableSharedReference {
                     control: Some(control),
@@ -15475,6 +15585,10 @@ impl<'a> Interpreter<'a> {
                 EvaluationValue::NullablePayloadEnum { ty, value } => {
                     Ok(LocalValue::NullablePayloadEnum { ty, value })
                 }
+                EvaluationValue::ForeignAggregate(value) => Ok(LocalValue::ForeignAggregate(value)),
+                EvaluationValue::NullableForeignAggregate { ty, value } => {
+                    Ok(LocalValue::NullableForeignAggregate { ty, value })
+                }
                 EvaluationValue::Function(value) => Ok(LocalValue::Function(value)),
                 EvaluationValue::NullableFunction {
                     function_type,
@@ -15537,11 +15651,14 @@ impl<'a> Interpreter<'a> {
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a collection",
             )),
-            Some(EvaluationValue::PayloadEnum(_) | EvaluationValue::NullablePayloadEnum { .. }) => {
-                Err(InterpreterError::new(
-                    "MIR scalar evaluation produced a payload enum",
-                ))
-            }
+            Some(
+                EvaluationValue::PayloadEnum(_)
+                | EvaluationValue::NullablePayloadEnum { .. }
+                | EvaluationValue::ForeignAggregate(_)
+                | EvaluationValue::NullableForeignAggregate { .. },
+            ) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a payload enum",
+            )),
             Some(EvaluationValue::Function(_) | EvaluationValue::NullableFunction { .. }) => Err(
                 InterpreterError::new("MIR scalar evaluation produced a function value"),
             ),
@@ -15601,11 +15718,14 @@ impl<'a> Interpreter<'a> {
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a collection",
             )),
-            Some(EvaluationValue::PayloadEnum(_) | EvaluationValue::NullablePayloadEnum { .. }) => {
-                Err(InterpreterError::new(
-                    "MIR string evaluation produced a payload enum",
-                ))
-            }
+            Some(
+                EvaluationValue::PayloadEnum(_)
+                | EvaluationValue::NullablePayloadEnum { .. }
+                | EvaluationValue::ForeignAggregate(_)
+                | EvaluationValue::NullableForeignAggregate { .. },
+            ) => Err(InterpreterError::new(
+                "MIR string evaluation produced a payload enum",
+            )),
             Some(EvaluationValue::Function(_) | EvaluationValue::NullableFunction { .. }) => Err(
                 InterpreterError::new("MIR string evaluation produced a function value"),
             ),
@@ -16062,6 +16182,12 @@ impl<'a> Interpreter<'a> {
             Some(EvaluationValue::NullablePayloadEnum { ty, value }) => {
                 Ok(LocalValue::NullablePayloadEnum { ty, value })
             }
+            Some(EvaluationValue::ForeignAggregate(value)) => {
+                Ok(LocalValue::ForeignAggregate(value))
+            }
+            Some(EvaluationValue::NullableForeignAggregate { ty, value }) => {
+                Ok(LocalValue::NullableForeignAggregate { ty, value })
+            }
             Some(EvaluationValue::Function(value)) => Ok(LocalValue::Function(value)),
             Some(EvaluationValue::NullableFunction {
                 function_type,
@@ -16180,6 +16306,10 @@ impl<'a> Interpreter<'a> {
             LocalValue::PayloadEnum(value) => EvaluationValue::PayloadEnum(value),
             LocalValue::NullablePayloadEnum { ty, value } => {
                 EvaluationValue::NullablePayloadEnum { ty, value }
+            }
+            LocalValue::ForeignAggregate(value) => EvaluationValue::ForeignAggregate(value),
+            LocalValue::NullableForeignAggregate { ty, value } => {
+                EvaluationValue::NullableForeignAggregate { ty, value }
             }
             LocalValue::Function(value) => EvaluationValue::Function(value),
             LocalValue::NullableFunction {
@@ -16835,6 +16965,11 @@ impl<'a> Interpreter<'a> {
                 LocalValue::ByteRegion(_) => Err(InterpreterError::new(
                     "MIR byte region was used as a scalar",
                 )),
+                LocalValue::ForeignAggregate(_) | LocalValue::NullableForeignAggregate { .. } => {
+                    Err(InterpreterError::new(
+                        "MIR foreign aggregate local was used as another value type",
+                    ))
+                }
                 LocalValue::PayloadEnum(_) | LocalValue::NullablePayloadEnum { .. } => {
                     Err(InterpreterError::new(format!(
                         "MIR payload enum local local{} was used as a scalar value",
@@ -19190,6 +19325,7 @@ fn assertion_local_value_presentation(
         | LocalValue::NullableWritableWeakReference { control: None, .. }
         | LocalValue::NullableSharedReferenceAccess { control: None, .. }
         | LocalValue::NullablePayloadEnum { value: None, .. }
+        | LocalValue::NullableForeignAggregate { value: None, .. }
         | LocalValue::NullableFunction { value: None, .. } => "null".to_string(),
         LocalValue::NullableScalar {
             value: Some(mir::ScalarValue::Enum(value)),
@@ -19319,6 +19455,9 @@ fn typed_null_value(ty: mir::Type) -> Result<LocalValue, InterpreterError> {
         }
         mir::Type::NullableRegion(kind) => LocalValue::ByteRegion(ByteRegionValue::absent(kind)),
         mir::Type::NullablePayloadEnum(ty) => LocalValue::NullablePayloadEnum { ty, value: None },
+        mir::Type::NullableForeignAggregate(ty) => {
+            LocalValue::NullableForeignAggregate { ty, value: None }
+        }
         mir::Type::NullableFunction(function_type) => LocalValue::NullableFunction {
             function_type,
             value: None,
@@ -19347,6 +19486,7 @@ fn is_absent_nullable_value(value: &LocalValue) -> bool {
         | LocalValue::NullableWritableWeakReference { control: None, .. }
         | LocalValue::NullableSharedReferenceAccess { control: None, .. }
         | LocalValue::NullablePayloadEnum { value: None, .. }
+        | LocalValue::NullableForeignAggregate { value: None, .. }
         | LocalValue::NullableFunction { value: None, .. } => true,
         LocalValue::Collection(value) => value.nullable && !value.present,
         LocalValue::ByteRegion(value) => value.nullable && value.source.is_none(),
@@ -19414,6 +19554,8 @@ fn local_value_type(program: &mir::Program, value: &LocalValue) -> mir::Type {
         }
         LocalValue::PayloadEnum(value) => mir::Type::PayloadEnum(value.ty),
         LocalValue::NullablePayloadEnum { ty, .. } => mir::Type::NullablePayloadEnum(*ty),
+        LocalValue::ForeignAggregate(value) => mir::Type::ForeignAggregate(value.ty),
+        LocalValue::NullableForeignAggregate { ty, .. } => mir::Type::NullableForeignAggregate(*ty),
         LocalValue::Function(value) => mir::Type::Function(value.function_type),
         LocalValue::NullableFunction { function_type, .. } => {
             mir::Type::NullableFunction(*function_type)
@@ -19460,6 +19602,9 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         }
         mir::Type::NullableCollection(collection) => Some(mir::Type::Collection(collection)),
         mir::Type::NullablePayloadEnum(payload) => Some(mir::Type::PayloadEnum(payload)),
+        mir::Type::NullableForeignAggregate(aggregate) => {
+            Some(mir::Type::ForeignAggregate(aggregate))
+        }
         mir::Type::NullableFunction(function_type) => Some(mir::Type::Function(function_type)),
         mir::Type::Collection(_) => None,
         _ => None,
@@ -19508,7 +19653,10 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
         | MixedValue::Function { owner, .. } => {
             owner.set(owner.get().saturating_add(1));
         }
-        MixedValue::Null | MixedValue::Scalar { .. } | MixedValue::String(_) => {}
+        MixedValue::Null
+        | MixedValue::Scalar { .. }
+        | MixedValue::String(_)
+        | MixedValue::ForeignAggregate(_) => {}
     }
 }
 
@@ -20329,6 +20477,14 @@ fn assign_local(
             if expected == *ty
     ) || matches!(
         (definition.ty, &value),
+        (mir::Type::ForeignAggregate(expected), LocalValue::ForeignAggregate(value))
+            if expected == value.ty
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::NullableForeignAggregate(expected), LocalValue::NullableForeignAggregate { ty, .. })
+            if expected == *ty
+    ) || matches!(
+        (definition.ty, &value),
         (mir::Type::Interface(expected), LocalValue::Error(value)) if program.interface_vtables[value.vtable.0].interface == expected
     ) || matches!(
         (definition.ty, &value),
@@ -20376,6 +20532,8 @@ fn assign_local(
             LocalValue::Collection(_) => "collection",
             LocalValue::PayloadEnum(_) => "payload enum",
             LocalValue::NullablePayloadEnum { .. } => "nullable payload enum",
+            LocalValue::ForeignAggregate(_) => "foreign aggregate",
+            LocalValue::NullableForeignAggregate { .. } => "nullable foreign aggregate",
             LocalValue::Function(_) => "function",
             LocalValue::NullableFunction { .. } => "nullable function",
             LocalValue::ClosureEnvironment(_) => "closure environment",
@@ -20524,15 +20682,6 @@ fn block_in(
         .get(id.0)
         .filter(|block| block.id == id)
         .ok_or_else(|| InterpreterError::new(format!("MIR BlockId block{} does not exist", id.0)))
-}
-
-/// Foreign structs and unions run through the native companion library
-/// (Decision 0148 sections 22 and 23); `unsafe_code::companion_operations`
-/// refuses a program with one before it runs.
-fn foreign_aggregate_refusal() -> InterpreterError {
-    InterpreterError::new(
-        "the interpreter runs foreign structs and unions through the native companion library",
-    )
 }
 
 #[cfg(test)]

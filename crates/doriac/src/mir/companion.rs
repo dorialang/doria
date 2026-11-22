@@ -27,7 +27,8 @@ pub struct CompanionPlanError {
 /// The companion plan of `program`. Regions group by identity in identity
 /// order; the first lowering of each, in function order, is the one the
 /// companion compiles, and every other lowering must have the same inputs,
-/// outputs, result and exits. Host operations are numbered from 1 in region
+/// outputs, result and exits, numbered as the first numbers its locals and
+/// blocks. Host operations are numbered from 1 in region
 /// order and then block and statement order; 0 is reserved for accepting an
 /// output. Entries take the function ids after every function of `program`.
 pub fn plan(program: &Program) -> Result<Companion, CompanionPlanError> {
@@ -82,13 +83,32 @@ pub fn plan(program: &Program) -> Result<Companion, CompanionPlanError> {
         let shape = RegionShape::of(canonical, region);
         for lowering in &lowerings[1..] {
             let other = function(lowering.function);
-            let other_shape = RegionShape::of(other, &other.unsafe_regions[lowering.region]);
+            let other_region = &other.unsafe_regions[lowering.region];
+            let other_shape = RegionShape::of(other, other_region);
             if other_shape != shape {
                 return Err(CompanionPlanError {
                     span: region.span,
                     details: format!(
                         "region {id} has {shape:?} in `{}` but {other_shape:?} in `{}`",
                         canonical.name, other.name
+                    ),
+                });
+            }
+            // A host runs each host operation in its own frame of the
+            // lowering it entered from, through the first lowering's
+            // operation table, so every lowering numbers the locals and
+            // blocks the region exchanges and runs as the first does.
+            if other_region.inputs != region.inputs
+                || other_region.outputs != region.outputs
+                || other_region.result != region.result
+                || other_region.blocks != region.blocks
+                || other_region.exits != region.exits
+            {
+                return Err(CompanionPlanError {
+                    span: region.span,
+                    details: format!(
+                        "region {id} numbers its locals or blocks in `{}` differently from `{}`",
+                        other.name, canonical.name
                     ),
                 });
             }
@@ -1203,5 +1223,41 @@ pub fn library(program: &Program) -> CompanionLibrary {
     CompanionLibrary {
         program: library,
         emitted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host runs host operations in the frame of the lowering it
+    /// entered from, through the first lowering's operation table, so a
+    /// second lowering that numbers the region's locals differently is a
+    /// compiler defect the plan reports.
+    #[test]
+    fn every_lowering_of_a_region_numbers_it_as_the_first() {
+        let source = "use Doria\\Std\\Ffi\\Pointer;\nfunction main(): void { let $value = 7; unsafe { echo Pointer::to($value)->read(); } }";
+        let mut program = crate::lower_source_to_mir("plan.doria", source.to_string())
+            .expect("the program lowers");
+        let index = program
+            .functions
+            .iter()
+            .position(|function| !function.unsafe_regions.is_empty())
+            .expect("a function holds the region");
+        assert!(plan(&program).is_ok());
+        let mut copy = program.functions[index].clone();
+        copy.id = FunctionId(program.functions.len());
+        let input = copy.unsafe_regions[0].inputs[0].local;
+        let mut renumbered = copy.locals[input.0].clone();
+        renumbered.id = LocalId(copy.locals.len());
+        copy.unsafe_regions[0].inputs[0].local = renumbered.id;
+        copy.locals.push(renumbered);
+        program.functions.push(copy);
+        let error = plan(&program).expect_err("the lowerings differ in numbering");
+        assert!(
+            error.details.contains("numbers its locals or blocks"),
+            "{}",
+            error.details
+        );
     }
 }

@@ -172,29 +172,6 @@ fn php_output_reports_that_it_does_not_build_boundary_values_yet() {
     );
 }
 
-/// The program prints `stdout` and exits 0 on every native profile; the
-/// interpreter reports that it runs pointer operations through the native
-/// companion library.
-/// The program prints `stdout` and exits 0 on every target. The
-/// interpreter runs unsafe code through the native companion library and
-/// reports a program with foreign structs or unions, which it does not run
-/// yet.
-fn assert_runs_natively(source: &str, stdout: &str) {
-    let mir = program(source);
-    if doriac::unsafe_code::companion_operations(&mir).is_empty() {
-        assert_runs_everywhere(source, stdout);
-        return;
-    }
-    assert_interpreter_reports_companion(&mir);
-    for profile in NativeProfile::AVAILABLE {
-        let run = execute_native(&mir, *profile);
-        assert_eq!(run.status.code(), Some(0), "{profile:?}: {run:?}");
-        assert_eq!(String::from_utf8_lossy(&run.stdout), stdout, "{profile:?}");
-        assert!(run.stderr.is_empty(), "{profile:?}: {run:?}");
-    }
-}
-
-/// The program panics with `code` and `title` on every native profile.
 /// Runs `source` in the interpreter in a child process, `doriac compile
 /// --target debug`: a panic inside an unsafe region ends the process that
 /// hosts the companion (Decision 0148 section 23), which writes the
@@ -212,9 +189,23 @@ fn interpret_in_child(source: &str) -> std::process::Output {
         .expect("doriac runs")
 }
 
-fn assert_panics_natively(source: &str, code: &str, title: &str) {
+/// The program panics with `code` and `title` in the interpreter and on
+/// every native profile.
+fn assert_panics_with_title(source: &str, code: &str, title: &str) {
     let mir = program(source);
-    if doriac::unsafe_code::companion_operations(&mir).is_empty() {
+    if mir.companion.regions.is_empty() {
+        // Without unsafe regions the interpreter runs in this process.
+        let interpreted = interpret(&mir).expect("the interpreter should run the program");
+        assert_eq!(interpreted.exit_status, 101, "interpreter");
+        let diagnostic = interpreted
+            .runtime_diagnostic
+            .as_ref()
+            .expect("the interpreter reports the panic");
+        assert!(
+            diagnostic.code == code && diagnostic.title == title,
+            "interpreter: {diagnostic:?}"
+        );
+    } else {
         let interpreted = interpret_in_child(source);
         let stderr = String::from_utf8_lossy(&interpreted.stderr);
         assert_eq!(
@@ -226,8 +217,6 @@ fn assert_panics_natively(source: &str, code: &str, title: &str) {
             stderr.contains(code) && stderr.contains(title),
             "interpreter: {stderr}"
         );
-    } else {
-        assert_interpreter_reports_companion(&mir);
     }
     for profile in NativeProfile::AVAILABLE {
         let run = execute_native(&mir, *profile);
@@ -238,22 +227,6 @@ fn assert_panics_natively(source: &str, code: &str, title: &str) {
             "{profile:?}: {stderr}"
         );
     }
-}
-
-fn assert_interpreter_reports_companion(mir: &doriac::mir::Program) {
-    let companion = doriac::unsafe_code::companion_operations(mir);
-    assert!(
-        companion.iter().all(|diagnostic| diagnostic.code == "E0784"
-            && [
-                "Foreign Structs And Unions Cannot Run In The Interpreter Yet",
-                "Regions Over Foreign Memory Cannot Run In The Interpreter Yet",
-            ]
-            .contains(&diagnostic.title.as_str())),
-        "{companion:#?}"
-    );
-    assert!(!companion.is_empty());
-    let error = interpret(mir).expect_err("the interpreter runs unsafe code through the companion");
-    assert!(error.to_string().contains(&companion[0].message), "{error}");
 }
 
 const POINTER: &str = "use Doria\\Std\\Ffi\\{Pointer, WritablePointer};\n";
@@ -301,7 +274,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "true 4096 4108 4088 4102 4101 4104 true true true");
+    assert_runs_everywhere(&source, "true 4096 4108 4088 4102 4101 4104 true true true");
 }
 
 /// `?->` on `?Pointer<T>` and `?WritablePointer<T>` runs the member only
@@ -367,7 +340,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "7 -1 true 0 9 9 -2 2\n9 -4 -5 9\n9 false false false true true false",
     );
@@ -391,7 +364,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "7");
+    assert_runs_everywhere(&source, "7");
 }
 
 /// A `mixed` box records the exact type of what it holds (Decision 0148
@@ -466,7 +439,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "color 2 shade 6 7 pointer 7 writable other callback 42 long 5 int64 6 false false true",
     );
@@ -479,7 +452,7 @@ fn an_aligned_access_at_a_misaligned_address_panics_with_p1702() {
         "?Pointer<float64> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<float64> $writablePointer = WritablePointer::cast($pointer); $writablePointer->write(1.5); }",
     ] {
         let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
-        assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
+        assert_panics_with_title(&source, "P1702", "Pointer Access Is Misaligned");
     }
 }
 
@@ -496,7 +469,7 @@ fn an_offset_that_leaves_the_address_space_panics_with_p1703() {
         "?Pointer<int64> $pointer = Pointer::fromAddress(4096); if ($pointer != null) { echo $pointer->offset(2305843009213693952)->address; }",
     ] {
         let source = format!("{POINTER}function main(): void {{ unsafe {{ {body} }} }}");
-        assert_panics_natively(&source, "P1703", "Pointer Arithmetic Left The Address Space");
+        assert_panics_with_title(&source, "P1703", "Pointer Arithmetic Left The Address Space");
     }
 }
 
@@ -570,7 +543,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "30 99 80 33 30 11 100 66 50");
+    assert_runs_everywhere(&source, "30 99 80 33 30 11 100 66 50");
 }
 
 #[test]
@@ -612,7 +585,7 @@ function main(): void
 "
     );
     // Every tier-1 target is little-endian.
-    assert_runs_natively(&source, "7 7 5 true 511");
+    assert_runs_everywhere(&source, "7 7 5 true 511");
 
     // A writable parameter of a function or a closure and a writable
     // capture name the caller's place (Andrew's ruling of 2026-11-21,
@@ -638,7 +611,7 @@ function main(): void {{
 }}
 "
     );
-    assert_runs_natively(&parameters, "8 8 5 5 9 10");
+    assert_runs_everywhere(&parameters, "8 8 5 5 9 10");
 }
 
 const C_LIBRARY: &str = r#"
@@ -739,7 +712,7 @@ function main(): void
     );
     // `fill` and `clear` bind one symbol with two signatures: the second
     // calls the address the first imports.
-    assert_runs_natively(&source, "7 123456 5 97 true 120 105 5");
+    assert_runs_everywhere(&source, "7 123456 5 97 true 120 105 5");
 }
 
 #[cfg(unix)]
@@ -811,7 +784,7 @@ function main(): void
     }
 }
 ";
-    assert_runs_natively(source, "5 3 2 9 11 13");
+    assert_runs_everywhere(source, "5 3 2 9 11 13");
 }
 
 #[test]
@@ -844,7 +817,7 @@ function main(): void
     echo $between . \" \" . ForeignCall::lastSystemCode;
 }
 ";
-    assert_runs_natively(source, "text -1 9");
+    assert_runs_everywhere(source, "text -1 9");
 }
 
 const AGGREGATES: &str = r#"
@@ -930,7 +903,7 @@ function main(): void
 "
     );
     // Every tier-1 target is little-endian and lays these out alike.
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "10 255 15 10 6 3 99 30 true 3 15 15 4 1 24 8 32 4 0 2 67305985",
     );
@@ -1045,7 +1018,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "7 2 9 3 255 true false\ntrue 40 6 1 true 3\ntrue 251 252 true 1 7 true 0 9\nmaybe 0 maybe 3 none\n3 77 3 -1 4",
     );
@@ -1120,7 +1093,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "3 true 3 3 true 3 -1 1:4,6\n1:4,6 - 2:7,9 3:7,9 -");
+    assert_runs_everywhere(&source, "3 true 3 3 true 3 -1 1:4,6\n1:4,6 - 2:7,9 3:7,9 -");
 }
 
 /// `?->` on a nullable region runs each region member only when the region
@@ -1171,7 +1144,7 @@ function main(): void
     }
 }
 ";
-    assert_runs_natively(source, "4 2 1 3 -1 -1 0 3,2,1,2");
+    assert_runs_everywhere(source, "4 2 1 3 -1 -1 0 3,2,1,2");
 }
 
 #[test]
@@ -1265,7 +1238,7 @@ function main(): void
 }}
 "#
     );
-    assert_runs_natively(&source, "2 3 4\n11 22 33\n0 3\n4 2\n3\n10/30\n");
+    assert_runs_everywhere(&source, "2 3 4\n11 22 33\n0 3\n4 2\n3\n10/30\n");
     let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
         .expect_err("PHP output takes the C data model through the companion");
     assert!(
@@ -1311,7 +1284,7 @@ function main(): void
 }}
 "#
     );
-    assert_runs_natively(&source, "41\n2\n41 1 3\n");
+    assert_runs_everywhere(&source, "41\n2\n41 1 3\n");
 }
 
 /// A writable home lends the caller's storage: a closure's writable
@@ -1368,7 +1341,7 @@ function main(): void
 }}
 "#
     );
-    assert_runs_natively(&source, "77\n77 55 66\n1 3\n42\n9\n");
+    assert_runs_everywhere(&source, "77\n77 55 66\n1 3\n42\n9\n");
 }
 
 /// A collection stores foreign structs and unions inline in its element
@@ -1422,7 +1395,7 @@ function main(): void
     );
     // Every tier-1 target is little-endian: 258 with its low byte 2 is
     // 0x0102, and four 1 bytes are 0x01010101.
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "3 7 6 13 7 2 99 2 1 77 -5 1234567890123 10 258 16843009 2 true 258 1 true 3 3 true false 20 21 1",
     );
@@ -1504,7 +1477,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "9 2 44 20 50 103 6 12 1=1/1/0 3=3/3/33 263");
+    assert_runs_everywhere(&source, "9 2 44 20 50 103 6 12 1=1/1/0 3=3/3/33 263");
 }
 
 /// A typed array region over foreign structs (Decision 0148 section 8)
@@ -1547,115 +1520,69 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "2 20 300 2 3 9 333 201 3 333 301 24 24");
+    assert_runs_everywhere(&source, "2 20 300 2 3 9 333 201 3 333 301 24 24");
 }
 
 #[test]
-fn the_interpreter_and_php_output_report_foreign_aggregates() {
-    let source = format!(
-        "{AGGREGATES}function main(): void {{ let $color = new Color(red: 1, green: 2, blue: 3); echo $color->red; }}"
+fn php_output_reports_foreign_aggregates() {
+    let sources = [
+        format!(
+            "{AGGREGATES}function main(): void {{ let $color = new Color(red: 1, green: 2, blue: 3); echo $color->red; }}"
+        ),
+        // A value boxed as `mixed` is one too, and so is the box's test.
+        format!(
+            "{AGGREGATES}function main(): void {{ mixed $value = new Color(red: 1, green: 2, blue: 3); echo $value is Color; }}"
+        ),
+        format!(
+            "{AGGREGATES}class Palette {{ static Color $primary = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ echo Palette::primary->red; }}"
+        ),
+        format!("{AGGREGATES}function main(): void {{ echo Color::SIZE; }}"),
+    ];
+    for source in sources {
+        let php =
+            doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
+                .expect_err("PHP output takes the C data model through the companion");
+        assert!(
+            php.iter().any(|diagnostic| diagnostic.code == "E0784"),
+            "{php:#?}"
+        );
+    }
+}
+
+/// The interpreter holds a foreign struct or union as its C-layout bytes
+/// (Decision 0148 section 6), in locals, `mixed` boxes, properties,
+/// statics and enum payloads, as the native targets do.
+#[test]
+fn the_interpreter_runs_foreign_aggregates_where_native_code_holds_them() {
+    assert_runs_everywhere(
+        &format!(
+            "{AGGREGATES}function main(): void {{ let $color = new Color(red: 1, green: 2, blue: 3); echo $color->red . \" \" . $color->alpha; }}"
+        ),
+        "1 255",
     );
-    let debug = doriac::compile_source(
-        "stage40.doria",
-        source.clone(),
-        doriac::backend::BackendTarget::Debug,
-    )
-    .expect_err("the interpreter runs foreign aggregates through the companion");
-    assert!(
-        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
-        "{debug:#?}"
+    assert_runs_everywhere(
+        &format!(
+            "{AGGREGATES}function main(): void {{ mixed $value = new Color(red: 1, green: 2, blue: 3); if ($value is Color) {{ echo $value->green; }} }}"
+        ),
+        "2",
     );
-    let php = doriac::compile_source("stage40.doria", source, doriac::backend::BackendTarget::Php)
-        .expect_err("PHP output takes the C data model through the companion");
-    assert!(
-        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
-        "{php:#?}"
+    assert_runs_everywhere(
+        &format!(
+            "{AGGREGATES}class Holder {{ Color $color = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ let $holder = new Holder(); echo $holder->color->blue; }}"
+        ),
+        "3",
     );
-    // A value boxed as `mixed` is one too, and so is the box's test.
-    let boxed = format!(
-        "{AGGREGATES}function main(): void {{ mixed $value = new Color(red: 1, green: 2, blue: 3); echo $value is Color; }}"
+    assert_runs_everywhere(
+        &format!(
+            "{AGGREGATES}class Palette {{ static Color $primary = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ echo Palette::primary->red; }}"
+        ),
+        "1",
     );
-    let debug = doriac::compile_source(
-        "stage40.doria",
-        boxed.clone(),
-        doriac::backend::BackendTarget::Debug,
-    )
-    .expect_err("the interpreter runs foreign aggregates through the companion");
-    assert!(
-        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
-        "{debug:#?}"
-    );
-    let php = doriac::compile_source("stage40.doria", boxed, doriac::backend::BackendTarget::Php)
-        .expect_err("PHP output takes the C data model through the companion");
-    assert!(
-        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
-        "{php:#?}"
-    );
-    // A construction stored straight into a property is a companion
-    // operation too.
-    let property = format!(
-        "{AGGREGATES}class Holder {{ Color $color = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ let $holder = new Holder(); }}"
-    );
-    let debug = doriac::compile_source(
-        "stage40.doria",
-        property,
-        doriac::backend::BackendTarget::Debug,
-    )
-    .expect_err("the interpreter runs foreign aggregates through the companion");
-    assert!(
-        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
-        "{debug:#?}"
-    );
-    // A static property holding one is reported where it is declared.
-    let held = format!(
-        "{AGGREGATES}class Palette {{ static Color $primary = new Color(red: 1, green: 2, blue: 3); }} function main(): void {{ echo Palette::primary->red; }}"
-    );
-    let debug = doriac::compile_source(
-        "stage40.doria",
-        held.clone(),
-        doriac::backend::BackendTarget::Debug,
-    )
-    .expect_err("the interpreter runs foreign aggregates through the companion");
-    assert!(
-        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
-        "{debug:#?}"
-    );
-    let php = doriac::compile_source("stage40.doria", held, doriac::backend::BackendTarget::Php)
-        .expect_err("PHP output takes the C data model through the companion");
-    assert!(
-        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
-        "{php:#?}"
-    );
-    // An enum whose payload holds an aggregate is reported where it is
-    // held.
-    let payload = format!(
-        "{AGGREGATES}enum Paint {{ case Solid(Color $color); }} function show(Paint $paint): void {{}} function main(): void {{ show(Paint::Solid(new Color(red: 1, green: 2, blue: 3))); }}"
-    );
-    let debug = doriac::compile_source(
-        "stage40.doria",
-        payload,
-        doriac::backend::BackendTarget::Debug,
-    )
-    .expect_err("the interpreter runs foreign aggregates through the companion");
-    assert!(
-        debug.iter().any(|diagnostic| diagnostic.code == "E0784"
-            && diagnostic.title == "Foreign Structs And Unions Cannot Run In The Interpreter Yet"),
-        "{debug:#?}"
-    );
-    let constant = format!("{AGGREGATES}function main(): void {{ echo Color::SIZE; }}");
-    let php = doriac::compile_source(
-        "stage40.doria",
-        constant,
-        doriac::backend::BackendTarget::Php,
-    )
-    .expect_err("PHP output takes the C data model through the companion");
-    assert!(
-        php.iter().any(|diagnostic| diagnostic.code == "E0784"),
-        "{php:#?}"
+    assert_runs_everywhere(
+        &format!(
+            "{AGGREGATES}enum Paint {{ case Solid(Color $color); }} function show(Paint $paint): string {{ return match ($paint) {{ Paint::Solid($color) => \"solid {{$color->green}}\", }}; }} function main(): void {{ echo show(Paint::Solid(new Color(red: 1, green: 2, blue: 3))); }}"
+        ),
+        "solid 2",
     );
 }
 
@@ -1691,7 +1618,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "1 5 40 77 77 77 32 9 9 3");
+    assert_runs_everywhere(&source, "1 5 40 77 77 77 32 9 9 3");
 }
 
 #[test]
@@ -1701,7 +1628,7 @@ fn an_aligned_aggregate_access_at_a_misaligned_address_panics_with_p1702() {
         "?Pointer<Sample> $pointer = Pointer::fromAddress(4100); if ($pointer != null) { WritablePointer<Sample> $writablePointer = WritablePointer::cast($pointer); $writablePointer->write(new Sample(tag: 1, value: 2, extra: 3)); }",
     ] {
         let source = format!("{POINTER}{AGGREGATES}function main(): void {{ unsafe {{ {body} }} }}");
-        assert_panics_natively(&source, "P1702", "Pointer Access Is Misaligned");
+        assert_panics_with_title(&source, "P1702", "Pointer Access Is Misaligned");
     }
 }
 
@@ -1759,7 +1686,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "3 2 -7 -1 1285714285714 2");
+    assert_runs_everywhere(&source, "3 2 -7 -1 1285714285714 2");
 }
 
 /// System V x86_64 and AArch64 pass a 16-byte struct of two integer
@@ -1814,7 +1741,7 @@ function main(): void
 "
     );
     // memset writes three bytes of 1: 0x010101.
-    assert_runs_natively(&source, "true 65793 24");
+    assert_runs_everywhere(&source, "true 65793 24");
 }
 
 #[test]
@@ -1842,7 +1769,7 @@ function main(): void
 "
     );
     // `uint16[3]` takes bytes 0 to 5; `int32` is aligned to byte 8.
-    assert_runs_natively(&source, "12 7 0 0 7 9");
+    assert_runs_everywhere(&source, "12 7 0 0 7 9");
 }
 
 #[test]
@@ -1884,7 +1811,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "true true true 42 255");
+    assert_runs_everywhere(&source, "true true true 42 255");
 }
 
 #[test]
@@ -1968,7 +1895,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "0 24 true 3 7 true\n42 2 42 2 true\ntrue true true 0 true\ntrue true true true",
     );
@@ -2019,7 +1946,7 @@ function main(): void
     );
     // memset writes 65 into bytes 1 to 4 of the buffer itself: C receives
     // the storage's address, and no copy is made.
-    assert_runs_natively(&source, "true true 0 65 65 0 2 65 true 6 111");
+    assert_runs_everywhere(&source, "true true 0 65 65 0 2 65 true 6 111");
 }
 
 const ARRAY_REGIONS: &str = "
@@ -2146,7 +2073,7 @@ function main(): void
     }
 }
 "#;
-    assert_runs_natively(source, "3 3 3 7");
+    assert_runs_everywhere(source, "3 3 3 7");
 }
 
 #[test]
@@ -2173,7 +2100,7 @@ function main(): void
     }
 }
 "#;
-    assert_runs_natively(source, "41 41");
+    assert_runs_everywhere(source, "41 41");
 }
 
 #[test]
@@ -2310,7 +2237,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "4 5");
+    assert_runs_everywhere(&source, "4 5");
     // Fixed-length array fields of float and bool elements (section 6).
     let fields = "
 extern \"C\" struct Sample
@@ -2333,7 +2260,7 @@ function main(): void
     }
 }
 ";
-    assert_runs_natively(fields, "1.5 0.25 set");
+    assert_runs_everywhere(fields, "1.5 0.25 set");
 }
 
 #[test]
@@ -2364,7 +2291,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "true 5 0 true 0 5 true");
+    assert_runs_everywhere(&source, "true 5 0 true 0 5 true");
     // A fixed-length array field of nullable pointers (section 6) is a
     // region of words, zero-filled when omitted.
     let fields = format!(
@@ -2391,7 +2318,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&fields, "24 true true 5 4 true");
+    assert_runs_everywhere(&fields, "24 true true 5 4 true");
     // Without pointer formation the interpreter reads and writes them too.
     assert_runs_everywhere(
         "use Doria\\Std\\Ffi\\Pointer;
@@ -2446,7 +2373,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "2 3 4 40 0");
+    assert_runs_everywhere(&source, "2 3 4 40 0");
 }
 
 #[test]
@@ -2520,7 +2447,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "72 33 3 7 115 72 9 7 0 105");
+    assert_runs_everywhere(&source, "72 33 3 7 115 72 9 7 0 105");
     let mismatch = format!(
         "{POINTER}
 extern \"C\" struct Tip
@@ -2541,7 +2468,7 @@ function main(): void
 }}
 "
     );
-    assert_panics_natively(
+    assert_panics_with_title(
         &mismatch,
         "P1704",
         "Array Region Length Does Not Match The Field",
@@ -2590,7 +2517,7 @@ function main(): void
     echo \" \" . $outer->tip->other[2] . \" \" . $outer->tip->text[2];
 }
 ";
-    assert_runs_natively(source, "105 46 105 72 0 72 46 0");
+    assert_runs_everywhere(source, "105 46 105 72 0 72 46 0");
     let mismatch = "
 extern \"C\" struct Tip
 {
@@ -2606,7 +2533,7 @@ function main(): void
     echo $tip->text[0];
 }
 ";
-    assert_panics_natively(
+    assert_panics_with_title(
         mismatch,
         "P1704",
         "Array Region Length Does Not Match The Field",
@@ -2694,7 +2621,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "6 héllo 55357 0 A😀 invalid");
+    assert_runs_everywhere(&source, "6 héllo 55357 0 A😀 invalid");
 }
 
 #[test]
@@ -2759,7 +2686,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "-3 1 1 5 7 9 ");
+    assert_runs_everywhere(&source, "-3 1 1 5 7 9 ");
 }
 
 #[test]
@@ -2876,7 +2803,7 @@ function main(): void
     }
 }
 ";
-    assert_runs_natively(
+    assert_runs_everywhere(
         source,
         "9 7 2.50 -9\n1 2 3 4 5 6 0.5 1.5 2.5 3.5 4.5 5.5 6.5 7.5 8.5",
     );
@@ -2957,7 +2884,7 @@ function main(): void
     }
 }
 ";
-    assert_runs_natively(source, "381002 6 9.5 -1-2-3 true");
+    assert_runs_everywhere(source, "381002 6 9.5 -1-2-3 true");
 }
 
 #[test]
@@ -3010,6 +2937,98 @@ function main(): void
     }
 }
 
+/// A region an unsafe expression returns over a `Bytes` value views the
+/// companion's copy of the buffer while it runs; the host maps it back to
+/// its own `Bytes` at the same offset (Decision 0148 section 23), so the
+/// view reads and writes the program's bytes as it does natively.
+#[test]
+fn a_region_returned_over_the_companions_buffer_copy_views_the_host_bytes() {
+    assert_runs_everywhere(
+        "use Doria\\Std\\Io\\ByteRegion;
+function main(): void
+{
+    Bytes $bytes = Bytes::fromArray([1, 2, 3, 4]);
+    writable ByteRegion $region = $bytes->getRegion(0, 0);
+    unsafe {
+        let $view = $bytes->getRegion(1, 2);
+        echo $view->pointer->read() . \" \";
+        $region = $view;
+    }
+    echo $region[0] . \" \" . $region[1] . \" \" . $region->length;
+}
+",
+        "2 2 3 2",
+    );
+}
+
+/// The frames of the Call Path `stderr` shows, innermost first.
+fn call_path_frames(stderr: &str) -> Vec<&str> {
+    stderr
+        .split("Call Path")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{stderr}"))
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split(" \u{b7} ").next().unwrap_or(line))
+        .take_while(|line| !line.starts_with("Process Exited"))
+        .collect()
+}
+
+#[test]
+fn a_panic_in_a_region_inside_a_callback_shows_the_foreign_call() {
+    // Decision 0148 sections 13 and 23: a region the callback's body runs
+    // links its frame to the Call Path through C as the callback's own
+    // frame does, in the interpreter and natively.
+    let source = format!(
+        "{SORTING}
+extern \"C\" function refuse(Pointer<Opaque> $left, Pointer<Opaque> $right): int32
+{{
+    unsafe {{
+        Pointer<int32> $first = Pointer::cast($left);
+        return $first->read() + 2147483647;
+    }}
+}}
+
+function sort(writable int32[] $values): void
+{{
+    unsafe {{
+        writable WritableArrayRegion<int32> $region = $values->getWritableRegion(0, 2);
+        qsort(WritablePointer::cast($region->writablePointer), CSize::from(2), CSize::from(4), refuse);
+    }}
+}}
+
+function main(): void
+{{
+    writable int32[] $values = [2, 1];
+    sort($values);
+}}
+"
+    );
+    let interpreted = interpret_in_child(&source);
+    let stderr = String::from_utf8_lossy(&interpreted.stderr);
+    assert_eq!(
+        interpreted.status.code(),
+        Some(101),
+        "interpreter: {stderr}"
+    );
+    assert_eq!(
+        call_path_frames(&stderr),
+        ["refuse", "[foreign call]", "sort", "main"],
+        "interpreter: {stderr}"
+    );
+    let mir = program(&source);
+    for profile in NativeProfile::AVAILABLE {
+        let run = execute_native(&mir, *profile);
+        assert_eq!(run.status.code(), Some(101), "{profile:?}: {run:?}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(
+            call_path_frames(&stderr),
+            ["refuse", "[foreign call]", "sort", "main"],
+            "{profile:?}: {stderr}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_callback_on_another_thread_panics_with_p1706() {
@@ -3044,7 +3063,7 @@ function main(): void
     echo \"joined\";
 }
 ";
-    assert_panics_natively(source, "P1706", "C Called Doria From Another Thread");
+    assert_panics_with_title(source, "P1706", "C Called Doria From Another Thread");
 }
 
 /// A C allocator for the foreign-memory programs (Decision 0148 section
@@ -3138,7 +3157,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "5 12 18 released done");
+    assert_runs_everywhere(&source, "5 12 18 released done");
 }
 
 #[test]
@@ -3184,7 +3203,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "-5 5 15 25 25");
+    assert_runs_everywhere(&source, "-5 5 15 25 25");
 }
 
 #[test]
@@ -3204,7 +3223,7 @@ function main(): void
 }}
 "
     );
-    assert_panics_natively(&misaligned, "P1702", "Pointer Access Is Misaligned");
+    assert_panics_with_title(&misaligned, "P1702", "Pointer Access Is Misaligned");
     let negative = format!(
         "{C_ALLOCATOR}
 function main(): void
@@ -3219,7 +3238,7 @@ function main(): void
 }}
 "
     );
-    assert_panics_natively(
+    assert_panics_with_title(
         &negative,
         "P1703",
         "Pointer Arithmetic Left The Address Space",
@@ -3327,7 +3346,7 @@ function main(): void
     echo " compared " . ($writable->acquireReadonlyAccess()->count > 0);
 }
 "#;
-    assert_runs_natively(
+    assert_runs_everywhere(
         source,
         "3 back 3 dropped 3 circle circle shared 7 second 7 found true compared true dropped 1 dropped 7",
     );
@@ -3389,7 +3408,7 @@ function main(): void
     echo " end";
 }
 "#;
-    assert_runs_natively(
+    assert_runs_everywhere(
         source,
         " Ada Ada Ada Grace Grace dropped Grace end dropped Ada",
     );
@@ -3561,7 +3580,7 @@ fn only_the_target_platform_branch_is_emitted_and_linked() {
     if cfg!(target_os = "macos") {
         // `user32` and `x11` have no link input here, and nothing emitted
         // references them.
-        assert_runs_natively(PLATFORM_WINDOWS, "7 Doria");
+        assert_runs_everywhere(PLATFORM_WINDOWS, "7 Doria");
     }
 }
 
@@ -3894,7 +3913,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "10 15 15 1 42 255 7 1");
+    assert_runs_everywhere(&source, "10 15 15 1 42 255 7 1");
 }
 
 #[test]
@@ -3951,7 +3970,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "105 7 111 9 2 257");
+    assert_runs_everywhere(&source, "105 7 111 9 2 257");
 }
 
 #[test]
@@ -3997,7 +4016,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(&source, "none solid 10 mixed 20 7 6 mixed 20 7 6 none");
+    assert_runs_everywhere(&source, "none solid 10 mixed 20 7 6 mixed 20 7 6 none");
 }
 
 #[test]
@@ -4078,7 +4097,7 @@ function main(): void
 }}
 "
     );
-    assert_runs_natively(
+    assert_runs_everywhere(
         &source,
         "10 255 2 2 9 13 4 10 2 102 -1 6 true 2 2 257 7 4 65 0 1 30 255 255 255 3 solid 9 7",
     );
@@ -4126,7 +4145,7 @@ function main(): void
 }}
 "#
     );
-    assert_runs_natively(&source, "41 41\n3\n");
+    assert_runs_everywhere(&source, "41 41\n3\n");
 }
 
 /// A writable foreign struct parameter of a plain function lends the
@@ -4159,7 +4178,7 @@ function main(): void
 }}
 "#
     );
-    assert_runs_natively(&source, "77 77 88 3\n");
+    assert_runs_everywhere(&source, "77 77 88 3\n");
 }
 
 const REGION_EDGES: &str = r#"
@@ -4361,7 +4380,7 @@ fn unsafe_contexts_lower_to_regions_with_their_exits() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(measures.len(), 2, "{measures:?}");
 
-    assert_runs_natively(&source, "1 3 4\n1 3 4 5 6 70\n1 11\n5 caught\n23\n1");
+    assert_runs_everywhere(&source, "1 3 4\n1 3 4 5 6 70\n1 11\n5 caught\n23\n1");
 }
 
 /// An unsafe context in a branch checking finds dead for the target is not
@@ -4393,7 +4412,7 @@ function main(): void
         &source[region.span.start..region.span.end],
         format!("unsafe({live})")
     );
-    assert_runs_natively(&source, if cfg!(windows) { "1" } else { "2" });
+    assert_runs_everywhere(&source, if cfg!(windows) { "1" } else { "2" });
 }
 
 /// A region's inputs are the locals it shares with its surroundings, in
@@ -4460,7 +4479,7 @@ function main(): void
         !outputs.iter().any(|(name, ..)| name == "factor"),
         "{outputs:?}"
     );
-    assert_runs_natively(&source, "done 4");
+    assert_runs_everywhere(&source, "done 4");
 }
 
 /// A nullable Copy value crosses as its non-null form plus its presence:
@@ -4535,7 +4554,7 @@ function main(): void
         let expected = (expected.0.to_string(), expected.1, expected.2);
         assert!(outputs.contains(&expected), "{expected:?} in {outputs:?}");
     }
-    assert_runs_natively(&source, "seven 7 boxed 2");
+    assert_runs_everywhere(&source, "seven 7 boxed 2");
 }
 
 /// The companion has one entry per region identity: the ordinary and the
@@ -4681,7 +4700,7 @@ function main(): void
         }),
         "{operations:#?}"
     );
-    assert_runs_natively(&source, "inside\n5 6");
+    assert_runs_everywhere(&source, "inside\n5 6");
 }
 
 /// A region's companion entry (Decision 0148 section 23, entry ABI
@@ -4803,5 +4822,5 @@ function main(): void
         })
         .count();
     assert_eq!((accepted, released, indexed), (2, 2, 1), "{entry:#?}");
-    assert_runs_natively(&source, "hey!!!\n");
+    assert_runs_everywhere(&source, "hey!!!\n");
 }

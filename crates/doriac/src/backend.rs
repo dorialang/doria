@@ -360,10 +360,6 @@ fn emit_debug(
     linking: &crate::native_link::NativeLinking,
 ) -> Result<BackendOutput, BackendError> {
     let mir = lower_validated_mir(program)?;
-    let companion = crate::unsafe_code::companion_operations(&mir);
-    if !companion.is_empty() {
-        return Err(BackendError::from_diagnostics(companion));
-    }
     let io = mir_interpreter::MirIo {
         linking: linking.clone(),
         ..mir_interpreter::MirIo::default()

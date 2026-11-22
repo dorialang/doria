@@ -27,7 +27,7 @@ pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Di
     Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
         .with_title(title)
         .with_explanation(
-            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and take the target's C data model, through the native companion library. The interpreter does not run foreign structs and unions through it yet, and PHP output does not use it yet.",
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and take the target's C data model, through the native companion library. PHP output does not use it yet.",
         )
 }
 
@@ -63,128 +63,6 @@ pub fn unbuilt_form(span: Span, title: &str, message: impl Into<String>) -> Diag
         .pop()
         .expect("a reported form has its diagnostic")
 }
-
-/// One E0784 diagnostic per MIR operation on a foreign struct or union or
-/// on a region over foreign memory, which the native targets build and the
-/// interpreter does not run yet, in program order. The interpreter runs every other unsafe operation through
-/// the native companion library.
-pub fn companion_operations(program: &crate::mir::Program) -> Vec<Diagnostic> {
-    let mut seen = HashSet::new();
-    let mut diagnostics = Vec::new();
-    for function in &program.functions {
-        for block in &function.blocks {
-            for statement in &block.statements {
-                let (span, title, message) = match statement {
-                    // A region over memory C owns lives on the host as an
-                    // address and a length.
-                    crate::mir::Statement::Pointer {
-                        operation: crate::mir::PointerOperation::ForeignRange { .. },
-                        span,
-                        ..
-                    } => (
-                        span,
-                        "Regions Over Foreign Memory Cannot Run In The Interpreter Yet",
-                        "regions over memory a foreign library owns are part of Doria; the interpreter does not run them yet",
-                    ),
-                    crate::mir::Statement::ForeignField { span, .. }
-                    | crate::mir::Statement::AssignLocal {
-                        value:
-                            crate::mir::Rvalue::ForeignAggregate(
-                                crate::mir::ForeignAggregateExpression::Construct { span, .. },
-                            ),
-                        ..
-                    }
-                    | crate::mir::Statement::AssignProperty {
-                        value:
-                            crate::mir::Rvalue::ForeignAggregate(
-                                crate::mir::ForeignAggregateExpression::Construct { span, .. },
-                            ),
-                        ..
-                    } => (span, AGGREGATE_TITLE, AGGREGATE_MESSAGE),
-                    _ => continue,
-                };
-                if seen.insert(*span) {
-                    diagnostics.push(companion_form(*span, title, message));
-                }
-            }
-        }
-        // Every foreign aggregate value comes from a construction, a
-        // pointer read or a foreign call; a function that only passes one
-        // on is reported where it is declared.
-        let holds_aggregate = function
-            .locals
-            .iter()
-            .any(|local| holds_foreign_aggregate(program, local.ty, &mut HashSet::new()));
-        if holds_aggregate && diagnostics.is_empty() && seen.insert(function.source_span) {
-            diagnostics.push(companion_form(
-                function.source_span,
-                AGGREGATE_TITLE,
-                AGGREGATE_MESSAGE,
-            ));
-        }
-    }
-    // A static property's foreign struct or union lives in static data the
-    // program reads and writes in place.
-    for property in &program.statics {
-        if holds_foreign_aggregate(program, property.ty, &mut HashSet::new())
-            && seen.insert(property.source_span)
-        {
-            diagnostics.push(companion_form(
-                property.source_span,
-                AGGREGATE_TITLE,
-                AGGREGATE_MESSAGE,
-            ));
-        }
-    }
-    diagnostics
-}
-
-/// Whether a value of `ty` holds a foreign struct or union: the aggregate
-/// itself or its nullable form, or a payload enum with one in a case's
-/// payload.
-fn holds_foreign_aggregate(
-    program: &crate::mir::Program,
-    ty: crate::mir::Type,
-    visited: &mut HashSet<crate::enums::EnumId>,
-) -> bool {
-    match ty {
-        crate::mir::Type::ForeignAggregate(_) | crate::mir::Type::NullableForeignAggregate(_) => {
-            true
-        }
-        crate::mir::Type::PayloadEnum(payload) | crate::mir::Type::NullablePayloadEnum(payload) => {
-            visited.insert(payload.id)
-                && program.enums.get(payload.id.0).is_some_and(|definition| {
-                    definition.cases.iter().any(|case| {
-                        case.payload
-                            .iter()
-                            .any(|field| holds_foreign_aggregate(program, field.ty, visited))
-                    })
-                })
-        }
-        // A collection stores its elements inline, and a typed array region
-        // views a typed array's elements.
-        crate::mir::Type::Collection(collection)
-        | crate::mir::Type::NullableCollection(collection) => program
-            .collection_types
-            .get(collection.0)
-            .is_some_and(|definition| {
-                holds_foreign_aggregate(program, definition.value, visited)
-                    || definition
-                        .key
-                        .is_some_and(|key| holds_foreign_aggregate(program, key, visited))
-            }),
-        crate::mir::Type::Region(region) | crate::mir::Type::NullableRegion(region) => {
-            region.array.is_some_and(|array| {
-                holds_foreign_aggregate(program, crate::mir::Type::Collection(array), visited)
-            })
-        }
-        _ => false,
-    }
-}
-
-const AGGREGATE_TITLE: &str = "Foreign Structs And Unions Cannot Run In The Interpreter Yet";
-const AGGREGATE_MESSAGE: &str =
-    "foreign structs and unions are part of Doria; the interpreter does not run them yet";
 
 /// Section 16's `WindowsLastError` capture exists only on Windows, so a
 /// call that emitted code makes to a binding capturing it on another target

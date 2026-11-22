@@ -1,4 +1,5 @@
 //! Configuration retains descriptors, never copies bytes or performs I/O.
+use super::byte_region::RegionSource;
 use super::*;
 use crate::compiler_known_io::{IoErrorReason, IoOperation, IoTarget};
 
@@ -205,9 +206,11 @@ impl Interpreter<'_> {
     ) -> Result<bool, InterpreterError> {
         let source = region
             .source
+            .and_then(RegionSource::elements)
             .ok_or_else(|| InterpreterError::new("transfer region has no storage"))?;
         let prior_source = prior
             .source
+            .and_then(RegionSource::elements)
             .ok_or_else(|| InterpreterError::new("retained transfer region has no storage"))?;
         let storage = self
             .borrowed_collections

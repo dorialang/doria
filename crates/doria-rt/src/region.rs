@@ -169,14 +169,18 @@ pub unsafe extern "C" fn dr_v1_region_slot_store_bytes(
 }
 
 /// The `Bytes` buffer `slot` holds, copied, or null. Frees `previous`.
+/// The slot then names the copy's data, so the host maps a region the
+/// companion returns over the copy back to the buffer it lent (Decision
+/// 0148 section 23).
 ///
 /// # Safety
 ///
-/// `slot` is readable; `previous` is null or a buffer the caller owns.
+/// `slot` is readable and writable; `previous` is null or a buffer the
+/// caller owns.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_region_slot_load_bytes(
     frame: *const DrStackFrameV2,
-    slot: *const DrRegionSlotV1,
+    slot: *mut DrRegionSlotV1,
     previous: *mut DrBytesV1,
 ) -> *mut DrBytesV1 {
     let value = match (*slot).data {
@@ -186,6 +190,7 @@ pub unsafe extern "C" fn dr_v1_region_slot_load_bytes(
             if value.is_null() {
                 panic_catalogued(frame, ALLOCATION_FAILED);
             }
+            (*slot).data = bytes::data(value);
             value
         }
     };
@@ -211,18 +216,23 @@ pub unsafe extern "C" fn dr_v1_region_slot_store_array(
 }
 
 /// Fills `target`, an empty typed array the caller built, with the
-/// elements `slot` holds.
+/// elements `slot` holds. The slot then names the copy's elements, as
+/// `dr_v1_region_slot_load_bytes` records its copy.
 ///
 /// # Safety
 ///
-/// `slot` is readable and holds elements of `target`'s C layout.
+/// `slot` is readable and writable and holds elements of `target`'s C
+/// layout.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_region_slot_load_array(
     frame: *const DrStackFrameV2,
-    slot: *const DrRegionSlotV1,
+    slot: *mut DrRegionSlotV1,
     target: *mut collection::DrCollectionV1,
 ) {
     collection::replace_elements(frame, target, (*slot).data, (*slot).length);
+    if !(*slot).data.is_null() {
+        (*slot).data = collection::element_storage(target).0.cast_const();
+    }
 }
 
 /// Writes `value`, a `CString` or `Utf16String` buffer of `unit_bytes`-byte
