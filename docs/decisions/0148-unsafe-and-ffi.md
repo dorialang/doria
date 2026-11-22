@@ -1008,6 +1008,37 @@ a static property access, and a Doria I/O or runtime intrinsic each run on the
 host through a reverse edge: `host->call(host, operationId, arguments, results)`,
 returning the same status set. Arguments and results cross by the table above.
 
+**Version 1 of the entry ABI.** The facts below belong to version 1, which the
+`v1` in the entry names and `DrRegionHostV1` carry; a change to any of them
+takes a new version.
+
+- One host operation is one whole MIR statement or terminator that needs the
+  host. It runs inside the host frame suspended at the region entry; the locals
+  it reads cross as its arguments and the locals it writes as its results.
+  Values on the host, the host tokens, never leave that frame.
+- The host runs Doria calls, construction, static property access, every
+  operation that touches a host token, and Doria I/O (`echo`, `printf`,
+  `write_stderr`, file and stream I/O, `read_line`). Value operations on the
+  values the companion holds (string building, arithmetic, conversions,
+  region reads) run in the companion against the shared runtime. A panic goes
+  to the panic sink.
+- Operation 0 is reserved: before its own cleanup the companion hands each
+  string output to the host through it, and the output slot carries the host
+  token the host returns.
+- Operation identities come from one MIR host-operation table, numbered in
+  region identity order and then block order; PHP output generates the PHP for
+  each operation from that table.
+- Slots follow C struct layout and alignment. A by-value slot holds the value in
+  its native layout, a nullable one in its nullable layout with its presence
+  (a nullable pointer is one word whose null is zero). A string or foreign
+  string slot is `{const uint8_t *bytes; size_t length}`, with a null `bytes`
+  for an absent `?string`. A buffer or region slot is
+  `{void *data; size_t length}`. A host token is a `uintptr_t`. `outputs` holds
+  the output slots in order (a return value and an error token are among
+  them), then the expression result, then an `int32` break/continue target
+  index. Host-call arguments and results follow the same slot rules in operand
+  order.
+
 **Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
 reverse edge; the body runs on the host. C-callable signatures are FFI-safe, so every
@@ -1158,6 +1189,20 @@ has one precise contract.
 - The companion's entry ABI, status codes, marshalling table, host operations,
   hosted raw-handle tokens, foreign-backed host regions, panic sink, file
   naming, cache path and key (sections 22 and 23).
+- Version 1 of the entry ABI (section 23), specified on 2026-11-22:
+  - Whole statements as host operations: foreign calls and pointer operations
+    are already their own MIR statements, so a host operation holds no native
+    work, and the shared local walk names its exact arguments and results.
+  - Value operations stay in the companion: one runtime per process makes them
+    sound, and a reverse edge per string operation would make string-heavy
+    regions pay a crossing each time.
+  - Operation 0 accepts string outputs: it keeps both the bytes rule and the
+    companion's own cleanup at region exit, with no second export and one
+    status set.
+  - One MIR host-operation table: operation identity has one owner, and a
+    second classification in the PHP backend could drift from it.
+  - The slot layout is C layout, so the companion, the interpreter's loader and
+    PHP's `FFI::cdef` declarations read one shape.
 - The unsafe inventory for `baton audit unsafe` is compiler metadata (section 25).
 - `Platform::architecture` beside `Platform::operatingSystem` (section 17), and
   the placement of `Platform`, `OperatingSystem` and `Architecture` in

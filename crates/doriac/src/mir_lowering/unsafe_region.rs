@@ -409,9 +409,8 @@ pub(super) fn bind_values(program: &mut mir::Program) {
                 terminator_locals(&block.terminator, &modes, &mut note);
             }
             let locals = &function.locals;
-            let value = |local: mir::LocalId| mir::UnsafeRegionValue {
-                local,
-                kind: mir::UnsafeRegionValueKind::of(locals[local.0].ty, collections),
+            let value = |local: mir::LocalId| {
+                mir::UnsafeRegionValue::of(local, locals[local.0].ty, collections)
             };
             region.inputs = used
                 .iter()

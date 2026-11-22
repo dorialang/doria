@@ -8283,6 +8283,31 @@ impl UnsafeRegion {
 pub struct UnsafeRegionValue {
     pub local: LocalId,
     pub kind: UnsafeRegionValueKind,
+    /// A nullable Copy value crosses as its non-null form does, plus its
+    /// presence: native values and regions in their native nullable layout
+    /// (a nullable pointer is one word whose null is zero), a `?string` as
+    /// nullable text. A nullable Move value is a host token and records no
+    /// presence of its own.
+    pub nullable: bool,
+}
+
+impl UnsafeRegionValue {
+    pub fn of(local: LocalId, ty: Type, collections: &[CollectionType]) -> Self {
+        let kind = UnsafeRegionValueKind::of(ty, collections);
+        let nullable = kind != UnsafeRegionValueKind::HostToken
+            && matches!(
+                ty,
+                Type::NullableScalar(_)
+                    | Type::NullableString
+                    | Type::NullableRegion(_)
+                    | Type::NullableForeignAggregate(_)
+            );
+        Self {
+            local,
+            kind,
+            nullable,
+        }
+    }
 }
 
 /// How a value crosses between the host and the companion library, by
@@ -8291,7 +8316,7 @@ pub struct UnsafeRegionValue {
 pub enum UnsafeRegionValueKind {
     /// By value in its native layout: integers, floats, `bool`, enums,
     /// boundary types, pointers, C function pointers, handles, foreign
-    /// aggregates and Copy inline values, and their nullable forms.
+    /// aggregates and Copy inline values.
     Native,
     /// A `string`, as UTF-8 bytes.
     Text,
@@ -8303,16 +8328,20 @@ pub enum UnsafeRegionValueKind {
     Region,
     /// `CString` or `Utf16String`, re-materialized natively.
     ForeignString,
-    /// Every other value stays on the host as an opaque token.
+    /// Every other value stays on the host as an opaque token: class
+    /// instances, interfaces, other collections, closures, `mixed`, shared
+    /// references and nullable Move values.
     HostToken,
 }
 
 impl UnsafeRegionValueKind {
+    /// The crossing of `ty`. A nullable Copy value has the kind of its
+    /// non-null form; `UnsafeRegionValue::nullable` records its presence.
     pub fn of(ty: Type, collections: &[CollectionType]) -> Self {
         match ty {
             Type::Scalar(scalar) | Type::NullableScalar(scalar) => Self::of_scalar(scalar),
             Type::ForeignAggregate(_) | Type::NullableForeignAggregate(_) => Self::Native,
-            Type::String => Self::Text,
+            Type::String | Type::NullableString => Self::Text,
             Type::Region(_) | Type::NullableRegion(_) => Self::Region,
             Type::Collection(id) => {
                 let collection = collections

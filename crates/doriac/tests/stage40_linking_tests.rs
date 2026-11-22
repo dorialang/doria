@@ -632,7 +632,11 @@ fn zlib_regions_name_their_inputs_and_write_backs() {
             .iter()
             .map(|value| {
                 let local = &main.locals[value.local.0];
-                (local.name.trim_start_matches('$').to_string(), value.kind)
+                (
+                    local.name.trim_start_matches('$').to_string(),
+                    value.kind,
+                    value.nullable,
+                )
             })
             .collect::<Vec<_>>()
     };
@@ -657,36 +661,50 @@ fn zlib_regions_name_their_inputs_and_write_backs() {
     let inputs = named(&compress.inputs);
     let outputs = named(&compress.outputs);
     for expected in [
-        ("packed".to_string(), UnsafeRegionValueKind::Buffer),
-        ("packedLength".to_string(), UnsafeRegionValueKind::Native),
-        ("input".to_string(), UnsafeRegionValueKind::Buffer),
+        ("packed".to_string(), UnsafeRegionValueKind::Buffer, false),
+        (
+            "packedLength".to_string(),
+            UnsafeRegionValueKind::Native,
+            false,
+        ),
+        ("input".to_string(), UnsafeRegionValueKind::Buffer, false),
     ] {
         assert!(inputs.contains(&expected), "{expected:?} in {inputs:?}");
     }
     assert!(
-        outputs.contains(&("packed".to_string(), UnsafeRegionValueKind::Buffer)),
+        outputs.contains(&("packed".to_string(), UnsafeRegionValueKind::Buffer, false)),
         "{outputs:?}"
     );
     assert!(
-        outputs.contains(&("packedLength".to_string(), UnsafeRegionValueKind::Native)),
+        outputs.contains(&(
+            "packedLength".to_string(),
+            UnsafeRegionValueKind::Native,
+            false
+        )),
         "{outputs:?}"
     );
     assert!(
-        !outputs.iter().any(|(name, _)| name == "input"),
+        !outputs.iter().any(|(name, ..)| name == "input"),
         "{outputs:?}"
     );
 
     let deflate = region("stream");
     let inputs = named(&deflate.inputs);
     assert!(
-        inputs.contains(&("stream".to_string(), UnsafeRegionValueKind::Native)),
+        inputs.contains(&("stream".to_string(), UnsafeRegionValueKind::Native, false)),
         "{inputs:?}"
     );
     assert!(
-        inputs.contains(&("version".to_string(), UnsafeRegionValueKind::ForeignString)),
+        inputs.contains(&(
+            "version".to_string(),
+            UnsafeRegionValueKind::ForeignString,
+            false
+        )),
         "{inputs:?}"
     );
-    assert!(
-        named(&deflate.outputs).contains(&("stream".to_string(), UnsafeRegionValueKind::Native))
-    );
+    assert!(named(&deflate.outputs).contains(&(
+        "stream".to_string(),
+        UnsafeRegionValueKind::Native,
+        false
+    )));
 }

@@ -4357,34 +4357,109 @@ function main(): void
             .iter()
             .map(|value| {
                 let name = tally.locals[value.local.0].name.trim_start_matches('$');
-                (name.to_string(), value.kind)
+                (name.to_string(), value.kind, value.nullable)
             })
             .collect::<Vec<_>>()
     };
     let inputs = named(&region.inputs);
-    let position = |name: &str| inputs.iter().position(|(input, _)| input == name);
+    let position = |name: &str| inputs.iter().position(|(input, ..)| input == name);
     assert!(position("factor").is_some(), "{inputs:?}");
     assert!(position("total") < position("label"), "{inputs:?}");
     assert!(
-        inputs.contains(&("label".to_string(), UnsafeRegionValueKind::Text)),
+        inputs.contains(&("label".to_string(), UnsafeRegionValueKind::Text, false)),
         "{inputs:?}"
     );
     assert!(
-        inputs.contains(&("factor".to_string(), UnsafeRegionValueKind::Native)),
+        inputs.contains(&("factor".to_string(), UnsafeRegionValueKind::Native, false)),
         "{inputs:?}"
     );
     let outputs = named(&region.outputs);
     assert!(
-        outputs.contains(&("total".to_string(), UnsafeRegionValueKind::Native)),
+        outputs.contains(&("total".to_string(), UnsafeRegionValueKind::Native, false)),
         "{outputs:?}"
     );
     assert!(
-        outputs.contains(&("label".to_string(), UnsafeRegionValueKind::Text)),
+        outputs.contains(&("label".to_string(), UnsafeRegionValueKind::Text, false)),
         "{outputs:?}"
     );
     assert!(
-        !outputs.iter().any(|(name, _)| name == "factor"),
+        !outputs.iter().any(|(name, ..)| name == "factor"),
         "{outputs:?}"
     );
     assert_runs_natively(&source, "done 4");
+}
+
+/// A nullable Copy value crosses as its non-null form plus its presence:
+/// `?int` and `?Pointer<T>` natively, `?string` as nullable text. A
+/// nullable class value is a host token with no presence of its own.
+#[test]
+fn nullable_copy_values_cross_with_their_presence() {
+    use doriac::mir::UnsafeRegionValueKind;
+    let source = format!(
+        "{C_LIBRARY}
+class Counter
+{{
+}}
+
+function describe(?int $count, ?string $name, ?Pointer<int32> $maybe, ?Counter $box): string
+{{
+    writable ?int $copied = null;
+    writable ?string $label = null;
+    writable ?Pointer<int32> $kept = null;
+    writable bool $boxed = false;
+    writable int32 $magnitude = 0;
+    unsafe {{
+        $magnitude = abs(-2);
+        $copied = $count;
+        $label = $name;
+        $kept = $maybe;
+        $boxed = $box is Counter;
+    }}
+    if ($boxed) {{
+        return ($label ?? \"none\") . \" \" . ($copied ?? 0) . \" boxed \" . $magnitude;
+    }}
+    return ($label ?? \"none\") . \" \" . ($copied ?? 0);
+}}
+
+function main(): void
+{{
+    echo describe(7, \"seven\", null, new Counter());
+}}
+"
+    );
+    let mir = program(&source);
+    let describe = function_named(&mir, "describe");
+    let [region] = describe.unsafe_regions.as_slice() else {
+        panic!("{:#?}", describe.unsafe_regions);
+    };
+    let named = |values: &[doriac::mir::UnsafeRegionValue]| {
+        values
+            .iter()
+            .map(|value| {
+                let name = describe.locals[value.local.0].name.trim_start_matches('$');
+                (name.to_string(), value.kind, value.nullable)
+            })
+            .collect::<Vec<_>>()
+    };
+    let inputs = named(&region.inputs);
+    for expected in [
+        ("count", UnsafeRegionValueKind::Native, true),
+        ("name", UnsafeRegionValueKind::Text, true),
+        ("maybe", UnsafeRegionValueKind::Native, true),
+        ("box", UnsafeRegionValueKind::HostToken, false),
+        ("boxed", UnsafeRegionValueKind::Native, false),
+    ] {
+        let expected = (expected.0.to_string(), expected.1, expected.2);
+        assert!(inputs.contains(&expected), "{expected:?} in {inputs:?}");
+    }
+    let outputs = named(&region.outputs);
+    for expected in [
+        ("copied", UnsafeRegionValueKind::Native, true),
+        ("label", UnsafeRegionValueKind::Text, true),
+        ("kept", UnsafeRegionValueKind::Native, true),
+    ] {
+        let expected = (expected.0.to_string(), expected.1, expected.2);
+        assert!(outputs.contains(&expected), "{expected:?} in {outputs:?}");
+    }
+    assert_runs_natively(&source, "seven 7 boxed 2");
 }
