@@ -1249,6 +1249,7 @@ function main(): int { let $box = new Box(); return 42; }
         writable: false,
         owned: false,
         synthetic: true,
+        binding: None,
     };
     let mut entry = program.functions[program.entry.0].clone();
     entry.id = mir::FunctionId(program.functions.len());
@@ -1291,6 +1292,7 @@ function main(): int { let $box = new Box(); return 42; }
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         },
     ];
     main.blocks = vec![

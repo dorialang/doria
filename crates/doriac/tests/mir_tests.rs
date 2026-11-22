@@ -264,6 +264,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                binding: None,
                 owned: false,
             }],
             blocks: vec![
@@ -981,6 +982,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                binding: None,
                 owned: false,
             }],
             blocks: vec![BasicBlock {
@@ -3285,6 +3287,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                binding: None,
                 owned: false,
             }],
             blocks: vec![BasicBlock {

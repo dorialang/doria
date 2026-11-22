@@ -243,6 +243,7 @@ pub(crate) fn build_virtual_return_adapter(
             writable: call_result_is_writable(owned, implementation.return_borrow),
             owned,
             synthetic: true,
+            binding: None,
         });
         let error = mir::LocalId(locals.len());
         locals.push(mir::Local {
@@ -252,6 +253,7 @@ pub(crate) fn build_virtual_return_adapter(
             writable: true,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         vec![
             mir::BasicBlock {

@@ -1457,6 +1457,7 @@ mod tests {
                 writable: false,
                 owned: false,
                 synthetic: false,
+                binding: None,
             };
             assert!(super::local_needs_borrow_home(&function, &local), "{ty}");
             local.owned = true;
@@ -1470,6 +1471,7 @@ mod tests {
             writable: false,
             owned: false,
             synthetic: false,
+            binding: None,
         };
         assert!(!super::local_needs_borrow_home(&function, &parameter));
 
@@ -1655,6 +1657,7 @@ function main(): void { let $input = StandardStreams::input; observe($input); }
                 writable: false,
                 owned: false,
                 synthetic: false,
+                binding: None,
             }];
             assert!(super::has_nominal_borrow_home(ty), "{ty}");
             assert!(

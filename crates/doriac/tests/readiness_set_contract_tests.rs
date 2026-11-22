@@ -943,6 +943,7 @@ function fresh(RegistrationKey<BorrowingReady> $seed): RegistrationKey<Borrowing
         writable: false,
         owned: false,
         synthetic: true,
+        binding: None,
     });
     let error = mir::LocalId(function.locals.len());
     function.locals.push(mir::Local {
@@ -952,6 +953,7 @@ function fresh(RegistrationKey<BorrowingReady> $seed): RegistrationKey<Borrowing
         writable: false,
         owned: true,
         synthetic: true,
+        binding: None,
     });
     let identity = mir::RetainedStorageIdentity {
         origin: function.source_span,
@@ -1129,6 +1131,7 @@ fn mir_helpers_preserve_storage_effects_across_return_types_and_expression_posit
                         owned: false,
                         writable: false,
                         synthetic: true,
+                        binding: None,
                     });
                     statements.push(mir::Statement::AssignLocal {
                         target,
@@ -1330,6 +1333,7 @@ fn mir_conditional_removal_requires_the_call_to_execute_on_every_path() {
             owned: false,
             writable: false,
             synthetic: false,
+            binding: None,
         });
         relay.params.push(enabled);
         relay
@@ -1480,6 +1484,7 @@ fn mir_conditional_removal_requires_the_call_to_execute_on_every_path() {
                     owned: false,
                     writable: false,
                     synthetic: false,
+                    binding: None,
                 });
                 relay.params.push(receiver);
                 relay
@@ -2012,6 +2017,7 @@ fn mir_registration_then_removal_preserves_new_and_incoming_sources() {
         writable: false,
         owned: true,
         synthetic: true,
+        binding: None,
     });
     function.return_type = mir::ReturnType::Value(stream_type);
     function.blocks[1].terminator = mir::Terminator::CheckedIo {

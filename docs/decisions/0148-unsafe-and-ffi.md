@@ -1147,6 +1147,11 @@ takes a new version.
 - The host handle table gives handle `n` to its `n`th entry.
 - One shared runtime holds one attached host, so the interpretations of one
   process that run a companion take turns.
+- PHP output keeps a frame of the region function's MIR locals for each
+  region call. A local that lowers a source binding names it, and the frame
+  takes that binding's PHP value before the call and gives it back after;
+  temporaries and host tokens live only in the frame. Each host operation
+  is a generated PHP function over that frame.
 
 **Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
@@ -1388,6 +1393,11 @@ has one precise contract.
     frames are below the host's, and neither side unwinds.
   - The Call Path of a callback from the runtime's record: the runtime
     already holds the outbound call's frame for every C entry.
+  - A frame of MIR locals for PHP host operations: a host operation is a
+    MIR statement over MIR locals, and PHP output keeps each value in the
+    place of its source binding, so the binding a MIR local records is the
+    one map between them, and the PHP backend classifies no statement of
+    its own.
   - Import slots for runtime data on Windows: an import library defines
     only the `__imp_` slot for a DLL's data, and COFF has no automatic
     data import. Native code keeps its direct store around each foreign

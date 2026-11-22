@@ -1017,6 +1017,7 @@ fn writable_region_excludes_source_reads_and_mutation() {
                 writable: false,
                 owned: false,
                 synthetic: true,
+                binding: None,
             });
             Statement::AssignLocal {
                 target,

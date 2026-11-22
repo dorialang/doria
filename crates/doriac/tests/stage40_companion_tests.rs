@@ -234,6 +234,44 @@ fn offset(mir: &Program, function: &str, record: &SlotRecord, name: &str) -> usi
         .offset as usize
 }
 
+/// Each local a region exchanges with its surroundings names the source
+/// binding it lowers, which a host that keeps its own place for each
+/// binding (PHP output) reads and writes; a temporary names none.
+#[test]
+fn region_locals_name_the_bindings_they_lower() {
+    let source = format!("{C_LIBRARY}{SHOUT}");
+    let mir = program(&source);
+    let function = mir
+        .functions
+        .iter()
+        .find(|candidate| candidate.name == "shout")
+        .unwrap();
+    let region = &function.unsafe_regions[0];
+    let binding = |name: &str| {
+        let local = region
+            .inputs
+            .iter()
+            .map(|value| &function.locals[value.local.0])
+            .find(|local| local.name.trim_start_matches('$') == name)
+            .unwrap_or_else(|| panic!("`{name}` is a region input"));
+        local
+            .binding
+            .unwrap_or_else(|| panic!("`{name}` names its binding"))
+    };
+    assert_ne!(binding("text"), binding("count"));
+    let parameters = function
+        .params
+        .iter()
+        .map(|parameter| function.locals[parameter.0].binding)
+        .collect::<Vec<_>>();
+    assert!(parameters.iter().all(Option::is_some), "{parameters:?}");
+    assert!(function
+        .locals
+        .iter()
+        .filter(|local| local.synthetic)
+        .all(|local| local.binding.is_none()));
+}
+
 /// Calls the region of `shout` from this process through a stub host on
 /// every profile: a fallthrough edge and a `break` edge, each writing the
 /// outputs, handing the string to the host and returning its status.

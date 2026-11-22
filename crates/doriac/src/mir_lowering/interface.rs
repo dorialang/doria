@@ -687,6 +687,7 @@ fn build_collection_entry(
         writable: operation == Op::Advance,
         owned: false,
         synthetic: true,
+        binding: None,
     }];
     let mut statements = Vec::new();
     if operation != Op::Advance {
@@ -697,6 +698,7 @@ fn build_collection_entry(
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         statements.push(mir::Statement::AssignLocal {
             target: source,
@@ -777,6 +779,7 @@ fn build_collection_entry(
                     writable: false,
                     owned: false,
                     synthetic: true,
+                    binding: None,
                 });
                 statements.push(mir::Statement::AssignLocal {
                     target: position,
@@ -790,6 +793,7 @@ fn build_collection_entry(
                     writable: false,
                     owned: false,
                     synthetic: true,
+                    binding: None,
                 });
                 statements.push(mir::Statement::CoreCollection {
                     collection: source,
@@ -825,6 +829,7 @@ fn build_collection_entry(
                         writable: false,
                         owned: false,
                         synthetic: true,
+                        binding: None,
                     });
                     statements.push(mir::Statement::AssignLocal { target, value });
                     read_local_as_rvalue(target, definition.value, true)
@@ -898,6 +903,7 @@ fn build_entry(
             owned: parameter.mode == mir::FunctionParameterMode::Take
                 && parameter.ty.requires_owned_cleanup(),
             synthetic: true,
+            binding: None,
         })
         .collect::<Vec<_>>();
     let params = locals.iter().map(|local| local.id).collect::<Vec<_>>();
@@ -971,6 +977,7 @@ fn build_entry(
             writable: locals[0].writable,
             owned: locals[0].owned,
             synthetic: true,
+            binding: None,
         });
         statements.push(mir::Statement::AssignLocal {
             target,
@@ -1002,6 +1009,7 @@ fn build_entry(
             writable: call_result_is_writable(owned, implementation.return_borrow),
             owned,
             synthetic: true,
+            binding: None,
         });
         Some((local, ty))
     } else {
@@ -1052,6 +1060,7 @@ fn build_entry(
             writable: true,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         blocks.push(mir::BasicBlock {
             id: mir::BlockId(0),
@@ -2486,6 +2495,7 @@ function main(): void { inspect(true); inspect(false); }
             id: alias,
             owned: false,
             synthetic: true,
+            binding: None,
             ..original.clone()
         });
         let mut inserted = false;

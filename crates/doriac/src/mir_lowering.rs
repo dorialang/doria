@@ -18,6 +18,7 @@ use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType
 use crate::semantics::executable_effects::InstanceEffects;
 use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
 use crate::source::Span;
+use crate::symbols::BindingId;
 use crate::types::{resolved_type_is_symbolic, substitute_resolved_type, ClassType, ResolvedType};
 use crate::{hir, mir};
 
@@ -3970,8 +3971,10 @@ fn lower_function(
     let mut params = Vec::new();
     if let Some(class) = receiver {
         let writable = matches!(signature.receiver_mode, Some(mir::ReceiverMode::Writable));
+        let binding = context.receiver_binding(function.span);
         params.push(context.declare_user_local_owned(
             "this",
+            binding,
             writable,
             context.class_receiver_type(class),
             signature.receiver_mode == Some(mir::ReceiverMode::Consuming),
@@ -3985,8 +3988,13 @@ fn lower_function(
             .zip(signature.parameter_owns.iter().copied())
             .zip(signature.parameter_modes.iter().copied())
             .map(|(((param, ty), owned), mode)| {
-                let local =
-                    context.declare_user_local_owned(&param.name, param.writable, ty, owned);
+                let local = context.declare_user_local_owned(
+                    &param.name,
+                    context.binding_declared_at(param.span),
+                    param.writable,
+                    ty,
+                    owned,
+                );
                 // A lent place is the caller's storage, as for a closure.
                 if mode == mir::FunctionParameterMode::Writable
                     || param.writable && ty.has_move_ownership()
@@ -3995,7 +4003,12 @@ fn lower_function(
                 } else if param.writable && ty.requires_owned_cleanup() && !owned {
                     // Ordinary Copy parameters replace a private value. The ABI
                     // input stays borrowed; this binding owns its copy and cleanup.
-                    let snapshot = context.declare_user_local(&param.name, true, ty);
+                    let snapshot = context.declare_user_local(
+                        &param.name,
+                        context.binding_declared_at(param.span),
+                        true,
+                        ty,
+                    );
                     context.push_statement(mir::Statement::AssignLocal {
                         target: snapshot,
                         value: local_rvalue(local, ty, true),
@@ -4645,7 +4658,14 @@ fn lower_closure_function(
             // Writable captures alias the original owning place. Only a
             // consuming call owns the captured value's cleanup obligation.
             let owned = consumed && ty.requires_owned_cleanup();
-            let local = context.declare_synthetic_named_local(name, writable, ty, owned, consumed);
+            let local = context.declare_synthetic_named_local(
+                name,
+                Some(capture.source_binding_id),
+                writable,
+                ty,
+                owned,
+                consumed,
+            );
             if writable {
                 context.replaceable_writable_bindings.insert(local);
             }
@@ -4666,6 +4686,7 @@ fn lower_closure_function(
     {
         let local = context.declare_user_local_owned(
             &parameter.name,
+            context.binding_declared_at(parameter.span),
             parameter.writable,
             definition.ty,
             matches!(definition.mode, mir::FunctionParameterMode::Take)
@@ -5691,7 +5712,13 @@ fn lower_try_statement(
             .mir_resolved_type(&clause.error_type)
             .expect("checked catch type has executable MIR metadata");
         let caught = if let Some(binding) = &clause.binding {
-            context.declare_pattern_local(&binding.name, catch_ty, true, true)
+            context.declare_pattern_local(
+                &binding.name,
+                context.binding_declared_at(binding.span),
+                catch_ty,
+                true,
+                true,
+            )
         } else {
             context.declare_hidden_owned_local(catch_ty)
         };
@@ -8407,6 +8434,7 @@ fn lower_collection_foreach_in_scope(
             CollectionForeachProjection::Main,
         ) => Some(context.declare_user_local(
             &binding.name,
+            context.binding_declared_at(binding.span),
             false,
             mir::Type::Scalar(mir::ScalarType::Integer(index_type)),
         )),
@@ -8421,7 +8449,13 @@ fn lower_collection_foreach_in_scope(
                     "checked Dictionary-key foreach plan has no key type",
                 )]
             })?;
-            Some(context.declare_user_local_owned(&binding.name, false, key_type, false))
+            Some(context.declare_user_local_owned(
+                &binding.name,
+                context.binding_declared_at(binding.span),
+                false,
+                key_type,
+                false,
+            ))
         }
         (None, _, _) => None,
         (Some(binding), crate::semantics::ForeachIterationKind::ValueOnly, _) => {
@@ -8445,6 +8479,7 @@ fn lower_collection_foreach_in_scope(
     };
     let value_local = context.declare_user_local_owned(
         &foreach.value_binding.name,
+        context.binding_declared_at(foreach.value_binding.span),
         foreach.value_binding.writable,
         binding_type,
         false,
@@ -8657,12 +8692,18 @@ fn lower_region_foreach_in_scope(
     let first_local = foreach.first_binding.as_ref().map(|binding| {
         context.declare_user_local(
             &binding.name,
+            context.binding_declared_at(binding.span),
             false,
             mir::Type::Scalar(mir::ScalarType::Integer(index_type)),
         )
     });
-    let value_local =
-        context.declare_user_local_owned(&foreach.value_binding.name, writable, element, false);
+    let value_local = context.declare_user_local_owned(
+        &foreach.value_binding.name,
+        context.binding_declared_at(foreach.value_binding.span),
+        writable,
+        element,
+        false,
+    );
 
     let header_block = context.create_block();
     let body_block = context.create_block();
@@ -9319,6 +9360,7 @@ fn lower_range_foreach_in_scope(
 
     let binding_local = context.declare_user_local(
         &foreach.value_binding.name,
+        context.binding_declared_at(foreach.value_binding.span),
         false,
         mir::Type::Scalar(mir::ScalarType::Integer(integer_type)),
     );
@@ -10441,14 +10483,47 @@ impl<'semantic> LoweringContext<'semantic> {
         self.current_block = None;
     }
 
-    fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
-        let owned = user_local_type_owns_value(ty);
-        self.declare_user_local_owned(name, writable, ty, owned)
+    /// The source binding declared at `span`, which the user local declared
+    /// for it lowers.
+    fn binding_declared_at(&self, span: Span) -> Option<BindingId> {
+        self.semantic_info
+            .binding_resolution
+            .declaration_by_span
+            .get(&span)
+            .copied()
     }
 
+    /// The receiver binding of the method declared at `span`, which has no
+    /// source declaration of its own.
+    fn receiver_binding(&self, span: Span) -> Option<BindingId> {
+        let owner = crate::symbols::LexicalOwner::Callable(span);
+        self.semantic_info
+            .binding_resolution
+            .declarations_by_id
+            .values()
+            .find(|declaration| {
+                declaration.kind == crate::symbols::BindingKind::MethodReceiver
+                    && declaration.owner == owner
+            })
+            .map(|declaration| declaration.id)
+    }
+
+    fn declare_user_local(
+        &mut self,
+        name: &str,
+        binding: Option<BindingId>,
+        writable: bool,
+        ty: mir::Type,
+    ) -> mir::LocalId {
+        let owned = user_local_type_owns_value(ty);
+        self.declare_user_local_owned(name, binding, writable, ty, owned)
+    }
+
+    /// Declares the local that lowers the source binding `binding`.
     fn declare_user_local_owned(
         &mut self,
         name: &str,
+        binding: Option<BindingId>,
         writable: bool,
         ty: mir::Type,
         owned: bool,
@@ -10461,6 +10536,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable,
             owned,
             synthetic: false,
+            binding,
         });
         self.local_scopes
             .last_mut()
@@ -10485,12 +10561,15 @@ impl<'semantic> LoweringContext<'semantic> {
     ) -> mir::LocalId {
         let name = format!("{prefix}{}", self.temp_counter);
         self.temp_counter += 1;
-        self.declare_synthetic_named_local(&name, writable, ty, owned, true)
+        self.declare_synthetic_named_local(&name, None, writable, ty, owned, true)
     }
 
+    /// Declares a compiler-named local; `binding` is the source binding it
+    /// lowers, such as the capture a closure body reads.
     fn declare_synthetic_named_local(
         &mut self,
         name: &str,
+        binding: Option<BindingId>,
         writable: bool,
         ty: mir::Type,
         owned: bool,
@@ -10504,6 +10583,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable,
             owned,
             synthetic: true,
+            binding,
         });
         self.local_scopes
             .last_mut()
@@ -10529,6 +10609,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         id
     }
@@ -10544,6 +10625,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned,
             synthetic: true,
+            binding: None,
         });
         id
     }
@@ -10559,6 +10641,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned,
             synthetic: true,
+            binding: None,
         });
         if byte_region::is_type(ty) {
             self.track_region_temporary(id);
@@ -10591,6 +10674,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         // The structured checked-error edge owns and consumes this carrier.
         // It is deliberately absent from lexical cleanup obligations.
@@ -10633,6 +10717,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         if byte_region::is_type(ty) {
             self.track_region_temporary(id);
@@ -10640,9 +10725,12 @@ impl<'semantic> LoweringContext<'semantic> {
         id
     }
 
+    /// Declares a pattern, catch or payload local; `binding` is the source
+    /// binding it lowers, none for a compiler-introduced payload slot.
     fn declare_pattern_local(
         &mut self,
         name: &str,
+        binding: Option<BindingId>,
         ty: mir::Type,
         owned: bool,
         cleanup: bool,
@@ -10655,6 +10743,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned,
             synthetic: true,
+            binding,
         });
         self.local_scopes
             .last_mut()
@@ -10685,6 +10774,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         self.scope_owned_locals
             .last_mut()
@@ -10704,6 +10794,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         id
     }
@@ -10729,6 +10820,7 @@ impl<'semantic> LoweringContext<'semantic> {
             writable: false,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         let obligation = drop_obligation_for_owned_local(id, ty);
         if let Some(statement) = self.statement_owned_locals.last_mut() {
@@ -11748,7 +11840,8 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         lower_rvalue_as_expected(&decl.initializer, ty, context)?
     };
     let owned = user_local_type_owns_value(ty) && !value.borrows_move_value();
-    let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
+    let binding = context.binding_declared_at(decl.bindings[0].span);
+    let local = context.declare_user_local_owned(name, binding, decl.writable, ty, owned);
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value,
@@ -11882,7 +11975,14 @@ fn lower_grouped_var_decl(
     let targets = decl
         .bindings
         .iter()
-        .map(|binding| context.declare_user_local(&binding.name, decl.writable, ty))
+        .map(|binding| {
+            context.declare_user_local(
+                &binding.name,
+                context.binding_declared_at(binding.span),
+                decl.writable,
+                ty,
+            )
+        })
         .collect();
     context.push_statement(mir::Statement::AssignLocalGroup { targets, value });
     Ok(())
@@ -11986,7 +12086,8 @@ fn lower_string_var_decl(
         .first()
         .expect("string local declaration must contain one binding")
         .name;
-    let local = context.declare_user_local(name, decl.writable, mir::Type::String);
+    let binding = context.binding_declared_at(decl.bindings[0].span);
+    let local = context.declare_user_local(name, binding, decl.writable, mir::Type::String);
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value: mir::Rvalue::String(value),
@@ -17129,7 +17230,13 @@ fn bind_match_arm(
                         && (owned
                             || matches!(ty, mir::Type::String | mir::Type::NullableString)
                             || copy_payload_cleanup);
-                    Ok(context.declare_pattern_local(&binding.name, ty, owned, cleanup))
+                    Ok(context.declare_pattern_local(
+                        &binding.name,
+                        context.binding_declared_at(binding.span),
+                        ty,
+                        owned,
+                        cleanup,
+                    ))
                 })
                 .collect::<DiagnosticResult<Vec<_>>>()?;
             context.push_statement(mir::Statement::BindPayloadEnumFields {
@@ -17162,7 +17269,13 @@ fn bind_match_arm(
                 && (transfer || copy_payload_cleanup);
             let cleanup = !matches!(mode, mir::MatchBindingMode::GuardView)
                 && (owned || matches!(ty, mir::Type::String | mir::Type::NullableString));
-            let target = context.declare_pattern_local(&binding.name, ty, owned, cleanup);
+            let target = context.declare_pattern_local(
+                &binding.name,
+                context.binding_declared_at(binding.span),
+                ty,
+                owned,
+                cleanup,
+            );
             let value = narrowed_match_local_rvalue(
                 scrutinee,
                 scrutinee_type,

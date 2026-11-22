@@ -287,6 +287,7 @@ fn binding_entry(
             writable: true,
             owned,
             synthetic: true,
+            binding: None,
         });
         id
     };
@@ -471,6 +472,7 @@ fn forwarder(
             writable: true,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         id
     };
@@ -780,6 +782,7 @@ impl<'f> EntryBuilder<'f> {
                 writable: true,
                 owned: false,
                 synthetic: true,
+                binding: None,
             });
             id
         };

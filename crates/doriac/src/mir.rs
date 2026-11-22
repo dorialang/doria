@@ -1539,6 +1539,12 @@ pub struct Local {
     pub writable: bool,
     pub owned: bool,
     pub synthetic: bool,
+    /// The source binding the local lowers, when it lowers one: a
+    /// parameter, a receiver, a declared local, a loop, catch or match
+    /// binding, or a closure capture. A backend that keeps its own place
+    /// for a binding (PHP output) reaches the local's value there through
+    /// this identity. Temporaries and compiler-introduced locals have none.
+    pub binding: Option<BindingId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

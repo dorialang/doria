@@ -217,6 +217,7 @@ fn payload_match(
                     || (field.requires_owned_cleanup() && !field.has_move_ownership());
                 let local = context.declare_pattern_local(
                     &format!("<core payload {position}>"),
+                    None,
                     *field,
                     false,
                     cleanup,

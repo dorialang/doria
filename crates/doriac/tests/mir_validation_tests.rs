@@ -572,6 +572,7 @@ fn writable_class_aliases_cannot_escalate_readonly_source_access() {
             name: "alias".into(),
             owned: false,
             synthetic: true,
+            binding: None,
             ..owner.clone()
         });
         let value = match owner.ty {
@@ -670,6 +671,7 @@ function inspect(writable {type_name} $items): void {{}}
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         let target = LocalId(function.locals.len());
         function.locals.push(Local {
@@ -679,6 +681,7 @@ function inspect(writable {type_name} $items): void {{}}
             writable: permits_writable_value,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         let entry = function.entry_block;
         function.blocks[entry.0].statements.extend([
@@ -803,6 +806,7 @@ function main(): void {{ let $holder = new Holder(); $holder->inspect(); }}
                 writable: true,
                 owned: false,
                 synthetic: true,
+                binding: None,
             });
             id
         };
@@ -839,6 +843,7 @@ function main(): void {{ let $holder = new Holder(); $holder->inspect(); }}
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         let view = append_view(function);
         function.blocks[entry.0].statements.splice(
@@ -4394,6 +4399,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
             writable: false,
             owned: true,
             synthetic: false,
+            binding: None,
         }],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4441,6 +4447,7 @@ fn shared_validator_enforces_grouped_local_invariants() {
             writable: false,
             owned: false,
             synthetic: false,
+            binding: None,
         })
         .collect();
     valid.functions[0].blocks[0].statements = vec![Statement::AssignLocalGroup {
@@ -4563,6 +4570,7 @@ fn shared_validator_rejects_confused_string_intrinsic_collection_shapes() {
         ty: Type::Collection(CollectionTypeId(0)),
         writable: false,
         synthetic: true,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0].statements = vec![
@@ -4598,6 +4606,7 @@ fn shared_validator_rejects_wrong_nullable_string_intrinsic_representation() {
         ty: Type::NullableString,
         writable: false,
         synthetic: true,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0]
@@ -4639,6 +4648,7 @@ fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
         ty: Type::Collection(CollectionTypeId(0)),
         writable: false,
         synthetic: false,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0].statements = vec![
@@ -4916,6 +4926,7 @@ fn shared_validator_enforces_sequence_fill_shape() {
         writable: false,
         owned: true,
         synthetic: false,
+        binding: None,
     });
     program.functions[0].blocks[0].statements = vec![
         Statement::AssignLocal {
@@ -4978,6 +4989,7 @@ fn shared_validator_requires_exact_is_proof_for_mixed_payload_reads() {
         writable: false,
         owned: true,
         synthetic: false,
+        binding: None,
     });
     program.functions[0].blocks[0]
         .statements
@@ -5020,6 +5032,7 @@ fn shared_validator_limits_explicit_string_drops_to_synthetic_temporaries() {
         ty: Type::String,
         writable: false,
         synthetic: true,
+        binding: None,
         owned: false,
     });
     program.functions[0].blocks[0].statements = vec![
@@ -5158,6 +5171,7 @@ fn shared_validator_rejects_scalar_string_assignment_mixing() {
         ty: Type::String,
         writable: true,
         synthetic: false,
+        binding: None,
         owned: false,
     });
     program.functions[0].blocks[0]
@@ -5200,6 +5214,7 @@ fn shared_validator_rejects_nullable_rvalue_assigned_to_plain_string() {
         ty: Type::String,
         writable: true,
         synthetic: false,
+        binding: None,
         owned: false,
     });
     program.functions[0].blocks[0]
@@ -5498,6 +5513,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -5821,6 +5837,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
                 writable: false,
                 owned: false,
                 synthetic: false,
+                binding: None,
             },
             class_local(1, ClassId(0)),
         ],
@@ -6041,6 +6058,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -6157,6 +6175,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
                 ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -6192,6 +6211,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
             writable: false,
             synthetic: false,
+            binding: None,
             owned: false,
         },
         borrowed_class_local(1, ClassId(0)),
@@ -6892,6 +6912,7 @@ fn shared_validator_requires_class_properties_in_construction_order() {
         ty: Type::String,
         writable: false,
         synthetic: false,
+        binding: None,
         owned: false,
     });
     let Statement::AssignLocal {
@@ -6973,6 +6994,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         writable: false,
         owned: false,
         synthetic: false,
+        binding: None,
     };
     program.functions.push(Function {
         id: FunctionId(1),
@@ -7717,6 +7739,7 @@ function main(): void {
         writable: false,
         owned: false,
         synthetic: true,
+        binding: None,
     });
     let entry = &mut main.blocks[main.entry_block.0];
     let construction = entry.statements.iter().position(|statement| {
@@ -8440,6 +8463,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
                 ty: Type::NullableClass(ClassId(1)),
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -8552,6 +8576,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
             ty: Type::SharedReference(doriac::mir::SharedPayload::Class(ClassId(0))),
             writable: false,
             synthetic: false,
+            binding: None,
             owned: false,
         }],
         blocks: vec![BasicBlock {
@@ -8587,6 +8612,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         ty: Type::WeakReference(doriac::mir::SharedPayload::Class(ClassId(0))),
         writable: false,
         synthetic: false,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0]
@@ -8644,6 +8670,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
             ty: Type::WeakReference(doriac::mir::SharedPayload::Class(ClassId(0))),
             writable: false,
             synthetic: false,
+            binding: None,
             owned: false,
         }],
         blocks: vec![BasicBlock {
@@ -8830,6 +8857,7 @@ fn class_local(index: usize, class: ClassId) -> Local {
         ty: Type::Class(class),
         writable: false,
         synthetic: false,
+        binding: None,
         owned: true,
     }
 }
@@ -8906,6 +8934,7 @@ fn class_new_program() -> Program {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
