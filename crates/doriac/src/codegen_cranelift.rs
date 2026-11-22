@@ -86,6 +86,7 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 const RUNTIME_RETURNED_TRAP: u8 = 1;
 
 mod c_entry;
+mod companion;
 mod process;
 mod readiness_set;
 #[cfg(test)]
@@ -94,7 +95,7 @@ mod stream_callbacks;
 mod terminal;
 
 struct DeclaredNativeItems<'a> {
-    function_ids: &'a [FuncId],
+    function_ids: &'a [Option<FuncId>],
     class_drop_function_ids: &'a [FuncId],
     collection_drop_function_ids: &'a [FuncId],
     closure_drop_function_ids: &'a [FuncId],
@@ -120,7 +121,18 @@ pub(crate) fn lower_validated_mir_to_object_with_metrics(
 ) -> Result<Vec<u8>, BackendError> {
     let isa_builder =
         cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
-    lower_validated_mir_to_object_for_isa(program, isa_builder, metrics)
+    lower_validated_mir_to_object_for_isa(program, isa_builder, metrics, None)
+}
+
+/// The object of the native companion library `library` (Decision 0148
+/// section 23): its emitted functions, each region entry exported as its
+/// versioned C entry, and no process entry.
+pub(crate) fn lower_companion_object(
+    library: &mir::companion::CompanionLibrary,
+) -> Result<Vec<u8>, BackendError> {
+    let isa_builder =
+        cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
+    lower_validated_mir_to_object_for_isa(&library.program, isa_builder, None, Some(library))
 }
 
 /// The shared Cranelift settings for every Doria object.
@@ -153,6 +165,7 @@ fn lower_validated_mir_to_object_for_isa(
     program: &mir::Program,
     isa_builder: cranelift_codegen::isa::Builder,
     metrics: Option<&mut mir_validation::OptimizationMetrics>,
+    companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Vec<u8>, BackendError> {
     let isa = isa_builder
         .finish(native_flags()?)
@@ -162,15 +175,50 @@ fn lower_validated_mir_to_object_for_isa(
             .map_err(|error| backend_failure(error.to_string()))?,
     );
 
+    // A companion emits only its own functions; every other function of
+    // the program stays on the host and is not declared.
+    let emits = |function: &mir::Function| {
+        companion.is_none_or(|library| library.emitted.contains(&function.id))
+    };
     let mut function_ids = Vec::with_capacity(program.functions.len());
     for function in &program.functions {
+        if !emits(function) {
+            function_ids.push(None);
+            continue;
+        }
         let signature = function_signature(&mut module, program, function)?;
         let function_id = module
             .declare_function(&function_symbol(function), Linkage::Local, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
-        function_ids.push(function_id);
+        function_ids.push(Some(function_id));
     }
-    let c_entries = c_entry::declare(&mut module, program)?;
+    let c_entries = c_entry::declare(&mut module, program, companion)?;
+    if companion.is_some() {
+        let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
+        let declarations = DeclaredNativeItems {
+            function_ids: &function_ids,
+            class_drop_function_ids: &[],
+            collection_drop_function_ids: &[],
+            closure_drop_function_ids: &[],
+            closure_descriptor_ids: &[],
+            class_descriptor_ids: &[],
+            static_ids: &[],
+        };
+        for function in program.functions.iter().filter(|function| emits(function)) {
+            define_function(
+                &mut module,
+                program,
+                function,
+                &declarations,
+                &optimization.functions[function.id.0],
+            )?;
+        }
+        c_entry::define(&mut module, program, &c_entries, &function_ids)?;
+        return module
+            .finish()
+            .emit()
+            .map_err(|error| backend_failure(error.to_string()));
+    }
     let class_drop_function_ids = declare_class_drop_functions(&mut module, program)?;
     let collection_drop_function_ids = declare_collection_drop_functions(&mut module, program)?;
     let closure_drop_function_ids = declare_closure_drop_functions(&mut module, program)?;
@@ -333,7 +381,7 @@ fn declare_closure_drop_functions(
 fn define_closure_descriptors(
     module: &mut ObjectModule,
     program: &mir::Program,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     closure_drop_function_ids: &[FuncId],
 ) -> Result<Vec<DataId>, BackendError> {
     let pointer_bytes = usize::from(module.target_config().pointer_bytes());
@@ -342,8 +390,9 @@ fn define_closure_descriptors(
         .closure_descriptors
         .iter()
         .map(|descriptor| {
-            let entry = *function_ids
+            let entry = function_ids
                 .get(descriptor.entry_function.0)
+                .and_then(|id| *id)
                 .ok_or_else(|| malformed_mir("closure descriptor entry was not declared"))?;
             let drop_environment = *closure_drop_function_ids
                 .get(descriptor.id.0)
@@ -390,7 +439,7 @@ fn declare_interface_vtable(
 fn define_class_descriptors(
     module: &mut ObjectModule,
     program: &mir::Program,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     class_drop_function_ids: &[FuncId],
 ) -> Result<Vec<DataId>, BackendError> {
     let pointer_bytes = usize::from(module.target_config().pointer_bytes());
@@ -447,9 +496,16 @@ fn define_class_descriptors(
                 let Some(function) = entry.implementation else {
                     continue;
                 };
-                let function = *function_ids.get(function.0).ok_or_else(|| {
-                    malformed_mir(format!("virtual function{} was not declared", function.0))
-                })?;
+                let function =
+                    function_ids
+                        .get(function.0)
+                        .and_then(|id| *id)
+                        .ok_or_else(|| {
+                            malformed_mir(format!(
+                                "virtual function{} was not declared",
+                                function.0
+                            ))
+                        })?;
                 let function = module.declare_func_in_data(function, &mut table);
                 table.write_function_addr((slot * pointer_bytes) as u32, function);
             }
@@ -1136,7 +1192,7 @@ fn define_nonclass_interface_vtable(
     module: &mut ObjectModule,
     program: &mir::Program,
     table: &mir::InterfaceVtable,
-    functions: &[FuncId],
+    functions: &[Option<FuncId>],
     collection_drops: &[FuncId],
 ) -> Result<DataId, BackendError> {
     let width = usize::from(module.target_config().pointer_bytes());
@@ -1235,7 +1291,11 @@ fn define_nonclass_interface_vtable(
     let reference = module.declare_func_in_data(drop, &mut data);
     data.write_function_addr((width * 3) as u32, reference);
     for (slot, function) in table.methods.iter().enumerate() {
-        let reference = module.declare_func_in_data(functions[function.0], &mut data);
+        let function = functions
+            .get(function.0)
+            .and_then(|id| *id)
+            .ok_or_else(|| malformed_mir("interface method entry was not declared"))?;
+        let reference = module.declare_func_in_data(function, &mut data);
         data.write_function_addr(
             (width * (crate::native_abi::INTERFACE_VTABLE_HEADER_WORDS + slot)) as u32,
             reference,
@@ -1250,7 +1310,7 @@ fn define_nonclass_interface_vtable(
 fn define_static_data(
     module: &mut ObjectModule,
     program: &mir::Program,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     class_drop_function_ids: &[FuncId],
     collection_drop_function_ids: &[FuncId],
     class_descriptor_ids: &[DataId],
@@ -1492,8 +1552,9 @@ fn define_static_data(
             module.declare_data_in_data(class_descriptor_id, &mut description);
         description.write_data_addr((pointer_bytes * 8) as u32, class_descriptor_reference, 0);
         for (slot, function) in table.methods.iter().enumerate() {
-            let function = *function_ids
+            let function = function_ids
                 .get(function.0)
+                .and_then(|id| *id)
                 .ok_or_else(|| malformed_mir("interface method entry was not declared"))?;
             let reference = module.declare_func_in_data(function, &mut description);
             description.write_function_addr(
@@ -1589,8 +1650,9 @@ fn define_function(
         static_ids,
         ..
     } = declarations;
-    let function_id = *function_ids
+    let function_id = function_ids
         .get(function.id.0)
+        .and_then(|id| *id)
         .ok_or_else(|| malformed_mir(format!("function{} was not declared", function.id.0)))?;
     let signature = function_signature(module, program, function)?;
     let mut context = module.make_context();
@@ -2887,15 +2949,16 @@ fn define_process_main(
     program: &mir::Program,
     process_main_id: FuncId,
     process_signature: &Signature,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     static_ids: &[DataId],
 ) -> Result<(), BackendError> {
     let entry = program
         .functions
         .get(program.entry.0)
         .ok_or_else(|| malformed_mir("entry function does not exist"))?;
-    let entry_id = *function_ids
+    let entry_id = function_ids
         .get(program.entry.0)
+        .and_then(|id| *id)
         .ok_or_else(|| malformed_mir("entry function was not declared"))?;
 
     let mut context = module.make_context();
@@ -3283,7 +3346,7 @@ fn clif_tag_type(width: u32) -> Result<ClifType, BackendError> {
 struct LoweringResources<'module, 'program> {
     module: &'module mut ObjectModule,
     program: &'program mir::Program,
-    function_ids: &'program [FuncId],
+    function_ids: &'program [Option<FuncId>],
     class_drop_function_ids: &'program [FuncId],
     collection_drop_function_ids: &'program [FuncId],
     closure_descriptor_ids: &'program [DataId],
@@ -4112,13 +4175,22 @@ fn lower_statement(
             target,
             ..
         } => lower_foreign_call(builder, function, args, *target, resources)?,
-        mir::Statement::HostRecord { .. }
-        | mir::Statement::RegionSlot { .. }
-        | mir::Statement::CallHost { .. } => {
-            return Err(malformed_mir(
-                "a companion entry statement reached the program's own code generation",
-            ))
-        }
+        mir::Statement::HostRecord {
+            target,
+            size,
+            align,
+        } => companion::host_record(builder, *target, *size, *align, resources)?,
+        mir::Statement::RegionSlot {
+            record,
+            slot,
+            access,
+        } => companion::region_slot(builder, *record, *slot, *access, resources)?,
+        mir::Statement::CallHost {
+            host,
+            operation,
+            arguments,
+            results,
+        } => companion::call_host(builder, *host, *operation, *arguments, *results, resources)?,
         mir::Statement::ForeignField {
             aggregate,
             offset,
@@ -24636,9 +24708,10 @@ fn declared_function(
     resources: &mut LoweringResources<'_, '_>,
     function: mir::FunctionId,
 ) -> Result<cranelift_codegen::ir::FuncRef, BackendError> {
-    let function_id = *resources
+    let function_id = resources
         .function_ids
         .get(function.0)
+        .and_then(|id| *id)
         .ok_or_else(|| malformed_mir(format!("function{} does not exist", function.0)))?;
     Ok(resources
         .module

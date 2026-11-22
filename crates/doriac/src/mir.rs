@@ -7043,12 +7043,13 @@ pub enum Statement {
         access: SlotAccess,
     },
     /// `host->call(host, operation, arguments, results)` through the
-    /// `DrRegionHostV1` the pointer local `host` addresses; an absent
-    /// record passes a null pointer. In version 1 every operation returns
-    /// status 0, and a panic on the host never returns. Only companion
-    /// entries contain it.
+    /// `DrRegionHostV1` the pointer local `host` addresses, or, when `host`
+    /// is `None`, the host attached at load, which a callback entry calls
+    /// since C passes it none; an absent record passes a null pointer. In
+    /// version 1 every operation returns status 0, and a panic on the host
+    /// never returns. Only companion entries contain it.
     CallHost {
-        host: LocalId,
+        host: Option<LocalId>,
         operation: u32,
         arguments: Option<LocalId>,
         results: Option<LocalId>,
@@ -8367,6 +8368,44 @@ pub struct Companion {
     /// Operation `n` is `host_operations[n - 1]`; operation 0
     /// (`ACCEPT_OUTPUT_OPERATION`) hands an output to the host.
     pub host_operations: Vec<HostOperation>,
+    /// One callback per C-callable function, in `Program::c_entries` order;
+    /// their operations follow every host operation.
+    pub callbacks: Vec<CompanionCallback>,
+}
+
+/// A C-callable function (Decision 0148 section 23, Callbacks): the
+/// companion holds its C entry, exported as `doria_callback_v1_<n>`, which
+/// checks the thread and forwards the call to the host as operation
+/// `operation`, whose arguments are the function's parameters and whose
+/// results are its return value. The body runs on the host, which holds
+/// the function's C function pointer value as that entry's address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionCallback {
+    pub operation: u32,
+    pub function: FunctionId,
+    pub arguments: SlotRecord,
+    pub results: SlotRecord,
+    /// The forwarding function the C entry calls. Its id follows every
+    /// region entry, and region entries take its C entry address in place
+    /// of the function's.
+    pub forwarder: Function,
+}
+
+impl CompanionCallback {
+    /// The exported C entry, numbered by the callback's operation.
+    pub fn entry_symbol(&self) -> String {
+        format!("doria_callback_v1_{}", self.operation)
+    }
+}
+
+impl Companion {
+    /// Whether `function` is a region entry, whose C entry links its frame
+    /// to the host frame it receives.
+    pub fn is_region_entry(&self, function: FunctionId) -> bool {
+        self.regions
+            .iter()
+            .any(|region| region.entry.id == function)
+    }
 }
 
 /// The reserved host operation through which the companion hands each
@@ -8515,8 +8554,9 @@ pub enum UnsafeRegionValueKind {
     Native,
     /// A `string`, as UTF-8 bytes.
     Text,
-    /// `Bytes` or a `T[]` of native elements: copied into a native buffer,
-    /// and copied back at every exit when the region writes it.
+    /// `Bytes` or a `T[]` of C-layout elements (those a region over the
+    /// array addresses): copied into a native buffer, and copied back at
+    /// every exit when the region writes it.
     Buffer,
     /// A byte or typed array region: over host storage it crosses as a
     /// buffer does; over foreign memory, as address and length.
@@ -8546,8 +8586,11 @@ impl UnsafeRegionValueKind {
                 match collection.kind {
                     CollectionKind::Bytes => Self::Buffer,
                     CollectionKind::ForeignString(_) => Self::ForeignString,
+                    // Its elements cross as `{data, length}`, so they keep
+                    // the C layout a region over the array addresses
+                    // (section 8).
                     CollectionKind::TypedArray
-                        if Self::of(collection.value, collections) == Self::Native =>
+                        if crate::native_abi::pointee_layout(collection.value).is_some() =>
                     {
                         Self::Buffer
                     }
@@ -12332,8 +12375,8 @@ impl fmt::Display for Statement {
                 };
                 write!(
                     formatter,
-                    "call_host(local{}, {operation}, {}, {})",
-                    host.0,
+                    "call_host({}, {operation}, {}, {})",
+                    host.map_or_else(|| "attached".to_string(), |host| format!("local{}", host.0)),
                     record(arguments),
                     record(results)
                 )

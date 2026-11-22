@@ -846,7 +846,7 @@ mod tests {
         let context = Context::create();
         let machine = host_target_machine().unwrap();
         let target = machine.get_target_data();
-        let module = build_module(&context, &machine, &program, None).unwrap();
+        let module = build_module(&context, &machine, &program, None, None).unwrap();
         let declarations = DeclaredProgram {
             functions: program
                 .functions

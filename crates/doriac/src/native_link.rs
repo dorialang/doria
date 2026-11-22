@@ -294,6 +294,17 @@ impl NativeLinking {
         program: &crate::mir::Program,
         target: CTarget,
     ) -> Result<LinkPlan, Vec<Diagnostic>> {
+        self.resolve_functions(program.functions.iter(), target)
+    }
+
+    /// The link plan of the code of `functions` for `target`: a companion
+    /// library links what its own functions reference (Decision 0148
+    /// section 23).
+    pub fn resolve_functions<'f>(
+        &self,
+        functions: impl Iterator<Item = &'f crate::mir::Function>,
+        target: CTarget,
+    ) -> Result<LinkPlan, Vec<Diagnostic>> {
         let mut diagnostics = Vec::new();
         let mut plan = LinkPlan {
             windows_subsystem: self.windows_subsystem,
@@ -301,7 +312,7 @@ impl NativeLinking {
         };
         let mut referenced = BTreeSet::new();
         let mut runtime_names = BTreeMap::<OsString, PathBuf>::new();
-        for (library, span) in referenced_libraries(program) {
+        for (library, span) in referenced_libraries(functions) {
             let (package, facts) = self.library_for(span.source, &library);
             if !referenced.insert((package.map(str::to_string), library.clone())) {
                 continue;
@@ -403,12 +414,12 @@ impl NativeLinking {
     }
 }
 
-/// Every logical library a foreign call of `program` names, with the
+/// Every logical library a foreign call of `functions` names, with the
 /// call's span, in program order.
-fn referenced_libraries(program: &crate::mir::Program) -> Vec<(String, Span)> {
-    program
-        .functions
-        .iter()
+fn referenced_libraries<'f>(
+    functions: impl Iterator<Item = &'f crate::mir::Function>,
+) -> Vec<(String, Span)> {
+    functions
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.statements)
         .filter_map(|statement| match statement {

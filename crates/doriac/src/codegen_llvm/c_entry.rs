@@ -15,8 +15,18 @@ use crate::native_abi::c_abi::{
 use inkwell::attributes::Attribute;
 
 /// The symbol of the C entry of `function`.
-pub(super) fn symbol(function: mir::FunctionId) -> String {
-    format!("__doria_c_entry_{}", function.0)
+pub(super) fn symbol(program: &mir::Program, function: mir::FunctionId) -> String {
+    // A companion exports its callbacks' C entries (Decision 0148
+    // section 23).
+    match program
+        .companion
+        .callbacks
+        .iter()
+        .find(|callback| callback.forwarder.id == function)
+    {
+        Some(callback) => callback.entry_symbol(),
+        None => format!("__doria_c_entry_{}", function.0),
+    }
 }
 
 /// The C layout of a C entry's parameters and result, and their placement.
@@ -165,19 +175,35 @@ pub(super) fn declare<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
     program: &mir::Program,
+    companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Vec<(mir::FunctionId, FunctionValue<'ctx>)>, BackendError> {
-    program
-        .c_entries
-        .iter()
+    // A companion's C entries are its exported region entries and its
+    // callbacks' forwarders (Decision 0148 section 23).
+    let entries = match companion {
+        Some(_) => program
+            .companion
+            .regions
+            .iter()
+            .map(|region| region.entry.id)
+            .chain(program.c_entries.iter().copied())
+            .collect::<Vec<_>>(),
+        None => program.c_entries.clone(),
+    };
+    entries
+        .into_iter()
         .map(|id| {
-            let function = function_in(program, *id)?;
+            let function = function_in(program, id)?;
             let (_, physical) = physical(program, function)?;
             let (ty, attributes) = c_function_type(context, &physical, aggregate_size(function));
-            let entry = module.add_function(&symbol(*id), ty, Some(Linkage::Internal));
+            let (name, linkage) = match companion.and_then(|library| library.export(id)) {
+                Some(name) => (name, Linkage::External),
+                None => (symbol(program, id), Linkage::Internal),
+            };
+            let entry = module.add_function(&name, ty, Some(linkage));
             for (index, attribute) in attributes {
                 entry.add_attribute(AttributeLoc::Param(index), attribute);
             }
-            Ok((*id, entry))
+            Ok((id, entry))
         })
         .collect()
 }
@@ -280,6 +306,7 @@ fn emit<'ctx>(
     frame: PointerValue<'ctx>,
     callee: FunctionValue<'ctx>,
 ) -> Result<(), BackendError> {
+    let region = program.companion.is_region_entry(function.id);
     let (types, physical) = physical(program, function)?;
     let pointer = context.ptr_type(AddressSpace::default());
     let word = context.i64_type();
@@ -288,24 +315,35 @@ fn emit<'ctx>(
     builder.position_at_end(block);
     let received = entry.get_params();
 
-    // The thread check and the frame link (section 13).
-    let usize_type = word;
-    let frame_type = context.struct_type(&[usize_type.into(); 11], false);
-    let marker = build(builder.build_alloca(frame_type, "c.entry.marker"))?;
-    let enter = module
-        .get_function(crate::native_abi::ENTER_C_FUNCTION)
-        .unwrap_or_else(|| {
-            module.add_function(
-                crate::native_abi::ENTER_C_FUNCTION,
-                pointer.fn_type(&[pointer.into(), pointer.into()], false),
-                Some(Linkage::External),
-            )
-        });
-    let parent =
-        build(builder.build_call(enter, &[marker.into(), frame.into()], "c.entry.parent"))?
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| backend_failure("the C entry runtime call returns the parent frame"))?;
+    // The thread check and the frame link (section 13). A region entry's
+    // frame links to the host frame its caller passes (section 23).
+    let (symbol, arguments) = if region {
+        let caller = *received
+            .get(1)
+            .ok_or_else(|| malformed_mir("a region entry receives its caller's frame"))?;
+        (
+            crate::native_abi::ENTER_REGION,
+            [frame.into(), caller.into()],
+        )
+    } else {
+        let frame_type = context.struct_type(&[word.into(); 11], false);
+        let marker = build(builder.build_alloca(frame_type, "c.entry.marker"))?;
+        (
+            crate::native_abi::ENTER_C_FUNCTION,
+            [marker.into(), frame.into()],
+        )
+    };
+    let enter = module.get_function(symbol).unwrap_or_else(|| {
+        module.add_function(
+            symbol,
+            pointer.fn_type(&[pointer.into(), pointer.into()], false),
+            Some(Linkage::External),
+        )
+    });
+    let parent = build(builder.build_call(enter, &arguments, "c.entry.parent"))?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| backend_failure("the C entry runtime call returns the parent frame"))?;
 
     let mut aggregates: HashMap<usize, PointerValue<'ctx>> = HashMap::new();
     let mut scalars: HashMap<usize, BasicValueEnum<'ctx>> = HashMap::new();

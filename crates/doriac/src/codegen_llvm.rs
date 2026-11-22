@@ -91,6 +91,7 @@ use crate::native_closure_abi;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 mod c_entry;
+mod companion;
 mod process;
 mod readiness_set;
 mod stream_callbacks;
@@ -111,7 +112,7 @@ pub fn lower_mir_to_llvm_ir(program: &mir::Program) -> Result<String, BackendErr
     mir_validation::validate_program(program)?;
     let target_machine = host_target_machine()?;
     let context = Context::create();
-    let module = build_module(&context, &target_machine, program, None)?;
+    let module = build_module(&context, &target_machine, program, None, None)?;
     Ok(module.print_to_string().to_string())
 }
 
@@ -121,7 +122,7 @@ pub fn lower_mir_to_optimized_llvm_ir(program: &mir::Program) -> Result<String, 
     mir_validation::validate_program(program)?;
     let target_machine = host_target_machine()?;
     let context = Context::create();
-    let module = build_module(&context, &target_machine, program, None)?;
+    let module = build_module(&context, &target_machine, program, None, None)?;
     optimize_module(&module, &target_machine)?;
     Ok(module.print_to_string().to_string())
 }
@@ -155,10 +156,32 @@ pub(crate) fn lower_validated_mir_to_object_with_metrics(
 ) -> Result<Vec<u8>, BackendError> {
     let target_machine = host_target_machine()?;
     let context = Context::create();
-    let module = build_module(&context, &target_machine, program, metrics)?;
+    let module = build_module(&context, &target_machine, program, metrics, None)?;
 
     optimize_module(&module, &target_machine)?;
 
+    let object = target_machine
+        .write_to_memory_buffer(&module, FileType::Object)
+        .map_err(|error| backend_failure(format!("LLVM object emission failed: {error}")))?;
+    Ok(object.as_slice().to_vec())
+}
+
+/// The object of the native companion library `library` (Decision 0148
+/// section 23): its emitted functions, each region entry exported as its
+/// versioned C entry, and no process entry.
+pub(crate) fn lower_companion_object(
+    library: &mir::companion::CompanionLibrary,
+) -> Result<Vec<u8>, BackendError> {
+    let target_machine = host_target_machine()?;
+    let context = Context::create();
+    let module = build_module(
+        &context,
+        &target_machine,
+        &library.program,
+        None,
+        Some(library),
+    )?;
+    optimize_module(&module, &target_machine)?;
     let object = target_machine
         .write_to_memory_buffer(&module, FileType::Object)
         .map_err(|error| backend_failure(format!("LLVM object emission failed: {error}")))?;
@@ -186,6 +209,7 @@ fn build_module<'ctx>(
     target_machine: &TargetMachine,
     program: &mir::Program,
     metrics: Option<&mut mir_validation::OptimizationMetrics>,
+    companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Module<'ctx>, BackendError> {
     let triple = TargetMachine::get_default_triple();
     let module = context.create_module("doria_stage_15");
@@ -195,7 +219,7 @@ fn build_module<'ctx>(
 
     let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
     let functions = declare_functions(context, &module, &target_data, program)?;
-    let c_entries = c_entry::declare(context, &module, program)?;
+    let c_entries = c_entry::declare(context, &module, program, companion)?;
     for function in &program.functions {
         let offset = native_closure_abi::NativeCallableSignaturePlan::direct(function)
             .source_parameter_offset() as u32;
@@ -227,6 +251,65 @@ fn build_module<'ctx>(
                 );
             }
         }
+    }
+    if let Some(library) = companion {
+        // A companion emits only its own functions; every other function of
+        // the program stays on the host, and its unused declaration goes.
+        let declarations = DeclaredProgram {
+            functions,
+            class_drop_functions: Vec::new(),
+            collection_drop_functions: Vec::new(),
+            closure_drop_functions: Vec::new(),
+            closure_descriptors: Vec::new(),
+            class_descriptors: Vec::new(),
+            statics: Vec::new(),
+            interface_vtables: Vec::new(),
+            error_origins: Vec::new(),
+        };
+        for function in &program.functions {
+            if library.emitted.contains(&function.id) {
+                define_function(
+                    context,
+                    &module,
+                    &target_data,
+                    program,
+                    function,
+                    &declarations,
+                    &optimization.functions[function.id.0],
+                )?;
+            }
+        }
+        c_entry::define(
+            context,
+            &module,
+            &target_data,
+            program,
+            &c_entries,
+            &declarations,
+        )?;
+        for function in &program.functions {
+            if library.emitted.contains(&function.id) {
+                continue;
+            }
+            let declaration = declarations.functions[function.id.0];
+            if declaration
+                .as_global_value()
+                .as_pointer_value()
+                .get_first_use()
+                .is_some()
+            {
+                return Err(malformed_mir(format!(
+                    "the companion reaches `{}`, which runs on the host",
+                    function.name
+                )));
+            }
+            // SAFETY: the declaration has no body and no use.
+            unsafe { declaration.delete() };
+        }
+        module
+            .verify()
+            .map_err(|error| backend_failure(format!("LLVM verification failed: {error}")))?;
+        return Ok(module);
     }
     let class_drop_functions = declare_class_drop_functions(context, &module, program);
     let collection_drop_functions = declare_collection_drop_functions(context, &module, program);
@@ -5535,13 +5618,22 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 target,
                 ..
             } => self.lower_foreign_call(function, args, *target)?,
-            mir::Statement::HostRecord { .. }
-            | mir::Statement::RegionSlot { .. }
-            | mir::Statement::CallHost { .. } => {
-                return Err(malformed_mir(
-                    "a companion entry statement reached the program's own code generation",
-                ))
-            }
+            mir::Statement::HostRecord {
+                target,
+                size,
+                align,
+            } => self.lower_host_record(*target, *size, *align)?,
+            mir::Statement::RegionSlot {
+                record,
+                slot,
+                access,
+            } => self.lower_region_slot(*record, *slot, *access)?,
+            mir::Statement::CallHost {
+                host,
+                operation,
+                arguments,
+                results,
+            } => self.lower_call_host(*host, *operation, *arguments, *results)?,
             mir::Statement::ForeignField {
                 aggregate,
                 offset,
@@ -23574,7 +23666,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::PointerOperation::CEntryAddress { function } => {
                 let entry = self
                     .module
-                    .get_function(&c_entry::symbol(*function))
+                    .get_function(&c_entry::symbol(self.program, *function))
                     .ok_or_else(|| malformed_mir("a C entry address names a declared C entry"))?;
                 Some(
                     build(self.builder.build_ptr_to_int(

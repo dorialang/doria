@@ -190,7 +190,181 @@ pub fn plan(program: &Program) -> Result<Companion, CompanionPlanError> {
             entry,
         });
     }
+    plan_callbacks(program, &mut companion).map_err(|details| CompanionPlanError {
+        span: companion.regions[0].entry.source_span,
+        details,
+    })?;
     Ok(companion)
+}
+
+/// The callbacks of `companion`: every C-callable function of the program,
+/// in `Program::c_entries` order, numbered after every host operation. A
+/// host holds a C function pointer value as the address of its callback's
+/// C entry in the companion, wherever the value was taken, and the entries
+/// take their C entry addresses from the forwarders.
+fn plan_callbacks(program: &Program, companion: &mut Companion) -> Result<(), String> {
+    let first_forwarder = program.functions.len() + companion.regions.len();
+    let mut callbacks = Vec::<CompanionCallback>::new();
+    for (index, function) in program.c_entries.iter().enumerate() {
+        let callable = program
+            .functions
+            .get(function.0)
+            .filter(|callable| callable.id == *function)
+            .ok_or("a C entry names an emitted function")?;
+        let operation = (companion.host_operations.len() + index) as u32 + 1;
+        let id = FunctionId(first_forwarder + index);
+        callbacks.push(forwarder(program, callable, operation, id)?);
+    }
+    for region in &mut companion.regions {
+        for block in &mut region.entry.blocks {
+            for statement in &mut block.statements {
+                if let Statement::Pointer {
+                    operation: PointerOperation::CEntryAddress { function },
+                    ..
+                } = statement
+                {
+                    *function = callbacks
+                        .iter()
+                        .find(|callback| callback.function == *function)
+                        .ok_or("a C entry address names a C-callable function")?
+                        .forwarder
+                        .id;
+                }
+            }
+        }
+    }
+    companion.callbacks = callbacks;
+    Ok(())
+}
+
+/// The forwarder of the C-callable function `callable`: its parameters,
+/// stored into an argument record, host operation `operation`, and its
+/// return value loaded from the result record.
+fn forwarder(
+    program: &Program,
+    callable: &Function,
+    operation: u32,
+    id: FunctionId,
+) -> Result<CompanionCallback, String> {
+    let mut locals = callable
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| Local {
+            id: LocalId(index),
+            ..callable.locals[parameter.0].clone()
+        })
+        .collect::<Vec<_>>();
+    let params = (0..locals.len()).map(LocalId).collect::<Vec<_>>();
+    let mut local = |name: &str, ty: Type| {
+        let id = LocalId(locals.len());
+        locals.push(Local {
+            id,
+            name: name.to_string(),
+            ty,
+            writable: true,
+            owned: false,
+            synthetic: true,
+        });
+        id
+    };
+    let arguments_record = local("$arguments", POINTER);
+    let results_record = local("$results", POINTER);
+    let result = match callable.return_type {
+        ReturnType::Value(ty) => Some((local("$result", ty), ty)),
+        ReturnType::Void => None,
+    };
+    let collections = &program.collection_types;
+    let values = |locals: &[Local], ids: &mut dyn Iterator<Item = LocalId>| {
+        ids.map(|id| UnsafeRegionValue::of(id, locals[id.0].ty, collections))
+            .collect::<Vec<_>>()
+    };
+    let shell = Function {
+        locals: locals.clone(),
+        ..callable.clone()
+    };
+    let arguments = SlotRecord::of(&shell, values(&locals, &mut params.iter().copied()), false)
+        .ok_or("a callback's arguments fit a record")?;
+    let results = SlotRecord::of(
+        &shell,
+        values(&locals, &mut result.iter().map(|(local, _)| *local)),
+        false,
+    )
+    .ok_or("a callback's result fits a record")?;
+    if arguments.slots.len() != params.len() || results.slots.len() != usize::from(result.is_some())
+    {
+        return Err(format!(
+            "`{}` passes a value with no slot; C-callable signatures pass every value by value",
+            callable.name
+        ));
+    }
+    let mut statements = vec![Statement::HostRecord {
+        target: arguments_record,
+        size: arguments.size,
+        align: arguments.align,
+    }];
+    statements.extend(arguments.slots.iter().map(|slot| Statement::RegionSlot {
+        record: arguments_record,
+        slot: *slot,
+        access: SlotAccess::Store,
+    }));
+    if result.is_some() {
+        statements.push(Statement::HostRecord {
+            target: results_record,
+            size: results.size,
+            align: results.align,
+        });
+    }
+    statements.push(Statement::CallHost {
+        host: None,
+        operation,
+        arguments: (!arguments.slots.is_empty()).then_some(arguments_record),
+        results: result.is_some().then_some(results_record),
+    });
+    statements.extend(results.slots.iter().map(|slot| Statement::RegionSlot {
+        record: results_record,
+        slot: *slot,
+        access: SlotAccess::Load,
+    }));
+    let terminator = match result {
+        Some((local, ty)) => {
+            Terminator::Return(super::value_factory::local_rvalue(local, ty, false))
+        }
+        None => Terminator::ReturnVoid,
+    };
+    let forwarder = Function {
+        id,
+        name: callable.name.clone(),
+        source_span: callable.source_span,
+        diagnostic_frame: callable.diagnostic_frame,
+        method: None,
+        virtual_slot: None,
+        receiver_mode: None,
+        closure: None,
+        params,
+        parameter_modes: callable.parameter_modes.clone(),
+        return_type: callable.return_type,
+        return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
+        test_assertion_checked_effects: Vec::new(),
+        checked_effects: Vec::new(),
+        locals,
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements,
+            terminator,
+        }],
+        entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
+    };
+    Ok(CompanionCallback {
+        operation,
+        function: callable.id,
+        arguments,
+        results,
+        forwarder,
+    })
 }
 
 /// A terminator that leaves the function is a region exit the host
@@ -596,7 +770,7 @@ impl<'f> EntryBuilder<'f> {
                     span: self.region.span,
                 });
                 statements.push(Statement::CallHost {
-                    host: self.host,
+                    host: Some(self.host),
                     operation: ACCEPT_OUTPUT_OPERATION,
                     arguments: Some(self.slot),
                     results: Some(self.slot),
@@ -662,7 +836,7 @@ impl<'f> EntryBuilder<'f> {
                 }),
         );
         statements.push(Statement::CallHost {
-            host: self.host,
+            host: Some(self.host),
             operation: operation.id,
             arguments,
             results,
@@ -742,9 +916,44 @@ fn status(status: i32) -> Terminator {
     )))
 }
 
-/// The program the companion library compiles: `program` with each
-/// region's entry after its functions, at the index the entry's id names.
-pub fn library(program: &Program) -> Program {
+/// The native companion library of a program (Decision 0148 section 23):
+/// the program with each region's entry after its functions, at the index
+/// the entry's id names, and the functions the library emits.
+#[derive(Debug, Clone)]
+pub struct CompanionLibrary {
+    pub program: Program,
+    /// The functions the library emits, in id order: every region entry and
+    /// each extern declaration's function an entry calls. Every other
+    /// statement of a region that reaches a function is a host operation,
+    /// so nothing else is reached; the program's own functions stay on the
+    /// host, and their ids keep their places only so types and calls keep
+    /// their meaning.
+    pub emitted: Vec<FunctionId>,
+}
+
+impl CompanionLibrary {
+    /// The exported symbol of `function`, when it is a region entry or a
+    /// callback's forwarder, whose C entry the host takes as the C function
+    /// pointer value of the callback.
+    pub fn export(&self, function: FunctionId) -> Option<String> {
+        let companion = &self.program.companion;
+        let first =
+            self.program.functions.len() - companion.regions.len() - companion.callbacks.len();
+        let index = function.0.checked_sub(first)?;
+        match companion.regions.get(index) {
+            Some(region) => Some(region.entry_symbol()),
+            None => companion
+                .callbacks
+                .get(index - companion.regions.len())
+                .map(CompanionCallback::entry_symbol),
+        }
+    }
+}
+
+/// The companion library of `program`. What each entry reaches is what the
+/// shared local walk reports, the same walk that decides which statements
+/// are host operations.
+pub fn library(program: &Program) -> CompanionLibrary {
     let mut library = program.clone();
     library.functions.extend(
         program
@@ -753,5 +962,42 @@ pub fn library(program: &Program) -> Program {
             .iter()
             .map(|region| region.entry.clone()),
     );
-    library
+    library.functions.extend(
+        program
+            .companion
+            .callbacks
+            .iter()
+            .map(|callback| callback.forwarder.clone()),
+    );
+    // The companion's C entries are its callbacks' forwarders; the
+    // program's C-callable functions run on the host.
+    library.c_entries = program
+        .companion
+        .callbacks
+        .iter()
+        .map(|callback| callback.forwarder.id)
+        .collect();
+    let modes = |_: FunctionId, _: usize| None;
+    let mut emitted = HashSet::new();
+    for region in &program.companion.regions {
+        emitted.insert(region.entry.id);
+        let mut reach = |reach: HostReach| {
+            if let HostReach::Call(Some(function)) = reach {
+                emitted.insert(function);
+            }
+        };
+        for block in &region.entry.blocks {
+            for statement in &block.statements {
+                statement_touches(statement, &modes, &mut |_, _| {}, &mut reach);
+            }
+            terminator_touches(&block.terminator, &modes, &mut |_, _| {}, &mut reach);
+        }
+    }
+    emitted.extend(library.c_entries.iter().copied());
+    let mut emitted = emitted.into_iter().collect::<Vec<_>>();
+    emitted.sort_by_key(|function| function.0);
+    CompanionLibrary {
+        program: library,
+        emitted,
+    }
 }

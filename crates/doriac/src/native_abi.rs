@@ -224,6 +224,74 @@ pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
 /// recording of the thread running Doria code at process entry.
 pub const FOREIGN_CALL_FRAME: &str = "dr_v1_foreign_call_frame";
 pub const ENTER_C_FUNCTION: &str = "dr_v1_enter_c_function";
+/// Enters a companion region entry: the thread check, then the host's
+/// frame as the region's parent (Decision 0148 section 23).
+pub const ENTER_REGION: &str = "dr_v1_enter_region";
+/// The host a companion's callback entries forward to.
+pub const REGION_HOST: &str = "dr_v1_region_host";
+/// The slot accessors of content values (Decision 0148 section 23, entry
+/// ABI version 1): `store(slot, value)` lends a value's content, and
+/// `load` copies a slot's content into a value the companion owns.
+pub const REGION_SLOT_STORE_TEXT: &str = "dr_v1_region_slot_store_text";
+pub const REGION_SLOT_LOAD_TEXT: &str = "dr_v1_region_slot_load_text";
+pub const REGION_SLOT_STORE_BYTES: &str = "dr_v1_region_slot_store_bytes";
+pub const REGION_SLOT_LOAD_BYTES: &str = "dr_v1_region_slot_load_bytes";
+pub const REGION_SLOT_STORE_ARRAY: &str = "dr_v1_region_slot_store_array";
+pub const REGION_SLOT_LOAD_ARRAY: &str = "dr_v1_region_slot_load_array";
+pub const REGION_SLOT_STORE_FOREIGN_STRING: &str = "dr_v1_region_slot_store_foreign_string";
+pub const REGION_SLOT_LOAD_FOREIGN_STRING: &str = "dr_v1_region_slot_load_foreign_string";
+
+/// How a `RegionSlot` statement moves a slot's value, shared by both
+/// native backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionSlotForm {
+    /// Copied between the local's storage and the slot in its native layout.
+    Native,
+    /// A string, through the text accessors; `nullable` for `?string`.
+    Text { nullable: bool },
+    /// A `Bytes` buffer.
+    Bytes,
+    /// A typed array of C-layout elements.
+    Array(crate::mir::CollectionTypeId),
+    /// A `CString` or `Utf16String` of `unit_bytes`-byte code units.
+    ForeignString { unit_bytes: u64 },
+    /// A region view `{data, length}`; `nullable` for a `?` region, whose
+    /// local also holds its presence.
+    Region { nullable: bool },
+}
+
+impl RegionSlotForm {
+    pub fn of(slot: mir::CompanionSlot, ty: mir::Type, program: &mir::Program) -> Option<Self> {
+        let collection = |ty: mir::Type| match ty {
+            mir::Type::Collection(id) => program.collection_types.get(id.0).map(|c| (id, c.kind)),
+            _ => None,
+        };
+        Some(match slot.value.kind {
+            mir::UnsafeRegionValueKind::Native => Self::Native,
+            mir::UnsafeRegionValueKind::Text => Self::Text {
+                nullable: ty == mir::Type::NullableString,
+            },
+            mir::UnsafeRegionValueKind::Buffer => match collection(ty)? {
+                (_, mir::CollectionKind::Bytes) => Self::Bytes,
+                (id, mir::CollectionKind::TypedArray) => Self::Array(id),
+                _ => return None,
+            },
+            mir::UnsafeRegionValueKind::ForeignString => match collection(ty)? {
+                (_, mir::CollectionKind::ForeignString(encoding)) => Self::ForeignString {
+                    unit_bytes: match encoding {
+                        crate::foreign::ForeignStringEncoding::Utf8 => 1,
+                        crate::foreign::ForeignStringEncoding::Utf16 => 2,
+                    },
+                },
+                _ => return None,
+            },
+            mir::UnsafeRegionValueKind::Region => Self::Region {
+                nullable: matches!(ty, mir::Type::NullableRegion(_)),
+            },
+            mir::UnsafeRegionValueKind::HostToken => return None,
+        })
+    }
+}
 pub const RECORD_DORIA_THREAD: &str = "dr_v1_record_doria_thread";
 /// Decision 0148 section 14 (amendment of 2026-11-17): the trampoline
 /// through which the fast profile calls a variadic C function, and the

@@ -15,8 +15,18 @@ use crate::native_abi::c_abi::{
 use cranelift_codegen::ir::ArgumentPurpose;
 
 /// The symbol of the C entry of `function`.
-pub(super) fn symbol(function: mir::FunctionId) -> String {
-    format!("__doria_c_entry_{}", function.0)
+pub(super) fn symbol(program: &mir::Program, function: mir::FunctionId) -> String {
+    // A companion exports its callbacks' C entries (Decision 0148
+    // section 23).
+    match program
+        .companion
+        .callbacks
+        .iter()
+        .find(|callback| callback.forwarder.id == function)
+    {
+        Some(callback) => callback.entry_symbol(),
+        None => format!("__doria_c_entry_{}", function.0),
+    }
 }
 
 fn entry_frame_symbol(function: mir::FunctionId) -> String {
@@ -116,18 +126,34 @@ pub(super) fn c_signature(module: &ObjectModule, physical: &PhysicalSignature) -
 pub(super) fn declare(
     module: &mut ObjectModule,
     program: &mir::Program,
+    companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Vec<(mir::FunctionId, FuncId)>, BackendError> {
-    program
-        .c_entries
-        .iter()
+    // A companion's C entries are its exported region entries and its
+    // callbacks' forwarders (Decision 0148 section 23).
+    let entries = match companion {
+        Some(_) => program
+            .companion
+            .regions
+            .iter()
+            .map(|region| region.entry.id)
+            .chain(program.c_entries.iter().copied())
+            .collect::<Vec<_>>(),
+        None => program.c_entries.clone(),
+    };
+    entries
+        .into_iter()
         .map(|id| {
-            let function = function_in(program, *id)?;
+            let function = function_in(program, id)?;
             let (_, physical) = physical(program, function)?;
             let signature = c_signature(module, &physical);
+            let (name, linkage) = match companion.and_then(|library| library.export(id)) {
+                Some(name) => (name, Linkage::Export),
+                None => (symbol(program, id), Linkage::Local),
+            };
             let entry = module
-                .declare_function(&symbol(*id), Linkage::Local, &signature)
+                .declare_function(&name, linkage, &signature)
                 .map_err(|error| backend_failure(error.to_string()))?;
-            Ok((*id, entry))
+            Ok((id, entry))
         })
         .collect()
 }
@@ -138,8 +164,9 @@ pub(super) fn address(
     function: mir::FunctionId,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
-    let Some(cranelift_module::FuncOrDataId::Func(id)) =
-        resources.module.get_name(&symbol(function))
+    let Some(cranelift_module::FuncOrDataId::Func(id)) = resources
+        .module
+        .get_name(&symbol(resources.program, function))
     else {
         return Err(malformed_mir("a C entry address names a declared C entry"));
     };
@@ -227,13 +254,14 @@ pub(super) fn define(
     module: &mut ObjectModule,
     program: &mir::Program,
     entries: &[(mir::FunctionId, FuncId)],
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
 ) -> Result<(), BackendError> {
     for (id, entry) in entries {
         let function = function_in(program, *id)?;
         let entry_frame = define_entry_frame(module, program, function)?;
-        let callee = *function_ids
+        let callee = function_ids
             .get(id.0)
+            .and_then(|id| *id)
             .ok_or_else(|| malformed_mir("a C entry's function was not declared"))?;
         let mut context = module.make_context();
         context.func.signature = module
@@ -273,6 +301,7 @@ fn emit(
     entry_frame: DataId,
     callee: FuncId,
 ) -> Result<(), BackendError> {
+    let region = program.companion.is_region_entry(function.id);
     let pointer = module.target_config().pointer_type();
     let flags = MemFlagsData::trusted();
     let (types, physical) = physical(program, function)?;
@@ -281,18 +310,27 @@ fn emit(
     builder.switch_to_block(block);
     let received = builder.block_params(block).to_vec();
 
-    // The thread check and the frame link (section 13).
-    let marker = slot(builder, pointer.bytes() * 11, pointer.bytes(), pointer);
+    // The thread check and the frame link (section 13). A region entry's
+    // frame links to the host frame its caller passes (section 23).
     let entry_frame = module.declare_data_in_func(entry_frame, builder.func);
     let entry_frame = builder.ins().symbol_value(pointer, entry_frame);
+    let (symbol, arguments) = if region {
+        let caller = *received
+            .get(1)
+            .ok_or_else(|| malformed_mir("a region entry receives its caller's frame"))?;
+        (crate::native_abi::ENTER_REGION, [entry_frame, caller])
+    } else {
+        let marker = slot(builder, pointer.bytes() * 11, pointer.bytes(), pointer);
+        (crate::native_abi::ENTER_C_FUNCTION, [marker, entry_frame])
+    };
     let mut enter = module.make_signature();
     enter.params = vec![AbiParam::new(pointer), AbiParam::new(pointer)];
     enter.returns = vec![AbiParam::new(pointer)];
     let enter = module
-        .declare_function(crate::native_abi::ENTER_C_FUNCTION, Linkage::Import, &enter)
+        .declare_function(symbol, Linkage::Import, &enter)
         .map_err(|error| backend_failure(error.to_string()))?;
     let enter = module.declare_func_in_func(enter, builder.func);
-    let call = builder.ins().call(enter, &[marker, entry_frame]);
+    let call = builder.ins().call(enter, &arguments);
     let parent = builder.inst_results(call)[0];
 
     // Each aggregate argument, rebuilt from the registers or memory C

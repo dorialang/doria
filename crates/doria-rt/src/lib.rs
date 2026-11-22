@@ -34,6 +34,7 @@ mod native_handle;
 mod owned_interface;
 mod platform_io;
 mod process;
+mod region;
 mod string_ops;
 mod system_code;
 pub mod terminal;
@@ -3135,6 +3136,16 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
         emergency_runtime_panic();
     }
 
+    // A host running this program's regions renders the panic itself
+    // (Decision 0148 section 23) and never returns.
+    region::report_to_host(
+        current_frame,
+        entry.code.as_bytes(),
+        message,
+        message_length,
+        facts,
+        fact_count,
+    );
     if write_runtime_outcome_record(
         current_frame,
         entry.code.as_bytes(),

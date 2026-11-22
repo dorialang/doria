@@ -98,7 +98,7 @@ pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), Back
 /// permissions carry over.
 /// Copies a native library's runtime file into the executable's directory,
 /// where the executable loads it.
-fn publish_runtime_file(file: &Path, directory: &Path) -> Result<(), BackendError> {
+pub(crate) fn publish_runtime_file(file: &Path, directory: &Path) -> Result<(), BackendError> {
     let name = file.file_name().ok_or_else(|| {
         BackendError::new(format!(
             "runtime file `{}` has no file name",

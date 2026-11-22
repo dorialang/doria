@@ -372,8 +372,7 @@ impl Walker<'_, '_> {
                 results,
                 ..
             } => {
-                self.read(*host);
-                for record in arguments.iter().chain(results) {
+                for record in host.iter().chain(arguments).chain(results) {
                     self.read(*record);
                 }
             }

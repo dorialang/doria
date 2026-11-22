@@ -1067,6 +1067,38 @@ takes a new version.
   site becomes a host call, each edge out of the region writes `outputs` and
   releases the companion's copies in reverse order. `host->call` returns 0
   for every operation; the companion does not read it.
+- `DrRegionHostV1` is `{call, panic}`: `call` at offset 0, then the panic
+  sink, which takes the frame, code, message and facts of a validated
+  runtime panic and never returns. The host attaches it once, before its
+  first region call, through the shared runtime's
+  `dr_v1_attach_region_host`, which also records the host's thread as the
+  thread running Doria code.
+- `callerFrame` is the host's frame of the function the region is written
+  in. The entry's own frame stands in for it and links to its parent, so
+  the Call Path matches the native one. The entry checks the thread
+  (P1706) before it runs.
+- Content slots move through the shared runtime's slot accessors, which
+  both native backends call. A present empty value points at its own
+  storage, so its data is never null; a native slot is copied in its
+  native layout.
+- A `T[]` crosses as a buffer when a region over it addresses its
+  elements (section 8): `{data, length}` then shares their C layout. Any
+  other `T[]` is a host token.
+- Each C-callable function is a callback, numbered after every host
+  operation in the order MIR lists the program's C entries. The companion exports its C entry as
+  `doria_callback_v1_<operation>`, which checks the thread, links the Call
+  Path and forwards to the attached host: the arguments are the function's
+  parameters and the results its return value. The host holds the
+  function's C function pointer value as that entry's address.
+- The library emits the region entries, the extern declarations' functions
+  they call and the callbacks' forwarders, as the shared local walk reports
+  them; the program's other functions stay on the host.
+- The library depends on the hosted shared runtime at
+  `.doria-runtime/<identity>/` beside it, through an rpath on Unix. On
+  Windows the host loads that runtime before the library, which then
+  resolves to the loaded module.
+- The companion follows the build's native profile: Cranelift by default,
+  LLVM for `--release`, and the profile is part of the cache key.
 
 **Callbacks.** The companion contains the C entry for each C-callable Doria function.
 The entry performs section 13's thread check and forwards to the host through a
@@ -1252,6 +1284,27 @@ has one precise contract.
   - A generated MIR entry: MIR validation and both native backends already
     own every statement of the region, so the entry adds only its slot,
     record and host-call statements.
+  - The host record and its attachment: one registration carries the call
+    and the panic sink, and the runtime that every companion shares holds
+    it, so a panic in any region and every callback find the same host.
+  - The entry's frame in place of the host's: it names the same function
+    with the companion's current site, so linking it to the parent of the
+    host's frame renders the native Call Path with no duplicate frame.
+  - Slot accessors in the runtime: the content rules (non-null present
+    data, copies at load, release of the replaced value) have one
+    implementation for both backends.
+  - Buffers only for C-layout arrays: a host reads `{data, length}` as C
+    elements, which only the arrays a region can address guarantee.
+  - Callbacks as forwarding operations: the body runs on the host as the
+    record requires, and the forwarder reuses the C entry machinery for the
+    thread check and the Call Path. Every C-callable function has one,
+    because safe host code takes C function pointer values too (zlib's
+    `zalloc` is stored in a `z_stream` before the region that passes it).
+  - Emitting from the shared local walk: the walk that decides which
+    statements are host operations already names every function a region
+    reaches, so what the library emits has one owner.
+  - The profile follows the program: the companion is part of the same
+    build, so a release build's regions get the optimized profile.
 - The unsafe inventory for `baton audit unsafe` is compiler metadata (section 25).
 - `Platform::architecture` beside `Platform::operatingSystem` (section 17), and
   the placement of `Platform`, `OperatingSystem` and `Architecture` in

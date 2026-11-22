@@ -65,6 +65,7 @@ pub mod names;
 mod narrowing;
 pub mod native_abi;
 pub mod native_closure_abi;
+pub mod native_companion;
 pub mod native_link;
 pub mod native_process;
 mod native_shared;

@@ -4274,10 +4274,11 @@ fn validate_statement(
             results,
         } => {
             require_companion_entry(program, function)?;
-            for local in std::iter::once(host).chain(arguments).chain(results) {
+            for local in host.iter().chain(arguments).chain(results) {
                 require_companion_pointer(function, *local)?;
             }
-            if *operation as usize > program.companion.host_operations.len() {
+            let companion = &program.companion;
+            if *operation as usize > companion.host_operations.len() + companion.callbacks.len() {
                 return Err(malformed_mir(format!(
                     "a companion entry calls host operation {operation}, which the plan lacks"
                 )));
@@ -6657,7 +6658,7 @@ fn validate_companion(program: &mir::Program) -> Result<(), BackendError> {
     }
     // Each entry is validated as the companion library compiles it, beside
     // the program's functions, which its foreign calls reach.
-    let library = mir::companion::library(program);
+    let library = mir::companion::library(program).program;
     for (index, region) in program.companion.regions.iter().enumerate() {
         let entry = &region.entry;
         let pointer = |local: &mir::LocalId| {
@@ -6679,6 +6680,9 @@ fn validate_companion(program: &mir::Program) -> Result<(), BackendError> {
         }
         validate_function(&library, entry)?;
     }
+    for callback in &program.companion.callbacks {
+        validate_function(&library, &callback.forwarder)?;
+    }
     Ok(())
 }
 
@@ -6692,11 +6696,18 @@ fn require_companion_entry(
     program: &mir::Program,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
-    if program
-        .companion
+    let companion = &program.companion;
+    if companion
         .regions
         .iter()
-        .any(|region| region.entry.id == function.id)
+        .map(|region| region.entry.id)
+        .chain(
+            companion
+                .callbacks
+                .iter()
+                .map(|callback| callback.forwarder.id),
+        )
+        .any(|id| id == function.id)
     {
         return Ok(());
     }
@@ -15093,7 +15104,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             results,
             ..
         } => {
-            for local in std::iter::once(host).chain(arguments).chain(results) {
+            for local in host.iter().chain(arguments).chain(results) {
                 accesses.resource_read(*local);
             }
         }

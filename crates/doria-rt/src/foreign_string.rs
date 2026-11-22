@@ -24,7 +24,11 @@ unsafe fn text<'a>(value: *const DrStringV1) -> &'a [u8] {
 }
 
 /// A buffer of `units` code units of `unit_bytes` each plus a NUL unit.
-unsafe fn buffer(frame: *const DrStackFrameV2, units: usize, unit_bytes: usize) -> *mut u8 {
+pub(crate) unsafe fn buffer(
+    frame: *const DrStackFrameV2,
+    units: usize,
+    unit_bytes: usize,
+) -> *mut u8 {
     let total = units
         .checked_add(1)
         .and_then(|units| units.checked_mul(unit_bytes))

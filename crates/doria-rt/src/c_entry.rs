@@ -103,3 +103,29 @@ pub unsafe extern "C" fn dr_v1_enter_c_function(
     });
     marker
 }
+
+/// Enters a region entry of the native companion library (Decision 0148
+/// section 23). Panics with P1706, reported at `entry`, when the calling
+/// thread is not the thread the host attached on. Otherwise returns the
+/// parent the region's own frame links to: `caller` is the host's frame of
+/// the function the region is written in, which the region's frame stands
+/// in for, so its parent is `caller`'s parent.
+///
+/// # Safety
+///
+/// `entry` points to a valid frame that describes the region's function,
+/// and `caller` is null or a valid frame chain.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_enter_region(
+    entry: *const DrStackFrameV2,
+    caller: *const DrStackFrameV2,
+) -> *const DrStackFrameV2 {
+    let thread = DORIA_THREAD.load(Ordering::Relaxed);
+    if thread == 0 || thread != current_thread() {
+        panic_catalogued(entry, FOREIGN_THREAD);
+    }
+    if caller.is_null() {
+        return ptr::null();
+    }
+    (*caller).parent
+}

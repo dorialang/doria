@@ -233,6 +233,18 @@ fn invoke_linker(
             foreign: plan,
         },
     );
+    run_linker(linker, arguments, cc_is_set, msvc_host)
+}
+
+/// Runs `linker` with `arguments`, finding the Visual Studio environment
+/// when the MSVC driver is not on the path.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn run_linker(
+    linker: String,
+    arguments: Vec<OsString>,
+    cc_is_set: bool,
+    msvc_host: bool,
+) -> Result<(String, Vec<String>), BackendError> {
     let mut command = Command::new(&linker);
     command.args(&arguments);
 
@@ -621,6 +633,152 @@ fn linker_arguments(
         arguments.push(OsString::from("-lbcrypt"));
     }
     arguments
+}
+
+/// The file extension of a platform shared library.
+pub(crate) fn shared_library_extension() -> &'static str {
+    if cfg!(windows) {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
+}
+
+/// Links `object_bytes` into a platform shared library (Decision 0148
+/// section 23's native shared-library artifact): its exported entries, the
+/// foreign link inputs of `plan`, and a dynamic dependency on the hosted
+/// shared runtime `runtime`, which the library finds at `runtime_directory`
+/// relative to itself. Returns the library's bytes.
+pub(crate) fn link_shared_library(
+    object_bytes: &[u8],
+    runtime: &Path,
+    runtime_directory: &Path,
+    plan: &LinkPlan,
+) -> Result<Vec<u8>, BackendError> {
+    let temp_stem = unique_temp_stem();
+    let object_path = temp_stem.with_extension(object_extension());
+    let library_path = temp_stem.with_extension(shared_library_extension());
+    let import_path = temp_stem.with_extension("runtime.lib");
+    let definition_path = temp_stem.with_extension("def");
+    let cleanup = || {
+        for path in [&object_path, &library_path, &import_path, &definition_path] {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_file(library_path.with_extension("lib"));
+        let _ = fs::remove_file(library_path.with_extension("exp"));
+    };
+    fs::write(&object_path, object_bytes)
+        .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
+    let result = (|| {
+        let cc_is_set = env::var_os("CC").is_some();
+        let msvc_host = cfg!(all(windows, target_env = "msvc"));
+        let linker = env::var("CC").unwrap_or_else(|_| default_linker(msvc_host).to_string());
+        let msvc_driver =
+            cfg!(windows) && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(&linker));
+        let runtime_folder = runtime.parent().unwrap_or(Path::new("."));
+        let mut arguments = Vec::new();
+        if msvc_driver {
+            // MSVC links a DLL against an import library; the runtime ships
+            // only its DLL, so one is made from the symbols the object
+            // imports from it.
+            write_runtime_import_library(object_bytes, runtime, &definition_path, &import_path)?;
+            arguments.extend([
+                OsString::from("/nologo"),
+                OsString::from("/LD"),
+                object_path.as_os_str().to_os_string(),
+                OsString::from(format!("/Fe:{}", library_path.display())),
+                OsString::from("/link"),
+                import_path.as_os_str().to_os_string(),
+            ]);
+            arguments.extend(
+                [
+                    "libcmt.lib",
+                    "libvcruntime.lib",
+                    "ucrt.lib",
+                    "/NODEFAULTLIB:libucrt.lib",
+                    "kernel32.lib",
+                ]
+                .map(OsString::from),
+            );
+            arguments.extend(plan.msvc_arguments());
+        } else {
+            let target = crate::c_layout::CTarget::host();
+            arguments.push(object_path.as_os_str().to_os_string());
+            arguments.push(OsString::from(if cfg!(target_os = "macos") {
+                "-dynamiclib"
+            } else {
+                "-shared"
+            }));
+            arguments.push(OsString::from("-o"));
+            arguments.push(library_path.as_os_str().to_os_string());
+            let mut search = OsString::from("-L");
+            search.push(runtime_folder);
+            arguments.push(search);
+            arguments.push(OsString::from("-ldoria_rt"));
+            let origin = if cfg!(target_os = "macos") {
+                "@loader_path"
+            } else {
+                "$ORIGIN"
+            };
+            if !cfg!(windows) {
+                arguments.push(OsString::from(format!(
+                    "-Wl,-rpath,{origin}/{}",
+                    runtime_directory.display()
+                )));
+            }
+            arguments.extend(plan.driver_arguments(target));
+        }
+        run_linker(linker, arguments, cc_is_set, msvc_host)?;
+        fs::read(&library_path)
+            .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))
+    })();
+    cleanup();
+    result
+}
+
+/// Writes an import library for the shared runtime DLL `runtime` that
+/// names every runtime symbol `object_bytes` imports.
+fn write_runtime_import_library(
+    object_bytes: &[u8],
+    runtime: &Path,
+    definition: &Path,
+    import: &Path,
+) -> Result<(), BackendError> {
+    use cranelift_object::object::{Object, ObjectSymbol};
+    let object = cranelift_object::object::File::parse(object_bytes)
+        .map_err(|error| BackendError::new(format!("cannot read generated object: {error}")))?;
+    let mut symbols = object
+        .symbols()
+        .filter(|symbol| symbol.is_undefined())
+        .filter_map(|symbol| symbol.name().ok().map(str::to_string))
+        .filter(|name| name.starts_with("dr_"))
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    let name = runtime
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut text = format!("LIBRARY {name}\nEXPORTS\n");
+    for symbol in symbols {
+        text.push_str(&format!("    {symbol}\n"));
+    }
+    fs::write(definition, text)
+        .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
+    run_linker(
+        "lib.exe".to_string(),
+        vec![
+            OsString::from("/nologo"),
+            OsString::from(format!("/def:{}", definition.display())),
+            OsString::from(format!("/out:{}", import.display())),
+            OsString::from("/machine:x64"),
+        ],
+        false,
+        true,
+    )
+    .map(|_| ())
 }
 
 fn is_msvc_style_compiler_driver(linker: &str) -> bool {
