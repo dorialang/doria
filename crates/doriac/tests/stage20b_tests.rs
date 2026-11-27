@@ -95,7 +95,7 @@ function label(?string $value = null): ?string { return $value; }
 
     let writable = default_diagnostic(
         r#"
-function label(writable string $value = "guest"): string { return $value; }
+class Label { function __construct(writable string $value = "guest") {} }
 "#,
     );
     assert_eq!(

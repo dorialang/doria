@@ -368,7 +368,7 @@ function main(): void {
     $bytes[position()] += 3; $bytes[0]++; --$bytes[0];
     echo "byte {$bytes[0]};";
 }
-"#, "R;stored 13;R;count 13;hooks 4 3;R;copy 13;local 10;I;R;array 13;I;R;list 30;I;R;nested 13;R;dictionary 8;I;byte 13;");
+"#, "R;stored 13;R;count 13;hooks 4 3;R;copy 13;local 13;I;R;array 13;I;R;list 30;I;R;nested 13;R;dictionary 8;I;byte 13;");
 }
 
 #[test]
