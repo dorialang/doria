@@ -4,6 +4,14 @@ Documentation role: working note.
 
 Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The durable executable manifest is `crates/doriac/tests/fixtures/native_parity_examples.txt`. The differential test reads that manifest, executes each finite source through the MIR interpreter, Cranelift fast profile, and LLVM release profile, and compares exact stdout bytes, stderr bytes, and process status.
 
+The manifest also runs the entry source of every package under
+`examples/ffi`. A fixture's `link` file in `crates/doriac/tests/fixtures/native_io/`
+gives each host's `--link-*` flags for the native libraries its source names,
+and the interpreter's companion library and both native profiles link with
+them. A fixture's `php_output` file states whether PHP output builds and runs
+the source as the interpreter does (`runs`) or the diagnostic code it reports,
+such as `E0784`.
+
 Stage 30e adds the focused closure manifest at
 `crates/doriac/tests/fixtures/native_closures/manifest.txt`. Its fixtures declare
 their native profiles and compare closure output, failure status, ownership, and

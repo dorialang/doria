@@ -435,26 +435,8 @@ fn a_build_plan_links_its_package_libraries_and_refuses_an_unenforced_deny_polic
 /// owns through an owner class's region.
 const ZLIB_PACKAGE: &str = include_str!("../../../examples/ffi/zlib/src/main.doria");
 
-const ZLIB_OUTPUT: &str = "bound true
-compress2 true
-smaller true
-uncompress true
-round trip true
-deflateInit_ true
-deflate true
-consumed true
-input address true
-output address true
-deflateEnd true
-stream round trip true
-counted deflate true
-allocations counted true
-every allocation released true
-foreign uncompress true
-foreign region true
-foreign buffer released
-Doria binds zlib. Doria binds zlib. Doria binds zlib. Doria binds zlib.
-";
+/// The package's output, which the durable parity manifest also checks.
+const ZLIB_OUTPUT: &str = include_str!("fixtures/native_io/zlib/expected_stdout");
 
 /// One way this host links zlib: its name, the direct flags and the
 /// schema-2 `inputs` and `runtimeFiles` Baton would write for them.
